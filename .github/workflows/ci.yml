@@ -9,6 +9,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Least privilege for every job below: all three only check out the repository
+# and run cargo. Without this block each job inherits the repository's default
+# GITHUB_TOKEN permissions, which CodeQL flags as
+# actions/missing-workflow-permissions.
+permissions:
+  contents: read
+
 jobs:
   fmt:
     name: cargo fmt
