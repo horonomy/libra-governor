@@ -22,9 +22,13 @@ mod messages;
 pub mod wire;
 
 pub use libra_governor_domain::{Confidence, Estimate};
+pub use libra_governor_estimator::{
+    AdmissionOutcome, AdmissionPolicy, AdmissionStats, CoverageReport, QuantileCoverage, Stratum,
+};
 pub use messages::{
-    FinalizeOutcome, FinalizeResult, PreflightResult, ReconSummary, Request, RequestEnvelope,
-    Response, ResponseEnvelope, StatusResult, TaskSummary,
+    AdmissionPolicyReport, CalibrationReportResult, FinalizeOutcome, FinalizeResult,
+    PreflightResult, ReconSummary, Request, RequestEnvelope, Response, ResponseEnvelope,
+    StatusResult, TaskSummary,
 };
 
 /// The protocol version this build of the crate speaks. Bump on any
@@ -37,4 +41,9 @@ pub use messages::{
 /// mismatch — see the HORO-1126 PR description. The daemon must be
 /// restarted (killed, then re-spawned on the next hook invocation) after
 /// upgrading.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// Bumped 2 -> 3 for HORO-1132: `Request` gained `CalibrationReport` and
+/// `Response` gained the matching `CalibrationReport` variant. Same known
+/// limitation as the 1 -> 2 bump: a long-lived v2 daemon must be
+/// restarted after upgrading.
+pub const PROTOCOL_VERSION: u32 = 3;
