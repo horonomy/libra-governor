@@ -96,7 +96,8 @@ def fetch_distilled_traj(
 
     info = traj.get("info", {}) if isinstance(traj, dict) else {}
     model_stats = info.get("model_stats")
-    if not model_stats:
+    llm_call_data = info.get("llm_call_data") if isinstance(traj, dict) else None
+    if not model_stats and not llm_call_data:
         return None
 
     distilled = {
@@ -105,6 +106,7 @@ def fetch_distilled_traj(
         "submission": submission,
         "exit_status": info.get("exit_status"),
         "model_stats": model_stats,
+        "llm_call_data": llm_call_data,
     }
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(json.dumps(distilled), encoding="utf-8")
