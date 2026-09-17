@@ -12,14 +12,23 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{confidence::Confidence, resource_amount::ResourceAmount};
+use crate::{
+    confidence::Confidence,
+    resource_amount::ResourceAmount,
+    task_features::{BucketTier, FEATURE_SCHEMA_VERSION},
+};
 
 /// The version/feature-set string every produced [`Estimate`] is tagged
 /// with, so a stored estimate is always traceable to the exact estimator
 /// logic that produced it (the campaign's estimator-versioning rule).
 /// Bump this any time the quantile method, confidence thresholds, or
 /// bucketing logic changes.
-pub const ESTIMATOR_VERSION: &str = "v1-empirical-quantile";
+///
+/// Bumped `v1-empirical-quantile` -> `v2-bucketed-quantile` for
+/// HORO-1130: the estimator now actually buckets local history by task
+/// class (see [`BucketTier`]) instead of always collapsing to the global
+/// pool.
+pub const ESTIMATOR_VERSION: &str = "v2-bucketed-quantile";
 
 /// A probabilistic preflight estimate: P50/P80/P90 for both wall-clock
 /// duration and resource usage, plus the confidence/provenance metadata
@@ -58,6 +67,15 @@ pub struct Estimate {
     /// Human-readable explanation, always present on a cold-start
     /// estimate; `None` on a normally computed one.
     pub reason: Option<String>,
+    /// Traceability tag for the [`crate::TaskFeatures`] schema this
+    /// estimate's bucketing decision was made against (HORO-1130). Always
+    /// non-empty, even on a cold-start estimate, so every `Estimate` is
+    /// traceable to the exact feature-derivation logic in force when it
+    /// was produced.
+    pub feature_schema_version: String,
+    /// Which tier of the hierarchical backoff ladder this estimate was
+    /// actually computed from — see `libra-governor-estimator` crate docs.
+    pub bucket_tier: BucketTier,
 }
 
 impl Estimate {
@@ -78,6 +96,8 @@ impl Estimate {
             reason: Some(
                 "insufficient local history: no ExecutionReceipt rows recorded yet".to_string(),
             ),
+            feature_schema_version: FEATURE_SCHEMA_VERSION.to_string(),
+            bucket_tier: BucketTier::ColdStart,
         }
     }
 }
