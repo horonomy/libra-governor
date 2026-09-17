@@ -37,7 +37,7 @@ use libra_governor_protocol::{
     Response, ResponseEnvelope, StatusResult, TaskSummary, PROTOCOL_VERSION,
 };
 
-use crate::{contract, log, recon, recon::ReconBudget};
+use crate::{contract, features, log, recon, recon::ReconBudget};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
@@ -213,16 +213,19 @@ fn handle_preflight(
     let contract = contract::draft_contract(previous_contract.as_ref(), &recon);
     ledger.insert_contract(task_id, &contract, now)?;
 
-    // Estimator input: the full local receipt history. No task
-    // classification exists in the schema yet (see
-    // `libra-governor-estimator` crate docs), so `class_receipts` is
-    // always `None` today — the estimator still implements the
-    // class-bucket tier so a future classifier only needs to supply it.
-    let history = ledger.receipts_for_estimation(None)?;
-    let estimate = libra_governor_estimator::estimate(&history, None);
+    // Estimator input (HORO-1130): real task-class bucketing over
+    // preflight-knowable features. `model` is unavailable at preflight
+    // time (see `features::derive_task_features` docs) so it is always
+    // `None` here — the RepoTopologyModel tier of the ladder simply never
+    // matches on it until a future preflight payload exposes the model
+    // up front.
+    let task_features = features::derive_task_features(&recon, task_hint, cwd, None);
+    let history = ledger.receipts_for_estimation()?;
+    let estimate = libra_governor_estimator::estimate_bucketed(&history, &task_features);
 
     let plan = libra_governor_domain::ExecutionPlan::new(task_id, contract.revision, None, now)
-        .with_estimate(estimate.clone());
+        .with_estimate(estimate.clone())
+        .with_task_features(Some(task_features));
     ledger.insert_plan(&plan)?;
 
     // Supersede any prior in-flight preflight for this session before
@@ -295,7 +298,8 @@ fn handle_finalize(
     )
     .with_tool_call_count(tool_call_count)
     .with_model(model)
-    .with_provider(None);
+    .with_provider(None)
+    .with_task_features(plan.task_features.clone());
 
     ledger.insert_receipt(&receipt)?;
 
