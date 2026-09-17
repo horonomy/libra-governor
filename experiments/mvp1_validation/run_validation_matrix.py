@@ -70,9 +70,9 @@ def receipt_count(ledger_path: Path) -> int:
         conn.close()
 
 
-def preflight(binary, env, session_id, cwd, prompt="add input validation to the login handler"):
+def preflight(binary, env, session_id, cwd, prompt="add input validation to the login handler", timeout=30):
     payload = {"session_id": session_id, "cwd": str(cwd), "prompt": prompt, "hook_event_name": "UserPromptSubmit"}
-    return run_hook(binary, ["hook", "user-prompt-submit"], payload, env)
+    return run_hook(binary, ["hook", "user-prompt-submit"], payload, env, timeout=timeout)
 
 
 def stop(binary, env, session_id, model="claude-sonnet-5"):
@@ -101,6 +101,11 @@ class Matrix:
 
     def fresh_env(self, tag):
         state_dir = self.work_root / f"state-{tag}"
+        # Genuinely fresh: wipe any state left behind by a prior run of
+        # this script (each test's "before" assertions assume an empty
+        # ledger) rather than silently accumulating rows across runs.
+        if state_dir.exists():
+            shutil.rmtree(state_dir)
         state_dir.mkdir(parents=True, exist_ok=True)
         env = dict(os.environ)
         env["LIBRA_GOVERNOR_STATE_DIR"] = str(state_dir)
@@ -175,7 +180,16 @@ class Matrix:
 
             stray_sid = f"stray-{uuid.uuid4()}"
             s = stop(self.binary, env, stray_sid)
-            no_op_ok = s.returncode == 0 and "no active task" in s.stderr.lower()
+            # hook_stop.rs only eprintln!s on the Finalized branch; the
+            # NoActiveTask safe no-op is logged to daemon.log instead (see
+            # hook_stop.rs::log / run()). So stderr is expected to be empty
+            # here — check the log file for the real evidence.
+            log_text = (state_dir / "daemon.log").read_text() if (state_dir / "daemon.log").exists() else ""
+            no_op_ok = (
+                s.returncode == 0
+                and s.stderr.strip() == ""
+                and "no active task for this session, safe no-op" in log_text
+            )
 
             # Daemon must still be alive and responsive afterwards.
             st = statusline(self.binary, env)
@@ -184,8 +198,11 @@ class Matrix:
             self.record(
                 "user_abort_and_stray_stop",
                 preflight_ok and no_op_ok and still_alive,
-                f"preflight_ok={preflight_ok}, stray-stop safe no-op={no_op_ok} "
-                f"(stderr={s.stderr.strip()!r}), daemon still alive/responsive after={still_alive}",
+                f"preflight_ok={preflight_ok} (session never Stopped, simulating user abort). "
+                f"stray-stop (session with no preceding preflight) safe no-op={no_op_ok}: "
+                f"exit 0, stdout/stderr empty (hook_stop.rs only eprintln!s on the Finalized "
+                f"branch), daemon.log contains the expected 'no active task ... safe no-op' "
+                f"line. daemon still alive/responsive after={still_alive}",
             )
         finally:
             self._kill_any_daemon(state_dir, proc=daemon)
