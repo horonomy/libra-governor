@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Libra Governor: domain crate (placeholder scaffold, no logic yet)."
+description = "Libra Governor: domain crate — task, contract, event, and receipt types."
 
 [dependencies]
+uuid.workspace = true
+serde.workspace = true
+time.workspace = true

@@ -1,19 +1,33 @@
-//! Placeholder crate for `libra-governor-domain`.
+//! `libra-governor-domain` — the canonical, harness-agnostic domain types
+//! Libra's daemon, ledger, and estimator are built on.
 //!
-//! This crate is part of the Libra Governor bootstrap scaffold (HORO-1118).
-//! Real domain logic lands in follow-up tickets.
+//! # Privacy invariant
+//!
+//! None of the types in this crate carry a field for raw prompt text or
+//! raw tool output content. [`ExecutionEventKind::ToolInvoked`] carries a
+//! tool *name* only; [`ExecutionOutcome`] carries evidence *references*
+//! (URLs, IDs, paths), never inlined content. This is a structural
+//! guarantee, not a convention some caller could violate by populating an
+//! optional field — the field simply does not exist on the type.
+//!
+//! # The economic unit
+//!
+//! [`TaskIdentity`], not a session or a token, is the anchor every other
+//! type in this crate attaches to. See
+//! `docs/adr/0002-task-not-session-as-economic-unit.md` for why.
 
-/// Returns the crate name, confirming the crate builds and links.
-pub fn placeholder() -> &'static str {
-    "domain"
-}
+mod completion_contract;
+mod execution_event;
+mod execution_outcome;
+mod execution_plan;
+mod execution_receipt;
+mod resource_amount;
+mod task_identity;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn placeholder_returns_crate_name() {
-        assert_eq!(placeholder(), "domain");
-    }
-}
+pub use completion_contract::{CompletionContract, CompletionCriterion};
+pub use execution_event::{ExecutionEvent, ExecutionEventKind};
+pub use execution_outcome::ExecutionOutcome;
+pub use execution_plan::{ExecutionPlan, PlanId};
+pub use execution_receipt::ExecutionReceipt;
+pub use resource_amount::{ResourceAmount, ResourceKind};
+pub use task_identity::{ExternalRef, TaskId, TaskIdentity};

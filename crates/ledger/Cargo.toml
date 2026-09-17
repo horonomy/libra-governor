@@ -4,6 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Libra Governor: ledger crate (placeholder scaffold, no logic yet)."
+description = "Libra Governor: ledger crate — SQLite-backed task trajectory store."
 
 [dependencies]
+libra-governor-domain = { path = "../domain" }
+rusqlite.workspace = true
+uuid.workspace = true
+time.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
