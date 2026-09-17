@@ -1,6 +1,7 @@
 use libra_governor_domain::{
-    CompletionContract, CompletionCriterion, ExecutionEvent, ExecutionEventKind, ExecutionOutcome,
-    ExecutionPlan, ExecutionReceipt, ExternalRef, PlanId, ResourceAmount, TaskId, TaskIdentity,
+    CompletionContract, CompletionCriterion, Estimate, ExecutionEvent, ExecutionEventKind,
+    ExecutionOutcome, ExecutionPlan, ExecutionReceipt, ExternalRef, PlanId, ResourceAmount, TaskId,
+    TaskIdentity,
 };
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
@@ -24,6 +25,10 @@ fn parse_time(s: &str) -> Result<time::OffsetDateTime, LedgerError> {
     time::OffsetDateTime::parse(s, &Rfc3339)
         .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))
 }
+
+/// Raw `plans` row shape for [`LedgerStore::get_plan`]: `(task_id,
+/// contract_revision, recon_snapshot_ref, created_at, estimate_json)`.
+type PlanRow = (String, i64, Option<String>, String, Option<String>);
 
 impl LedgerStore {
     /// Reconstructs one task's full trajectory: identity, ordered events,
@@ -133,7 +138,7 @@ impl LedgerStore {
         task_id: TaskId,
     ) -> Result<Vec<ExecutionPlan>, LedgerError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, contract_revision, recon_snapshot_ref, created_at
+            "SELECT id, contract_revision, recon_snapshot_ref, created_at, estimate_json
              FROM plans WHERE task_id = ?1 ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map([task_id_str], |row| {
@@ -141,14 +146,25 @@ impl LedgerStore {
             let contract_revision: i64 = row.get(1)?;
             let recon_snapshot_ref: Option<String> = row.get(2)?;
             let created_at: String = row.get(3)?;
-            Ok((id, contract_revision, recon_snapshot_ref, created_at))
+            let estimate_json: Option<String> = row.get(4)?;
+            Ok((
+                id,
+                contract_revision,
+                recon_snapshot_ref,
+                created_at,
+                estimate_json,
+            ))
         })?;
 
         let mut plans = Vec::new();
         for row in rows {
-            let (id, contract_revision, recon_snapshot_ref, created_at) = row?;
+            let (id, contract_revision, recon_snapshot_ref, created_at, estimate_json) = row?;
             let id = Uuid::parse_str(&id)
                 .map(PlanId)
+                .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
+            let estimate: Option<Estimate> = estimate_json
+                .map(|s| serde_json::from_str(&s))
+                .transpose()
                 .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
             plans.push(ExecutionPlan {
                 id,
@@ -156,6 +172,7 @@ impl LedgerStore {
                 contract_revision: contract_revision as u32,
                 recon_snapshot_ref,
                 created_at: parse_time(&created_at)?,
+                estimate,
             });
         }
         Ok(plans)
@@ -168,7 +185,7 @@ impl LedgerStore {
     ) -> Result<Vec<ExecutionReceipt>, LedgerError> {
         let mut stmt = self.conn.prepare(
             "SELECT plan_id, contract_revision, actual_duration_secs, actual_usage_json,
-                    outcome_json, recorded_at
+                    outcome_json, recorded_at, tool_call_count, model, provider
              FROM receipts WHERE task_id = ?1 ORDER BY recorded_at ASC",
         )?;
         let rows = stmt.query_map([task_id_str], |row| {
@@ -178,6 +195,9 @@ impl LedgerStore {
             let actual_usage_json: String = row.get(3)?;
             let outcome_json: String = row.get(4)?;
             let recorded_at: String = row.get(5)?;
+            let tool_call_count: i64 = row.get(6)?;
+            let model: Option<String> = row.get(7)?;
+            let provider: Option<String> = row.get(8)?;
             Ok((
                 plan_id,
                 contract_revision,
@@ -185,6 +205,9 @@ impl LedgerStore {
                 actual_usage_json,
                 outcome_json,
                 recorded_at,
+                tool_call_count,
+                model,
+                provider,
             ))
         })?;
 
@@ -197,6 +220,9 @@ impl LedgerStore {
                 usage_json,
                 outcome_json,
                 recorded_at,
+                tool_call_count,
+                model,
+                provider,
             ) = row?;
             let plan_id = Uuid::parse_str(&plan_id)
                 .map(PlanId)
@@ -214,6 +240,165 @@ impl LedgerStore {
                 actual_usage,
                 outcome,
                 recorded_at: parse_time(&recorded_at)?,
+                tool_call_count: tool_call_count as u64,
+                model,
+                provider,
+            });
+        }
+        Ok(receipts)
+    }
+
+    /// Returns the single [`ExecutionPlan`] with `plan_id`, if any.
+    pub fn get_plan(&self, plan_id: PlanId) -> Result<Option<ExecutionPlan>, LedgerError> {
+        let plan_id_str = plan_id.0.to_string();
+        let row: Option<PlanRow> = self
+            .conn
+            .query_row(
+                "SELECT task_id, contract_revision, recon_snapshot_ref, created_at, estimate_json
+                 FROM plans WHERE id = ?1",
+                [&plan_id_str],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .ok();
+
+        let Some((task_id, contract_revision, recon_snapshot_ref, created_at, estimate_json)) = row
+        else {
+            return Ok(None);
+        };
+
+        let task_id = Uuid::parse_str(&task_id)
+            .map(TaskId)
+            .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
+        let estimate: Option<Estimate> = estimate_json
+            .map(|s| serde_json::from_str(&s))
+            .transpose()
+            .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
+
+        Ok(Some(ExecutionPlan {
+            id: plan_id,
+            task_id,
+            contract_revision: contract_revision as u32,
+            recon_snapshot_ref,
+            created_at: parse_time(&created_at)?,
+            estimate,
+        }))
+    }
+
+    /// Returns the currently `in_flight` plan for `session_id`, if any.
+    /// Used by `Finalize` to find the estimate a Stop-hook receipt should
+    /// be compared against.
+    pub fn in_flight_plan_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<PlanId>, LedgerError> {
+        let plan_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT plan_id FROM session_preflights
+                 WHERE session_id = ?1 AND status = 'in_flight'
+                 ORDER BY created_at DESC LIMIT 1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .ok();
+        plan_id
+            .map(|s| {
+                Uuid::parse_str(&s)
+                    .map(PlanId)
+                    .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))
+            })
+            .transpose()
+    }
+
+    /// Returns every locally recorded [`ExecutionReceipt`], across all
+    /// tasks — the sample set `libra-governor-estimator` computes
+    /// quantiles from.
+    ///
+    /// `task_class` is accepted (rather than omitted) so this signature
+    /// already matches the class-bucketed-history tier the estimator's
+    /// design calls for; no caller passes anything but `None` yet because
+    /// nothing in this schema classifies tasks (see HORO-1126 PR
+    /// description — a documented, intentional deviation, not an
+    /// oversight). When `task_class` is `Some`, this currently still
+    /// returns the full global history unfiltered.
+    pub fn receipts_for_estimation(
+        &self,
+        _task_class: Option<&str>,
+    ) -> Result<Vec<ExecutionReceipt>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_id, plan_id, contract_revision, actual_duration_secs,
+                    actual_usage_json, outcome_json, recorded_at, tool_call_count, model, provider
+             FROM receipts ORDER BY recorded_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let task_id: String = row.get(0)?;
+            let plan_id: String = row.get(1)?;
+            let contract_revision: i64 = row.get(2)?;
+            let actual_duration_secs: i64 = row.get(3)?;
+            let actual_usage_json: String = row.get(4)?;
+            let outcome_json: String = row.get(5)?;
+            let recorded_at: String = row.get(6)?;
+            let tool_call_count: i64 = row.get(7)?;
+            let model: Option<String> = row.get(8)?;
+            let provider: Option<String> = row.get(9)?;
+            Ok((
+                task_id,
+                plan_id,
+                contract_revision,
+                actual_duration_secs,
+                actual_usage_json,
+                outcome_json,
+                recorded_at,
+                tool_call_count,
+                model,
+                provider,
+            ))
+        })?;
+
+        let mut receipts = Vec::new();
+        for row in rows {
+            let (
+                task_id,
+                plan_id,
+                contract_revision,
+                actual_duration_secs,
+                usage_json,
+                outcome_json,
+                recorded_at,
+                tool_call_count,
+                model,
+                provider,
+            ) = row?;
+            let task_id = Uuid::parse_str(&task_id)
+                .map(TaskId)
+                .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
+            let plan_id = Uuid::parse_str(&plan_id)
+                .map(PlanId)
+                .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
+            let actual_usage: Vec<ResourceAmount> = serde_json::from_str(&usage_json)
+                .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
+            let outcome: ExecutionOutcome = serde_json::from_str(&outcome_json)
+                .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
+
+            receipts.push(ExecutionReceipt {
+                task_id,
+                contract_revision: contract_revision as u32,
+                plan_id,
+                actual_duration_secs: actual_duration_secs as u64,
+                actual_usage,
+                outcome,
+                recorded_at: parse_time(&recorded_at)?,
+                tool_call_count: tool_call_count as u64,
+                model,
+                provider,
             });
         }
         Ok(receipts)

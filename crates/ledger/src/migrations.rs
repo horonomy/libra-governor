@@ -27,6 +27,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 2,
         sql: include_str!("../migrations/0002_session_preflight_state.sql"),
     },
+    Migration {
+        version: 3,
+        sql: include_str!("../migrations/0003_estimate_and_receipt_actuals.sql"),
+    },
 ];
 
 /// Applies every migration whose version is greater than the database's

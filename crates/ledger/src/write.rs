@@ -111,17 +111,29 @@ impl LedgerStore {
     }
 
     /// Inserts an [`ExecutionPlan`], linking it to the task and the exact
-    /// contract revision it assumed.
+    /// contract revision it assumed. `plan.estimate`, if present, is
+    /// stored alongside so a later `Finalize` request can compare against
+    /// the ORIGINAL estimate without re-running the estimator (HORO-1126).
     pub fn insert_plan(&mut self, plan: &ExecutionPlan) -> Result<(), LedgerError> {
+        let estimate_json = plan
+            .estimate
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| {
+                LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+            })?;
+
         self.conn.execute(
-            "INSERT INTO plans (id, task_id, contract_revision, recon_snapshot_ref, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO plans (id, task_id, contract_revision, recon_snapshot_ref, created_at, estimate_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![
                 plan.id.0.to_string(),
                 plan.task_id.to_string(),
                 plan.contract_revision,
                 plan.recon_snapshot_ref,
                 rfc3339(plan.created_at)?,
+                estimate_json,
             ],
         )?;
         Ok(())
@@ -139,8 +151,9 @@ impl LedgerStore {
 
         self.conn.execute(
             "INSERT INTO receipts (task_id, plan_id, contract_revision, actual_duration_secs,
-                                    actual_usage_json, outcome_json, recorded_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                                    actual_usage_json, outcome_json, recorded_at,
+                                    tool_call_count, model, provider)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 receipt.task_id.to_string(),
                 receipt.plan_id.0.to_string(),
@@ -149,6 +162,9 @@ impl LedgerStore {
                 usage_json,
                 outcome_json,
                 rfc3339(receipt.recorded_at)?,
+                receipt.tool_call_count as i64,
+                receipt.model,
+                receipt.provider,
             ],
         )?;
         Ok(())

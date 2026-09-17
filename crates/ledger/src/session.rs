@@ -138,6 +138,59 @@ impl LedgerStore {
         )?;
         Ok(())
     }
+
+    /// Returns when `session_id` first resolved a task (i.e. its first
+    /// `Preflight`), if it has ever done so. Used as "task start" for
+    /// elapsed-duration computation at `Finalize` — see
+    /// [`Self::resolve_or_create_task_for_session`], which is the only
+    /// writer of `session_tasks.created_at` and writes it exactly once
+    /// per session.
+    pub fn session_started_at(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<time::OffsetDateTime>, LedgerError> {
+        let created_at: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT created_at FROM session_tasks WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .ok();
+        created_at
+            .map(|s| {
+                time::OffsetDateTime::parse(&s, &Rfc3339)
+                    .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))
+            })
+            .transpose()
+    }
+
+    /// Increments the fire-and-forget per-session tool-call counter.
+    /// Deliberately a single cheap upsert with no session -> task lookup,
+    /// so this stays fast enough not to add perceptible latency to every
+    /// tool call (`hook post-tool-use`, HORO-1126).
+    pub fn increment_tool_call_count(&mut self, session_id: &str) -> Result<(), LedgerError> {
+        self.conn.execute(
+            "INSERT INTO tool_call_counts (session_id, count) VALUES (?1, 1)
+             ON CONFLICT(session_id) DO UPDATE SET count = count + 1",
+            [session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Returns the current tool-call count for `session_id` (`0` if none
+    /// has been recorded).
+    pub fn tool_call_count_for_session(&self, session_id: &str) -> Result<u64, LedgerError> {
+        let count: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT count FROM tool_call_counts WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .ok();
+        Ok(count.unwrap_or(0) as u64)
+    }
 }
 
 #[cfg(test)]
@@ -243,5 +296,40 @@ mod tests {
             )
             .unwrap();
         assert_eq!(superseded_count, 1);
+    }
+
+    #[test]
+    fn session_started_at_is_none_before_any_preflight() {
+        let store = LedgerStore::open_in_memory().unwrap();
+        assert_eq!(store.session_started_at("sess-1").unwrap(), None);
+    }
+
+    #[test]
+    fn session_started_at_returns_first_resolution_time() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        store
+            .resolve_or_create_task_for_session("sess-1", now())
+            .unwrap();
+        assert_eq!(store.session_started_at("sess-1").unwrap(), Some(now()));
+    }
+
+    #[test]
+    fn tool_call_count_starts_at_zero_and_increments() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        assert_eq!(store.tool_call_count_for_session("sess-1").unwrap(), 0);
+        store.increment_tool_call_count("sess-1").unwrap();
+        store.increment_tool_call_count("sess-1").unwrap();
+        store.increment_tool_call_count("sess-1").unwrap();
+        assert_eq!(store.tool_call_count_for_session("sess-1").unwrap(), 3);
+    }
+
+    #[test]
+    fn tool_call_counts_are_independent_per_session() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        store.increment_tool_call_count("sess-a").unwrap();
+        store.increment_tool_call_count("sess-b").unwrap();
+        store.increment_tool_call_count("sess-b").unwrap();
+        assert_eq!(store.tool_call_count_for_session("sess-a").unwrap(), 1);
+        assert_eq!(store.tool_call_count_for_session("sess-b").unwrap(), 2);
     }
 }
