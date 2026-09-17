@@ -11,3 +11,6 @@ pub mod contract;
 pub mod log;
 pub mod paths;
 pub mod recon;
+pub mod server;
+
+pub use server::{bind_or_detect_running, handle_connection, serve, DaemonConfig, DaemonError};
