@@ -8,13 +8,36 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::Once;
 use std::time::{Duration, Instant};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_libra-governor")
 }
 
+/// Spawns the binary once, untimed, before any test's timing assertions
+/// run. On some platforms (notably macOS Gatekeeper/AMFI) the *first*
+/// execution of a freshly built binary pays a one-time OS validation
+/// cost that has nothing to do with this program's own logic — without
+/// this warm-up, that cost would land inside whichever test happens to
+/// spawn the binary first and make its wall-clock budget assertion
+/// flaky on a clean build. Every test below calls this before starting
+/// its own clock.
+fn warm_up_binary() {
+    static WARM_UP: Once = Once::new();
+    WARM_UP.call_once(|| {
+        // No subcommand -> prints usage and exits 2 almost immediately
+        // once past OS validation; output is irrelevant here.
+        let _ = Command::new(bin())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    });
+}
+
 fn run_hook(state_dir: &std::path::Path, stdin_payload: &str) -> (std::process::Output, Duration) {
+    warm_up_binary();
     let mut child = Command::new(bin())
         .args(["hook", "user-prompt-submit"])
         .env("LIBRA_GOVERNOR_STATE_DIR", state_dir)
@@ -130,6 +153,7 @@ fn hook_degrades_gracefully_when_the_daemon_cannot_start() {
 
 #[test]
 fn statusline_never_spawns_and_reports_placeholder_when_daemon_is_down() {
+    warm_up_binary();
     let state_dir = tempfile::tempdir().unwrap();
 
     let start = Instant::now();
