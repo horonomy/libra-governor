@@ -30,10 +30,11 @@ use std::io::BufReader;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 
+use libra_governor_domain::{ExecutionOutcome, ExecutionReceipt};
 use libra_governor_ledger::LedgerStore;
 use libra_governor_protocol::{
-    wire, PreflightResult, ReconSummary, Request, RequestEnvelope, Response, ResponseEnvelope,
-    StatusResult, TaskSummary, PROTOCOL_VERSION,
+    wire, FinalizeOutcome, FinalizeResult, PreflightResult, ReconSummary, Request, RequestEnvelope,
+    Response, ResponseEnvelope, StatusResult, TaskSummary, PROTOCOL_VERSION,
 };
 
 use crate::{contract, log, recon, recon::ReconBudget};
@@ -158,7 +159,7 @@ fn dispatch(
                     confidence: result.confidence,
                     recon_cost_seconds: result.recon_cost_seconds,
                 });
-                Response::Preflight(result)
+                Response::Preflight(Box::new(result))
             }
             Err(e) => {
                 log::append_line(&config.log_path, &format!("preflight error: {e}"));
@@ -170,6 +171,29 @@ fn dispatch(
         Request::Status => Response::Status(StatusResult {
             current_task: current_task.clone(),
         }),
+        Request::ToolInvoked {
+            session_id,
+            tool_name: _,
+        } => match ledger.increment_tool_call_count(&session_id) {
+            Ok(()) => Response::Ack,
+            Err(e) => {
+                log::append_line(&config.log_path, &format!("tool_invoked error: {e}"));
+                Response::Error {
+                    message: "internal error recording tool invocation".to_string(),
+                }
+            }
+        },
+        Request::Finalize { session_id, model } => {
+            match handle_finalize(&session_id, model, ledger, current_task) {
+                Ok(outcome) => Response::Finalize(outcome),
+                Err(e) => {
+                    log::append_line(&config.log_path, &format!("finalize error: {e}"));
+                    Response::Error {
+                        message: "internal error finalizing task".to_string(),
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -189,7 +213,16 @@ fn handle_preflight(
     let contract = contract::draft_contract(previous_contract.as_ref(), &recon);
     ledger.insert_contract(task_id, &contract, now)?;
 
-    let plan = libra_governor_domain::ExecutionPlan::new(task_id, contract.revision, None, now);
+    // Estimator input: the full local receipt history. No task
+    // classification exists in the schema yet (see
+    // `libra-governor-estimator` crate docs), so `class_receipts` is
+    // always `None` today — the estimator still implements the
+    // class-bucket tier so a future classifier only needs to supply it.
+    let history = ledger.receipts_for_estimation(None)?;
+    let estimate = libra_governor_estimator::estimate(&history, None);
+
+    let plan = libra_governor_domain::ExecutionPlan::new(task_id, contract.revision, None, now)
+        .with_estimate(estimate.clone());
     ledger.insert_plan(&plan)?;
 
     // Supersede any prior in-flight preflight for this session before
@@ -212,8 +245,68 @@ fn handle_preflight(
         },
         confidence: recon.confidence,
         recon_cost_seconds: recon.elapsed.as_secs_f64(),
-        estimate: None,
+        estimate: Some(estimate),
     })
+}
+
+/// Finalizes the task bound to `session_id`: computes elapsed duration
+/// and gathers the tool-call count, builds an [`ExecutionReceipt`] with
+/// `outcome: Unknown` (MVP 1.0 has no automated Completion Contract
+/// verification — see crate docs), and persists it. A safe no-op
+/// (`FinalizeOutcome::NoActiveTask`) when `session_id` has no task bound
+/// to it at all (e.g. `Stop` fired with no preceding `Preflight`).
+fn handle_finalize(
+    session_id: &str,
+    model: Option<String>,
+    ledger: &mut LedgerStore,
+    current_task: &mut Option<TaskSummary>,
+) -> Result<FinalizeOutcome, DaemonError> {
+    let Some(task_id) = ledger.task_id_for_session(session_id)? else {
+        return Ok(FinalizeOutcome::NoActiveTask);
+    };
+    let Some(plan_id) = ledger.in_flight_plan_for_session(session_id)? else {
+        return Ok(FinalizeOutcome::NoActiveTask);
+    };
+    let Some(plan) = ledger.get_plan(plan_id)? else {
+        return Ok(FinalizeOutcome::NoActiveTask);
+    };
+
+    let now = time::OffsetDateTime::now_utc();
+    let started_at = ledger.session_started_at(session_id)?.unwrap_or(now);
+    let elapsed_secs = (now - started_at).whole_seconds().max(0) as u64;
+    let tool_call_count = ledger.tool_call_count_for_session(session_id)?;
+
+    // MVP 1.0 has no automated Completion Contract verification (no
+    // test-running integration): outcome is always `Unknown` here,
+    // structurally correct per `ExecutionOutcome`'s own docs — a task
+    // must never be inferred "done" merely because the session stopped.
+    // Actual resource usage is an honest empty `Vec`, not a zeroed USD
+    // amount: Claude Code's `Stop`/`PostToolUse` hook payloads expose no
+    // token/cost data (see PR description), so nothing here fabricates a
+    // spend figure.
+    let receipt = ExecutionReceipt::new(
+        task_id,
+        plan.contract_revision,
+        plan_id,
+        elapsed_secs,
+        vec![],
+        ExecutionOutcome::Unknown,
+        now,
+    )
+    .with_tool_call_count(tool_call_count)
+    .with_model(model)
+    .with_provider(None);
+
+    ledger.insert_receipt(&receipt)?;
+
+    if current_task.as_ref().map(|t| t.task_id) == Some(task_id) {
+        *current_task = None;
+    }
+
+    Ok(FinalizeOutcome::Finalized(Box::new(FinalizeResult {
+        receipt,
+        estimate: plan.estimate,
+    })))
 }
 
 #[cfg(test)]
@@ -257,4 +350,91 @@ mod tests {
     // handle_preflight) is exercised end to end, over a real socket, by
     // `crates/daemon/tests/preflight_integration.rs` via the public
     // `handle_connection` re-export — no need to duplicate that here.
+
+    #[test]
+    fn finalize_with_no_active_task_is_a_safe_no_op() {
+        let mut ledger = LedgerStore::open_in_memory().unwrap();
+        let mut current_task = None;
+        let outcome =
+            handle_finalize("no-such-session", None, &mut ledger, &mut current_task).unwrap();
+        assert_eq!(outcome, FinalizeOutcome::NoActiveTask);
+    }
+
+    #[test]
+    fn finalize_after_a_real_preflight_persists_a_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = DaemonConfig {
+            socket_path: dir.path().join("d.sock"),
+            ledger_path: dir.path().join("ledger.sqlite3"),
+            log_path: dir.path().join("daemon.log"),
+            recon_budget: crate::recon::ReconBudget::default(),
+        };
+        let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
+
+        let preflight =
+            handle_preflight("fix the bug", dir.path(), "sess-1", &mut ledger, &config).unwrap();
+        assert!(
+            preflight.estimate.is_some(),
+            "preflight must always carry an estimate (cold-start counts)"
+        );
+
+        ledger.increment_tool_call_count("sess-1").unwrap();
+        ledger.increment_tool_call_count("sess-1").unwrap();
+
+        let mut current_task = Some(TaskSummary {
+            task_id: preflight.task_id,
+            confidence: preflight.confidence,
+            recon_cost_seconds: preflight.recon_cost_seconds,
+        });
+
+        let outcome = handle_finalize(
+            "sess-1",
+            Some("claude-sonnet-5".to_string()),
+            &mut ledger,
+            &mut current_task,
+        )
+        .unwrap();
+        let FinalizeOutcome::Finalized(result) = outcome else {
+            panic!("expected a Finalized outcome after a real preflight");
+        };
+        assert_eq!(result.receipt.task_id, preflight.task_id);
+        assert_eq!(result.receipt.tool_call_count, 2);
+        assert_eq!(result.receipt.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(result.receipt.outcome, ExecutionOutcome::Unknown);
+        assert!(result.estimate.is_some());
+        assert!(
+            current_task.is_none(),
+            "finalizing the current task must clear statusline state"
+        );
+
+        // Machine-readable: the receipt is queryable back out of SQLite.
+        let trajectory = ledger.task_trajectory(preflight.task_id).unwrap();
+        assert_eq!(trajectory.receipts.len(), 1);
+        assert_eq!(trajectory.receipts[0].tool_call_count, 2);
+    }
+
+    #[test]
+    fn tool_invoked_dispatch_increments_the_session_counter() {
+        let mut ledger = LedgerStore::open_in_memory().unwrap();
+        let mut current_task = None;
+        let dir = tempfile::tempdir().unwrap();
+        let config = DaemonConfig {
+            socket_path: dir.path().join("d.sock"),
+            ledger_path: dir.path().join("ledger.sqlite3"),
+            log_path: dir.path().join("daemon.log"),
+            recon_budget: crate::recon::ReconBudget::default(),
+        };
+
+        let response = dispatch(
+            Request::ToolInvoked {
+                session_id: "sess-1".to_string(),
+                tool_name: "Bash".to_string(),
+            },
+            &mut ledger,
+            &mut current_task,
+            &config,
+        );
+        assert_eq!(response, Response::Ack);
+        assert_eq!(ledger.tool_call_count_for_session("sess-1").unwrap(), 1);
+    }
 }

@@ -102,10 +102,14 @@ fn preflight_returns_sane_result_within_recon_budget() {
             assert_eq!(result.confidence, Confidence::High);
             assert!(result.recon_cost_seconds >= 0.0);
             assert!(result.recon_cost_seconds < 5.0);
+            let estimate = result
+                .estimate
+                .expect("HORO-1126: every preflight carries an Estimate, cold-start included");
             assert!(
-                result.estimate.is_none(),
-                "HORO-1126 estimator math is out of scope here"
+                estimate.cold_start,
+                "no ExecutionReceipt history exists yet in this fresh ledger"
             );
+            assert_eq!(estimate.sample_count, 0);
         }
         other => panic!("expected a Preflight response, got {other:?}"),
     }

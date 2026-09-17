@@ -8,6 +8,7 @@ description = "Libra Governor: local daemon — Unix-socket server, bounded reco
 
 [dependencies]
 libra-governor-domain = { path = "../domain" }
+libra-governor-estimator = { path = "../estimator" }
 libra-governor-ledger = { path = "../ledger" }
 libra-governor-protocol = { path = "../protocol" }
 serde_json.workspace = true
