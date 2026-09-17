@@ -1,0 +1,95 @@
+# Phase 0 estimator replay harness configuration (HORO-1120).
+# Frozen at data-collection time; do not tune after freeze-splits has run.
+
+seed: 1120
+
+submissions:
+  # Required: SWE-agent-family submissions with real info.model_stats cost data.
+  required:
+    - name: "20240402_sweagent_claude3opus"
+      adapter: sweagent
+      model_id: "claude-3-opus"
+      harness_id: "sweagent"
+    - name: "20240402_sweagent_gpt4"
+      adapter: sweagent
+      model_id: "gpt-4"
+      harness_id: "sweagent"
+    - name: "20240620_sweagent_claude3.5sonnet"
+      adapter: sweagent
+      model_id: "claude-3.5-sonnet"
+      harness_id: "sweagent"
+    - name: "20240728_sweagent_gpt4o"
+      adapter: sweagent
+      model_id: "gpt-4o"
+      harness_id: "sweagent"
+    - name: "20250511_sweagent_lm_32b"
+      adapter: sweagent
+      model_id: "lm_32b"
+      harness_id: "sweagent"
+    - name: "20250804_codesweep_sweagent_kimi_k2_instruct"
+      adapter: sweagent
+      model_id: "kimi_k2_instruct"
+      harness_id: "codesweep_sweagent"
+  # Optional/stretch: different cost-stats key (llm_call_data). Included if
+  # time permits; never required for the escalation-condition row count.
+  optional:
+    - name: "epam-ai-run-claude-3-5-sonnet"
+      adapter: epam
+      model_id: "claude-3.5-sonnet"
+      harness_id: "epam-ai-run"
+  skip:
+    - "emergent"
+    - "Lingxi"
+
+# Explicitly skipped: unparseable or lack cost stats per verified probe (see PROVENANCE.md).
+skip_submissions: ["emergent", "Lingxi"]
+
+quantiles: [0.5, 0.8, 0.9]
+
+# Fixed 3-point n_estimators grid for the candidate GBRT (picked via
+# calibration-fold pinball loss, not searched further).
+candidate_n_estimators_grid: [50, 100, 200]
+candidate_max_depth: 3
+
+# Admission-decision budget grid (USD), used by admission_regret().
+budget_grid_usd: [0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0]
+
+# Penalty (USD-equivalent) charged per forgone-success false-reject in
+# admission_regret(). This is a policy choice, not derived from data --
+# it says "missing one resolvable task is worth roughly this much budget
+# headroom" for Phase 0 purposes only.
+forgone_success_penalty_usd: 5.0
+
+# wall_clock_seconds proxy formula (documented, not measured):
+#   wall_clock_seconds = base_seconds_per_call * api_calls
+#                        + seconds_per_1k_tokens * (tokens_sent + tokens_received) / 1000
+# Constants are simple, defensible round numbers, not fit to any ground truth
+# (none exists in this dataset) -- see PROVENANCE.md "Known limitations".
+proxy_time:
+  base_seconds_per_call: 8.0
+  seconds_per_1k_tokens: 1.0
+
+# Calibration slice carved out of each training fold for split-conformal (CQR).
+calibration_fraction: 0.2
+
+# Minimum uncensored row count required before model fitting proceeds
+# (HORO-1120 escalation condition -> HORO-1123 if not met).
+min_uncensored_rows: 2000
+
+# Admission-time feature whitelist (see features.py for derivation).
+feature_whitelist:
+  - repo
+  - problem_statement_char_len
+  - problem_statement_line_count
+  - problem_statement_code_block_count
+  - problem_statement_has_traceback
+  - problem_statement_filepath_token_count
+  - problem_statement_numeric_token_count
+  - created_at_year_month
+  - model_id
+  - harness_id
+  - repo_prior_median_cost
+  - repo_prior_n
+
+target_primary: instance_cost_usd
+target_secondary: wall_clock_seconds
