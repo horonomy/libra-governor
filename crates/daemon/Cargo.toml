@@ -1,0 +1,9 @@
+[package]
+name = "libra-governor-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Libra Governor: local daemon (state machine / ledger / policy). Placeholder scaffold, no logic yet."
+
+[dependencies]

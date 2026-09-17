@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/domain",
+    "crates/protocol",
+    "crates/daemon",
+    "crates/cli",
+    "crates/ledger",
+    "crates/estimator",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/horonomy/libra-governor"
+
+[workspace.dependencies]
