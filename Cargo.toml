@@ -17,3 +17,9 @@ license = "Apache-2.0"
 repository = "https://github.com/horonomy/libra-governor"
 
 [workspace.dependencies]
+uuid = { version = "1", features = ["v4", "serde"] }
+serde = { version = "1", features = ["derive"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+thiserror = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"
