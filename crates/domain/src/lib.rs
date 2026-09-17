@@ -10,6 +10,16 @@
 //! guarantee, not a convention some caller could violate by populating an
 //! optional field — the field simply does not exist on the type.
 //!
+//! [`TaskFeatures`] (HORO-1130) extends this same guarantee to
+//! estimator bucketing: every one of its fields is an irreversible
+//! derived scalar — a count, a boolean, a length, a small closed-set
+//! enum, or a truncated SHA-256 digest of a canonicalized path — never
+//! the prompt text, tool output, or file path it was computed from. A
+//! reviewer does not need to trust a convention here either: there is no
+//! `String`-typed field on [`TaskFeatures`] that could hold raw content
+//! except `repo_key` (a hex digest, not a path) and `model` (a short
+//! model identifier, never derived from prompt or file content).
+//!
 //! # The economic unit
 //!
 //! [`TaskIdentity`], not a session or a token, is the anchor every other
@@ -24,6 +34,7 @@ mod execution_outcome;
 mod execution_plan;
 mod execution_receipt;
 mod resource_amount;
+mod task_features;
 mod task_identity;
 
 pub use completion_contract::{CompletionContract, CompletionCriterion};
@@ -34,4 +45,5 @@ pub use execution_outcome::ExecutionOutcome;
 pub use execution_plan::{ExecutionPlan, PlanId};
 pub use execution_receipt::ExecutionReceipt;
 pub use resource_amount::{ResourceAmount, ResourceKind};
+pub use task_features::{BuildTopology, BucketTier, TaskFeatures, FEATURE_SCHEMA_VERSION};
 pub use task_identity::{ExternalRef, TaskId, TaskIdentity};
