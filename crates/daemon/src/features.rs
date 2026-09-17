@@ -20,8 +20,8 @@ use crate::recon::ReconOutput;
 /// File extensions treated as evidence of a filepath-shaped token,
 /// alongside any token containing a path separator (`/`).
 const COMMON_SOURCE_EXTENSIONS: &[&str] = &[
-    "rs", "py", "js", "ts", "tsx", "jsx", "go", "rb", "java", "c", "cc", "cpp", "h", "hpp",
-    "toml", "yaml", "yml", "json", "md", "sql", "sh", "cfg", "ini", "lock",
+    "rs", "py", "js", "ts", "tsx", "jsx", "go", "rb", "java", "c", "cc", "cpp", "h", "hpp", "toml",
+    "yaml", "yml", "json", "md", "sql", "sh", "cfg", "ini", "lock",
 ];
 
 /// SHA-256 of the canonicalized repository root path, hex-truncated to
@@ -101,9 +101,9 @@ fn count_filepath_tokens(prompt: &str) -> u32 {
             if trimmed.contains('/') {
                 return true;
             }
-            trimmed
-                .rsplit_once('.')
-                .is_some_and(|(_, ext)| COMMON_SOURCE_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+            trimmed.rsplit_once('.').is_some_and(|(_, ext)| {
+                COMMON_SOURCE_EXTENSIONS.contains(&ext.to_lowercase().as_str())
+            })
         })
         .count() as u32
 }

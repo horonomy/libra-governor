@@ -45,5 +45,5 @@ pub use execution_outcome::ExecutionOutcome;
 pub use execution_plan::{ExecutionPlan, PlanId};
 pub use execution_receipt::ExecutionReceipt;
 pub use resource_amount::{ResourceAmount, ResourceKind};
-pub use task_features::{BuildTopology, BucketTier, TaskFeatures, FEATURE_SCHEMA_VERSION};
+pub use task_features::{BucketTier, BuildTopology, TaskFeatures, FEATURE_SCHEMA_VERSION};
 pub use task_identity::{ExternalRef, TaskId, TaskIdentity};

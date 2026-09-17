@@ -180,10 +180,10 @@ fn second_preflight_for_same_session_supersedes_the_first() {
 /// sample_count smaller than the seeded-plus-noise global pool.
 #[test]
 fn preflight_selects_a_bucketed_tier_once_same_repo_history_exists() {
+    use libra_governor_daemon::{features::derive_task_features, recon::run_recon};
     use libra_governor_domain::{
         CompletionContract, ExecutionOutcome, ExecutionPlan, ExecutionReceipt, PlanId, TaskIdentity,
     };
-    use libra_governor_daemon::{features::derive_task_features, recon::run_recon};
 
     let dir = tempfile::tempdir().unwrap();
     let ledger_path = dir.path().join("ledger.sqlite3");
@@ -192,7 +192,11 @@ fn preflight_selects_a_bucketed_tier_once_same_repo_history_exists() {
     // Real recon + real feature derivation against the same fixture repo
     // the request below will target, so repo_key/topology line up
     // exactly with what the daemon will derive at request time.
-    let recon = run_recon(&fixture_repo(), "fix the login bug", &ReconBudget::default());
+    let recon = run_recon(
+        &fixture_repo(),
+        "fix the login bug",
+        &ReconBudget::default(),
+    );
     let seeded_features = derive_task_features(&recon, "fix the login bug", &fixture_repo(), None);
 
     {
@@ -305,7 +309,10 @@ fn preflight_selects_a_bucketed_tier_once_same_repo_history_exists() {
                 estimate.sample_count, 5,
                 "must use the smaller, more specific same-repo bucket, not the 20-row global noise"
             );
-            assert_eq!(estimate.feature_schema_version, seeded_features.feature_schema_version);
+            assert_eq!(
+                estimate.feature_schema_version,
+                seeded_features.feature_schema_version
+            );
         }
         other => panic!("expected a Preflight response, got {other:?}"),
     }

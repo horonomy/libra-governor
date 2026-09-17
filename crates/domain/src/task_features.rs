@@ -105,8 +105,12 @@ mod tests {
     #[test]
     fn task_features_field_set_contains_no_outcome_or_actual_fields() {
         let json = serde_json::to_value(sample()).unwrap();
-        let fields: std::collections::BTreeSet<&str> =
-            json.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        let fields: std::collections::BTreeSet<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
 
         let expected: std::collections::BTreeSet<&str> = [
             "repo_key",
@@ -125,7 +129,10 @@ mod tests {
         .into_iter()
         .collect();
 
-        assert_eq!(fields, expected, "TaskFeatures field set changed — verify no outcome/actual/post-hoc field was added");
+        assert_eq!(
+            fields, expected,
+            "TaskFeatures field set changed — verify no outcome/actual/post-hoc field was added"
+        );
 
         for leaked in [
             "outcome",

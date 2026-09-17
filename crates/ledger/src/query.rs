@@ -177,8 +177,14 @@ impl LedgerStore {
 
         let mut plans = Vec::new();
         for row in rows {
-            let (id, contract_revision, recon_snapshot_ref, created_at, estimate_json, task_features_json) =
-                row?;
+            let (
+                id,
+                contract_revision,
+                recon_snapshot_ref,
+                created_at,
+                estimate_json,
+                task_features_json,
+            ) = row?;
             let id = Uuid::parse_str(&id)
                 .map(PlanId)
                 .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
@@ -297,8 +303,14 @@ impl LedgerStore {
             )
             .ok();
 
-        let Some((task_id, contract_revision, recon_snapshot_ref, created_at, estimate_json, task_features_json)) =
-            row
+        let Some((
+            task_id,
+            contract_revision,
+            recon_snapshot_ref,
+            created_at,
+            estimate_json,
+            task_features_json,
+        )) = row
         else {
             return Ok(None);
         };

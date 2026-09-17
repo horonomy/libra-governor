@@ -55,7 +55,11 @@ pub fn estimate(
 ) -> Estimate {
     if let Some(class) = class_receipts {
         if class.len() >= MIN_CLASS_SAMPLES {
-            return compute(class, BucketTier::Repo, libra_governor_domain::FEATURE_SCHEMA_VERSION);
+            return compute(
+                class,
+                BucketTier::Repo,
+                libra_governor_domain::FEATURE_SCHEMA_VERSION,
+            );
         }
     }
     if !global_receipts.is_empty() {
@@ -90,11 +94,7 @@ pub fn estimate_bucketed(
     for tier in bucket_ladder(current) {
         let bucketed: Vec<ExecutionReceipt> = history
             .iter()
-            .filter(|(features, _)| {
-                features
-                    .as_ref()
-                    .is_some_and(|f| matches(tier, f, current))
-            })
+            .filter(|(features, _)| features.as_ref().is_some_and(|f| matches(tier, f, current)))
             .map(|(_, receipt)| receipt.clone())
             .collect();
         if bucketed.len() >= MIN_CLASS_SAMPLES {
@@ -143,7 +143,11 @@ fn matches(tier: BucketTier, a: &TaskFeatures, b: &TaskFeatures) -> bool {
 /// an empty slice — callers route the empty case to
 /// [`Estimate::cold_start`] instead, so this function can assume at least
 /// one sample.
-fn compute(receipts: &[ExecutionReceipt], bucket_tier: BucketTier, feature_schema_version: &str) -> Estimate {
+fn compute(
+    receipts: &[ExecutionReceipt],
+    bucket_tier: BucketTier,
+    feature_schema_version: &str,
+) -> Estimate {
     debug_assert!(!receipts.is_empty());
 
     let mut durations: Vec<u64> = receipts.iter().map(|r| r.actual_duration_secs).collect();
@@ -420,7 +424,10 @@ mod tests {
         duration_secs: u64,
         task_features: Option<TaskFeatures>,
     ) -> (Option<TaskFeatures>, ExecutionReceipt) {
-        (task_features.clone(), receipt(duration_secs, vec![]).with_task_features(task_features))
+        (
+            task_features.clone(),
+            receipt(duration_secs, vec![]).with_task_features(task_features),
+        )
     }
 
     #[test]
@@ -429,7 +436,10 @@ mod tests {
         let result = estimate_bucketed(&[], &current);
         assert!(result.cold_start);
         assert_eq!(result.bucket_tier, BucketTier::ColdStart);
-        assert_eq!(result.feature_schema_version, current.feature_schema_version);
+        assert_eq!(
+            result.feature_schema_version,
+            current.feature_schema_version
+        );
     }
 
     #[test]
@@ -482,7 +492,11 @@ mod tests {
         history.extend((1..=5).map(|n| {
             dated_receipt(
                 n * 10,
-                Some(features("repo-a", BuildTopology::Cargo, Some("other-model"))),
+                Some(features(
+                    "repo-a",
+                    BuildTopology::Cargo,
+                    Some("other-model"),
+                )),
             )
         }));
 
@@ -498,7 +512,9 @@ mod tests {
             estimate_bucketed(&[], &current).estimator_version,
             "v2-bucketed-quantile"
         );
-        let history: Vec<_> = (1..=5).map(|n| dated_receipt(n, Some(current.clone()))).collect();
+        let history: Vec<_> = (1..=5)
+            .map(|n| dated_receipt(n, Some(current.clone())))
+            .collect();
         assert_eq!(
             estimate_bucketed(&history, &current).estimator_version,
             "v2-bucketed-quantile"
@@ -508,7 +524,9 @@ mod tests {
     #[test]
     fn resource_amounts_remain_none_on_every_bucketed_estimate_from_real_local_data() {
         let current = features("repo-a", BuildTopology::Cargo, None);
-        let history: Vec<_> = (1..=10).map(|n| dated_receipt(n, Some(current.clone()))).collect();
+        let history: Vec<_> = (1..=10)
+            .map(|n| dated_receipt(n, Some(current.clone())))
+            .collect();
         let result = estimate_bucketed(&history, &current);
         assert!(result.resource_p50.is_none());
         assert!(result.resource_p80.is_none());
