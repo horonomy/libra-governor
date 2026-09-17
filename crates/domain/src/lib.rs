@@ -17,6 +17,8 @@
 //! `docs/adr/0002-task-not-session-as-economic-unit.md` for why.
 
 mod completion_contract;
+mod confidence;
+mod estimate;
 mod execution_event;
 mod execution_outcome;
 mod execution_plan;
@@ -25,6 +27,8 @@ mod resource_amount;
 mod task_identity;
 
 pub use completion_contract::{CompletionContract, CompletionCriterion};
+pub use confidence::Confidence;
+pub use estimate::{Estimate, ESTIMATOR_VERSION};
 pub use execution_event::{ExecutionEvent, ExecutionEventKind};
 pub use execution_outcome::ExecutionOutcome;
 pub use execution_plan::{ExecutionPlan, PlanId};

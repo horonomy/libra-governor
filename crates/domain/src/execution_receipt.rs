@@ -27,9 +27,27 @@ pub struct ExecutionReceipt {
     pub actual_usage: Vec<ResourceAmount>,
     pub outcome: ExecutionOutcome,
     pub recorded_at: OffsetDateTime,
+    /// Number of tool invocations observed for the finalized session (see
+    /// `PostToolUse` hook counter, HORO-1126). `0` is a genuine count, not
+    /// a missing-data marker — the counter always starts at zero and is
+    /// always available once a session exists.
+    pub tool_call_count: u64,
+    /// The model identifier reported by the harness's hook payload, if
+    /// any. `None` when the harness does not expose it (see
+    /// [`Self::provider`] docs — this is a real, honestly-`None`-able
+    /// field, not a placeholder that will always be populated later).
+    pub model: Option<String>,
+    /// The provider identifier, if the harness's hook payload exposes
+    /// one. As of MVP 1.0, Claude Code's `Stop`/`PostToolUse` hook
+    /// payloads do not expose a provider field at all (only `model`), so
+    /// this is always `None` in practice today — a real platform
+    /// limitation, not a bug. The field exists so a future harness that
+    /// does expose it does not require another schema change.
+    pub provider: Option<String>,
 }
 
 impl ExecutionReceipt {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         task_id: TaskId,
         contract_revision: u32,
@@ -47,7 +65,31 @@ impl ExecutionReceipt {
             actual_usage,
             outcome,
             recorded_at,
+            tool_call_count: 0,
+            model: None,
+            provider: None,
         }
+    }
+
+    /// Attaches the tool-call count observed for the finalized session.
+    pub fn with_tool_call_count(mut self, tool_call_count: u64) -> Self {
+        self.tool_call_count = tool_call_count;
+        self
+    }
+
+    /// Attaches the model identifier, if the harness's hook payload
+    /// exposed one.
+    pub fn with_model(mut self, model: Option<String>) -> Self {
+        self.model = model;
+        self
+    }
+
+    /// Attaches the provider identifier, if the harness's hook payload
+    /// exposed one. See field docs on [`Self::provider`] for why this is
+    /// always `None` for Claude Code today.
+    pub fn with_provider(mut self, provider: Option<String>) -> Self {
+        self.provider = provider;
+        self
     }
 }
 

@@ -1,19 +1,321 @@
-//! Placeholder crate for `libra-governor-estimator`.
+//! `libra-governor-estimator` — a simple, native-Rust, self-calibrating
+//! empirical-quantile estimator for preflight cost/time estimates.
 //!
-//! This crate is part of the Libra Governor bootstrap scaffold (HORO-1118).
-//! Real domain logic lands in follow-up tickets.
+//! This is deliberately *not* the Python/sklearn conformal-GBRT estimator
+//! evaluated in `experiments/phase0/` — that harness is a separate,
+//! already-closed evidence artifact, out of scope here. This crate
+//! computes P50/P80/P90 quantiles directly over locally accumulated
+//! [`ExecutionReceipt`] history, with no model training and no external
+//! dependency.
+//!
+//! # Bucketing
+//!
+//! The estimator's design supports three tiers, most to least specific:
+//! (a) a same-task-class bucket, if the local history for that class has
+//! at least [`MIN_CLASS_SAMPLES`] rows; (b) the full global local
+//! history; (c) cold start (zero local history at all). [`estimate`]
+//! implements all three tiers as a function of the sample sets it is
+//! handed. **Deviation**: nothing in `libra-governor-domain` or
+//! `libra-governor-ledger` classifies tasks today (no `task_class`
+//! concept exists on [`libra_governor_domain::TaskIdentity`] or
+//! [`ExecutionReceipt`]), so `libra-governor-daemon` currently always
+//! calls [`estimate`] with `class_receipts: None`, collapsing tier (a)
+//! away — every estimate MVP 1.0 actually produces comes from tier (b)
+//! or (c). Building a task classifier was judged out of scope for this
+//! ticket (HORO-1126): it would be a parallel, un-evidenced heuristic
+//! invented for this ticket alone rather than a real consumer's need.
+//! The tier-(a) code path is still implemented and unit-tested so a
+//! future classifier ticket only needs to supply `class_receipts`.
 
-/// Returns the crate name, confirming the crate builds and links.
-pub fn placeholder() -> &'static str {
-    "estimator"
+use libra_governor_domain::{Confidence, Estimate, ExecutionReceipt, ResourceAmount, ResourceKind};
+
+/// Minimum number of same-task-class samples required to prefer the
+/// class-bucketed history over the full global history. Chosen as a
+/// small, defensible threshold consistent with
+/// [`Confidence::from_sample_count`]'s "5 samples is the low/medium
+/// boundary" — below this, a class-specific bucket is not meaningfully
+/// more informative than the global pool, so falling back to more data
+/// beats a data-starved narrow slice.
+pub const MIN_CLASS_SAMPLES: usize = 5;
+
+/// Computes a preflight [`Estimate`] from local execution history.
+///
+/// `global_receipts` is the full local history (see
+/// [`libra_governor_ledger::LedgerStore::receipts_for_estimation`]).
+/// `class_receipts`, when `Some` and at least [`MIN_CLASS_SAMPLES`] long,
+/// is preferred over `global_receipts` — see module docs on bucketing.
+/// Falls back to [`Estimate::cold_start`] only when `global_receipts` is
+/// also empty.
+pub fn estimate(
+    global_receipts: &[ExecutionReceipt],
+    class_receipts: Option<&[ExecutionReceipt]>,
+) -> Estimate {
+    if let Some(class) = class_receipts {
+        if class.len() >= MIN_CLASS_SAMPLES {
+            return compute(class);
+        }
+    }
+    if !global_receipts.is_empty() {
+        return compute(global_receipts);
+    }
+    Estimate::cold_start()
+}
+
+/// Computes real quantiles over a non-empty sample set. Never called with
+/// an empty slice — callers route the empty case to
+/// [`Estimate::cold_start`] instead, so this function can assume at least
+/// one sample.
+fn compute(receipts: &[ExecutionReceipt]) -> Estimate {
+    debug_assert!(!receipts.is_empty());
+
+    let mut durations: Vec<u64> = receipts.iter().map(|r| r.actual_duration_secs).collect();
+    durations.sort_unstable();
+
+    let (resource_p50, resource_p80, resource_p90) = resource_quantiles(receipts);
+
+    Estimate {
+        duration_p50_secs: Some(quantile_u64(&durations, 0.50)),
+        duration_p80_secs: Some(quantile_u64(&durations, 0.80)),
+        duration_p90_secs: Some(quantile_u64(&durations, 0.90)),
+        resource_p50,
+        resource_p80,
+        resource_p90,
+        confidence: Confidence::from_sample_count(receipts.len()),
+        sample_count: receipts.len(),
+        cold_start: false,
+        estimator_version: libra_governor_domain::ESTIMATOR_VERSION.to_string(),
+        reason: None,
+    }
+}
+
+/// Nearest-rank quantile over an already-sorted, non-empty slice.
+/// `p` is a fraction in `[0.0, 1.0]`.
+fn quantile_u64(sorted: &[u64], p: f64) -> u64 {
+    debug_assert!(!sorted.is_empty());
+    let rank = (p * sorted.len() as f64).ceil() as usize;
+    let index = rank.saturating_sub(1).min(sorted.len() - 1);
+    sorted[index]
+}
+
+/// Selects the most-common [`ResourceKind`] across every
+/// [`ExecutionReceipt::actual_usage`] entry in `receipts`, then computes
+/// P50/P80/P90 over just the amounts of that kind.
+///
+/// [`ResourceAmount`] deliberately does not implement addition/averaging
+/// across kinds (see its crate docs: mixing USD cents, raw tokens, and
+/// quota percentages must never be silently summed). Quantiling over the
+/// single most-observed kind and ignoring the others is this ticket's
+/// chosen simplification — a future ticket could instead return one
+/// `Estimate` per kind, but nothing in the current `PreflightResult`/
+/// `Estimate` shape asks for that, and building it speculatively would be
+/// exactly the unwarranted complexity this ticket's brief asks to avoid.
+/// Returns `(None, None, None)` when no receipt carries any resource
+/// usage at all (true of every MVP 1.0 receipt today — Claude Code's hook
+/// payloads expose no cost/token data, see the PR description).
+fn resource_quantiles(
+    receipts: &[ExecutionReceipt],
+) -> (
+    Option<ResourceAmount>,
+    Option<ResourceAmount>,
+    Option<ResourceAmount>,
+) {
+    let amounts: Vec<&ResourceAmount> = receipts
+        .iter()
+        .flat_map(|r| r.actual_usage.iter())
+        .collect();
+    if amounts.is_empty() {
+        return (None, None, None);
+    }
+
+    let most_common_kind = most_common_kind(&amounts);
+
+    let mut values: Vec<f64> = amounts
+        .iter()
+        .filter(|a| a.kind() == most_common_kind)
+        .map(|a| numeric_value(a))
+        .collect();
+    values.sort_by(f64::total_cmp);
+
+    let to_amount = |v: f64| rebuild_amount(most_common_kind, v);
+    (
+        Some(to_amount(quantile_f64(&values, 0.50))),
+        Some(to_amount(quantile_f64(&values, 0.80))),
+        Some(to_amount(quantile_f64(&values, 0.90))),
+    )
+}
+
+fn quantile_f64(sorted: &[f64], p: f64) -> f64 {
+    debug_assert!(!sorted.is_empty());
+    let rank = (p * sorted.len() as f64).ceil() as usize;
+    let index = rank.saturating_sub(1).min(sorted.len() - 1);
+    sorted[index]
+}
+
+/// The first-encountered [`ResourceKind`] with the highest occurrence
+/// count. Deterministic tie-breaking (first-seen order) rather than
+/// enum-declaration order, so the result does not silently change if
+/// `ResourceKind`'s variant order is ever reshuffled.
+fn most_common_kind(amounts: &[&ResourceAmount]) -> ResourceKind {
+    let mut seen_order: Vec<ResourceKind> = Vec::new();
+    let mut counts: Vec<(ResourceKind, usize)> = Vec::new();
+    for amount in amounts {
+        let kind = amount.kind();
+        if let Some(entry) = counts.iter_mut().find(|(k, _)| *k == kind) {
+            entry.1 += 1;
+        } else {
+            seen_order.push(kind);
+            counts.push((kind, 1));
+        }
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(kind, _)| kind)
+        .unwrap_or(seen_order[0])
+}
+
+fn numeric_value(amount: &ResourceAmount) -> f64 {
+    match amount {
+        ResourceAmount::UsdCents(v) => *v as f64,
+        ResourceAmount::Tokens(v) => *v as f64,
+        ResourceAmount::QuotaPercent(v) => *v as f64,
+    }
+}
+
+fn rebuild_amount(kind: ResourceKind, value: f64) -> ResourceAmount {
+    match kind {
+        ResourceKind::Usd => ResourceAmount::UsdCents(value.round() as i64),
+        ResourceKind::Tokens => ResourceAmount::Tokens(value.round() as u64),
+        ResourceKind::QuotaPercent => ResourceAmount::QuotaPercent(value as f32),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libra_governor_domain::{ExecutionOutcome, PlanId, TaskId};
+    use time::OffsetDateTime;
+
+    fn receipt(duration_secs: u64, usage: Vec<ResourceAmount>) -> ExecutionReceipt {
+        ExecutionReceipt::new(
+            TaskId::new(),
+            1,
+            PlanId::new(),
+            duration_secs,
+            usage,
+            ExecutionOutcome::Unknown,
+            OffsetDateTime::UNIX_EPOCH,
+        )
+    }
 
     #[test]
-    fn placeholder_returns_crate_name() {
-        assert_eq!(placeholder(), "estimator");
+    fn cold_start_when_no_local_history_at_all() {
+        let result = estimate(&[], None);
+        assert!(result.cold_start);
+        assert_eq!(result.sample_count, 0);
+        assert_eq!(result.confidence, Confidence::Low);
+        assert!(result.duration_p50_secs.is_none());
+    }
+
+    #[test]
+    fn falls_back_to_global_history_when_no_class_bucket_supplied() {
+        let receipts: Vec<_> = (1..=10).map(|n| receipt(n * 10, vec![])).collect();
+        let result = estimate(&receipts, None);
+        assert!(!result.cold_start);
+        assert_eq!(result.sample_count, 10);
+        assert_eq!(
+            result.estimator_version,
+            libra_governor_domain::ESTIMATOR_VERSION
+        );
+    }
+
+    #[test]
+    fn prefers_class_bucket_when_it_meets_the_minimum_sample_threshold() {
+        let global: Vec<_> = (1..=50).map(|n| receipt(n * 100, vec![])).collect();
+        let class: Vec<_> = (1..=5).map(|n| receipt(n, vec![])).collect();
+        let result = estimate(&global, Some(&class));
+        assert_eq!(
+            result.sample_count, 5,
+            "must use the smaller, more specific class bucket once it meets the threshold"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_global_when_class_bucket_is_too_thin() {
+        let global: Vec<_> = (1..=20).map(|n| receipt(n * 100, vec![])).collect();
+        let class: Vec<_> = (1..=2).map(|n| receipt(n, vec![])).collect();
+        let result = estimate(&global, Some(&class));
+        assert_eq!(
+            result.sample_count, 20,
+            "a class bucket below MIN_CLASS_SAMPLES must not be used"
+        );
+    }
+
+    #[test]
+    fn quantile_u64_matches_hand_computed_values_for_ten_samples() {
+        let sorted: Vec<u64> = (1..=10).map(|n| n * 10).collect(); // 10,20,...,100
+        assert_eq!(quantile_u64(&sorted, 0.50), 50);
+        assert_eq!(quantile_u64(&sorted, 0.80), 80);
+        assert_eq!(quantile_u64(&sorted, 0.90), 90);
+    }
+
+    #[test]
+    fn duration_confidence_escalates_with_sample_count() {
+        let few: Vec<_> = (1..=3).map(|n| receipt(n, vec![])).collect();
+        assert_eq!(estimate(&few, None).confidence, Confidence::Low);
+
+        let medium: Vec<_> = (1..=10).map(|n| receipt(n, vec![])).collect();
+        assert_eq!(estimate(&medium, None).confidence, Confidence::Medium);
+
+        let many: Vec<_> = (1..=30).map(|n| receipt(n, vec![])).collect();
+        assert_eq!(estimate(&many, None).confidence, Confidence::High);
+    }
+
+    #[test]
+    fn resource_quantiles_are_none_when_no_receipt_carries_usage() {
+        let receipts: Vec<_> = (1..=5).map(|n| receipt(n, vec![])).collect();
+        let result = estimate(&receipts, None);
+        assert!(result.resource_p50.is_none());
+        assert!(result.resource_p80.is_none());
+        assert!(result.resource_p90.is_none());
+    }
+
+    #[test]
+    fn resource_quantiles_computed_over_tokens_when_present() {
+        let receipts: Vec<_> = (1..=10)
+            .map(|n| receipt(n, vec![ResourceAmount::Tokens(n * 1000)]))
+            .collect();
+        let result = estimate(&receipts, None);
+        assert_eq!(result.resource_p50, Some(ResourceAmount::Tokens(5000)));
+        assert_eq!(result.resource_p90, Some(ResourceAmount::Tokens(9000)));
+    }
+
+    #[test]
+    fn resource_quantiles_pick_the_most_common_kind_and_ignore_the_rest() {
+        let mut receipts: Vec<_> = (1..=8)
+            .map(|n| receipt(n, vec![ResourceAmount::Tokens(n * 100)]))
+            .collect();
+        // A minority of receipts report a USD amount instead — must not
+        // be mixed into the token quantiles.
+        receipts.push(receipt(9, vec![ResourceAmount::UsdCents(999)]));
+
+        let result = estimate(&receipts, None);
+        match result.resource_p50 {
+            Some(ResourceAmount::Tokens(_)) => {}
+            other => panic!("expected the majority Tokens kind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_estimate_is_tagged_with_the_estimator_version() {
+        assert_eq!(
+            Estimate::cold_start().estimator_version,
+            libra_governor_domain::ESTIMATOR_VERSION
+        );
+        let receipts: Vec<_> = (1..=5).map(|n| receipt(n, vec![])).collect();
+        assert_eq!(
+            estimate(&receipts, None).estimator_version,
+            libra_governor_domain::ESTIMATOR_VERSION
+        );
     }
 }

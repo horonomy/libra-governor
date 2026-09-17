@@ -17,6 +17,7 @@
 use std::io::Read;
 use std::path::PathBuf;
 
+use libra_governor_domain::Estimate;
 use libra_governor_protocol::{Confidence, PreflightResult, Request, Response};
 use serde::Deserialize;
 
@@ -134,7 +135,8 @@ fn format_additional_context(result: &PreflightResult) -> String {
     if let Some(reason) = &result.recon_summary.reason {
         text.push_str(&format!("Note: {reason}\n"));
     }
-    text.push_str("Cost/time estimate: pending (HORO-1126). This preflight is advisory only.");
+    text.push_str(&format_estimate_summary(result.estimate.as_ref()));
+    text.push_str(" This preflight is advisory only.");
 
     let output = serde_json::json!({
         "hookSpecificOutput": {
@@ -143,6 +145,30 @@ fn format_additional_context(result: &PreflightResult) -> String {
         }
     });
     serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Renders one line summarizing the preflight [`Estimate`] (HORO-1126).
+/// A cold-start estimate (no local history yet) is reported honestly as
+/// such, never as a fabricated number.
+fn format_estimate_summary(estimate: Option<&Estimate>) -> String {
+    match estimate {
+        None => "Cost/time estimate: unavailable.".to_string(),
+        Some(estimate) if estimate.cold_start => format!(
+            "Cost/time estimate: cold start — {} (confidence: low).",
+            estimate
+                .reason
+                .as_deref()
+                .unwrap_or("insufficient local history")
+        ),
+        Some(estimate) => format!(
+            "Cost/time estimate: P50 {}s / P90 {}s (confidence: {:?}, n={}, estimator {}).",
+            estimate.duration_p50_secs.unwrap_or(0),
+            estimate.duration_p90_secs.unwrap_or(0),
+            estimate.confidence,
+            estimate.sample_count,
+            estimate.estimator_version,
+        ),
+    }
 }
 
 /// Prints a plain-text `additionalContext` message wrapped in the

@@ -13,11 +13,13 @@ path = "src/main.rs"
 
 [dependencies]
 libra-governor-daemon = { path = "../daemon" }
+libra-governor-domain = { path = "../domain" }
 libra-governor-protocol = { path = "../protocol" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-libra-governor-domain = { path = "../domain" }
+libra-governor-ledger = { path = "../ledger" }
 tempfile.workspace = true
+time.workspace = true

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::task_identity::TaskId;
+use crate::{estimate::Estimate, task_identity::TaskId};
 
 /// Identifier for one [`ExecutionPlan`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -36,7 +36,10 @@ impl Default for PlanId {
 /// the snapshot content itself — the snapshot's storage/format is owned
 /// by the estimator ticket (HORO-1126); this type only needs a stable
 /// pointer to it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Not `Eq` — [`Estimate`] embeds [`crate::ResourceAmount`], which carries
+/// an `f32` (`QuotaPercent`) and so is `PartialEq` only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionPlan {
     pub id: PlanId,
     pub task_id: TaskId,
@@ -46,6 +49,12 @@ pub struct ExecutionPlan {
     /// any was taken.
     pub recon_snapshot_ref: Option<String>,
     pub created_at: OffsetDateTime,
+    /// The probabilistic estimate (HORO-1126) computed for this plan, if
+    /// any. Set after construction via [`Self::with_estimate`] rather than
+    /// as a required constructor argument, so every existing
+    /// `ExecutionPlan::new` call site (pre-dating the estimator) keeps
+    /// compiling unchanged.
+    pub estimate: Option<Estimate>,
 }
 
 impl ExecutionPlan {
@@ -61,7 +70,15 @@ impl ExecutionPlan {
             contract_revision,
             recon_snapshot_ref,
             created_at,
+            estimate: None,
         }
+    }
+
+    /// Attaches an [`Estimate`] to this plan, returning `self` for
+    /// chaining at the construction site.
+    pub fn with_estimate(mut self, estimate: Estimate) -> Self {
+        self.estimate = Some(estimate);
+        self
     }
 }
 

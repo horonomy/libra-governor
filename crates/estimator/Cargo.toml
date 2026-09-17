@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Libra Governor: estimator crate (placeholder scaffold, no logic yet)."
+description = "Libra Governor: estimator crate — self-calibrating empirical-quantile preflight estimates from local ExecutionReceipt history."
 
 [dependencies]
+libra-governor-domain = { path = "../domain" }
+
+[dev-dependencies]
+time.workspace = true
