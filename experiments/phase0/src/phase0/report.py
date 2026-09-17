@@ -107,13 +107,17 @@ def render_report(results: dict[str, Any]) -> str:
     lines.append("(Supporting evidence only -- see falsification rule above.)")
     lines.append("")
     lines.append(
-        "| split_config | model_name | quantile | empirical_coverage | pinball_loss | n | oracle_probe | status |"  # noqa: E501
+        "| split_config | model_name | target | quantile | empirical_coverage | pinball_loss | n | oracle_probe | status |"  # noqa: E501
     )
-    lines.append("|---|---|---|---|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
     for row in metrics_rows:
+        cov = row["empirical_coverage"]
+        pin = row["pinball_loss"]
+        cov_str = f"{cov:.3f}" if cov is not None else "n/a"
+        pin_str = f"{pin:.4f}" if pin is not None else "n/a"
         lines.append(
-            f"| {row['split_config']} | {row['model_name']} | {row['quantile']} | "
-            f"{row['empirical_coverage']:.3f} | {row['pinball_loss']:.4f} | {row['n']} | "
+            f"| {row['split_config']} | {row['model_name']} | {row.get('target', '')} | "
+            f"{row['quantile']} | {cov_str} | {pin_str} | {row['n']} | "
             f"{row['oracle_probe']} | {row['status']} |"
         )
     lines.append("")
