@@ -7,5 +7,7 @@
 //! defined in `libra-governor-protocol`; the daemon is the only
 //! component that reads the repository or writes to the ledger.
 
+pub mod contract;
 pub mod log;
 pub mod paths;
+pub mod recon;
