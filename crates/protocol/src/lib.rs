@@ -19,6 +19,7 @@
 //! it does not actually understand.
 
 mod messages;
+pub mod wire;
 
 pub use messages::{
     Confidence, PreflightResult, ReconSummary, Request, RequestEnvelope, Response,
