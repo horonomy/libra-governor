@@ -1,0 +1,9 @@
+[package]
+name = "libra-governor-domain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Libra Governor: domain crate (placeholder scaffold, no logic yet)."
+
+[dependencies]

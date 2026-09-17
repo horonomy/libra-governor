@@ -1,0 +1,14 @@
+[package]
+name = "libra-governor-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Libra Governor: libra-governor CLI binary. Placeholder scaffold, no logic yet."
+default-run = "libra-governor"
+
+[[bin]]
+name = "libra-governor"
+path = "src/main.rs"
+
+[dependencies]

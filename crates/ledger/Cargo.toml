@@ -1,0 +1,9 @@
+[package]
+name = "libra-governor-ledger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Libra Governor: ledger crate (placeholder scaffold, no logic yet)."
+
+[dependencies]
