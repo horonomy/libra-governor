@@ -1,0 +1,41 @@
+name: Phase 0 estimator harness CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "experiments/phase0/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "experiments/phase0/**"
+
+defaults:
+  run:
+    working-directory: experiments/phase0
+
+jobs:
+  lint-and-test:
+    name: ruff + pytest (fixture only, no network)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Sync dependencies
+        run: uv sync --group dev
+
+      - name: ruff check
+        run: uv run ruff check .
+
+      - name: ruff format --check
+        run: uv run ruff format --check .
+
+      # Network-free by construction: tests only ever read
+      # tests/fixtures/mini.parquet, never data/raw/ or the network. The
+      # full fetch/extract/run pipeline against real S3/HuggingFace data is
+      # a local/manual step (see README.md), not a CI gate.
+      - name: pytest (fixture only)
+        run: uv run pytest tests/ -x

@@ -1,2 +1,9 @@
 /target
 .DS_Store
+
+# Python (experiments/phase0)
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+experiments/phase0/data/raw/
