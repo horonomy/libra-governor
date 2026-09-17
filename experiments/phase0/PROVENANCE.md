@@ -96,3 +96,29 @@ whether the `min_uncensored_rows` (2000, configured in
 If it was not met, model fitting was intentionally skipped -- this is a
 dataset-adequacy judgment routed to HORO-1123, not something worked around
 here.
+
+## Real-data run status as of this PR
+
+A real `fetch` against the live sources in this PROVENANCE.md (S3 +
+SWE-bench/experiments + HuggingFace) was started and verified working --
+real submissions were listed, real `.traj` files were downloaded and
+distilled (confirmed: e.g. `astropy__astropy-12907` from
+`20240402_sweagent_claude3opus` distilled to
+`{"model_stats": {"instance_cost": 3.72..., "tokens_sent": 233992, ...},
+"exit_status": "submitted"}`), and real `results.json` files were fetched
+for multiple submissions. Partial live sampling across the 4 finished
+submissions showed a real censoring rate around 35-40% (`exit_cost` /
+`exit_context` in `exit_status`) -- high enough that whether the full
+dataset clears `min_uncensored_rows=2000` is genuinely uncertain, not a
+foregone conclusion either way.
+
+The fetch did not complete within this PR's session -- the sandboxed
+network here sustains roughly 1-1.5 MB/s aggregate across 16 concurrent
+connections against ~3.8 GB total, i.e. on the order of an hour, not
+minutes. Rather than commit a partial extraction or fabricate the
+remainder, **no `data/interim/trajectories.parquet`, `data/splits/*.json`,
+or `results/phase0_results.json`/`phase0_report.md` are committed by this
+PR.** Run `phase0 fetch && phase0 extract && phase0 freeze-splits && phase0
+run && phase0 report` locally (with normal network bandwidth this should
+take well under the sandboxed estimate above) to produce the real evidence
+artifact and learn the actual escalation outcome.
