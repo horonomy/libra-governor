@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 /// quota consumed, since some providers only expose usage as a percentage
 /// with no per-request price at all.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", content = "amount", rename_all = "snake_case")]
 pub enum ResourceAmount {
     /// US dollars, represented as integer cents.
     UsdCents(i64),
