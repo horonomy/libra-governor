@@ -31,10 +31,12 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 
 use libra_governor_domain::{ExecutionOutcome, ExecutionReceipt};
+use libra_governor_estimator::{admission_replay, duration_coverage, AdmissionPolicy};
 use libra_governor_ledger::LedgerStore;
 use libra_governor_protocol::{
-    wire, FinalizeOutcome, FinalizeResult, PreflightResult, ReconSummary, Request, RequestEnvelope,
-    Response, ResponseEnvelope, StatusResult, TaskSummary, PROTOCOL_VERSION,
+    wire, AdmissionPolicyReport, CalibrationReportResult, FinalizeOutcome, FinalizeResult,
+    PreflightResult, ReconSummary, Request, RequestEnvelope, Response, ResponseEnvelope,
+    StatusResult, TaskSummary, PROTOCOL_VERSION,
 };
 
 use crate::{contract, features, log, recon, recon::ReconBudget};
@@ -194,7 +196,70 @@ fn dispatch(
                 }
             }
         }
+        Request::CalibrationReport => match handle_calibration_report(ledger, config) {
+            Ok(result) => Response::CalibrationReport(Box::new(result)),
+            Err(e) => {
+                log::append_line(&config.log_path, &format!("calibration_report error: {e}"));
+                Response::Error {
+                    message: "internal error computing calibration report".to_string(),
+                }
+            }
+        },
     }
+}
+
+/// The default [`AdmissionPolicy`]s `calibration report` replays against
+/// local history — a short, medium wall-clock deadline at the same
+/// threshold quantile (P80) the estimator itself would be checked
+/// against for an admission decision. Not tunable yet (no `Request`
+/// field for it): a fixed, documented default is more useful for a
+/// pre-launch product's first real evidence than a configuration surface
+/// nobody has asked for.
+const DEFAULT_ADMISSION_POLICIES: [AdmissionPolicy; 2] = [
+    AdmissionPolicy {
+        deadline_secs: 300,
+        threshold_quantile: 0.80,
+    },
+    AdmissionPolicy {
+        deadline_secs: 600,
+        threshold_quantile: 0.80,
+    },
+];
+
+/// Computes real duration-coverage and admission-replay calibration
+/// metrics (HORO-1132) over every locally recorded receipt paired back to
+/// its originating estimate. Per this repo's own architecture rule (see
+/// `ARCHITECTURE.md`), this computation lives in the daemon, not the CLI
+/// reaching into the ledger directly.
+fn handle_calibration_report(
+    ledger: &LedgerStore,
+    config: &DaemonConfig,
+) -> Result<CalibrationReportResult, DaemonError> {
+    let (pairs, dropped_rows) = ledger.calibration_pairs()?;
+    if dropped_rows > 0 {
+        log::append_line(
+            &config.log_path,
+            &format!(
+                "calibration_report: dropped {dropped_rows} receipt row(s) with no usable \
+                 estimate (estimate-less plan or cold-start estimate)"
+            ),
+        );
+    }
+
+    let coverage = duration_coverage(&pairs);
+    let admission = DEFAULT_ADMISSION_POLICIES
+        .into_iter()
+        .map(|policy| AdmissionPolicyReport {
+            policy,
+            outcome: admission_replay(&pairs, policy),
+        })
+        .collect();
+
+    Ok(CalibrationReportResult {
+        coverage,
+        admission,
+        dropped_rows,
+    })
 }
 
 fn handle_preflight(
