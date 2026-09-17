@@ -122,6 +122,18 @@ def render_report(results: dict[str, Any]) -> str:
         )
     lines.append("")
 
+    tuning_rows = results.get("candidate_tuning", [])
+    if tuning_rows:
+        lines.append("## Candidate n_estimators choice (per split_config / target / fold)")
+        lines.append("")
+        lines.append("| split_config | target | chosen_n_estimators (by quantile) |")
+        lines.append("|---|---|---|")
+        for row in tuning_rows:
+            lines.append(
+                f"| {row['split_config']} | {row['target']} | {row['chosen_n_estimators']} |"
+            )
+        lines.append("")
+
     lines.append("## Run metadata")
     lines.append("")
     lines.append(f"- seed: {run_meta.get('seed')}")
