@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Libra Governor: libra-governor CLI binary. Placeholder scaffold, no logic yet."
+description = "Libra Governor: libra-governor CLI binary — daemon runner, Claude Code hook, and statusline subcommands."
 default-run = "libra-governor"
 
 [[bin]]
@@ -12,3 +12,12 @@ name = "libra-governor"
 path = "src/main.rs"
 
 [dependencies]
+libra-governor-daemon = { path = "../daemon" }
+libra-governor-protocol = { path = "../protocol" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+libra-governor-domain = { path = "../domain" }
+tempfile.workspace = true
