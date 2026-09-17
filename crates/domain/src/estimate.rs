@@ -28,7 +28,15 @@ use crate::{
 /// HORO-1130: the estimator now actually buckets local history by task
 /// class (see [`BucketTier`]) instead of always collapsing to the global
 /// pool.
-pub const ESTIMATOR_VERSION: &str = "v2-bucketed-quantile";
+///
+/// Bumped `v2-bucketed-quantile` -> `v3-tiered-confidence` for
+/// HORO-1132: `confidence` is now computed by
+/// [`crate::Confidence::from_evidence`], which accounts for the
+/// [`BucketTier`] a sample count came from (a `Global`-tier pool is
+/// capped at [`crate::Confidence::Medium`] no matter how large it gets),
+/// not just the bare sample count [`crate::Confidence::from_sample_count`]
+/// used to use.
+pub const ESTIMATOR_VERSION: &str = "v3-tiered-confidence";
 
 /// A probabilistic preflight estimate: P50/P80/P90 for both wall-clock
 /// duration and resource usage, plus the confidence/provenance metadata
