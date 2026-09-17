@@ -33,7 +33,7 @@ submissions:
   # Optional/stretch: different cost-stats key (llm_call_data). Included if
   # time permits; never required for the escalation-condition row count.
   optional:
-    - name: "epam-ai-run-claude-3-5-sonnet"
+    - name: "20241029_epam-ai-run-claude-3-5-sonnet"
       adapter: epam
       model_id: "claude-3.5-sonnet"
       harness_id: "epam-ai-run"
