@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use libra_governor_domain::BuildTopology;
 use libra_governor_protocol::Confidence;
 
 /// Directory names never descended into. Chosen because they are large,
@@ -72,6 +73,36 @@ pub struct ReconOutput {
     pub confidence: Confidence,
     pub reason: Option<String>,
     pub elapsed: Duration,
+}
+
+impl ReconOutput {
+    /// The dominant build/dependency tooling detected during this
+    /// reconnaissance run, derived from [`Self::detected_test_commands`]
+    /// (HORO-1130) — reuses the same [`BUILD_MARKERS`] detection this
+    /// crate already performs rather than re-walking the tree. `Unknown`
+    /// when no marker was detected at all, `Mixed` when more than one
+    /// distinct topology's marker was detected.
+    pub fn build_topology(&self) -> BuildTopology {
+        let mut detected: Vec<BuildTopology> = Vec::new();
+        for command in &self.detected_test_commands {
+            let topology = match command.as_str() {
+                "cargo test" => BuildTopology::Cargo,
+                "npm test" => BuildTopology::Npm,
+                "pytest" => BuildTopology::Python,
+                "go test ./..." => BuildTopology::Go,
+                "bundle exec rspec" => BuildTopology::Ruby,
+                _ => continue,
+            };
+            if !detected.contains(&topology) {
+                detected.push(topology);
+            }
+        }
+        match detected.as_slice() {
+            [] => BuildTopology::Unknown,
+            [single] => *single,
+            _ => BuildTopology::Mixed,
+        }
+    }
 }
 
 /// Runs bounded reconnaissance against `root` for `prompt`, never
@@ -340,6 +371,31 @@ mod tests {
         // finishes, deterministically, rather than depending on how fast
         // the walk happens to run on this machine.
         assert!(output.truncated);
+    }
+
+    #[test]
+    fn build_topology_detects_cargo_project() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir.path().join("Cargo.toml"), "[package]\nname=\"x\"");
+        let output = run_recon(dir.path(), "anything", &ReconBudget::default());
+        assert_eq!(output.build_topology(), BuildTopology::Cargo);
+    }
+
+    #[test]
+    fn build_topology_is_unknown_with_no_marker_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir.path().join("a.txt"), "hello");
+        let output = run_recon(dir.path(), "anything", &ReconBudget::default());
+        assert_eq!(output.build_topology(), BuildTopology::Unknown);
+    }
+
+    #[test]
+    fn build_topology_is_mixed_with_more_than_one_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir.path().join("Cargo.toml"), "[package]\nname=\"x\"");
+        write_file(&dir.path().join("package.json"), "{}");
+        let output = run_recon(dir.path(), "anything", &ReconBudget::default());
+        assert_eq!(output.build_topology(), BuildTopology::Mixed);
     }
 
     #[test]
