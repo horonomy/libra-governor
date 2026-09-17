@@ -72,7 +72,12 @@ mod tests {
     #[test]
     fn plan_links_task_and_contract_revision() {
         let task_id = TaskId::new();
-        let plan = ExecutionPlan::new(task_id, 2, Some("snap-1".to_string()), OffsetDateTime::UNIX_EPOCH);
+        let plan = ExecutionPlan::new(
+            task_id,
+            2,
+            Some("snap-1".to_string()),
+            OffsetDateTime::UNIX_EPOCH,
+        );
         assert_eq!(plan.task_id, task_id);
         assert_eq!(plan.contract_revision, 2);
     }

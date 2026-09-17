@@ -31,7 +31,12 @@ impl LedgerStore {
         self.conn.execute(
             "INSERT INTO tasks (task_id, external_ref_kind, external_ref_value, created_at)
              VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![identity.id.to_string(), ref_kind, ref_value, rfc3339(created_at)?],
+            rusqlite::params![
+                identity.id.to_string(),
+                ref_kind,
+                ref_value,
+                rfc3339(created_at)?
+            ],
         )?;
         Ok(())
     }
@@ -74,10 +79,15 @@ impl LedgerStore {
     /// `event_id` is the event's idempotency key: re-inserting the same
     /// `event_id` is a no-op (`INSERT OR IGNORE`), so a hook that retries
     /// after an ambiguous failure cannot double-count an event.
-    pub fn insert_event(&mut self, event_id: Uuid, event: &ExecutionEvent) -> Result<(), LedgerError> {
+    pub fn insert_event(
+        &mut self,
+        event_id: Uuid,
+        event: &ExecutionEvent,
+    ) -> Result<(), LedgerError> {
         let occurred_at = rfc3339(event.occurred_at)?;
-        let payload_json = serde_json::to_string(&event.kind)
-            .map_err(|e| LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
+        let payload_json = serde_json::to_string(&event.kind).map_err(|e| {
+            LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+        })?;
 
         let tx = self.conn.transaction()?;
         let inserted = tx.execute(
@@ -120,10 +130,12 @@ impl LedgerStore {
     /// Inserts an [`ExecutionReceipt`], the estimate-vs-actual record for
     /// one plan.
     pub fn insert_receipt(&mut self, receipt: &ExecutionReceipt) -> Result<(), LedgerError> {
-        let usage_json = serde_json::to_string(&receipt.actual_usage)
-            .map_err(|e| LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
-        let outcome_json = serde_json::to_string(&receipt.outcome)
-            .map_err(|e| LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
+        let usage_json = serde_json::to_string(&receipt.actual_usage).map_err(|e| {
+            LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+        })?;
+        let outcome_json = serde_json::to_string(&receipt.outcome).map_err(|e| {
+            LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+        })?;
 
         self.conn.execute(
             "INSERT INTO receipts (task_id, plan_id, contract_revision, actual_duration_secs,

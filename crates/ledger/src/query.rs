@@ -89,7 +89,11 @@ impl LedgerStore {
             let (occurred_at, payload_json) = row?;
             let kind: ExecutionEventKind = serde_json::from_str(&payload_json)
                 .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
-            events.push(ExecutionEvent::new(task_id, parse_time(&occurred_at)?, kind));
+            events.push(ExecutionEvent::new(
+                task_id,
+                parse_time(&occurred_at)?,
+                kind,
+            ));
         }
         Ok(events)
     }
@@ -186,8 +190,14 @@ impl LedgerStore {
 
         let mut receipts = Vec::new();
         for row in rows {
-            let (plan_id, contract_revision, actual_duration_secs, usage_json, outcome_json, recorded_at) =
-                row?;
+            let (
+                plan_id,
+                contract_revision,
+                actual_duration_secs,
+                usage_json,
+                outcome_json,
+                recorded_at,
+            ) = row?;
             let plan_id = Uuid::parse_str(&plan_id)
                 .map(PlanId)
                 .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;

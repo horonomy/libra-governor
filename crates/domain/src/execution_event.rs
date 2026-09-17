@@ -50,13 +50,9 @@ pub enum ExecutionEventKind {
         session_id: String,
     },
     /// An agent session working this task ended.
-    SessionEnded {
-        session_id: String,
-    },
+    SessionEnded { session_id: String },
     /// The user submitted a prompt within a session for this task.
-    UserPromptSubmitted {
-        session_id: String,
-    },
+    UserPromptSubmitted { session_id: String },
     /// A tool call was invoked.
     ToolInvoked {
         session_id: String,

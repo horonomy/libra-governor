@@ -96,7 +96,11 @@ fn plan_ties_to_the_exact_contract_revision_it_assumed() {
     store.insert_plan(&plan).unwrap();
 
     let trajectory = store.task_trajectory(identity.id).unwrap();
-    assert_eq!(trajectory.contracts.len(), 2, "changing the contract must not mutate history");
+    assert_eq!(
+        trajectory.contracts.len(),
+        2,
+        "changing the contract must not mutate history"
+    );
     assert_eq!(trajectory.plans.len(), 1);
     assert_eq!(
         trajectory.plans[0].contract_revision, 1,
@@ -143,7 +147,12 @@ fn execution_event_kind_has_no_field_for_raw_prompt_or_output_content() {
         tool_name: "Bash".to_string(),
     };
     let json = serde_json::to_value(&event).unwrap();
-    let fields: Vec<&str> = json.as_object().unwrap().keys().map(String::as_str).collect();
+    let fields: Vec<&str> = json
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
     assert_eq!(
         fields.len(),
         3,
@@ -161,7 +170,9 @@ fn receipt_query_reconstructs_full_task_trajectory_from_sqlite_alone() {
     store.insert_task(&identity, now()).unwrap();
 
     let contract = CompletionContract::first(vec![CompletionCriterion::required("tests pass")]);
-    store.insert_contract(identity.id, &contract, now()).unwrap();
+    store
+        .insert_contract(identity.id, &contract, now())
+        .unwrap();
 
     let started = ExecutionEvent::new(
         identity.id,
