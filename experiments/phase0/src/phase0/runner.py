@@ -37,6 +37,12 @@ from phase0.models.candidate import CandidateEstimator
 
 ORACLE_PROBE_MODELS = {"taskclass_difficulty"}
 
+# Primary target is modeled with the decision-utility metric (budgets are
+# USD); the secondary (proxy) target only gets coverage/pinball/sharpness --
+# admission_regret() is defined in USD and has no analog for seconds.
+PRIMARY_TARGET = "instance_cost_usd"
+SECONDARY_TARGET = "wall_clock_seconds"
+
 
 def _fit_predict_baselines(
     train_df: pd.DataFrame,
@@ -98,6 +104,9 @@ def _fit_predict_baselines(
 
     # llm_self_estimate: single global cache, model_id varies per row so we
     # group by model_id and predict per-group, merging masks back in order.
+    # No cache fixture is committed (no LLM API access was available while
+    # building this harness -- see PROVENANCE.md), so every row here is
+    # expected to come back unavailable rather than fabricated.
     llm_pred = np.full((len(test_df), len(qs)), np.nan)
     llm_unavailable = np.zeros(len(test_df), dtype=bool)
     t0 = time.perf_counter()
@@ -193,7 +202,20 @@ def _fit_predict_candidate(
     }
 
 
-def run_all(cfg: Config, df: pd.DataFrame, splits_dir: Path, cache_dir: Path) -> dict[str, Any]:
+def _run_target(
+    cfg: Config,
+    df: pd.DataFrame,
+    splits_dir: Path,
+    cache_dir: Path,
+    target_col: str,
+    compute_decision_utility: bool,
+    compute_cost_accum: dict[str, dict[str, list[float]]],
+    tuning_rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Runs both split configs for one target column. Returns
+    (metrics_rows, stratified_rows, decision_rows) for that target -- decision_rows
+    is empty when compute_decision_utility is False (the secondary/proxy target).
+    """
     qs = list(cfg["quantiles"])
     budgets = list(cfg["budget_grid_usd"])
     penalty = float(cfg["forgone_success_penalty_usd"])
@@ -205,7 +227,6 @@ def run_all(cfg: Config, df: pd.DataFrame, splits_dir: Path, cache_dir: Path) ->
     metrics_rows: list[dict[str, Any]] = []
     stratified_rows: list[dict[str, Any]] = []
     decision_rows: list[dict[str, Any]] = []
-    compute_cost_accum: dict[str, dict[str, list[float]]] = {}
 
     for split_name, group_col in splits.SPLIT_CONFIGS.items():
         payload = splits.load_frozen_split(split_name, splits_dir)
@@ -221,13 +242,13 @@ def run_all(cfg: Config, df: pd.DataFrame, splits_dir: Path, cache_dir: Path) ->
             if not train_mask.any() or not test_mask.any():
                 continue
 
-            fold_df = features.add_repo_prior_features(df, train_mask)
+            fold_df = features.add_repo_prior_features(df, train_mask, target_col=target_col)
             train_df = fold_df[train_mask].reset_index(drop=True)
             test_df = fold_df[test_mask].reset_index(drop=True)
 
-            y_train_usd = train_df["instance_cost_usd"].to_numpy()
-            y_train_log = np.log1p(y_train_usd)
-            y_test_usd = test_df["instance_cost_usd"].to_numpy()
+            y_train_raw = train_df[target_col].to_numpy()
+            y_train_log = np.log1p(y_train_raw)
+            y_test_raw = test_df[target_col].to_numpy()
 
             baseline_results = _fit_predict_baselines(train_df, test_df, y_train_log, qs, cache_dir)
 
@@ -245,16 +266,25 @@ def run_all(cfg: Config, df: pd.DataFrame, splits_dir: Path, cache_dir: Path) ->
                 max_depth,
                 seed,
             )
+            tuning_rows.append(
+                {
+                    "split_config": split_name,
+                    "target": target_col,
+                    "chosen_n_estimators": {
+                        str(q): n for q, n in candidate_result["chosen_n_estimators"].items()
+                    },
+                }
+            )
 
             all_results = {**baseline_results, "candidate": candidate_result}
 
             for model_name, result in all_results.items():
-                pred_usd = np.expm1(result["pred_log"])
+                pred_raw = np.expm1(result["pred_log"])
                 bucket = oof.setdefault(
                     model_name,
                     {
-                        "pred_usd": [],
-                        "y_true_usd": [],
+                        "pred": [],
+                        "y_true": [],
                         "resolved": [],
                         "censored": [],
                         "unavailable_mask": [],
@@ -264,8 +294,8 @@ def run_all(cfg: Config, df: pd.DataFrame, splits_dir: Path, cache_dir: Path) ->
                         "predict_seconds": [],
                     },
                 )
-                bucket["pred_usd"].append(pred_usd)
-                bucket["y_true_usd"].append(y_test_usd)
+                bucket["pred"].append(pred_raw)
+                bucket["y_true"].append(y_test_raw)
                 bucket["resolved"].append(test_df["resolved"].to_numpy())
                 bucket["censored"].append(test_df["censored"].to_numpy())
                 mask = (
@@ -277,43 +307,45 @@ def run_all(cfg: Config, df: pd.DataFrame, splits_dir: Path, cache_dir: Path) ->
                 bucket["fit_seconds"].append(result["fit_seconds"])
                 bucket["predict_seconds"].append(result["predict_seconds"])
 
-                key = model_name
-                cost_bucket = compute_cost_accum.setdefault(
-                    key, {"fit_seconds": [], "predict_seconds": [], "n_predict_rows": []}
-                )
-                cost_bucket["fit_seconds"].append(result["fit_seconds"])
-                cost_bucket["predict_seconds"].append(result["predict_seconds"])
-                cost_bucket["n_predict_rows"].append(len(test_df))
+                if target_col == PRIMARY_TARGET:
+                    cost_bucket = compute_cost_accum.setdefault(
+                        model_name, {"fit_seconds": [], "predict_seconds": [], "n_predict_rows": []}
+                    )
+                    cost_bucket["fit_seconds"].append(result["fit_seconds"])
+                    cost_bucket["predict_seconds"].append(result["predict_seconds"])
+                    cost_bucket["n_predict_rows"].append(len(test_df))
 
         # aggregate out-of-fold predictions for this split_config
         for model_name, bucket in oof.items():
-            pred_usd = np.concatenate(bucket["pred_usd"], axis=0)
-            y_true_usd = np.concatenate(bucket["y_true_usd"], axis=0)
+            pred = np.concatenate(bucket["pred"], axis=0)
+            y_true = np.concatenate(bucket["y_true"], axis=0)
             resolved = np.concatenate(bucket["resolved"], axis=0)
             censored = np.concatenate(bucket["censored"], axis=0)
             unavailable = np.concatenate(bucket["unavailable_mask"], axis=0)
             available = ~unavailable
             oracle_probe = bucket["oracle_probe"]
-            n_total = len(pred_usd)
+            n_total = len(pred)
 
             for qi, q in enumerate(qs):
-                pred_q = pred_usd[:, qi]
+                pred_q = pred[:, qi]
                 if available.any():
-                    cov = empirical_coverage(y_true_usd[available], pred_q[available])
-                    cov_uncensored = empirical_coverage(
-                        y_true_usd[available & ~censored], pred_q[available & ~censored]
+                    cov = empirical_coverage(y_true[available], pred_q[available])
+                    uncensored_avail = available & ~censored
+                    cov_uncensored = (
+                        empirical_coverage(y_true[uncensored_avail], pred_q[uncensored_avail])
+                        if uncensored_avail.any()
+                        else None
                     )
+                    censored_avail = available & censored
                     cov_censored = (
-                        empirical_coverage(
-                            y_true_usd[available & censored], pred_q[available & censored]
-                        )
-                        if (available & censored).any()
-                        else float("nan")
+                        empirical_coverage(y_true[censored_avail], pred_q[censored_avail])
+                        if censored_avail.any()
+                        else None
                     )
-                    pin = pinball_loss(y_true_usd[available], pred_q[available], q)
+                    pin = pinball_loss(y_true[available], pred_q[available], q)
                 else:
-                    cov = cov_uncensored = cov_censored = float("nan")
-                    pin = float("nan")
+                    cov = cov_uncensored = cov_censored = None
+                    pin = None
 
                 status = (
                     "unavailable"
@@ -321,21 +353,21 @@ def run_all(cfg: Config, df: pd.DataFrame, splits_dir: Path, cache_dir: Path) ->
                     else "ok"
                 )
 
-                width = float("nan")
+                width = None
                 if q == 0.9 and available.any():
                     p50_idx = qs.index(0.5) if 0.5 in qs else None
                     if p50_idx is not None:
-                        width = mean_interval_width(pred_usd[available, p50_idx], pred_q[available])
+                        width = mean_interval_width(pred[available, p50_idx], pred_q[available])
 
-                overrun = float("nan")
+                overrun = None
                 if q == 0.9 and available.any():
-                    overrun = overrun_severity_p95(y_true_usd[available], pred_q[available])
+                    overrun = overrun_severity_p95(y_true[available], pred_q[available])
 
                 metrics_rows.append(
                     {
                         "split_config": split_name,
                         "model_name": model_name,
-                        "target": "instance_cost_usd",
+                        "target": target_col,
                         "quantile": q,
                         "empirical_coverage": cov,
                         "coverage_uncensored": cov_uncensored,
@@ -358,16 +390,16 @@ def run_all(cfg: Config, df: pd.DataFrame, splits_dir: Path, cache_dir: Path) ->
                         strat_mask = ~resolved & ~censored
                     strat_avail = strat_mask & available
                     if strat_avail.any():
-                        strat_cov = empirical_coverage(y_true_usd[strat_avail], pred_q[strat_avail])
-                        strat_pin = pinball_loss(y_true_usd[strat_avail], pred_q[strat_avail], q)
+                        strat_cov = empirical_coverage(y_true[strat_avail], pred_q[strat_avail])
+                        strat_pin = pinball_loss(y_true[strat_avail], pred_q[strat_avail], q)
                     else:
-                        strat_cov = float("nan")
-                        strat_pin = float("nan")
+                        strat_cov = None
+                        strat_pin = None
                     stratified_rows.append(
                         {
                             "split_config": split_name,
                             "model_name": model_name,
-                            "target": "instance_cost_usd",
+                            "target": target_col,
                             "quantile": q,
                             "stratum": stratum_name,
                             "empirical_coverage": strat_cov,
@@ -378,11 +410,11 @@ def run_all(cfg: Config, df: pd.DataFrame, splits_dir: Path, cache_dir: Path) ->
                         }
                     )
 
-            if 0.8 in qs and available.any():
+            if compute_decision_utility and 0.8 in qs and available.any():
                 q80_idx = qs.index(0.8)
                 regret_rows = admission_regret(
-                    pred_usd[available, q80_idx],
-                    y_true_usd[available],
+                    pred[available, q80_idx],
+                    y_true[available],
                     budgets,
                     censored[available],
                     resolved[available],
@@ -392,6 +424,22 @@ def run_all(cfg: Config, df: pd.DataFrame, splits_dir: Path, cache_dir: Path) ->
                     decision_rows.append(
                         {"split_config": split_name, "model_name": model_name, **row}
                     )
+
+    return metrics_rows, stratified_rows, decision_rows
+
+
+def run_all(cfg: Config, df: pd.DataFrame, splits_dir: Path, cache_dir: Path) -> dict[str, Any]:
+    compute_cost_accum: dict[str, dict[str, list[float]]] = {}
+    tuning_rows: list[dict[str, Any]] = []
+
+    metrics_rows, stratified_rows, decision_rows = _run_target(
+        cfg, df, splits_dir, cache_dir, PRIMARY_TARGET, True, compute_cost_accum, tuning_rows
+    )
+    secondary_metrics, secondary_stratified, _ = _run_target(
+        cfg, df, splits_dir, cache_dir, SECONDARY_TARGET, False, compute_cost_accum, tuning_rows
+    )
+    metrics_rows += secondary_metrics
+    stratified_rows += secondary_stratified
 
     compute_cost_rows = []
     for model_name, bucket in compute_cost_accum.items():
@@ -413,6 +461,7 @@ def run_all(cfg: Config, df: pd.DataFrame, splits_dir: Path, cache_dir: Path) ->
         "stratified": stratified_rows,
         "decision_utility": decision_rows,
         "compute_cost": compute_cost_rows,
+        "candidate_tuning": tuning_rows,
     }
 
 
