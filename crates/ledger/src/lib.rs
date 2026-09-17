@@ -25,6 +25,7 @@
 
 mod migrations;
 mod query;
+mod session;
 mod store;
 mod write;
 
