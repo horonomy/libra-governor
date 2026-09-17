@@ -1,0 +1,7 @@
+// Fixture file for the HORO-1127 release-gate corpus. Exists only so
+// bounded reconnaissance has a real "login"-named path to match against
+// prompts like "add input validation to the login handler".
+
+export function login(username: string, password: string): boolean {
+  return false;
+}

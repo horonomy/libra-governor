@@ -8,7 +8,7 @@ members = [
     "crates/ledger",
     "crates/estimator",
 ]
-exclude = ["experiments/phase0"]
+exclude = ["experiments/phase0", "experiments/mvp1_validation/fixtures/rust-crate"]
 
 [workspace.package]
 version = "0.0.0"
