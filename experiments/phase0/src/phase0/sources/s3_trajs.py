@@ -71,9 +71,7 @@ def _distilled_cache_path(cache_dir: Path, submission: str, instance_id: str) ->
     return cache_dir / "distilled" / submission / f"{instance_id}.json"
 
 
-def fetch_distilled_traj(
-    obj: S3Object, submission: str, cache_dir: Path
-) -> dict[str, Any] | None:
+def fetch_distilled_traj(obj: S3Object, submission: str, cache_dir: Path) -> dict[str, Any] | None:
     """Download one .traj object, extract cost/exit-status fields, discard the body.
 
     Returns None if the object has no info.model_stats (unusable for cost
