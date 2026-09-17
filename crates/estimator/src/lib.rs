@@ -32,14 +32,24 @@ use libra_governor_domain::{
     BucketTier, Confidence, Estimate, ExecutionReceipt, ResourceAmount, ResourceKind, TaskFeatures,
 };
 
+pub mod calibration;
+pub use calibration::{
+    admission_replay, duration_coverage, AdmissionOutcome, AdmissionPolicy, AdmissionStats,
+    CostCoverage, CoverageReport, QuantileCoverage, Stratum, CALIBRATION_QUANTILES,
+    REQUIRED_CALIBRATION_PAIRS,
+};
+
 /// Minimum number of same-task-class samples required to prefer the
 /// class-bucketed history over the full global history. Chosen as a
-/// small, defensible threshold consistent with
-/// [`Confidence::from_sample_count`]'s "5 samples is the low/medium
-/// boundary" — below this, a class-specific bucket is not meaningfully
-/// more informative than the global pool, so falling back to more data
-/// beats a data-starved narrow slice.
-pub const MIN_CLASS_SAMPLES: usize = 5;
+/// small, defensible threshold — below this, a class-specific bucket is
+/// not meaningfully more informative than the global pool, so falling
+/// back to more data beats a data-starved narrow slice.
+///
+/// Re-exported from `libra-governor-domain` (rather than redeclared
+/// here) since HORO-1132: [`Confidence::from_evidence`] applies this same
+/// threshold as its narrow-tier low/medium boundary, and the two must
+/// never silently drift apart.
+pub use libra_governor_domain::MIN_CLASS_SAMPLES;
 
 /// Computes a preflight [`Estimate`] from local execution history.
 ///
@@ -162,7 +172,7 @@ fn compute(
         resource_p50,
         resource_p80,
         resource_p90,
-        confidence: Confidence::from_sample_count(receipts.len()),
+        confidence: Confidence::from_evidence(bucket_tier, receipts.len()),
         sample_count: receipts.len(),
         cold_start: false,
         estimator_version: libra_governor_domain::ESTIMATOR_VERSION.to_string(),
@@ -344,15 +354,35 @@ mod tests {
     }
 
     #[test]
-    fn duration_confidence_escalates_with_sample_count() {
+    fn duration_confidence_via_global_tier_is_capped_at_medium() {
+        // `estimate()`'s class-bucket branch tags its result
+        // `BucketTier::Repo` (see its own docs), so a caller-supplied
+        // class bucket can still reach High via the narrow-tier rule —
+        // only the *global-fallback* branch (no class bucket supplied,
+        // or one too thin to use) is subject to the Global cap tested
+        // here (HORO-1132: `Confidence::from_evidence`).
         let few: Vec<_> = (1..=3).map(|n| receipt(n, vec![])).collect();
-        assert_eq!(estimate(&few, None).confidence, Confidence::Low);
-
-        let medium: Vec<_> = (1..=10).map(|n| receipt(n, vec![])).collect();
-        assert_eq!(estimate(&medium, None).confidence, Confidence::Medium);
+        assert_eq!(estimate(&few, None).confidence, Confidence::Medium);
 
         let many: Vec<_> = (1..=30).map(|n| receipt(n, vec![])).collect();
-        assert_eq!(estimate(&many, None).confidence, Confidence::High);
+        assert_eq!(
+            estimate(&many, None).confidence,
+            Confidence::Medium,
+            "Global tier confidence is capped at Medium regardless of n (HORO-1132)"
+        );
+    }
+
+    #[test]
+    fn duration_confidence_via_class_bucket_still_escalates_to_high() {
+        let global: Vec<_> = (1..=50).map(|n| receipt(n * 100, vec![])).collect();
+        let class: Vec<_> = (1..=20).map(|n| receipt(n, vec![])).collect();
+        let result = estimate(&global, Some(&class));
+        assert_eq!(result.bucket_tier, BucketTier::Repo);
+        assert_eq!(
+            result.confidence,
+            Confidence::High,
+            "a narrow (non-Global) tier with n>=20 must still reach High"
+        );
     }
 
     #[test]
@@ -506,18 +536,18 @@ mod tests {
     }
 
     #[test]
-    fn estimate_bucketed_tags_every_estimate_with_v2_bucketed_quantile() {
+    fn estimate_bucketed_tags_every_estimate_with_v3_tiered_confidence() {
         let current = features("repo-a", BuildTopology::Cargo, None);
         assert_eq!(
             estimate_bucketed(&[], &current).estimator_version,
-            "v2-bucketed-quantile"
+            "v3-tiered-confidence"
         );
         let history: Vec<_> = (1..=5)
             .map(|n| dated_receipt(n, Some(current.clone())))
             .collect();
         assert_eq!(
             estimate_bucketed(&history, &current).estimator_version,
-            "v2-bucketed-quantile"
+            "v3-tiered-confidence"
         );
     }
 
