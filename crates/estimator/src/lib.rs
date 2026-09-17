@@ -29,8 +29,7 @@
 //! [`MIN_CLASS_SAMPLES`] wins.
 
 use libra_governor_domain::{
-    BuildTopology, BucketTier, Confidence, Estimate, ExecutionReceipt, ResourceAmount,
-    ResourceKind, TaskFeatures,
+    BucketTier, Confidence, Estimate, ExecutionReceipt, ResourceAmount, ResourceKind, TaskFeatures,
 };
 
 /// Minimum number of same-task-class samples required to prefer the
@@ -274,7 +273,7 @@ fn rebuild_amount(kind: ResourceKind, value: f64) -> ResourceAmount {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libra_governor_domain::{ExecutionOutcome, PlanId, TaskId};
+    use libra_governor_domain::{BuildTopology, ExecutionOutcome, PlanId, TaskId};
     use time::OffsetDateTime;
 
     fn receipt(duration_secs: u64, usage: Vec<ResourceAmount>) -> ExecutionReceipt {

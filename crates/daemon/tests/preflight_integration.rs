@@ -180,7 +180,9 @@ fn second_preflight_for_same_session_supersedes_the_first() {
 /// sample_count smaller than the seeded-plus-noise global pool.
 #[test]
 fn preflight_selects_a_bucketed_tier_once_same_repo_history_exists() {
-    use libra_governor_domain::{ExecutionOutcome, ExecutionPlan, ExecutionReceipt, PlanId, TaskIdentity};
+    use libra_governor_domain::{
+        CompletionContract, ExecutionOutcome, ExecutionPlan, ExecutionReceipt, PlanId, TaskIdentity,
+    };
     use libra_governor_daemon::{features::derive_task_features, recon::run_recon};
 
     let dir = tempfile::tempdir().unwrap();
@@ -200,6 +202,9 @@ fn preflight_selects_a_bucketed_tier_once_same_repo_history_exists() {
         for n in 1..=5u64 {
             let identity = TaskIdentity::new(None);
             ledger.insert_task(&identity, now).unwrap();
+            ledger
+                .insert_contract(identity.id, &CompletionContract::first(vec![]), now)
+                .unwrap();
             let plan = ExecutionPlan::new(identity.id, 1, None, now)
                 .with_task_features(Some(seeded_features.clone()));
             ledger.insert_plan(&plan).unwrap();
@@ -221,6 +226,9 @@ fn preflight_selects_a_bucketed_tier_once_same_repo_history_exists() {
         for n in 1..=20u64 {
             let identity = TaskIdentity::new(None);
             ledger.insert_task(&identity, now).unwrap();
+            ledger
+                .insert_contract(identity.id, &CompletionContract::first(vec![]), now)
+                .unwrap();
             let plan_id = PlanId::new();
             let plan = ExecutionPlan {
                 id: plan_id,
