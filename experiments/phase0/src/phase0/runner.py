@@ -363,6 +363,11 @@ def _run_target(
                 if q == 0.9 and available.any():
                     overrun = overrun_severity_p95(y_true[available], pred_q[available])
 
+                # Unit-suffixed keys must match the actual target's unit --
+                # PRIMARY_TARGET is USD, SECONDARY_TARGET (wall_clock_seconds)
+                # is seconds. Emitting seconds under a "_usd" key would be a
+                # silent unit bug in the artifact HORO-1123 consumes.
+                is_cost_target = target_col == PRIMARY_TARGET
                 metrics_rows.append(
                     {
                         "split_config": split_name,
@@ -373,8 +378,10 @@ def _run_target(
                         "coverage_uncensored": cov_uncensored,
                         "coverage_censored": cov_censored,
                         "pinball_loss": pin,
-                        "mean_interval_width_usd": width,
-                        "overrun_severity_p95_usd": overrun,
+                        "mean_interval_width_usd": width if is_cost_target else None,
+                        "overrun_severity_p95_usd": overrun if is_cost_target else None,
+                        "mean_interval_width_seconds": None if is_cost_target else width,
+                        "overrun_severity_p95_seconds": None if is_cost_target else overrun,
                         "n": n_total,
                         "oracle_probe": oracle_probe,
                         "status": status,
