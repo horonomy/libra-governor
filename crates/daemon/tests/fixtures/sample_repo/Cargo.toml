@@ -1,0 +1,9 @@
+[package]
+name = "fixture-sample-repo"
+version = "0.0.0"
+edition = "2021"
+
+# Not a real workspace member — this is a synthetic fixture repo used only
+# by crates/daemon/tests/preflight_integration.rs to exercise bounded
+# reconnaissance and Completion Contract drafting against a small,
+# realistic project structure. It must never be built.
