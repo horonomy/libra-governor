@@ -92,6 +92,30 @@ fn spawn_daemon_detached() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Sends `request` to an already-running daemon and returns without
+/// waiting for (or even reading) a response. Used by `hook
+/// post-tool-use`: the daemon's accept loop is single-threaded and
+/// serial (see `libra-governor-daemon::server` docs), so a request that
+/// waits for its response could queue behind an in-flight `Preflight`'s
+/// whole reconnaissance budget — unacceptable for something that must
+/// not add perceptible latency to every tool call. The write still lands
+/// and the daemon still processes it and increments its counter; this
+/// function just never blocks on the reply (a `Write` to a local Unix
+/// socket's kernel buffer does not need the full round trip to
+/// "succeed" from the caller's point of view). Never spawns a daemon —
+/// if none is running, there is nothing to increment, and spawning one
+/// just to fire a counter increment at it would be wasteful on the far
+/// hotter tool-call path.
+pub fn fire_and_forget(socket_path: &Path, request: Request) -> Result<(), ClientError> {
+    let stream = connect_only(socket_path)?;
+    let envelope = RequestEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request,
+    };
+    wire::write_message(&stream, &envelope)?;
+    Ok(())
+}
+
 /// Sends `request` over `stream` and returns the daemon's [`Response`],
 /// after validating the protocol version on the reply.
 pub fn roundtrip(stream: &UnixStream, request: Request) -> Result<Response, ClientError> {
