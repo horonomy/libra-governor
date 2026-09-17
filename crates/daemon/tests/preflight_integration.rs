@@ -171,3 +171,149 @@ fn second_preflight_for_same_session_supersedes_the_first() {
         "second preflight for the same session must produce contract revision 2"
     );
 }
+
+/// End-to-end HORO-1130 check: derives real `TaskFeatures` from a real
+/// recon pass against the fixture repo, seeds the ledger with enough
+/// same-repo receipts to clear the bucketing threshold, then drives a
+/// real `Preflight` request over the socket and asserts the returned
+/// estimate actually used a bucketed (non-global) tier with a
+/// sample_count smaller than the seeded-plus-noise global pool.
+#[test]
+fn preflight_selects_a_bucketed_tier_once_same_repo_history_exists() {
+    use libra_governor_daemon::{features::derive_task_features, recon::run_recon};
+    use libra_governor_domain::{
+        CompletionContract, ExecutionOutcome, ExecutionPlan, ExecutionReceipt, PlanId, TaskIdentity,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let ledger_path = dir.path().join("ledger.sqlite3");
+    let now = time::OffsetDateTime::now_utc();
+
+    // Real recon + real feature derivation against the same fixture repo
+    // the request below will target, so repo_key/topology line up
+    // exactly with what the daemon will derive at request time.
+    let recon = run_recon(
+        &fixture_repo(),
+        "fix the login bug",
+        &ReconBudget::default(),
+    );
+    let seeded_features = derive_task_features(&recon, "fix the login bug", &fixture_repo(), None);
+
+    {
+        let mut ledger = LedgerStore::open(&ledger_path).unwrap();
+        // MIN_CLASS_SAMPLES (5) same-repo receipts, each with a distinct
+        // duration so the resulting quantiles are non-trivial.
+        for n in 1..=5u64 {
+            let identity = TaskIdentity::new(None);
+            ledger.insert_task(&identity, now).unwrap();
+            ledger
+                .insert_contract(identity.id, &CompletionContract::first(vec![]), now)
+                .unwrap();
+            let plan = ExecutionPlan::new(identity.id, 1, None, now)
+                .with_task_features(Some(seeded_features.clone()));
+            ledger.insert_plan(&plan).unwrap();
+            let receipt = ExecutionReceipt::new(
+                identity.id,
+                1,
+                plan.id,
+                n * 60,
+                vec![],
+                ExecutionOutcome::Unknown,
+                now,
+            )
+            .with_task_features(Some(seeded_features.clone()));
+            ledger.insert_receipt(&receipt).unwrap();
+        }
+        // Unrelated global noise from a different (synthetic) repo, large
+        // enough that if the estimator wrongly fell back to the global
+        // tier the sample_count would visibly differ from the seeded 5.
+        for n in 1..=20u64 {
+            let identity = TaskIdentity::new(None);
+            ledger.insert_task(&identity, now).unwrap();
+            ledger
+                .insert_contract(identity.id, &CompletionContract::first(vec![]), now)
+                .unwrap();
+            let plan_id = PlanId::new();
+            let plan = ExecutionPlan {
+                id: plan_id,
+                task_id: identity.id,
+                contract_revision: 1,
+                recon_snapshot_ref: None,
+                created_at: now,
+                estimate: None,
+                task_features: None,
+            };
+            ledger.insert_plan(&plan).unwrap();
+            let receipt = ExecutionReceipt::new(
+                identity.id,
+                1,
+                plan_id,
+                n * 1000,
+                vec![],
+                ExecutionOutcome::Unknown,
+                now,
+            );
+            ledger.insert_receipt(&receipt).unwrap();
+        }
+    }
+
+    let config = DaemonConfig {
+        socket_path: dir.path().join("d.sock"),
+        ledger_path,
+        log_path: dir.path().join("daemon.log"),
+        recon_budget: ReconBudget::default(),
+    };
+
+    let listener = libra_governor_daemon::bind_or_detect_running(&config.socket_path).unwrap();
+    let server_thread = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
+        let mut current_task = None;
+        libra_governor_daemon::handle_connection(stream, &mut ledger, &mut current_task, &config)
+            .unwrap();
+    });
+
+    let socket_path = dir.path().join("d.sock");
+    let client = UnixStream::connect(&socket_path).unwrap();
+    let request = RequestEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request: Request::Preflight {
+            task_hint: "fix the login bug".to_string(),
+            cwd: fixture_repo(),
+            session_id: "bucketed-test-session".to_string(),
+        },
+    };
+    wire::write_message(&client, &request).unwrap();
+    let response: ResponseEnvelope =
+        wire::read_message(BufReader::new(client.try_clone().unwrap())).unwrap();
+    server_thread.join().unwrap();
+
+    match response.response {
+        Response::Preflight(result) => {
+            let estimate = result.estimate.expect("estimate must always be present");
+            assert!(
+                !estimate.cold_start,
+                "seeded history must produce a real, non-cold-start estimate"
+            );
+            assert!(
+                matches!(
+                    estimate.bucket_tier,
+                    libra_governor_domain::BucketTier::RepoTopologyModel
+                        | libra_governor_domain::BucketTier::RepoTopology
+                        | libra_governor_domain::BucketTier::Repo
+                ),
+                "expected the Repo tier or narrower once same-repo history clears the threshold, got {:?}",
+                estimate.bucket_tier
+            );
+            assert_eq!(
+                estimate.sample_count, 5,
+                "must use the smaller, more specific same-repo bucket, not the 20-row global noise"
+            );
+            assert_eq!(
+                estimate.feature_schema_version,
+                seeded_features.feature_schema_version
+            );
+        }
+        other => panic!("expected a Preflight response, got {other:?}"),
+    }
+}

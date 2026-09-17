@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::{estimate::Estimate, task_identity::TaskId};
+use crate::{estimate::Estimate, task_features::TaskFeatures, task_identity::TaskId};
 
 /// Identifier for one [`ExecutionPlan`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -55,6 +55,13 @@ pub struct ExecutionPlan {
     /// `ExecutionPlan::new` call site (pre-dating the estimator) keeps
     /// compiling unchanged.
     pub estimate: Option<Estimate>,
+    /// The [`TaskFeatures`] this plan's estimate was computed against, if
+    /// any (HORO-1130). Persisted here (mirroring how [`Self::estimate`]
+    /// is carried) so `hook stop`'s later `Finalize` request — which has
+    /// no access to the original prompt or reconnaissance output — can
+    /// copy it onto the finalized [`crate::ExecutionReceipt`] without
+    /// re-deriving it.
+    pub task_features: Option<TaskFeatures>,
 }
 
 impl ExecutionPlan {
@@ -71,6 +78,7 @@ impl ExecutionPlan {
             recon_snapshot_ref,
             created_at,
             estimate: None,
+            task_features: None,
         }
     }
 
@@ -78,6 +86,13 @@ impl ExecutionPlan {
     /// chaining at the construction site.
     pub fn with_estimate(mut self, estimate: Estimate) -> Self {
         self.estimate = Some(estimate);
+        self
+    }
+
+    /// Attaches the [`TaskFeatures`] this plan's estimate was computed
+    /// against, returning `self` for chaining at the construction site.
+    pub fn with_task_features(mut self, task_features: Option<TaskFeatures>) -> Self {
+        self.task_features = task_features;
         self
     }
 }

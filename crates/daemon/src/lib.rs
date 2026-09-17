@@ -8,6 +8,7 @@
 //! component that reads the repository or writes to the ledger.
 
 pub mod contract;
+pub mod features;
 pub mod log;
 pub mod paths;
 pub mod recon;

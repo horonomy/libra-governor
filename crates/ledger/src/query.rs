@@ -1,7 +1,7 @@
 use libra_governor_domain::{
     CompletionContract, CompletionCriterion, Estimate, ExecutionEvent, ExecutionEventKind,
-    ExecutionOutcome, ExecutionPlan, ExecutionReceipt, ExternalRef, PlanId, ResourceAmount, TaskId,
-    TaskIdentity,
+    ExecutionOutcome, ExecutionPlan, ExecutionReceipt, ExternalRef, PlanId, ResourceAmount,
+    TaskFeatures, TaskId, TaskIdentity,
 };
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
@@ -26,9 +26,26 @@ fn parse_time(s: &str) -> Result<time::OffsetDateTime, LedgerError> {
         .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))
 }
 
+/// Deserializes a nullable `task_features_json` column value into an
+/// `Option<TaskFeatures>`. `None` means "genuinely no features recorded"
+/// (a pre-HORO-1130 row), not a deserialize failure.
+fn parse_task_features(json: Option<String>) -> Result<Option<TaskFeatures>, LedgerError> {
+    json.map(|s| serde_json::from_str(&s))
+        .transpose()
+        .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))
+}
+
 /// Raw `plans` row shape for [`LedgerStore::get_plan`]: `(task_id,
-/// contract_revision, recon_snapshot_ref, created_at, estimate_json)`.
-type PlanRow = (String, i64, Option<String>, String, Option<String>);
+/// contract_revision, recon_snapshot_ref, created_at, estimate_json,
+/// task_features_json)`.
+type PlanRow = (
+    String,
+    i64,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+);
 
 impl LedgerStore {
     /// Reconstructs one task's full trajectory: identity, ordered events,
@@ -138,7 +155,7 @@ impl LedgerStore {
         task_id: TaskId,
     ) -> Result<Vec<ExecutionPlan>, LedgerError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, contract_revision, recon_snapshot_ref, created_at, estimate_json
+            "SELECT id, contract_revision, recon_snapshot_ref, created_at, estimate_json, task_features_json
              FROM plans WHERE task_id = ?1 ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map([task_id_str], |row| {
@@ -147,18 +164,27 @@ impl LedgerStore {
             let recon_snapshot_ref: Option<String> = row.get(2)?;
             let created_at: String = row.get(3)?;
             let estimate_json: Option<String> = row.get(4)?;
+            let task_features_json: Option<String> = row.get(5)?;
             Ok((
                 id,
                 contract_revision,
                 recon_snapshot_ref,
                 created_at,
                 estimate_json,
+                task_features_json,
             ))
         })?;
 
         let mut plans = Vec::new();
         for row in rows {
-            let (id, contract_revision, recon_snapshot_ref, created_at, estimate_json) = row?;
+            let (
+                id,
+                contract_revision,
+                recon_snapshot_ref,
+                created_at,
+                estimate_json,
+                task_features_json,
+            ) = row?;
             let id = Uuid::parse_str(&id)
                 .map(PlanId)
                 .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
@@ -166,6 +192,7 @@ impl LedgerStore {
                 .map(|s| serde_json::from_str(&s))
                 .transpose()
                 .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
+            let task_features = parse_task_features(task_features_json)?;
             plans.push(ExecutionPlan {
                 id,
                 task_id,
@@ -173,6 +200,7 @@ impl LedgerStore {
                 recon_snapshot_ref,
                 created_at: parse_time(&created_at)?,
                 estimate,
+                task_features,
             });
         }
         Ok(plans)
@@ -185,7 +213,7 @@ impl LedgerStore {
     ) -> Result<Vec<ExecutionReceipt>, LedgerError> {
         let mut stmt = self.conn.prepare(
             "SELECT plan_id, contract_revision, actual_duration_secs, actual_usage_json,
-                    outcome_json, recorded_at, tool_call_count, model, provider
+                    outcome_json, recorded_at, tool_call_count, model, provider, task_features_json
              FROM receipts WHERE task_id = ?1 ORDER BY recorded_at ASC",
         )?;
         let rows = stmt.query_map([task_id_str], |row| {
@@ -198,6 +226,7 @@ impl LedgerStore {
             let tool_call_count: i64 = row.get(6)?;
             let model: Option<String> = row.get(7)?;
             let provider: Option<String> = row.get(8)?;
+            let task_features_json: Option<String> = row.get(9)?;
             Ok((
                 plan_id,
                 contract_revision,
@@ -208,6 +237,7 @@ impl LedgerStore {
                 tool_call_count,
                 model,
                 provider,
+                task_features_json,
             ))
         })?;
 
@@ -223,6 +253,7 @@ impl LedgerStore {
                 tool_call_count,
                 model,
                 provider,
+                task_features_json,
             ) = row?;
             let plan_id = Uuid::parse_str(&plan_id)
                 .map(PlanId)
@@ -231,6 +262,7 @@ impl LedgerStore {
                 .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
             let outcome: ExecutionOutcome = serde_json::from_str(&outcome_json)
                 .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
+            let task_features = parse_task_features(task_features_json)?;
 
             receipts.push(ExecutionReceipt {
                 task_id,
@@ -243,6 +275,7 @@ impl LedgerStore {
                 tool_call_count: tool_call_count as u64,
                 model,
                 provider,
+                task_features,
             });
         }
         Ok(receipts)
@@ -254,7 +287,7 @@ impl LedgerStore {
         let row: Option<PlanRow> = self
             .conn
             .query_row(
-                "SELECT task_id, contract_revision, recon_snapshot_ref, created_at, estimate_json
+                "SELECT task_id, contract_revision, recon_snapshot_ref, created_at, estimate_json, task_features_json
                  FROM plans WHERE id = ?1",
                 [&plan_id_str],
                 |row| {
@@ -264,12 +297,20 @@ impl LedgerStore {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
                     ))
                 },
             )
             .ok();
 
-        let Some((task_id, contract_revision, recon_snapshot_ref, created_at, estimate_json)) = row
+        let Some((
+            task_id,
+            contract_revision,
+            recon_snapshot_ref,
+            created_at,
+            estimate_json,
+            task_features_json,
+        )) = row
         else {
             return Ok(None);
         };
@@ -281,6 +322,7 @@ impl LedgerStore {
             .map(|s| serde_json::from_str(&s))
             .transpose()
             .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
+        let task_features = parse_task_features(task_features_json)?;
 
         Ok(Some(ExecutionPlan {
             id: plan_id,
@@ -289,6 +331,7 @@ impl LedgerStore {
             recon_snapshot_ref,
             created_at: parse_time(&created_at)?,
             estimate,
+            task_features,
         }))
     }
 
@@ -319,23 +362,24 @@ impl LedgerStore {
     }
 
     /// Returns every locally recorded [`ExecutionReceipt`], across all
-    /// tasks — the sample set `libra-governor-estimator` computes
-    /// quantiles from.
+    /// tasks, paired with the [`TaskFeatures`] its originating plan was
+    /// estimated against (`None` for a pre-HORO-1130 receipt) — the
+    /// sample set `libra-governor-estimator::estimate_bucketed` buckets
+    /// and computes quantiles from.
     ///
-    /// `task_class` is accepted (rather than omitted) so this signature
-    /// already matches the class-bucketed-history tier the estimator's
-    /// design calls for; no caller passes anything but `None` yet because
-    /// nothing in this schema classifies tasks (see HORO-1126 PR
-    /// description — a documented, intentional deviation, not an
-    /// oversight). When `task_class` is `Some`, this currently still
-    /// returns the full global history unfiltered.
+    /// Previously (HORO-1126) this took an always-ignored `_task_class:
+    /// Option<&str>` parameter: nothing in the schema classified tasks
+    /// yet, so it was dead code by design. HORO-1130 activates real
+    /// bucketing, so the parameter is replaced by the richer return type
+    /// the estimator's ladder actually needs, rather than resurrecting an
+    /// unused string-classifier parameter no caller ever had a value for.
     pub fn receipts_for_estimation(
         &self,
-        _task_class: Option<&str>,
-    ) -> Result<Vec<ExecutionReceipt>, LedgerError> {
+    ) -> Result<Vec<(Option<TaskFeatures>, ExecutionReceipt)>, LedgerError> {
         let mut stmt = self.conn.prepare(
             "SELECT task_id, plan_id, contract_revision, actual_duration_secs,
-                    actual_usage_json, outcome_json, recorded_at, tool_call_count, model, provider
+                    actual_usage_json, outcome_json, recorded_at, tool_call_count, model, provider,
+                    task_features_json
              FROM receipts ORDER BY recorded_at ASC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -349,6 +393,7 @@ impl LedgerStore {
             let tool_call_count: i64 = row.get(7)?;
             let model: Option<String> = row.get(8)?;
             let provider: Option<String> = row.get(9)?;
+            let task_features_json: Option<String> = row.get(10)?;
             Ok((
                 task_id,
                 plan_id,
@@ -360,6 +405,7 @@ impl LedgerStore {
                 tool_call_count,
                 model,
                 provider,
+                task_features_json,
             ))
         })?;
 
@@ -376,6 +422,7 @@ impl LedgerStore {
                 tool_call_count,
                 model,
                 provider,
+                task_features_json,
             ) = row?;
             let task_id = Uuid::parse_str(&task_id)
                 .map(TaskId)
@@ -387,19 +434,24 @@ impl LedgerStore {
                 .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
             let outcome: ExecutionOutcome = serde_json::from_str(&outcome_json)
                 .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
+            let task_features = parse_task_features(task_features_json)?;
 
-            receipts.push(ExecutionReceipt {
-                task_id,
-                contract_revision: contract_revision as u32,
-                plan_id,
-                actual_duration_secs: actual_duration_secs as u64,
-                actual_usage,
-                outcome,
-                recorded_at: parse_time(&recorded_at)?,
-                tool_call_count: tool_call_count as u64,
-                model,
-                provider,
-            });
+            receipts.push((
+                task_features.clone(),
+                ExecutionReceipt {
+                    task_id,
+                    contract_revision: contract_revision as u32,
+                    plan_id,
+                    actual_duration_secs: actual_duration_secs as u64,
+                    actual_usage,
+                    outcome,
+                    recorded_at: parse_time(&recorded_at)?,
+                    tool_call_count: tool_call_count as u64,
+                    model,
+                    provider,
+                    task_features,
+                },
+            ));
         }
         Ok(receipts)
     }

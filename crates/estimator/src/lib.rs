@@ -10,24 +10,27 @@
 //!
 //! # Bucketing
 //!
-//! The estimator's design supports three tiers, most to least specific:
-//! (a) a same-task-class bucket, if the local history for that class has
-//! at least [`MIN_CLASS_SAMPLES`] rows; (b) the full global local
-//! history; (c) cold start (zero local history at all). [`estimate`]
-//! implements all three tiers as a function of the sample sets it is
-//! handed. **Deviation**: nothing in `libra-governor-domain` or
-//! `libra-governor-ledger` classifies tasks today (no `task_class`
-//! concept exists on [`libra_governor_domain::TaskIdentity`] or
-//! [`ExecutionReceipt`]), so `libra-governor-daemon` currently always
-//! calls [`estimate`] with `class_receipts: None`, collapsing tier (a)
-//! away — every estimate MVP 1.0 actually produces comes from tier (b)
-//! or (c). Building a task classifier was judged out of scope for this
-//! ticket (HORO-1126): it would be a parallel, un-evidenced heuristic
-//! invented for this ticket alone rather than a real consumer's need.
-//! The tier-(a) code path is still implemented and unit-tested so a
-//! future classifier ticket only needs to supply `class_receipts`.
+//! [`estimate`] (MVP 1.0, kept unchanged) supports three coarse tiers,
+//! most to least specific, purely as a function of the sample sets it is
+//! handed: (a) a caller-supplied "class" bucket, if it has at least
+//! [`MIN_CLASS_SAMPLES`] rows; (b) the full global local history; (c)
+//! cold start. Nothing in `libra-governor-domain` classified tasks in
+//! MVP 1.0, so `libra-governor-daemon` never actually called it with a
+//! class bucket — every MVP 1.0 estimate came from tier (b) or (c).
+//!
+//! [`estimate_bucketed`] (HORO-1130) replaces that with a real
+//! hierarchical backoff ladder over [`TaskFeatures`] — see
+//! [`bucket_ladder`] — and is what `libra-governor-daemon` calls today.
+//! Walks most-specific to least-specific
+//! (`RepoTopologyModel -> RepoTopology -> Repo -> Topology`), then falls
+//! back to the full global history (`Global`), then to
+//! [`Estimate::cold_start`] (`ColdStart`) when there is no local history
+//! at all. The first tier whose matching sample set meets
+//! [`MIN_CLASS_SAMPLES`] wins.
 
-use libra_governor_domain::{Confidence, Estimate, ExecutionReceipt, ResourceAmount, ResourceKind};
+use libra_governor_domain::{
+    BucketTier, Confidence, Estimate, ExecutionReceipt, ResourceAmount, ResourceKind, TaskFeatures,
+};
 
 /// Minimum number of same-task-class samples required to prefer the
 /// class-bucketed history over the full global history. Chosen as a
@@ -52,20 +55,99 @@ pub fn estimate(
 ) -> Estimate {
     if let Some(class) = class_receipts {
         if class.len() >= MIN_CLASS_SAMPLES {
-            return compute(class);
+            return compute(
+                class,
+                BucketTier::Repo,
+                libra_governor_domain::FEATURE_SCHEMA_VERSION,
+            );
         }
     }
     if !global_receipts.is_empty() {
-        return compute(global_receipts);
+        return compute(
+            global_receipts,
+            BucketTier::Global,
+            libra_governor_domain::FEATURE_SCHEMA_VERSION,
+        );
     }
     Estimate::cold_start()
+}
+
+/// Computes a preflight [`Estimate`] with real task-class bucketing
+/// (HORO-1130): walks [`bucket_ladder`] most-specific to least-specific,
+/// using the first tier whose matching sample set meets
+/// [`MIN_CLASS_SAMPLES`], falling back to the full local history
+/// ([`BucketTier::Global`]) and finally to [`Estimate::cold_start`]
+/// ([`BucketTier::ColdStart`]) when there is no local history at all.
+///
+/// `history` is every locally recorded receipt paired with the
+/// [`TaskFeatures`] its originating plan was estimated against, if any
+/// (see
+/// [`libra_governor_ledger::LedgerStore::receipts_for_estimation`]). A
+/// pre-MVP-2 receipt with `None` features can never match a bucketed
+/// tier (it carries no features to match against) but still contributes
+/// to the global-tier sample set — see the migration/backward-compat
+/// test in this module.
+pub fn estimate_bucketed(
+    history: &[(Option<TaskFeatures>, ExecutionReceipt)],
+    current: &TaskFeatures,
+) -> Estimate {
+    for tier in bucket_ladder(current) {
+        let bucketed: Vec<ExecutionReceipt> = history
+            .iter()
+            .filter(|(features, _)| features.as_ref().is_some_and(|f| matches(tier, f, current)))
+            .map(|(_, receipt)| receipt.clone())
+            .collect();
+        if bucketed.len() >= MIN_CLASS_SAMPLES {
+            return compute(&bucketed, tier, &current.feature_schema_version);
+        }
+    }
+
+    let global: Vec<ExecutionReceipt> = history.iter().map(|(_, r)| r.clone()).collect();
+    if !global.is_empty() {
+        return compute(&global, BucketTier::Global, &current.feature_schema_version);
+    }
+
+    let mut cold = Estimate::cold_start();
+    cold.feature_schema_version = current.feature_schema_version.clone();
+    cold
+}
+
+/// The hierarchical backoff ladder, most specific to least specific.
+/// [`BucketTier::Global`] and [`BucketTier::ColdStart`] are not part of
+/// this ladder: they are the two fallbacks [`estimate_bucketed`] applies
+/// after every ladder tier has been tried and none met
+/// [`MIN_CLASS_SAMPLES`].
+fn bucket_ladder(_current: &TaskFeatures) -> [BucketTier; 4] {
+    [
+        BucketTier::RepoTopologyModel,
+        BucketTier::RepoTopology,
+        BucketTier::Repo,
+        BucketTier::Topology,
+    ]
+}
+
+/// Whether `a` and `b` belong to the same bucket at `tier`.
+fn matches(tier: BucketTier, a: &TaskFeatures, b: &TaskFeatures) -> bool {
+    match tier {
+        BucketTier::RepoTopologyModel => {
+            a.repo_key == b.repo_key && a.topology == b.topology && a.model == b.model
+        }
+        BucketTier::RepoTopology => a.repo_key == b.repo_key && a.topology == b.topology,
+        BucketTier::Repo => a.repo_key == b.repo_key,
+        BucketTier::Topology => a.topology == b.topology,
+        BucketTier::Global | BucketTier::ColdStart => true,
+    }
 }
 
 /// Computes real quantiles over a non-empty sample set. Never called with
 /// an empty slice — callers route the empty case to
 /// [`Estimate::cold_start`] instead, so this function can assume at least
 /// one sample.
-fn compute(receipts: &[ExecutionReceipt]) -> Estimate {
+fn compute(
+    receipts: &[ExecutionReceipt],
+    bucket_tier: BucketTier,
+    feature_schema_version: &str,
+) -> Estimate {
     debug_assert!(!receipts.is_empty());
 
     let mut durations: Vec<u64> = receipts.iter().map(|r| r.actual_duration_secs).collect();
@@ -85,6 +167,8 @@ fn compute(receipts: &[ExecutionReceipt]) -> Estimate {
         cold_start: false,
         estimator_version: libra_governor_domain::ESTIMATOR_VERSION.to_string(),
         reason: None,
+        feature_schema_version: feature_schema_version.to_string(),
+        bucket_tier,
     }
 }
 
@@ -193,7 +277,7 @@ fn rebuild_amount(kind: ResourceKind, value: f64) -> ResourceAmount {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libra_governor_domain::{ExecutionOutcome, PlanId, TaskId};
+    use libra_governor_domain::{BuildTopology, ExecutionOutcome, PlanId, TaskId};
     use time::OffsetDateTime;
 
     fn receipt(duration_secs: u64, usage: Vec<ResourceAmount>) -> ExecutionReceipt {
@@ -317,5 +401,135 @@ mod tests {
             estimate(&receipts, None).estimator_version,
             libra_governor_domain::ESTIMATOR_VERSION
         );
+    }
+
+    fn features(repo_key: &str, topology: BuildTopology, model: Option<&str>) -> TaskFeatures {
+        TaskFeatures {
+            repo_key: repo_key.to_string(),
+            topology,
+            model: model.map(str::to_string),
+            prompt_char_len: 10,
+            prompt_line_count: 1,
+            prompt_code_block_count: 0,
+            prompt_has_traceback: false,
+            prompt_filepath_token_count: 0,
+            prompt_numeric_token_count: 0,
+            likely_affected_path_count: 0,
+            detected_test_command_count: 1,
+            feature_schema_version: libra_governor_domain::FEATURE_SCHEMA_VERSION.to_string(),
+        }
+    }
+
+    fn dated_receipt(
+        duration_secs: u64,
+        task_features: Option<TaskFeatures>,
+    ) -> (Option<TaskFeatures>, ExecutionReceipt) {
+        (
+            task_features.clone(),
+            receipt(duration_secs, vec![]).with_task_features(task_features),
+        )
+    }
+
+    #[test]
+    fn estimate_bucketed_reaches_cold_start_with_no_history_at_all() {
+        let current = features("repo-a", BuildTopology::Cargo, Some("claude-sonnet-5"));
+        let result = estimate_bucketed(&[], &current);
+        assert!(result.cold_start);
+        assert_eq!(result.bucket_tier, BucketTier::ColdStart);
+        assert_eq!(
+            result.feature_schema_version,
+            current.feature_schema_version
+        );
+    }
+
+    #[test]
+    fn estimate_bucketed_falls_back_to_global_when_no_bucket_meets_threshold() {
+        let current = features("repo-a", BuildTopology::Cargo, Some("claude-sonnet-5"));
+        // Unfeatured (pre-MVP-2) history: cannot match any bucketed tier,
+        // but must still contribute to the global tier.
+        let history: Vec<_> = (1..=6).map(|n| dated_receipt(n * 10, None)).collect();
+        let result = estimate_bucketed(&history, &current);
+        assert_eq!(result.bucket_tier, BucketTier::Global);
+        assert_eq!(result.sample_count, 6);
+        assert!(!result.cold_start);
+    }
+
+    #[test]
+    fn estimate_bucketed_selects_repo_tier_once_threshold_is_met() {
+        let current = features("repo-a", BuildTopology::Cargo, Some("claude-sonnet-5"));
+        let mut history: Vec<_> = (1..=5)
+            .map(|n| {
+                dated_receipt(
+                    n,
+                    Some(features("repo-a", BuildTopology::Npm, Some("other-model"))),
+                )
+            })
+            .collect();
+        // A larger pool of unrelated global history, so the global tier
+        // would report a different (larger) sample_count if it were
+        // chosen instead.
+        history.extend((1..=50).map(|n| dated_receipt(n * 100, None)));
+
+        let result = estimate_bucketed(&history, &current);
+        assert_eq!(
+            result.bucket_tier,
+            BucketTier::Repo,
+            "same repo_key but different topology/model must land on the Repo tier, not narrower"
+        );
+        assert_eq!(result.sample_count, 5);
+        assert!(
+            result.sample_count < history.len(),
+            "bucketed sample_count must be smaller than the global pool"
+        );
+    }
+
+    #[test]
+    fn estimate_bucketed_prefers_most_specific_tier_available() {
+        let current = features("repo-a", BuildTopology::Cargo, Some("claude-sonnet-5"));
+        let mut history: Vec<_> = (1..=5)
+            .map(|n| dated_receipt(n, Some(current.clone())))
+            .collect();
+        history.extend((1..=5).map(|n| {
+            dated_receipt(
+                n * 10,
+                Some(features(
+                    "repo-a",
+                    BuildTopology::Cargo,
+                    Some("other-model"),
+                )),
+            )
+        }));
+
+        let result = estimate_bucketed(&history, &current);
+        assert_eq!(result.bucket_tier, BucketTier::RepoTopologyModel);
+        assert_eq!(result.sample_count, 5);
+    }
+
+    #[test]
+    fn estimate_bucketed_tags_every_estimate_with_v2_bucketed_quantile() {
+        let current = features("repo-a", BuildTopology::Cargo, None);
+        assert_eq!(
+            estimate_bucketed(&[], &current).estimator_version,
+            "v2-bucketed-quantile"
+        );
+        let history: Vec<_> = (1..=5)
+            .map(|n| dated_receipt(n, Some(current.clone())))
+            .collect();
+        assert_eq!(
+            estimate_bucketed(&history, &current).estimator_version,
+            "v2-bucketed-quantile"
+        );
+    }
+
+    #[test]
+    fn resource_amounts_remain_none_on_every_bucketed_estimate_from_real_local_data() {
+        let current = features("repo-a", BuildTopology::Cargo, None);
+        let history: Vec<_> = (1..=10)
+            .map(|n| dated_receipt(n, Some(current.clone())))
+            .collect();
+        let result = estimate_bucketed(&history, &current);
+        assert!(result.resource_p50.is_none());
+        assert!(result.resource_p80.is_none());
+        assert!(result.resource_p90.is_none());
     }
 }

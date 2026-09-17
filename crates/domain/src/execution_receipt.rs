@@ -6,7 +6,7 @@ use time::OffsetDateTime;
 
 use crate::{
     execution_outcome::ExecutionOutcome, execution_plan::PlanId, resource_amount::ResourceAmount,
-    task_identity::TaskId,
+    task_features::TaskFeatures, task_identity::TaskId,
 };
 
 /// The recorded actuals for one task's execution, tied back to the plan
@@ -44,6 +44,13 @@ pub struct ExecutionReceipt {
     /// limitation, not a bug. The field exists so a future harness that
     /// does expose it does not require another schema change.
     pub provider: Option<String>,
+    /// The preflight-knowable [`TaskFeatures`] this task's plan was
+    /// estimated against, if any (HORO-1130). `None` for a pre-MVP-2
+    /// receipt recorded before this field existed — a genuinely absent
+    /// value, not a placeholder; such a receipt still contributes to
+    /// global-tier estimation (see `libra-governor-estimator`), just
+    /// never to a class-bucketed tier.
+    pub task_features: Option<TaskFeatures>,
 }
 
 impl ExecutionReceipt {
@@ -68,6 +75,7 @@ impl ExecutionReceipt {
             tool_call_count: 0,
             model: None,
             provider: None,
+            task_features: None,
         }
     }
 
@@ -89,6 +97,13 @@ impl ExecutionReceipt {
     /// always `None` for Claude Code today.
     pub fn with_provider(mut self, provider: Option<String>) -> Self {
         self.provider = provider;
+        self
+    }
+
+    /// Attaches the [`TaskFeatures`] the originating plan was estimated
+    /// against, if any (HORO-1130).
+    pub fn with_task_features(mut self, task_features: Option<TaskFeatures>) -> Self {
+        self.task_features = task_features;
         self
     }
 }

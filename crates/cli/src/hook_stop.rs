@@ -251,8 +251,10 @@ mod tests {
             confidence: Confidence::Medium,
             sample_count: 8,
             cold_start: false,
-            estimator_version: "v1-empirical-quantile".to_string(),
+            estimator_version: "v2-bucketed-quantile".to_string(),
             reason: None,
+            feature_schema_version: "fs-v1".to_string(),
+            bucket_tier: libra_governor_domain::BucketTier::Global,
         };
         let result = FinalizeResult {
             receipt: sample_receipt(),
@@ -277,8 +279,10 @@ mod tests {
             confidence: Confidence::Medium,
             sample_count: 8,
             cold_start: false,
-            estimator_version: "v1-empirical-quantile".to_string(),
+            estimator_version: "v2-bucketed-quantile".to_string(),
             reason: None,
+            feature_schema_version: "fs-v1".to_string(),
+            bucket_tier: libra_governor_domain::BucketTier::Global,
         };
         let result = FinalizeResult {
             receipt,

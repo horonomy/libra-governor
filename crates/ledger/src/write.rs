@@ -123,10 +123,18 @@ impl LedgerStore {
             .map_err(|e| {
                 LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
             })?;
+        let task_features_json = plan
+            .task_features
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| {
+                LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+            })?;
 
         self.conn.execute(
-            "INSERT INTO plans (id, task_id, contract_revision, recon_snapshot_ref, created_at, estimate_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO plans (id, task_id, contract_revision, recon_snapshot_ref, created_at, estimate_json, task_features_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
                 plan.id.0.to_string(),
                 plan.task_id.to_string(),
@@ -134,6 +142,7 @@ impl LedgerStore {
                 plan.recon_snapshot_ref,
                 rfc3339(plan.created_at)?,
                 estimate_json,
+                task_features_json,
             ],
         )?;
         Ok(())
@@ -148,12 +157,20 @@ impl LedgerStore {
         let outcome_json = serde_json::to_string(&receipt.outcome).map_err(|e| {
             LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
         })?;
+        let task_features_json = receipt
+            .task_features
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| {
+                LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+            })?;
 
         self.conn.execute(
             "INSERT INTO receipts (task_id, plan_id, contract_revision, actual_duration_secs,
                                     actual_usage_json, outcome_json, recorded_at,
-                                    tool_call_count, model, provider)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                    tool_call_count, model, provider, task_features_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 receipt.task_id.to_string(),
                 receipt.plan_id.0.to_string(),
@@ -165,6 +182,7 @@ impl LedgerStore {
                 receipt.tool_call_count as i64,
                 receipt.model,
                 receipt.provider,
+                task_features_json,
             ],
         )?;
         Ok(())
