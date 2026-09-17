@@ -14,6 +14,7 @@ libra-governor-protocol = { path = "../protocol" }
 serde_json.workspace = true
 time.workspace = true
 thiserror.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
