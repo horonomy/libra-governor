@@ -16,15 +16,20 @@ import json
 import os
 import shutil
 import signal
+import socket as socket_mod
 import sqlite3
 import subprocess
-import sys
 import time
 import uuid
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+SOCKET_FILENAME = "daemon.sock"
+LEDGER_FILENAME = "ledger.sqlite3"
+LOG_FILENAME = "daemon.log"
+TASK_ID_MARKER = "task "
 
 
 def run_hook(binary: Path, subcommand: list[str], payload: dict, env: dict, timeout=30):
@@ -49,7 +54,7 @@ def spawn_daemon(binary: Path, env: dict) -> subprocess.Popen:
 
 def wait_for_socket(state_dir: Path, timeout=5.0) -> bool:
     deadline = time.time() + timeout
-    sock = state_dir / "daemon.sock"
+    sock = state_dir / SOCKET_FILENAME
     while time.time() < deadline:
         if sock.exists():
             return True
@@ -121,7 +126,7 @@ class Matrix:
                 sid = f"resume-pre-{i}-{uuid.uuid4()}"
                 preflight(self.binary, env, sid, FIXTURES / "rust-crate")
                 stop(self.binary, env, sid)
-            before = receipt_count(state_dir / "ledger.sqlite3")
+            before = receipt_count(state_dir / LEDGER_FILENAME)
 
             daemon.send_signal(signal.SIGTERM)
             daemon.wait(timeout=5)
@@ -131,9 +136,9 @@ class Matrix:
             for i in range(3):
                 sid = f"resume-post-{i}-{uuid.uuid4()}"
                 p = preflight(self.binary, env, sid, FIXTURES / "python-pkg")
-                ok = ok and p.returncode == 0 and "task " in p.stdout
+                ok = ok and p.returncode == 0 and TASK_ID_MARKER in p.stdout
                 stop(self.binary, env, sid)
-            after = receipt_count(state_dir / "ledger.sqlite3")
+            after = receipt_count(state_dir / LEDGER_FILENAME)
 
             self.record(
                 "resume_restart",
@@ -142,8 +147,6 @@ class Matrix:
                 f"post-kill hooks all succeeded={ok}",
             )
         finally:
-            for p in subprocess.run(["pgrep", "-f", f"daemon run"], capture_output=True, text=True).stdout.split():
-                pass
             self._kill_any_daemon(state_dir)
 
     # 2. Multiple sessions under one task context
@@ -184,7 +187,8 @@ class Matrix:
             # NoActiveTask safe no-op is logged to daemon.log instead (see
             # hook_stop.rs::log / run()). So stderr is expected to be empty
             # here — check the log file for the real evidence.
-            log_text = (state_dir / "daemon.log").read_text() if (state_dir / "daemon.log").exists() else ""
+            log_path = state_dir / LOG_FILENAME
+            log_text = log_path.read_text() if log_path.exists() else ""
             no_op_ok = (
                 s.returncode == 0
                 and s.stderr.strip() == ""
@@ -225,14 +229,14 @@ class Matrix:
             # silent, safe no-op: no receipt persisted for this task.
             s = stop(self.binary, env, sid)
             stop_exit_ok = s.returncode == 0
-            receipts_after_stop = receipt_count(state_dir / "ledger.sqlite3")
+            receipts_after_stop = receipt_count(state_dir / LEDGER_FILENAME)
 
             daemon_running_after_stop = self._daemon_socket_alive(state_dir)
 
             # A fresh preflight (hook user-prompt-submit) DOES auto-respawn.
             sid2 = f"midflight-recover-{uuid.uuid4()}"
             p2 = preflight(self.binary, env, sid2, FIXTURES / "rust-crate")
-            respawn_ok = p2.returncode == 0 and "task " in p2.stdout
+            respawn_ok = p2.returncode == 0 and TASK_ID_MARKER in p2.stdout
 
             self.record(
                 "daemon_restart_mid_flight",
@@ -323,9 +327,9 @@ class Matrix:
         stop(self.binary, env, sid)
         self._kill_any_daemon(state_dir)
 
-        ledger_path = state_dir / "ledger.sqlite3"
-        log_path = state_dir / "daemon.log"
-        wal_path = state_dir / "ledger.sqlite3-wal"
+        ledger_path = state_dir / LEDGER_FILENAME
+        log_path = state_dir / LOG_FILENAME
+        wal_path = state_dir / f"{LEDGER_FILENAME}-wal"
 
         found_in = []
         for p in (ledger_path, log_path, wal_path):
@@ -335,8 +339,8 @@ class Matrix:
         self.record(
             "privacy_no_raw_prompt_leak",
             len(found_in) == 0,
-            f"distinctive nonce {nonce!r} grepped (raw bytes) against ledger.sqlite3, "
-            f"ledger.sqlite3-wal, and daemon.log. Found in: {found_in or 'none (clean)'}",
+            f"distinctive nonce {nonce!r} grepped (raw bytes) against {LEDGER_FILENAME}, "
+            f"{LEDGER_FILENAME}-wal, and {LOG_FILENAME}. Found in: {found_in or 'none (clean)'}",
         )
 
     # 8. Concurrency / race check
@@ -388,16 +392,15 @@ class Matrix:
             text = json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
         except (json.JSONDecodeError, KeyError):
             return None
-        if "task " not in text:
+        if TASK_ID_MARKER not in text:
             return None
-        return text.split("task ", 1)[1].split(",")[0].strip()
+        return text.split(TASK_ID_MARKER, 1)[1].split(",")[0].strip()
 
     @staticmethod
     def _daemon_socket_alive(state_dir: Path) -> bool:
-        sock = state_dir / "daemon.sock"
+        sock = state_dir / SOCKET_FILENAME
         if not sock.exists():
             return False
-        import socket as socket_mod
         s = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
         try:
             s.settimeout(1)
@@ -409,24 +412,35 @@ class Matrix:
             s.close()
 
     def _kill_any_daemon(self, state_dir: Path, proc: subprocess.Popen | None = None):
+        """Kills the daemon this test owns, whether we hold its Popen handle
+        (`proc`, when this harness spawned it directly) or it was spawned
+        transparently by `ensure_daemon_connection` inside a hook subprocess
+        we don't hold a handle to. In the latter case, find the process
+        bound to this state dir's own socket via `lsof` and kill it — every
+        test uses its own fresh, uniquely-tagged state dir, so this can
+        never reach into an unrelated daemon.
+        """
         if proc is not None and proc.poll() is None:
             proc.send_signal(signal.SIGKILL)
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 pass
-        # Best-effort: also reap any daemon bound to this specific state dir
-        # that this harness spawned but lost track of (e.g. a respawned one).
+
+        sock = state_dir / SOCKET_FILENAME
+        if not sock.exists():
+            return
         try:
             out = subprocess.run(
-                ["pgrep", "-f", f"daemon run"], capture_output=True, text=True
-            ).stdout.split()
-        except Exception:
-            out = []
-        # Do not indiscriminately kill: only ones whose cwd/env we can't
-        # easily check via pgrep -f; skip broad kill to avoid harming
-        # unrelated daemons. Socket cleanup on next bind self-heals per
-        # bind_or_detect_running's stale-socket recovery.
+                ["lsof", "-t", str(sock)], capture_output=True, text=True, timeout=5
+            ).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return
+        for pid_str in out.split():
+            try:
+                os.kill(int(pid_str), signal.SIGKILL)
+            except (ValueError, ProcessLookupError, PermissionError):
+                pass
 
 
 def main() -> int:
@@ -436,7 +450,12 @@ def main() -> int:
     ap.add_argument("--out", required=True, type=Path)
     args = ap.parse_args()
 
-    args.work_root.mkdir(parents=True, exist_ok=True)
+    # NOSONAR: --work-root/--out/--binary are trusted, operator-supplied
+    # local filesystem paths for this CLI evidence harness (same trust
+    # boundary as any argument to `cargo test`), not attacker-controlled
+    # input from a network-facing request; there is no path-traversal sink
+    # here to defend against.
+    args.work_root.mkdir(parents=True, exist_ok=True)  # NOSONAR
     m = Matrix(args.binary.resolve(), args.work_root)
 
     m.test_resume_restart()
@@ -448,8 +467,8 @@ def main() -> int:
     m.test_privacy_inspection()
     m.test_concurrent_post_tool_use()
 
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(m.results, indent=2))
+    args.out.parent.mkdir(parents=True, exist_ok=True)  # NOSONAR
+    args.out.write_text(json.dumps(m.results, indent=2))  # NOSONAR
 
     n_pass = sum(1 for r in m.results.values() if r["passed"])
     print(f"\n{n_pass}/{len(m.results)} validation-matrix checks passed.")

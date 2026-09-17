@@ -3,5 +3,5 @@
 # prompts like "add input validation to the login handler".
 
 
-def login(username: str, password: str) -> bool:
+def login(_username: str, _password: str) -> bool:
     return False

@@ -21,8 +21,6 @@ import argparse
 import json
 import os
 import random
-import signal
-import string
 import subprocess
 import sys
 import time
@@ -30,7 +28,6 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 PROMPTS = [
@@ -101,22 +98,18 @@ class TaskRecord:
     errors: list[str] = field(default_factory=list)
 
 
-def do_task(binary: Path, env: dict, index: int, fixture: Path, prompt: str) -> TaskRecord:
-    session_id = f"corpus-{index}-{uuid.uuid4()}"
-    rec = TaskRecord(index=index, fixture=fixture.name, prompt=prompt, session_id=session_id)
-
-    # 1. Preflight (UserPromptSubmit)
-    preflight_payload = {
-        "session_id": session_id,
+def _run_preflight(binary: Path, env: dict, rec: TaskRecord, fixture: Path, prompt: str) -> bool:
+    """Hook user-prompt-submit. Returns False if the task should stop here."""
+    payload = {
+        "session_id": rec.session_id,
         "cwd": str(fixture),
         "prompt": prompt,
         "hook_event_name": "UserPromptSubmit",
-        "transcript_path": "/tmp/does-not-exist.jsonl",
     }
-    proc = run_hook(binary, ["hook", "user-prompt-submit"], preflight_payload, env)
+    proc = run_hook(binary, ["hook", "user-prompt-submit"], payload, env)
     if proc.returncode != 0:
         rec.errors.append(f"preflight exit {proc.returncode}: {proc.stderr[:500]}")
-        return rec
+        return False
 
     ctx = parse_additional_context(proc.stdout)
     text = ctx.get("additionalContext", "")
@@ -132,20 +125,25 @@ def do_task(binary: Path, env: dict, index: int, fixture: Path, prompt: str) -> 
     rec.recon_truncated = "truncated" in text.lower() and "Note:" in text
     if "revision " in text:
         try:
-            rec.contract_revision = int(
-                text.split("revision ", 1)[1].split(")")[0].strip()
-            )
+            rec.contract_revision = int(text.split("revision ", 1)[1].split(")")[0].strip())
         except (IndexError, ValueError):
             pass
     rec.estimate_present = "Cost/time estimate:" in text
     rec.estimate_cold_start = "cold start" in text if rec.estimate_present else None
+    return True
 
-    # 2. A few PostToolUse notifications (fire-and-forget)
-    n_tools = random.randint(2, 6)
+
+def _run_tool_calls(binary: Path, env: dict, rec: TaskRecord, fixture: Path) -> None:
+    """A few PostToolUse notifications (fire-and-forget)."""
+    # random.randint/choice here only pick how many synthetic tool-call
+    # notifications to fire and which placeholder tool name to log — not a
+    # security- or credential-relevant decision, so the stdlib PRNG (not
+    # `secrets`) is the right, and reproducible-with-a-seed, choice.
+    n_tools = random.randint(2, 6)  # NOSONAR
     for _ in range(n_tools):
         tool_payload = {
-            "session_id": session_id,
-            "tool_name": random.choice(TOOL_NAMES),
+            "session_id": rec.session_id,
+            "tool_name": random.choice(TOOL_NAMES),  # NOSONAR
             "cwd": str(fixture),
             "hook_event_name": "PostToolUse",
         }
@@ -155,20 +153,18 @@ def do_task(binary: Path, env: dict, index: int, fixture: Path, prompt: str) -> 
         else:
             rec.tool_calls_sent += 1
 
-    # Simulate real elapsed "execution" time between preflight and stop.
-    time.sleep(random.uniform(0.05, 0.35))
 
-    # 3. Stop (finalize)
-    stop_payload = {
-        "session_id": session_id,
+def _run_stop(binary: Path, env: dict, rec: TaskRecord) -> None:
+    payload = {
+        "session_id": rec.session_id,
         "model": "claude-sonnet-5",
         "hook_event_name": "Stop",
         "stop_hook_active": False,
     }
-    sproc = run_hook(binary, ["hook", "stop"], stop_payload, env)
+    sproc = run_hook(binary, ["hook", "stop"], payload, env)
     if sproc.returncode != 0:
         rec.errors.append(f"stop exit {sproc.returncode}: {sproc.stderr[:500]}")
-        return rec
+        return
 
     rec.stderr_summary = sproc.stderr.strip()
     if "Execution Receipt" in sproc.stderr:
@@ -185,6 +181,21 @@ def do_task(binary: Path, env: dict, index: int, fixture: Path, prompt: str) -> 
                 pass
     elif "no active task" in sproc.stderr.lower():
         rec.stop_ok = True  # safe no-op is a legitimate, documented outcome
+
+
+def do_task(binary: Path, env: dict, index: int, fixture: Path, prompt: str) -> TaskRecord:
+    session_id = f"corpus-{index}-{uuid.uuid4()}"
+    rec = TaskRecord(index=index, fixture=fixture.name, prompt=prompt, session_id=session_id)
+
+    if not _run_preflight(binary, env, rec, fixture, prompt):
+        return rec
+
+    _run_tool_calls(binary, env, rec, fixture)
+
+    # Simulate real elapsed "execution" time between preflight and stop.
+    time.sleep(random.uniform(0.05, 0.35))  # NOSONAR (see _run_tool_calls)
+
+    _run_stop(binary, env, rec)
     return rec
 
 
@@ -197,12 +208,17 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=1127)
     args = ap.parse_args()
 
-    random.seed(args.seed)
-    args.state_dir.mkdir(parents=True, exist_ok=True)
+    random.seed(args.seed)  # NOSONAR (see _run_tool_calls)
+    # NOSONAR: --state-dir/--out/--binary are trusted, operator-supplied
+    # local filesystem paths for this CLI evidence harness (same trust
+    # boundary as any argument to `cargo test`), not attacker-controlled
+    # input from a network-facing request; there is no path-traversal
+    # sink here to defend against.
+    args.state_dir.mkdir(parents=True, exist_ok=True)  # NOSONAR
     env = dict(os.environ)
     env["LIBRA_GOVERNOR_STATE_DIR"] = str(args.state_dir)
 
-    binary = args.binary.resolve()
+    binary = args.binary.resolve()  # NOSONAR
     if not binary.exists():
         print(f"binary not found: {binary}", file=sys.stderr)
         return 2
@@ -228,8 +244,8 @@ def main() -> int:
             "tasks_with_errors": sum(1 for r in records if r.errors),
         },
     }
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(out, indent=2))
+    args.out.parent.mkdir(parents=True, exist_ok=True)  # NOSONAR
+    args.out.write_text(json.dumps(out, indent=2))  # NOSONAR
     print(json.dumps(out["summary"], indent=2))
     return 0
 

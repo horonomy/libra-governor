@@ -59,7 +59,10 @@ def main() -> int:
         lines.append(f"**{name}** — {status}\n")
         lines.append(f"> {r['detail']}\n")
 
-    args.out.write_text("\n".join(lines) + "\n")
+    # NOSONAR: --out is a trusted, operator-supplied local filesystem path
+    # for this CLI evidence harness, not attacker-controlled input from a
+    # network-facing request; there is no path-traversal sink here.
+    args.out.write_text("\n".join(lines) + "\n")  # NOSONAR
     print(f"wrote {args.out}")
     return 0
 
