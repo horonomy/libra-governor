@@ -51,13 +51,27 @@ def proxy_wall_clock_seconds(
     return base * api_calls + per_1k * (tokens_sent + tokens_received) / 1000.0
 
 
-def fetch_all(cfg: Config, raw_dir: Path, include_optional: bool = False) -> None:
-    """Network step: list S3 prefixes, download+distill trajs, fetch results.json + HF metadata."""
+def fetch_all(
+    cfg: Config, raw_dir: Path, include_optional: bool = False, max_workers: int = 16
+) -> None:
+    """Network step: list S3 prefixes, download+distill trajs, fetch results.json + HF metadata.
+
+    Downloads within one submission are threaded (max_workers, default 16) --
+    each .traj GET is independent I/O against the same pooled Session, and
+    sequential single-connection fetching of ~2,900 objects across the 6
+    required submissions is impractically slow.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     for sub in all_submissions(cfg, include_optional=include_optional):
         name = sub["name"]
         objects = s3_trajs.list_prefix(f"verified/{name}/trajs/")
-        for obj in objects:
-            s3_trajs.fetch_distilled_traj(obj, name, raw_dir)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [
+                pool.submit(s3_trajs.fetch_distilled_traj, obj, name, raw_dir) for obj in objects
+            ]
+            for future in as_completed(futures):
+                future.result()  # surface any exception immediately
         swebench.fetch_results_json(name, raw_dir / "results")
     swebench.fetch_task_metadata(raw_dir / "metadata")
 
