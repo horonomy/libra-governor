@@ -120,28 +120,10 @@ def cmd_freeze_splits(args: argparse.Namespace) -> None:
         print(f"froze {name} -> {path}")
 
 
-def cmd_run(args: argparse.Namespace) -> None:
-    cfg = load_config(args.config)
-    if not DEFAULT_INTERIM_PARQUET.exists():
-        raise SystemExit(f"{DEFAULT_INTERIM_PARQUET} does not exist. Run `phase0 extract` first.")
-    df = pd.read_parquet(DEFAULT_INTERIM_PARQUET)
-
-    n_uncensored = int((~df["censored"]).sum()) if not df.empty else 0
-    min_required = int(cfg["min_uncensored_rows"])
-    if n_uncensored < min_required and not args.force:
-        raise SystemExit(
-            f"ESCALATION: only {n_uncensored} uncensored rows, below the "
-            f"min_uncensored_rows={min_required} threshold in configs/phase0.yaml. "
-            f"Per the HORO-1120 spec, this is a dataset-adequacy judgment for a "
-            f"human / HORO-1123, not something to route around. Stopping before "
-            f"model fitting. Pass --force to override for a debug run (results "
-            f"will still be tagged with the shortfall)."
-        )
-
-    run_output = runner.run_all(cfg, df, DEFAULT_SPLITS_DIR, DEFAULT_CACHE_DIR)
-
-    results = {
-        "schema_version": "1.0",
+def _build_run_and_dataset_blocks(
+    cfg, df: pd.DataFrame, n_uncensored: int, min_required: int
+) -> dict:
+    return {
         "run": {
             "seed": int(cfg["seed"]),
             "git_sha": _git_sha(),
@@ -167,14 +149,60 @@ def cmd_run(args: argparse.Namespace) -> None:
             "n_uncensored_rows": n_uncensored,
             "min_uncensored_rows": min_required,
         },
-        **run_output,
     }
 
+
+def _write_results(results: dict) -> None:
     DEFAULT_RESULTS_JSON.parent.mkdir(parents=True, exist_ok=True)
-    results = _json_sanitize(results)
+    sanitized = _json_sanitize(results)
     DEFAULT_RESULTS_JSON.write_text(
-        json.dumps(results, indent=2, sort_keys=True, allow_nan=False), encoding="utf-8"
+        json.dumps(sanitized, indent=2, sort_keys=True, allow_nan=False), encoding="utf-8"
     )
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    cfg = load_config(args.config)
+    if not DEFAULT_INTERIM_PARQUET.exists():
+        raise SystemExit(f"{DEFAULT_INTERIM_PARQUET} does not exist. Run `phase0 extract` first.")
+    df = pd.read_parquet(DEFAULT_INTERIM_PARQUET)
+
+    n_uncensored = int((~df["censored"]).sum()) if not df.empty else 0
+    min_required = int(cfg["min_uncensored_rows"])
+    run_and_dataset = _build_run_and_dataset_blocks(cfg, df, n_uncensored, min_required)
+
+    if n_uncensored < min_required and not args.force:
+        # Per spec: this is a dataset-adequacy judgment for HORO-1123, not
+        # something to route around by fitting models anyway. But an
+        # escalation still deserves a real, honest artifact -- not silence.
+        # Write run/dataset metadata (real censoring_rate, n_uncensored_rows,
+        # escalation_triggered: true) with EMPTY model-result arrays, so
+        # `phase0 report` can render the falsification-rule banner plus the
+        # escalation note ("NO EVIDENCE -- no matched candidate/taskclass_repo
+        # rows") instead of `phase0 run`/`phase0 report` leaving no artifact
+        # at all or silently fabricating fitted numbers.
+        results = {
+            "schema_version": "1.0",
+            **run_and_dataset,
+            "metrics": [],
+            "stratified": [],
+            "decision_utility": [],
+            "compute_cost": [],
+            "candidate_tuning": [],
+        }
+        _write_results(results)
+        raise SystemExit(
+            f"ESCALATION: only {n_uncensored} uncensored rows, below the "
+            f"min_uncensored_rows={min_required} threshold in configs/phase0.yaml. "
+            f"Wrote {DEFAULT_RESULTS_JSON} with dataset metadata and empty "
+            f"model-result arrays (no models fitted). Per the HORO-1120 spec, "
+            f"this is a dataset-adequacy judgment for a human / HORO-1123, "
+            f"not something to route around. Pass --force to override for a "
+            f"debug run (results will still be tagged with the shortfall)."
+        )
+
+    run_output = runner.run_all(cfg, df, DEFAULT_SPLITS_DIR, DEFAULT_CACHE_DIR)
+    results = {"schema_version": "1.0", **run_and_dataset, **run_output}
+    _write_results(results)
     print(f"run complete -> {DEFAULT_RESULTS_JSON}")
 
 
