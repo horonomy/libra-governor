@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use libra_governor_domain::{CompletionContract, TaskId};
+use libra_governor_domain::{CompletionContract, Confidence, Estimate, ExecutionReceipt, TaskId};
 use serde::{Deserialize, Serialize};
 
 /// A request envelope: a required, non-defaulted protocol version plus
@@ -43,18 +43,28 @@ pub enum Request {
     /// entirely from state the daemon already holds — never triggers new
     /// reconnaissance or any LLM call.
     Status,
-}
-
-/// How much the daemon trusts a produced [`PreflightResult`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Confidence {
-    /// Insufficient evidence: an explicit reason is carried on
-    /// [`ReconSummary::reason`] rather than silently expanding scope or
-    /// guessing confidently.
-    Low,
-    Medium,
-    High,
+    /// Fire-and-forget notification that a tool was invoked in
+    /// `session_id`. The daemon increments a per-session counter and
+    /// replies [`Response::Ack`]; it never records a full
+    /// `ExecutionEvent` or does any other work here, so this stays cheap
+    /// enough not to add perceptible latency to every tool call (see
+    /// `libra-governor-cli`'s `hook post-tool-use`, HORO-1126).
+    ToolInvoked {
+        session_id: String,
+        tool_name: String,
+    },
+    /// Ask the daemon to finalize the task bound to `session_id`: compute
+    /// elapsed duration, gather the tool-call count, and persist an
+    /// [`libra_governor_domain::ExecutionReceipt`]. Answered with
+    /// [`Response::Finalize`]. Sent from `hook stop`
+    /// (HORO-1126). `model`, if the harness's hook payload exposed one,
+    /// is recorded on the receipt as-is; harnesses that do not expose it
+    /// (see [`libra_governor_domain::ExecutionReceipt::provider`] docs)
+    /// leave it `None`.
+    Finalize {
+        session_id: String,
+        model: Option<String>,
+    },
 }
 
 /// Summary of one bounded reconnaissance run. Never contains raw file
@@ -91,11 +101,14 @@ pub struct PreflightResult {
     /// Wall-clock cost of the reconnaissance itself, in seconds — recon
     /// is not free and is accounted for explicitly.
     pub recon_cost_seconds: f64,
-    /// Placeholder for the probabilistic cost/time estimate HORO-1126
-    /// will compute. Always `None` as produced by this ticket's code;
-    /// the field exists so `PreflightResult` is structurally ready for
-    /// HORO-1126 to populate without another protocol version bump.
-    pub estimate: Option<serde_json::Value>,
+    /// The probabilistic cost/time estimate computed by
+    /// `libra-governor-estimator` from local `ExecutionReceipt` history
+    /// (HORO-1126). Structurally always `Some` in practice — even a
+    /// cold-start (zero local history) result is a real, honestly-flagged
+    /// [`Estimate`] (see [`Estimate::cold_start`]) rather than `None`; the
+    /// field stays `Option` only so a hand-built or historical
+    /// `PreflightResult` without one still deserializes.
+    pub estimate: Option<Estimate>,
 }
 
 /// The result of a `Status` request.
@@ -113,12 +126,69 @@ pub struct TaskSummary {
     pub recon_cost_seconds: f64,
 }
 
+/// The outcome of a `Finalize` request.
+///
+/// A plain `Option<FinalizeResult>` would leave "no active task for this
+/// session" and "task existed but its receipt somehow could not be built"
+/// indistinguishable from each other and from a deserialize bug; this
+/// enum keeps the no-active-task case an explicit, named, structurally
+/// impossible-to-confuse variant (see `hook stop`'s "safe no-op" edge
+/// case, HORO-1126).
+///
+/// Tagged `"state"`, not `"kind"`: this type is only ever carried inside
+/// [`Response::Finalize`]'s newtype variant, and [`Response`] is itself
+/// internally tagged with `"kind"`. Serde inserts an internally-tagged
+/// enum's tag key directly into its newtype-variant payload's own map,
+/// so tagging both enums `"kind"` would collide — the outer variant name
+/// (`"finalize"`) and this type's own discriminant would both try to
+/// occupy the same JSON key, producing a `{"kind":"finalize","kind":
+/// "no_active_task"}`-shaped object that fails to round-trip (a real bug
+/// hit and fixed during HORO-1126 development — see PR description).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum FinalizeOutcome {
+    /// `session_id` has no task bound to it — e.g. `Stop` fired with no
+    /// preceding `Preflight`/`UserPromptSubmit` for this session. Not an
+    /// error: finalizing is a safe no-op.
+    NoActiveTask,
+    /// Boxed: `FinalizeResult` embeds a full `ExecutionReceipt`, which
+    /// made this enum's largest variant ~336 bytes against `NoActiveTask`'s
+    /// zero — clippy's `large_enum_variant` lint. Boxing keeps every
+    /// `FinalizeOutcome` (and therefore every `Response`) the size of a
+    /// pointer regardless of which variant it holds.
+    Finalized(Box<FinalizeResult>),
+}
+
+/// The persisted receipt plus the original estimate it is being compared
+/// against, returned together so `hook stop` can render the
+/// estimate-vs-actual summary without a second round trip.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FinalizeResult {
+    pub receipt: ExecutionReceipt,
+    /// The estimate recorded on the plan this receipt's `plan_id` points
+    /// to, if the plan carried one (see [`Estimate::cold_start`] — even a
+    /// cold-start plan carries `Some`, so this is `None` only for a plan
+    /// predating HORO-1126, which cannot exist in a fresh MVP 1.0
+    /// deployment but could in a database upgraded in place).
+    pub estimate: Option<Estimate>,
+}
+
 /// One response the daemon may send back.
+///
+/// `Preflight` is boxed: `PreflightResult` (contract draft + recon
+/// summary + `Estimate`) is materially larger than every other variant,
+/// which would otherwise trip clippy's `large_enum_variant` lint on this
+/// enum the same way it did on [`FinalizeOutcome`] — see that type's
+/// docs for the underlying reasoning.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
-    Preflight(PreflightResult),
+    Preflight(Box<PreflightResult>),
     Status(StatusResult),
+    Finalize(FinalizeOutcome),
+    /// Acknowledges a fire-and-forget request (`ToolInvoked`) with no
+    /// further payload.
+    Ack,
     /// The daemon could not (or would not) answer the request — e.g. a
     /// protocol version mismatch, or an internal error it caught rather
     /// than let propagate as a crash.
@@ -197,5 +267,37 @@ mod tests {
             "field must serialize as null, not be omitted"
         );
         assert!(json["estimate"].is_null());
+    }
+
+    #[test]
+    fn finalize_outcome_no_active_task_round_trips() {
+        let outcome = FinalizeOutcome::NoActiveTask;
+        let json = serde_json::to_string(&outcome).unwrap();
+        let round_tripped: FinalizeOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(outcome, round_tripped);
+    }
+
+    #[test]
+    fn tool_invoked_request_round_trips() {
+        let request = Request::ToolInvoked {
+            session_id: "sess-1".to_string(),
+            tool_name: "Bash".to_string(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        let round_tripped: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(request, round_tripped);
+    }
+
+    #[test]
+    fn finalize_request_round_trips_with_and_without_model() {
+        for model in [None, Some("claude-sonnet-5".to_string())] {
+            let request = Request::Finalize {
+                session_id: "sess-1".to_string(),
+                model,
+            };
+            let json = serde_json::to_string(&request).unwrap();
+            let round_tripped: Request = serde_json::from_str(&json).unwrap();
+            assert_eq!(request, round_tripped);
+        }
     }
 }
