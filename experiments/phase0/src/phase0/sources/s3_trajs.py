@@ -20,9 +20,17 @@ from pathlib import Path
 from typing import Any
 
 import requests
+from requests.adapters import HTTPAdapter
 
 BUCKET_URL = "https://swe-bench-submissions.s3.amazonaws.com/"
 S3_NS = "{http://s3.amazonaws.com/doc/2006-03-01/}"
+
+# A single pooled Session per process: reusing TCP/TLS connections instead of
+# opening a fresh one per .traj GET is the difference between this fetch
+# taking minutes and taking hours -- with ~2,900 objects across the 6
+# required submissions, per-request handshake overhead dominates otherwise.
+_SESSION = requests.Session()
+_SESSION.mount("https://", HTTPAdapter(pool_connections=32, pool_maxsize=32, max_retries=2))
 
 
 @dataclass(frozen=True)
@@ -40,7 +48,7 @@ def list_prefix(prefix: str) -> list[S3Object]:
         params: dict[str, str] = {"list-type": "2", "prefix": prefix}
         if continuation_token:
             params["continuation-token"] = continuation_token
-        resp = requests.get(BUCKET_URL, params=params, timeout=30)
+        resp = _SESSION.get(BUCKET_URL, params=params, timeout=30)
         resp.raise_for_status()
         # Note: this XML is ListObjectsV2 output from AWS S3 itself (fixed
         # https://swe-bench-submissions.s3.amazonaws.com/ endpoint), not
@@ -85,7 +93,7 @@ def fetch_distilled_traj(obj: S3Object, submission: str, cache_dir: Path) -> dic
             return cached
 
     url = BUCKET_URL + obj.key
-    resp = requests.get(url, timeout=60)
+    resp = _SESSION.get(url, timeout=60)
     resp.raise_for_status()
     try:
         traj = json.loads(resp.text)
