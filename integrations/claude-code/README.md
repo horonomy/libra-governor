@@ -46,14 +46,22 @@ overall hooks/daemon responsibility boundary.
 
   Never spawns the daemon and never makes an LLM call of its own — see
   `crates/cli/src/statusline.rs`.
+- `libra-governor calibration report` — a manual command (not a hook):
+  asks the daemon for real duration-coverage and admission-replay
+  calibration evidence, computed over every locally recorded receipt
+  paired back to its originating estimate, and prints a human-readable
+  report to stdout. Honestly reports "insufficient data" rather than a
+  fabricated number when local history is thin — see
+  `libra-governor-estimator::calibration` docs.
 
 All four talk to the daemon over the versioned JSON-over-Unix-socket
-protocol defined in `crates/protocol` (bumped to version 2 in HORO-1126
-— see that crate's `lib.rs` docs for the upgrade caveat: a long-lived v1
-daemon must be restarted, it will not understand the new request
-variants). Everything about admission, reconnaissance, estimation, and
-the ledger stays local — see the Privacy Boundary section of
-`ARCHITECTURE.md`.
+protocol defined in `crates/protocol` (bumped to version 2 in HORO-1126,
+then to version 3 in HORO-1132 for the `CalibrationReport`
+request/response — see that crate's `lib.rs` docs for the upgrade
+caveat: a long-lived daemon on an older protocol version must be
+restarted, it will not understand a newer client's request variants).
+Everything about admission, reconnaissance, estimation, and the ledger
+stays local — see the Privacy Boundary section of `ARCHITECTURE.md`.
 
 ## What Claude Code's hook payloads actually expose (verified against
 ## the official hooks docs, HORO-1126)

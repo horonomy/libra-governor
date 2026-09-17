@@ -227,24 +227,48 @@ pub fn duration_coverage(pairs: &[CalibrationPair]) -> CoverageReport {
 /// Pairs whose estimate does not carry `threshold_quantile` (i.e.
 /// `threshold_quantile` is not one of [`CALIBRATION_QUANTILES`]) are
 /// excluded rather than guessed at.
+///
+/// Gated on the same [`REQUIRED_CALIBRATION_PAIRS`] floor as
+/// [`duration_coverage`]: an admit/false-admit *rate* computed from a
+/// handful of pairs is exactly the same false-positive-from-nothing
+/// shape this module exists to prevent for coverage — "1 admitted, 0
+/// false admits" from n=1 reads just as misleadingly confident as "100%
+/// coverage" from n=0. The real per-pair counting logic lives in
+/// [`admission_stats`], which the hand-computed fixture test below calls
+/// directly (bypassing this gate on purpose, since that test's whole
+/// point is to pin the counting logic itself on a small, human-checkable
+/// fixture).
 pub fn admission_replay(pairs: &[CalibrationPair], policy: AdmissionPolicy) -> AdmissionOutcome {
     let usable: Vec<&CalibrationPair> = pairs
         .iter()
         .filter(|p| quantile_value(&p.estimate, policy.threshold_quantile).is_some())
         .collect();
 
-    if usable.is_empty() {
-        return AdmissionOutcome::Insufficient { n: 0, required: 1 };
+    if usable.len() < REQUIRED_CALIBRATION_PAIRS {
+        return AdmissionOutcome::Insufficient {
+            n: usable.len(),
+            required: REQUIRED_CALIBRATION_PAIRS,
+        };
     }
 
+    AdmissionOutcome::Computed(admission_stats(&usable, policy))
+}
+
+/// The real per-pair admit/false-admit/false-reject counting, with no
+/// insufficient-data gate of its own — callers decide whether `pairs` is
+/// a large enough sample to trust. [`admission_replay`] is the gated
+/// public entry point; this exists as a separate function so the
+/// hand-computed small-fixture test can exercise the counting logic
+/// directly without needing 30 rows to satisfy that gate.
+fn admission_stats(pairs: &[&CalibrationPair], policy: AdmissionPolicy) -> AdmissionStats {
     let mut admit_count = 0usize;
     let mut false_admit_count = 0usize;
     let mut false_reject_count = 0usize;
     let mut overruns: Vec<f64> = Vec::new();
 
-    for pair in &usable {
+    for pair in pairs {
         let predicted = quantile_value(&pair.estimate, policy.threshold_quantile)
-            .expect("filtered to pairs carrying this quantile above");
+            .expect("caller filtered to pairs carrying this quantile");
         let admit = predicted <= policy.deadline_secs;
         let within_deadline = pair.actual_duration_secs <= policy.deadline_secs;
 
@@ -268,14 +292,14 @@ pub fn admission_replay(pairs: &[CalibrationPair], policy: AdmissionPolicy) -> A
         Some(crate::quantile_f64(&sorted, 0.95))
     };
 
-    AdmissionOutcome::Computed(AdmissionStats {
-        n: usable.len(),
+    AdmissionStats {
+        n: pairs.len(),
         admit_count,
         false_admit_count,
         false_reject_count,
         mean_overrun_secs,
         p95_overrun_secs,
-    })
+    }
 }
 
 fn mean(values: &[f64]) -> Option<f64> {
@@ -604,13 +628,51 @@ mod tests {
         );
         assert_eq!(
             outcome,
-            AdmissionOutcome::Insufficient { n: 0, required: 1 }
+            AdmissionOutcome::Insufficient {
+                n: 0,
+                required: REQUIRED_CALIBRATION_PAIRS,
+            }
+        );
+    }
+
+    /// The public `admission_replay` gate must never render a real-looking
+    /// admit/false-admit rate from a handful of pairs — the exact same
+    /// false-positive-from-nothing shape [`CoverageReport::Insufficient`]
+    /// prevents for coverage. A perfect "1 admitted, 0 false admits" from
+    /// n=1 would be just as misleading as "100% coverage" from n=0.
+    #[test]
+    fn admission_replay_below_the_required_floor_is_insufficient_even_with_real_data() {
+        let policy = AdmissionPolicy {
+            deadline_secs: 100,
+            threshold_quantile: 0.80,
+        };
+        let pairs: Vec<_> = (1..REQUIRED_CALIBRATION_PAIRS)
+            .map(|n| {
+                pair(
+                    computed_estimate(40, 80, 100, 10, BucketTier::Global),
+                    n as u64,
+                )
+            })
+            .collect();
+
+        let outcome = admission_replay(&pairs, policy);
+        assert_eq!(
+            outcome,
+            AdmissionOutcome::Insufficient {
+                n: REQUIRED_CALIBRATION_PAIRS - 1,
+                required: REQUIRED_CALIBRATION_PAIRS,
+            }
         );
     }
 
     /// Hand-computed false-admit/false-reject counts on a small (~6 row)
     /// fixture — verifiable by inspection, not by trusting the
-    /// implementation.
+    /// implementation. Calls the private `admission_stats` counting
+    /// function directly, bypassing `admission_replay`'s
+    /// `REQUIRED_CALIBRATION_PAIRS` gate on purpose: this test's whole
+    /// point is to pin the counting logic itself on a small,
+    /// human-checkable fixture, not to also satisfy the real-evidence
+    /// floor.
     ///
     /// Policy: deadline=100s, threshold_quantile=0.80.
     ///
@@ -636,7 +698,7 @@ mod tests {
             (50, 40),
             (100, 100),
         ];
-        let pairs: Vec<_> = rows
+        let owned_pairs: Vec<_> = rows
             .iter()
             .map(|&(p80, actual)| {
                 pair(
@@ -645,10 +707,9 @@ mod tests {
                 )
             })
             .collect();
+        let pairs: Vec<&CalibrationPair> = owned_pairs.iter().collect();
 
-        let AdmissionOutcome::Computed(stats) = admission_replay(&pairs, policy) else {
-            panic!("expected Computed outcome for 6 usable pairs");
-        };
+        let stats = admission_stats(&pairs, policy);
         assert_eq!(stats.n, 6);
         assert_eq!(stats.admit_count, 4, "rows 1,2,5,6 have p80 <= 100");
         assert_eq!(stats.false_admit_count, 1, "row 2 only");
@@ -672,7 +733,10 @@ mod tests {
         );
         assert_eq!(
             outcome,
-            AdmissionOutcome::Insufficient { n: 0, required: 1 }
+            AdmissionOutcome::Insufficient {
+                n: 0,
+                required: REQUIRED_CALIBRATION_PAIRS,
+            }
         );
     }
 

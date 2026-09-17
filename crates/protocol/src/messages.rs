@@ -341,4 +341,62 @@ mod tests {
             assert_eq!(request, round_tripped);
         }
     }
+
+    #[test]
+    fn calibration_report_request_round_trips() {
+        let request = Request::CalibrationReport;
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(json, r#"{"kind":"calibration_report"}"#);
+        let round_tripped: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(request, round_tripped);
+    }
+
+    /// `CalibrationReportResult` embeds two internally-tagged enums of its
+    /// own (`CoverageReport` and `AdmissionOutcome`, both tagged
+    /// `"state"`) inside `Response`'s own `"kind"`-tagged enum — precisely
+    /// the shape that produced a real tag-collision bug during HORO-1126
+    /// (see [`FinalizeOutcome`]'s docs). This round-trips a full envelope
+    /// with real `Computed` variants on both nested enums to prove they
+    /// nest without colliding.
+    #[test]
+    fn calibration_report_response_round_trips_through_a_full_envelope() {
+        use libra_governor_estimator::{AdmissionStats, QuantileCoverage};
+
+        let envelope = ResponseEnvelope {
+            protocol_version: 1,
+            response: Response::CalibrationReport(Box::new(CalibrationReportResult {
+                coverage: CoverageReport::Computed {
+                    n: 40,
+                    overall: vec![QuantileCoverage {
+                        quantile: 0.5,
+                        n: 40,
+                        hits: 20,
+                        empirical_coverage: Some(0.5),
+                        pinball_loss: Some(1.5),
+                    }],
+                    by_bucket_tier: vec![],
+                    by_sample_band: vec![],
+                },
+                admission: vec![AdmissionPolicyReport {
+                    policy: AdmissionPolicy {
+                        deadline_secs: 300,
+                        threshold_quantile: 0.80,
+                    },
+                    outcome: AdmissionOutcome::Computed(AdmissionStats {
+                        n: 40,
+                        admit_count: 30,
+                        false_admit_count: 2,
+                        false_reject_count: 1,
+                        mean_overrun_secs: Some(12.5),
+                        p95_overrun_secs: Some(40.0),
+                    }),
+                }],
+                dropped_rows: 3,
+            })),
+        };
+
+        let json = serde_json::to_string(&envelope).unwrap();
+        let round_tripped: ResponseEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(envelope, round_tripped);
+    }
 }
