@@ -13,6 +13,20 @@ import re
 
 import numpy as np
 import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
+
+CATEGORICAL_FEATURES: list[str] = ["repo", "model_id", "harness_id", "created_at_year_month"]
+NUMERIC_FEATURES: list[str] = [
+    "problem_statement_char_len",
+    "problem_statement_line_count",
+    "problem_statement_code_block_count",
+    "problem_statement_has_traceback",
+    "problem_statement_filepath_token_count",
+    "problem_statement_numeric_token_count",
+    "repo_prior_median_cost",
+    "repo_prior_n",
+]
 
 FEATURE_WHITELIST: list[str] = [
     "repo",
@@ -86,3 +100,47 @@ def add_repo_prior_features(
     out["repo_prior_median_cost"] = medians
     out["repo_prior_n"] = counts
     return out
+
+
+class FeatureEncoder:
+    """Numeric-encodes the whitelisted columns for the candidate/knn models.
+
+    One-hot encodes CATEGORICAL_FEATURES (fit on the training fold only, so
+    a category unseen in training maps to an all-zero row rather than
+    leaking test-fold categories back into the encoder) and passes
+    NUMERIC_FEATURES through unchanged. fit()/transform() only ever see
+    FEATURE_WHITELIST columns -- this is the boundary tests/test_leakage.py
+    checks against.
+    """
+
+    def __init__(self) -> None:
+        self._ct = ColumnTransformer(
+            transformers=[
+                (
+                    "cat",
+                    OneHotEncoder(handle_unknown="ignore", sparse_output=False),
+                    CATEGORICAL_FEATURES,
+                ),
+                ("num", "passthrough", NUMERIC_FEATURES),
+            ]
+        )
+        self._fitted = False
+        self.output_columns: list[str] = []
+
+    def fit(self, X: pd.DataFrame) -> "FeatureEncoder":
+        X = X[FEATURE_WHITELIST].copy()
+        X[NUMERIC_FEATURES] = X[NUMERIC_FEATURES].astype(float)
+        self._ct.fit(X)
+        cat_names = list(
+            self._ct.named_transformers_["cat"].get_feature_names_out(CATEGORICAL_FEATURES)
+        )
+        self.output_columns = cat_names + NUMERIC_FEATURES
+        self._fitted = True
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        assert self._fitted, "call fit() first"
+        X = X[FEATURE_WHITELIST].copy()
+        X[NUMERIC_FEATURES] = X[NUMERIC_FEATURES].astype(float)
+        arr = self._ct.transform(X)
+        return pd.DataFrame(arr, columns=self.output_columns, index=X.index)
