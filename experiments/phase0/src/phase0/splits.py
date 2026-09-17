@@ -105,7 +105,7 @@ def carve_calibration_slice(
     into both fit and calibration.
     """
     train_df = df[df["row_id"].isin(train_row_ids)]
-    groups = train_df[group_col].unique()
+    groups = np.array(train_df[group_col].unique().tolist(), dtype=object)
     rng = np.random.default_rng(seed)
     rng.shuffle(groups)
     n_cal_groups = max(1, int(round(len(groups) * calibration_fraction)))
