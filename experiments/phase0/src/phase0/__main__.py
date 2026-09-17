@@ -9,11 +9,14 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import math
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from phase0 import pipeline, report, runner, splits
@@ -59,6 +62,28 @@ def _package_versions() -> dict[str, str]:
         except importlib.metadata.PackageNotFoundError:
             versions[pkg] = "unknown"
     return versions
+
+
+def _json_sanitize(value: Any) -> Any:
+    """Recursively converts numpy scalars to native Python and non-finite
+    floats (NaN/Inf) to None, so json.dumps produces strict, valid JSON.
+    Non-finite floats and numpy scalar types are both guaranteed to occur in
+    this artifact (e.g. coverage_censored on an empty stratum, np.float64
+    metric values) -- this is not a defensive no-op.
+    """
+    if isinstance(value, dict):
+        return {k: _json_sanitize(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_sanitize(v) for v in value]
+    if isinstance(value, (np.floating,)):
+        value = float(value)
+    elif isinstance(value, (np.integer,)):
+        return int(value)
+    elif isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
 
 
 def cmd_fetch(args: argparse.Namespace) -> None:
@@ -146,7 +171,10 @@ def cmd_run(args: argparse.Namespace) -> None:
     }
 
     DEFAULT_RESULTS_JSON.parent.mkdir(parents=True, exist_ok=True)
-    DEFAULT_RESULTS_JSON.write_text(json.dumps(results, indent=2, sort_keys=True), encoding="utf-8")
+    results = _json_sanitize(results)
+    DEFAULT_RESULTS_JSON.write_text(
+        json.dumps(results, indent=2, sort_keys=True, allow_nan=False), encoding="utf-8"
+    )
     print(f"run complete -> {DEFAULT_RESULTS_JSON}")
 
 
