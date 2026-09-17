@@ -88,6 +88,13 @@ def add_repo_prior_features(
     the global training-fold median with repo_prior_n = 0 -- this is the
     documented cold-start degradation, not a bug: it must never emit NaN
     into the candidate/knn models.
+
+    Note: the column is always named `repo_prior_median_cost` regardless of
+    `target_col` -- when the runner calls this for the secondary
+    (wall_clock_seconds) target, the column holds a median of *seconds*, not
+    cost. The name is a leftover from the primary-target case; harmless
+    (it's just a feature value to the model) but don't read the column name
+    as a unit guarantee.
     """
     out = df.copy()
     train_df = df.loc[train_mask]
