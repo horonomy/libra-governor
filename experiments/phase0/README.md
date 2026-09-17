@@ -43,9 +43,11 @@ limitations.
 - `data/splits/{cold_start,history_assisted}.json` -- committed, frozen
   GroupKFold(5) splits with a content hash. `phase0 run` hard-errors if these
   are missing or have been hand-edited after freezing.
-- `data/cache/llm_selfestimate.json` -- committed. See PROVENANCE.md; this is
-  an honestly-labeled synthetic fixture, not real LLM output (no LLM API
-  access was available while building this harness).
+- `data/cache/llm_selfestimate.json` -- **not committed**. No LLM API access
+  was available while building this harness, so there is no real
+  self-estimate data to cache; every `llm_self_estimate` row in the results
+  artifact is `status: "unavailable"` rather than a fabricated fixture. See
+  PROVENANCE.md.
 - `results/phase0_results.json` / `results/phase0_report.md` -- committed
   output artifacts.
 - `tests/fixtures/mini.parquet` -- a small, deterministic, synthetic fixture

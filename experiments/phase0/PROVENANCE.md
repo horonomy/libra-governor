@@ -52,16 +52,19 @@ metrics are reported both aggregate and stratified (`resolved` /
 `unresolved` / `exit_cost` as a distinct third stratum, not folded into
 `unresolved`) so this bias is visible rather than averaged away.
 
-## `llm_self_estimate` fixture
+## `llm_self_estimate` baseline: status "unavailable"
 
-`data/cache/llm_selfestimate.json` is a **synthetic, honestly-labeled
-fixture**, not real LLM self-estimate output. No LLM API access was
-available while building this harness. It is keyed by `instance_id` (the
-`(instance_id, prompt_sha256, model_id)` composite key from the spec falls
-back to a bare `instance_id` lookup, per `LLMSelfEstimateEstimator`), with a
-`_meta` marker documenting its synthetic status. Any instance not present in
-the cache produces a `status: "unavailable"` row in the results artifact --
-never a fabricated prediction.
+No LLM API access was available while building this harness, so
+`data/cache/llm_selfestimate.json` is **not committed** -- there is no real
+self-estimate data to cache, and the spec is explicit that a synthetic
+fixture standing in for real LLM output is not an acceptable alternative
+("do NOT fabricate fake 'real' LLM responses"). `LLMSelfEstimateEstimator`
+already handles a missing cache file correctly: every row for this baseline
+comes back `status: "unavailable"` in `results/phase0_results.json`, never a
+fabricated or silently-skipped prediction. Populating this cache with real
+cached LLM responses (keyed by `(instance_id, prompt_sha256, model_id)`,
+per `LLMSelfEstimateEstimator.cache_key`) is future work once API access is
+available, not part of this Phase 0 evidence.
 
 ## Known limitations
 
