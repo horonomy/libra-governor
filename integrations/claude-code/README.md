@@ -1,21 +1,42 @@
 # Claude Code integration
 
-The first real Claude Code integration (HORO-1125): a submitted prompt
-triggers the local Governor daemon to run bounded, read-only
+HORO-1125 shipped the first real Claude Code integration: a submitted
+prompt triggers the local Governor daemon to run bounded, read-only
 reconnaissance and produce a preflight result (a draft Completion
-Contract, plus a placeholder the probabilistic cost/time estimator —
-HORO-1126 — will fill in) surfaced inside Claude Code's own context, and
-a one-line statusline showing the daemon's current state. See
+Contract) surfaced inside Claude Code's own context, plus a one-line
+statusline showing the daemon's current state. HORO-1126 closes the loop:
+the preflight now carries a real probabilistic P50/P80/P90 cost/time
+[`Estimate`](../../crates/domain/src/estimate.rs), tool calls are counted
+during the session, and a `Stop` hook finalizes the session's task into
+an [`ExecutionReceipt`](../../crates/domain/src/execution_receipt.rs) —
+the estimate-vs-actual record used for calibration. See
 [`../../ARCHITECTURE.md`](../../ARCHITECTURE.md) for how this fits the
 overall hooks/daemon responsibility boundary.
 
-## What ships in this ticket
+## What ships
 
 - `libra-governor hook user-prompt-submit` — a `UserPromptSubmit` hook
   command. Reads the hook JSON payload from stdin, asks the daemon
-  (starting it if not already running) for a preflight, and prints a
+  (starting it if not already running) for a preflight — now including a
+  real `Estimate` (P50/P80/P90 duration and resource quantiles, computed
+  by `libra-governor-estimator` from local `ExecutionReceipt` history;
+  see cold-start handling below) — and prints a
   `hookSpecificOutput.additionalContext` JSON object so Claude Code
   injects the preflight summary into its own context window.
+- `libra-governor hook post-tool-use` — a `PostToolUse` hook command.
+  Fires a cheap, fire-and-forget notification at the daemon to increment
+  a per-session tool-call counter. Never spawns the daemon and never
+  waits for its response (see `crates/cli/src/client.rs::fire_and_forget`
+  docs) — this must not add perceptible latency to every tool call.
+- `libra-governor hook stop` — a `Stop` hook command. Asks the daemon to
+  finalize the session's task: compute elapsed wall-clock duration
+  (from the session's first `Preflight`), gather the tool-call count,
+  and persist an `ExecutionReceipt` with `outcome: Unknown` (MVP 1.0 has
+  no automated Completion Contract verification — see "What this
+  integration intentionally does not do" below). Prints a concise
+  Estimate-vs-Actual summary to **stderr** (never stdout, which stays
+  reserved for the hook protocol); a safe no-op when the session never
+  had a preceding preflight.
 - `libra-governor statusline` — a `statusLine` command. Reads the
   daemon's current task/preflight state and prints one short line, e.g.:
 
@@ -26,10 +47,25 @@ overall hooks/daemon responsibility boundary.
   Never spawns the daemon and never makes an LLM call of its own — see
   `crates/cli/src/statusline.rs`.
 
-Both talk to the daemon over the versioned JSON-over-Unix-socket
-protocol defined in `crates/protocol`. Everything about admission,
-reconnaissance, and the ledger stays local — see the Privacy Boundary
-section of `ARCHITECTURE.md`.
+All four talk to the daemon over the versioned JSON-over-Unix-socket
+protocol defined in `crates/protocol` (bumped to version 2 in HORO-1126
+— see that crate's `lib.rs` docs for the upgrade caveat: a long-lived v1
+daemon must be restarted, it will not understand the new request
+variants). Everything about admission, reconnaissance, estimation, and
+the ledger stays local — see the Privacy Boundary section of
+`ARCHITECTURE.md`.
+
+## What Claude Code's hook payloads actually expose (verified against
+## the official hooks docs, HORO-1126)
+
+- `Stop` and `PostToolUse` payloads both include a `model` field (the
+  canonical model name) — `hook stop` parses and records it on the
+  receipt when present.
+- Neither payload exposes a provider identifier, token counts, or
+  cost/spend data. `ExecutionReceipt.provider` is therefore always `None`
+  today, and `actual_usage` is always an empty list — an honest "unknown"
+  rather than a fabricated zero-cost figure. See
+  `crates/domain/src/execution_receipt.rs` field docs.
 
 ## Setup
 
@@ -53,6 +89,26 @@ Add the following to `.claude/settings.json` (project-level) or
           {
             "type": "command",
             "command": "/absolute/path/to/libra-governor hook user-prompt-submit"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/libra-governor hook post-tool-use"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/libra-governor hook stop"
           }
         ]
       }
@@ -141,10 +197,22 @@ binary as a subprocess) and `crates/daemon/tests/preflight_integration.rs`
 
 ## What this integration intentionally does not do (yet)
 
-- No cost/time estimate — `PreflightResult.estimate` is always `None`
-  here; the math lands in HORO-1126.
+- No automated Completion Contract verification — `hook stop` always
+  records `ExecutionOutcome::Unknown`. MVP 1.0 has no test-running
+  integration; a task is never inferred "done" merely because the model
+  stopped talking. Future scope.
 - No hard budget enforcement or blocking of execution — MVP 1.0 is
-  advisory only.
+  advisory only, on every hook including `Stop` (no `{"decision":
+  "block", ...}` is ever emitted).
+- No task classification — the estimator's class-bucketed-history tier
+  is implemented and unit-tested in `libra-governor-estimator`, but no
+  caller supplies a class yet (nothing in the schema classifies tasks).
+  Every MVP 1.0 estimate comes from the global-local-history or
+  cold-start tier. See that crate's docs.
+- No cross-session task finalization — `resolve_or_create_task_for_session`
+  already maps each distinct `session_id` to its own `TaskId`, so `hook
+  stop` finalizes per-session/per-task; there is no multi-session merge
+  to get wrong.
 - No MCP server or skill command — out of scope for this ticket; the
   hook + statusline path above is the required integration surface.
 - No Completion Contract correction UX — the draft is produced and

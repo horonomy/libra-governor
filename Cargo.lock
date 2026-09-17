@@ -167,11 +167,13 @@ version = "0.0.0"
 dependencies = [
  "libra-governor-daemon",
  "libra-governor-domain",
+ "libra-governor-ledger",
  "libra-governor-protocol",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
+ "time",
 ]
 
 [[package]]
@@ -179,6 +181,7 @@ name = "libra-governor-daemon"
 version = "0.0.0"
 dependencies = [
  "libra-governor-domain",
+ "libra-governor-estimator",
  "libra-governor-ledger",
  "libra-governor-protocol",
  "serde_json",
@@ -199,6 +202,10 @@ dependencies = [
 [[package]]
 name = "libra-governor-estimator"
 version = "0.0.0"
+dependencies = [
+ "libra-governor-domain",
+ "time",
+]
 
 [[package]]
 name = "libra-governor-ledger"
