@@ -8,6 +8,9 @@ description = "Libra Governor: estimator crate — self-calibrating empirical-qu
 
 [dependencies]
 libra-governor-domain = { path = "../domain" }
+libra-governor-ledger = { path = "../ledger" }
+serde.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 time.workspace = true
