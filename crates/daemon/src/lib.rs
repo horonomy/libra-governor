@@ -1,20 +1,11 @@
-//! Placeholder crate for `libra-governor-daemon`.
+//! `libra-governor-daemon` — the local long-running Governor daemon:
+//! Unix-socket server, bounded reconnaissance, and Completion Contract
+//! drafting.
 //!
-//! The daemon is the source-of-truth state machine, ledger, and policy
-//! engine for the Governor. This crate is currently a bootstrap scaffold
-//! (HORO-1118) with no real logic.
+//! See `ARCHITECTURE.md` for how this fits the overall system shape:
+//! Claude Code hooks/statusline talk to this daemon over the protocol
+//! defined in `libra-governor-protocol`; the daemon is the only
+//! component that reads the repository or writes to the ledger.
 
-/// Returns the crate name, confirming the crate builds and links.
-pub fn placeholder() -> &'static str {
-    "daemon"
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn placeholder_returns_crate_name() {
-        assert_eq!(placeholder(), "daemon");
-    }
-}
+pub mod log;
+pub mod paths;

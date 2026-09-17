@@ -4,6 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Libra Governor: local daemon (state machine / ledger / policy). Placeholder scaffold, no logic yet."
+description = "Libra Governor: local daemon — Unix-socket server, bounded reconnaissance, and Completion Contract drafting."
 
 [dependencies]
+libra-governor-domain = { path = "../domain" }
+libra-governor-ledger = { path = "../ledger" }
+libra-governor-protocol = { path = "../protocol" }
+serde_json.workspace = true
+time.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
