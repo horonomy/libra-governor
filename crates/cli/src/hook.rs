@@ -21,7 +21,7 @@ use libra_governor_domain::Estimate;
 use libra_governor_protocol::{Confidence, PreflightResult, Request, Response};
 use serde::Deserialize;
 
-use crate::client;
+use crate::{bucket_prose::describe_bucket_tier, client};
 
 /// The subset of the Claude Code `UserPromptSubmit` hook payload this
 /// integration needs. Extra fields (`transcript_path`,
@@ -161,12 +161,13 @@ fn format_estimate_summary(estimate: Option<&Estimate>) -> String {
                 .unwrap_or("insufficient local history")
         ),
         Some(estimate) => format!(
-            "Cost/time estimate: P50 {}s / P90 {}s (confidence: {:?}, n={}, estimator {}).",
+            "Cost/time estimate: P50 {}s / P90 {}s (confidence: {:?}, n={}, estimator {}, {}).",
             estimate.duration_p50_secs.unwrap_or(0),
             estimate.duration_p90_secs.unwrap_or(0),
             estimate.confidence,
             estimate.sample_count,
             estimate.estimator_version,
+            describe_bucket_tier(estimate.bucket_tier, estimate.sample_count),
         ),
     }
 }
