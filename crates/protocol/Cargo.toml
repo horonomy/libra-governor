@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Libra Governor: protocol crate (placeholder scaffold, no logic yet)."
+description = "Libra Governor: protocol crate — versioned daemon IPC request/response types and wire framing."
 
 [dependencies]
+libra-governor-domain = { path = "../domain" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]

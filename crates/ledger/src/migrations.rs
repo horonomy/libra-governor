@@ -18,10 +18,16 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: include_str!("../migrations/0001_init.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: include_str!("../migrations/0001_init.sql"),
+    },
+    Migration {
+        version: 2,
+        sql: include_str!("../migrations/0002_session_preflight_state.sql"),
+    },
+];
 
 /// Applies every migration whose version is greater than the database's
 /// current recorded version, in ascending order. Safe to call on every
@@ -70,13 +76,17 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, MIGRATIONS.last().unwrap().version);
 
         let applied_rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(applied_rows, 1, "migration 1 must be recorded exactly once");
+        assert_eq!(
+            applied_rows,
+            MIGRATIONS.len() as i64,
+            "each migration must be recorded exactly once"
+        );
     }
 }
