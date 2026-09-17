@@ -164,10 +164,28 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 [[package]]
 name = "libra-governor-cli"
 version = "0.0.0"
+dependencies = [
+ "libra-governor-daemon",
+ "libra-governor-domain",
+ "libra-governor-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
 
 [[package]]
 name = "libra-governor-daemon"
 version = "0.0.0"
+dependencies = [
+ "libra-governor-domain",
+ "libra-governor-ledger",
+ "libra-governor-protocol",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "time",
+]
 
 [[package]]
 name = "libra-governor-domain"
@@ -198,6 +216,12 @@ dependencies = [
 [[package]]
 name = "libra-governor-protocol"
 version = "0.0.0"
+dependencies = [
+ "libra-governor-domain",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "libsqlite3-sys"
