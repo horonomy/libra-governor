@@ -125,12 +125,29 @@ def receipt_count(ledger_path: Path) -> int:
         conn.close()
 
 
+def _resolve_within(base: Path, *parts: str) -> Path:
+    """Join ``parts`` onto ``base``, resolve the result, and assert it
+    still resolves inside ``base`` before any caller passes it to a
+    filesystem sink (mkdir/open/extractall).
+
+    Guards SonarCloud pythonsecurity:S8707 for every path derived from
+    the externally-supplied ``--work-root`` CLI argument: ``base`` is
+    validated once, up front, in ``main()`` (resolved to an absolute
+    canonical path); every path built from it in this harness is
+    constrained here to stay inside that trusted root.
+    """
+    candidate = base.joinpath(*parts).resolve()
+    if candidate != base and base not in candidate.parents:
+        raise ValueError(f"path must resolve inside {base}: {candidate}")
+    return candidate
+
+
 def new_profile(tag: str, work_root: Path) -> dict:
     """A fresh fake-$HOME profile: isolated $HOME, cargo registry/git
     symlinked to the real cache (network-cache reuse only -- the install
     root itself, $FAKE_HOME/.cargo/bin, is genuinely fresh), everything
     else genuinely isolated."""
-    fake_home = work_root / f"home-{tag}"
+    fake_home = _resolve_within(work_root, f"home-{tag}")
     if fake_home.exists():
         shutil.rmtree(fake_home)
     fake_home.mkdir(parents=True)
@@ -170,7 +187,13 @@ def main():
     ap.add_argument("--scenario", default="all")
     args = ap.parse_args()
 
-    work_root = Path(args.work_root)
+    # SonarCloud pythonsecurity:S8707: --work-root is an externally
+    # supplied CLI argument reaching filesystem mkdir/open/extractall
+    # sinks throughout this harness. Resolve it once, here, to an
+    # absolute canonical path -- every path built from it downstream
+    # (new_profile's fake_home, item 7's old_src/archive_path) is then
+    # constrained via _resolve_within() to stay inside this root.
+    work_root = Path(args.work_root).resolve()
     work_root.mkdir(parents=True, exist_ok=True)
     RESULTS.mkdir(parents=True, exist_ok=True)
 
@@ -361,11 +384,11 @@ def main():
         upgrade_lines.append("SKIPPED: tag mvp-3.0 not found in this repository; genuinely infeasible.")
         record("item7_upgrade", None, "tag mvp-3.0 not found")
     else:
-        old_src = work_root / "old-mvp-3.0-src"
+        old_src = _resolve_within(work_root, "old-mvp-3.0-src")
         if old_src.exists():
             shutil.rmtree(old_src)
         old_src.mkdir(parents=True)
-        archive_path = work_root / "mvp-3.0.tar"
+        archive_path = _resolve_within(work_root, "mvp-3.0.tar")
         with open(archive_path, "wb") as f:
             arch_proc = subprocess.run(["git", "archive", "mvp-3.0"], cwd=str(REPO_ROOT), stdout=f)
         upgrade_lines.append(f"git archive mvp-3.0 exit={arch_proc.returncode}")
