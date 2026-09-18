@@ -27,8 +27,8 @@ pub use libra_governor_estimator::{
 };
 pub use messages::{
     AdmissionPolicyReport, CalibrationReportResult, FinalizeOutcome, FinalizeResult,
-    PreflightResult, ReconSummary, Request, RequestEnvelope, Response, ResponseEnvelope,
-    StatusResult, TaskSummary,
+    PreflightResult, ReconSummary, ReplanState, Request, RequestEnvelope, Response,
+    ResponseEnvelope, StatusResult, TaskSummary,
 };
 
 /// The protocol version this build of the crate speaks. Bump on any
@@ -46,4 +46,10 @@ pub use messages::{
 /// `Response` gained the matching `CalibrationReport` variant. Same known
 /// limitation as the 1 -> 2 bump: a long-lived v2 daemon must be
 /// restarted after upgrading.
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// Bumped 3 -> 4 for HORO-1139: `PreflightResult` gained `plan_id` and
+/// `TaskSummary` gained `plan_id`/`remaining_estimate`/`replan_state` —
+/// a v3 client would silently fail to deserialize these new required
+/// fields. Same known limitation as the earlier bumps: a long-lived v3
+/// daemon must be restarted after upgrading.
+pub const PROTOCOL_VERSION: u32 = 4;

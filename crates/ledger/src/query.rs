@@ -1,7 +1,7 @@
 use libra_governor_domain::{
     CompletionContract, CompletionCriterion, Estimate, ExecutionEvent, ExecutionEventKind,
-    ExecutionOutcome, ExecutionPlan, ExecutionReceipt, ExternalRef, PlanId, ResourceAmount,
-    TaskFeatures, TaskId, TaskIdentity,
+    ExecutionOutcome, ExecutionPlan, ExecutionReceipt, ExternalRef, PlanId, ReplanId, ReplanReason,
+    ReplanRecord, ResourceAmount, TaskFeatures, TaskId, TaskIdentity,
 };
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -38,7 +38,7 @@ fn parse_task_features(json: Option<String>) -> Result<Option<TaskFeatures>, Led
 
 /// Raw `plans` row shape for [`LedgerStore::get_plan`]: `(task_id,
 /// contract_revision, recon_snapshot_ref, created_at, estimate_json,
-/// task_features_json)`.
+/// task_features_json, replaces_plan_id, replan_reason_json)`.
 type PlanRow = (
     String,
     i64,
@@ -46,7 +46,27 @@ type PlanRow = (
     String,
     Option<String>,
     Option<String>,
+    Option<String>,
+    Option<String>,
 );
+
+/// Deserializes a nullable `replan_reason_json` column value.
+fn parse_replan_reason(json: Option<String>) -> Result<Option<ReplanReason>, LedgerError> {
+    json.map(|s| serde_json::from_str(&s))
+        .transpose()
+        .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))
+}
+
+/// Parses a nullable `replaces_plan_id` column value into an
+/// `Option<PlanId>`.
+fn parse_plan_id(id: Option<String>) -> Result<Option<PlanId>, LedgerError> {
+    id.map(|s| {
+        Uuid::parse_str(&s)
+            .map(PlanId)
+            .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))
+    })
+    .transpose()
+}
 
 impl LedgerStore {
     /// Reconstructs one task's full trajectory: identity, ordered events,
@@ -156,23 +176,19 @@ impl LedgerStore {
         task_id: TaskId,
     ) -> Result<Vec<ExecutionPlan>, LedgerError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, contract_revision, recon_snapshot_ref, created_at, estimate_json, task_features_json
+            "SELECT id, contract_revision, recon_snapshot_ref, created_at, estimate_json, task_features_json, replaces_plan_id, replan_reason_json
              FROM plans WHERE task_id = ?1 ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map([task_id_str], |row| {
-            let id: String = row.get(0)?;
-            let contract_revision: i64 = row.get(1)?;
-            let recon_snapshot_ref: Option<String> = row.get(2)?;
-            let created_at: String = row.get(3)?;
-            let estimate_json: Option<String> = row.get(4)?;
-            let task_features_json: Option<String> = row.get(5)?;
             Ok((
-                id,
-                contract_revision,
-                recon_snapshot_ref,
-                created_at,
-                estimate_json,
-                task_features_json,
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })?;
 
@@ -185,6 +201,8 @@ impl LedgerStore {
                 created_at,
                 estimate_json,
                 task_features_json,
+                replaces_plan_id,
+                replan_reason_json,
             ) = row?;
             let id = Uuid::parse_str(&id)
                 .map(PlanId)
@@ -202,6 +220,8 @@ impl LedgerStore {
                 created_at: parse_time(&created_at)?,
                 estimate,
                 task_features,
+                replaces: parse_plan_id(replaces_plan_id)?,
+                replan_reason: parse_replan_reason(replan_reason_json)?,
             });
         }
         Ok(plans)
@@ -288,7 +308,7 @@ impl LedgerStore {
         let row: Option<PlanRow> = self
             .conn
             .query_row(
-                "SELECT task_id, contract_revision, recon_snapshot_ref, created_at, estimate_json, task_features_json
+                "SELECT task_id, contract_revision, recon_snapshot_ref, created_at, estimate_json, task_features_json, replaces_plan_id, replan_reason_json
                  FROM plans WHERE id = ?1",
                 [&plan_id_str],
                 |row| {
@@ -299,6 +319,8 @@ impl LedgerStore {
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
                     ))
                 },
             )
@@ -311,6 +333,8 @@ impl LedgerStore {
             created_at,
             estimate_json,
             task_features_json,
+            replaces_plan_id,
+            replan_reason_json,
         )) = row
         else {
             return Ok(None);
@@ -333,7 +357,60 @@ impl LedgerStore {
             created_at: parse_time(&created_at)?,
             estimate,
             task_features,
+            replaces: parse_plan_id(replaces_plan_id)?,
+            replan_reason: parse_replan_reason(replan_reason_json)?,
         }))
+    }
+
+    /// Returns every [`ReplanRecord`] persisted for `task_id`, ordered
+    /// oldest-first (HORO-1139) — a task's full replan history, queryable
+    /// without reconstructing it from `plans` rows.
+    pub fn replan_history_for_task(
+        &self,
+        task_id: TaskId,
+    ) -> Result<Vec<ReplanRecord>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, prior_plan_id, new_plan_id, trigger, detail, remaining_estimate_json, created_at
+             FROM replan_events WHERE task_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([task_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            let (id, prior_plan_id, new_plan_id, trigger_json, detail, remaining_json, created_at) =
+                row?;
+            records.push(ReplanRecord {
+                id: Uuid::parse_str(&id)
+                    .map(ReplanId)
+                    .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?,
+                task_id,
+                prior_plan_id: Uuid::parse_str(&prior_plan_id)
+                    .map(PlanId)
+                    .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?,
+                new_plan_id: Uuid::parse_str(&new_plan_id)
+                    .map(PlanId)
+                    .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?,
+                reason: ReplanReason {
+                    trigger: serde_json::from_str(&trigger_json)
+                        .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?,
+                    detail,
+                },
+                remaining_estimate: serde_json::from_str(&remaining_json)
+                    .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?,
+                created_at: parse_time(&created_at)?,
+            });
+        }
+        Ok(records)
     }
 
     /// Returns the currently `in_flight` plan for `session_id`, if any.
@@ -635,5 +712,115 @@ mod calibration_pairs_tests {
         let (pairs, dropped) = store.calibration_pairs().unwrap();
         assert_eq!(pairs.len(), 2);
         assert_eq!(dropped, 2);
+    }
+}
+
+#[cfg(test)]
+mod replan_persistence_tests {
+    use super::*;
+    use libra_governor_domain::{
+        CompletionCriterion, Confidence, RemainingEstimate, ReplanTriggerKind, TaskIdentity,
+    };
+
+    fn now() -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH
+    }
+
+    fn seed_plan(store: &mut LedgerStore) -> (TaskId, ExecutionPlan) {
+        let identity = TaskIdentity::new(None);
+        store.insert_task(&identity, now()).unwrap();
+        let contract = CompletionContract::first(vec![CompletionCriterion::required("c")]);
+        store
+            .insert_contract(identity.id, &contract, now())
+            .unwrap();
+        let plan = ExecutionPlan::new(identity.id, contract.revision, None, now());
+        store.insert_plan(&plan).unwrap();
+        (identity.id, plan)
+    }
+
+    fn sample_remaining_estimate() -> RemainingEstimate {
+        RemainingEstimate::from_bucketed(Estimate {
+            duration_p50_secs: Some(30),
+            duration_p80_secs: Some(50),
+            duration_p90_secs: Some(60),
+            resource_p50: None,
+            resource_p80: None,
+            resource_p90: None,
+            confidence: Confidence::Medium,
+            sample_count: 8,
+            cold_start: false,
+            estimator_version: "v3-tiered-confidence".to_string(),
+            reason: None,
+            feature_schema_version: "fs-v1".to_string(),
+            bucket_tier: libra_governor_domain::BucketTier::Global,
+        })
+    }
+
+    #[test]
+    fn a_replanned_plan_persists_its_linkage_and_round_trips() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let (task_id, prior) = seed_plan(&mut store);
+
+        let reason = ReplanReason::new(
+            ReplanTriggerKind::ToolCallCountExceeded,
+            "n=17 vs typical 6",
+        );
+        let new_plan = ExecutionPlan::new(task_id, prior.contract_revision, None, now())
+            .with_estimate(sample_remaining_estimate().estimate.clone())
+            .with_replan_linkage(prior.id, reason.clone());
+        store.insert_plan(&new_plan).unwrap();
+
+        let fetched = store.get_plan(new_plan.id).unwrap().expect("plan exists");
+        assert_eq!(fetched.replaces, Some(prior.id));
+        assert_eq!(fetched.replan_reason, Some(reason));
+    }
+
+    #[test]
+    fn an_original_plan_carries_no_replan_linkage_after_round_tripping() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let (_task_id, plan) = seed_plan(&mut store);
+
+        let fetched = store.get_plan(plan.id).unwrap().expect("plan exists");
+        assert_eq!(fetched.replaces, None);
+        assert_eq!(fetched.replan_reason, None);
+    }
+
+    #[test]
+    fn replan_history_for_task_is_empty_before_any_replan() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let (task_id, _plan) = seed_plan(&mut store);
+        assert_eq!(store.replan_history_for_task(task_id).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn replan_history_for_task_is_queryable_after_a_replan_event() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let (task_id, prior) = seed_plan(&mut store);
+
+        let reason = ReplanReason::new(ReplanTriggerKind::PossibleToolLoop, "4x Bash in a row");
+        let new_plan = ExecutionPlan::new(task_id, prior.contract_revision, None, now())
+            .with_replan_linkage(prior.id, reason.clone());
+        store.insert_plan(&new_plan).unwrap();
+
+        let record = libra_governor_domain::ReplanRecord {
+            id: libra_governor_domain::ReplanId::new(),
+            task_id,
+            prior_plan_id: prior.id,
+            new_plan_id: new_plan.id,
+            reason: reason.clone(),
+            remaining_estimate: sample_remaining_estimate(),
+            created_at: now(),
+        };
+        store.insert_replan_event(&record).unwrap();
+
+        let history = store.replan_history_for_task(task_id).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].prior_plan_id, prior.id);
+        assert_eq!(history[0].new_plan_id, new_plan.id);
+        assert_eq!(
+            history[0].reason.trigger,
+            ReplanTriggerKind::PossibleToolLoop
+        );
+        assert_eq!(history[0].reason.detail, reason.detail);
     }
 }

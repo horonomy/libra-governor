@@ -191,12 +191,13 @@ fn print_context(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libra_governor_domain::{CompletionContract, CompletionCriterion, TaskId};
+    use libra_governor_domain::{CompletionContract, CompletionCriterion, PlanId, TaskId};
     use libra_governor_protocol::ReconSummary;
 
     fn sample_preflight_result() -> PreflightResult {
         PreflightResult {
             task_id: TaskId::new(),
+            plan_id: PlanId::new(),
             contract_draft: CompletionContract::first(vec![
                 CompletionCriterion::required("Matches the user's stated request"),
                 CompletionCriterion::required("Relevant tests pass (cargo test)"),

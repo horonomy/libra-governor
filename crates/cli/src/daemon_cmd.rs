@@ -3,6 +3,7 @@
 //! when the `hook` subcommand finds no daemon listening.
 
 use libra_governor_daemon::{recon::ReconBudget, DaemonConfig, DaemonError};
+use libra_governor_domain::ReplanHysteresisConfig;
 
 /// Runs the daemon in the foreground: resolves state paths, binds the
 /// socket (recovering a stale socket file, or exiting cleanly if another
@@ -23,6 +24,7 @@ pub fn run() {
         ledger_path: state_dir.join("ledger.sqlite3"),
         log_path: state_dir.join("daemon.log"),
         recon_budget: ReconBudget::default(),
+        replan_hysteresis: ReplanHysteresisConfig::default(),
     };
 
     let listener = match libra_governor_daemon::bind_or_detect_running(&config.socket_path) {

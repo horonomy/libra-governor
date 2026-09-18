@@ -3,7 +3,9 @@
 
 use std::path::PathBuf;
 
-use libra_governor_domain::{CompletionContract, Confidence, Estimate, ExecutionReceipt, TaskId};
+use libra_governor_domain::{
+    CompletionContract, Confidence, Estimate, ExecutionReceipt, PlanId, TaskId,
+};
 use libra_governor_estimator::{AdmissionOutcome, AdmissionPolicy, CoverageReport};
 use serde::{Deserialize, Serialize};
 
@@ -117,6 +119,11 @@ pub struct PreflightResult {
     /// field stays `Option` only so a hand-built or historical
     /// `PreflightResult` without one still deserializes.
     pub estimate: Option<Estimate>,
+    /// The [`PlanId`] of the `ExecutionPlan` this preflight produced
+    /// (HORO-1139) — so a client can correlate a later `Status` render's
+    /// `TaskSummary::plan_id` back to "the plan this preflight created"
+    /// without a separate lookup.
+    pub plan_id: PlanId,
 }
 
 /// The result of a `Status` request.
@@ -127,11 +134,46 @@ pub struct StatusResult {
 
 /// A compact summary of the daemon's most recently produced preflight,
 /// suitable for a one-line statusline render.
+///
+/// `remaining_estimate`/`replan_state`/`plan_id` (HORO-1139) are the
+/// runtime-replanning visibility surface: after a material replan they
+/// reflect the *current* remaining-work estimate and plan, not the
+/// original preflight one — see `libra-governor-daemon`'s `ToolInvoked`
+/// handling and `crates/cli/src/statusline.rs`'s render of this type.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskSummary {
     pub task_id: TaskId,
+    /// Confidence of the *current* best estimate — the original
+    /// preflight estimate's confidence until a replan happens, then the
+    /// (possibly downgraded) remaining estimate's confidence.
     pub confidence: Confidence,
     pub recon_cost_seconds: f64,
+    /// The plan this summary currently reflects: the original preflight
+    /// plan, or the most recent replan's new plan.
+    pub plan_id: PlanId,
+    /// The current best remaining-work estimate: the original preflight
+    /// [`Estimate`] until a replan happens, then the most recent
+    /// replan's recomputed one (HORO-1139).
+    pub remaining_estimate: Estimate,
+    pub replan_state: ReplanState,
+}
+
+/// Runtime replanning state for one task, as of the daemon's most recent
+/// `ToolInvoked` handling (HORO-1139) — the statusline-visible half of
+/// "govern the run."
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ReplanState {
+    /// No material deviation has triggered a replan yet.
+    Stable,
+    /// This task has been automatically replanned `count` times so far
+    /// (still within its hysteresis budget — see
+    /// `libra_governor_domain::ReplanHysteresisConfig`).
+    Replanned { count: u32 },
+    /// This task's automatic-replan budget is exhausted; the next
+    /// material event will not silently replan again — it needs human
+    /// approval (see `libra_governor_domain::HysteresisOutcome::EscalateApprovalNeeded`).
+    EscalatedAwaitingApproval,
 }
 
 /// The outcome of a `Finalize` request.
@@ -219,12 +261,15 @@ pub struct CalibrationReportResult {
 /// enum the same way it did on [`FinalizeOutcome`] — see that type's
 /// docs for the underlying reasoning. `CalibrationReport` is boxed for
 /// the same reason: it carries a full `CoverageReport` (per-quantile,
-/// per-stratum breakdowns) plus a `Vec<AdmissionPolicyReport>`.
+/// per-stratum breakdowns) plus a `Vec<AdmissionPolicyReport>`. `Status`
+/// is boxed as of HORO-1139: `TaskSummary` grew a full `Estimate`
+/// (`remaining_estimate`), pushing `StatusResult` past the same
+/// large-enum-variant threshold.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
     Preflight(Box<PreflightResult>),
-    Status(StatusResult),
+    Status(Box<StatusResult>),
     Finalize(FinalizeOutcome),
     /// Acknowledges a fire-and-forget request (`ToolInvoked`) with no
     /// further payload.
@@ -301,6 +346,7 @@ mod tests {
             confidence: Confidence::Low,
             recon_cost_seconds: 0.01,
             estimate: None,
+            plan_id: PlanId::new(),
         };
         let json = serde_json::to_value(&result).unwrap();
         assert!(

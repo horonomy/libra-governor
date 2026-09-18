@@ -8,7 +8,9 @@
 //! preflight rather than leaving it dangling — see
 //! `migrations/0002_session_preflight_state.sql`.
 
-use libra_governor_domain::{CompletionContract, PlanId, TaskId, TaskIdentity};
+use libra_governor_domain::{
+    CompletionContract, PlanId, ReplanHysteresisState, TaskId, TaskIdentity,
+};
 use time::format_description::well_known::Rfc3339;
 
 use crate::{store::LedgerStore, LedgerError};
@@ -191,6 +193,111 @@ impl LedgerStore {
             .ok();
         Ok(count.unwrap_or(0) as u64)
     }
+
+    /// Records one tool invocation for `session_id`'s same-tool streak
+    /// (HORO-1139): if `tool_name` matches the last-invoked tool, the
+    /// streak increments; otherwise it resets to `1`. Returns the
+    /// resulting streak count. The streak is deliberately not
+    /// time-windowed beyond "no different tool invoked in between" — see
+    /// `libra_governor_domain::replan` module docs for why a consecutive
+    /// streak, not a wall-clock window, is the signal used here (Claude
+    /// Code's `PostToolUse` payload carries no reliable elapsed-time
+    /// field cheap enough to reason about per call).
+    ///
+    /// `last_tool_at` is persisted alongside purely as diagnostic
+    /// metadata (when this session's streak-relevant tool last ran) — it
+    /// is not currently read back by any windowing logic, honestly
+    /// documented here rather than implying a time window exists when it
+    /// does not.
+    pub fn record_tool_invocation(
+        &mut self,
+        session_id: &str,
+        tool_name: &str,
+        now: time::OffsetDateTime,
+    ) -> Result<u64, LedgerError> {
+        let previous: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT last_tool_name FROM tool_call_counts WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+
+        let streak: i64 = if previous.as_deref() == Some(tool_name) {
+            self.conn.query_row(
+                "SELECT same_tool_streak FROM tool_call_counts WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )?
+        } else {
+            0
+        } + 1;
+
+        self.conn.execute(
+            "INSERT INTO tool_call_counts (session_id, count, last_tool_name, last_tool_at, same_tool_streak)
+             VALUES (?1, 0, ?2, ?3, ?4)
+             ON CONFLICT(session_id) DO UPDATE SET
+                last_tool_name = excluded.last_tool_name,
+                last_tool_at = excluded.last_tool_at,
+                same_tool_streak = excluded.same_tool_streak",
+            rusqlite::params![session_id, tool_name, rfc3339(now)?, streak],
+        )?;
+        Ok(streak as u64)
+    }
+
+    /// Returns the current per-task [`ReplanHysteresisState`] (HORO-1139):
+    /// how many automatic replans this task has already had and when the
+    /// most recent one happened. `ReplanHysteresisState::default()`
+    /// (never replanned) if no `replan_state` row exists yet.
+    pub fn replan_state_for_task(
+        &self,
+        task_id: TaskId,
+    ) -> Result<ReplanHysteresisState, LedgerError> {
+        let row: Option<(i64, Option<String>, i64)> = self
+            .conn
+            .query_row(
+                "SELECT auto_replan_count, last_replan_at, tool_call_count_at_last_replan
+                 FROM replan_state WHERE task_id = ?1",
+                [task_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .ok();
+
+        let Some((auto_replan_count, last_replan_at, tool_call_count_at_last_replan)) = row else {
+            return Ok(ReplanHysteresisState::default());
+        };
+        let last_replan_at = last_replan_at
+            .map(|s| {
+                time::OffsetDateTime::parse(&s, &Rfc3339)
+                    .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))
+            })
+            .transpose()?;
+
+        Ok(ReplanHysteresisState {
+            auto_replan_count: auto_replan_count as u32,
+            last_replan_at,
+            tool_call_count_at_last_replan: tool_call_count_at_last_replan as u64,
+        })
+    }
+
+    /// Resets `session_id`'s same-tool streak to `0` (HORO-1139): called
+    /// right after a replan triggered by [`possible_tool_loop`], so the
+    /// loop signal re-baselines the same way the tool-call-count signal
+    /// does via `record_replan_for_task`'s
+    /// `tool_call_count_at_last_replan` — otherwise the very next
+    /// repeated tool call would immediately look like a continuation of
+    /// the already-replanned-on streak instead of fresh evidence.
+    ///
+    /// [`possible_tool_loop`]: libra_governor_domain::possible_tool_loop
+    pub fn reset_tool_streak(&mut self, session_id: &str) -> Result<(), LedgerError> {
+        self.conn.execute(
+            "UPDATE tool_call_counts SET same_tool_streak = 0 WHERE session_id = ?1",
+            [session_id],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -331,5 +438,124 @@ mod tests {
         store.increment_tool_call_count("sess-b").unwrap();
         assert_eq!(store.tool_call_count_for_session("sess-a").unwrap(), 1);
         assert_eq!(store.tool_call_count_for_session("sess-b").unwrap(), 2);
+    }
+
+    #[test]
+    fn record_tool_invocation_streak_increments_on_repeats_and_resets_on_a_new_tool() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        assert_eq!(
+            store
+                .record_tool_invocation("sess-1", "Bash", now())
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .record_tool_invocation("sess-1", "Bash", now())
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .record_tool_invocation("sess-1", "Bash", now())
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            store
+                .record_tool_invocation("sess-1", "Read", now())
+                .unwrap(),
+            1,
+            "a different tool must reset the streak"
+        );
+        assert_eq!(
+            store
+                .record_tool_invocation("sess-1", "Read", now())
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn record_tool_invocation_streaks_are_independent_per_session() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        store
+            .record_tool_invocation("sess-a", "Bash", now())
+            .unwrap();
+        store
+            .record_tool_invocation("sess-a", "Bash", now())
+            .unwrap();
+        assert_eq!(
+            store
+                .record_tool_invocation("sess-b", "Bash", now())
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .record_tool_invocation("sess-a", "Bash", now())
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn replan_state_for_task_defaults_when_never_replanned() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = store
+            .resolve_or_create_task_for_session("sess-1", now())
+            .unwrap();
+        assert_eq!(
+            store.replan_state_for_task(task_id).unwrap(),
+            libra_governor_domain::ReplanHysteresisState::default()
+        );
+    }
+
+    #[test]
+    fn record_replan_for_task_increments_count_and_sets_last_replan_at() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = store
+            .resolve_or_create_task_for_session("sess-1", now())
+            .unwrap();
+
+        store.record_replan_for_task(task_id, now(), 7).unwrap();
+        let state = store.replan_state_for_task(task_id).unwrap();
+        assert_eq!(state.auto_replan_count, 1);
+        assert_eq!(state.last_replan_at, Some(now()));
+        assert_eq!(state.tool_call_count_at_last_replan, 7);
+
+        let later = now() + time::Duration::seconds(60);
+        store.record_replan_for_task(task_id, later, 15).unwrap();
+        let state = store.replan_state_for_task(task_id).unwrap();
+        assert_eq!(state.auto_replan_count, 2);
+        assert_eq!(state.last_replan_at, Some(later));
+        assert_eq!(state.tool_call_count_at_last_replan, 15);
+    }
+
+    #[test]
+    fn reset_tool_streak_zeroes_the_streak_but_not_the_count() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        store
+            .record_tool_invocation("sess-1", "Bash", now())
+            .unwrap();
+        store
+            .record_tool_invocation("sess-1", "Bash", now())
+            .unwrap();
+        store.increment_tool_call_count("sess-1").unwrap();
+
+        store.reset_tool_streak("sess-1").unwrap();
+
+        assert_eq!(
+            store
+                .record_tool_invocation("sess-1", "Bash", now())
+                .unwrap(),
+            1,
+            "streak restarts fresh after a reset even though the same tool repeats"
+        );
+        assert_eq!(
+            store.tool_call_count_for_session("sess-1").unwrap(),
+            1,
+            "the plain cumulative count is untouched by a streak reset"
+        );
     }
 }
