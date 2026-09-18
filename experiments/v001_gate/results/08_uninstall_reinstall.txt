@@ -1,0 +1,57 @@
+$ libra-governor uninstall --yes
+exit=0
+--- stdout ---
+libra-governor uninstall: removed from /tmp/libra-horo1152-work/home-main/.claude/settings.json
+  hook commands removed: 3
+  statusline removed:    true
+  apiKeyHelper removed:  false
+  base URL removed:      false
+  backup written:        /tmp/libra-horo1152-work/home-main/.claude/settings.json.libra-backup-1789737690-34323
+libra-governor uninstall: the daemon binary at /tmp/libra-horo1152-work/home-main/.cargo/bin/libra-governor was installed via `cargo install`.
+  To remove it, run: cargo uninstall libra-governor-cli
+libra-governor uninstall: removed /tmp/libra-horo1152-work/home-main/.local/state/libra-governor
+
+--- stderr ---
+
+
+
+$ libra-governor doctor  (after uninstall)
+exit=0
+--- stdout ---
+libra-governor doctor
+======================
+
+[warn] state_dir: state directory /tmp/libra-horo1152-work/home-main/.local/state/libra-governor does not exist yet — the daemon has never run (normal before the first prompt)
+[warn] claude_settings: not installed into /tmp/libra-horo1152-work/home-main/.claude/settings.json — run `libra-governor install`
+[warn] daemon_reachable: daemon is not running — it starts on demand on the next Claude Code prompt (this is normal)
+
+
+--- stderr ---
+
+
+
+$ libra-governor install  (reinstall)
+exit=0
+--- stdout ---
+libra-governor install: wired into /tmp/libra-horo1152-work/home-main/.claude/settings.json
+  hooks added:      3
+  statusline added: true
+  backup written:   /tmp/libra-horo1152-work/home-main/.claude/settings.json.libra-backup-1789737690-34325
+
+Next: submit a prompt in Claude Code, then run `libra-governor doctor`.
+
+
+
+$ libra-governor doctor  (after reinstall)
+exit=0
+--- stdout ---
+libra-governor doctor
+======================
+
+[ok] state_dir_permissions: /tmp/libra-horo1152-work/home-main/.local/state/libra-governor is owner-only (0700)
+[ok] config_file_present: no config.json — running the balanced preset with no gateway (defaults)
+[ok] gateway_token_present: gateway capability token not yet created (/tmp/libra-horo1152-work/home-main/.local/state/libra-governor/gateway.token)
+[ok] claude_settings: hooks and statusline wired in /tmp/libra-horo1152-work/home-main/.claude/settings.json
+[warn] daemon_reachable: daemon is not running — it starts on demand on the next Claude Code prompt (this is normal)
+
+

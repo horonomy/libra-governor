@@ -1,0 +1,50 @@
+=== daemon.log (/tmp/libra-horo1152-work/home-upgrade/.local/state/libra-governor/daemon.log) ===
+(daemon.log is architecturally documented to never receive raw prompt text or hook payload content -- crates/daemon/src/log.rs / crates/daemon/src/paths.rs docstring)
+daemon.log / credential nonce :: 'fake-test-credential-nonce-8f2c1a' -> count=0 -> PASS (absent, as required)
+daemon.log / prompt 1 :: 'add input validation to the login handler' -> count=0 -> PASS (absent, as required)
+daemon.log / prompt 2 :: 'implement a new /health endpoint' -> count=0 -> PASS (absent, as required)
+daemon.log / fixture path :: 'experiments/mvp1_validation/fixtures/rust-crate' -> count=0 -> INFO (expected present here: it is the artifact's own legitimate content)
+
+=== ledger.sqlite3 (strings scan, /tmp/libra-horo1152-work/home-upgrade/.local/state/libra-governor/ledger.sqlite3) ===
+ledger.sqlite3 / credential nonce :: 'fake-test-credential-nonce-8f2c1a' -> count=0 -> PASS (absent, as required)
+ledger.sqlite3 / prompt 1 :: 'add input validation to the login handler' -> count=0 -> PASS (absent, as required)
+ledger.sqlite3 / prompt 2 :: 'implement a new /health endpoint' -> count=0 -> PASS (absent, as required)
+ledger.sqlite3 / fixture path :: 'experiments/mvp1_validation/fixtures/rust-crate' -> count=0 -> INFO
+
+=== doctor / doctor --json actual command output (isolated from this file's own config.json dump) ===
+results/10_capability_tier_text.txt also embeds, for readability, the raw
+config.json this gate wrote as INPUT to each scenario (which legitimately
+contains the test nonce, since it's the fixture, not libra's output). To
+avoid a false-positive grep against our own fixture dump, this check
+isolates only the actual 'libra-governor doctor' / 'doctor --json' STDOUT
+sections (everything from the first '$ libra-governor doctor' marker
+onward) and greps only that.
+doctor+doctor--json actual output / credential nonce :: 'fake-test-credential-nonce-8f2c1a' -> count=0 -> PASS (absent, as required)
+(the full combined file 10_capability_tier_text.txt DOES contain the nonce
+once, in the fixture config.json this gate wrote as input -- that is
+expected and not a leak; verified above that libra's own doctor command
+output never echoes it)
+
+=== settings.json backups under ~/.claude/ (item 9 cycle profile) ===
+settings.json.libra-backup-1789737690-34328 / credential nonce :: 'fake-test-credential-nonce-8f2c1a' -> count=0 -> PASS (absent, as required)
+settings.json.libra-backup-1789737690-34343 / credential nonce :: 'fake-test-credential-nonce-8f2c1a' -> count=0 -> PASS (absent, as required)
+
+=== NOTE on credential_command execution ===
+crates/cli/src/doctor_cmd.rs's own module docstring states doctor never
+reads gateway.token's contents, runs a credential_command, or echoes
+anything from config.json beyond presence/validity. This gate did not
+separately start a live gateway proxy to exercise CredentialCommand::resolve()
+end-to-end (that would require a loopback fake upstream, out of scope for
+this install/doctor/lifecycle gate) -- that resolution path already has its
+own real unit-test coverage in crates/gateway/src/credential.rs. What this
+gate DOES verify directly: the fake credential nonce embedded in this gate's
+own config.json fixtures never appears in daemon.log, the ledger, doctor's
+output, or any settings.json backup produced during this gate's runs.
+
+=== release artifact scan ===
+This repo's scripts/install.sh and README.md document no release-tarball/
+artifact build step (see README.md 'Install': "This repository's CI... does
+not publish a release binary or artifact anywhere") -- there is no
+release artifact to scan for this v0.0.1 Developer Preview. Confirmed by
+reading .github/workflows/ci.yml: no artifact-upload or packaging step exists.
+(grep for artifact-upload/packaging steps in ci.yml: no matches)

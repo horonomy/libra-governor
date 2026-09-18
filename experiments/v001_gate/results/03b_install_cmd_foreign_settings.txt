@@ -1,0 +1,108 @@
+$ libra-governor install  (against PRE-EXISTING ~/.claude/settings.json with foreign keys)
+exit code: 0
+--- stdout ---
+libra-governor install: wired into /tmp/libra-horo1152-work/home-foreign/.claude/settings.json
+  hooks added:      3
+  statusline added: false
+  statusline:       left untouched — a non-Governor statusLine is already configured
+  backup written:   /tmp/libra-horo1152-work/home-foreign/.claude/settings.json.libra-backup-1789737633-28514
+
+Note: your existing statusLine was not replaced. Run `libra-governor doctor` for details.
+Next: submit a prompt in Claude Code, then run `libra-governor doctor`.
+
+--- stderr ---
+
+--- seeded settings.json (pristine) ---
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "type": "command",
+        "command": "/usr/local/bin/some-other-tool hook pre"
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "/usr/local/bin/other-statusline"
+  },
+  "env": {
+    "SOME_OTHER_TOOL_TOKEN": "not-a-real-secret-placeholder"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)"
+    ]
+  },
+  "someTopLevelKeyLibraDoesNotKnowAbout": {
+    "nested": [
+      "value",
+      1,
+      true
+    ]
+  }
+}
+--- settings.json after install ---
+{
+  "env": {
+    "SOME_OTHER_TOOL_TOKEN": "not-a-real-secret-placeholder"
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "/tmp/libra-horo1152-work/home-foreign/.cargo/bin/libra-governor hook post-tool-use",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "command": "/usr/local/bin/some-other-tool hook pre",
+        "type": "command"
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "/tmp/libra-horo1152-work/home-foreign/.cargo/bin/libra-governor hook stop",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "command": "/tmp/libra-horo1152-work/home-foreign/.cargo/bin/libra-governor hook user-prompt-submit",
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)"
+    ]
+  },
+  "someTopLevelKeyLibraDoesNotKnowAbout": {
+    "nested": [
+      "value",
+      1,
+      true
+    ]
+  },
+  "statusLine": {
+    "command": "/usr/local/bin/other-statusline",
+    "type": "command"
+  }
+}
+
+pristine sha256: 9e220407ffc0be4e1a89e0b53e178e4f391694a8697c0671084f341c22272a5c
+after-install sha256: e8ae2e4b3aa6e534a0bcb226b21b5b6462dd605af671dee9ab1d269bb2ca022b
+foreign subtrees preserved after install: True

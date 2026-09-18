@@ -1,0 +1,10 @@
+$ libra-governor hook user-prompt-submit  (fresh fixture repo: /Users/bryant/Bryant-Developments/horonomy/libra-governor-v0.0.1-HORO-1152-release_gate/experiments/mvp1_validation/fixtures/rust-crate)
+session_id: gate-0c76549c-4d78-47e3-aff4-28d52b39c7cc
+exit code: 0
+--- stdout ---
+{"hookSpecificOutput":{"additionalContext":"{\"hookSpecificOutput\":{\"additionalContext\":\"[libra-governor] Preflight complete (task b4653ed9-095b-47c1-9113-8d0e1861d067, confidence: high, recon: 0.00s).\\nDraft Completion Contract (revision 1):\\n  - [required] Matches the user's stated request\\n  - [required] Relevant tests pass (cargo test)\\n  - [optional] Changes are scoped to the likely affected area(s): src/login.rs\\nCost/time estimate: cold start — insufficient local history: no ExecutionReceipt rows recorded yet (confidence: low). This preflight is advisory only.\",\"hookEventName\":\"UserPromptSubmit\"}}","hookEventName":"UserPromptSubmit"}}
+
+--- stderr ---
+
+state dir exists after preflight: True
+socket present: True

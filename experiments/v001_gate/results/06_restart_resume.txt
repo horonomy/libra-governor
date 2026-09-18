@@ -1,0 +1,8 @@
+daemon spawned pid=28527
+socket up before kill: True
+daemon SIGKILLed
+post-kill preflight exit=0 respawn_ok=True
+stdout={"hookSpecificOutput":{"additionalContext":"{\"hookSpecificOutput\":{\"additionalContext\":\"[libra-governor] Preflight complete (task 29be426d-8222-43db-bcdd-f410d43207d8, confidence: high, recon: 0.00s).\\nDraft Completion Contract (revision 1):\\n  - [required] Matches the user's stated request\\n  - [required] Relevant tests pass (pytest)\\n  - [optional] Changes are scoped to the likely affected area(s): app/login.py\\nCost/time estimate: P50 0s / P90 0s (confidence: Medium, n=1, estimator v3-tiered-confidence, basis: global history (mixed task classes), n=1). This preflight is advisory only.\",\"hookEventName\":\"UserPromptSubmit\"}}","hookEventName":"UserPromptSubmit"}}
+
+post-kill stop exit=0
+receipts before kill=1, after resume+stop=2

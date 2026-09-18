@@ -1,0 +1,130 @@
+Seeded settings.json (pristine), sha256=9e220407ffc0be4e1a89e0b53e178e4f391694a8697c0671084f341c22272a5c:
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "type": "command",
+        "command": "/usr/local/bin/some-other-tool hook pre"
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "/usr/local/bin/other-statusline"
+  },
+  "env": {
+    "SOME_OTHER_TOOL_TOKEN": "not-a-real-secret-placeholder"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)"
+    ]
+  },
+  "someTopLevelKeyLibraDoesNotKnowAbout": {
+    "nested": [
+      "value",
+      1,
+      true
+    ]
+  }
+}
+
+$ libra-governor install
+exit=0
+stdout=libra-governor install: wired into /tmp/libra-horo1152-work/home-cycle/.claude/settings.json
+  hooks added:      3
+  statusline added: false
+  statusline:       left untouched — a non-Governor statusLine is already configured
+  backup written:   /tmp/libra-horo1152-work/home-cycle/.claude/settings.json.libra-backup-1789737690-34328
+
+Note: your existing statusLine was not replaced. Run `libra-governor doctor` for details.
+Next: submit a prompt in Claude Code, then run `libra-governor doctor`.
+
+
+After install, sha256=1a54074d9866caf8e76d5767236482f1b152a40a9ea202642a8251d6d74c6749:
+{
+  "env": {
+    "SOME_OTHER_TOOL_TOKEN": "not-a-real-secret-placeholder"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "command": "/usr/local/bin/some-other-tool hook pre",
+        "type": "command"
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)"
+    ]
+  },
+  "someTopLevelKeyLibraDoesNotKnowAbout": {
+    "nested": [
+      "value",
+      1,
+      true
+    ]
+  },
+  "statusLine": {
+    "command": "/usr/local/bin/other-statusline",
+    "type": "command"
+  }
+}
+
+
+Foreign subtree, pristine vs after-install (jq -S style structural compare):
+pristine       = {"env": {"SOME_OTHER_TOOL_TOKEN": "not-a-real-secret-placeholder"}, "hooks_PreToolUse": [{"command": "/usr/local/bin/some-other-tool hook pre", "type": "command"}], "permissions": {"allow": ["Bash(ls:*)"]}, "someTopLevelKeyLibraDoesNotKnowAbout": {"nested": ["value", 1, true]}, "statusLine": {"command": "/usr/local/bin/other-statusline", "type": "command"}}
+after install  = {"env": {"SOME_OTHER_TOOL_TOKEN": "not-a-real-secret-placeholder"}, "hooks_PreToolUse": [{"command": "/usr/local/bin/some-other-tool hook pre", "type": "command"}], "permissions": {"allow": ["Bash(ls:*)"]}, "someTopLevelKeyLibraDoesNotKnowAbout": {"nested": ["value", 1, true]}, "statusLine": {"command": "/usr/local/bin/other-statusline", "type": "command"}}
+foreign subtree unchanged by install: True
+
+$ libra-governor uninstall --yes
+exit=0
+stdout=libra-governor uninstall: removed from /tmp/libra-horo1152-work/home-cycle/.claude/settings.json
+  hook commands removed: 3
+  statusline removed:    false
+  apiKeyHelper removed:  false
+  base URL removed:      false
+  backup written:        /tmp/libra-horo1152-work/home-cycle/.claude/settings.json.libra-backup-1789737690-34343
+libra-governor uninstall: the daemon binary at /tmp/libra-horo1152-work/home-cycle/.cargo/bin/libra-governor was installed via `cargo install`.
+  To remove it, run: cargo uninstall libra-governor-cli
+libra-governor uninstall: removed /tmp/libra-horo1152-work/home-cycle/.local/state/libra-governor
+
+
+After uninstall:
+{
+  "env": {
+    "SOME_OTHER_TOOL_TOKEN": "not-a-real-secret-placeholder"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "command": "/usr/local/bin/some-other-tool hook pre",
+        "type": "command"
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)"
+    ]
+  },
+  "someTopLevelKeyLibraDoesNotKnowAbout": {
+    "nested": [
+      "value",
+      1,
+      true
+    ]
+  },
+  "statusLine": {
+    "command": "/usr/local/bin/other-statusline",
+    "type": "command"
+  }
+}
+
+after-uninstall sha256: 1a54074d9866caf8e76d5767236482f1b152a40a9ea202642a8251d6d74c6749
+byte-identical to pristine after full install->uninstall cycle: False
+foreign subtree structurally identical after full cycle: True
+
+backup files written under ~/.claude/ during this cycle: ['settings.json.libra-backup-1789737690-34328', 'settings.json.libra-backup-1789737690-34343']
+(collision check: 2 backup file(s) for 2 write operations that could have backed up an existing file -- install backs up the pre-existing settings.json once; no duplicate/overwritten backup names observed)
