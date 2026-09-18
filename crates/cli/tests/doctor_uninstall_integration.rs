@@ -165,15 +165,12 @@ fn install_doctor_uninstall_doctor_lifecycle() {
         "doctor after install must report hooks wired: {stdout}"
     );
 
-    // uninstall --yes also removes the daemon binary itself, since the
-    // install marker names this exact path (see uninstall_cmd's module
-    // docs) — a real, intended consequence of a full uninstall. Keep an
-    // untracked copy purely so this test can still run `doctor`
-    // afterward to observe the resulting "not installed" state, the
-    // same workaround `scripts/smoke-test.sh` uses for the same reason.
-    let doctor_checker = sandbox.bin_path.with_file_name("doctor-checker");
-    std::fs::copy(&sandbox.bin_path, &doctor_checker).unwrap();
-
+    // uninstall never deletes the daemon binary itself (it only reports
+    // how to remove it via `cargo uninstall`, to avoid corrupting
+    // cargo's own package bookkeeping — see uninstall_cmd's module
+    // docs), so sandbox.bin_path stays usable for the post-uninstall
+    // doctor check below with no copy/workaround needed.
+    //
     // uninstall's confirmation prompt reads stdin; Stdio::null() is not a
     // TTY, so the state dir deletion is safely skipped without --yes.
     // Passing --yes here exercises the confirmed deletion path.
@@ -184,17 +181,11 @@ fn install_doctor_uninstall_doctor_lifecycle() {
         String::from_utf8_lossy(&uninstall_output.stderr)
     );
     assert!(
-        !sandbox.bin_path.exists(),
-        "uninstall --yes should have removed the binary it installed"
+        sandbox.bin_path.exists(),
+        "uninstall must never delete the daemon binary directly"
     );
 
-    let doctor_again = Command::new(&doctor_checker)
-        .arg("doctor")
-        .env("LIBRA_GOVERNOR_STATE_DIR", &sandbox.state_dir)
-        .env("LIBRA_GOVERNOR_CLAUDE_DIR", &sandbox.claude_dir)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+    let (doctor_again, _) = sandbox.run(&["doctor"]);
     assert!(doctor_again.status.success());
     let stdout_again = String::from_utf8_lossy(&doctor_again.stdout);
     assert!(
