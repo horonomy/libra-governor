@@ -1202,40 +1202,60 @@ fn gateway_status(config: &DaemonConfig) -> GatewayStatusResult {
 /// it).
 fn handle_doctor(ledger: &LedgerStore, config: &DaemonConfig) -> DoctorResult {
     let state_dir = config.socket_path.parent();
-    let (config_file_present, config_file_valid, config_file_error) = match state_dir {
-        Some(dir) => {
-            let path = dir.join(crate::config_file::CONFIG_FILE_NAME);
-            if !path.exists() {
-                (false, true, None)
-            } else {
-                match crate::config_file::load_overrides(dir) {
-                    Ok(_) => (true, true, None),
-                    Err(e) => (true, false, Some(e.to_string())),
+    let (config_file_present, config_file_valid, config_file_error, running_config_matches_disk) =
+        match state_dir {
+            Some(dir) => {
+                let path = dir.join(crate::config_file::CONFIG_FILE_NAME);
+                if !path.exists() {
+                    (false, true, None, true)
+                } else {
+                    match crate::config_file::load_overrides(dir) {
+                        Ok((policy_on_disk, gateway_on_disk)) => {
+                            // A present, *valid* config.json can still
+                            // disagree with what this already-running
+                            // daemon holds in memory — the common "edited
+                            // config.json, forgot to restart the daemon"
+                            // case. Compare the two fields doctor already
+                            // reports elsewhere (policy preset, whether a
+                            // gateway is configured at all) rather than a
+                            // full struct equality, since those are the
+                            // only two things `load_overrides` can even
+                            // change.
+                            let policy_matches = policy_on_disk
+                                .as_ref()
+                                .map(|p| p.name == config.policy.name)
+                                .unwrap_or(true);
+                            let gateway_matches =
+                                gateway_on_disk.is_some() == config.gateway.is_some();
+                            (true, true, None, policy_matches && gateway_matches)
+                        }
+                        Err(e) => (true, false, Some(e.to_string()), true),
+                    }
                 }
             }
-        }
-        // Only reachable if `socket_path` was hand-built with no parent
-        // (e.g. a bare relative filename) — never true for a real daemon
-        // started via `daemon_cmd::run`, which always joins onto
-        // `paths::state_dir()`.
-        None => (false, true, None),
-    };
+            // Only reachable if `socket_path` was hand-built with no parent
+            // (e.g. a bare relative filename) — never true for a real daemon
+            // started via `daemon_cmd::run`, which always joins onto
+            // `paths::state_dir()`.
+            None => (false, true, None, true),
+        };
 
     let schema_version_applied = ledger.schema_version().unwrap_or(0);
     let schema_version_known = libra_governor_ledger::latest_known_version();
 
     let gw = gateway_status(config);
-    let gateway_credential_configured = config
-        .gateway
-        .as_ref()
-        .map(|g| {
-            matches!(
-                g.credential_mode,
-                libra_governor_gateway::config::GatewayCredentialMode::GovernorHeld { .. }
-                    | libra_governor_gateway::config::GatewayCredentialMode::PassThroughSubscription
-            )
-        })
-        .unwrap_or(false);
+    // Narrowed to the one distinction that actually varies: whether the
+    // daemon itself holds a credential (`GovernorHeld`) versus relaying
+    // the agent's own subscription credential through unmodified
+    // (`PassThroughSubscription`, where the daemon holds nothing). Any
+    // configured `[gateway]` table implies *some* credential_mode, so
+    // matching both variants here would just restate `gateway_configured`.
+    let gateway_credential_configured = config.gateway.as_ref().is_some_and(|g| {
+        matches!(
+            g.credential_mode,
+            libra_governor_gateway::config::GatewayCredentialMode::GovernorHeld { .. }
+        )
+    });
 
     DoctorResult {
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1247,6 +1267,7 @@ fn handle_doctor(ledger: &LedgerStore, config: &DaemonConfig) -> DoctorResult {
         config_file_present,
         config_file_valid,
         config_file_error,
+        running_config_matches_disk,
         gateway_configured: config.gateway.is_some(),
         gateway_running: gw.running,
         gateway_disabled_reason: gw.disabled_reason,
@@ -1431,6 +1452,7 @@ mod tests {
         assert!(!result.config_file_present);
         assert!(result.config_file_valid);
         assert!(result.config_file_error.is_none());
+        assert!(result.running_config_matches_disk);
         assert_eq!(result.policy_preset, "balanced");
         assert!(!result.gateway_configured);
         assert!(!result.gateway_running);
@@ -1454,5 +1476,38 @@ mod tests {
         assert!(result.config_file_present);
         assert!(!result.config_file_valid);
         assert!(result.config_file_error.is_some());
+        assert!(
+            result.running_config_matches_disk,
+            "an invalid file changes nothing about the running config, so there is no drift to report"
+        );
+    }
+
+    #[test]
+    fn doctor_flags_stale_config_when_disk_preset_disagrees_with_the_running_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        // The running config (built by config_for_doctor_tests) uses the
+        // "balanced" preset; config.json on disk now names a different,
+        // valid preset — the classic "edited the file, forgot to restart
+        // the daemon" case.
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"policy": {"preset": "deadline_first"}}"#,
+        )
+        .unwrap();
+        let config = config_for_doctor_tests(dir.path());
+        let ledger = LedgerStore::open(&config.ledger_path).unwrap();
+
+        let result = handle_doctor(&ledger, &config);
+
+        assert!(result.config_file_present);
+        assert!(result.config_file_valid);
+        assert_eq!(
+            result.policy_preset, "balanced",
+            "still reports the running preset"
+        );
+        assert!(
+            !result.running_config_matches_disk,
+            "a valid but disagreeing config.json must be flagged as stale"
+        );
     }
 }

@@ -137,24 +137,39 @@ fn state_dir_permission_finding(dir: &Path) -> Finding {
     }
 }
 
+/// Validates `config.json` locally (the same `load_overrides` parser the
+/// daemon itself uses) rather than only via the daemon: a fresh install
+/// with a corrupt `config.json` and no daemon running yet must still be
+/// reported as broken, not silently pass because nothing has started it
+/// up to notice. When a daemon *is* reachable, [`daemon_findings`] also
+/// reports `config_file_valid` from its own live re-read — deliberately
+/// redundant with this check rather than relying on only one of the two,
+/// since either one running alone must still catch the problem.
 fn config_file_presence_finding(dir: &Path) -> Finding {
     let path = dir.join(libra_governor_daemon::config_file::CONFIG_FILE_NAME);
-    if path.exists() {
-        Finding {
-            id: "config_file_present",
-            severity: Severity::Ok,
-            message: format!(
-                "{} is present (validity is checked via the daemon)",
-                path.display()
-            ),
-        }
-    } else {
-        Finding {
+    if !path.exists() {
+        return Finding {
             id: "config_file_present",
             severity: Severity::Ok,
             message: "no config.json — running the balanced preset with no gateway (defaults)"
                 .to_string(),
-        }
+        };
+    }
+    match libra_governor_daemon::config_file::load_overrides(dir) {
+        Ok(_) => Finding {
+            id: "config_file_present",
+            severity: Severity::Ok,
+            message: format!("{} is present and parses cleanly", path.display()),
+        },
+        Err(e) => Finding {
+            id: "config_file_present",
+            severity: Severity::Error,
+            message: format!(
+                "{} is present but invalid: {e} — the daemon falls back to its hardcoded \
+                 defaults until this is fixed",
+                path.display()
+            ),
+        },
     }
 }
 
@@ -201,6 +216,16 @@ fn claude_settings_finding() -> Finding {
             message: format!(
                 "only some of UserPromptSubmit/PostToolUse/Stop are wired in {} — \
                  re-run `libra-governor install`",
+                path.display()
+            ),
+        }
+    } else if !inspection.statusline_wired {
+        Finding {
+            id: "claude_settings",
+            severity: Severity::Ok,
+            message: format!(
+                "hooks wired in {}; statusLine is not Governor's (either none is configured, \
+                 or a foreign one was left in place by `install`)",
                 path.display()
             ),
         }
@@ -294,6 +319,16 @@ fn daemon_findings(daemon: &Option<Result<DoctorResult, String>>) -> Vec<Finding
                 severity: Severity::Ok,
                 message: format!("admission policy preset: {}", result.policy_preset),
             });
+            if !result.running_config_matches_disk {
+                findings.push(Finding {
+                    id: "stale_config",
+                    severity: Severity::Error,
+                    message: "config.json on disk no longer matches what this running daemon \
+                              loaded at startup — restart it to pick up the change: \
+                              pkill -f \"libra-governor daemon run\""
+                        .to_string(),
+                });
+            }
             if result.gateway_configured {
                 findings.push(Finding {
                     id: "gateway",

@@ -374,6 +374,18 @@ pub struct DoctorResult {
     pub config_file_valid: bool,
     /// Why `config.json` was rejected, when it was present but invalid.
     pub config_file_error: Option<String>,
+    /// `true` when the running daemon's in-memory config already
+    /// reflects what's currently on disk in `config.json` — `false`
+    /// means the file was edited (policy preset and/or gateway presence
+    /// changed) since this daemon process last read it at startup, and a
+    /// restart is needed to pick the change up. Always `true` when
+    /// `config_file_present` is `false` (nothing on disk to disagree
+    /// with) or when `config_file_valid` is `false` (a rejected file
+    /// changes nothing, so there is no drift to report). Computed by
+    /// re-reading `config.json` fresh on every `doctor` call and
+    /// comparing its policy name and gateway presence against the
+    /// values the running config actually reports below.
+    pub running_config_matches_disk: bool,
     /// `true` when a `[gateway]` table is configured at all (regardless
     /// of whether it actually started — see `gateway_running`).
     pub gateway_configured: bool,
@@ -386,11 +398,17 @@ pub struct DoctorResult {
     /// What this deployment may honestly claim to enforce — mirrors
     /// [`GatewayStatusResult::capabilities`].
     pub gateway_capabilities: Option<EnforcementCapabilities>,
-    /// `true` when a gateway credential is configured (a
-    /// `credential_command` for `governor_held`, or `credential_mode:
-    /// pass_through_subscription`'s implicit reliance on the agent's own
-    /// credential) — presence only, never the credential's value or the
-    /// command's output.
+    /// `true` only when the gateway is configured for
+    /// `credential_mode: governor_held` — i.e. this daemon itself holds
+    /// (invokes a `credential_command` for) a credential, as opposed to
+    /// `pass_through_subscription`, where the daemon holds nothing and
+    /// simply relays the agent's own credential through unmodified.
+    /// Presence only, never the credential's value or the command's
+    /// output. Deliberately narrower than "any gateway credential mode
+    /// is configured" (which would be redundant with `gateway_configured`
+    /// whenever a `[gateway]` table exists at all) — this field exists to
+    /// answer the one question that actually varies: does the daemon
+    /// hold a credential of its own.
     pub gateway_credential_configured: bool,
     /// Always `false` in this build: no telemetry code path exists
     /// anywhere in this repository (see `ARCHITECTURE.md`'s privacy
@@ -466,6 +484,7 @@ mod tests {
                 config_file_present: false,
                 config_file_valid: true,
                 config_file_error: None,
+                running_config_matches_disk: true,
                 gateway_configured: true,
                 gateway_running: true,
                 gateway_disabled_reason: None,
