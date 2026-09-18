@@ -247,6 +247,8 @@ pub enum PolicyValidationError {
     },
     #[error("policy quality floor must declare at least one required completion criterion")]
     EmptyRequiredCriteria,
+    #[error("resource amount {amount:?} is out of QuotaPercent's documented 0.0..=100.0 domain")]
+    ResourceQuotaPercentOutOfRange { amount: ResourceAmount },
 }
 
 impl Policy {
@@ -318,6 +320,12 @@ impl Policy {
             });
         }
 
+        Self::validate_quota_percent_range(resource.target)?;
+        Self::validate_quota_percent_range(resource.hard_ceiling)?;
+        if let Some(elastic) = resource.elastic_ceiling {
+            Self::validate_quota_percent_range(elastic)?;
+        }
+
         match (resource.mode, resource.elastic_ceiling) {
             (ConstraintMode::Elastic, None) => {
                 return Err(PolicyValidationError::ResourceElasticModeMissingCeiling {
@@ -354,6 +362,18 @@ impl Policy {
             (ConstraintMode::Hard | ConstraintMode::Approval, None) => {}
         }
 
+        Ok(())
+    }
+
+    /// Rejects a [`ResourceAmount::QuotaPercent`] outside its own
+    /// documented `0.0..=100.0` domain. A no-op for `UsdCents`/`Tokens`,
+    /// which have no such bound.
+    fn validate_quota_percent_range(amount: ResourceAmount) -> Result<(), PolicyValidationError> {
+        if let ResourceAmount::QuotaPercent(p) = amount {
+            if !(0.0..=100.0).contains(&p) {
+                return Err(PolicyValidationError::ResourceQuotaPercentOutOfRange { amount });
+            }
+        }
         Ok(())
     }
 
@@ -422,6 +442,22 @@ pub enum PolicyEvaluationError {
         policy_kind: ResourceKind,
         projected_kind: ResourceKind,
     },
+    /// The policy's `resource` bound is in [`ConstraintMode::Elastic`]
+    /// but carries no `elastic_ceiling`. [`Policy::validated`] never
+    /// produces this — it can only happen if a `Policy` was built some
+    /// other way (a struct literal, or deserialized from untrusted/
+    /// hand-edited data) that bypassed validation. Returned rather than
+    /// panicking, since a stored `Policy` read back via `Deserialize` is
+    /// exactly the kind of "untrusted until checked" input this crate's
+    /// error types exist for.
+    #[error("resource bound is in Elastic mode but carries no elastic ceiling (policy did not go through Policy::validated)")]
+    InconsistentResourceBound,
+    /// The policy's `time` bound is in a mode that requires a ceiling
+    /// (`Hard` needs `hard_ceiling_secs`, `Elastic` needs
+    /// `elastic_ceiling_secs`) that isn't set. Same non-panicking
+    /// rationale as [`Self::InconsistentResourceBound`].
+    #[error("time bound is in {mode:?} mode but is missing the ceiling that mode requires (policy did not go through Policy::validated)")]
+    InconsistentTimeBound { mode: ConstraintMode },
 }
 
 /// The outcome of evaluating one constraint (resource or time) against
@@ -540,8 +576,8 @@ impl Policy {
             });
         }
 
-        let resource_outcome = Self::evaluate_resource(&self.resource, projected_resource);
-        let time_outcome = Self::evaluate_time(&self.time, projected_duration_secs);
+        let resource_outcome = Self::evaluate_resource(&self.resource, projected_resource)?;
+        let time_outcome = Self::evaluate_time(&self.time, projected_duration_secs)?;
         let confidence_ok = estimate_confidence >= self.min_confidence;
 
         let mut deny_reasons = Vec::new();
@@ -580,12 +616,15 @@ impl Policy {
         })
     }
 
-    fn evaluate_resource(bound: &ResourceBound, projected: ResourceAmount) -> ConstraintOutcome {
+    fn evaluate_resource(
+        bound: &ResourceBound,
+        projected: ResourceAmount,
+    ) -> Result<ConstraintOutcome, PolicyEvaluationError> {
         let p = projected.as_f64();
         let target = bound.target.as_f64();
         let hard = bound.hard_ceiling.as_f64();
 
-        match bound.mode {
+        let outcome = match bound.mode {
             ConstraintMode::Hard => {
                 if p > hard {
                     ConstraintOutcome::Deny(DenyReason::ResourceExceedsHardCeiling {
@@ -599,7 +638,7 @@ impl Policy {
             ConstraintMode::Elastic => {
                 let elastic = bound
                     .elastic_ceiling
-                    .expect("validated: Elastic mode always has an elastic_ceiling");
+                    .ok_or(PolicyEvaluationError::InconsistentResourceBound)?;
                 if p <= target || p <= elastic.as_f64() {
                     ConstraintOutcome::Admit
                 } else if p <= hard {
@@ -633,15 +672,21 @@ impl Policy {
                     })
                 }
             }
-        }
+        };
+        Ok(outcome)
     }
 
-    fn evaluate_time(bound: &TimeBound, projected_secs: u64) -> ConstraintOutcome {
-        match bound.mode {
+    fn evaluate_time(
+        bound: &TimeBound,
+        projected_secs: u64,
+    ) -> Result<ConstraintOutcome, PolicyEvaluationError> {
+        let outcome = match bound.mode {
             ConstraintMode::Hard => {
-                let hard = bound
-                    .hard_ceiling_secs
-                    .expect("validated: Hard mode always has a hard_ceiling_secs");
+                let hard = bound.hard_ceiling_secs.ok_or(
+                    PolicyEvaluationError::InconsistentTimeBound {
+                        mode: ConstraintMode::Hard,
+                    },
+                )?;
                 if projected_secs > hard {
                     ConstraintOutcome::Deny(DenyReason::TimeExceedsHardCeiling {
                         projected_secs,
@@ -652,53 +697,64 @@ impl Policy {
                 }
             }
             ConstraintMode::Elastic => {
-                let elastic = bound
-                    .elastic_ceiling_secs
-                    .expect("validated: Elastic mode always has an elastic_ceiling_secs");
+                let elastic = bound.elastic_ceiling_secs.ok_or(
+                    PolicyEvaluationError::InconsistentTimeBound {
+                        mode: ConstraintMode::Elastic,
+                    },
+                )?;
                 if projected_secs <= bound.target_secs || projected_secs <= elastic {
                     ConstraintOutcome::Admit
-                } else if bound
-                    .hard_ceiling_secs
-                    .is_none_or(|hard| projected_secs <= hard)
-                {
+                } else if let Some(hard_ceiling_secs) = bound.hard_ceiling_secs {
+                    if projected_secs <= hard_ceiling_secs {
+                        ConstraintOutcome::ApprovalRequired(ApprovalRequest::Time {
+                            projected_secs,
+                            target_secs: bound.target_secs,
+                            elastic_ceiling_secs: Some(elastic),
+                            hard_ceiling_secs: bound.hard_ceiling_secs,
+                        })
+                    } else {
+                        ConstraintOutcome::Deny(DenyReason::TimeExceedsHardCeiling {
+                            projected_secs,
+                            hard_ceiling_secs,
+                        })
+                    }
+                } else {
                     ConstraintOutcome::ApprovalRequired(ApprovalRequest::Time {
                         projected_secs,
                         target_secs: bound.target_secs,
                         elastic_ceiling_secs: Some(elastic),
-                        hard_ceiling_secs: bound.hard_ceiling_secs,
-                    })
-                } else {
-                    ConstraintOutcome::Deny(DenyReason::TimeExceedsHardCeiling {
-                        projected_secs,
-                        hard_ceiling_secs: bound
-                            .hard_ceiling_secs
-                            .expect("checked is_none_or above"),
+                        hard_ceiling_secs: None,
                     })
                 }
             }
             ConstraintMode::Approval => {
                 if projected_secs <= bound.target_secs {
                     ConstraintOutcome::Admit
-                } else if bound
-                    .hard_ceiling_secs
-                    .is_none_or(|hard| projected_secs <= hard)
-                {
+                } else if let Some(hard_ceiling_secs) = bound.hard_ceiling_secs {
+                    if projected_secs <= hard_ceiling_secs {
+                        ConstraintOutcome::ApprovalRequired(ApprovalRequest::Time {
+                            projected_secs,
+                            target_secs: bound.target_secs,
+                            elastic_ceiling_secs: None,
+                            hard_ceiling_secs: bound.hard_ceiling_secs,
+                        })
+                    } else {
+                        ConstraintOutcome::Deny(DenyReason::TimeExceedsHardCeiling {
+                            projected_secs,
+                            hard_ceiling_secs,
+                        })
+                    }
+                } else {
                     ConstraintOutcome::ApprovalRequired(ApprovalRequest::Time {
                         projected_secs,
                         target_secs: bound.target_secs,
                         elastic_ceiling_secs: None,
-                        hard_ceiling_secs: bound.hard_ceiling_secs,
-                    })
-                } else {
-                    ConstraintOutcome::Deny(DenyReason::TimeExceedsHardCeiling {
-                        projected_secs,
-                        hard_ceiling_secs: bound
-                            .hard_ceiling_secs
-                            .expect("checked is_none_or above"),
+                        hard_ceiling_secs: None,
                     })
                 }
             }
-        }
+        };
+        Ok(outcome)
     }
 }
 
@@ -1611,6 +1667,187 @@ mod tests {
             PolicyEvaluationError::ProjectedResourceKindMismatch {
                 policy_kind: ResourceKind::Usd,
                 projected_kind: ResourceKind::Tokens,
+            }
+        );
+    }
+
+    #[test]
+    fn tokens_resource_preset_and_evaluate_round_trip() {
+        // Subscription/quota-metered resources must be representable
+        // without a fake USD conversion — Tokens is one such kind.
+        let inputs = PolicyPresetInputs {
+            resource_target: ResourceAmount::Tokens(10_000),
+            time_target_secs: 600,
+            quality_floor: quality_floor(),
+        };
+        let policy = Policy::balanced(inputs).expect("valid policy");
+        assert_eq!(policy.resource.target, ResourceAmount::Tokens(10_000));
+        assert_eq!(
+            policy.resource.elastic_ceiling,
+            Some(ResourceAmount::Tokens(12_500))
+        );
+        assert_eq!(policy.resource.hard_ceiling, ResourceAmount::Tokens(15_000));
+
+        let decision = policy
+            .evaluate(ResourceAmount::Tokens(11_000), 600, Confidence::Medium)
+            .expect("compatible kind");
+        assert_eq!(decision.admission, Admission::Admit);
+
+        let over_hard = policy
+            .evaluate(ResourceAmount::Tokens(20_000), 600, Confidence::Medium)
+            .expect("compatible kind");
+        assert!(matches!(over_hard.admission, Admission::Deny(_)));
+    }
+
+    #[test]
+    fn quota_percent_resource_preset_and_evaluate_round_trip() {
+        // A subscription plan that only exposes a quota percentage, with
+        // no per-request price at all, must also be representable.
+        let inputs = PolicyPresetInputs {
+            resource_target: ResourceAmount::QuotaPercent(40.0),
+            time_target_secs: 600,
+            quality_floor: quality_floor(),
+        };
+        let policy = Policy::balanced(inputs).expect("valid policy");
+        assert_eq!(policy.resource.target, ResourceAmount::QuotaPercent(40.0));
+        assert_eq!(
+            policy.resource.elastic_ceiling,
+            Some(ResourceAmount::QuotaPercent(50.0))
+        );
+        assert_eq!(
+            policy.resource.hard_ceiling,
+            ResourceAmount::QuotaPercent(60.0)
+        );
+
+        let decision = policy
+            .evaluate(ResourceAmount::QuotaPercent(45.0), 600, Confidence::Medium)
+            .expect("compatible kind");
+        assert_eq!(decision.admission, Admission::Admit);
+    }
+
+    #[test]
+    fn quota_percent_preset_saturates_at_100_instead_of_producing_an_out_of_range_ceiling() {
+        // deadline_first's 3x multiplier on an 80% target would be 240%
+        // without saturation — not representable, and not rejected as
+        // invalid either, since the saturated value is exactly what the
+        // policy means ("as much of the quota as exists").
+        let inputs = PolicyPresetInputs {
+            resource_target: ResourceAmount::QuotaPercent(80.0),
+            time_target_secs: 600,
+            quality_floor: quality_floor(),
+        };
+        let policy = Policy::deadline_first(inputs).expect("valid policy");
+        assert_eq!(
+            policy.resource.hard_ceiling,
+            ResourceAmount::QuotaPercent(100.0)
+        );
+    }
+
+    #[test]
+    fn rejects_quota_percent_out_of_range() {
+        let err = Policy::validated(
+            "invalid",
+            ResourceBound {
+                mode: ConstraintMode::Hard,
+                target: ResourceAmount::QuotaPercent(40.0),
+                elastic_ceiling: None,
+                hard_ceiling: ResourceAmount::QuotaPercent(150.0),
+            },
+            TimeBound {
+                mode: ConstraintMode::Hard,
+                target_secs: 600,
+                elastic_ceiling_secs: None,
+                hard_ceiling_secs: Some(600),
+                deadline: None,
+            },
+            quality_floor(),
+            Confidence::Medium,
+            AutonomyBoundary::AskOnApproval,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PolicyValidationError::ResourceQuotaPercentOutOfRange {
+                amount: ResourceAmount::QuotaPercent(150.0),
+            }
+        );
+    }
+
+    #[test]
+    fn evaluate_returns_an_error_rather_than_panicking_on_a_policy_that_bypassed_validation() {
+        // Policy is `Deserialize`, and every field is `pub` — a stored
+        // (or hand-edited) Policy can reach evaluate() without ever
+        // going through Policy::validated. evaluate() must fail safely,
+        // not panic, on an internally-inconsistent policy like this one
+        // (Elastic mode, no elastic_ceiling).
+        let json = serde_json::json!({
+            "policy_schema_version": POLICY_SCHEMA_VERSION,
+            "name": "hand-edited",
+            "resource": {
+                "mode": "elastic",
+                "target": {"kind": "usd_cents", "amount": 1000},
+                "elastic_ceiling": null,
+                "hard_ceiling": {"kind": "usd_cents", "amount": 2000}
+            },
+            "time": {
+                "mode": "hard",
+                "target_secs": 600,
+                "elastic_ceiling_secs": null,
+                "hard_ceiling_secs": null,
+                "deadline": null
+            },
+            "quality_floor": {
+                "revision": 1,
+                "criteria": [{"description": "tests pass", "required": true}]
+            },
+            "min_confidence": "medium",
+            "autonomy": "ask_on_approval"
+        });
+        let policy: Policy = serde_json::from_value(json).expect("deserializes structurally");
+
+        let resource_err = policy
+            .evaluate(ResourceAmount::UsdCents(1), 1, Confidence::Medium)
+            .unwrap_err();
+        assert_eq!(
+            resource_err,
+            PolicyEvaluationError::InconsistentResourceBound
+        );
+    }
+
+    #[test]
+    fn evaluate_returns_an_error_for_a_hard_time_bound_missing_its_ceiling() {
+        let json = serde_json::json!({
+            "policy_schema_version": POLICY_SCHEMA_VERSION,
+            "name": "hand-edited",
+            "resource": {
+                "mode": "hard",
+                "target": {"kind": "usd_cents", "amount": 1000},
+                "elastic_ceiling": null,
+                "hard_ceiling": {"kind": "usd_cents", "amount": 1000}
+            },
+            "time": {
+                "mode": "hard",
+                "target_secs": 600,
+                "elastic_ceiling_secs": null,
+                "hard_ceiling_secs": null,
+                "deadline": null
+            },
+            "quality_floor": {
+                "revision": 1,
+                "criteria": [{"description": "tests pass", "required": true}]
+            },
+            "min_confidence": "medium",
+            "autonomy": "ask_on_approval"
+        });
+        let policy: Policy = serde_json::from_value(json).expect("deserializes structurally");
+
+        let time_err = policy
+            .evaluate(ResourceAmount::UsdCents(1), 1, Confidence::Medium)
+            .unwrap_err();
+        assert_eq!(
+            time_err,
+            PolicyEvaluationError::InconsistentTimeBound {
+                mode: ConstraintMode::Hard
             }
         );
     }
