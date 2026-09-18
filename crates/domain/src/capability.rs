@@ -245,7 +245,8 @@ mod tests {
     #[test]
     fn only_gateway_tiers_can_refuse_before_spend() {
         assert!(
-            EnforcementCapabilities::for_tier(EnforcementTier::GatewayMetered, "p").pre_spend_refusal
+            EnforcementCapabilities::for_tier(EnforcementTier::GatewayMetered, "p")
+                .pre_spend_refusal
         );
         assert!(
             EnforcementCapabilities::for_tier(EnforcementTier::GatewayObservedQuota, "p")
