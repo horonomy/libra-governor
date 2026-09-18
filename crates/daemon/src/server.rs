@@ -201,6 +201,10 @@ pub fn serve(listener: UnixListener, config: &DaemonConfig) -> Result<(), Daemon
     // reclaimed. The handle is kept alive for the life of `serve`; when
     // it drops, the gateway's shutdown channel closes and its thread
     // winds down.
+    // `let _gateway = ...`, NOT `let _ = ...`: an underscore-prefixed
+    // binding holds the value for the scope, while a bare `_` pattern
+    // drops it immediately — which would close the shutdown channel and
+    // stop the gateway the instant it started.
     let _gateway = start_gateway(config);
 
     for incoming in listener.incoming() {
