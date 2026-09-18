@@ -68,6 +68,18 @@ fn parse_plan_id(id: Option<String>) -> Result<Option<PlanId>, LedgerError> {
     .transpose()
 }
 
+/// Deserializes a nullable `reservation_evidence_json` column value
+/// (HORO-1141). `None` means "genuinely no reservation evidence
+/// recorded" (a pre-HORO-1141 row, or a task with no `task_budgets`
+/// row), not a deserialize failure.
+fn parse_reservation_evidence(
+    json: Option<String>,
+) -> Result<Option<libra_governor_domain::ReservationEvidence>, LedgerError> {
+    json.map(|s| serde_json::from_str(&s))
+        .transpose()
+        .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))
+}
+
 impl LedgerStore {
     /// Reconstructs one task's full trajectory: identity, ordered events,
     /// all contract revisions, all plans, and all receipts.
@@ -234,7 +246,8 @@ impl LedgerStore {
     ) -> Result<Vec<ExecutionReceipt>, LedgerError> {
         let mut stmt = self.conn.prepare(
             "SELECT plan_id, contract_revision, actual_duration_secs, actual_usage_json,
-                    outcome_json, recorded_at, tool_call_count, model, provider, task_features_json
+                    outcome_json, recorded_at, tool_call_count, model, provider, task_features_json,
+                    reservation_evidence_json
              FROM receipts WHERE task_id = ?1 ORDER BY recorded_at ASC",
         )?;
         let rows = stmt.query_map([task_id_str], |row| {
@@ -248,6 +261,7 @@ impl LedgerStore {
             let model: Option<String> = row.get(7)?;
             let provider: Option<String> = row.get(8)?;
             let task_features_json: Option<String> = row.get(9)?;
+            let reservation_evidence_json: Option<String> = row.get(10)?;
             Ok((
                 plan_id,
                 contract_revision,
@@ -259,6 +273,7 @@ impl LedgerStore {
                 model,
                 provider,
                 task_features_json,
+                reservation_evidence_json,
             ))
         })?;
 
@@ -275,6 +290,7 @@ impl LedgerStore {
                 model,
                 provider,
                 task_features_json,
+                reservation_evidence_json,
             ) = row?;
             let plan_id = Uuid::parse_str(&plan_id)
                 .map(PlanId)
@@ -284,6 +300,7 @@ impl LedgerStore {
             let outcome: ExecutionOutcome = serde_json::from_str(&outcome_json)
                 .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
             let task_features = parse_task_features(task_features_json)?;
+            let reservations = parse_reservation_evidence(reservation_evidence_json)?;
 
             receipts.push(ExecutionReceipt {
                 task_id,
@@ -297,6 +314,7 @@ impl LedgerStore {
                 model,
                 provider,
                 task_features,
+                reservations,
             });
         }
         Ok(receipts)
@@ -457,7 +475,7 @@ impl LedgerStore {
         let mut stmt = self.conn.prepare(
             "SELECT task_id, plan_id, contract_revision, actual_duration_secs,
                     actual_usage_json, outcome_json, recorded_at, tool_call_count, model, provider,
-                    task_features_json
+                    task_features_json, reservation_evidence_json
              FROM receipts ORDER BY recorded_at ASC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -472,6 +490,7 @@ impl LedgerStore {
             let model: Option<String> = row.get(8)?;
             let provider: Option<String> = row.get(9)?;
             let task_features_json: Option<String> = row.get(10)?;
+            let reservation_evidence_json: Option<String> = row.get(11)?;
             Ok((
                 task_id,
                 plan_id,
@@ -484,6 +503,7 @@ impl LedgerStore {
                 model,
                 provider,
                 task_features_json,
+                reservation_evidence_json,
             ))
         })?;
 
@@ -501,6 +521,7 @@ impl LedgerStore {
                 model,
                 provider,
                 task_features_json,
+                reservation_evidence_json,
             ) = row?;
             let task_id = Uuid::parse_str(&task_id)
                 .map(TaskId)
@@ -513,6 +534,7 @@ impl LedgerStore {
             let outcome: ExecutionOutcome = serde_json::from_str(&outcome_json)
                 .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
             let task_features = parse_task_features(task_features_json)?;
+            let reservations = parse_reservation_evidence(reservation_evidence_json)?;
 
             receipts.push((
                 task_features.clone(),
@@ -528,6 +550,7 @@ impl LedgerStore {
                     model,
                     provider,
                     task_features,
+                    reservations,
                 },
             ));
         }

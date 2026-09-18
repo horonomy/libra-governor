@@ -31,16 +31,17 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 
 use libra_governor_domain::{
-    evaluate_hysteresis, possible_tool_loop, tool_call_count_is_material, Estimate,
-    ExecutionOutcome, ExecutionPlan, ExecutionReceipt, HysteresisOutcome, RemainingEstimate,
-    ReplanId, ReplanReason, ReplanRecord, ReplanTriggerKind, ABSOLUTE_TOOL_CALL_COUNT_FALLBACK,
-    DEFAULT_LOOP_STREAK_THRESHOLD,
+    completion_reserve_for, evaluate_hysteresis, possible_tool_loop, tool_call_count_is_material,
+    Admission, CompletionContract, CompletionCriterion, Estimate, ExecutionOutcome, ExecutionPlan,
+    ExecutionReceipt, HysteresisOutcome, Policy, PolicyPresetInputs, RemainingEstimate, ReplanId,
+    ReplanReason, ReplanRecord, ReplanTriggerKind, ReservationClass, ReservationState,
+    ResourceAmount, ABSOLUTE_TOOL_CALL_COUNT_FALLBACK, DEFAULT_LOOP_STREAK_THRESHOLD,
 };
 use libra_governor_estimator::{
     admission_replay, duration_coverage, estimate_bucketed, typical_tool_call_count_bucketed,
     AdmissionPolicy,
 };
-use libra_governor_ledger::LedgerStore;
+use libra_governor_ledger::{LedgerStore, ReserveOutcome, ReserveRequest};
 use libra_governor_protocol::{
     wire, AdmissionPolicyReport, CalibrationReportResult, FinalizeOutcome, FinalizeResult,
     PreflightResult, ReconSummary, ReplanState, Request, RequestEnvelope, Response,
@@ -59,6 +60,13 @@ pub enum DaemonError {
     Wire(#[from] wire::WireError),
     #[error("another daemon is already running at {0}")]
     AlreadyRunning(PathBuf),
+    /// Only reachable if a `Policy`/projected-amount pairing is
+    /// internally inconsistent (e.g. a hand-built `Policy` that bypassed
+    /// [`Policy::validated`]) — every `Policy` this daemon constructs
+    /// itself goes through validation, so this is a defensive path, not
+    /// an expected one (HORO-1141).
+    #[error("policy evaluation error: {0}")]
+    Policy(#[from] libra_governor_domain::PolicyEvaluationError),
 }
 
 pub struct DaemonConfig {
@@ -69,6 +77,40 @@ pub struct DaemonConfig {
     /// Cooldown and max-auto-replan-count controls (HORO-1139) — see
     /// `libra_governor_domain::ReplanHysteresisConfig` docs.
     pub replan_hysteresis: libra_governor_domain::ReplanHysteresisConfig,
+    /// The admission [`Policy`] every task's [`TaskBudget`][libra_governor_domain::TaskBudget]
+    /// is initialized from at its first `Preflight` (HORO-1141 — the
+    /// first real wiring of HORO-1137's `Policy::evaluate` into the
+    /// daemon). See [`default_admission_policy`] for the shipped
+    /// default.
+    pub policy: Policy,
+    /// How long a reservation may stay `Active` before startup/opportunistic
+    /// reconciliation reclaims it (HORO-1141) — see
+    /// [`reconcile_stale_reservations`].
+    pub reservation_ttl_secs: u64,
+}
+
+/// The default admission [`Policy`] every task's budget is initialized
+/// from when no per-task policy override exists yet (no such override
+/// surface exists as of HORO-1141 — every task uses this one policy).
+/// `resource_target` is denominated in [`libra_governor_domain::ResourceAmount::Tokens`]:
+/// the only resource figure this system can honestly report today is a
+/// token count (Claude Code's hook payloads expose no cost/USD data —
+/// see `ExecutionReceipt::provider` docs), so pricing every task budget
+/// in USD would fabricate a conversion nothing here can back up.
+///
+/// Constructed from fixed, known-valid inputs, so the `Policy::balanced`
+/// validation this calls can never actually fail in practice — `.expect`
+/// documents that invariant rather than propagating a `Result` that has
+/// no real failure mode for a caller to handle.
+pub fn default_admission_policy() -> Policy {
+    Policy::balanced(PolicyPresetInputs {
+        resource_target: ResourceAmount::Tokens(100_000),
+        time_target_secs: 3600,
+        quality_floor: CompletionContract::first(vec![CompletionCriterion::required(
+            "required verification (tests/build/lint) passes",
+        )]),
+    })
+    .expect("default_admission_policy's hardcoded inputs are always valid")
 }
 
 /// Binds `socket_path`, handling the stale-vs-live detection documented
@@ -93,6 +135,38 @@ pub fn bind_or_detect_running(socket_path: &PathBuf) -> Result<UnixListener, Dae
     }
 }
 
+/// Reclaims every reservation left `Active` past its `expires_at`
+/// (HORO-1141) — the crash/restart reconciliation path: a reservation
+/// issued by a process (a hook invocation, or this same daemon) that
+/// then crashed without settling or releasing it would otherwise stay
+/// `Active`, and its drawn Completion Reserve unrestored, forever.
+/// Called once at daemon startup (before the accept loop begins — see
+/// [`serve`]) and again opportunistically at the top of every
+/// `Preflight` (see `handle_preflight`) so a long-lived daemon process
+/// stays honest without a dedicated timer thread. Errors are logged, not
+/// propagated — reconciliation failing must never take the whole daemon
+/// down.
+pub(crate) fn reconcile_stale_reservations(ledger: &mut LedgerStore, config: &DaemonConfig) {
+    let now = time::OffsetDateTime::now_utc();
+    match ledger.expire_stale_reservations(now) {
+        Ok(expired) if !expired.is_empty() => {
+            let restored: f64 = expired.iter().map(|r| r.drawn_from_reserve.as_f64()).sum();
+            log::append_line(
+                &config.log_path,
+                &format!(
+                    "startup reconciliation: expired {} stale reservation(s), restored {restored} \
+                     to their completion reserve(s)",
+                    expired.len()
+                ),
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            log::append_line(&config.log_path, &format!("reconciliation error: {e}"));
+        }
+    }
+}
+
 /// Runs the daemon's blocking accept loop against an already-bound
 /// listener. Returns only on an unrecoverable I/O error accepting a new
 /// connection; per-connection errors are caught and logged, never
@@ -100,6 +174,8 @@ pub fn bind_or_detect_running(socket_path: &PathBuf) -> Result<UnixListener, Dae
 pub fn serve(listener: UnixListener, config: &DaemonConfig) -> Result<(), DaemonError> {
     let mut ledger = LedgerStore::open(&config.ledger_path)?;
     let mut current_task: Option<TaskSummary> = None;
+
+    reconcile_stale_reservations(&mut ledger, config);
 
     for incoming in listener.incoming() {
         let stream = match incoming {
@@ -327,8 +403,22 @@ fn handle_preflight(
 ) -> Result<PreflightResult, DaemonError> {
     let now = time::OffsetDateTime::now_utc();
 
+    // Opportunistic reconciliation (HORO-1141): a long-lived daemon does
+    // this once at startup (see `serve`) too, but re-running it here
+    // means a reservation left dangling by a crashed subagent gets
+    // reclaimed before the very next preflight needs its capacity, not
+    // only after the next daemon restart.
+    reconcile_stale_reservations(ledger, config);
+
     let task_id = ledger.resolve_or_create_task_for_session(session_id, now)?;
     let previous_contract = ledger.latest_contract(task_id)?;
+    let had_existing_budget = ledger.task_budget(task_id)?.is_some();
+    // Captured before `supersede_in_flight_preflights` below so the
+    // outgoing plan's reservation (if this is a second-or-later prompt
+    // in the same session, not a replan) can be released rather than
+    // left `active` and untouched until its TTL eventually expires
+    // (HORO-1141).
+    let previous_plan_id = ledger.in_flight_plan_for_session(session_id)?;
 
     let recon = recon::run_recon(cwd, task_hint, &config.recon_budget);
     let contract = contract::draft_contract(previous_contract.as_ref(), &recon);
@@ -356,6 +446,125 @@ fn handle_preflight(
     ledger.supersede_in_flight_preflights(session_id)?;
     ledger.record_preflight(session_id, task_id, plan.id, now)?;
 
+    // Release the outgoing plan's reservation, if any (HORO-1141): a
+    // fresh (non-replan) preflight for a task that already had an
+    // in-flight plan — e.g. a second prompt in the same session — must
+    // not leave that plan's envelope `active` forever; only `ToolInvoked`'s
+    // replan path and `Finalize`'s settlement otherwise touch it.
+    if let Some(previous_plan_id) = previous_plan_id {
+        ledger.release_active_for_plan(task_id, previous_plan_id, now)?;
+    }
+
+    // Completion Reserve + atomic admission (HORO-1141): the first real
+    // wiring of HORO-1137's `Policy::evaluate` into the daemon. Every
+    // task's budget is initialized (idempotently — a no-op if one
+    // already exists) from `config.policy` and the reserve this
+    // contract/estimate imply; a second-or-later preflight for the same
+    // task (a new prompt in the same session, or a replan) recomputes
+    // and adjusts the reserve against the freshest evidence.
+    let reserve_estimate = completion_reserve_for(&contract, Some(&estimate), &config.policy);
+    let budget = ledger.initialize_task_budget(task_id, &config.policy, &reserve_estimate, now)?;
+    if had_existing_budget {
+        match ledger.adjust_completion_reserve(
+            task_id,
+            reserve_estimate.amount,
+            reserve_estimate.basis,
+            now,
+        )? {
+            libra_governor_ledger::AdjustOutcome::Insufficient { available, .. } => {
+                log::append_line(
+                    &config.log_path,
+                    &format!(
+                        "task {task_id}: could not raise completion reserve to \
+                         {reserve_estimate:?} — only {available:?} of headroom available"
+                    ),
+                );
+            }
+            libra_governor_ledger::AdjustOutcome::Adjusted { .. }
+            | libra_governor_ledger::AdjustOutcome::NoBudget => {}
+        }
+    }
+
+    // Project total committed capacity (settled + active + this
+    // preflight's own requested envelope) and evaluate it against the
+    // policy's Hard/Elastic/Approval resource and time constraints
+    // (HORO-1137). `resource_p80` is preferred when its kind matches the
+    // policy's; a cold-start (or kind-mismatched) estimate falls back to
+    // the policy's own target — the same basis rule `completion_reserve_for`
+    // uses, applied here to the admission projection.
+    let requested = estimate
+        .resource_p80
+        .filter(|amount| amount.kind() == budget.resource_kind)
+        .unwrap_or(config.policy.resource.target);
+    let required_headroom = ledger.available(task_id, ReservationClass::RequiredWork)?;
+    let committed = required_headroom
+        .map(|h| budget.hard_limit.as_f64() - h.value)
+        .unwrap_or(0.0);
+    let projected =
+        ResourceAmount::from_kind_f64(budget.resource_kind, committed + requested.as_f64());
+    let decision = config.policy.evaluate(
+        projected,
+        estimate.duration_p80_secs.unwrap_or(0),
+        estimate.confidence,
+    )?;
+
+    match &decision.admission {
+        Admission::Admit => {
+            // The reserve's own share of `requested` is already held on
+            // `task_budgets.completion_reserve` — only the remainder
+            // (the ordinary work envelope) needs an explicit reservation
+            // row, so `work_envelope + completion_reserve == requested`
+            // and nothing is double-counted.
+            let work_envelope_value =
+                (requested.as_f64() - reserve_estimate.amount.as_f64()).max(0.0);
+            let work_envelope =
+                ResourceAmount::from_kind_f64(budget.resource_kind, work_envelope_value);
+            match ledger.reserve(ReserveRequest {
+                task_id,
+                session_id,
+                plan_id: Some(plan.id),
+                class: ReservationClass::RequiredWork,
+                amount: work_envelope,
+                idempotency_key: &format!("plan:{}", plan.id.0),
+                now,
+                ttl_secs: config.reservation_ttl_secs,
+            })? {
+                ReserveOutcome::Granted(_) | ReserveOutcome::AlreadyGranted(_) => {}
+                ReserveOutcome::Insufficient { available, .. } => {
+                    log::append_line(
+                        &config.log_path,
+                        &format!(
+                            "task {task_id}: policy admitted but the ledger could not reserve \
+                             the work envelope — only {available:?} available"
+                        ),
+                    );
+                }
+                ReserveOutcome::NoBudget => {
+                    log::append_line(
+                        &config.log_path,
+                        &format!("task {task_id}: reserve attempted with no task_budgets row"),
+                    );
+                }
+            }
+        }
+        Admission::ApprovalRequired(_) | Admission::Deny(_) => {
+            // Optional work is denied/approval-gated before it can
+            // consume protected completion resources (HORO-1141
+            // acceptance criterion): no reservation is written here at
+            // all, so nothing beyond what earlier reservations already
+            // hold is committed against this task's envelope.
+            log::append_line(
+                &config.log_path,
+                &format!(
+                    "task {task_id}: admission decision {:?} — no reservation made",
+                    decision.admission
+                ),
+            );
+        }
+    }
+
+    let completion_reserve = ledger.task_budget(task_id)?.map(|b| b.completion_reserve);
+
     Ok(PreflightResult {
         task_id,
         contract_draft: contract,
@@ -371,6 +580,8 @@ fn handle_preflight(
         recon_cost_seconds: recon.elapsed.as_secs_f64(),
         estimate: Some(estimate),
         plan_id: plan.id,
+        admission: Some(decision),
+        completion_reserve,
     })
 }
 
@@ -513,6 +724,76 @@ fn handle_tool_invoked(
     ledger.supersede_in_flight_preflights(session_id)?;
     ledger.record_preflight(session_id, task_id, new_plan.id, now)?;
 
+    // Recompute and re-reserve against the replan's remaining estimate
+    // (HORO-1141): the superseded plan's envelope is refunded, not
+    // stranded `active` forever, and the Completion Reserve is
+    // recalculated against fresh evidence rather than staying pinned to
+    // the original (now-stale) preflight's estimate.
+    ledger.release_active_for_plan(task_id, plan.id, now)?;
+    if let Some(contract) = ledger.latest_contract(task_id)? {
+        let reserve_estimate =
+            completion_reserve_for(&contract, Some(&remaining.estimate), &config.policy);
+        match ledger.adjust_completion_reserve(
+            task_id,
+            reserve_estimate.amount,
+            reserve_estimate.basis,
+            now,
+        )? {
+            libra_governor_ledger::AdjustOutcome::Insufficient { available, .. } => {
+                log::append_line(
+                    &config.log_path,
+                    &format!(
+                        "task {task_id}: replan could not raise completion reserve to \
+                         {reserve_estimate:?} — only {available:?} of headroom available"
+                    ),
+                );
+            }
+            libra_governor_ledger::AdjustOutcome::Adjusted { .. }
+            | libra_governor_ledger::AdjustOutcome::NoBudget => {}
+        }
+
+        if let Some(budget) = ledger.task_budget(task_id)? {
+            let requested = remaining
+                .estimate
+                .resource_p80
+                .filter(|amount| amount.kind() == budget.resource_kind)
+                .unwrap_or(config.policy.resource.target);
+            let work_envelope_value =
+                (requested.as_f64() - reserve_estimate.amount.as_f64()).max(0.0);
+            let work_envelope =
+                ResourceAmount::from_kind_f64(budget.resource_kind, work_envelope_value);
+            match ledger.reserve(ReserveRequest {
+                task_id,
+                session_id,
+                plan_id: Some(new_plan.id),
+                class: ReservationClass::RequiredWork,
+                amount: work_envelope,
+                idempotency_key: &format!("plan:{}", new_plan.id.0),
+                now,
+                ttl_secs: config.reservation_ttl_secs,
+            })? {
+                ReserveOutcome::Granted(_) | ReserveOutcome::AlreadyGranted(_) => {}
+                ReserveOutcome::Insufficient { available, .. } => {
+                    log::append_line(
+                        &config.log_path,
+                        &format!(
+                            "task {task_id}: replan could not reserve the recomputed work \
+                             envelope — only {available:?} available"
+                        ),
+                    );
+                }
+                ReserveOutcome::NoBudget => {
+                    log::append_line(
+                        &config.log_path,
+                        &format!(
+                            "task {task_id}: replan reserve attempted with no task_budgets row"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
     ledger.insert_replan_event(&ReplanRecord {
         id: ReplanId::new(),
         task_id,
@@ -615,6 +896,22 @@ fn handle_finalize(
     .with_provider(None)
     .with_task_features(plan.task_features.clone());
 
+    // Settle every reservation still active on this plan (HORO-1141).
+    // `None` as the actual cost: Claude Code's hook payloads expose no
+    // token/cost usage figure (see the comment above on `actual_usage`),
+    // so settlement conservatively falls back to the reserved amount
+    // rather than fabricating one — see `Reservation::usage_known` docs.
+    let active_reservations: Vec<_> = ledger
+        .reservations_for_task(task_id)?
+        .into_iter()
+        .filter(|r| r.plan_id == Some(plan_id) && r.state == ReservationState::Active)
+        .collect();
+    for reservation in active_reservations {
+        ledger.settle(reservation.id, None, now)?;
+    }
+    let reservation_evidence = ledger.reservation_evidence(task_id)?;
+    let receipt = receipt.with_reservation_evidence(reservation_evidence);
+
     ledger.insert_receipt(&receipt)?;
 
     if current_task.as_ref().map(|t| t.task_id) == Some(task_id) {
@@ -687,6 +984,8 @@ mod tests {
             log_path: dir.path().join("daemon.log"),
             recon_budget: crate::recon::ReconBudget::default(),
             replan_hysteresis: libra_governor_domain::ReplanHysteresisConfig::default(),
+            policy: default_admission_policy(),
+            reservation_ttl_secs: 900,
         };
         let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
 
@@ -746,6 +1045,8 @@ mod tests {
             log_path: dir.path().join("daemon.log"),
             recon_budget: crate::recon::ReconBudget::default(),
             replan_hysteresis: libra_governor_domain::ReplanHysteresisConfig::default(),
+            policy: default_admission_policy(),
+            reservation_ttl_secs: 900,
         };
 
         let response = dispatch(

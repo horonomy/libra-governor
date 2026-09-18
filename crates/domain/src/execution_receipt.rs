@@ -9,6 +9,26 @@ use crate::{
     task_features::TaskFeatures, task_identity::TaskId,
 };
 
+/// Reservation/release/overrun evidence recorded onto an
+/// [`ExecutionReceipt`] at finalization (HORO-1141) — the receipt-level
+/// half of the ticket's "Receipt records reservation/release/overrun
+/// evidence" acceptance criterion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReservationEvidence {
+    pub reserved_total: ResourceAmount,
+    pub settled_total: ResourceAmount,
+    pub released_total: ResourceAmount,
+    /// `None` when no reservation overran. Never `Some(zero)`.
+    pub overrun_total: Option<ResourceAmount>,
+    pub completion_reserve_initial: ResourceAmount,
+    pub completion_reserve_remaining: ResourceAmount,
+    pub reservation_count: u32,
+    /// How many settlements carried a real, reported usage figure rather
+    /// than the conservative reserved-amount fallback (see
+    /// [`crate::Reservation::usage_known`]).
+    pub usage_known_count: u32,
+}
+
 /// The recorded actuals for one task's execution, tied back to the plan
 /// (and therefore contract revision) it was estimated against.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -51,6 +71,12 @@ pub struct ExecutionReceipt {
     /// global-tier estimation (see `libra-governor-estimator`), just
     /// never to a class-bucketed tier.
     pub task_features: Option<TaskFeatures>,
+    /// Reservation/release/overrun evidence for this task's resource
+    /// envelope (HORO-1141), if the daemon's reservation ledger was in
+    /// use for this task. `None` for a pre-HORO-1141 receipt or a task
+    /// with no `task_budgets` row — a genuinely absent value, not a
+    /// placeholder.
+    pub reservations: Option<ReservationEvidence>,
 }
 
 impl ExecutionReceipt {
@@ -76,6 +102,7 @@ impl ExecutionReceipt {
             model: None,
             provider: None,
             task_features: None,
+            reservations: None,
         }
     }
 
@@ -104,6 +131,14 @@ impl ExecutionReceipt {
     /// against, if any (HORO-1130).
     pub fn with_task_features(mut self, task_features: Option<TaskFeatures>) -> Self {
         self.task_features = task_features;
+        self
+    }
+
+    /// Attaches reservation/release/overrun evidence for this task's
+    /// resource envelope, if the reservation ledger was in use
+    /// (HORO-1141).
+    pub fn with_reservation_evidence(mut self, evidence: Option<ReservationEvidence>) -> Self {
+        self.reservations = evidence;
         self
     }
 }

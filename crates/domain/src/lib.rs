@@ -35,6 +35,7 @@ mod execution_plan;
 mod execution_receipt;
 mod policy;
 mod replan;
+mod reservation;
 mod resource_amount;
 mod task_features;
 mod task_identity;
@@ -45,7 +46,7 @@ pub use estimate::{Estimate, ESTIMATOR_VERSION};
 pub use execution_event::{ExecutionEvent, ExecutionEventKind};
 pub use execution_outcome::ExecutionOutcome;
 pub use execution_plan::{ExecutionPlan, PlanId};
-pub use execution_receipt::ExecutionReceipt;
+pub use execution_receipt::{ExecutionReceipt, ReservationEvidence};
 pub use policy::{
     Admission, ApprovalRequest, AutonomyBoundary, ConstraintMode, ConstraintOutcome, DenyReason,
     Policy, PolicyDecision, PolicyEvaluationError, PolicyPresetInputs, PolicyValidationError,
@@ -59,6 +60,12 @@ pub use replan::{
     ABSOLUTE_TOOL_CALL_COUNT_FALLBACK, DEFAULT_LOOP_STREAK_THRESHOLD,
     DETERMINISTIC_WIDENING_FACTOR, REPLAN_SCHEMA_VERSION, TOOL_CALL_COUNT_MATERIAL_MULTIPLIER,
 };
-pub use resource_amount::{ResourceAmount, ResourceKind};
+pub use reservation::{
+    completion_reserve_for, CompletionReserveBasis, CompletionReserveEstimate, Reservation,
+    ReservationClass, ReservationId, ReservationState, TaskBudget,
+    COMPLETION_RESERVE_BASE_FRACTION, COMPLETION_RESERVE_MAX_FRACTION,
+    COMPLETION_RESERVE_PER_REQUIRED_CRITERION, RESERVATION_SCHEMA_VERSION,
+};
+pub use resource_amount::{Headroom, ResourceAmount, ResourceKind};
 pub use task_features::{BucketTier, BuildTopology, TaskFeatures, FEATURE_SCHEMA_VERSION};
 pub use task_identity::{ExternalRef, TaskId, TaskIdentity};

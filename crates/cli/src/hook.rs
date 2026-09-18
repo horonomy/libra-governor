@@ -213,6 +213,8 @@ mod tests {
             confidence: Confidence::High,
             recon_cost_seconds: 0.42,
             estimate: None,
+            admission: None,
+            completion_reserve: None,
         }
     }
 

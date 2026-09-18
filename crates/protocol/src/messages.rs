@@ -4,7 +4,8 @@
 use std::path::PathBuf;
 
 use libra_governor_domain::{
-    CompletionContract, Confidence, Estimate, ExecutionReceipt, PlanId, TaskId,
+    CompletionContract, Confidence, Estimate, ExecutionReceipt, PlanId, PolicyDecision,
+    ResourceAmount, TaskId,
 };
 use libra_governor_estimator::{AdmissionOutcome, AdmissionPolicy, CoverageReport};
 use serde::{Deserialize, Serialize};
@@ -124,6 +125,17 @@ pub struct PreflightResult {
     /// `TaskSummary::plan_id` back to "the plan this preflight created"
     /// without a separate lookup.
     pub plan_id: PlanId,
+    /// The admission decision (HORO-1137's `Policy::evaluate`, first
+    /// wired up into the daemon in HORO-1141) for this preflight's
+    /// projected resource/time requirement. `None` only if a task's
+    /// budget could not be resolved at all — never `None` on a normal
+    /// preflight.
+    pub admission: Option<PolicyDecision>,
+    /// The protected Completion Reserve held for this task's required
+    /// completion work (HORO-1141), after this preflight's own
+    /// recomputation. `None` only if a task's budget could not be
+    /// resolved at all.
+    pub completion_reserve: Option<ResourceAmount>,
 }
 
 /// The result of a `Status` request.
@@ -347,6 +359,8 @@ mod tests {
             recon_cost_seconds: 0.01,
             estimate: None,
             plan_id: PlanId::new(),
+            admission: None,
+            completion_reserve: None,
         };
         let json = serde_json::to_value(&result).unwrap();
         assert!(

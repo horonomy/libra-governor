@@ -36,6 +36,8 @@ fn preflight_returns_sane_result_within_recon_budget() {
         log_path: dir.path().join("daemon.log"),
         recon_budget,
         replan_hysteresis: libra_governor_domain::ReplanHysteresisConfig::default(),
+        policy: libra_governor_daemon::default_admission_policy(),
+        reservation_ttl_secs: 900,
     };
 
     let listener = libra_governor_daemon::bind_or_detect_running(&config.socket_path).unwrap();
@@ -125,6 +127,8 @@ fn second_preflight_for_same_session_supersedes_the_first() {
         log_path: dir.path().join("daemon.log"),
         recon_budget: ReconBudget::default(),
         replan_hysteresis: libra_governor_domain::ReplanHysteresisConfig::default(),
+        policy: libra_governor_daemon::default_admission_policy(),
+        reservation_ttl_secs: 900,
     };
 
     let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
@@ -267,6 +271,8 @@ fn preflight_selects_a_bucketed_tier_once_same_repo_history_exists() {
         log_path: dir.path().join("daemon.log"),
         recon_budget: ReconBudget::default(),
         replan_hysteresis: libra_governor_domain::ReplanHysteresisConfig::default(),
+        policy: libra_governor_daemon::default_admission_policy(),
+        reservation_ttl_secs: 900,
     };
 
     let listener = libra_governor_daemon::bind_or_detect_running(&config.socket_path).unwrap();

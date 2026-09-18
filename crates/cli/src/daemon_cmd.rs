@@ -5,6 +5,12 @@
 use libra_governor_daemon::{recon::ReconBudget, DaemonConfig, DaemonError};
 use libra_governor_domain::ReplanHysteresisConfig;
 
+/// Default TTL (HORO-1141) for how long a reservation may stay `Active`
+/// before startup/opportunistic reconciliation reclaims it — generous
+/// enough to cover a normal task's exploration-through-finalization span
+/// without being effectively unbounded.
+const DEFAULT_RESERVATION_TTL_SECS: u64 = 900;
+
 /// Runs the daemon in the foreground: resolves state paths, binds the
 /// socket (recovering a stale socket file, or exiting cleanly if another
 /// daemon already owns it — see
@@ -25,6 +31,8 @@ pub fn run() {
         log_path: state_dir.join("daemon.log"),
         recon_budget: ReconBudget::default(),
         replan_hysteresis: ReplanHysteresisConfig::default(),
+        policy: libra_governor_daemon::default_admission_policy(),
+        reservation_ttl_secs: DEFAULT_RESERVATION_TTL_SECS,
     };
 
     let listener = match libra_governor_daemon::bind_or_detect_running(&config.socket_path) {
