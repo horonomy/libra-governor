@@ -9,9 +9,22 @@ the preflight now carries a real probabilistic P50/P80/P90 cost/time
 [`Estimate`](../../crates/domain/src/estimate.rs), tool calls are counted
 during the session, and a `Stop` hook finalizes the session's task into
 an [`ExecutionReceipt`](../../crates/domain/src/execution_receipt.rs) —
-the estimate-vs-actual record used for calibration. See
-[`../../ARCHITECTURE.md`](../../ARCHITECTURE.md) for how this fits the
-overall hooks/daemon responsibility boundary.
+the estimate-vs-actual record used for calibration. HORO-1139 closes a
+further loop — "govern the run": every `PostToolUse` notification is now
+also checked for a MATERIAL deviation from what the current plan's
+estimate implied (a possible tool-call loop, or a tool-call count that
+has exceeded what history says is typical — see
+[`crates/domain/src/replan.rs`](../../crates/domain/src/replan.rs) for
+exactly which signals are genuinely available from Claude Code's hook
+payloads and which are honestly left undetected). A material event,
+subject to cooldown/max-replan hysteresis, triggers a deterministic
+replan: the remaining-work estimate is recomputed and widened, linked
+back to the plan it replaces with a structured reason, and persisted.
+The statusline now surfaces this directly (current plan id, remaining
+P90, and replan state) — see "What Claude Code's hook payloads actually
+expose" below for why this is the statusline's job rather than
+`PostToolUse`'s. See [`../../ARCHITECTURE.md`](../../ARCHITECTURE.md)
+for how this fits the overall hooks/daemon responsibility boundary.
 
 ## What ships
 
@@ -41,11 +54,14 @@ overall hooks/daemon responsibility boundary.
   daemon's current task/preflight state and prints one short line, e.g.:
 
   ```
-  libra: task a1b2c3d4 | preflight: high | recon: 0.4s
+  libra: task a1b2c3d4 | plan f00dcafe | preflight: high | recon: 0.4s | remaining P90: 90s | replanned 1x
   ```
 
-  Never spawns the daemon and never makes an LLM call of its own — see
-  `crates/cli/src/statusline.rs`.
+  `replanned 1x` (or `stable` / `escalated — awaiting approval`,
+  HORO-1139) reflects the most recent material replan, if any — this is
+  the primary visibility surface for runtime replanning; see "What ships"
+  above. Never spawns the daemon and never makes an LLM call of its own —
+  see `crates/cli/src/statusline.rs`.
 - `libra-governor calibration report` — a manual command (not a hook):
   asks the daemon for real duration-coverage and admission-replay
   calibration evidence, computed over every locally recorded receipt
@@ -56,9 +72,10 @@ overall hooks/daemon responsibility boundary.
 
 All four talk to the daemon over the versioned JSON-over-Unix-socket
 protocol defined in `crates/protocol` (bumped to version 2 in HORO-1126,
-then to version 3 in HORO-1132 for the `CalibrationReport`
-request/response — see that crate's `lib.rs` docs for the upgrade
-caveat: a long-lived daemon on an older protocol version must be
+to version 3 in HORO-1132 for the `CalibrationReport` request/response,
+then to version 4 in HORO-1139 for the replan-visibility fields on
+`PreflightResult`/`TaskSummary` — see that crate's `lib.rs` docs for the
+upgrade caveat: a long-lived daemon on an older protocol version must be
 restarted, it will not understand a newer client's request variants).
 Everything about admission, reconnaissance, estimation, and the ledger
 stays local — see the Privacy Boundary section of `ARCHITECTURE.md`.
@@ -182,8 +199,8 @@ logic and its known narrow-window limitation (documented there).
 3. Open that project in Claude Code and submit any prompt.
 4. Confirm:
    - The statusline (bottom of the Claude Code UI) updates to show
-     `libra: task ... | preflight: ... | recon: ...s` shortly after you
-     submit the prompt.
+     `libra: task ... | plan ... | preflight: ... | recon: ...s |
+     remaining P90: ... | stable` shortly after you submit the prompt.
    - `tail -f ~/.local/state/libra-governor/daemon.log` shows a `daemon
      started` line the first time, and no errors on later prompts.
    - `ls ~/.local/state/libra-governor/` shows `daemon.sock`,
