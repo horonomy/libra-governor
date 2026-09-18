@@ -1,0 +1,23 @@
+--- Security review: forged/malformed/out-of-range daemon protocol requests ---
+Real daemon subprocess, real Unix socket, protocol_version=6 (crates/protocol/src/lib.rs)
+
+1. malformed JSON -> {"protocol_version":6,"response":{"kind":"error","message":"malformed request"}}
+
+2. wrong protocol_version (999) -> {"protocol_version":6,"response":{"kind":"error","message":"protocol version mismatch: daemon speaks 6, client sent 999"}}
+
+3. unknown request kind, forged reservation-shaped payload -> {"protocol_version":6,"response":{"kind":"error","message":"malformed request"}}
+
+4. legitimate ToolInvoked request with a smuggled out-of-range 'amount' field -> {"protocol_version":6,"response":{"kind":"ack"}}
+
+   (protocol has no reservation-amount field on any Request variant at all -- see
+   crates/protocol/src/messages.rs -- so this field is simply ignored by serde,
+   never interpreted as a reservation instruction of any kind.)
+5. daemon still alive & answers Status correctly after all of the above -> {"protocol_version":6,"response":{"kind":"status","current_task":null}}
+
+
+Result: every malformed/forged/unknown-kind request was rejected with a structured
+Response::Error and never crashed or corrupted the daemon; the daemon remained fully
+responsive afterward. No CLI/protocol surface accepts a direct reservation-amount
+field at all (see PROTOCOL.md research: Request has exactly 6 variants, none of
+which carries a resource amount) -- so there is no 'malformed reservation amount'
+to smuggle through this socket in the first place.

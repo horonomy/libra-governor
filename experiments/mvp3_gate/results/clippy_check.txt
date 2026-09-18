@@ -1,0 +1,2 @@
+    Checking libra-governor-daemon v0.0.0 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-mvp-3.0-HORO-1146-release_gate/crates/daemon)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 27.34s

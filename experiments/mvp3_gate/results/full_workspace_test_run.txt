@@ -1,0 +1,537 @@
+=== cargo test --workspace -- --test-threads=1 ===
+(run in multiple staggered invocations due to this machine's known shared cargo target-dir
+ contention issue -- see /Users/bryant/CLAUDE.md 'Incident: Disk Pressure from Per-Worktree
+ Rust Build Artifacts' -- each invocation is a full, unmodified cargo test run; test bodies
+ and pass/fail outcomes are identical and reproducible across every retry, only wall-clock
+ time to progress through the binary list varied)
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/main.rs (/Users/bryant/.cargo/shared-target/debug/deps/libra_governor-3408483d28f3c06b)
+
+running 28 tests
+test bucket_prose::tests::cold_start_has_no_sample_count_in_its_prose ... ok
+test bucket_prose::tests::every_non_cold_start_tier_reports_its_sample_count ... ok
+test calibration_cmd::tests::render_report_computed_coverage_includes_dropped_rows_note ... ok
+test calibration_cmd::tests::render_report_insufficient_coverage_is_honest_not_a_fabricated_number ... ok
+test client::tests::connect_only_fails_fast_when_nothing_is_listening ... ok
+test gateway_cmd::tests::a_bound_violation_is_surfaced_as_a_warning ... ok
+test gateway_cmd::tests::a_conservative_settlement_count_is_explained_rather_than_shown_bare ... ok
+test gateway_cmd::tests::a_hooks_only_deployment_says_there_is_no_pre_spend_refusal ... ok
+test gateway_cmd::tests::a_metered_gateway_reports_an_enforced_monetary_cap_and_its_pricing_version ... ok
+test gateway_cmd::tests::a_subscription_gateway_says_plainly_that_no_monetary_cap_is_enforced ... ok
+test gateway_cmd::tests::every_refusal_category_is_reported_separately ... ok
+test hook::tests::format_additional_context_includes_confidence_and_criteria ... ok
+test hook::tests::hook_payload_ignores_unknown_fields ... ok
+test hook::tests::malformed_hook_payload_fails_to_deserialize ... ok
+test hook::tests::print_context_never_panics_and_produces_valid_json ... ok
+test hook_post_tool_use::tests::hook_payload_ignores_unknown_fields ... ok
+test hook_post_tool_use::tests::malformed_hook_payload_fails_to_deserialize ... ok
+test hook_stop::tests::format_receipt_summary_cold_start_is_structurally_distinct ... ok
+test hook_stop::tests::format_receipt_summary_computed_estimate_reports_inside_p90 ... ok
+test hook_stop::tests::format_receipt_summary_outside_p90_reports_no ... ok
+test hook_stop::tests::format_resource_renders_each_kind ... ok
+test hook_stop::tests::hook_payload_ignores_unknown_fields_and_missing_model ... ok
+test hook_stop::tests::hook_payload_parses_model_when_present ... ok
+test statusline::tests::format_status_reflects_a_replanned_state ... ok
+test statusline::tests::format_status_reflects_escalation ... ok
+test statusline::tests::format_status_renders_a_single_line_with_confidence_and_recon_cost ... ok
+test statusline::tests::format_status_reports_idle_when_no_current_task ... ok
+test statusline::tests::short_task_id_truncates_to_eight_characters ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/hook_cli_integration.rs (/Users/bryant/.cargo/shared-target/debug/deps/hook_cli_integration-be63c130b259404c)
+
+running 8 tests
+test full_loop_preflight_tool_calls_stop_produces_a_receipt ... ok
+test hook_degrades_gracefully_when_the_daemon_cannot_start ... ok
+test hook_handles_malformed_stdin_payload_gracefully ... ok
+test hook_spawns_daemon_and_returns_a_preflight_summary ... ok
+test post_tool_use_never_spawns_a_daemon_and_stays_fast_when_daemon_is_down ... ok
+test receipt_survives_daemon_restart_and_is_queryable ... ok
+test statusline_never_spawns_and_reports_placeholder_when_daemon_is_down ... ok
+test stop_with_no_active_task_is_a_safe_no_op ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 161.58s
+
+     Running unittests src/lib.rs (/Users/bryant/.cargo/shared-target/debug/deps/libra_governor_daemon-9a56137f85c88e59)
+
+running 31 tests
+test contract::tests::draft_adds_optional_scope_criterion_when_paths_matched ... ok
+test contract::tests::draft_adds_required_test_criterion_when_tests_detected ... ok
+test contract::tests::draft_always_includes_baseline_criterion ... ok
+test contract::tests::draft_contract_increments_revision_from_prior ... ok
+test contract::tests::draft_contract_starts_at_revision_one_with_no_prior ... ok
+test features::tests::derive_task_features_counts_code_blocks_and_traceback ... ok
+test features::tests::derive_task_features_has_no_traceback_or_code_blocks_for_a_plain_prompt ... ok
+test features::tests::repo_key_differs_for_different_paths ... ok
+test features::tests::repo_key_is_stable_for_the_same_canonicalized_path ... ok
+test features::tests::repo_key_never_contains_the_raw_path ... ok
+test log::tests::append_line_creates_file_and_writes_content ... ok
+test log::tests::append_line_never_panics_on_unwritable_path ... ok
+test paths::tests::ensure_state_dir_creates_directory ... ok
+test paths::tests::socket_and_ledger_paths_share_the_state_dir ... ok
+test paths::tests::state_dir_honors_explicit_override ... ok
+test recon::tests::build_topology_detects_cargo_project ... ok
+test recon::tests::build_topology_is_mixed_with_more_than_one_marker ... ok
+test recon::tests::build_topology_is_unknown_with_no_marker_files ... ok
+test recon::tests::recon_detects_cargo_project_and_matches_prompt_path ... ok
+test recon::tests::recon_ignores_denylisted_directories ... ok
+test recon::tests::recon_never_writes_to_the_filesystem ... ok
+test recon::tests::recon_reports_low_confidence_for_nonexistent_root ... ok
+test recon::tests::recon_reports_low_confidence_with_reason_for_empty_repo ... ok
+test recon::tests::recon_stops_at_a_near_zero_time_budget ... ok
+test recon::tests::recon_stops_at_a_small_file_count_cap ... ok
+test server::tests::bind_or_detect_running_detects_live_daemon ... ok
+test server::tests::bind_or_detect_running_recovers_stale_socket_file ... ok
+test server::tests::bind_or_detect_running_succeeds_on_fresh_path ... ok
+test server::tests::finalize_after_a_real_preflight_persists_a_receipt ... ok
+test server::tests::finalize_with_no_active_task_is_a_safe_no_op ... ok
+test server::tests::tool_invoked_dispatch_increments_the_session_counter ... ok
+
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/daemon_unreachable.rs (/Users/bryant/.cargo/shared-target/debug/deps/daemon_unreachable-275473422f1d3f05)
+
+running 2 tests
+test connecting_to_a_socket_path_with_nothing_listening_fails_fast ... ok
+test connecting_to_a_stale_socket_file_with_no_listener_fails_fast ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/gateway_enforcement.rs (/Users/bryant/.cargo/shared-target/debug/deps/gateway_enforcement-43fd9cd9f1876368)
+
+running 9 tests
+test a_gateway_request_row_is_written_and_carries_no_body_or_credential ... ok
+test a_gateway_reservation_is_optional_work_with_no_plan_id ... ok
+test a_replan_never_releases_an_in_flight_gateway_reservation ... ok
+test a_request_beyond_the_hard_budget_is_refused_by_the_real_ledger ... ok
+test enabling_the_gateway_suppresses_the_plan_level_work_envelope ... ok
+test settlement_refunds_the_unspent_remainder_of_a_gateway_reservation ... ok
+test settling_the_same_reservation_twice_does_not_double_charge ... ok
+test settling_without_a_usage_figure_charges_the_full_reserved_amount ... ok
+test the_completion_reserve_is_never_drawn_by_gateway_traffic ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/mvp3_gate_evidence.rs (/Users/bryant/.cargo/shared-target/debug/deps/mvp3_gate_evidence-d181e3a15a9822de)
+
+running 3 tests
+test concurrent_subagents_near_a_tight_hard_ceiling_through_the_real_ledger_spend_authority ... ok
+test deadline_first_confidence_floor_denies_cold_start_but_the_deadline_pressure_shape_admits_at_low_confidence ... ok
+test security_evidence_credential_and_prompt_content_never_touch_persisted_state ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/preflight_integration.rs (/Users/bryant/.cargo/shared-target/debug/deps/preflight_integration-cc1a25630012c4ce)
+
+running 3 tests
+test preflight_returns_sane_result_within_recon_budget ... ok
+test preflight_selects_a_bucketed_tier_once_same_repo_history_exists ... ok
+test second_preflight_for_same_session_supersedes_the_first ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/replan_integration.rs (/Users/bryant/.cargo/shared-target/debug/deps/replan_integration-ccbab5a7d3043132)
+
+running 3 tests
+test exhausting_the_auto_replan_budget_escalates_instead_of_replanning_again ... ok
+test possible_tool_loop_streak_triggers_a_replan_before_the_count_threshold ... ok
+test tool_call_count_material_deviation_triggers_a_replan_visible_in_status ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/reservation_integration.rs (/Users/bryant/.cargo/shared-target/debug/deps/reservation_integration-00d6d3afa705c06b)
+
+running 6 tests
+test a_replan_releases_the_old_plans_reservation_and_reserves_the_new_one ... ok
+test admission_approval_required_writes_no_reservation ... ok
+test admission_deny_writes_no_reservation_and_leaves_the_reserve_untouched ... ok
+test admission_happy_path_initializes_a_budget_and_reserves_the_work_envelope ... ok
+test finalize_settles_active_reservations_and_records_receipt_evidence ... ok
+test identical_preflights_produce_identical_admission_and_reserve_decisions ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running unittests src/lib.rs (/Users/bryant/.cargo/shared-target/debug/deps/libra_governor_domain-56a28e0d3637e0d8)
+
+running 96 tests
+test capability::tests::a_claimed_monetary_cap_always_names_its_pricing_version ... ok
+test capability::tests::capabilities_round_trip_through_json ... ok
+test capability::tests::gateway_metered_is_the_only_tier_claiming_a_monetary_cap ... ok
+test capability::tests::hooks_only_holds_no_credential_and_observes_no_usage ... ok
+test capability::tests::only_gateway_tiers_can_refuse_before_spend ... ok
+test capability::tests::subscription_tier_names_the_concrete_reason_it_cannot_price ... ok
+test capability::tests::unpriced_model_reason_carries_the_model_it_could_not_price ... ok
+test completion_contract::tests::next_revision_increments_without_mutating_original ... ok
+test completion_contract::tests::required_criteria_filters_optional_ones ... ok
+test confidence::tests::from_evidence_cold_start_is_always_low ... ok
+test confidence::tests::from_evidence_global_is_capped_at_medium_regardless_of_n ... ok
+test confidence::tests::from_evidence_narrow_tiers_follow_the_min_class_samples_threshold ... ok
+test confidence::tests::from_sample_count_thresholds ... ok
+test estimate::tests::cold_start_has_no_numeric_bounds_and_is_flagged ... ok
+test execution_event::tests::event_carries_its_task_id ... ok
+test execution_outcome::tests::completed_outcome_requires_no_implicit_evidence ... ok
+test execution_outcome::tests::unknown_outcome_has_no_evidence ... ok
+test execution_plan::tests::a_fresh_plan_carries_no_replan_linkage ... ok
+test execution_plan::tests::plan_links_task_and_contract_revision ... ok
+test execution_plan::tests::with_replan_linkage_records_the_prior_plan_and_reason_without_touching_contract_revision ... ok
+test execution_receipt::tests::receipt_links_task_and_plan ... ok
+test policy::tests::approval_mode_admits_at_and_below_target_with_no_pre_authorized_band ... ok
+test policy::tests::approval_mode_denies_past_the_hard_ceiling ... ok
+test policy::tests::approval_mode_requires_approval_for_any_amount_past_target ... ok
+test policy::tests::approval_mode_time_with_no_hard_ceiling_never_denies ... ok
+test policy::tests::confidence_below_threshold_denies_admission_independent_of_bounds ... ok
+test policy::tests::confidence_exactly_at_threshold_passes ... ok
+test policy::tests::deadline_first_preserves_quality_floor_while_spending_more ... ok
+test policy::tests::deadline_first_time_bound_is_tighter_than_balanced ... ok
+test policy::tests::elastic_mode_admits_exactly_at_the_elastic_ceiling ... ok
+test policy::tests::elastic_mode_admits_exactly_at_the_hard_ceiling_as_approval_required ... ok
+test policy::tests::elastic_mode_admits_within_target ... ok
+test policy::tests::elastic_mode_denies_past_the_hard_ceiling ... ok
+test policy::tests::elastic_mode_requires_approval_between_elastic_and_hard_ceiling ... ok
+test policy::tests::evaluate_rejects_projected_resource_kind_mismatch ... ok
+test policy::tests::evaluate_returns_an_error_for_a_hard_time_bound_missing_its_ceiling ... ok
+test policy::tests::evaluate_returns_an_error_rather_than_panicking_on_a_policy_that_bypassed_validation ... ok
+test policy::tests::hard_mode_admits_below_the_boundary ... ok
+test policy::tests::hard_mode_admits_exactly_at_the_boundary_value ... ok
+test policy::tests::hard_mode_denies_exactly_one_unit_past_the_boundary ... ok
+test policy::tests::policy_schema_version_propagates_from_policy_to_decision ... ok
+test policy::tests::presets_are_deterministic_and_inspectable ... ok
+test policy::tests::quality_invariant_required_criteria_survive_a_tight_projected_budget ... ok
+test policy::tests::quota_percent_preset_saturates_at_100_instead_of_producing_an_out_of_range_ceiling ... ok
+test policy::tests::quota_percent_resource_preset_and_evaluate_round_trip ... ok
+test policy::tests::rejects_deadline_in_the_past ... ok
+test policy::tests::rejects_elastic_ceiling_below_target ... ok
+test policy::tests::rejects_elastic_ceiling_set_for_non_elastic_mode ... ok
+test policy::tests::rejects_elastic_mode_missing_elastic_ceiling ... ok
+test policy::tests::rejects_empty_required_criteria ... ok
+test policy::tests::rejects_hard_ceiling_below_elastic_ceiling ... ok
+test policy::tests::rejects_hard_mode_missing_hard_ceiling ... ok
+test policy::tests::rejects_quota_percent_out_of_range ... ok
+test policy::tests::rejects_resource_kind_mismatch ... ok
+test policy::tests::rejects_target_above_hard_ceiling ... ok
+test policy::tests::tokens_resource_preset_and_evaluate_round_trip ... ok
+test replan::tests::hysteresis_allows_again_once_the_cooldown_has_elapsed ... ok
+test replan::tests::hysteresis_allows_the_first_replan_with_no_prior_state ... ok
+test replan::tests::hysteresis_escalates_once_max_auto_replans_is_reached_even_past_cooldown ... ok
+test replan::tests::hysteresis_suppresses_a_second_replan_inside_the_cooldown_window ... ok
+test replan::tests::possible_tool_loop_triggers_only_at_or_above_the_streak_threshold ... ok
+test replan::tests::remaining_estimate_never_downgrades_confidence_below_low ... ok
+test replan::tests::remaining_estimate_passes_a_cold_start_estimate_through_unwidened ... ok
+test replan::tests::remaining_estimate_widens_p80_p90_and_downgrades_confidence ... ok
+test replan::tests::replan_cost_evaluation_never_alters_protected_criteria ... ok
+test replan::tests::replan_cost_that_fits_under_the_hard_ceiling_is_admitted ... ok
+test replan::tests::replan_cost_that_pushes_past_the_hard_ceiling_is_denied ... ok
+test replan::tests::replan_record_round_trips_through_json_and_links_prior_and_new_plan_ids ... ok
+test replan::tests::should_replan_net_gain_exactly_at_min_gain_is_a_yes ... ok
+test replan::tests::should_replan_rejects_mismatched_resource_kinds ... ok
+test replan::tests::should_replan_says_no_when_continuing_is_cheaper_than_replanning ... ok
+test replan::tests::should_replan_says_no_when_net_gain_is_positive_but_below_min_gain_floor ... ok
+test replan::tests::should_replan_says_yes_when_benefit_clearly_exceeds_cost_and_min_gain ... ok
+test replan::tests::tool_call_count_material_falls_back_to_absolute_threshold_when_no_typical ... ok
+test replan::tests::tool_call_count_material_uses_bucket_typical_when_available ... ok
+test replan::tests::trivial_events_are_correctly_ignored ... ok
+test reservation::tests::amount_never_exceeds_hard_ceiling ... ok
+test reservation::tests::falls_back_to_policy_target_on_cold_start ... ok
+test reservation::tests::falls_back_to_policy_target_on_kind_mismatch ... ok
+test reservation::tests::fraction_grows_with_required_criteria_and_clamps_at_max ... ok
+test reservation::tests::outstanding_draw_matches_state ... ok
+test reservation::tests::overrun_and_refunded_are_derived_correctly ... ok
+test reservation::tests::uses_estimate_p80_when_kind_matches ... ok
+test resource_amount::tests::as_f64_reads_the_raw_numeric_value ... ok
+test resource_amount::tests::from_kind_f64_reconstructs_amounts_by_kind ... ok
+test resource_amount::tests::from_kind_f64_saturates_negative_input_at_zero ... ok
+test resource_amount::tests::from_kind_f64_saturates_quota_percent_at_its_documented_domain ... ok
+test resource_amount::tests::headroom_clamped_display_never_goes_negative ... ok
+test resource_amount::tests::headroom_reports_exhaustion_including_negative_overrun ... ok
+test resource_amount::tests::kind_matches_variant ... ok
+test resource_amount::tests::scaled_preserves_kind_and_multiplies ... ok
+test resource_amount::tests::scaled_saturates_quota_percent_at_its_documented_domain ... ok
+test task_features::tests::task_features_field_set_contains_no_outcome_or_actual_fields ... ok
+test task_features::tests::task_features_round_trips_through_json ... ok
+test task_identity::tests::task_id_new_values_are_unique ... ok
+test task_identity::tests::task_identity_carries_optional_external_ref ... ok
+
+test result: ok. 96 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/Users/bryant/.cargo/shared-target/debug/deps/libra_governor_estimator-14f8e1db21d1f295)
+
+running 32 tests
+test calibration::tests::a_handful_of_pairs_is_still_insufficient ... ok
+test calibration::tests::admission_replay_below_the_required_floor_is_insufficient_even_with_real_data ... ok
+test calibration::tests::admission_replay_excludes_pairs_whose_estimate_lacks_the_threshold_quantile ... ok
+test calibration::tests::admission_replay_with_no_usable_pairs_is_insufficient ... ok
+test calibration::tests::all_zero_durations_does_not_falsely_report_full_coverage ... ok
+test calibration::tests::cost_coverage_carries_no_populable_cost_value ... ok
+test calibration::tests::coverage_and_admission_types_serialize_no_cost_field ... ok
+test calibration::tests::empirical_coverage_converges_to_nominal_for_a_known_distribution ... ok
+test calibration::tests::hand_computed_false_admit_and_false_reject_on_a_small_fixture ... ok
+test calibration::tests::in_sample_coverage_trivially_meets_nominal_by_construction ... ok
+test calibration::tests::zero_pairs_never_renders_as_full_coverage ... ok
+test tests::cold_start_when_no_local_history_at_all ... ok
+test tests::duration_confidence_via_class_bucket_still_escalates_to_high ... ok
+test tests::duration_confidence_via_global_tier_is_capped_at_medium ... ok
+test tests::estimate_bucketed_falls_back_to_global_when_no_bucket_meets_threshold ... ok
+test tests::estimate_bucketed_prefers_most_specific_tier_available ... ok
+test tests::estimate_bucketed_reaches_cold_start_with_no_history_at_all ... ok
+test tests::estimate_bucketed_selects_repo_tier_once_threshold_is_met ... ok
+test tests::estimate_bucketed_tags_every_estimate_with_v3_tiered_confidence ... ok
+test tests::every_estimate_is_tagged_with_the_estimator_version ... ok
+test tests::falls_back_to_global_history_when_no_class_bucket_supplied ... ok
+test tests::falls_back_to_global_when_class_bucket_is_too_thin ... ok
+test tests::prefers_class_bucket_when_it_meets_the_minimum_sample_threshold ... ok
+test tests::quantile_u64_matches_hand_computed_values_for_ten_samples ... ok
+test tests::resource_amounts_remain_none_on_every_bucketed_estimate_from_real_local_data ... ok
+test tests::resource_quantiles_are_none_when_no_receipt_carries_usage ... ok
+test tests::resource_quantiles_computed_over_tokens_when_present ... ok
+test tests::resource_quantiles_pick_the_most_common_kind_and_ignore_the_rest ... ok
+test tests::typical_tool_call_count_bucketed_computes_the_median_over_the_matching_tier ... ok
+test tests::typical_tool_call_count_bucketed_is_none_when_no_tier_meets_the_threshold ... ok
+test tests::typical_tool_call_count_bucketed_is_none_with_no_matching_history ... ok
+test tests::typical_tool_call_count_bucketed_prefers_the_most_specific_matching_tier ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/Users/bryant/.cargo/shared-target/debug/deps/libra_governor_gateway-4ce50ca53e57af08)
+
+running 68 tests
+test config::tests::a_bare_origin_with_a_trailing_slash_is_accepted ... ok
+test config::tests::a_garbage_upstream_is_refused_rather_than_partially_parsed ... ok
+test config::tests::a_host_outside_the_allowlist_is_refused ... ok
+test config::tests::a_non_loopback_bind_address_is_refused ... ok
+test config::tests::a_non_standard_https_port_needs_an_explicit_opt_in ... ok
+test config::tests::a_path_query_or_fragment_on_the_upstream_is_refused ... ok
+test config::tests::a_plaintext_upstream_is_permitted_only_for_a_loopback_host_with_the_flag ... ok
+test config::tests::a_plaintext_upstream_is_refused ... ok
+test config::tests::an_extended_allowlist_admits_the_host_it_names ... ok
+test config::tests::governor_held_mode_may_enforce_a_usd_budget ... ok
+test config::tests::loopback_host_detection_is_literal_and_never_resolves ... ok
+test config::tests::pricing_overrides_reach_the_validated_table ... ok
+test config::tests::subscription_mode_against_a_usd_budget_is_refused_by_code_not_documentation ... ok
+test config::tests::the_host_header_check_accepts_only_this_listener_s_own_spellings ... ok
+test config::tests::the_shipped_default_configuration_validates ... ok
+test config::tests::userinfo_in_the_upstream_url_is_refused ... ok
+test config::tests::zero_valued_limits_are_refused ... ok
+test cost::tests::a_missing_or_zero_max_tokens_is_refused_never_reserved_as_zero ... ok
+test cost::tests::a_token_budget_never_needs_pricing ... ok
+test cost::tests::a_usd_budget_refuses_an_unpriced_model_rather_than_guessing ... ok
+test cost::tests::a_usd_reservation_always_covers_the_exact_settlement_it_bounds ... ok
+test cost::tests::bound_violation_is_detected_rather_than_clamped ... ok
+test cost::tests::cents_conversion_never_yields_a_negative_or_nan_amount ... ok
+test cost::tests::input_bound_rounds_up_so_it_can_never_under_count ... ok
+test cost::tests::quota_percent_is_refused_before_any_reservation_is_attempted ... ok
+test cost::tests::settlement_prices_each_reported_tier_at_its_own_rate ... ok
+test cost::tests::token_reservation_is_input_upper_bound_plus_max_tokens ... ok
+test cost::tests::token_settlement_sums_every_reported_tier ... ok
+test cost::tests::usd_reservation_prices_input_at_the_most_expensive_cache_tier ... ok
+test credential::tests::a_command_that_would_prompt_gets_no_stdin ... ok
+test credential::tests::a_credential_with_a_newline_is_rejected_rather_than_smuggled_into_a_header ... ok
+test credential::tests::a_missing_program_fails_to_spawn_rather_than_panicking ... ok
+test credential::tests::a_non_zero_exit_is_an_error_whose_message_carries_no_output ... ok
+test credential::tests::capability_token_is_persisted_at_mode_0600_and_reloaded ... ok
+test credential::tests::debug_never_renders_the_credential ... ok
+test credential::tests::empty_output_is_an_error_not_an_empty_credential ... ok
+test credential::tests::header_value_is_marked_sensitive ... ok
+test credential::tests::oversized_output_is_refused_rather_than_buffered ... ok
+test credential::tests::resolve_reads_stdout_and_trims_the_trailing_newline ... ok
+test credential::tests::token_comparison_accepts_only_the_exact_value ... ok
+test credential::tests::token_debug_never_renders_the_token ... ok
+test credential::tests::two_generated_tokens_differ ... ok
+test credential::tests::whitespace_only_output_is_empty_not_a_credential ... ok
+test pricing::tests::an_unknown_model_is_unpriced_rather_than_guessed ... ok
+test pricing::tests::every_pinned_entry_has_strictly_positive_finite_prices ... ok
+test pricing::tests::longest_prefix_wins_over_a_shorter_one ... ok
+test pricing::tests::overrides_extend_and_replace_the_pinned_table ... ok
+test pricing::tests::pinned_table_prices_a_dated_model_id_by_prefix ... ok
+test pricing::tests::pinned_table_reports_no_overrides ... ok
+test pricing::tests::worst_case_input_price_is_the_most_expensive_tier ... ok
+test route::tests::an_upstream_path_is_a_constant_not_the_inbound_path ... ok
+test route::tests::only_messages_is_metered_and_only_hello_is_local ... ok
+test route::tests::the_method_is_part_of_the_match ... ok
+test route::tests::the_three_supported_routes_match ... ok
+test route::tests::traversal_and_near_miss_paths_are_refused_rather_than_normalised ... ok
+test stats::tests::counters_are_safe_to_share_across_threads ... ok
+test stats::tests::counters_start_at_zero_and_increment_independently ... ok
+test stats::tests::total_denied_sums_every_refusal_category ... ok
+test usage::tests::a_non_streaming_body_reports_its_top_level_usage ... ok
+test usage::tests::a_provider_reported_zero_is_distinguishable_from_no_report ... ok
+test usage::tests::a_stream_cut_off_mid_flight_keeps_the_last_observed_usage ... ok
+test usage::tests::a_stream_with_no_usage_at_all_reports_none_not_zero ... ok
+test usage::tests::an_oversized_line_is_dropped_without_growing_the_buffer ... ok
+test usage::tests::an_unparseable_non_streaming_body_reports_no_usage ... ok
+test usage::tests::malformed_json_is_ignored_rather_than_failing_the_stream ... ok
+test usage::tests::parses_identically_when_chunk_boundaries_split_every_frame ... ok
+test usage::tests::takes_the_last_cumulative_output_count_and_never_sums_deltas ... ok
+test usage::tests::total_tokens_sums_every_tier ... ok
+
+test result: ok. 68 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/auth_and_routing.rs (/Users/bryant/.cargo/shared-target/debug/deps/auth_and_routing-27f0437c8e282d90)
+
+running 19 tests
+test a_host_header_naming_another_destination_is_refused_before_routing ... ok
+test a_path_outside_the_closed_route_table_is_refused ... ok
+test a_request_body_over_the_cap_is_refused_before_the_upstream_is_dialled ... ok
+test a_request_with_no_credential_is_refused_and_never_reaches_the_upstream ... ok
+test a_wrong_capability_token_is_refused ... ok
+test count_tokens_is_forwarded_without_reserving_anything ... ok
+test disagreeing_dual_auth_headers_are_refused_without_any_upstream_call ... ok
+test every_response_carries_a_request_id_for_correlation ... ok
+test fake_upstream::tests::every_credential_shaped_fixture_value_is_obviously_fake ... ok
+test fake_upstream::tests::the_canned_sse_stream_reports_cumulative_output_tokens ... ok
+test fake_upstream::tests::the_fake_upstream_serves_the_scenario_it_is_asked_for ... ok
+test fake_upstream::tests::the_truncated_stream_never_reaches_message_stop ... ok
+test forwarding_chain_and_inbound_host_headers_are_dropped ... ok
+test matching_dual_auth_headers_are_not_ambiguous ... ok
+test ordinary_headers_and_the_query_string_are_forwarded_unchanged ... ok
+test pass_through_subscription_mode_forwards_the_callers_own_credential_unchanged ... ok
+test the_capability_token_is_accepted_under_either_header_spelling ... ok
+test the_connectivity_probe_is_answered_locally_and_costs_nothing ... ok
+test the_upstream_receives_the_governor_held_credential_and_never_the_local_token ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+     Running tests/fake_upstream.rs (/Users/bryant/.cargo/shared-target/debug/deps/fake_upstream-24de113df29cd2aa)
+
+running 4 tests
+test tests::every_credential_shaped_fixture_value_is_obviously_fake ... ok
+test tests::the_canned_sse_stream_reports_cumulative_output_tokens ... ok
+test tests::the_fake_upstream_serves_the_scenario_it_is_asked_for ... ok
+test tests::the_truncated_stream_never_reaches_message_stop ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/proxy_lifecycle.rs (/Users/bryant/.cargo/shared-target/debug/deps/proxy_lifecycle-e413414305e2c77e)
+
+running 27 tests
+test a_bound_violation_is_recorded_rather_than_clamped_away ... ok
+test a_client_retry_is_a_fresh_reservation_not_a_double_settlement ... ok
+test a_completed_request_writes_exactly_one_provenance_row_with_the_real_terminal_state ... ok
+test a_ledger_failure_fails_closed_rather_than_letting_the_request_through ... ok
+test a_non_streaming_request_settles_from_the_bodys_top_level_usage ... ok
+test a_policy_denial_refuses_the_request_before_any_provider_spend ... ok
+test a_priced_model_against_a_usd_budget_reserves_and_settles_in_cents ... ok
+test a_provenance_row_never_carries_a_body_or_a_credential ... ok
+test a_quota_percent_budget_is_refused_because_tokens_cannot_be_converted_into_it ... ok
+test a_request_with_no_positive_max_tokens_is_refused_before_any_reservation ... ok
+test a_request_with_no_session_binding_is_refused_as_task_unbound ... ok
+test a_response_reporting_no_usage_settles_conservatively_at_the_reserved_amount ... ok
+test a_session_with_no_admitted_task_is_refused ... ok
+test a_stream_cut_off_mid_flight_settles_at_the_last_observed_usage ... ok
+test a_streaming_request_is_reserved_relayed_verbatim_and_settled_at_the_exact_observed_usage ... ok
+test an_approval_gated_request_still_proceeds_and_is_recorded_as_such ... ok
+test an_unpriced_model_against_a_usd_budget_is_refused_rather_than_priced_by_guess ... ok
+test an_upstream_401_triggers_exactly_one_credential_refresh_retry ... ok
+test an_upstream_error_is_relayed_verbatim_and_the_reservation_is_released_in_full ... ok
+test an_upstream_rate_limit_is_relayed_as_itself_not_rewritten ... ok
+test every_terminal_transition_writes_exactly_one_provenance_row_carrying_its_pricing_version ... ok
+test exhausted_headroom_refuses_even_though_the_completion_reserve_still_holds_capacity ... ok
+test fake_upstream::tests::every_credential_shaped_fixture_value_is_obviously_fake ... ok
+test fake_upstream::tests::the_canned_sse_stream_reports_cumulative_output_tokens ... ok
+test fake_upstream::tests::the_fake_upstream_serves_the_scenario_it_is_asked_for ... ok
+test fake_upstream::tests::the_truncated_stream_never_reaches_message_stop ... ok
+test the_reservation_is_the_conservative_worst_case_not_the_eventual_actual ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
+
+     Running tests/ssrf_and_config.rs (/Users/bryant/.cargo/shared-target/debug/deps/ssrf_and_config-b2eb121853f9dd26)
+
+running 13 tests
+test a_gateway_bound_to_a_non_loopback_address_never_starts ... ok
+test a_gateway_whose_upstream_is_not_configuration_never_starts ... ok
+test a_name_that_merely_looks_like_loopback_is_not_treated_as_loopback ... ok
+test a_subscription_deployment_may_not_claim_a_usd_hard_cap ... ok
+test a_traversal_path_is_refused_rather_than_normalised_into_the_upstream_url ... ok
+test an_absolute_form_request_uri_cannot_redirect_the_outbound_call ... ok
+test an_upstream_redirect_is_relayed_rather_than_followed ... ok
+test fake_upstream::tests::every_credential_shaped_fixture_value_is_obviously_fake ... ok
+test fake_upstream::tests::the_canned_sse_stream_reports_cumulative_output_tokens ... ok
+test fake_upstream::tests::the_fake_upstream_serves_the_scenario_it_is_asked_for ... ok
+test fake_upstream::tests::the_truncated_stream_never_reaches_message_stop ... ok
+test the_configured_upstream_is_the_only_destination_any_request_reaches ... ok
+test the_plaintext_loopback_opt_in_cannot_be_turned_into_an_exfiltration_path ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running unittests src/lib.rs (/Users/bryant/.cargo/shared-target/debug/deps/libra_governor_ledger-7b48e13d13e4c8ff)
+
+running 50 tests
+test gateway::tests::a_bound_violation_is_persisted_rather_than_absorbed ... ok
+test gateway::tests::a_rejection_with_no_task_at_all_still_records_a_row ... ok
+test gateway::tests::closing_an_unknown_id_is_a_silent_no_op ... ok
+test gateway::tests::closing_records_the_settled_figures_and_the_terminal_state ... ok
+test gateway::tests::opening_twice_updates_the_same_row_rather_than_duplicating_it ... ok
+test gateway::tests::spend_for_task_aggregates_settled_amounts_in_the_recorded_kind ... ok
+test gateway::tests::the_schema_has_no_column_that_could_hold_a_body_or_a_credential ... ok
+test migrations::tests::applying_migrations_twice_is_a_no_op ... ok
+test query::calibration_pairs_tests::a_mix_of_rows_keeps_only_the_eligible_ones ... ok
+test query::calibration_pairs_tests::excludes_cold_start_estimates ... ok
+test query::calibration_pairs_tests::excludes_receipts_whose_plan_has_no_estimate_at_all ... ok
+test query::calibration_pairs_tests::keeps_a_real_computed_estimate_paired_with_its_actual ... ok
+test query::replan_persistence_tests::a_replanned_plan_persists_its_linkage_and_round_trips ... ok
+test query::replan_persistence_tests::an_original_plan_carries_no_replan_linkage_after_round_tripping ... ok
+test query::replan_persistence_tests::replan_history_for_task_is_empty_before_any_replan ... ok
+test query::replan_persistence_tests::replan_history_for_task_is_queryable_after_a_replan_event ... ok
+test reservation::tests::a_forged_task_id_cannot_create_a_reservation_because_no_budget_exists ... ok
+test reservation::tests::adjust_completion_reserve_lowering_is_always_permitted ... ok
+test reservation::tests::adjust_completion_reserve_raising_is_bounded_by_optional_headroom ... ok
+test reservation::tests::duplicate_reserve_with_the_same_idempotency_key_is_a_safe_replay ... ok
+test reservation::tests::duplicate_settlement_event_is_idempotent ... ok
+test reservation::tests::expire_stale_reservations_reclaims_only_past_expiry ... ok
+test reservation::tests::optional_work_cannot_draw_into_the_completion_reserve ... ok
+test reservation::tests::release_active_for_plan_releases_only_that_plans_active_reservations ... ok
+test reservation::tests::release_restores_the_full_drawn_reserve ... ok
+test reservation::tests::required_work_draws_into_the_completion_reserve_once_exhausted ... ok
+test reservation::tests::reservation_evidence_summarizes_reserved_settled_released_and_overrun ... ok
+test reservation::tests::reserve_grants_within_optional_headroom ... ok
+test reservation::tests::reserving_a_mismatched_resource_kind_is_rejected_and_writes_nothing ... ok
+test reservation::tests::settle_with_no_reported_usage_falls_back_to_the_reserved_amount ... ok
+test reservation::tests::settling_an_unknown_reservation_id_is_not_found_and_changes_nothing ... ok
+test reservation::tests::settling_over_the_reservation_records_an_overrun_and_can_exhaust_headroom ... ok
+test reservation::tests::settling_under_the_reservation_refunds_and_restores_the_reserve ... ok
+test reservation::tests::settling_with_a_negative_amount_is_rejected ... ok
+test session::tests::latest_contract_is_none_before_any_contract_recorded ... ok
+test session::tests::latest_contract_returns_highest_revision ... ok
+test session::tests::record_replan_for_task_increments_count_and_sets_last_replan_at ... ok
+test session::tests::record_tool_invocation_streak_increments_on_repeats_and_resets_on_a_new_tool ... ok
+test session::tests::record_tool_invocation_streaks_are_independent_per_session ... ok
+test session::tests::replan_state_for_task_defaults_when_never_replanned ... ok
+test session::tests::reset_tool_streak_zeroes_the_streak_but_not_the_count ... ok
+test session::tests::resolve_or_create_gives_distinct_ids_for_distinct_sessions ... ok
+test session::tests::resolve_or_create_returns_same_task_id_for_repeat_session ... ok
+test session::tests::session_started_at_is_none_before_any_preflight ... ok
+test session::tests::session_started_at_returns_first_resolution_time ... ok
+test session::tests::supersede_marks_prior_in_flight_preflight_before_new_one_recorded ... ok
+test session::tests::tool_call_count_starts_at_zero_and_increments ... ok
+test session::tests::tool_call_counts_are_independent_per_session ... ok
+test store::tests::open_enables_wal_mode ... ok
+test store::tests::reopening_same_file_preserves_schema ... ok
+
+test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+     Running tests/reservation_concurrency.rs (/Users/bryant/.cargo/shared-target/debug/deps/reservation_concurrency-e5e3fe0d0b1fa407)
+
+running 3 tests
+test a_reservation_left_active_by_a_crashed_process_is_reclaimed_on_reconciliation ... ok
+test concurrent_optional_reservations_never_double_spend_the_shared_envelope ... ok
+test concurrent_required_work_reservations_never_over_draw_the_completion_reserve ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running tests/trajectory.rs (/Users/bryant/.cargo/shared-target/debug/deps/trajectory-7d5bf195c811c55c)
+
+   Compiling libra-governor-ledger v0.0.0 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-mvp-3.0-HORO-1146-release_gate/crates/ledger)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 49.39s
+     Running tests/trajectory.rs (/Users/bryant/.cargo/shared-target/debug/deps/trajectory-64f4dba4037f9ff5)
+
+running 6 tests
+test data_survives_closing_and_reopening_the_same_database_file ... ok
+test execution_event_kind_has_no_field_for_raw_prompt_or_output_content ... ok
+test multiple_sessions_attach_to_one_stable_task_identity ... ok
+test plan_ties_to_the_exact_contract_revision_it_assumed ... ok
+test receipt_query_reconstructs_full_task_trajectory_from_sqlite_alone ... ok
+test reinserting_the_same_event_id_is_idempotent ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+

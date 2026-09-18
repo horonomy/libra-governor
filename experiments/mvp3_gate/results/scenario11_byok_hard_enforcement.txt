@@ -1,0 +1,10 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running tests/auth_and_routing.rs (/Users/bryant/.cargo/shared-target/debug/deps/auth_and_routing-27f0437c8e282d90)
+
+running 3 tests
+test a_request_with_no_credential_is_refused_and_never_reaches_the_upstream ... ok
+test a_wrong_capability_token_is_refused ... ok
+test disagreeing_dual_auth_headers_are_refused_without_any_upstream_call ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 16 filtered out; finished in 0.06s
+
