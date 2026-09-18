@@ -38,6 +38,42 @@ impl ResourceAmount {
             ResourceAmount::QuotaPercent(_) => ResourceKind::QuotaPercent,
         }
     }
+
+    /// The raw numeric value, regardless of unit (HORO-1137).
+    ///
+    /// Deliberately does not implement `PartialOrd`/`Ord` on the enum
+    /// itself: comparing two [`ResourceAmount`]s of different
+    /// [`ResourceKind`]s (e.g. dollars vs. tokens) is meaningless and
+    /// must not silently type-check. Callers that already know (or have
+    /// validated) both amounts share a kind — such as
+    /// `crate::policy::Policy` evaluation, which validates this at
+    /// construction — may compare via this accessor. Callers that
+    /// haven't established a shared kind should use [`Self::kind`] to
+    /// check first.
+    pub fn as_f64(&self) -> f64 {
+        match self {
+            ResourceAmount::UsdCents(c) => *c as f64,
+            ResourceAmount::Tokens(t) => *t as f64,
+            ResourceAmount::QuotaPercent(p) => *p as f64,
+        }
+    }
+
+    /// Scales this amount by `factor`, preserving its [`ResourceKind`]
+    /// (HORO-1137). Used to derive an elastic/hard ceiling from a target
+    /// amount (e.g. `target.scaled(1.5)`) without hardcoding a
+    /// unit-specific multiplication in policy-preset code. Rounds to the
+    /// unit's natural precision (whole cents, whole tokens).
+    pub fn scaled(&self, factor: f64) -> ResourceAmount {
+        match self {
+            ResourceAmount::UsdCents(c) => {
+                ResourceAmount::UsdCents(((*c as f64) * factor).round() as i64)
+            }
+            ResourceAmount::Tokens(t) => {
+                ResourceAmount::Tokens(((*t as f64) * factor).round() as u64)
+            }
+            ResourceAmount::QuotaPercent(p) => ResourceAmount::QuotaPercent(*p * factor as f32),
+        }
+    }
 }
 
 /// The unit a [`ResourceAmount`] is measured in, without the value —
@@ -62,6 +98,29 @@ mod tests {
         assert_eq!(
             ResourceAmount::QuotaPercent(12.5).kind(),
             ResourceKind::QuotaPercent
+        );
+    }
+
+    #[test]
+    fn as_f64_reads_the_raw_numeric_value() {
+        assert_eq!(ResourceAmount::UsdCents(199).as_f64(), 199.0);
+        assert_eq!(ResourceAmount::Tokens(500).as_f64(), 500.0);
+        assert_eq!(ResourceAmount::QuotaPercent(12.5).as_f64(), 12.5_f64);
+    }
+
+    #[test]
+    fn scaled_preserves_kind_and_multiplies() {
+        assert_eq!(
+            ResourceAmount::UsdCents(1000).scaled(1.5),
+            ResourceAmount::UsdCents(1500)
+        );
+        assert_eq!(
+            ResourceAmount::Tokens(200).scaled(2.0),
+            ResourceAmount::Tokens(400)
+        );
+        assert_eq!(
+            ResourceAmount::QuotaPercent(10.0).scaled(2.0),
+            ResourceAmount::QuotaPercent(20.0)
         );
     }
 }
