@@ -422,8 +422,17 @@ pub async fn handle(
     let tier = tier_tag(state.config.tier);
     let mut record = GatewayRequestRecord::new(request_id.clone(), tier);
 
-    let response = run(&state, req, &request_id, &mut record).await;
-    state.recorder.record(record);
+    // Exactly one provenance row per terminal transition (ADR 0003 §11).
+    // A metered 2xx hands ownership of the row to the pump task, which is
+    // the only place that knows how the response actually ended —
+    // cleanly, with the client gone, or with the upstream cut off. Writing
+    // one here as well would race that task and could overwrite the real
+    // terminal state with this snapshot's optimistic guess.
+    let mut pump_owns_record = false;
+    let response = run(&state, req, &request_id, &mut record, &mut pump_owns_record).await;
+    if !pump_owns_record {
+        state.recorder.record(record);
+    }
     Ok(response)
 }
 
@@ -451,6 +460,10 @@ fn reject(
         Decision::TaskUnbound | Decision::UnpricedModel | Decision::UnenforceableRequest => {
             state.stats.record_denied_unenforceable()
         }
+        // A transport failure is not an authorization refusal, and
+        // bucketing it as one would make the statusline blame the user
+        // for the provider being unreachable.
+        Decision::UpstreamUnavailable | Decision::Overloaded => state.stats.record_upstream_error(),
         _ => state.stats.record_denied_unauthorized(),
     }
     refusal(status, decision, request_id, reason)
@@ -461,6 +474,9 @@ async fn run(
     req: Request<Incoming>,
     request_id: &str,
     record: &mut GatewayRequestRecord,
+    // Set when the response's own pump task will write the provenance
+    // row instead of `handle`. See that function's comment.
+    pump_owns_record: &mut bool,
 ) -> Response<GatewayBody> {
     // ---- Host header, checked BEFORE routing -------------------------
     //
@@ -603,7 +619,15 @@ async fn run(
     }
 
     metered_request(
-        state, record, route, &parts, query, body, request_id, &presented,
+        state,
+        record,
+        route,
+        &parts,
+        query,
+        body,
+        request_id,
+        &presented,
+        pump_owns_record,
     )
     .await
 }
@@ -766,6 +790,10 @@ async fn forward_unmetered(
         Ok(upstream) => {
             let status = upstream.status();
             record.upstream_status = Some(status.as_u16());
+            if !status.is_success() {
+                state.stats.record_upstream_error();
+                record.terminal_state = TerminalState::UpstreamRejected.as_str();
+            }
             let (head, incoming) = upstream.into_parts();
             relay_head(status, &head.headers, request_id)
                 .body(incoming.map_err(io_error).boxed())
@@ -809,6 +837,7 @@ async fn metered_request(
     body: Bytes,
     request_id: &str,
     presented: &PresentedCredential,
+    pump_owns_record: &mut bool,
 ) -> Response<GatewayBody> {
     // ---- Estimating --------------------------------------------------
     let envelope = parse_messages_envelope(&body);
@@ -1052,6 +1081,9 @@ async fn metered_request(
         record: record.clone(),
         is_sse,
     };
+    // From here the pump owns the provenance row: it is the only place
+    // that will learn how this response actually ended.
+    *pump_owns_record = true;
     tokio::spawn(pump_and_settle(incoming, sender, settle_ctx));
 
     relay_head(status, &head.headers, request_id)

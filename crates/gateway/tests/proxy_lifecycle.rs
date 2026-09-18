@@ -506,7 +506,7 @@ fn a_response_reporting_no_usage_settles_conservatively_at_the_reserved_amount()
     );
 
     wait_until(
-        || !gw.authority.calls().is_empty() && gw.recorder.records().len() >= 2,
+        || gw.recorder.records().len() == 1,
         "the settlement and its provenance row",
     );
     assert_eq!(
@@ -621,8 +621,10 @@ fn every_terminal_transition_writes_exactly_one_provenance_row_carrying_its_pric
     );
     assert_eq!(records[0].terminal_state, "rejected_before_upstream");
 
-    // A completed request writes the response-path row plus the
-    // settlement row from the pump task.
+    // A completed request writes exactly ONE further row — the pump's,
+    // which is the only place that knows how the response ended. A second
+    // row written from the response path would race it and could
+    // overwrite the real terminal state with an optimistic guess.
     send(
         &rt,
         gw.addr,
@@ -632,7 +634,7 @@ fn every_terminal_transition_writes_exactly_one_provenance_row_carrying_its_pric
         &messages_body("claude-sonnet-4-5", Some(100), false),
     );
     wait_until(
-        || gw.recorder.records().len() >= 3,
+        || gw.recorder.records().len() == 2,
         "the settled request's provenance row",
     );
     let settled = gw
@@ -645,6 +647,35 @@ fn every_terminal_transition_writes_exactly_one_provenance_row_carrying_its_pric
     assert_eq!(settled.max_tokens, Some(100));
     assert_eq!(settled.tier, "gateway_metered");
     assert_eq!(settled.upstream_status, Some(200));
+}
+
+#[test]
+fn a_completed_request_writes_exactly_one_provenance_row_with_the_real_terminal_state() {
+    let rt = runtime();
+    let gw = start_test_gateway(TestGatewayOptions::default());
+
+    // A stream the upstream cuts off without a message_stop. The pump is
+    // the only code that learns this; a row written from the response
+    // path would claim it completed cleanly.
+    send(
+        &rt,
+        gw.addr,
+        "POST",
+        "/v1/messages",
+        &authorized_headers(&gw.token, "truncated"),
+        &messages_body("claude-sonnet-4-5", Some(1_000), true),
+    );
+    wait_until(|| !gw.authority.settlements().is_empty(), "settlement");
+
+    let records = gw.recorder.records();
+    assert_eq!(
+        records.len(),
+        1,
+        "exactly one provenance row per terminal transition (ADR 0003 §11) — a second row \
+         would race the pump and could overwrite the real terminal state"
+    );
+    assert!(records[0].settled_amount.is_some());
+    assert_eq!(records[0].upstream_status, Some(200));
 }
 
 #[test]
