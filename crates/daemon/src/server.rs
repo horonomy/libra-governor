@@ -413,6 +413,12 @@ fn handle_preflight(
     let task_id = ledger.resolve_or_create_task_for_session(session_id, now)?;
     let previous_contract = ledger.latest_contract(task_id)?;
     let had_existing_budget = ledger.task_budget(task_id)?.is_some();
+    // Captured before `supersede_in_flight_preflights` below so the
+    // outgoing plan's reservation (if this is a second-or-later prompt
+    // in the same session, not a replan) can be released rather than
+    // left `active` and untouched until its TTL eventually expires
+    // (HORO-1141).
+    let previous_plan_id = ledger.in_flight_plan_for_session(session_id)?;
 
     let recon = recon::run_recon(cwd, task_hint, &config.recon_budget);
     let contract = contract::draft_contract(previous_contract.as_ref(), &recon);
@@ -439,6 +445,15 @@ fn handle_preflight(
     // cancelling mid-session) from leaving orphaned "active" state.
     ledger.supersede_in_flight_preflights(session_id)?;
     ledger.record_preflight(session_id, task_id, plan.id, now)?;
+
+    // Release the outgoing plan's reservation, if any (HORO-1141): a
+    // fresh (non-replan) preflight for a task that already had an
+    // in-flight plan — e.g. a second prompt in the same session — must
+    // not leave that plan's envelope `active` forever; only `ToolInvoked`'s
+    // replan path and `Finalize`'s settlement otherwise touch it.
+    if let Some(previous_plan_id) = previous_plan_id {
+        ledger.release_active_for_plan(task_id, previous_plan_id, now)?;
+    }
 
     // Completion Reserve + atomic admission (HORO-1141): the first real
     // wiring of HORO-1137's `Policy::evaluate` into the daemon. Every
