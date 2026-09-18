@@ -1316,4 +1316,283 @@ mod tests {
         assert_eq!(decision.policy_schema_version, POLICY_SCHEMA_VERSION);
         assert_eq!(decision.policy_schema_version, policy.policy_schema_version);
     }
+
+    #[test]
+    fn rejects_elastic_ceiling_below_target() {
+        let err = Policy::validated(
+            "invalid",
+            ResourceBound {
+                mode: ConstraintMode::Elastic,
+                target: ResourceAmount::UsdCents(1000),
+                elastic_ceiling: Some(ResourceAmount::UsdCents(500)),
+                hard_ceiling: ResourceAmount::UsdCents(2000),
+            },
+            TimeBound {
+                mode: ConstraintMode::Hard,
+                target_secs: 600,
+                elastic_ceiling_secs: None,
+                hard_ceiling_secs: Some(600),
+                deadline: None,
+            },
+            quality_floor(),
+            Confidence::Medium,
+            AutonomyBoundary::AskOnApproval,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PolicyValidationError::ResourceElasticCeilingBelowTarget {
+                target: ResourceAmount::UsdCents(1000),
+                elastic: ResourceAmount::UsdCents(500),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_hard_ceiling_below_elastic_ceiling() {
+        let err = Policy::validated(
+            "invalid",
+            ResourceBound {
+                mode: ConstraintMode::Elastic,
+                target: ResourceAmount::UsdCents(1000),
+                elastic_ceiling: Some(ResourceAmount::UsdCents(1500)),
+                hard_ceiling: ResourceAmount::UsdCents(1200),
+            },
+            TimeBound {
+                mode: ConstraintMode::Hard,
+                target_secs: 600,
+                elastic_ceiling_secs: None,
+                hard_ceiling_secs: Some(600),
+                deadline: None,
+            },
+            quality_floor(),
+            Confidence::Medium,
+            AutonomyBoundary::AskOnApproval,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PolicyValidationError::ResourceElasticCeilingAboveHardCeiling {
+                elastic: ResourceAmount::UsdCents(1500),
+                hard_ceiling: ResourceAmount::UsdCents(1200),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_target_above_hard_ceiling() {
+        let err = Policy::validated(
+            "invalid",
+            ResourceBound {
+                mode: ConstraintMode::Hard,
+                target: ResourceAmount::UsdCents(2000),
+                elastic_ceiling: None,
+                hard_ceiling: ResourceAmount::UsdCents(1000),
+            },
+            TimeBound {
+                mode: ConstraintMode::Hard,
+                target_secs: 600,
+                elastic_ceiling_secs: None,
+                hard_ceiling_secs: Some(600),
+                deadline: None,
+            },
+            quality_floor(),
+            Confidence::Medium,
+            AutonomyBoundary::AskOnApproval,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PolicyValidationError::ResourceTargetExceedsHardCeiling {
+                target: ResourceAmount::UsdCents(2000),
+                hard_ceiling: ResourceAmount::UsdCents(1000),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_deadline_in_the_past() {
+        let now = OffsetDateTime::now_utc();
+        let deadline = now - time::Duration::days(1);
+        let err = Policy::validated_at(
+            "invalid",
+            ResourceBound {
+                mode: ConstraintMode::Hard,
+                target: ResourceAmount::UsdCents(1000),
+                elastic_ceiling: None,
+                hard_ceiling: ResourceAmount::UsdCents(1000),
+            },
+            TimeBound {
+                mode: ConstraintMode::Hard,
+                target_secs: 600,
+                elastic_ceiling_secs: None,
+                hard_ceiling_secs: Some(600),
+                deadline: Some(deadline),
+            },
+            quality_floor(),
+            Confidence::Medium,
+            AutonomyBoundary::AskOnApproval,
+            now,
+        )
+        .unwrap_err();
+        assert_eq!(err, PolicyValidationError::DeadlineInPast { deadline, now });
+    }
+
+    #[test]
+    fn rejects_empty_required_criteria() {
+        let no_required_criteria =
+            CompletionContract::first(vec![CompletionCriterion::optional("nice to have")]);
+        let err = Policy::validated(
+            "invalid",
+            ResourceBound {
+                mode: ConstraintMode::Hard,
+                target: ResourceAmount::UsdCents(1000),
+                elastic_ceiling: None,
+                hard_ceiling: ResourceAmount::UsdCents(1000),
+            },
+            TimeBound {
+                mode: ConstraintMode::Hard,
+                target_secs: 600,
+                elastic_ceiling_secs: None,
+                hard_ceiling_secs: Some(600),
+                deadline: None,
+            },
+            no_required_criteria,
+            Confidence::Medium,
+            AutonomyBoundary::AskOnApproval,
+        )
+        .unwrap_err();
+        assert_eq!(err, PolicyValidationError::EmptyRequiredCriteria);
+    }
+
+    #[test]
+    fn rejects_hard_mode_missing_hard_ceiling() {
+        let err = Policy::validated(
+            "invalid",
+            ResourceBound {
+                mode: ConstraintMode::Hard,
+                target: ResourceAmount::UsdCents(1000),
+                elastic_ceiling: None,
+                hard_ceiling: ResourceAmount::UsdCents(1000),
+            },
+            TimeBound {
+                mode: ConstraintMode::Hard,
+                target_secs: 600,
+                elastic_ceiling_secs: None,
+                hard_ceiling_secs: None,
+                deadline: None,
+            },
+            quality_floor(),
+            Confidence::Medium,
+            AutonomyBoundary::AskOnApproval,
+        )
+        .unwrap_err();
+        assert_eq!(err, PolicyValidationError::TimeHardModeMissingHardCeiling);
+    }
+
+    #[test]
+    fn rejects_elastic_ceiling_set_for_non_elastic_mode() {
+        let err = Policy::validated(
+            "invalid",
+            ResourceBound {
+                mode: ConstraintMode::Hard,
+                target: ResourceAmount::UsdCents(1000),
+                elastic_ceiling: Some(ResourceAmount::UsdCents(1200)),
+                hard_ceiling: ResourceAmount::UsdCents(1500),
+            },
+            TimeBound {
+                mode: ConstraintMode::Hard,
+                target_secs: 600,
+                elastic_ceiling_secs: None,
+                hard_ceiling_secs: Some(600),
+                deadline: None,
+            },
+            quality_floor(),
+            Confidence::Medium,
+            AutonomyBoundary::AskOnApproval,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PolicyValidationError::ResourceElasticCeilingSetForMode {
+                mode: ConstraintMode::Hard,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_elastic_mode_missing_elastic_ceiling() {
+        let err = Policy::validated(
+            "invalid",
+            ResourceBound {
+                mode: ConstraintMode::Elastic,
+                target: ResourceAmount::UsdCents(1000),
+                elastic_ceiling: None,
+                hard_ceiling: ResourceAmount::UsdCents(1500),
+            },
+            TimeBound {
+                mode: ConstraintMode::Hard,
+                target_secs: 600,
+                elastic_ceiling_secs: None,
+                hard_ceiling_secs: Some(600),
+                deadline: None,
+            },
+            quality_floor(),
+            Confidence::Medium,
+            AutonomyBoundary::AskOnApproval,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PolicyValidationError::ResourceElasticModeMissingCeiling {
+                mode: ConstraintMode::Elastic,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_resource_kind_mismatch() {
+        let err = Policy::validated(
+            "invalid",
+            ResourceBound {
+                mode: ConstraintMode::Hard,
+                target: ResourceAmount::UsdCents(1000),
+                elastic_ceiling: None,
+                hard_ceiling: ResourceAmount::Tokens(2000),
+            },
+            TimeBound {
+                mode: ConstraintMode::Hard,
+                target_secs: 600,
+                elastic_ceiling_secs: None,
+                hard_ceiling_secs: Some(600),
+                deadline: None,
+            },
+            quality_floor(),
+            Confidence::Medium,
+            AutonomyBoundary::AskOnApproval,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PolicyValidationError::ResourceKindMismatch {
+                target_kind: ResourceKind::Usd,
+                hard_ceiling_kind: ResourceKind::Tokens,
+            }
+        );
+    }
+
+    #[test]
+    fn evaluate_rejects_projected_resource_kind_mismatch() {
+        let policy = hard_resource_policy();
+        let err = policy
+            .evaluate(ResourceAmount::Tokens(1), 1, Confidence::Medium)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            PolicyEvaluationError::ProjectedResourceKindMismatch {
+                policy_kind: ResourceKind::Usd,
+                projected_kind: ResourceKind::Tokens,
+            }
+        );
+    }
 }
