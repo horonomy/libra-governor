@@ -7,6 +7,7 @@ members = [
     "crates/cli",
     "crates/ledger",
     "crates/estimator",
+    "crates/gateway",
 ]
 exclude = ["experiments/phase0", "experiments/mvp1_validation/fixtures/rust-crate"]
 
