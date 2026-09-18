@@ -139,17 +139,6 @@ def sha(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
-def chmod_executable_copy(path: Path) -> None:
-    """Set the standard permission for a CLI binary copied into a
-    per-profile isolated $CARGO_HOME/bin: 0o755 (owner rwx, group/other
-    read+execute). Each profile is a throwaway fake-$HOME rooted under
-    the caller-supplied --work-root, contains no secret material, and
-    the binary itself is public product code, so group/other read+exec
-    on the copy carries no risk -- only the owner needs write access.
-    """
-    os.chmod(path, 0o755)
-
-
 def _resolve_within(base: Path, *parts: str) -> Path:
     """Join ``parts`` onto ``base``, resolve the result, and assert it
     still resolves inside ``base`` before any caller passes it to a
@@ -260,7 +249,6 @@ def _run_item3_bootstrap(work_root: Path, binary: Path, record: RecordFn):
     absent_binpath = absent_profile["cargo_home"] / "bin" / "libra-governor"
     absent_binpath.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(binary, absent_binpath)
-    chmod_executable_copy(absent_binpath)
     assert not absent_settings_path.exists(), "expected no pre-existing settings.json in fresh fake_home"
     install_cmd_proc = run([str(absent_binpath), "install"], env=absent_env, timeout=30)
     absent_settings_after = absent_settings_path.read_text() if absent_settings_path.exists() else None
@@ -296,7 +284,6 @@ def _run_item3_bootstrap(work_root: Path, binary: Path, record: RecordFn):
     # reuse the already-built binary rather than re-running cargo install
     binary_foreign.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(binary, binary_foreign)
-    chmod_executable_copy(binary_foreign)
 
     install_foreign_proc = run([str(binary_foreign), "install"], env=foreign_env, timeout=30)
     after_install_sha = sha(foreign_settings_path)
@@ -498,7 +485,6 @@ def _run_item9_foreign_cycle(work_root: Path, binary: Path, foreign_seed: dict, 
     cyc_binpath = cycle_profile["cargo_home"] / "bin" / "libra-governor"
     cyc_binpath.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(binary, cyc_binpath)
-    chmod_executable_copy(cyc_binpath)
 
     cyc_install = run([str(cyc_binpath), "install"], env=cyc_env, timeout=30)
     cyc_after_install = json.loads(cyc_settings_path.read_text())
@@ -577,7 +563,6 @@ def _run_item10_capability_tier(work_root: Path, binary: Path, record: RecordFn)
         t_bin = tier_profile["cargo_home"] / "bin" / "libra-governor"
         t_bin.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(binary, t_bin)
-        chmod_executable_copy(t_bin)
         doctor_json = run([str(t_bin), "doctor", "--json"], env=t_env, timeout=30)
         doctor_text = run([str(t_bin), "doctor"], env=t_env, timeout=30)
         tier_lines.append(f"=== mode: {mode_name} ===\nconfig.json:\n{json.dumps(cfg, indent=2)}\n")
