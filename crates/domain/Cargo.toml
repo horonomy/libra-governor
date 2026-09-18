@@ -10,6 +10,7 @@ description = "Libra Governor: domain crate — task, contract, event, and recei
 uuid.workspace = true
 serde.workspace = true
 time.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

@@ -33,6 +33,7 @@ mod execution_event;
 mod execution_outcome;
 mod execution_plan;
 mod execution_receipt;
+mod policy;
 mod resource_amount;
 mod task_features;
 mod task_identity;
