@@ -21,8 +21,10 @@
 mod messages;
 pub mod wire;
 
+pub use libra_governor_domain::Estimate;
 pub use libra_governor_domain::{
-    Confidence, EnforcementCapabilities, EnforcementTier, Estimate, PolicyDecision, ResourceAmount,
+    Confidence, CredentialCustody, EnforcementCapabilities, EnforcementTier, MonetaryEnforcement,
+    NoMonetaryCap, PolicyDecision, ResourceAmount, UsageAccounting,
 };
 pub use libra_governor_estimator::{
     AdmissionOutcome, AdmissionPolicy, AdmissionStats, CoverageReport, QuantileCoverage, Stratum,
