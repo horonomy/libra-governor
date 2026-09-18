@@ -307,6 +307,10 @@ fn an_approval_gated_request_still_proceeds_and_is_recorded_as_such() {
         "the proxy has no channel to interrupt a human mid-request; approval is surfaced, \
          not enforced here"
     );
+    wait_until(
+        || gw.recorder.records().len() == 1,
+        "the pump's provenance row, which is written after settling",
+    );
     let record = gw.recorder.records().into_iter().next().unwrap();
     assert_eq!(record.decision_detail.as_deref(), Some("approval_required"));
 }
@@ -487,6 +491,10 @@ fn a_stream_cut_off_mid_flight_settles_at_the_last_observed_usage() {
         gw.authority.settlements(),
         vec![Some(ResourceAmount::Tokens(137))]
     );
+    wait_until(
+        || gw.recorder.records().len() == 1,
+        "the pump's provenance row, which is written after settling",
+    );
     let record = gw.recorder.records().pop().unwrap();
     assert!(record.usage_known);
 }
@@ -532,7 +540,10 @@ fn a_bound_violation_is_recorded_rather_than_clamped_away() {
         &messages_body("claude-sonnet-4-5", Some(10), true),
     );
 
-    wait_until(|| !gw.authority.settlements().is_empty(), "settlement");
+    wait_until(
+        || gw.recorder.records().len() == 1,
+        "the pump's provenance row, which is written after settling",
+    );
     let record = gw.recorder.records().pop().unwrap();
     assert!(
         record.bound_violated,
@@ -665,7 +676,10 @@ fn a_completed_request_writes_exactly_one_provenance_row_with_the_real_terminal_
         &authorized_headers(&gw.token, "truncated"),
         &messages_body("claude-sonnet-4-5", Some(1_000), true),
     );
-    wait_until(|| !gw.authority.settlements().is_empty(), "settlement");
+    wait_until(
+        || gw.recorder.records().len() == 1,
+        "the pump's provenance row, which is written after settling",
+    );
 
     let records = gw.recorder.records();
     assert_eq!(
@@ -691,7 +705,10 @@ fn a_provenance_row_never_carries_a_body_or_a_credential() {
         &authorized_headers(&gw.token, "nonstream"),
         &messages_body("claude-sonnet-4-5", Some(100), false),
     );
-    wait_until(|| !gw.authority.settlements().is_empty(), "settlement");
+    wait_until(
+        || gw.recorder.records().len() == 1,
+        "the pump's provenance row, which is written after settling",
+    );
 
     for record in gw.recorder.records() {
         let rendered = format!("{record:?}");
