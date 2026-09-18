@@ -218,11 +218,11 @@ pub fn apply(path: &Path, binary: &Path) -> Result<Applied, SettingsError> {
         .or_insert_with(|| Value::Object(Map::new()));
     let hooks_obj = as_object_or_replace(hooks_value);
 
-    for (event, subcommand) in HOOK_EVENTS.iter().zip([
-        "hook user-prompt-submit",
-        "hook post-tool-use",
-        "hook stop",
-    ]) {
+    for (event, subcommand) in
+        HOOK_EVENTS
+            .iter()
+            .zip(["hook user-prompt-submit", "hook post-tool-use", "hook stop"])
+    {
         let command = format!("{binary} {subcommand}");
         let entries = hooks_obj
             .entry((*event).to_string())
@@ -234,9 +234,9 @@ pub fn apply(path: &Path, binary: &Path) -> Result<Applied, SettingsError> {
                 .get("hooks")
                 .and_then(Value::as_array)
                 .map(|inner| {
-                    inner.iter().any(|h| {
-                        h.get("command").and_then(Value::as_str) == Some(command.as_str())
-                    })
+                    inner
+                        .iter()
+                        .any(|h| h.get("command").and_then(Value::as_str) == Some(command.as_str()))
                 })
                 .unwrap_or(false)
         });
@@ -322,8 +322,7 @@ pub fn remove(path: &Path) -> Result<Removed, SettingsError> {
                 };
                 let mut matchers_to_drop = Vec::new();
                 for (idx, matcher) in entries_arr.iter_mut().enumerate() {
-                    let Some(inner) = matcher.get_mut("hooks").and_then(Value::as_array_mut)
-                    else {
+                    let Some(inner) = matcher.get_mut("hooks").and_then(Value::as_array_mut) else {
                         continue;
                     };
                     let before = inner.len();
@@ -578,12 +577,18 @@ mod tests {
         );
         assert!(!removed.statusline_removed);
         assert!(!removed.api_key_helper_removed);
-        assert!(!removed.base_url_removed, "a non-loopback base URL is never ours");
+        assert!(
+            !removed.base_url_removed,
+            "a non-loopback base URL is never ours"
+        );
 
         let text = std::fs::read_to_string(&path).unwrap();
         let value: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
-            value["hooks"]["PostToolUse"][0]["hooks"].as_array().unwrap().len(),
+            value["hooks"]["PostToolUse"][0]["hooks"]
+                .as_array()
+                .unwrap()
+                .len(),
             1,
             "the foreign PostToolUse entry must survive"
         );
@@ -595,7 +600,10 @@ mod tests {
             value["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
             "/usr/local/bin/foreign-guard check"
         );
-        assert_eq!(value["statusLine"]["command"], "/usr/local/bin/my-other-statusline");
+        assert_eq!(
+            value["statusLine"]["command"],
+            "/usr/local/bin/my-other-statusline"
+        );
         assert_eq!(value["apiKeyHelper"], "/usr/local/bin/my-own-key-helper");
         assert_eq!(
             value["env"]["HTTP_PROXY"],
@@ -673,7 +681,8 @@ mod tests {
     fn a_backup_is_written_before_any_mutating_write() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
-        let seed = serde_json::json!({"apiKeyHelper": "/opt/libra/bin/libra-governor gateway token"});
+        let seed =
+            serde_json::json!({"apiKeyHelper": "/opt/libra/bin/libra-governor gateway token"});
         let original_bytes = serde_json::to_string_pretty(&seed).unwrap();
         std::fs::write(&path, &original_bytes).unwrap();
 
@@ -703,7 +712,10 @@ mod tests {
         let value: Value = serde_json::from_str(&text).unwrap();
         let stop = value["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 1, "the foreign matcher must survive");
-        assert_eq!(stop[0]["hooks"][0]["command"], "/usr/local/bin/other stop-notify");
+        assert_eq!(
+            stop[0]["hooks"][0]["command"],
+            "/usr/local/bin/other stop-notify"
+        );
     }
 
     #[test]
