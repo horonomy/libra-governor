@@ -45,6 +45,11 @@ pub use execution_event::{ExecutionEvent, ExecutionEventKind};
 pub use execution_outcome::ExecutionOutcome;
 pub use execution_plan::{ExecutionPlan, PlanId};
 pub use execution_receipt::ExecutionReceipt;
+pub use policy::{
+    Admission, ApprovalRequest, AutonomyBoundary, ConstraintMode, ConstraintOutcome, DenyReason,
+    Policy, PolicyDecision, PolicyEvaluationError, PolicyPresetInputs, PolicyValidationError,
+    ResourceBound, TimeBound, POLICY_SCHEMA_VERSION,
+};
 pub use resource_amount::{ResourceAmount, ResourceKind};
 pub use task_features::{BucketTier, BuildTopology, TaskFeatures, FEATURE_SCHEMA_VERSION};
 pub use task_identity::{ExternalRef, TaskId, TaskIdentity};
