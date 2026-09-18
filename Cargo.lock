@@ -350,6 +350,7 @@ version = "0.0.0"
 dependencies = [
  "libra-governor-daemon",
  "libra-governor-domain",
+ "libra-governor-gateway",
  "libra-governor-ledger",
  "libra-governor-protocol",
  "serde",
@@ -365,6 +366,7 @@ version = "0.0.0"
 dependencies = [
  "libra-governor-domain",
  "libra-governor-estimator",
+ "libra-governor-gateway",
  "libra-governor-ledger",
  "libra-governor-protocol",
  "serde_json",

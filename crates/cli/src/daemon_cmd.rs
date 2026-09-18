@@ -33,6 +33,9 @@ pub fn run() {
         replan_hysteresis: ReplanHysteresisConfig::default(),
         policy: libra_governor_daemon::default_admission_policy(),
         reservation_ttl_secs: DEFAULT_RESERVATION_TTL_SECS,
+        gateway: None,
+        gateway_stats: std::sync::Arc::new(Default::default()),
+        gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER.to_string(),
     };
 
     let listener = match libra_governor_daemon::bind_or_detect_running(&config.socket_path) {

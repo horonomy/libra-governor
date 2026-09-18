@@ -44,11 +44,11 @@ use libra_governor_estimator::{
 use libra_governor_ledger::{LedgerStore, ReserveOutcome, ReserveRequest};
 use libra_governor_protocol::{
     wire, AdmissionPolicyReport, CalibrationReportResult, FinalizeOutcome, FinalizeResult,
-    PreflightResult, ReconSummary, ReplanState, Request, RequestEnvelope, Response,
-    ResponseEnvelope, StatusResult, TaskSummary, PROTOCOL_VERSION,
+    GatewayStatusResult, PreflightResult, ReconSummary, ReplanState, Request, RequestEnvelope,
+    Response, ResponseEnvelope, StatusResult, TaskSummary, PROTOCOL_VERSION,
 };
 
-use crate::{contract, features, log, recon, recon::ReconBudget};
+use crate::{contract, features, gateway_authority, log, recon, recon::ReconBudget};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
@@ -87,6 +87,25 @@ pub struct DaemonConfig {
     /// reconciliation reclaims it (HORO-1141) — see
     /// [`reconcile_stale_reservations`].
     pub reservation_ttl_secs: u64,
+    /// The optional enforcement gateway (HORO-1144). `None` — the
+    /// default — means no gateway: the daemon serves hooks and the
+    /// statusline exactly as before, and every spend gate stays advisory.
+    ///
+    /// Runtime-gated rather than feature-gated on purpose. A Cargo
+    /// feature on a security-critical path produces a configuration that
+    /// is never compiled in CI and therefore never tested; as an
+    /// `Option`, the enforcement code is compiled, linted, and tested on
+    /// every build whether or not a given user turns it on. See ADR 0003
+    /// §1.
+    pub gateway: Option<libra_governor_gateway::config::GatewayConfig>,
+    /// Live counters for a running gateway, shared with it so
+    /// `GatewayStatus` can render them. Present even when no gateway is
+    /// configured, in which case every counter stays zero.
+    pub gateway_stats: std::sync::Arc<libra_governor_gateway::stats::GatewayStats>,
+    /// Header naming the agent session a gateway request belongs to. See
+    /// `libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER` and the
+    /// known limitation in `integrations/claude-code/README.md`.
+    pub gateway_session_header: String,
 }
 
 /// The default admission [`Policy`] every task's budget is initialized
@@ -176,6 +195,13 @@ pub fn serve(listener: UnixListener, config: &DaemonConfig) -> Result<(), Daemon
     let mut current_task: Option<TaskSummary> = None;
 
     reconcile_stale_reservations(&mut ledger, config);
+
+    // Started AFTER reconciliation so the gateway's first request sees a
+    // budget from which crashed predecessors' capacity has already been
+    // reclaimed. The handle is kept alive for the life of `serve`; when
+    // it drops, the gateway's shutdown channel closes and its thread
+    // winds down.
+    let _gateway = start_gateway(config);
 
     for incoming in listener.incoming() {
         let stream = match incoming {
@@ -299,6 +325,7 @@ fn dispatch(
                 }
             }
         }
+        Request::GatewayStatus => Response::GatewayStatus(Box::new(gateway_status(config))),
         Request::CalibrationReport => match handle_calibration_report(ledger, config) {
             Ok(result) => Response::CalibrationReport(Box::new(result)),
             Err(e) => {
@@ -519,31 +546,46 @@ fn handle_preflight(
                 (requested.as_f64() - reserve_estimate.amount.as_f64()).max(0.0);
             let work_envelope =
                 ResourceAmount::from_kind_f64(budget.resource_kind, work_envelope_value);
-            match ledger.reserve(ReserveRequest {
-                task_id,
-                session_id,
-                plan_id: Some(plan.id),
-                class: ReservationClass::RequiredWork,
-                amount: work_envelope,
-                idempotency_key: &format!("plan:{}", plan.id.0),
-                now,
-                ttl_secs: config.reservation_ttl_secs,
-            })? {
-                ReserveOutcome::Granted(_) | ReserveOutcome::AlreadyGranted(_) => {}
-                ReserveOutcome::Insufficient { available, .. } => {
-                    log::append_line(
-                        &config.log_path,
-                        &format!(
-                            "task {task_id}: policy admitted but the ledger could not reserve \
+            // When the gateway is enabled, per-request gateway
+            // reservations REPLACE this plan-level envelope rather than
+            // stacking with it (HORO-1144, ADR 0003 §4). Reserving both
+            // would double-count the same spend against one `hard_limit`
+            // and deny the task at roughly half its real budget.
+            if config.gateway.is_some() {
+                log::append_line(
+                    &config.log_path,
+                    &format!(
+                        "task {task_id}: gateway enabled — per-request reservations replace the \
+                         plan-level work envelope, none reserved here"
+                    ),
+                );
+            } else {
+                match ledger.reserve(ReserveRequest {
+                    task_id,
+                    session_id,
+                    plan_id: Some(plan.id),
+                    class: ReservationClass::RequiredWork,
+                    amount: work_envelope,
+                    idempotency_key: &format!("plan:{}", plan.id.0),
+                    now,
+                    ttl_secs: config.reservation_ttl_secs,
+                })? {
+                    ReserveOutcome::Granted(_) | ReserveOutcome::AlreadyGranted(_) => {}
+                    ReserveOutcome::Insufficient { available, .. } => {
+                        log::append_line(
+                            &config.log_path,
+                            &format!(
+                                "task {task_id}: policy admitted but the ledger could not reserve \
                              the work envelope — only {available:?} available"
-                        ),
-                    );
-                }
-                ReserveOutcome::NoBudget => {
-                    log::append_line(
-                        &config.log_path,
-                        &format!("task {task_id}: reserve attempted with no task_budgets row"),
-                    );
+                            ),
+                        );
+                    }
+                    ReserveOutcome::NoBudget => {
+                        log::append_line(
+                            &config.log_path,
+                            &format!("task {task_id}: reserve attempted with no task_budgets row"),
+                        );
+                    }
                 }
             }
         }
@@ -762,33 +804,45 @@ fn handle_tool_invoked(
                 (requested.as_f64() - reserve_estimate.amount.as_f64()).max(0.0);
             let work_envelope =
                 ResourceAmount::from_kind_f64(budget.resource_kind, work_envelope_value);
-            match ledger.reserve(ReserveRequest {
-                task_id,
-                session_id,
-                plan_id: Some(new_plan.id),
-                class: ReservationClass::RequiredWork,
-                amount: work_envelope,
-                idempotency_key: &format!("plan:{}", new_plan.id.0),
-                now,
-                ttl_secs: config.reservation_ttl_secs,
-            })? {
-                ReserveOutcome::Granted(_) | ReserveOutcome::AlreadyGranted(_) => {}
-                ReserveOutcome::Insufficient { available, .. } => {
-                    log::append_line(
-                        &config.log_path,
-                        &format!(
-                            "task {task_id}: replan could not reserve the recomputed work \
+            // Same mutual exclusion as `handle_preflight`'s: with the
+            // gateway on, the per-request reservations are the envelope.
+            if config.gateway.is_some() {
+                log::append_line(
+                    &config.log_path,
+                    &format!(
+                        "task {task_id}: gateway enabled — replan reserves no plan-level work \
+                         envelope; per-request gateway reservations carry it"
+                    ),
+                );
+            } else {
+                match ledger.reserve(ReserveRequest {
+                    task_id,
+                    session_id,
+                    plan_id: Some(new_plan.id),
+                    class: ReservationClass::RequiredWork,
+                    amount: work_envelope,
+                    idempotency_key: &format!("plan:{}", new_plan.id.0),
+                    now,
+                    ttl_secs: config.reservation_ttl_secs,
+                })? {
+                    ReserveOutcome::Granted(_) | ReserveOutcome::AlreadyGranted(_) => {}
+                    ReserveOutcome::Insufficient { available, .. } => {
+                        log::append_line(
+                            &config.log_path,
+                            &format!(
+                                "task {task_id}: replan could not reserve the recomputed work \
                              envelope — only {available:?} available"
-                        ),
-                    );
-                }
-                ReserveOutcome::NoBudget => {
-                    log::append_line(
-                        &config.log_path,
-                        &format!(
-                            "task {task_id}: replan reserve attempted with no task_budgets row"
-                        ),
-                    );
+                            ),
+                        );
+                    }
+                    ReserveOutcome::NoBudget => {
+                        log::append_line(
+                            &config.log_path,
+                            &format!(
+                                "task {task_id}: replan reserve attempted with no task_budgets row"
+                            ),
+                        );
+                    }
                 }
             }
         }
@@ -924,6 +978,155 @@ fn handle_finalize(
     })))
 }
 
+/// A running gateway's thread and its shutdown channel.
+///
+/// Dropping this closes the channel, which the gateway's own shutdown
+/// relay observes, ending its accept loop. The thread is deliberately NOT
+/// joined on drop: the daemon's `serve` loop only ends when the process
+/// is going away anyway, and blocking process exit on an in-flight
+/// streaming response would be worse than letting the OS reclaim it.
+pub struct GatewayHandle {
+    _shutdown: std::sync::mpsc::Sender<()>,
+}
+
+/// Starts the optional enforcement gateway, if one is configured
+/// (HORO-1144).
+///
+/// Every failure path here logs and returns `None`, leaving the gateway
+/// off and the daemon fully functional. That asymmetry is deliberate and
+/// recorded in ADR 0003 §6: the gateway's own admission fails CLOSED
+/// (anything it cannot enforce exactly, it refuses), but the daemon's
+/// core function fails OPEN (a mistyped upstream host must not take away
+/// preflight, estimation, and the ledger).
+fn start_gateway(config: &DaemonConfig) -> Option<GatewayHandle> {
+    let raw = config.gateway.clone()?;
+    let policy_kind = config.policy.resource.target.kind();
+
+    let validated = match libra_governor_gateway::config::validate(raw, policy_kind) {
+        Ok(validated) => validated,
+        Err(e) => {
+            log::append_line(
+                &config.log_path,
+                &format!("gateway disabled: configuration rejected — {e}"),
+            );
+            return None;
+        }
+    };
+
+    let ledger = match gateway_authority::open_gateway_ledger(&config.ledger_path) {
+        Ok(ledger) => ledger,
+        Err(e) => {
+            log::append_line(
+                &config.log_path,
+                &format!("gateway disabled: could not open its own ledger connection — {e}"),
+            );
+            return None;
+        }
+    };
+
+    let bind_addr = validated.bind_addr;
+    let tier = validated.tier;
+    let mut runtime_config = libra_governor_gateway::server::GatewayRuntimeConfig::new(
+        validated,
+        std::sync::Arc::new(gateway_authority::LedgerSpendAuthority::new(
+            std::sync::Arc::clone(&ledger),
+        )),
+        std::sync::Arc::new(gateway_authority::LedgerRequestRecorder::new(
+            ledger,
+            config.log_path.clone(),
+        )),
+        std::sync::Arc::clone(&config.gateway_stats),
+    );
+    runtime_config.session_header = config.gateway_session_header.clone();
+
+    // Resolving the credential and the capability token happens inside
+    // `build_state`, eagerly — a gateway that started and only then
+    // discovered it has no credential would already have told the user it
+    // was protecting them. It is done here, on the daemon's own thread,
+    // so the failure is reportable before anything starts listening.
+    if let Err(e) = libra_governor_gateway::server::build_state(&runtime_config) {
+        log::append_line(
+            &config.log_path,
+            &format!("gateway disabled: startup failed — {e}"),
+        );
+        return None;
+    }
+
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+    let log_path = config.log_path.clone();
+    std::thread::Builder::new()
+        .name("libra-gateway".to_string())
+        .spawn(move || {
+            if let Err(e) = libra_governor_gateway::server::run_gateway(runtime_config, shutdown_rx)
+            {
+                log::append_line(&log_path, &format!("gateway stopped: {e}"));
+            }
+        })
+        .ok()?;
+
+    log::append_line(
+        &config.log_path,
+        &format!("gateway listening on {bind_addr} at tier {tier:?}"),
+    );
+    Some(GatewayHandle {
+        _shutdown: shutdown_tx,
+    })
+}
+
+/// Answers a `GatewayStatus` request from state the daemon already holds.
+///
+/// Read-only by construction — there is no request variant that starts,
+/// stops, or reconfigures the gateway, because a security boundary a
+/// client can switch off over an IPC socket is not one.
+fn gateway_status(config: &DaemonConfig) -> GatewayStatusResult {
+    let snapshot = config.gateway_stats.snapshot();
+    let policy_kind = config.policy.resource.target.kind();
+
+    let (running, disabled_reason, capabilities, bind_addr) = match config.gateway.clone() {
+        None => (
+            false,
+            Some("no gateway is configured (DaemonConfig.gateway is None)".to_string()),
+            Some(libra_governor_domain::EnforcementCapabilities::for_tier(
+                libra_governor_domain::EnforcementTier::HooksOnly,
+                libra_governor_gateway::pricing::PRICING_VERSION,
+            )),
+            None,
+        ),
+        Some(raw) => match libra_governor_gateway::config::validate(raw, policy_kind) {
+            Ok(validated) => (
+                true,
+                None,
+                Some(libra_governor_domain::EnforcementCapabilities::for_tier(
+                    validated.tier,
+                    libra_governor_gateway::pricing::PRICING_VERSION,
+                )),
+                Some(validated.bind_addr.to_string()),
+            ),
+            // Re-validating rather than caching the startup result keeps
+            // this honest after a config change that has not been
+            // restarted into: the reported reason is the reason a restart
+            // would hit.
+            Err(e) => (false, Some(e.to_string()), None, None),
+        },
+    };
+
+    GatewayStatusResult {
+        running,
+        disabled_reason,
+        capabilities,
+        bind_addr,
+        forwarded: snapshot.forwarded,
+        denied_budget: snapshot.denied_budget,
+        denied_unenforceable: snapshot.denied_unenforceable,
+        denied_unauthorized: snapshot.denied_unauthorized,
+        approval_gated: snapshot.approval_gated,
+        settled_with_known_usage: snapshot.settled_with_known_usage,
+        settled_without_usage: snapshot.settled_without_usage,
+        upstream_errors: snapshot.upstream_errors,
+        bound_violations: snapshot.bound_violations,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -986,6 +1189,10 @@ mod tests {
             replan_hysteresis: libra_governor_domain::ReplanHysteresisConfig::default(),
             policy: default_admission_policy(),
             reservation_ttl_secs: 900,
+            gateway: None,
+            gateway_stats: std::sync::Arc::new(Default::default()),
+            gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER
+                .to_string(),
         };
         let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
 
@@ -1047,6 +1254,10 @@ mod tests {
             replan_hysteresis: libra_governor_domain::ReplanHysteresisConfig::default(),
             policy: default_admission_policy(),
             reservation_ttl_secs: 900,
+            gateway: None,
+            gateway_stats: std::sync::Arc::new(Default::default()),
+            gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER
+                .to_string(),
         };
 
         let response = dispatch(

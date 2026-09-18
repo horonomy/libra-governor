@@ -65,6 +65,9 @@ fn base_config(dir: &Path, policy: Policy) -> DaemonConfig {
         replan_hysteresis: ReplanHysteresisConfig::default(),
         policy,
         reservation_ttl_secs: 900,
+        gateway: None,
+        gateway_stats: std::sync::Arc::new(Default::default()),
+        gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER.to_string(),
     }
 }
 
