@@ -1,0 +1,51 @@
+$ libra-governor install  (against ABSENT ~/.claude/settings.json, from a fresh profile)
+exit code: 0
+--- stdout ---
+libra-governor install: wired into /tmp/libra-horo1152-work/home-absent-settings/.claude/settings.json
+  hooks added:      3
+  statusline added: true
+
+Next: submit a prompt in Claude Code, then run `libra-governor doctor`.
+
+--- stderr ---
+
+--- resulting settings.json ---
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "/tmp/libra-horo1152-work/home-absent-settings/.cargo/bin/libra-governor hook post-tool-use",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "/tmp/libra-horo1152-work/home-absent-settings/.cargo/bin/libra-governor hook stop",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "command": "/tmp/libra-horo1152-work/home-absent-settings/.cargo/bin/libra-governor hook user-prompt-submit",
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "command": "/tmp/libra-horo1152-work/home-absent-settings/.cargo/bin/libra-governor statusline",
+    "type": "command"
+  }
+}
+

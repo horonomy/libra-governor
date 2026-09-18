@@ -1,0 +1,24 @@
+$ libra-governor hook user-prompt-submit -> post-tool-use x3 -> hook stop
+session_id: gate-full-b49a88c8-37f5-4ac9-8edc-95ddfe8e1963
+preflight exit=0
+--- preflight stdout ---
+{"hookSpecificOutput":{"additionalContext":"{\"hookSpecificOutput\":{\"additionalContext\":\"[libra-governor] Preflight complete (task 32f87f75-d2df-41b5-a470-a2cbff1a00ce, confidence: medium, recon: 0.00s).\\nDraft Completion Contract (revision 1):\\n  - [required] Matches the user's stated request\\n  - [required] Relevant tests pass (cargo test)\\nCost/time estimate: cold start — insufficient local history: no ExecutionReceipt rows recorded yet (confidence: low). This preflight is advisory only.\",\"hookEventName\":\"UserPromptSubmit\"}}","hookEventName":"UserPromptSubmit"}}
+
+
+post-tool-use(Read) exit=0 stdout='' stderr=''
+post-tool-use(Edit) exit=0 stdout='' stderr=''
+post-tool-use(Bash) exit=0 stdout='' stderr=''
+
+stop exit=0
+--- stop stdout ---
+
+--- stop stderr ---
+[libra-governor] Execution Receipt (task 32f87f75-d2df-41b5-a470-a2cbff1a00ce)
+Estimate: cold start — insufficient local history: no ExecutionReceipt rows recorded yet (confidence: Low, n=0)
+Actual:   0s / unknown (harness does not expose cost/usage data)
+Outcome:  Unknown (no automated completion verification in MVP 1)
+Tool calls: 3
+Inside P90: n/a (cold start)
+
+
+receipt rows in ledger after stop: 1

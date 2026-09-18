@@ -1,0 +1,15 @@
+$ libra-governor doctor  (fresh install, before any Claude Code interaction)
+exit code: 0
+--- stdout ---
+libra-governor doctor
+======================
+
+[ok] state_dir_permissions: /tmp/libra-horo1152-work/home-main/.local/state/libra-governor is owner-only (0700)
+[ok] config_file_present: no config.json — running the balanced preset with no gateway (defaults)
+[ok] gateway_token_present: gateway capability token not yet created (/tmp/libra-horo1152-work/home-main/.local/state/libra-governor/gateway.token)
+[ok] claude_settings: hooks and statusline wired in /tmp/libra-horo1152-work/home-main/.claude/settings.json
+[warn] daemon_reachable: daemon is not running — it starts on demand on the next Claude Code prompt (this is normal)
+
+
+--- stderr ---
+

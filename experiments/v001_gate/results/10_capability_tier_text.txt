@@ -1,0 +1,117 @@
+=== mode: GovernorHeld ===
+config.json:
+{
+  "gateway": {
+    "bind_addr": "127.0.0.1:38765",
+    "token_path": "/tmp/libra-horo1152-work/gw-token-governed.txt",
+    "credential_mode": "governor_held",
+    "credential_command": "/bin/echo",
+    "credential_args": [
+      "fake-test-credential-nonce-8f2c1a"
+    ]
+  }
+}
+
+$ libra-governor doctor
+exit=0
+libra-governor doctor
+======================
+
+[warn] state_dir_permissions: /tmp/libra-horo1152-work/home-tier-GovernorHeld/.local/state/libra-governor is mode 755, not owner-only (0700) — it will be tightened on the next daemon start
+[ok] config_file_present: /tmp/libra-horo1152-work/home-tier-GovernorHeld/.local/state/libra-governor/config.json is present and parses cleanly
+[ok] gateway_token_present: gateway capability token not yet created (/tmp/libra-horo1152-work/home-tier-GovernorHeld/.local/state/libra-governor/gateway.token)
+[warn] claude_settings: not installed into /tmp/libra-horo1152-work/home-tier-GovernorHeld/.claude/settings.json — run `libra-governor install`
+[warn] daemon_reachable: daemon is not running — it starts on demand on the next Claude Code prompt (this is normal)
+
+
+
+$ libra-governor doctor --json
+exit=0
+{
+  "daemon": null,
+  "findings": [
+    {
+      "id": "state_dir_permissions",
+      "message": "/tmp/libra-horo1152-work/home-tier-GovernorHeld/.local/state/libra-governor is mode 755, not owner-only (0700) — it will be tightened on the next daemon start",
+      "severity": "warn"
+    },
+    {
+      "id": "config_file_present",
+      "message": "/tmp/libra-horo1152-work/home-tier-GovernorHeld/.local/state/libra-governor/config.json is present and parses cleanly",
+      "severity": "ok"
+    },
+    {
+      "id": "gateway_token_present",
+      "message": "gateway capability token not yet created (/tmp/libra-horo1152-work/home-tier-GovernorHeld/.local/state/libra-governor/gateway.token)",
+      "severity": "ok"
+    },
+    {
+      "id": "claude_settings",
+      "message": "not installed into /tmp/libra-horo1152-work/home-tier-GovernorHeld/.claude/settings.json — run `libra-governor install`",
+      "severity": "warn"
+    },
+    {
+      "id": "daemon_reachable",
+      "message": "daemon is not running — it starts on demand on the next Claude Code prompt (this is normal)",
+      "severity": "warn"
+    }
+  ]
+}
+
+
+=== mode: PassThroughSubscription ===
+config.json:
+{
+  "gateway": {
+    "bind_addr": "127.0.0.1:38766",
+    "token_path": "/tmp/libra-horo1152-work/gw-token-subscription.txt",
+    "credential_mode": "pass_through_subscription"
+  }
+}
+
+$ libra-governor doctor
+exit=0
+libra-governor doctor
+======================
+
+[warn] state_dir_permissions: /tmp/libra-horo1152-work/home-tier-PassThroughSubscription/.local/state/libra-governor is mode 755, not owner-only (0700) — it will be tightened on the next daemon start
+[ok] config_file_present: /tmp/libra-horo1152-work/home-tier-PassThroughSubscription/.local/state/libra-governor/config.json is present and parses cleanly
+[ok] gateway_token_present: gateway capability token not yet created (/tmp/libra-horo1152-work/home-tier-PassThroughSubscription/.local/state/libra-governor/gateway.token)
+[warn] claude_settings: not installed into /tmp/libra-horo1152-work/home-tier-PassThroughSubscription/.claude/settings.json — run `libra-governor install`
+[warn] daemon_reachable: daemon is not running — it starts on demand on the next Claude Code prompt (this is normal)
+
+
+
+$ libra-governor doctor --json
+exit=0
+{
+  "daemon": null,
+  "findings": [
+    {
+      "id": "state_dir_permissions",
+      "message": "/tmp/libra-horo1152-work/home-tier-PassThroughSubscription/.local/state/libra-governor is mode 755, not owner-only (0700) — it will be tightened on the next daemon start",
+      "severity": "warn"
+    },
+    {
+      "id": "config_file_present",
+      "message": "/tmp/libra-horo1152-work/home-tier-PassThroughSubscription/.local/state/libra-governor/config.json is present and parses cleanly",
+      "severity": "ok"
+    },
+    {
+      "id": "gateway_token_present",
+      "message": "gateway capability token not yet created (/tmp/libra-horo1152-work/home-tier-PassThroughSubscription/.local/state/libra-governor/gateway.token)",
+      "severity": "ok"
+    },
+    {
+      "id": "claude_settings",
+      "message": "not installed into /tmp/libra-horo1152-work/home-tier-PassThroughSubscription/.claude/settings.json — run `libra-governor install`",
+      "severity": "warn"
+    },
+    {
+      "id": "daemon_reachable",
+      "message": "daemon is not running — it starts on demand on the next Claude Code prompt (this is normal)",
+      "severity": "warn"
+    }
+  ]
+}
+

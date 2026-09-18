@@ -1,0 +1,40 @@
+$ HOME=/tmp/libra-horo1152-work/home-main CARGO_HOME=/tmp/libra-horo1152-work/home-main/.cargo CARGO_TARGET_DIR=/tmp/libra-horo1152-target-93431 ./scripts/install.sh
+exit code: 0
+--- stdout ---
+Using toolchain: rustc 1.98.0 (88d9e12ae 2026-08-18)
+
+Building and installing libra-governor from /Users/bryant/Bryant-Developments/horonomy/libra-governor-v0.0.1-HORO-1152-release_gate ...
+
+Installed: /tmp/libra-horo1152-work/home-main/.cargo/bin/libra-governor
+
+Wiring Claude Code integration (~/.claude/settings.json) ...
+libra-governor install: wired into /tmp/libra-horo1152-work/home-main/.claude/settings.json
+  hooks added:      3
+  statusline added: true
+
+Next: submit a prompt in Claude Code, then run `libra-governor doctor`.
+
+Running diagnostics ...
+libra-governor doctor
+======================
+
+[ok] state_dir_permissions: /tmp/libra-horo1152-work/home-main/.local/state/libra-governor is owner-only (0700)
+[ok] config_file_present: no config.json — running the balanced preset with no gateway (defaults)
+[ok] gateway_token_present: gateway capability token not yet created (/tmp/libra-horo1152-work/home-main/.local/state/libra-governor/gateway.token)
+[ok] claude_settings: hooks and statusline wired in /tmp/libra-horo1152-work/home-main/.claude/settings.json
+[warn] daemon_reachable: daemon is not running — it starts on demand on the next Claude Code prompt (this is normal)
+
+
+Install complete. Next steps:
+  1. Restart Claude Code (or open a new session) so it picks up the settings change.
+  2. Submit any prompt — the statusline should update within a couple of seconds.
+  3. Run 'libra-governor doctor' any time to check on things.
+  4. See README.md and integrations/claude-code/README.md for policy presets,
+     the optional enforcement gateway, and troubleshooting.
+
+--- stderr ---
+  Installing libra-governor-cli v0.0.1 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-v0.0.1-HORO-1152-release_gate/crates/cli)
+    Updating crates.io index
+    Finished `release` profile [optimized] target(s) in 1.36s
+  Installing /tmp/libra-horo1152-work/home-main/.cargo/bin/libra-governor
+   Installed package `libra-governor-cli v0.0.1 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-v0.0.1-HORO-1152-release_gate/crates/cli)` (executable `libra-governor`)

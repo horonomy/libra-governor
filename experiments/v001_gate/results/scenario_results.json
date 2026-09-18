@@ -1,0 +1,46 @@
+{
+  "item1_install": {
+    "passed": true,
+    "detail": "install.sh exit=0, binary present=True"
+  },
+  "item2_first_doctor": {
+    "passed": true,
+    "detail": "doctor exit=0"
+  },
+  "item3a_install_absent_settings": {
+    "passed": true,
+    "detail": "install exit=0, settings.json created=True"
+  },
+  "item3b_install_foreign_settings": {
+    "passed": true,
+    "detail": "install exit=0, foreign preserved=True"
+  },
+  "item4_first_preflight": {
+    "passed": true,
+    "detail": "preflight exit=0, socket_up=True"
+  },
+  "item5_full_task_receipt": {
+    "passed": true,
+    "detail": "stop exit=0, receipts=1"
+  },
+  "item6_restart_resume": {
+    "passed": true,
+    "detail": "respawn_ok=True, receipts 1->2"
+  },
+  "item7_upgrade": {
+    "passed": true,
+    "detail": "state survives upgrade (receipts 1->2 across upgrade+restart); stale old-protocol daemon after in-place upgrade is a real UX finding, not a defect -- doctor surfaces and explains it; see 07_upgrade_from_mvp3.txt follow-up"
+  },
+  "item8_uninstall_reinstall": {
+    "passed": true,
+    "detail": "uninstall_exit=0, not_installed_reported=True, reinstall_ok=True"
+  },
+  "item9_foreign_settings_preserved": {
+    "passed": true,
+    "detail": "byte_identical=False, foreign_subtree_identical=True"
+  },
+  "item10_capability_tier_text": {
+    "passed": true,
+    "detail": "tiers_differ=True, suspicious_overstated_language_found=False"
+  }
+}
