@@ -43,6 +43,12 @@ pub use store::LedgerStore;
 pub enum LedgerError {
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// A filesystem operation on the ledger's own files failed — as of
+    /// HORO-1146, only `LedgerStore::open`'s post-open `chmod` to
+    /// owner-only permissions (see `store::harden_file_permissions`)
+    /// raises this.
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
     #[error("task {0} not found")]
     TaskNotFound(String),
     /// A reservation/settlement amount's [`libra_governor_domain::ResourceKind`]

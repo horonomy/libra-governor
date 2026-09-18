@@ -135,9 +135,19 @@ pub fn default_admission_policy() -> Policy {
 /// Binds `socket_path`, handling the stale-vs-live detection documented
 /// on this module. Returns the bound listener, or
 /// [`DaemonError::AlreadyRunning`] if a live daemon already holds it.
+///
+/// The socket file is hardened to owner-only (`0600`) immediately after
+/// each successful `bind` (HORO-1146 security review finding #5) —
+/// defense in depth on top of the containing state directory's own
+/// `0700` mode (`libra_governor_daemon::paths::ensure_state_dir`), which
+/// is the real boundary protecting the brief window between `bind`
+/// creating the file and this function's own `chmod` running.
 pub fn bind_or_detect_running(socket_path: &PathBuf) -> Result<UnixListener, DaemonError> {
     match UnixListener::bind(socket_path) {
-        Ok(listener) => Ok(listener),
+        Ok(listener) => {
+            harden_socket_permissions(socket_path)?;
+            Ok(listener)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             if UnixStream::connect(socket_path).is_ok() {
                 return Err(DaemonError::AlreadyRunning(socket_path.clone()));
@@ -148,10 +158,17 @@ pub fn bind_or_detect_running(socket_path: &PathBuf) -> Result<UnixListener, Dae
             // rather than silently — acceptable for MVP 1.0's
             // single-user local scope (documented known limitation).
             std::fs::remove_file(socket_path)?;
-            Ok(UnixListener::bind(socket_path)?)
+            let listener = UnixListener::bind(socket_path)?;
+            harden_socket_permissions(socket_path)?;
+            Ok(listener)
         }
         Err(e) => Err(e.into()),
     }
+}
+
+fn harden_socket_permissions(socket_path: &PathBuf) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
 }
 
 /// Reclaims every reservation left `Active` past its `expires_at`

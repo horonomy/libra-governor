@@ -43,9 +43,33 @@ pub fn state_dir() -> Result<PathBuf, PathsError> {
 
 /// [`state_dir`], creating it (and its parents) if it does not already
 /// exist.
+///
+/// Created (and, if it already existed from before this hardening
+/// landed, tightened) to mode `0700` — owner-only — since this directory
+/// holds the SQLite ledger, the daemon's Unix socket, and the gateway
+/// capability token: real local-multi-user information-disclosure
+/// surface otherwise (HORO-1146 security review finding #5). This is the
+/// actual security boundary for everything under it; per-file hardening
+/// on the ledger/socket below is defense in depth on top of this, not a
+/// substitute for it — the ledger's own `-wal`/`-shm` sidecar files, for
+/// instance, are protected by this directory mode rather than hardened
+/// individually.
 pub fn ensure_state_dir() -> Result<PathBuf, PathsError> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
     let dir = state_dir()?;
-    std::fs::create_dir_all(&dir)?;
+    if !dir.exists() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)?;
+    } else {
+        // `DirBuilder::mode` only governs newly created directories — a
+        // directory that predates this hardening (or was otherwise
+        // created with a looser mode) is tightened here idempotently,
+        // rather than only ever protecting a fresh install.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
     Ok(dir)
 }
 
