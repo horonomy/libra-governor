@@ -1,5 +1,5 @@
 use libra_governor_domain::{
-    CompletionContract, ExecutionEvent, ExecutionPlan, ExecutionReceipt, TaskIdentity,
+    CompletionContract, ExecutionEvent, ExecutionPlan, ExecutionReceipt, ReplanRecord, TaskIdentity,
 };
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
@@ -131,10 +131,18 @@ impl LedgerStore {
             .map_err(|e| {
                 LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
             })?;
+        let replan_reason_json = plan
+            .replan_reason
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| {
+                LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+            })?;
 
         self.conn.execute(
-            "INSERT INTO plans (id, task_id, contract_revision, recon_snapshot_ref, created_at, estimate_json, task_features_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO plans (id, task_id, contract_revision, recon_snapshot_ref, created_at, estimate_json, task_features_json, replaces_plan_id, replan_reason_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
                 plan.id.0.to_string(),
                 plan.task_id.to_string(),
@@ -143,7 +151,59 @@ impl LedgerStore {
                 rfc3339(plan.created_at)?,
                 estimate_json,
                 task_features_json,
+                plan.replaces.map(|p| p.0.to_string()),
+                replan_reason_json,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Inserts a [`ReplanRecord`] into the durable, queryable replan
+    /// history (HORO-1139) — see `migrations/0005_replanning.sql`.
+    pub fn insert_replan_event(&mut self, record: &ReplanRecord) -> Result<(), LedgerError> {
+        let remaining_estimate_json =
+            serde_json::to_string(&record.remaining_estimate).map_err(|e| {
+                LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+            })?;
+        let trigger_json = serde_json::to_string(&record.reason.trigger).map_err(|e| {
+            LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+        })?;
+
+        self.conn.execute(
+            "INSERT INTO replan_events (id, task_id, prior_plan_id, new_plan_id, trigger, detail, remaining_estimate_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                record.id.0.to_string(),
+                record.task_id.to_string(),
+                record.prior_plan_id.0.to_string(),
+                record.new_plan_id.0.to_string(),
+                trigger_json,
+                record.reason.detail,
+                remaining_estimate_json,
+                rfc3339(record.created_at)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Records that `task_id` just had an automatic replan at `now`:
+    /// upserts `replan_state`, incrementing `auto_replan_count` and
+    /// setting `last_replan_at` — the durable half of
+    /// [`libra_governor_domain::ReplanHysteresisState`], surviving a
+    /// daemon restart (a task, unlike a session, is expected to span
+    /// more than one daemon process lifetime — see docs/adr/0002).
+    pub fn record_replan_for_task(
+        &mut self,
+        task_id: libra_governor_domain::TaskId,
+        now: time::OffsetDateTime,
+    ) -> Result<(), LedgerError> {
+        self.conn.execute(
+            "INSERT INTO replan_state (task_id, auto_replan_count, last_replan_at)
+             VALUES (?1, 1, ?2)
+             ON CONFLICT(task_id) DO UPDATE SET
+                auto_replan_count = auto_replan_count + 1,
+                last_replan_at = excluded.last_replan_at",
+            rusqlite::params![task_id.to_string(), rfc3339(now)?],
         )?;
         Ok(())
     }

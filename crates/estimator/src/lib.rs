@@ -136,6 +136,44 @@ fn bucket_ladder(_current: &TaskFeatures) -> [BucketTier; 4] {
     ]
 }
 
+/// The historically typical (median) `tool_call_count` for the bucket
+/// tier `current` would land in, if enough same-bucket history exists to
+/// trust a median (HORO-1139). Reuses the exact same
+/// [`bucket_ladder`]/[`matches`] walk [`estimate_bucketed`] uses, so
+/// "typical tool-call count" and "typical duration/resource" are always
+/// computed over the identical sample set for a given task — never two
+/// different, silently-drifting notions of "this task's bucket."
+///
+/// Returns `None` when no tier in the ladder has at least
+/// [`MIN_CLASS_SAMPLES`] matching receipts — callers (see
+/// `libra_governor_domain::tool_call_count_is_material`) fall back to a
+/// fixed absolute threshold in that case, exactly like
+/// [`estimate_bucketed`] falls back to [`BucketTier::Global`]/cold-start
+/// when no ladder tier meets the threshold. Deliberately does NOT fall
+/// back to a global-tier median: a tool-call count "typical" of the
+/// entire unrelated local history is not a meaningful comparison point
+/// the way a global-tier *duration/resource* quantile still is (that
+/// asymmetry is intentional, not an oversight — a materially different
+/// task class can have a wildly different normal tool-call count where
+/// duration still clusters more consistently).
+pub fn typical_tool_call_count_bucketed(
+    history: &[(Option<TaskFeatures>, ExecutionReceipt)],
+    current: &TaskFeatures,
+) -> Option<u64> {
+    for tier in bucket_ladder(current) {
+        let mut counts: Vec<u64> = history
+            .iter()
+            .filter(|(features, _)| features.as_ref().is_some_and(|f| matches(tier, f, current)))
+            .map(|(_, receipt)| receipt.tool_call_count)
+            .collect();
+        if counts.len() >= MIN_CLASS_SAMPLES {
+            counts.sort_unstable();
+            return Some(quantile_u64(&counts, 0.50));
+        }
+    }
+    None
+}
+
 /// Whether `a` and `b` belong to the same bucket at `tier`.
 fn matches(tier: BucketTier, a: &TaskFeatures, b: &TaskFeatures) -> bool {
     match tier {
@@ -548,6 +586,72 @@ mod tests {
         assert_eq!(
             estimate_bucketed(&history, &current).estimator_version,
             "v3-tiered-confidence"
+        );
+    }
+
+    fn dated_receipt_with_tool_calls(
+        duration_secs: u64,
+        tool_call_count: u64,
+        task_features: Option<TaskFeatures>,
+    ) -> (Option<TaskFeatures>, ExecutionReceipt) {
+        (
+            task_features.clone(),
+            receipt(duration_secs, vec![])
+                .with_task_features(task_features)
+                .with_tool_call_count(tool_call_count),
+        )
+    }
+
+    #[test]
+    fn typical_tool_call_count_bucketed_is_none_with_no_matching_history() {
+        let current = features("repo-a", BuildTopology::Cargo, Some("claude-sonnet-5"));
+        assert_eq!(typical_tool_call_count_bucketed(&[], &current), None);
+    }
+
+    #[test]
+    fn typical_tool_call_count_bucketed_is_none_when_no_tier_meets_the_threshold() {
+        let current = features("repo-a", BuildTopology::Cargo, Some("claude-sonnet-5"));
+        // Only 2 matching receipts -- below MIN_CLASS_SAMPLES.
+        let history: Vec<_> = (1..=2)
+            .map(|n| dated_receipt_with_tool_calls(n, n * 3, Some(current.clone())))
+            .collect();
+        assert_eq!(typical_tool_call_count_bucketed(&history, &current), None);
+    }
+
+    #[test]
+    fn typical_tool_call_count_bucketed_computes_the_median_over_the_matching_tier() {
+        let current = features("repo-a", BuildTopology::Cargo, Some("claude-sonnet-5"));
+        let history: Vec<_> = [2u64, 4, 6, 8, 10]
+            .into_iter()
+            .map(|n| dated_receipt_with_tool_calls(n, n, Some(current.clone())))
+            .collect();
+        assert_eq!(
+            typical_tool_call_count_bucketed(&history, &current),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn typical_tool_call_count_bucketed_prefers_the_most_specific_matching_tier() {
+        let current = features("repo-a", BuildTopology::Cargo, Some("claude-sonnet-5"));
+        // Exact-match tier: small counts.
+        let mut history: Vec<_> = [1u64, 2, 3, 4, 5]
+            .into_iter()
+            .map(|n| dated_receipt_with_tool_calls(n, n, Some(current.clone())))
+            .collect();
+        // Same repo, different topology/model (Repo tier only): large counts.
+        history.extend([50u64, 60, 70, 80, 90].into_iter().map(|n| {
+            dated_receipt_with_tool_calls(
+                n,
+                n,
+                Some(features("repo-a", BuildTopology::Npm, Some("other-model"))),
+            )
+        }));
+
+        assert_eq!(
+            typical_tool_call_count_bucketed(&history, &current),
+            Some(3),
+            "must use the exact-match tier's median, not the broader Repo tier's"
         );
     }
 
