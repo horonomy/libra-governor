@@ -369,7 +369,14 @@ def main():
     matrix = Matrix(binary, work_root)
     matrix.run_all()
 
-    out_path = Path(args.out)
+    out_path = Path(args.out).resolve()
+    # SonarCloud pythonsecurity:S8707: --out is an externally-supplied CLI
+    # argument reaching a filesystem-write sink; without this check a
+    # caller could point it outside the repo (e.g. ``--out ../../etc/x``)
+    # and traverse to an arbitrary path. This harness only ever needs to
+    # write its own evidence output, so results are constrained to REPO_ROOT.
+    if REPO_ROOT not in out_path.parents and out_path != REPO_ROOT:
+        raise SystemExit(f"--out must resolve inside the repository: {out_path}")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(matrix.results, indent=2))
 
