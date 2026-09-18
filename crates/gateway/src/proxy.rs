@@ -327,7 +327,14 @@ fn parse_messages_envelope(body: &[u8]) -> MessagesEnvelope {
 enum PresentedCredential {
     None,
     One {
+        /// The credential with any `Bearer ` prefix removed — the form
+        /// compared against the local capability token.
         raw: String,
+        /// The header value exactly as it arrived, prefix included. This
+        /// is what pass-through mode re-attaches: re-deriving it from
+        /// `raw` would silently drop the scheme and change the caller's
+        /// own credential on its way upstream.
+        original: String,
         header: &'static str,
     },
     /// Both `Authorization` and `x-api-key` were present with different
@@ -340,20 +347,27 @@ fn presented_credential(headers: &hyper::HeaderMap) -> PresentedCredential {
     let bearer = headers
         .get(hyper::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.strip_prefix("Bearer ").unwrap_or(v).trim().to_string());
+        .map(|v| {
+            (
+                v.strip_prefix("Bearer ").unwrap_or(v).trim().to_string(),
+                v.to_string(),
+            )
+        });
     let api_key = headers
         .get("x-api-key")
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim().to_string());
+        .map(|v| (v.trim().to_string(), v.to_string()));
 
     match (bearer, api_key) {
-        (Some(a), Some(b)) if a != b => PresentedCredential::Ambiguous,
-        (Some(a), _) => PresentedCredential::One {
-            raw: a,
+        (Some((a, _)), Some((b, _))) if a != b => PresentedCredential::Ambiguous,
+        (Some((raw, original)), _) => PresentedCredential::One {
+            raw,
+            original,
             header: "authorization",
         },
-        (None, Some(b)) => PresentedCredential::One {
-            raw: b,
+        (None, Some((raw, original))) => PresentedCredential::One {
+            raw,
+            original,
             header: "x-api-key",
         },
         (None, None) => PresentedCredential::None,
@@ -706,8 +720,10 @@ async fn outbound_credential(
             Some((HeaderName::from_static("x-api-key"), value))
         }
         GatewayCredentialMode::PassThroughSubscription => match presented {
-            PresentedCredential::One { raw, header } => {
-                let mut value = HeaderValue::from_str(raw).ok()?;
+            PresentedCredential::One {
+                original, header, ..
+            } => {
+                let mut value = HeaderValue::from_str(original).ok()?;
                 value.set_sensitive(true);
                 let name = if *header == "authorization" {
                     hyper::header::AUTHORIZATION
