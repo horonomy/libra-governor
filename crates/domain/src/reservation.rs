@@ -425,7 +425,10 @@ mod tests {
         settled_partial.state = ReservationState::Settled;
         settled_partial.settled_amount = Some(ResourceAmount::Tokens(400));
         // refunded = 500 - 400 = 100; outstanding = max(0, 200 - 100) = 100
-        assert_eq!(settled_partial.outstanding_draw(), ResourceAmount::Tokens(100));
+        assert_eq!(
+            settled_partial.outstanding_draw(),
+            ResourceAmount::Tokens(100)
+        );
 
         let mut released = base.clone();
         released.state = ReservationState::Released;

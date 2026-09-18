@@ -29,7 +29,7 @@
 //! rather than double-applying the effect.
 
 use libra_governor_domain::{
-    CompletionReserveBasis, CompletionReserveEstimate, Headroom, Policy, PlanId, Reservation,
+    CompletionReserveBasis, CompletionReserveEstimate, Headroom, PlanId, Policy, Reservation,
     ReservationClass, ReservationEvidence, ReservationId, ReservationState, ResourceAmount,
     ResourceKind, TaskBudget, TaskId, RESERVATION_SCHEMA_VERSION,
 };
@@ -45,7 +45,8 @@ fn rfc3339(t: OffsetDateTime) -> Result<String, LedgerError> {
 }
 
 fn parse_time(s: &str) -> Result<OffsetDateTime, LedgerError> {
-    OffsetDateTime::parse(s, &Rfc3339).map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))
+    OffsetDateTime::parse(s, &Rfc3339)
+        .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))
 }
 
 fn kind_to_str(kind: ResourceKind) -> &'static str {
@@ -195,7 +196,8 @@ fn row_to_reservation(row: ReservationRow) -> Result<Reservation, LedgerError> {
     let resource_kind = kind_from_str(&resource_kind)?;
     Ok(Reservation {
         id: ReservationId(
-            uuid::Uuid::parse_str(&id).map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?,
+            uuid::Uuid::parse_str(&id)
+                .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?,
         ),
         task_id: TaskId(
             uuid::Uuid::parse_str(&task_id)
@@ -322,8 +324,9 @@ impl LedgerStore {
         now: OffsetDateTime,
     ) -> Result<TaskBudget, LedgerError> {
         let resource_kind = policy.resource.target.kind();
-        let policy_json = serde_json::to_string(policy)
-            .map_err(|e| LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
+        let policy_json = serde_json::to_string(policy).map_err(|e| {
+            LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+        })?;
         let now_str = rfc3339(now)?;
 
         let tx = self
@@ -488,9 +491,9 @@ impl LedgerStore {
             .optional()?;
         if let Some(row) = existing {
             tx.commit()?;
-            return Ok(ReserveOutcome::AlreadyGranted(Box::new(row_to_reservation(
-                row,
-            )?)));
+            return Ok(ReserveOutcome::AlreadyGranted(Box::new(
+                row_to_reservation(row)?,
+            )));
         }
 
         let budget_row: Option<BudgetRow> = tx
@@ -733,8 +736,8 @@ impl LedgerStore {
                 rusqlite::params![restore, rfc3339(now)?, reservation.task_id.to_string()],
             )?;
         }
-        let updated_reservation = Self::get_reservation_tx(&tx, id)?
-            .expect("row just updated in this same transaction");
+        let updated_reservation =
+            Self::get_reservation_tx(&tx, id)?.expect("row just updated in this same transaction");
         tx.commit()?;
 
         let refunded = updated_reservation.refunded();
@@ -792,8 +795,8 @@ impl LedgerStore {
                 ],
             )?;
         }
-        let updated_reservation = Self::get_reservation_tx(&tx, id)?
-            .expect("row just updated in this same transaction");
+        let updated_reservation =
+            Self::get_reservation_tx(&tx, id)?.expect("row just updated in this same transaction");
         tx.commit()?;
         Ok(ReleaseOutcome::Released(Box::new(updated_reservation)))
     }
@@ -1091,5 +1094,864 @@ impl LedgerStore {
             reservation_count: reservations.len() as u32,
             usage_known_count,
         }))
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    //! Shared test fixtures for the reservation ledger — used by this
+    //! module's own unit tests and re-derived (not shared across the
+    //! crate boundary) by `tests/reservation_concurrency.rs`, which runs
+    //! as a separate compilation unit against only the public API.
+
+    use libra_governor_domain::{
+        AutonomyBoundary, CompletionContract, CompletionCriterion, CompletionReserveEstimate,
+        Confidence, ConstraintMode, Policy, ResourceAmount, ResourceBound, TimeBound,
+    };
+
+    /// A `Hard`-mode policy with `target == hard_ceiling == 1000 tokens`
+    /// — the simplest possible envelope for exercising reservation
+    /// arithmetic without an elastic band complicating the numbers.
+    pub(crate) fn thousand_token_policy() -> Policy {
+        Policy::validated(
+            "test",
+            ResourceBound {
+                mode: ConstraintMode::Hard,
+                target: ResourceAmount::Tokens(1000),
+                elastic_ceiling: None,
+                hard_ceiling: ResourceAmount::Tokens(1000),
+            },
+            TimeBound {
+                mode: ConstraintMode::Hard,
+                target_secs: 600,
+                elastic_ceiling_secs: None,
+                hard_ceiling_secs: Some(600),
+                deadline: None,
+            },
+            CompletionContract::first(vec![CompletionCriterion::required("tests pass")]),
+            Confidence::Low,
+            AutonomyBoundary::AskOnApproval,
+        )
+        .unwrap()
+    }
+
+    /// A fixed 200-token Completion Reserve against
+    /// [`thousand_token_policy`] — leaves 800 tokens of ordinary
+    /// (non-reserve) headroom.
+    pub(crate) fn fixed_reserve(amount: u64) -> CompletionReserveEstimate {
+        CompletionReserveEstimate {
+            amount: ResourceAmount::Tokens(amount),
+            basis: libra_governor_domain::CompletionReserveBasis::PolicyTarget,
+            fraction: amount as f64 / 1000.0,
+            required_criteria_count: 1,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{fixed_reserve, thousand_token_policy};
+    use super::*;
+    use crate::LedgerStore;
+
+    fn now() -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH
+    }
+
+    /// The invariant that must hold after every reservation operation:
+    /// the reserve never silently leaks (it must always equal the
+    /// initial reserve minus the sum of every reservation's outstanding
+    /// draw), and total committed capacity never exceeds the hard limit
+    /// except by a genuine, visible overrun.
+    fn assert_budget_invariant(store: &LedgerStore, task_id: TaskId) {
+        let budget = store
+            .task_budget(task_id)
+            .unwrap()
+            .expect("budget must exist");
+        let reservations = store.reservations_for_task(task_id).unwrap();
+
+        let outstanding_draw: f64 = reservations
+            .iter()
+            .map(|r| r.outstanding_draw().as_f64())
+            .sum();
+        assert_eq!(
+            budget.completion_reserve.as_f64(),
+            budget.initial_completion_reserve.as_f64() - outstanding_draw,
+            "completion_reserve must always equal initial minus outstanding draws"
+        );
+
+        let settled: f64 = reservations
+            .iter()
+            .filter(|r| r.state == ReservationState::Settled)
+            .filter_map(|r| r.settled_amount)
+            .map(|a| a.as_f64())
+            .sum();
+        let active: f64 = reservations
+            .iter()
+            .filter(|r| r.state == ReservationState::Active)
+            .map(|r| r.amount.as_f64())
+            .sum();
+        let overrun: f64 = reservations
+            .iter()
+            .filter_map(|r| r.overrun())
+            .map(|o| o.as_f64())
+            .sum();
+        assert!(
+            settled + active + budget.completion_reserve.as_f64()
+                <= budget.hard_limit.as_f64() + overrun + 1e-6,
+            "settled + active + reserve must not exceed the hard limit beyond a real overrun"
+        );
+    }
+
+    fn setup(store: &mut LedgerStore, reserve_amount: u64) -> TaskId {
+        let task_id = TaskId::new();
+        let identity = libra_governor_domain::TaskIdentity {
+            id: task_id,
+            external_ref: None,
+        };
+        store.insert_task(&identity, now()).unwrap();
+        let policy = thousand_token_policy();
+        let reserve = fixed_reserve(reserve_amount);
+        store
+            .initialize_task_budget(task_id, &policy, &reserve, now())
+            .unwrap();
+        task_id
+    }
+
+    // --- Basic reserve/settle/release round trips -------------------
+
+    #[test]
+    fn reserve_grants_within_optional_headroom() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+
+        let outcome = store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(500),
+                idempotency_key: "key-1",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap();
+        let ReserveOutcome::Granted(reservation) = outcome else {
+            panic!("expected Granted, got {outcome:?}");
+        };
+        assert_eq!(reservation.drawn_from_reserve, ResourceAmount::Tokens(0));
+        assert_budget_invariant(&store, task_id);
+    }
+
+    #[test]
+    fn optional_work_cannot_draw_into_the_completion_reserve() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+
+        let outcome = store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(900), // > 800 optional headroom
+                idempotency_key: "key-1",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap();
+        match outcome {
+            ReserveOutcome::Insufficient {
+                available,
+                protected_reserve,
+                ..
+            } => {
+                assert_eq!(available.value, 800.0);
+                assert_eq!(protected_reserve, ResourceAmount::Tokens(200));
+            }
+            other => panic!("expected Insufficient, got {other:?}"),
+        }
+        // Nothing was written.
+        assert_eq!(store.reservations_for_task(task_id).unwrap().len(), 0);
+        assert_budget_invariant(&store, task_id);
+    }
+
+    #[test]
+    fn required_work_draws_into_the_completion_reserve_once_exhausted() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+
+        let outcome = store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::RequiredWork,
+                amount: ResourceAmount::Tokens(900),
+                idempotency_key: "key-1",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap();
+        let ReserveOutcome::Granted(reservation) = outcome else {
+            panic!("expected Granted, got {outcome:?}");
+        };
+        assert_eq!(reservation.drawn_from_reserve, ResourceAmount::Tokens(100));
+        let budget = store.task_budget(task_id).unwrap().unwrap();
+        assert_eq!(budget.completion_reserve, ResourceAmount::Tokens(100));
+        assert_budget_invariant(&store, task_id);
+    }
+
+    // --- Failure case 3: provider response missing exact usage -------
+
+    #[test]
+    fn settle_with_no_reported_usage_falls_back_to_the_reserved_amount() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let ReserveOutcome::Granted(reservation) = store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(300),
+                idempotency_key: "key-1",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap()
+        else {
+            panic!("expected Granted");
+        };
+
+        let outcome = store.settle(reservation.id, None, now()).unwrap();
+        let SettleOutcome::Settled {
+            reservation,
+            refunded,
+            restored_to_reserve,
+            ..
+        } = outcome
+        else {
+            panic!("expected Settled");
+        };
+        assert_eq!(
+            reservation.settled_amount,
+            Some(ResourceAmount::Tokens(300))
+        );
+        assert_eq!(reservation.usage_known, Some(false));
+        assert_eq!(refunded, None);
+        assert_eq!(restored_to_reserve, ResourceAmount::Tokens(0));
+        assert_budget_invariant(&store, task_id);
+    }
+
+    // --- Failure case 4: over-reservation then refund -----------------
+
+    #[test]
+    fn settling_under_the_reservation_refunds_and_restores_the_reserve() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let ReserveOutcome::Granted(reservation) = store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::RequiredWork,
+                amount: ResourceAmount::Tokens(900), // draws 100 from reserve
+                idempotency_key: "key-1",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap()
+        else {
+            panic!("expected Granted");
+        };
+        assert_eq!(reservation.drawn_from_reserve, ResourceAmount::Tokens(100));
+
+        let outcome = store
+            .settle(reservation.id, Some(ResourceAmount::Tokens(600)), now())
+            .unwrap();
+        let SettleOutcome::Settled {
+            refunded,
+            restored_to_reserve,
+            overrun,
+            ..
+        } = outcome
+        else {
+            panic!("expected Settled");
+        };
+        assert_eq!(refunded, Some(ResourceAmount::Tokens(300)));
+        assert_eq!(overrun, None);
+        assert_eq!(restored_to_reserve, ResourceAmount::Tokens(100));
+
+        let budget = store.task_budget(task_id).unwrap().unwrap();
+        assert_eq!(budget.completion_reserve, ResourceAmount::Tokens(200));
+        assert_budget_invariant(&store, task_id);
+    }
+
+    // --- Failure case 5: actual cost above reservation ----------------
+
+    #[test]
+    fn settling_over_the_reservation_records_an_overrun_and_can_exhaust_headroom() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let ReserveOutcome::Granted(reservation) = store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(500),
+                idempotency_key: "key-1",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap()
+        else {
+            panic!("expected Granted");
+        };
+
+        let outcome = store
+            .settle(reservation.id, Some(ResourceAmount::Tokens(800)), now())
+            .unwrap();
+        let SettleOutcome::Settled { overrun, .. } = outcome else {
+            panic!("expected Settled");
+        };
+        assert_eq!(overrun, Some(ResourceAmount::Tokens(300)));
+
+        let headroom = store
+            .available(task_id, ReservationClass::OptionalWork)
+            .unwrap()
+            .unwrap();
+        assert!(
+            headroom.is_exhausted(),
+            "headroom must be exhausted, not clamped"
+        );
+        assert_eq!(headroom.value, 1000.0 - 800.0 - 200.0);
+
+        // A subsequent reserve must be refused now that headroom is gone.
+        let next = store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(1),
+                idempotency_key: "key-2",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap();
+        assert!(matches!(next, ReserveOutcome::Insufficient { .. }));
+        assert_budget_invariant(&store, task_id);
+    }
+
+    // --- Failure case 6: duplicate settlement / duplicate reserve -----
+
+    #[test]
+    fn duplicate_settlement_event_is_idempotent() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let ReserveOutcome::Granted(reservation) = store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(500),
+                idempotency_key: "key-1",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap()
+        else {
+            panic!("expected Granted");
+        };
+
+        let first = store
+            .settle(reservation.id, Some(ResourceAmount::Tokens(600)), now())
+            .unwrap();
+        assert!(matches!(first, SettleOutcome::Settled { .. }));
+
+        let second = store
+            .settle(reservation.id, Some(ResourceAmount::Tokens(999)), now())
+            .unwrap();
+        let SettleOutcome::AlreadyFinal(r) = second else {
+            panic!("expected AlreadyFinal, got {second:?}");
+        };
+        assert_eq!(r.settled_amount, Some(ResourceAmount::Tokens(600)));
+
+        let settled_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM reservations WHERE state = 'settled'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(settled_count, 1);
+        assert_budget_invariant(&store, task_id);
+    }
+
+    #[test]
+    fn duplicate_reserve_with_the_same_idempotency_key_is_a_safe_replay() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+
+        let req = || ReserveRequest {
+            task_id,
+            session_id: "sess-1",
+            plan_id: None,
+            class: ReservationClass::OptionalWork,
+            amount: ResourceAmount::Tokens(500),
+            idempotency_key: "key-1",
+            now: now(),
+            ttl_secs: 900,
+        };
+        let ReserveOutcome::Granted(first) = store.reserve(req()).unwrap() else {
+            panic!("expected Granted");
+        };
+        let ReserveOutcome::AlreadyGranted(second) = store.reserve(req()).unwrap() else {
+            panic!("expected AlreadyGranted");
+        };
+        assert_eq!(first.id, second.id);
+
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM reservations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_budget_invariant(&store, task_id);
+    }
+
+    // --- Failure case 7: stale reservation timeout / recovery ---------
+
+    #[test]
+    fn expire_stale_reservations_reclaims_only_past_expiry() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let ReserveOutcome::Granted(reservation) = store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::RequiredWork,
+                amount: ResourceAmount::Tokens(900),
+                idempotency_key: "key-1",
+                now: now(),
+                ttl_secs: 60,
+            })
+            .unwrap()
+        else {
+            panic!("expected Granted");
+        };
+        assert_eq!(reservation.drawn_from_reserve, ResourceAmount::Tokens(100));
+
+        // Not yet expired.
+        let before = store
+            .expire_stale_reservations(now() + time::Duration::seconds(30))
+            .unwrap();
+        assert!(before.is_empty());
+        assert_budget_invariant(&store, task_id);
+
+        // Past expiry: reclaimed, and the drawn reserve is restored.
+        let after = store
+            .expire_stale_reservations(now() + time::Duration::seconds(61))
+            .unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].state, ReservationState::Expired);
+        let budget = store.task_budget(task_id).unwrap().unwrap();
+        assert_eq!(budget.completion_reserve, ResourceAmount::Tokens(200));
+        assert_budget_invariant(&store, task_id);
+
+        // Headroom is available again for a fresh reservation.
+        let next = store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::RequiredWork,
+                amount: ResourceAmount::Tokens(900),
+                idempotency_key: "key-2",
+                now: now() + time::Duration::seconds(62),
+                ttl_secs: 900,
+            })
+            .unwrap();
+        assert!(matches!(next, ReserveOutcome::Granted(_)));
+    }
+
+    // --- Failure case 8: malicious/invalid event cannot forge spend/credit
+
+    #[test]
+    fn settling_an_unknown_reservation_id_is_not_found_and_changes_nothing() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let forged_id = ReservationId::new();
+
+        let outcome = store.settle(forged_id, Some(ResourceAmount::Tokens(1)), now());
+        assert!(matches!(outcome, Ok(SettleOutcome::NotFound)));
+        assert_budget_invariant(&store, task_id);
+    }
+
+    #[test]
+    fn settling_with_a_negative_amount_is_rejected() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let ReserveOutcome::Granted(reservation) = store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(500),
+                idempotency_key: "key-1",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap()
+        else {
+            panic!("expected Granted");
+        };
+
+        let result = store.settle(reservation.id, Some(ResourceAmount::Tokens(0)), now());
+        assert!(result.is_ok(), "zero is a legitimate settlement");
+
+        // Reserve a second one to attempt a negative settlement against.
+        let ReserveOutcome::Granted(reservation2) = store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(100),
+                idempotency_key: "key-2",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap()
+        else {
+            panic!("expected Granted");
+        };
+        // ResourceAmount::Tokens is u64 and cannot represent a negative
+        // value at the type level, so the negative-settlement rejection
+        // is exercised directly against LedgerError via UsdCents, whose
+        // representation IS capable of carrying a caller-supplied
+        // negative number.
+        let negative_usd_task = setup_usd(&mut store, 200);
+        let ReserveOutcome::Granted(usd_reservation) = store
+            .reserve(ReserveRequest {
+                task_id: negative_usd_task,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::UsdCents(500),
+                idempotency_key: "key-1",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap()
+        else {
+            panic!("expected Granted");
+        };
+        let result = store.settle(
+            usd_reservation.id,
+            Some(ResourceAmount::UsdCents(-50)),
+            now(),
+        );
+        assert!(matches!(result, Err(LedgerError::NegativeSettlement)));
+        // The row must remain untouched.
+        let reservation_after = store
+            .reservations_for_task(negative_usd_task)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == usd_reservation.id)
+            .unwrap();
+        assert_eq!(reservation_after.state, ReservationState::Active);
+        assert_budget_invariant(&store, task_id);
+        assert_budget_invariant(&store, negative_usd_task);
+
+        // avoid unused-variable warning for reservation2 without changing
+        // the assertions above
+        let _ = reservation2;
+    }
+
+    fn setup_usd(store: &mut LedgerStore, reserve_amount: i64) -> TaskId {
+        let task_id = TaskId::new();
+        let identity = libra_governor_domain::TaskIdentity {
+            id: task_id,
+            external_ref: None,
+        };
+        store.insert_task(&identity, now()).unwrap();
+        let policy = Policy::validated(
+            "test-usd",
+            libra_governor_domain::ResourceBound {
+                mode: libra_governor_domain::ConstraintMode::Hard,
+                target: ResourceAmount::UsdCents(1000),
+                elastic_ceiling: None,
+                hard_ceiling: ResourceAmount::UsdCents(1000),
+            },
+            libra_governor_domain::TimeBound {
+                mode: libra_governor_domain::ConstraintMode::Hard,
+                target_secs: 600,
+                elastic_ceiling_secs: None,
+                hard_ceiling_secs: Some(600),
+                deadline: None,
+            },
+            libra_governor_domain::CompletionContract::first(vec![
+                libra_governor_domain::CompletionCriterion::required("tests pass"),
+            ]),
+            libra_governor_domain::Confidence::Low,
+            libra_governor_domain::AutonomyBoundary::AskOnApproval,
+        )
+        .unwrap();
+        let reserve = CompletionReserveEstimate {
+            amount: ResourceAmount::UsdCents(reserve_amount),
+            basis: CompletionReserveBasis::PolicyTarget,
+            fraction: 0.2,
+            required_criteria_count: 1,
+        };
+        store
+            .initialize_task_budget(task_id, &policy, &reserve, now())
+            .unwrap();
+        task_id
+    }
+
+    #[test]
+    fn reserving_a_mismatched_resource_kind_is_rejected_and_writes_nothing() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200); // token-kind budget
+
+        let result = store.reserve(ReserveRequest {
+            task_id,
+            session_id: "sess-1",
+            plan_id: None,
+            class: ReservationClass::OptionalWork,
+            amount: ResourceAmount::UsdCents(100), // wrong kind
+            idempotency_key: "key-1",
+            now: now(),
+            ttl_secs: 900,
+        });
+        assert!(matches!(
+            result,
+            Err(LedgerError::ResourceKindMismatch { .. })
+        ));
+        assert_eq!(store.reservations_for_task(task_id).unwrap().len(), 0);
+        assert_budget_invariant(&store, task_id);
+    }
+
+    #[test]
+    fn a_forged_task_id_cannot_create_a_reservation_because_no_budget_exists() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let forged_task_id = TaskId::new(); // never inserted, never budgeted
+
+        let result = store
+            .reserve(ReserveRequest {
+                task_id: forged_task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(1),
+                idempotency_key: "key-1",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap();
+        assert!(matches!(result, ReserveOutcome::NoBudget));
+    }
+
+    // --- release / release_active_for_plan / reservation_evidence ----
+
+    #[test]
+    fn release_restores_the_full_drawn_reserve() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let ReserveOutcome::Granted(reservation) = store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::RequiredWork,
+                amount: ResourceAmount::Tokens(900),
+                idempotency_key: "key-1",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap()
+        else {
+            panic!("expected Granted");
+        };
+        assert_eq!(reservation.drawn_from_reserve, ResourceAmount::Tokens(100));
+
+        let outcome = store.release(reservation.id, now()).unwrap();
+        assert!(matches!(outcome, ReleaseOutcome::Released(_)));
+        let budget = store.task_budget(task_id).unwrap().unwrap();
+        assert_eq!(budget.completion_reserve, ResourceAmount::Tokens(200));
+        assert_budget_invariant(&store, task_id);
+
+        // Idempotent: releasing again is a safe no-op.
+        let again = store.release(reservation.id, now()).unwrap();
+        assert!(matches!(again, ReleaseOutcome::AlreadyFinal(_)));
+        assert_budget_invariant(&store, task_id);
+    }
+
+    #[test]
+    fn release_active_for_plan_releases_only_that_plans_active_reservations() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let contract = libra_governor_domain::CompletionContract::first(vec![
+            libra_governor_domain::CompletionCriterion::required("tests pass"),
+        ]);
+        store.insert_contract(task_id, &contract, now()).unwrap();
+        let plan_a_full =
+            libra_governor_domain::ExecutionPlan::new(task_id, contract.revision, None, now());
+        let plan_b_full =
+            libra_governor_domain::ExecutionPlan::new(task_id, contract.revision, None, now());
+        store.insert_plan(&plan_a_full).unwrap();
+        store.insert_plan(&plan_b_full).unwrap();
+        let plan_a = plan_a_full.id;
+        let plan_b = plan_b_full.id;
+
+        store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: Some(plan_a),
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(100),
+                idempotency_key: "a",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap();
+        store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: Some(plan_b),
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(200),
+                idempotency_key: "b",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap();
+
+        let released = store
+            .release_active_for_plan(task_id, plan_a, now())
+            .unwrap();
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].plan_id, Some(plan_a));
+
+        let active: Vec<_> = store
+            .reservations_for_task(task_id)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.state == ReservationState::Active)
+            .collect();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].plan_id, Some(plan_b));
+        assert_budget_invariant(&store, task_id);
+    }
+
+    #[test]
+    fn reservation_evidence_summarizes_reserved_settled_released_and_overrun() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+
+        let ReserveOutcome::Granted(r1) = store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(300),
+                idempotency_key: "a",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap()
+        else {
+            panic!("expected Granted");
+        };
+        store
+            .settle(r1.id, Some(ResourceAmount::Tokens(400)), now())
+            .unwrap(); // overrun of 100
+
+        let ReserveOutcome::Granted(r2) = store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(100),
+                idempotency_key: "b",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap()
+        else {
+            panic!("expected Granted");
+        };
+        store.release(r2.id, now()).unwrap();
+
+        let evidence = store.reservation_evidence(task_id).unwrap().unwrap();
+        assert_eq!(evidence.reserved_total, ResourceAmount::Tokens(400));
+        assert_eq!(evidence.settled_total, ResourceAmount::Tokens(400));
+        assert_eq!(evidence.released_total, ResourceAmount::Tokens(100));
+        assert_eq!(evidence.overrun_total, Some(ResourceAmount::Tokens(100)));
+        assert_eq!(evidence.reservation_count, 2);
+        assert_eq!(evidence.usage_known_count, 1);
+    }
+
+    #[test]
+    fn adjust_completion_reserve_lowering_is_always_permitted() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let outcome = store
+            .adjust_completion_reserve(
+                task_id,
+                ResourceAmount::Tokens(50),
+                CompletionReserveBasis::EstimateP80,
+                now(),
+            )
+            .unwrap();
+        assert!(matches!(outcome, AdjustOutcome::Adjusted { .. }));
+        let budget = store.task_budget(task_id).unwrap().unwrap();
+        assert_eq!(budget.completion_reserve, ResourceAmount::Tokens(50));
+        // Not `assert_budget_invariant` here: an explicit recomputation
+        // (replan-driven) legitimately changes `completion_reserve`
+        // independent of any reservation's draw/restore bookkeeping —
+        // the leak-detector invariant only holds absent such a
+        // recomputation, by design (see `adjust_completion_reserve` docs).
+    }
+
+    #[test]
+    fn adjust_completion_reserve_raising_is_bounded_by_optional_headroom() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        // Reserve all optional headroom (800), leaving none to raise into.
+        store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(800),
+                idempotency_key: "a",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap();
+
+        let outcome = store
+            .adjust_completion_reserve(
+                task_id,
+                ResourceAmount::Tokens(201),
+                CompletionReserveBasis::PolicyTarget,
+                now(),
+            )
+            .unwrap();
+        assert!(matches!(outcome, AdjustOutcome::Insufficient { .. }));
+        assert_budget_invariant(&store, task_id);
     }
 }
