@@ -913,4 +913,100 @@ mod tests {
             .expect("compatible kind");
         assert_eq!(decision.admission, Admission::Admit);
     }
+
+    fn elastic_resource_policy() -> Policy {
+        Policy::validated(
+            "test-elastic-resource",
+            ResourceBound {
+                mode: ConstraintMode::Elastic,
+                target: ResourceAmount::UsdCents(1000),
+                elastic_ceiling: Some(ResourceAmount::UsdCents(1500)),
+                hard_ceiling: ResourceAmount::UsdCents(2000),
+            },
+            TimeBound {
+                mode: ConstraintMode::Elastic,
+                target_secs: 600,
+                elastic_ceiling_secs: Some(900),
+                hard_ceiling_secs: Some(1200),
+                deadline: None,
+            },
+            quality_floor(),
+            Confidence::Medium,
+            AutonomyBoundary::AskOnApproval,
+        )
+        .expect("valid policy")
+    }
+
+    #[test]
+    fn elastic_mode_admits_within_target() {
+        let policy = elastic_resource_policy();
+        let decision = policy
+            .evaluate(ResourceAmount::UsdCents(1000), 600, Confidence::Medium)
+            .expect("compatible kind");
+        assert_eq!(decision.admission, Admission::Admit);
+    }
+
+    #[test]
+    fn elastic_mode_admits_exactly_at_the_elastic_ceiling() {
+        let policy = elastic_resource_policy();
+        let decision = policy
+            .evaluate(ResourceAmount::UsdCents(1500), 900, Confidence::Medium)
+            .expect("compatible kind");
+        assert_eq!(decision.admission, Admission::Admit);
+    }
+
+    #[test]
+    fn elastic_mode_requires_approval_between_elastic_and_hard_ceiling() {
+        let policy = elastic_resource_policy();
+        let decision = policy
+            .evaluate(ResourceAmount::UsdCents(1501), 901, Confidence::Medium)
+            .expect("compatible kind");
+        assert_eq!(
+            decision.resource_outcome,
+            ConstraintOutcome::ApprovalRequired(ApprovalRequest::Resource {
+                projected: ResourceAmount::UsdCents(1501),
+                target: ResourceAmount::UsdCents(1000),
+                elastic_ceiling: Some(ResourceAmount::UsdCents(1500)),
+                hard_ceiling: ResourceAmount::UsdCents(2000),
+            })
+        );
+        match &decision.admission {
+            Admission::ApprovalRequired(requests) => assert_eq!(requests.len(), 2),
+            other => panic!("expected ApprovalRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn elastic_mode_admits_exactly_at_the_hard_ceiling_as_approval_required() {
+        // At the hard ceiling itself: still ApprovalRequired, not Deny —
+        // Deny is reserved for strictly *past* the hard ceiling.
+        let policy = elastic_resource_policy();
+        let decision = policy
+            .evaluate(ResourceAmount::UsdCents(2000), 1200, Confidence::Medium)
+            .expect("compatible kind");
+        assert!(matches!(
+            decision.resource_outcome,
+            ConstraintOutcome::ApprovalRequired(_)
+        ));
+        assert!(matches!(
+            decision.time_outcome,
+            ConstraintOutcome::ApprovalRequired(_)
+        ));
+    }
+
+    #[test]
+    fn elastic_mode_denies_past_the_hard_ceiling() {
+        let policy = elastic_resource_policy();
+        let decision = policy
+            .evaluate(ResourceAmount::UsdCents(2001), 1201, Confidence::Medium)
+            .expect("compatible kind");
+        assert_eq!(
+            decision.resource_outcome,
+            ConstraintOutcome::Deny(DenyReason::ResourceExceedsHardCeiling {
+                projected: ResourceAmount::UsdCents(2001),
+                hard_ceiling: ResourceAmount::UsdCents(2000),
+            })
+        );
+        assert!(matches!(decision.admission, Admission::Deny(_)));
+    }
 }
