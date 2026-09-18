@@ -773,9 +773,24 @@ pub struct PolicyPresetInputs {
 
 impl Policy {
     /// Balanced pre-authorization: both cost and time get a moderate
-    /// elastic band (target..=1.25x, hard ceiling at 1.5x), medium
-    /// confidence required, ask before crossing into either band's
-    /// approval-required zone.
+    /// elastic band (target..=1.25x, hard ceiling at 1.5x), ask before
+    /// crossing into either band's approval-required zone.
+    ///
+    /// `min_confidence` is [`Confidence::Low`] — not [`Confidence::Medium`]
+    /// like [`Self::deadline_first`]/[`Self::strict_budget`] — deliberately
+    /// (HORO-1146 gate finding #1). `balanced` is the shipped *default*
+    /// policy every fresh install and every never-before-seen
+    /// repo/prompt combination is admitted under
+    /// (`crates/daemon::default_admission_policy`), and a cold-start
+    /// estimate is always [`Confidence::Low`] (no local receipt history
+    /// yet — see [`crate::confidence::Confidence::from_evidence`]).
+    /// Requiring `Medium` here meant every first-ever preflight denied
+    /// outright on the confidence floor alone, before any other
+    /// constraint was even considered — not a fabricated confidence
+    /// bump, just admitting that a resource/time band this elastic does
+    /// not need a `Medium`-confidence estimate to pre-authorize
+    /// spending into. A policy whose bands are tighter (`deadline_first`,
+    /// `strict_budget`) still requires real evidence before admitting.
     pub fn balanced(inputs: PolicyPresetInputs) -> Result<Self, PolicyValidationError> {
         Self::validated(
             "balanced",
@@ -793,7 +808,7 @@ impl Policy {
                 deadline: None,
             },
             inputs.quality_floor,
-            Confidence::Medium,
+            Confidence::Low,
             AutonomyBoundary::AskOnApproval,
         )
     }
@@ -1373,11 +1388,55 @@ mod tests {
                     deadline: None,
                 },
                 quality_floor: quality_floor(),
-                min_confidence: Confidence::Medium,
+                min_confidence: Confidence::Low,
                 autonomy: AutonomyBoundary::AskOnApproval,
             },
             "balanced must compile to exactly this concrete Policy value, no hidden logic"
         );
+    }
+
+    #[test]
+    fn balanced_admits_a_cold_start_low_confidence_estimate_on_confidence_alone() {
+        // HORO-1146 gate finding #1 regression: a brand-new install (or
+        // any never-before-seen repo/prompt combination) always produces
+        // a cold-start `Confidence::Low` estimate. Under the real,
+        // shipped `balanced` preset, that must not deny admission solely
+        // because of the confidence floor — it may still legitimately
+        // deny for a real reason (e.g. the projection exceeds the hard
+        // ceiling), just never for confidence alone.
+        let policy = Policy::balanced(preset_inputs()).expect("valid policy");
+        let inputs = preset_inputs();
+
+        let decision = policy
+            .evaluate(inputs.resource_target, inputs.time_target_secs, Confidence::Low)
+            .expect("compatible kind");
+
+        assert!(
+            decision.confidence_ok,
+            "cold-start Low confidence must satisfy balanced's confidence floor"
+        );
+        assert_eq!(
+            decision.admission,
+            Admission::Admit,
+            "an on-target, cold-start-confidence projection must cleanly admit under balanced"
+        );
+
+        // A genuinely over-budget cold-start projection must still deny
+        // — just for the real resource reason, never
+        // `ConfidenceBelowThreshold`.
+        let over_hard_ceiling = policy.resource.hard_ceiling.scaled(2.0);
+        let denied = policy
+            .evaluate(over_hard_ceiling, inputs.time_target_secs, Confidence::Low)
+            .expect("compatible kind");
+        match denied.admission {
+            Admission::Deny(reasons) => assert!(
+                reasons
+                    .iter()
+                    .all(|r| !matches!(r, DenyReason::ConfidenceBelowThreshold { .. })),
+                "a real budget-exhaustion deny must not also cite confidence: {reasons:?}"
+            ),
+            other => panic!("expected Deny for a projection past the hard ceiling, got {other:?}"),
+        }
     }
 
     #[test]
