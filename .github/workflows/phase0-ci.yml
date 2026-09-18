@@ -1,14 +1,23 @@
 name: Phase 0 estimator harness CI
 
+# The path filter is a deliberate cost control: this harness is only relevant to
+# experiments/phase0. The workflow's own path is listed as well, because this
+# workflow is the only check on its own correctness - without it, a YAML syntax
+# error (which GitHub rejects at parse time as a 0-job, 0-second run), a broken
+# install step, or a regression to the permissions block below all merge green.
+# Deliberately not widened any further, so an unrelated change still does not
+# start this job.
 on:
   push:
     branches: [main]
     paths:
       - "experiments/phase0/**"
+      - ".github/workflows/phase0-ci.yml"
   pull_request:
     branches: [main]
     paths:
       - "experiments/phase0/**"
+      - ".github/workflows/phase0-ci.yml"
 
 defaults:
   run:
@@ -26,10 +35,12 @@ jobs:
     name: ruff + pytest (fixture only, no network)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      # Pinned to commit SHAs rather than the @v7 major tags; see the note in
+      # ci.yml. Dependabot keeps these current.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
 
       - name: Sync dependencies
         run: uv sync --group dev
