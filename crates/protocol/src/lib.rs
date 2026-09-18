@@ -21,7 +21,7 @@
 mod messages;
 pub mod wire;
 
-pub use libra_governor_domain::{Confidence, Estimate};
+pub use libra_governor_domain::{Confidence, Estimate, PolicyDecision, ResourceAmount};
 pub use libra_governor_estimator::{
     AdmissionOutcome, AdmissionPolicy, AdmissionStats, CoverageReport, QuantileCoverage, Stratum,
 };
@@ -52,4 +52,11 @@ pub use messages::{
 /// a v3 client would silently fail to deserialize these new required
 /// fields. Same known limitation as the earlier bumps: a long-lived v3
 /// daemon must be restarted after upgrading.
-pub const PROTOCOL_VERSION: u32 = 4;
+///
+/// Bumped 4 -> 5 for HORO-1141: `PreflightResult` gained
+/// `admission`/`completion_reserve` and `ExecutionReceipt` (embedded in
+/// `FinalizeResult` -> `Response::Finalize`) gained `reservations` — a
+/// v4 client would silently fail to deserialize these new required
+/// fields. Same known limitation as the earlier bumps: a long-lived v4
+/// daemon must be restarted after upgrading.
+pub const PROTOCOL_VERSION: u32 = 5;
