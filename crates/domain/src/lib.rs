@@ -26,6 +26,7 @@
 //! type in this crate attaches to. See
 //! `docs/adr/0002-task-not-session-as-economic-unit.md` for why.
 
+mod capability;
 mod completion_contract;
 mod confidence;
 mod estimate;
@@ -40,6 +41,10 @@ mod resource_amount;
 mod task_features;
 mod task_identity;
 
+pub use capability::{
+    CredentialCustody, EnforcementCapabilities, EnforcementTier, MonetaryEnforcement,
+    NoMonetaryCap, UsageAccounting, CAPABILITY_SCHEMA_VERSION,
+};
 pub use completion_contract::{CompletionContract, CompletionCriterion};
 pub use confidence::{Confidence, MIN_CLASS_SAMPLES};
 pub use estimate::{Estimate, ESTIMATOR_VERSION};
