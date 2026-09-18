@@ -22,6 +22,11 @@ use libra_governor_gateway::credential::CredentialCommand;
 
 const SESSION: &str = "x-claude-code-session-id";
 
+/// A predicate over the refusal a bad upstream must produce. Named
+/// rather than written inline so the case table below stays a readable
+/// list of (upstream, expected refusal) pairs.
+type RefusalCheck = fn(&ConfigError) -> bool;
+
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -45,7 +50,7 @@ fn config_for(upstream: &str) -> GatewayConfig {
 fn a_gateway_whose_upstream_is_not_configuration_never_starts() {
     // Each of these is a shape that would let something other than the
     // operator choose the destination.
-    let cases: Vec<(&str, fn(&ConfigError) -> bool)> = vec![
+    let cases: Vec<(&str, RefusalCheck)> = vec![
         ("http://api.anthropic.com", |e| {
             matches!(e, ConfigError::UpstreamSchemeNotHttps { .. })
         }),
