@@ -19,6 +19,7 @@
 
 mod bucket_prose;
 mod calibration_cmd;
+mod claude_settings;
 mod client;
 mod daemon_cmd;
 mod gateway_cmd;
