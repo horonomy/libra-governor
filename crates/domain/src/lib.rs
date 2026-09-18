@@ -34,6 +34,7 @@ mod execution_outcome;
 mod execution_plan;
 mod execution_receipt;
 mod policy;
+mod replan;
 mod resource_amount;
 mod task_features;
 mod task_identity;
@@ -49,6 +50,14 @@ pub use policy::{
     Admission, ApprovalRequest, AutonomyBoundary, ConstraintMode, ConstraintOutcome, DenyReason,
     Policy, PolicyDecision, PolicyEvaluationError, PolicyPresetInputs, PolicyValidationError,
     ResourceBound, TimeBound, POLICY_SCHEMA_VERSION,
+};
+pub use replan::{
+    evaluate_hysteresis, evaluate_replan_cost_against_policy, possible_tool_loop, should_replan,
+    tool_call_count_is_material, HysteresisOutcome, RemainingEstimate, ReplanAssumptions,
+    ReplanCostBenefit, ReplanDecisionError, ReplanHysteresisConfig, ReplanHysteresisState,
+    ReplanId, ReplanReason, ReplanRecord, ReplanTier, ReplanTriggerKind,
+    ABSOLUTE_TOOL_CALL_COUNT_FALLBACK, DEFAULT_LOOP_STREAK_THRESHOLD,
+    DETERMINISTIC_WIDENING_FACTOR, REPLAN_SCHEMA_VERSION, TOOL_CALL_COUNT_MATERIAL_MULTIPLIER,
 };
 pub use resource_amount::{ResourceAmount, ResourceKind};
 pub use task_features::{BucketTier, BuildTopology, TaskFeatures, FEATURE_SCHEMA_VERSION};

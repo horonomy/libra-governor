@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::{estimate::Estimate, task_features::TaskFeatures, task_identity::TaskId};
+use crate::{
+    estimate::Estimate, replan::ReplanReason, task_features::TaskFeatures, task_identity::TaskId,
+};
 
 /// Identifier for one [`ExecutionPlan`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -62,6 +64,13 @@ pub struct ExecutionPlan {
     /// copy it onto the finalized [`crate::ExecutionReceipt`] without
     /// re-deriving it.
     pub task_features: Option<TaskFeatures>,
+    /// The prior [`PlanId`] this plan replaces, if this plan was
+    /// produced by a replan (HORO-1139) rather than an original
+    /// preflight. `None` for an original preflight plan.
+    pub replaces: Option<PlanId>,
+    /// The structured reason a replan produced this plan, if any. Always
+    /// `Some` iff `replaces` is `Some` — see [`Self::with_replan_linkage`].
+    pub replan_reason: Option<ReplanReason>,
 }
 
 impl ExecutionPlan {
@@ -79,6 +88,8 @@ impl ExecutionPlan {
             created_at,
             estimate: None,
             task_features: None,
+            replaces: None,
+            replan_reason: None,
         }
     }
 
@@ -93,6 +104,19 @@ impl ExecutionPlan {
     /// against, returning `self` for chaining at the construction site.
     pub fn with_task_features(mut self, task_features: Option<TaskFeatures>) -> Self {
         self.task_features = task_features;
+        self
+    }
+
+    /// Marks this plan as a replan of `prior_plan_id` for `reason`
+    /// (HORO-1139) — the linkage a replanned plan MUST carry: which plan
+    /// it replaces and why. Never touches `contract_revision` or any
+    /// other field of `self` — a replan cannot alter the Completion
+    /// Contract this plan assumes, only the estimate/scheduling it
+    /// carries (see `crate::replan` module docs and the
+    /// `required_criteria_*` tests there).
+    pub fn with_replan_linkage(mut self, prior_plan_id: PlanId, reason: ReplanReason) -> Self {
+        self.replaces = Some(prior_plan_id);
+        self.replan_reason = Some(reason);
         self
     }
 }
@@ -112,5 +136,37 @@ mod tests {
         );
         assert_eq!(plan.task_id, task_id);
         assert_eq!(plan.contract_revision, 2);
+    }
+
+    #[test]
+    fn a_fresh_plan_carries_no_replan_linkage() {
+        let plan = ExecutionPlan::new(TaskId::new(), 1, None, OffsetDateTime::UNIX_EPOCH);
+        assert_eq!(plan.replaces, None);
+        assert_eq!(plan.replan_reason, None);
+    }
+
+    #[test]
+    fn with_replan_linkage_records_the_prior_plan_and_reason_without_touching_contract_revision() {
+        use crate::replan::ReplanTriggerKind;
+
+        let prior = ExecutionPlan::new(TaskId::new(), 3, None, OffsetDateTime::UNIX_EPOCH);
+        let reason = ReplanReason::new(
+            ReplanTriggerKind::ToolCallCountExceeded,
+            "n=13 vs typical 5",
+        );
+        let replanned = ExecutionPlan::new(
+            prior.task_id,
+            prior.contract_revision,
+            None,
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .with_replan_linkage(prior.id, reason.clone());
+
+        assert_eq!(replanned.replaces, Some(prior.id));
+        assert_eq!(replanned.replan_reason, Some(reason));
+        assert_eq!(
+            replanned.contract_revision, prior.contract_revision,
+            "a replan must never alter the contract revision it assumes"
+        );
     }
 }
