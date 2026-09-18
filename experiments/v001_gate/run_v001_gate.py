@@ -50,6 +50,12 @@ SOCKET_FILENAME = "daemon.sock"
 LEDGER_FILENAME = "ledger.sqlite3"
 LOG_FILENAME = "daemon.log"
 
+# SonarCloud python:S1192 (duplicated literal) -- these path fragments
+# are reused across every fake-profile scenario below.
+CLAUDE_DIR_NAME = ".claude"
+SETTINGS_FILENAME = "settings.json"
+LOCAL_STATE_DIRNAME = ".local"
+
 
 def w(name: str, text: str) -> None:
     """Write a results file (overwrite) and echo a short marker to stdout."""
@@ -246,8 +252,8 @@ def main():
     # its settings.json is no longer absent -- record where things stand
     # after item 1 for reference, and use a *separate* fresh profile for
     # the explicit "absent settings.json" case in item 3a below.
-    settings_dir = fake_home / ".claude"
-    settings_path = settings_dir / "settings.json"
+    settings_dir = fake_home / CLAUDE_DIR_NAME
+    settings_path = settings_dir / SETTINGS_FILENAME
 
     # ---------- Item 3: Claude Code integration bootstrap ----------
     # 3a: absent settings.json -- a fresh profile, binary copied in
@@ -255,7 +261,7 @@ def main():
     absent_profile = new_profile("absent-settings", work_root)
     absent_home = absent_profile["fake_home"]
     absent_env = absent_profile["env"]
-    absent_settings_path = absent_home / ".claude" / "settings.json"
+    absent_settings_path = absent_home / CLAUDE_DIR_NAME / SETTINGS_FILENAME
     absent_binpath = absent_profile["cargo_home"] / "bin" / "libra-governor"
     absent_binpath.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(binary, absent_binpath)
@@ -274,9 +280,9 @@ def main():
     foreign_profile = new_profile("foreign", work_root)
     foreign_home = foreign_profile["fake_home"]
     foreign_env = foreign_profile["env"]
-    foreign_settings_dir = foreign_home / ".claude"
+    foreign_settings_dir = foreign_home / CLAUDE_DIR_NAME
     foreign_settings_dir.mkdir(parents=True, exist_ok=True)
-    foreign_settings_path = foreign_settings_dir / "settings.json"
+    foreign_settings_path = foreign_settings_dir / SETTINGS_FILENAME
     foreign_seed = {
         "hooks": {
             "PreToolUse": [{"type": "command", "command": "/usr/local/bin/some-other-tool hook pre"}],
@@ -330,7 +336,7 @@ def main():
            f"install exit={install_foreign_proc.returncode}, foreign preserved={foreign_preserved_after_install}")
 
     # ---------- Item 4: first bounded preflight ----------
-    state_dir = fake_home / ".local" / "state" / "libra-governor"
+    state_dir = fake_home / LOCAL_STATE_DIRNAME / "state" / "libra-governor"
     sid = f"gate-{uuid.uuid4()}"
     pf = preflight(binary, env, sid, FIXTURES / "rust-crate")
     w("04_first_bounded_preflight.txt",
@@ -351,7 +357,7 @@ def main():
     stop_proc = stop(binary, env, sid2)
     receipts_after = receipt_count(state_dir / LEDGER_FILENAME)
     lines = [
-        f"$ libra-governor hook user-prompt-submit -> post-tool-use x3 -> hook stop",
+        "$ libra-governor hook user-prompt-submit -> post-tool-use x3 -> hook stop",
         f"session_id: {sid2}",
         f"preflight exit={pf2.returncode}\n--- preflight stdout ---\n{pf2.stdout}\n",
     ]
@@ -425,7 +431,7 @@ def main():
             upgrade_lines.append(f"old-binary `doctor` (before upgrade):\n{old_doctor.stdout}\n")
 
             sid4 = f"upgrade-old-{uuid.uuid4()}"
-            up_state_dir = up_home / ".local" / "state" / "libra-governor"
+            up_state_dir = up_home / LOCAL_STATE_DIRNAME / "state" / "libra-governor"
             pf4 = preflight(up_binpath, up_env, sid4, FIXTURES / "rust-crate")
             stop4 = stop(up_binpath, up_env, sid4)
             receipts_old = receipt_count(up_state_dir / LEDGER_FILENAME)
@@ -471,9 +477,9 @@ def main():
     cycle_profile = new_profile("cycle", work_root)
     cyc_home = cycle_profile["fake_home"]
     cyc_env = cycle_profile["env"]
-    cyc_settings_dir = cyc_home / ".claude"
+    cyc_settings_dir = cyc_home / CLAUDE_DIR_NAME
     cyc_settings_dir.mkdir(parents=True, exist_ok=True)
-    cyc_settings_path = cyc_settings_dir / "settings.json"
+    cyc_settings_path = cyc_settings_dir / SETTINGS_FILENAME
     cyc_seed = dict(foreign_seed)  # same realistic foreign content
     cyc_settings_path.write_text(json.dumps(cyc_seed, indent=2))
     cyc_pristine_sha = sha(cyc_settings_path)
@@ -506,7 +512,7 @@ def main():
     byte_identical_after_uninstall = (cyc_settings_path.exists() and sha(cyc_settings_path) == cyc_pristine_sha)
     foreign_subtree_identical_after_uninstall = (foreign_after_uninstall == foreign_pristine)
 
-    backups = sorted(p.name for p in cyc_settings_dir.glob("settings.json.libra-backup-*"))
+    backups = sorted(p.name for p in cyc_settings_dir.glob(f"{SETTINGS_FILENAME}.libra-backup-*"))
 
     item9_text = (
         f"Seeded settings.json (pristine), sha256={cyc_pristine_sha}:\n{json.dumps(cyc_seed, indent=2)}\n\n"
@@ -549,7 +555,7 @@ def main():
         tier_profile = new_profile(f"tier-{mode_name}", work_root)
         t_home = tier_profile["fake_home"]
         t_env = tier_profile["env"]
-        t_state_dir = t_home / ".local" / "state" / "libra-governor"
+        t_state_dir = t_home / LOCAL_STATE_DIRNAME / "state" / "libra-governor"
         t_state_dir.mkdir(parents=True, exist_ok=True)
         cfg = {"gateway": gateway_cfg}
         (t_state_dir / "config.json").write_text(json.dumps(cfg, indent=2))
