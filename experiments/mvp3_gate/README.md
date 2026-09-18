@@ -253,18 +253,27 @@ its regression test, rather than deleted.
    carries a prior Deny forward so a chained replan also sees it.
    `handle_tool_invoked` (`crates/daemon/src/server.rs`) now checks the
    plan being replaced and skips the `ReservationClass::RequiredWork`
-   reservation (logging why) when it was Denied — the Completion Reserve
-   adjustment still runs, since it protects required completion work
-   regardless of admission outcome. Note finding #1's fix changes this
-   scenario's natural reproduction path: a cold-start preflight under
-   `balanced` now Admits, so the regression test for this finding uses
-   `Policy::strict_budget` (a real, deliberate Deny, not a
-   confidence-floor artifact) rather than relying on finding #1's
-   now-fixed cold-start Deny. Regression test:
+   reservation (logging why) when it was **Denied or left
+   ApprovalRequired** — the Completion Reserve adjustment still runs,
+   since it protects required completion work regardless of admission
+   outcome. An advisor review pass after the initial fix caught that the
+   first version's guard matched only `Admission::Deny(_)`, silently
+   missing `Admission::ApprovalRequired(_)` — the same defect with a
+   different discriminant, since `handle_preflight` already treats both
+   outcomes identically (neither writes a reservation). The guard was
+   widened accordingly. Note finding #1's fix changes this scenario's
+   natural reproduction path: a cold-start preflight under `balanced` now
+   Admits, so the regression tests for this finding use
+   `Policy::strict_budget` (Deny case, a real deliberate Deny, not a
+   confidence-floor artifact) and a dedicated `Approval`-mode policy
+   (ApprovalRequired case) rather than relying on finding #1's now-fixed
+   cold-start Deny. Regression tests:
    `a_material_event_replan_does_not_reserve_capacity_for_a_task_denied_at_admission`
-   (`crates/daemon/tests/reservation_integration.rs`) — verified to fail
-   on pre-fix code for the right reason (a real `RequiredWork` reservation
-   was found). Evidence at
+   and
+   `a_material_event_replan_does_not_reserve_capacity_for_a_task_left_approval_required`
+   (`crates/daemon/tests/reservation_integration.rs`) — both independently
+   verified to fail on pre-fix code for the right reason (a real, `Active`
+   `RequiredWork` reservation was found in each case). Evidence at
    `results/defect2_replan_does_not_reserve_for_denied_task.txt`.
 3. **No CLI/config surface for policy selection or the gateway** (see
    "Load-bearing methodology note" above) — the shipped binary can only
@@ -293,6 +302,11 @@ its regression test, rather than deleted.
    **not** retroactively convert scenarios 2/3/4/6/7/8/9(rust-half)/10/11/12
    to CLI-E2E evidence — `run_gate_matrix.py` itself was not rewritten to
    drive `config.json` — see the "Load-bearing methodology note" above.
+   The file format is documented for real users in
+   `integrations/claude-code/README.md`'s "Configuring the daemon
+   (`config.json`)" section (per-field tables for both `[policy]` and
+   `[gateway]`, a worked example, and how to verify via `gateway status`)
+   — not just in this evidence trail or the module's own doc comment.
 4. **Security review finding: state dir/socket/ledger created at
    umask-derived (not explicitly hardened) permissions** — see
    `results/security_review.md` item 5. Not originally numbered among the

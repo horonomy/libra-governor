@@ -1,21 +1,112 @@
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
-     Running unittests src/main.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/libra_governor-90c0431fbca7ae95)
+   Compiling libc v0.2.189
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.26
+   Compiling quote v1.0.47
+   Compiling cfg-if v1.0.5
+   Compiling find-msvc-tools v0.1.12
+   Compiling shlex v2.0.1
+   Compiling once_cell v1.21.4
+   Compiling serde_core v1.0.229
+   Compiling itoa v1.0.18
+   Compiling getrandom v0.4.3
+   Compiling version_check v0.9.5
+   Compiling serde v1.0.229
+   Compiling thiserror v2.0.20
+   Compiling zmij v1.0.23
+   Compiling num-conv v0.2.2
+   Compiling smallvec v1.16.1
+   Compiling powerfmt v0.2.0
+   Compiling serde_json v1.0.151
+   Compiling time-core v0.1.9
+   Compiling memchr v2.8.3
+   Compiling bitflags v2.13.2
+   Compiling cc v1.4.6
+   Compiling zerocopy v0.8.57
+   Compiling ahash v0.8.12
+   Compiling pkg-config v0.3.34
+   Compiling pin-project-lite v0.2.17
+   Compiling vcpkg v0.2.15
+   Compiling bytes v1.12.1
+   Compiling zeroize v1.9.0
+   Compiling futures-core v0.3.34
+   Compiling rustls-pki-types v1.15.1
+   Compiling http v1.5.0
+   Compiling fallible-iterator v0.3.0
+   Compiling untrusted v0.9.0
+   Compiling httparse v1.10.1
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling rustix v1.1.5
+   Compiling rustls v0.23.45
+   Compiling try-lock v0.2.5
+   Compiling futures-channel v0.3.34
+   Compiling want v0.3.1
+   Compiling tracing-core v0.1.36
+   Compiling subtle v2.6.1
+   Compiling atomic-waker v1.1.2
+   Compiling http-body v1.1.0
+   Compiling futures-task v0.3.34
+   Compiling httpdate v1.0.3
+   Compiling libsqlite3-sys v0.30.1
+   Compiling ring v0.17.14
+   Compiling tracing v0.1.44
+   Compiling futures-util v0.3.34
+   Compiling tower-service v0.3.3
+   Compiling fastrand v2.5.0
+   Compiling webpki-roots v1.0.9
+   Compiling generic-array v0.14.7
+   Compiling typenum v1.20.1
+   Compiling syn v3.0.6
+   Compiling deranged v0.5.8
+   Compiling socket2 v0.6.5
+   Compiling mio v1.2.3
+   Compiling getrandom v0.2.17
+   Compiling errno v0.3.14
+   Compiling uuid v1.26.1
+   Compiling cpufeatures v0.2.17
+   Compiling time v0.3.55
+   Compiling thiserror-impl v2.0.20
+   Compiling serde_derive v1.0.229
+   Compiling tokio-macros v2.7.2
+   Compiling tokio v1.53.1
+   Compiling tempfile v3.27.0
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling hashbrown v0.14.5
+   Compiling digest v0.10.7
+   Compiling sha2 v0.10.9
+   Compiling hashlink v0.9.1
+   Compiling libra-governor-domain v0.0.0 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-mvp-3.0-HORO-1146-release_gate/crates/domain)
+   Compiling rusqlite v0.32.1
+   Compiling rustls-webpki v0.103.15
+   Compiling hyper v1.11.1
+   Compiling http-body-util v0.1.5
+   Compiling libra-governor-ledger v0.0.0 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-mvp-3.0-HORO-1146-release_gate/crates/ledger)
+   Compiling hyper-util v0.1.20
+   Compiling libra-governor-estimator v0.0.0 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-mvp-3.0-HORO-1146-release_gate/crates/estimator)
+   Compiling libra-governor-protocol v0.0.0 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-mvp-3.0-HORO-1146-release_gate/crates/protocol)
+   Compiling tokio-rustls v0.26.5
+   Compiling hyper-rustls v0.27.9
+   Compiling libra-governor-gateway v0.0.0 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-mvp-3.0-HORO-1146-release_gate/crates/gateway)
+   Compiling libra-governor-daemon v0.0.0 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-mvp-3.0-HORO-1146-release_gate/crates/daemon)
+   Compiling libra-governor-cli v0.0.0 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-mvp-3.0-HORO-1146-release_gate/crates/cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.68s
+     Running unittests src/main.rs (/tmp/libra-horo1146-target-fix-94311/debug/deps/libra_governor-90c0431fbca7ae95)
 
 running 28 tests
-test bucket_prose::tests::cold_start_has_no_sample_count_in_its_prose ... ok
 test bucket_prose::tests::every_non_cold_start_tier_reports_its_sample_count ... ok
-test calibration_cmd::tests::render_report_insufficient_coverage_is_honest_not_a_fabricated_number ... ok
-test calibration_cmd::tests::render_report_computed_coverage_includes_dropped_rows_note ... ok
-test gateway_cmd::tests::a_conservative_settlement_count_is_explained_rather_than_shown_bare ... ok
-test gateway_cmd::tests::a_bound_violation_is_surfaced_as_a_warning ... ok
-test gateway_cmd::tests::a_hooks_only_deployment_says_there_is_no_pre_spend_refusal ... ok
-test gateway_cmd::tests::a_metered_gateway_reports_an_enforced_monetary_cap_and_its_pricing_version ... ok
+test hook::tests::hook_payload_ignores_unknown_fields ... ok
 test gateway_cmd::tests::a_subscription_gateway_says_plainly_that_no_monetary_cap_is_enforced ... ok
 test gateway_cmd::tests::every_refusal_category_is_reported_separately ... ok
-test hook::tests::hook_payload_ignores_unknown_fields ... ok
+test bucket_prose::tests::cold_start_has_no_sample_count_in_its_prose ... ok
 test hook::tests::malformed_hook_payload_fails_to_deserialize ... ok
-test hook::tests::print_context_never_panics_and_produces_valid_json ... ok
+test gateway_cmd::tests::a_hooks_only_deployment_says_there_is_no_pre_spend_refusal ... ok
+test gateway_cmd::tests::a_metered_gateway_reports_an_enforced_monetary_cap_and_its_pricing_version ... ok
+test calibration_cmd::tests::render_report_computed_coverage_includes_dropped_rows_note ... ok
 test hook_post_tool_use::tests::hook_payload_ignores_unknown_fields ... ok
+test calibration_cmd::tests::render_report_insufficient_coverage_is_honest_not_a_fabricated_number ... ok
+test hook::tests::print_context_never_panics_and_produces_valid_json ... ok
+test gateway_cmd::tests::a_bound_violation_is_surfaced_as_a_warning ... ok
+test gateway_cmd::tests::a_conservative_settlement_count_is_explained_rather_than_shown_bare ... ok
 test hook::tests::format_additional_context_includes_confidence_and_criteria ... ok
 test hook_post_tool_use::tests::malformed_hook_payload_fails_to_deserialize ... ok
 test hook_stop::tests::format_receipt_summary_cold_start_is_structurally_distinct ... ok
@@ -33,65 +124,65 @@ test client::tests::connect_only_fails_fast_when_nothing_is_listening ... ok
 
 test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running tests/hook_cli_integration.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/hook_cli_integration-02df8607260e660d)
+     Running tests/hook_cli_integration.rs (/tmp/libra-horo1146-target-fix-94311/debug/deps/hook_cli_integration-02df8607260e660d)
 
 running 9 tests
 test statusline_never_spawns_and_reports_placeholder_when_daemon_is_down ... ok
 test post_tool_use_never_spawns_a_daemon_and_stays_fast_when_daemon_is_down ... ok
-test hook_handles_malformed_stdin_payload_gracefully ... ok
 test stop_with_no_active_task_is_a_safe_no_op ... ok
-test daemon_loads_a_non_default_policy_and_gateway_from_config_json ... ok
+test hook_handles_malformed_stdin_payload_gracefully ... ok
 test hook_spawns_daemon_and_returns_a_preflight_summary ... ok
+test daemon_loads_a_non_default_policy_and_gateway_from_config_json ... ok
 test full_loop_preflight_tool_calls_stop_produces_a_receipt ... ok
 test receipt_survives_daemon_restart_and_is_queryable ... ok
 test hook_degrades_gracefully_when_the_daemon_cannot_start ... ok
 
-test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.68s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.04s
 
-     Running unittests src/lib.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/libra_governor_daemon-d491fe337eb42526)
+     Running unittests src/lib.rs (/tmp/libra-horo1146-target-fix-94311/debug/deps/libra_governor_daemon-d491fe337eb42526)
 
 running 37 tests
-test contract::tests::draft_always_includes_baseline_criterion ... ok
-test contract::tests::draft_adds_required_test_criterion_when_tests_detected ... ok
-test contract::tests::draft_adds_optional_scope_criterion_when_paths_matched ... ok
 test contract::tests::draft_contract_starts_at_revision_one_with_no_prior ... ok
+test contract::tests::draft_always_includes_baseline_criterion ... ok
 test contract::tests::draft_contract_increments_revision_from_prior ... ok
-test config_file::tests::an_unknown_preset_name_is_rejected ... ok
-test features::tests::repo_key_never_contains_the_raw_path ... ok
+test contract::tests::draft_adds_optional_scope_criterion_when_paths_matched ... ok
+test contract::tests::draft_adds_required_test_criterion_when_tests_detected ... ok
+test config_file::tests::a_bare_preset_name_selects_the_named_policy_with_sensible_defaults ... ok
+test config_file::tests::governor_held_without_a_credential_command_is_rejected ... ok
+test features::tests::derive_task_features_has_no_traceback_or_code_blocks_for_a_plain_prompt ... ok
 test config_file::tests::absent_config_file_produces_no_overrides ... ok
 test features::tests::repo_key_is_stable_for_the_same_canonicalized_path ... ok
-test config_file::tests::a_bare_preset_name_selects_the_named_policy_with_sensible_defaults ... ok
-test log::tests::append_line_never_panics_on_unwritable_path ... ok
-test features::tests::repo_key_differs_for_different_paths ... ok
-test log::tests::append_line_creates_file_and_writes_content ... ok
-test features::tests::derive_task_features_has_no_traceback_or_code_blocks_for_a_plain_prompt ... ok
-test config_file::tests::governor_held_without_a_credential_command_is_rejected ... ok
-test recon::tests::build_topology_detects_cargo_project ... ok
-test recon::tests::recon_reports_low_confidence_for_nonexistent_root ... ok
+test config_file::tests::an_unknown_preset_name_is_rejected ... ok
+test config_file::tests::malformed_json_is_reported_as_a_parse_error ... ok
 test config_file::tests::a_full_gateway_table_produces_a_governor_held_config ... ok
+test log::tests::append_line_never_panics_on_unwritable_path ... ok
+test features::tests::derive_task_features_counts_code_blocks_and_traceback ... ok
+test recon::tests::recon_reports_low_confidence_for_nonexistent_root ... ok
+test log::tests::append_line_creates_file_and_writes_content ... ok
+test features::tests::repo_key_never_contains_the_raw_path ... ok
+test paths::tests::ensure_state_dir_creates_directory ... ok
+test paths::tests::socket_and_ledger_paths_share_the_state_dir ... ok
+test paths::tests::state_dir_honors_explicit_override ... ok
+test recon::tests::build_topology_detects_cargo_project ... ok
 test recon::tests::build_topology_is_mixed_with_more_than_one_marker ... ok
 test recon::tests::build_topology_is_unknown_with_no_marker_files ... ok
-test recon::tests::recon_never_writes_to_the_filesystem ... ok
-test paths::tests::ensure_state_dir_creates_directory ... ok
-test server::tests::bind_or_detect_running_detects_live_daemon ... ok
-test recon::tests::recon_detects_cargo_project_and_matches_prompt_path ... ok
-test features::tests::derive_task_features_counts_code_blocks_and_traceback ... ok
-test paths::tests::socket_and_ledger_paths_share_the_state_dir ... ok
 test recon::tests::recon_reports_low_confidence_with_reason_for_empty_repo ... ok
-test paths::tests::state_dir_honors_explicit_override ... ok
-test config_file::tests::malformed_json_is_reported_as_a_parse_error ... ok
-test server::tests::bind_or_detect_running_recovers_stale_socket_file ... ok
+test features::tests::repo_key_differs_for_different_paths ... ok
+test server::tests::bind_or_detect_running_detects_live_daemon ... ok
 test server::tests::bind_or_detect_running_succeeds_on_fresh_path ... ok
+test recon::tests::recon_never_writes_to_the_filesystem ... ok
+test server::tests::bind_or_detect_running_recovers_stale_socket_file ... ok
+test recon::tests::recon_detects_cargo_project_and_matches_prompt_path ... ok
 test recon::tests::recon_ignores_denylisted_directories ... ok
 test recon::tests::recon_stops_at_a_small_file_count_cap ... ok
 test server::tests::finalize_with_no_active_task_is_a_safe_no_op ... ok
-test recon::tests::recon_stops_at_a_near_zero_time_budget ... ok
 test server::tests::tool_invoked_dispatch_increments_the_session_counter ... ok
+test recon::tests::recon_stops_at_a_near_zero_time_budget ... ok
 test server::tests::finalize_after_a_real_preflight_persists_a_receipt ... ok
 
-test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
 
-     Running tests/daemon_unreachable.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/daemon_unreachable-a13463d127bf24df)
+     Running tests/daemon_unreachable.rs (/tmp/libra-horo1146-target-fix-94311/debug/deps/daemon_unreachable-a13463d127bf24df)
 
 running 2 tests
 test connecting_to_a_socket_path_with_nothing_listening_fails_fast ... ok
@@ -99,31 +190,31 @@ test connecting_to_a_stale_socket_file_with_no_listener_fails_fast ... ok
 
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running tests/gateway_enforcement.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/gateway_enforcement-8799afa54e798f18)
+     Running tests/gateway_enforcement.rs (/tmp/libra-horo1146-target-fix-94311/debug/deps/gateway_enforcement-8799afa54e798f18)
 
 running 9 tests
 test a_request_beyond_the_hard_budget_is_refused_by_the_real_ledger ... ok
-test settling_the_same_reservation_twice_does_not_double_charge ... ok
-test a_gateway_reservation_is_optional_work_with_no_plan_id ... ok
+test a_replan_never_releases_an_in_flight_gateway_reservation ... ok
 test a_gateway_request_row_is_written_and_carries_no_body_or_credential ... ok
 test settling_without_a_usage_figure_charges_the_full_reserved_amount ... ok
-test a_replan_never_releases_an_in_flight_gateway_reservation ... ok
+test a_gateway_reservation_is_optional_work_with_no_plan_id ... ok
+test settling_the_same_reservation_twice_does_not_double_charge ... ok
 test settlement_refunds_the_unspent_remainder_of_a_gateway_reservation ... ok
 test the_completion_reserve_is_never_drawn_by_gateway_traffic ... ok
 test enabling_the_gateway_suppresses_the_plan_level_work_envelope ... ok
 
 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
 
-     Running tests/mvp3_gate_evidence.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/mvp3_gate_evidence-621b125db5e54908)
+     Running tests/mvp3_gate_evidence.rs (/tmp/libra-horo1146-target-fix-94311/debug/deps/mvp3_gate_evidence-621b125db5e54908)
 
 running 3 tests
 test concurrent_subagents_near_a_tight_hard_ceiling_through_the_real_ledger_spend_authority ... ok
-test security_evidence_credential_and_prompt_content_never_touch_persisted_state ... ok
 test deadline_first_confidence_floor_denies_cold_start_but_the_deadline_pressure_shape_admits_at_low_confidence ... ok
+test security_evidence_credential_and_prompt_content_never_touch_persisted_state ... ok
 
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
 
-     Running tests/preflight_integration.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/preflight_integration-780391e2b644ea30)
+     Running tests/preflight_integration.rs (/tmp/libra-horo1146-target-fix-94311/debug/deps/preflight_integration-780391e2b644ea30)
 
 running 3 tests
 test preflight_returns_sane_result_within_recon_budget ... ok
@@ -132,65 +223,66 @@ test preflight_selects_a_bucketed_tier_once_same_repo_history_exists ... ok
 
 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
 
-     Running tests/replan_integration.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/replan_integration-fe9f0683d7d7d8bc)
+     Running tests/replan_integration.rs (/tmp/libra-horo1146-target-fix-94311/debug/deps/replan_integration-fe9f0683d7d7d8bc)
 
 running 3 tests
 test possible_tool_loop_streak_triggers_a_replan_before_the_count_threshold ... ok
-test exhausting_the_auto_replan_budget_escalates_instead_of_replanning_again ... ok
 test tool_call_count_material_deviation_triggers_a_replan_visible_in_status ... ok
+test exhausting_the_auto_replan_budget_escalates_instead_of_replanning_again ... ok
 
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
 
-     Running tests/reservation_integration.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/reservation_integration-6d034428eedb15ca)
+     Running tests/reservation_integration.rs (/tmp/libra-horo1146-target-fix-94311/debug/deps/reservation_integration-6d034428eedb15ca)
 
-running 7 tests
+running 8 tests
 test admission_deny_writes_no_reservation_and_leaves_the_reserve_untouched ... ok
 test admission_happy_path_initializes_a_budget_and_reserves_the_work_envelope ... ok
-test finalize_settles_active_reservations_and_records_receipt_evidence ... ok
 test admission_approval_required_writes_no_reservation ... ok
+test finalize_settles_active_reservations_and_records_receipt_evidence ... ok
 test a_material_event_replan_does_not_reserve_capacity_for_a_task_denied_at_admission ... ok
+test a_material_event_replan_does_not_reserve_capacity_for_a_task_left_approval_required ... ok
 test a_replan_releases_the_old_plans_reservation_and_reserves_the_new_one ... ok
 test identical_preflights_produce_identical_admission_and_reserve_decisions ... ok
 
-test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
 
-     Running tests/security_permissions.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/security_permissions-37129ae62583685a)
+     Running tests/security_permissions.rs (/tmp/libra-horo1146-target-fix-94311/debug/deps/security_permissions-37129ae62583685a)
 
 running 3 tests
 test ensure_state_dir_creates_the_directory_owner_only ... ok
 test ensure_state_dir_tightens_an_existing_directory_created_with_a_looser_mode ... ok
 test a_real_daemon_startup_hardens_the_socket_and_ledger_file_modes ... ok
 
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 
-     Running unittests src/lib.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/libra_governor_domain-56a28e0d3637e0d8)
+     Running unittests src/lib.rs (/tmp/libra-horo1146-target-fix-94311/debug/deps/libra_governor_domain-56a28e0d3637e0d8)
 
 running 97 tests
-test capability::tests::a_claimed_monetary_cap_always_names_its_pricing_version ... ok
-test capability::tests::gateway_metered_is_the_only_tier_claiming_a_monetary_cap ... ok
-test capability::tests::hooks_only_holds_no_credential_and_observes_no_usage ... ok
-test capability::tests::only_gateway_tiers_can_refuse_before_spend ... ok
-test capability::tests::subscription_tier_names_the_concrete_reason_it_cannot_price ... ok
-test capability::tests::unpriced_model_reason_carries_the_model_it_could_not_price ... ok
-test capability::tests::capabilities_round_trip_through_json ... ok
-test completion_contract::tests::next_revision_increments_without_mutating_original ... ok
-test completion_contract::tests::required_criteria_filters_optional_ones ... ok
 test confidence::tests::from_evidence_cold_start_is_always_low ... ok
 test confidence::tests::from_evidence_global_is_capped_at_medium_regardless_of_n ... ok
-test confidence::tests::from_evidence_narrow_tiers_follow_the_min_class_samples_threshold ... ok
+test capability::tests::subscription_tier_names_the_concrete_reason_it_cannot_price ... ok
+test capability::tests::only_gateway_tiers_can_refuse_before_spend ... ok
 test confidence::tests::from_sample_count_thresholds ... ok
+test capability::tests::a_claimed_monetary_cap_always_names_its_pricing_version ... ok
+test confidence::tests::from_evidence_narrow_tiers_follow_the_min_class_samples_threshold ... ok
+test capability::tests::gateway_metered_is_the_only_tier_claiming_a_monetary_cap ... ok
+test completion_contract::tests::next_revision_increments_without_mutating_original ... ok
+test capability::tests::hooks_only_holds_no_credential_and_observes_no_usage ... ok
 test estimate::tests::cold_start_has_no_numeric_bounds_and_is_flagged ... ok
-test execution_event::tests::event_carries_its_task_id ... ok
+test completion_contract::tests::required_criteria_filters_optional_ones ... ok
 test execution_outcome::tests::completed_outcome_requires_no_implicit_evidence ... ok
+test execution_event::tests::event_carries_its_task_id ... ok
 test execution_outcome::tests::unknown_outcome_has_no_evidence ... ok
 test execution_plan::tests::a_fresh_plan_carries_no_replan_linkage ... ok
+test capability::tests::unpriced_model_reason_carries_the_model_it_could_not_price ... ok
 test execution_plan::tests::plan_links_task_and_contract_revision ... ok
 test execution_plan::tests::with_replan_linkage_records_the_prior_plan_and_reason_without_touching_contract_revision ... ok
 test execution_receipt::tests::receipt_links_task_and_plan ... ok
+test capability::tests::capabilities_round_trip_through_json ... ok
 test policy::tests::approval_mode_admits_at_and_below_target_with_no_pre_authorized_band ... ok
-test policy::tests::approval_mode_denies_past_the_hard_ceiling ... ok
 test policy::tests::approval_mode_requires_approval_for_any_amount_past_target ... ok
 test policy::tests::approval_mode_time_with_no_hard_ceiling_never_denies ... ok
+test policy::tests::approval_mode_denies_past_the_hard_ceiling ... ok
 test policy::tests::balanced_admits_a_cold_start_low_confidence_estimate_on_confidence_alone ... ok
 test policy::tests::confidence_below_threshold_denies_admission_independent_of_bounds ... ok
 test policy::tests::confidence_exactly_at_threshold_passes ... ok
@@ -204,12 +296,12 @@ test policy::tests::elastic_mode_requires_approval_between_elastic_and_hard_ceil
 test policy::tests::evaluate_rejects_projected_resource_kind_mismatch ... ok
 test policy::tests::hard_mode_admits_below_the_boundary ... ok
 test policy::tests::evaluate_returns_an_error_for_a_hard_time_bound_missing_its_ceiling ... ok
-test policy::tests::evaluate_returns_an_error_rather_than_panicking_on_a_policy_that_bypassed_validation ... ok
 test policy::tests::hard_mode_admits_exactly_at_the_boundary_value ... ok
 test policy::tests::hard_mode_denies_exactly_one_unit_past_the_boundary ... ok
+test policy::tests::evaluate_returns_an_error_rather_than_panicking_on_a_policy_that_bypassed_validation ... ok
 test policy::tests::policy_schema_version_propagates_from_policy_to_decision ... ok
-test policy::tests::presets_are_deterministic_and_inspectable ... ok
 test policy::tests::quality_invariant_required_criteria_survive_a_tight_projected_budget ... ok
+test policy::tests::presets_are_deterministic_and_inspectable ... ok
 test policy::tests::quota_percent_preset_saturates_at_100_instead_of_producing_an_out_of_range_ceiling ... ok
 test policy::tests::quota_percent_resource_preset_and_evaluate_round_trip ... ok
 test policy::tests::rejects_deadline_in_the_past ... ok
@@ -217,14 +309,14 @@ test policy::tests::rejects_elastic_ceiling_below_target ... ok
 test policy::tests::rejects_elastic_ceiling_set_for_non_elastic_mode ... ok
 test policy::tests::rejects_elastic_mode_missing_elastic_ceiling ... ok
 test policy::tests::rejects_empty_required_criteria ... ok
-test policy::tests::rejects_hard_ceiling_below_elastic_ceiling ... ok
 test policy::tests::rejects_hard_mode_missing_hard_ceiling ... ok
 test policy::tests::rejects_quota_percent_out_of_range ... ok
 test policy::tests::rejects_resource_kind_mismatch ... ok
+test policy::tests::rejects_hard_ceiling_below_elastic_ceiling ... ok
 test policy::tests::rejects_target_above_hard_ceiling ... ok
 test policy::tests::tokens_resource_preset_and_evaluate_round_trip ... ok
-test replan::tests::hysteresis_allows_again_once_the_cooldown_has_elapsed ... ok
 test replan::tests::hysteresis_allows_the_first_replan_with_no_prior_state ... ok
+test replan::tests::hysteresis_allows_again_once_the_cooldown_has_elapsed ... ok
 test replan::tests::hysteresis_escalates_once_max_auto_replans_is_reached_even_past_cooldown ... ok
 test replan::tests::hysteresis_suppresses_a_second_replan_inside_the_cooldown_window ... ok
 test replan::tests::possible_tool_loop_triggers_only_at_or_above_the_streak_threshold ... ok
@@ -238,10 +330,10 @@ test replan::tests::should_replan_net_gain_exactly_at_min_gain_is_a_yes ... ok
 test replan::tests::should_replan_rejects_mismatched_resource_kinds ... ok
 test replan::tests::should_replan_says_no_when_continuing_is_cheaper_than_replanning ... ok
 test replan::tests::should_replan_says_no_when_net_gain_is_positive_but_below_min_gain_floor ... ok
-test replan::tests::replan_record_round_trips_through_json_and_links_prior_and_new_plan_ids ... ok
 test replan::tests::should_replan_says_yes_when_benefit_clearly_exceeds_cost_and_min_gain ... ok
 test replan::tests::tool_call_count_material_falls_back_to_absolute_threshold_when_no_typical ... ok
 test replan::tests::tool_call_count_material_uses_bucket_typical_when_available ... ok
+test replan::tests::replan_record_round_trips_through_json_and_links_prior_and_new_plan_ids ... ok
 test replan::tests::trivial_events_are_correctly_ignored ... ok
 test reservation::tests::amount_never_exceeds_hard_ceiling ... ok
 test reservation::tests::falls_back_to_policy_target_on_cold_start ... ok
@@ -260,90 +352,89 @@ test resource_amount::tests::kind_matches_variant ... ok
 test resource_amount::tests::scaled_preserves_kind_and_multiplies ... ok
 test resource_amount::tests::scaled_saturates_quota_percent_at_its_documented_domain ... ok
 test task_features::tests::task_features_field_set_contains_no_outcome_or_actual_fields ... ok
-test task_features::tests::task_features_round_trips_through_json ... ok
 test task_identity::tests::task_id_new_values_are_unique ... ok
+test task_features::tests::task_features_round_trips_through_json ... ok
 test task_identity::tests::task_identity_carries_optional_external_ref ... ok
 
 test result: ok. 97 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running unittests src/lib.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/libra_governor_estimator-14f8e1db21d1f295)
+     Running unittests src/lib.rs (/tmp/libra-horo1146-target-fix-94311/debug/deps/libra_governor_estimator-14f8e1db21d1f295)
 
 running 32 tests
+test calibration::tests::cost_coverage_carries_no_populable_cost_value ... ok
+test calibration::tests::coverage_and_admission_types_serialize_no_cost_field ... ok
+test calibration::tests::admission_replay_below_the_required_floor_is_insufficient_even_with_real_data ... ok
 test calibration::tests::admission_replay_excludes_pairs_whose_estimate_lacks_the_threshold_quantile ... ok
 test calibration::tests::a_handful_of_pairs_is_still_insufficient ... ok
-test calibration::tests::admission_replay_below_the_required_floor_is_insufficient_even_with_real_data ... ok
-test calibration::tests::admission_replay_with_no_usable_pairs_is_insufficient ... ok
-test calibration::tests::cost_coverage_carries_no_populable_cost_value ... ok
-test calibration::tests::all_zero_durations_does_not_falsely_report_full_coverage ... ok
 test calibration::tests::hand_computed_false_admit_and_false_reject_on_a_small_fixture ... ok
-test calibration::tests::coverage_and_admission_types_serialize_no_cost_field ... ok
+test calibration::tests::admission_replay_with_no_usable_pairs_is_insufficient ... ok
+test calibration::tests::all_zero_durations_does_not_falsely_report_full_coverage ... ok
 test calibration::tests::zero_pairs_never_renders_as_full_coverage ... ok
-test tests::cold_start_when_no_local_history_at_all ... ok
 test calibration::tests::in_sample_coverage_trivially_meets_nominal_by_construction ... ok
+test tests::cold_start_when_no_local_history_at_all ... ok
 test tests::duration_confidence_via_global_tier_is_capped_at_medium ... ok
 test tests::estimate_bucketed_falls_back_to_global_when_no_bucket_meets_threshold ... ok
 test tests::duration_confidence_via_class_bucket_still_escalates_to_high ... ok
 test tests::estimate_bucketed_prefers_most_specific_tier_available ... ok
 test tests::estimate_bucketed_reaches_cold_start_with_no_history_at_all ... ok
-test tests::every_estimate_is_tagged_with_the_estimator_version ... ok
 test tests::estimate_bucketed_tags_every_estimate_with_v3_tiered_confidence ... ok
+test tests::every_estimate_is_tagged_with_the_estimator_version ... ok
 test tests::falls_back_to_global_history_when_no_class_bucket_supplied ... ok
+test tests::estimate_bucketed_selects_repo_tier_once_threshold_is_met ... ok
+test tests::falls_back_to_global_when_class_bucket_is_too_thin ... ok
 test tests::quantile_u64_matches_hand_computed_values_for_ten_samples ... ok
 test tests::resource_quantiles_are_none_when_no_receipt_carries_usage ... ok
 test tests::resource_amounts_remain_none_on_every_bucketed_estimate_from_real_local_data ... ok
 test tests::resource_quantiles_computed_over_tokens_when_present ... ok
-test tests::resource_quantiles_pick_the_most_common_kind_and_ignore_the_rest ... ok
 test tests::typical_tool_call_count_bucketed_computes_the_median_over_the_matching_tier ... ok
-test tests::prefers_class_bucket_when_it_meets_the_minimum_sample_threshold ... ok
-test tests::falls_back_to_global_when_class_bucket_is_too_thin ... ok
-test tests::typical_tool_call_count_bucketed_is_none_when_no_tier_meets_the_threshold ... ok
+test tests::resource_quantiles_pick_the_most_common_kind_and_ignore_the_rest ... ok
 test tests::typical_tool_call_count_bucketed_is_none_with_no_matching_history ... ok
-test tests::estimate_bucketed_selects_repo_tier_once_threshold_is_met ... ok
+test tests::typical_tool_call_count_bucketed_is_none_when_no_tier_meets_the_threshold ... ok
 test tests::typical_tool_call_count_bucketed_prefers_the_most_specific_matching_tier ... ok
+test tests::prefers_class_bucket_when_it_meets_the_minimum_sample_threshold ... ok
 test calibration::tests::empirical_coverage_converges_to_nominal_for_a_known_distribution ... ok
 
 test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 
-     Running unittests src/lib.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/libra_governor_gateway-4ce50ca53e57af08)
+     Running unittests src/lib.rs (/tmp/libra-horo1146-target-fix-94311/debug/deps/libra_governor_gateway-4ce50ca53e57af08)
 
 running 68 tests
-test config::tests::a_bare_origin_with_a_trailing_slash_is_accepted ... ok
-test config::tests::a_garbage_upstream_is_refused_rather_than_partially_parsed ... ok
-test config::tests::a_host_outside_the_allowlist_is_refused ... ok
-test config::tests::a_non_loopback_bind_address_is_refused ... ok
-test config::tests::a_non_standard_https_port_needs_an_explicit_opt_in ... ok
 test config::tests::a_path_query_or_fragment_on_the_upstream_is_refused ... ok
 test config::tests::a_plaintext_upstream_is_refused ... ok
 test config::tests::a_plaintext_upstream_is_permitted_only_for_a_loopback_host_with_the_flag ... ok
 test config::tests::an_extended_allowlist_admits_the_host_it_names ... ok
-test config::tests::loopback_host_detection_is_literal_and_never_resolves ... ok
+test config::tests::a_non_loopback_bind_address_is_refused ... ok
+test config::tests::a_garbage_upstream_is_refused_rather_than_partially_parsed ... ok
+test config::tests::a_bare_origin_with_a_trailing_slash_is_accepted ... ok
+test config::tests::a_host_outside_the_allowlist_is_refused ... ok
+test config::tests::a_non_standard_https_port_needs_an_explicit_opt_in ... ok
 test config::tests::governor_held_mode_may_enforce_a_usd_budget ... ok
-test config::tests::subscription_mode_against_a_usd_budget_is_refused_by_code_not_documentation ... ok
+test config::tests::loopback_host_detection_is_literal_and_never_resolves ... ok
 test config::tests::pricing_overrides_reach_the_validated_table ... ok
+test config::tests::subscription_mode_against_a_usd_budget_is_refused_by_code_not_documentation ... ok
 test config::tests::the_host_header_check_accepts_only_this_listener_s_own_spellings ... ok
 test config::tests::the_shipped_default_configuration_validates ... ok
 test config::tests::userinfo_in_the_upstream_url_is_refused ... ok
 test config::tests::zero_valued_limits_are_refused ... ok
-test cost::tests::a_missing_or_zero_max_tokens_is_refused_never_reserved_as_zero ... ok
 test cost::tests::a_token_budget_never_needs_pricing ... ok
+test cost::tests::a_missing_or_zero_max_tokens_is_refused_never_reserved_as_zero ... ok
 test cost::tests::a_usd_budget_refuses_an_unpriced_model_rather_than_guessing ... ok
-test cost::tests::bound_violation_is_detected_rather_than_clamped ... ok
 test cost::tests::a_usd_reservation_always_covers_the_exact_settlement_it_bounds ... ok
+test cost::tests::bound_violation_is_detected_rather_than_clamped ... ok
 test cost::tests::cents_conversion_never_yields_a_negative_or_nan_amount ... ok
 test cost::tests::input_bound_rounds_up_so_it_can_never_under_count ... ok
-test cost::tests::settlement_prices_each_reported_tier_at_its_own_rate ... ok
 test cost::tests::quota_percent_is_refused_before_any_reservation_is_attempted ... ok
+test cost::tests::settlement_prices_each_reported_tier_at_its_own_rate ... ok
 test cost::tests::token_reservation_is_input_upper_bound_plus_max_tokens ... ok
 test cost::tests::token_settlement_sums_every_reported_tier ... ok
 test cost::tests::usd_reservation_prices_input_at_the_most_expensive_cache_tier ... ok
 test credential::tests::a_credential_with_a_newline_is_rejected_rather_than_smuggled_into_a_header ... ok
-test credential::tests::header_value_is_marked_sensitive ... ok
 test credential::tests::debug_never_renders_the_credential ... ok
+test credential::tests::header_value_is_marked_sensitive ... ok
 test credential::tests::token_comparison_accepts_only_the_exact_value ... ok
 test credential::tests::token_debug_never_renders_the_token ... ok
 test pricing::tests::an_unknown_model_is_unpriced_rather_than_guessed ... ok
 test pricing::tests::every_pinned_entry_has_strictly_positive_finite_prices ... ok
-test credential::tests::a_missing_program_fails_to_spawn_rather_than_panicking ... ok
 test pricing::tests::longest_prefix_wins_over_a_shorter_one ... ok
 test pricing::tests::overrides_extend_and_replace_the_pinned_table ... ok
 test pricing::tests::pinned_table_prices_a_dated_model_id_by_prefix ... ok
@@ -351,59 +442,60 @@ test pricing::tests::pinned_table_reports_no_overrides ... ok
 test pricing::tests::worst_case_input_price_is_the_most_expensive_tier ... ok
 test route::tests::an_upstream_path_is_a_constant_not_the_inbound_path ... ok
 test route::tests::only_messages_is_metered_and_only_hello_is_local ... ok
-test credential::tests::capability_token_is_persisted_at_mode_0600_and_reloaded ... ok
 test route::tests::the_method_is_part_of_the_match ... ok
 test route::tests::the_three_supported_routes_match ... ok
-test credential::tests::two_generated_tokens_differ ... ok
 test route::tests::traversal_and_near_miss_paths_are_refused_rather_than_normalised ... ok
 test stats::tests::counters_start_at_zero_and_increment_independently ... ok
 test stats::tests::total_denied_sums_every_refusal_category ... ok
 test usage::tests::a_non_streaming_body_reports_its_top_level_usage ... ok
 test usage::tests::a_provider_reported_zero_is_distinguishable_from_no_report ... ok
-test usage::tests::a_stream_cut_off_mid_flight_keeps_the_last_observed_usage ... ok
 test usage::tests::a_stream_with_no_usage_at_all_reports_none_not_zero ... ok
+test usage::tests::a_stream_cut_off_mid_flight_keeps_the_last_observed_usage ... ok
 test usage::tests::an_unparseable_non_streaming_body_reports_no_usage ... ok
+test credential::tests::a_missing_program_fails_to_spawn_rather_than_panicking ... ok
+test credential::tests::two_generated_tokens_differ ... ok
+test credential::tests::capability_token_is_persisted_at_mode_0600_and_reloaded ... ok
 test stats::tests::counters_are_safe_to_share_across_threads ... ok
+test usage::tests::an_oversized_line_is_dropped_without_growing_the_buffer ... ok
 test usage::tests::malformed_json_is_ignored_rather_than_failing_the_stream ... ok
 test usage::tests::parses_identically_when_chunk_boundaries_split_every_frame ... ok
-test usage::tests::takes_the_last_cumulative_output_count_and_never_sums_deltas ... ok
 test usage::tests::total_tokens_sums_every_tier ... ok
-test usage::tests::an_oversized_line_is_dropped_without_growing_the_buffer ... ok
+test usage::tests::takes_the_last_cumulative_output_count_and_never_sums_deltas ... ok
 test credential::tests::a_command_that_would_prompt_gets_no_stdin ... ok
-test credential::tests::whitespace_only_output_is_empty_not_a_credential ... ok
-test credential::tests::a_non_zero_exit_is_an_error_whose_message_carries_no_output ... ok
 test credential::tests::empty_output_is_an_error_not_an_empty_credential ... ok
-test credential::tests::resolve_reads_stdout_and_trims_the_trailing_newline ... ok
+test credential::tests::whitespace_only_output_is_empty_not_a_credential ... ok
 test credential::tests::oversized_output_is_refused_rather_than_buffered ... ok
+test credential::tests::resolve_reads_stdout_and_trims_the_trailing_newline ... ok
+test credential::tests::a_non_zero_exit_is_an_error_whose_message_carries_no_output ... ok
 
-test result: ok. 68 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 68 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
 
-     Running tests/auth_and_routing.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/auth_and_routing-27f0437c8e282d90)
+     Running tests/auth_and_routing.rs (/tmp/libra-horo1146-target-fix-94311/debug/deps/auth_and_routing-27f0437c8e282d90)
 
 running 19 tests
-test fake_upstream::tests::every_credential_shaped_fixture_value_is_obviously_fake ... ok
 test fake_upstream::tests::the_canned_sse_stream_reports_cumulative_output_tokens ... ok
 test fake_upstream::tests::the_truncated_stream_never_reaches_message_stop ... ok
+test fake_upstream::tests::every_credential_shaped_fixture_value_is_obviously_fake ... ok
 test fake_upstream::tests::the_fake_upstream_serves_the_scenario_it_is_asked_for ... ok
 test pass_through_subscription_mode_forwards_the_callers_own_credential_unchanged ... ok
-test a_host_header_naming_another_destination_is_refused_before_routing ... ok
-test a_wrong_capability_token_is_refused ... ok
-test count_tokens_is_forwarded_without_reserving_anything ... ok
-test disagreeing_dual_auth_headers_are_refused_without_any_upstream_call ... ok
-test a_request_with_no_credential_is_refused_and_never_reaches_the_upstream ... ok
 test a_request_body_over_the_cap_is_refused_before_the_upstream_is_dialled ... ok
-test the_upstream_receives_the_governor_held_credential_and_never_the_local_token ... ok
 test ordinary_headers_and_the_query_string_are_forwarded_unchanged ... ok
 test a_path_outside_the_closed_route_table_is_refused ... ok
-test the_capability_token_is_accepted_under_either_header_spelling ... ok
+test count_tokens_is_forwarded_without_reserving_anything ... ok
+test a_request_with_no_credential_is_refused_and_never_reaches_the_upstream ... ok
 test matching_dual_auth_headers_are_not_ambiguous ... ok
 test every_response_carries_a_request_id_for_correlation ... ok
-test forwarding_chain_and_inbound_host_headers_are_dropped ... ok
+test disagreeing_dual_auth_headers_are_refused_without_any_upstream_call ... ok
 test the_connectivity_probe_is_answered_locally_and_costs_nothing ... ok
+test a_wrong_capability_token_is_refused ... ok
+test the_capability_token_is_accepted_under_either_header_spelling ... ok
+test the_upstream_receives_the_governor_held_credential_and_never_the_local_token ... ok
+test forwarding_chain_and_inbound_host_headers_are_dropped ... ok
+test a_host_header_naming_another_destination_is_refused_before_routing ... ok
 
 test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
 
-     Running tests/fake_upstream.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/fake_upstream-24de113df29cd2aa)
+     Running tests/fake_upstream.rs (/tmp/libra-horo1146-target-fix-94311/debug/deps/fake_upstream-24de113df29cd2aa)
 
 running 4 tests
 test tests::every_credential_shaped_fixture_value_is_obviously_fake ... ok
@@ -411,153 +503,153 @@ test tests::the_canned_sse_stream_reports_cumulative_output_tokens ... ok
 test tests::the_truncated_stream_never_reaches_message_stop ... ok
 test tests::the_fake_upstream_serves_the_scenario_it_is_asked_for ... ok
 
-test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running tests/proxy_lifecycle.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/proxy_lifecycle-e413414305e2c77e)
+     Running tests/proxy_lifecycle.rs (/tmp/libra-horo1146-target-fix-94311/debug/deps/proxy_lifecycle-e413414305e2c77e)
 
 running 27 tests
+test a_request_with_no_session_binding_is_refused_as_task_unbound ... ok
+test a_policy_denial_refuses_the_request_before_any_provider_spend ... ok
+test an_approval_gated_request_still_proceeds_and_is_recorded_as_such ... ok
 test a_priced_model_against_a_usd_budget_reserves_and_settles_in_cents ... ok
 test a_provenance_row_never_carries_a_body_or_a_credential ... ok
-test a_ledger_failure_fails_closed_rather_than_letting_the_request_through ... ok
-test a_bound_violation_is_recorded_rather_than_clamped_away ... ok
-test a_completed_request_writes_exactly_one_provenance_row_with_the_real_terminal_state ... ok
-test a_policy_denial_refuses_the_request_before_any_provider_spend ... ok
-test a_session_with_no_admitted_task_is_refused ... ok
-test fake_upstream::tests::every_credential_shaped_fixture_value_is_obviously_fake ... ok
-test a_quota_percent_budget_is_refused_because_tokens_cannot_be_converted_into_it ... ok
-test an_approval_gated_request_still_proceeds_and_is_recorded_as_such ... ok
-test fake_upstream::tests::the_truncated_stream_never_reaches_message_stop ... ok
-test fake_upstream::tests::the_canned_sse_stream_reports_cumulative_output_tokens ... ok
-test a_request_with_no_session_binding_is_refused_as_task_unbound ... ok
 test a_request_with_no_positive_max_tokens_is_refused_before_any_reservation ... ok
-test fake_upstream::tests::the_fake_upstream_serves_the_scenario_it_is_asked_for ... ok
 test a_client_retry_is_a_fresh_reservation_not_a_double_settlement ... ok
+test fake_upstream::tests::every_credential_shaped_fixture_value_is_obviously_fake ... ok
+test fake_upstream::tests::the_canned_sse_stream_reports_cumulative_output_tokens ... ok
 test a_stream_cut_off_mid_flight_settles_at_the_last_observed_usage ... ok
-test a_non_streaming_request_settles_from_the_bodys_top_level_usage ... ok
+test fake_upstream::tests::the_truncated_stream_never_reaches_message_stop ... ok
+test a_completed_request_writes_exactly_one_provenance_row_with_the_real_terminal_state ... ok
+test a_quota_percent_budget_is_refused_because_tokens_cannot_be_converted_into_it ... ok
+test a_ledger_failure_fails_closed_rather_than_letting_the_request_through ... ok
+test fake_upstream::tests::the_fake_upstream_serves_the_scenario_it_is_asked_for ... ok
 test a_streaming_request_is_reserved_relayed_verbatim_and_settled_at_the_exact_observed_usage ... ok
+test a_session_with_no_admitted_task_is_refused ... ok
+test a_non_streaming_request_settles_from_the_bodys_top_level_usage ... ok
 test a_response_reporting_no_usage_settles_conservatively_at_the_reserved_amount ... ok
+test a_bound_violation_is_recorded_rather_than_clamped_away ... ok
 test an_unpriced_model_against_a_usd_budget_is_refused_rather_than_priced_by_guess ... ok
-test an_upstream_401_triggers_exactly_one_credential_refresh_retry ... ok
-test exhausted_headroom_refuses_even_though_the_completion_reserve_still_holds_capacity ... ok
-test the_reservation_is_the_conservative_worst_case_not_the_eventual_actual ... ok
 test an_upstream_rate_limit_is_relayed_as_itself_not_rewritten ... ok
-test an_upstream_error_is_relayed_verbatim_and_the_reservation_is_released_in_full ... ok
+test an_upstream_401_triggers_exactly_one_credential_refresh_retry ... ok
+test the_reservation_is_the_conservative_worst_case_not_the_eventual_actual ... ok
 test every_terminal_transition_writes_exactly_one_provenance_row_carrying_its_pricing_version ... ok
+test an_upstream_error_is_relayed_verbatim_and_the_reservation_is_released_in_full ... ok
+test exhausted_headroom_refuses_even_though_the_completion_reserve_still_holds_capacity ... ok
 
-test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
 
-     Running tests/ssrf_and_config.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/ssrf_and_config-b2eb121853f9dd26)
+     Running tests/ssrf_and_config.rs (/tmp/libra-horo1146-target-fix-94311/debug/deps/ssrf_and_config-b2eb121853f9dd26)
 
 running 13 tests
-test a_gateway_bound_to_a_non_loopback_address_never_starts ... ok
-test a_name_that_merely_looks_like_loopback_is_not_treated_as_loopback ... ok
-test a_gateway_whose_upstream_is_not_configuration_never_starts ... ok
-test a_subscription_deployment_may_not_claim_a_usd_hard_cap ... ok
 test fake_upstream::tests::every_credential_shaped_fixture_value_is_obviously_fake ... ok
 test fake_upstream::tests::the_canned_sse_stream_reports_cumulative_output_tokens ... ok
 test fake_upstream::tests::the_truncated_stream_never_reaches_message_stop ... ok
+test a_gateway_bound_to_a_non_loopback_address_never_starts ... ok
+test a_name_that_merely_looks_like_loopback_is_not_treated_as_loopback ... ok
 test the_plaintext_loopback_opt_in_cannot_be_turned_into_an_exfiltration_path ... ok
+test a_gateway_whose_upstream_is_not_configuration_never_starts ... ok
+test a_subscription_deployment_may_not_claim_a_usd_hard_cap ... ok
 test fake_upstream::tests::the_fake_upstream_serves_the_scenario_it_is_asked_for ... ok
-test an_absolute_form_request_uri_cannot_redirect_the_outbound_call ... ok
-test a_traversal_path_is_refused_rather_than_normalised_into_the_upstream_url ... ok
 test an_upstream_redirect_is_relayed_rather_than_followed ... ok
 test the_configured_upstream_is_the_only_destination_any_request_reaches ... ok
+test a_traversal_path_is_refused_rather_than_normalised_into_the_upstream_url ... ok
+test an_absolute_form_request_uri_cannot_redirect_the_outbound_call ... ok
 
-test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
 
-     Running unittests src/lib.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/libra_governor_ledger-7b48e13d13e4c8ff)
+     Running unittests src/lib.rs (/tmp/libra-horo1146-target-fix-94311/debug/deps/libra_governor_ledger-7b48e13d13e4c8ff)
 
 running 50 tests
-test query::replan_persistence_tests::replan_history_for_task_is_empty_before_any_replan ... ok
-test gateway::tests::closing_records_the_settled_figures_and_the_terminal_state ... ok
-test gateway::tests::the_schema_has_no_column_that_could_hold_a_body_or_a_credential ... ok
-test query::calibration_pairs_tests::excludes_cold_start_estimates ... ok
-test query::calibration_pairs_tests::excludes_receipts_whose_plan_has_no_estimate_at_all ... ok
-test migrations::tests::applying_migrations_twice_is_a_no_op ... ok
-test query::replan_persistence_tests::replan_history_for_task_is_queryable_after_a_replan_event ... ok
-test query::calibration_pairs_tests::a_mix_of_rows_keeps_only_the_eligible_ones ... ok
-test query::replan_persistence_tests::an_original_plan_carries_no_replan_linkage_after_round_tripping ... ok
 test gateway::tests::a_rejection_with_no_task_at_all_still_records_a_row ... ok
+test query::replan_persistence_tests::an_original_plan_carries_no_replan_linkage_after_round_tripping ... ok
+test migrations::tests::applying_migrations_twice_is_a_no_op ... ok
+test query::calibration_pairs_tests::excludes_cold_start_estimates ... ok
 test query::calibration_pairs_tests::keeps_a_real_computed_estimate_paired_with_its_actual ... ok
 test query::replan_persistence_tests::a_replanned_plan_persists_its_linkage_and_round_trips ... ok
-test gateway::tests::spend_for_task_aggregates_settled_amounts_in_the_recorded_kind ... ok
-test gateway::tests::closing_an_unknown_id_is_a_silent_no_op ... ok
+test query::replan_persistence_tests::replan_history_for_task_is_queryable_after_a_replan_event ... ok
+test gateway::tests::the_schema_has_no_column_that_could_hold_a_body_or_a_credential ... ok
 test gateway::tests::a_bound_violation_is_persisted_rather_than_absorbed ... ok
+test gateway::tests::closing_records_the_settled_figures_and_the_terminal_state ... ok
+test query::calibration_pairs_tests::excludes_receipts_whose_plan_has_no_estimate_at_all ... ok
+test gateway::tests::spend_for_task_aggregates_settled_amounts_in_the_recorded_kind ... ok
 test gateway::tests::opening_twice_updates_the_same_row_rather_than_duplicating_it ... ok
+test query::calibration_pairs_tests::a_mix_of_rows_keeps_only_the_eligible_ones ... ok
+test gateway::tests::closing_an_unknown_id_is_a_silent_no_op ... ok
+test query::replan_persistence_tests::replan_history_for_task_is_empty_before_any_replan ... ok
 test reservation::tests::adjust_completion_reserve_lowering_is_always_permitted ... ok
 test reservation::tests::a_forged_task_id_cannot_create_a_reservation_because_no_budget_exists ... ok
-test reservation::tests::required_work_draws_into_the_completion_reserve_once_exhausted ... ok
-test reservation::tests::reserve_grants_within_optional_headroom ... ok
-test reservation::tests::adjust_completion_reserve_raising_is_bounded_by_optional_headroom ... ok
-test reservation::tests::duplicate_reserve_with_the_same_idempotency_key_is_a_safe_replay ... ok
-test reservation::tests::release_active_for_plan_releases_only_that_plans_active_reservations ... ok
-test reservation::tests::expire_stale_reservations_reclaims_only_past_expiry ... ok
 test reservation::tests::settling_an_unknown_reservation_id_is_not_found_and_changes_nothing ... ok
-test reservation::tests::settle_with_no_reported_usage_falls_back_to_the_reserved_amount ... ok
-test reservation::tests::optional_work_cannot_draw_into_the_completion_reserve ... ok
-test reservation::tests::reserving_a_mismatched_resource_kind_is_rejected_and_writes_nothing ... ok
+test reservation::tests::release_active_for_plan_releases_only_that_plans_active_reservations ... ok
 test reservation::tests::duplicate_settlement_event_is_idempotent ... ok
-test reservation::tests::settling_over_the_reservation_records_an_overrun_and_can_exhaust_headroom ... ok
-test reservation::tests::reservation_evidence_summarizes_reserved_settled_released_and_overrun ... ok
+test reservation::tests::settle_with_no_reported_usage_falls_back_to_the_reserved_amount ... ok
+test reservation::tests::reserving_a_mismatched_resource_kind_is_rejected_and_writes_nothing ... ok
+test reservation::tests::duplicate_reserve_with_the_same_idempotency_key_is_a_safe_replay ... ok
+test reservation::tests::adjust_completion_reserve_raising_is_bounded_by_optional_headroom ... ok
+test reservation::tests::reserve_grants_within_optional_headroom ... ok
+test reservation::tests::required_work_draws_into_the_completion_reserve_once_exhausted ... ok
 test reservation::tests::release_restores_the_full_drawn_reserve ... ok
+test reservation::tests::expire_stale_reservations_reclaims_only_past_expiry ... ok
+test reservation::tests::reservation_evidence_summarizes_reserved_settled_released_and_overrun ... ok
+test reservation::tests::optional_work_cannot_draw_into_the_completion_reserve ... ok
+test reservation::tests::settling_over_the_reservation_records_an_overrun_and_can_exhaust_headroom ... ok
+test reservation::tests::settling_under_the_reservation_refunds_and_restores_the_reserve ... ok
+test session::tests::reset_tool_streak_zeroes_the_streak_but_not_the_count ... ok
 test session::tests::latest_contract_is_none_before_any_contract_recorded ... ok
 test reservation::tests::settling_with_a_negative_amount_is_rejected ... ok
-test reservation::tests::settling_under_the_reservation_refunds_and_restores_the_reserve ... ok
-test session::tests::record_tool_invocation_streak_increments_on_repeats_and_resets_on_a_new_tool ... ok
-test session::tests::latest_contract_returns_highest_revision ... ok
-test session::tests::resolve_or_create_gives_distinct_ids_for_distinct_sessions ... ok
-test session::tests::reset_tool_streak_zeroes_the_streak_but_not_the_count ... ok
-test session::tests::supersede_marks_prior_in_flight_preflight_before_new_one_recorded ... ok
-test session::tests::record_replan_for_task_increments_count_and_sets_last_replan_at ... ok
 test session::tests::replan_state_for_task_defaults_when_never_replanned ... ok
-test session::tests::tool_call_counts_are_independent_per_session ... ok
 test session::tests::session_started_at_returns_first_resolution_time ... ok
 test session::tests::session_started_at_is_none_before_any_preflight ... ok
-test session::tests::resolve_or_create_returns_same_task_id_for_repeat_session ... ok
 test session::tests::record_tool_invocation_streaks_are_independent_per_session ... ok
+test session::tests::record_tool_invocation_streak_increments_on_repeats_and_resets_on_a_new_tool ... ok
+test session::tests::record_replan_for_task_increments_count_and_sets_last_replan_at ... ok
+test session::tests::resolve_or_create_gives_distinct_ids_for_distinct_sessions ... ok
+test session::tests::latest_contract_returns_highest_revision ... ok
+test session::tests::tool_call_counts_are_independent_per_session ... ok
 test session::tests::tool_call_count_starts_at_zero_and_increments ... ok
+test session::tests::resolve_or_create_returns_same_task_id_for_repeat_session ... ok
+test session::tests::supersede_marks_prior_in_flight_preflight_before_new_one_recorded ... ok
 test store::tests::open_enables_wal_mode ... ok
 test store::tests::reopening_same_file_preserves_schema ... ok
 
-test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s
+test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
 
-     Running tests/reservation_concurrency.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/reservation_concurrency-e5e3fe0d0b1fa407)
+     Running tests/reservation_concurrency.rs (/tmp/libra-horo1146-target-fix-94311/debug/deps/reservation_concurrency-e5e3fe0d0b1fa407)
 
 running 3 tests
 test a_reservation_left_active_by_a_crashed_process_is_reclaimed_on_reconciliation ... ok
-test concurrent_optional_reservations_never_double_spend_the_shared_envelope ... ok
 test concurrent_required_work_reservations_never_over_draw_the_completion_reserve ... ok
+test concurrent_optional_reservations_never_double_spend_the_shared_envelope ... ok
 
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
 
-     Running tests/trajectory.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/trajectory-7d5bf195c811c55c)
+     Running tests/trajectory.rs (/tmp/libra-horo1146-target-fix-94311/debug/deps/trajectory-7d5bf195c811c55c)
 
 running 6 tests
 test execution_event_kind_has_no_field_for_raw_prompt_or_output_content ... ok
-test plan_ties_to_the_exact_contract_revision_it_assumed ... ok
 test reinserting_the_same_event_id_is_idempotent ... ok
-test receipt_query_reconstructs_full_task_trajectory_from_sqlite_alone ... ok
+test plan_ties_to_the_exact_contract_revision_it_assumed ... ok
 test multiple_sessions_attach_to_one_stable_task_identity ... ok
+test receipt_query_reconstructs_full_task_trajectory_from_sqlite_alone ... ok
 test data_survives_closing_and_reopening_the_same_database_file ... ok
 
-test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
 
-     Running unittests src/lib.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/libra_governor_protocol-005d309e5f72c690)
+     Running unittests src/lib.rs (/tmp/libra-horo1146-target-fix-94311/debug/deps/libra_governor_protocol-005d309e5f72c690)
 
 running 13 tests
-test messages::tests::calibration_report_request_round_trips ... ok
-test messages::tests::finalize_outcome_no_active_task_round_trips ... ok
-test messages::tests::missing_protocol_version_field_fails_to_deserialize ... ok
-test messages::tests::status_request_serializes_with_kind_tag ... ok
-test messages::tests::finalize_request_round_trips_with_and_without_model ... ok
-test messages::tests::preflight_result_estimate_defaults_absent_but_present_in_schema ... ok
-test messages::tests::response_error_round_trips ... ok
-test messages::tests::request_envelope_round_trips_through_json ... ok
-test messages::tests::tool_invoked_request_round_trips ... ok
 test wire::tests::reading_from_empty_stream_reports_connection_closed ... ok
+test messages::tests::finalize_outcome_no_active_task_round_trips ... ok
+test messages::tests::status_request_serializes_with_kind_tag ... ok
+test messages::tests::response_error_round_trips ... ok
 test wire::tests::reading_malformed_json_reports_json_error ... ok
-test messages::tests::calibration_report_response_round_trips_through_a_full_envelope ... ok
 test wire::tests::write_then_read_round_trips ... ok
+test messages::tests::calibration_report_request_round_trips ... ok
+test messages::tests::missing_protocol_version_field_fails_to_deserialize ... ok
+test messages::tests::preflight_result_estimate_defaults_absent_but_present_in_schema ... ok
+test messages::tests::tool_invoked_request_round_trips ... ok
+test messages::tests::finalize_request_round_trips_with_and_without_model ... ok
+test messages::tests::request_envelope_round_trips_through_json ... ok
+test messages::tests::calibration_report_response_round_trips_through_a_full_envelope ... ok
 
 test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
@@ -597,3 +689,5 @@ running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
+
+27 test-result blocks, all ok, 0 failed. Total tests passed: 437 (436 + 1 new: a_material_event_replan_does_not_reserve_capacity_for_a_task_left_approval_required).

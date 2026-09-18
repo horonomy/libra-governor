@@ -1,8 +1,15 @@
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
-     Running tests/reservation_integration.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/reservation_integration-6d034428eedb15ca)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 16.26s
+     Running tests/reservation_integration.rs (/tmp/libra-horo1146-target-fix-6314/debug/deps/reservation_integration-6d034428eedb15ca)
 
-running 1 test
+running 8 tests
+test admission_happy_path_initializes_a_budget_and_reserves_the_work_envelope ... ok
+test admission_deny_writes_no_reservation_and_leaves_the_reserve_untouched ... ok
+test finalize_settles_active_reservations_and_records_receipt_evidence ... ok
+test admission_approval_required_writes_no_reservation ... ok
 test a_material_event_replan_does_not_reserve_capacity_for_a_task_denied_at_admission ... ok
+test a_material_event_replan_does_not_reserve_capacity_for_a_task_left_approval_required ... ok
+test a_replan_releases_the_old_plans_reservation_and_reserves_the_new_one ... ok
+test identical_preflights_produce_identical_admission_and_reserve_decisions ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.12s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
 

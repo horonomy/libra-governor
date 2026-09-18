@@ -69,15 +69,20 @@ at either gate.
 | `cargo fmt --all -- --check` | PASS (exit 0) | `fmt_check.txt` |
 | `cargo clippy --workspace --all-targets -- -D warnings` | PASS (exit 0, 0 warnings) | `clippy_check.txt` |
 | `cargo build --workspace` | PASS (exit 0) | `build_workspace.txt` |
-| `cargo test --workspace` | **PASS — 411 tests passed, 0 failed, across every crate and every test binary in the workspace** (`libra-governor-cli`, `-daemon`, `-domain`, `-estimator`, `-gateway`, `-ledger`, `-protocol` — lib and integration tests) | `full_workspace_test_run.txt` |
+| `cargo test --workspace` | **PASS — 437 tests passed, 0 failed, across every crate and every test binary in the workspace** (`libra-governor-cli`, `-daemon`, `-domain`, `-estimator`, `-gateway`, `-ledger`, `-protocol` — lib and integration tests) | `full_workspace_test_run.txt` |
 
-Per-binary breakdown (all green): cli-lib 28, `hook_cli_integration` 8,
-daemon-lib 31, `daemon_unreachable` 2, `gateway_enforcement` 9,
-`mvp3_gate_evidence` 3 (new), `preflight_integration` 3, `replan_integration`
-3, `reservation_integration` 6, domain-lib 96, estimator-lib 32, gateway-lib
-68, `auth_and_routing` 19, `fake_upstream` 4, `proxy_lifecycle` 27,
-`ssrf_and_config` 13, ledger-lib 50, `reservation_concurrency` 3,
-`trajectory` 6. Total: 411.
+Per-binary breakdown (all green, post-HORO-1146 fixes including the
+advisor-review follow-up to defect #2): cli-lib 28, `hook_cli_integration`
+9, daemon-lib 37, `daemon_unreachable` 2, `gateway_enforcement` 9,
+`mvp3_gate_evidence` 3, `preflight_integration` 3, `replan_integration` 3,
+`reservation_integration` 8 (6 original + 2 HORO-1146 regression tests:
+denied-at-admission and, after advisor review, the
+ApprovalRequired-at-admission case), `security_permissions` 3 (new),
+domain-lib 97 (96 + the cold-start-admits-under-`balanced` regression
+test), estimator-lib 32, gateway-lib 68, `auth_and_routing` 19,
+`fake_upstream` 4, `proxy_lifecycle` 27, `ssrf_and_config` 13, ledger-lib
+50, `reservation_concurrency` 3, `trajectory` 6, protocol-lib 13. Total:
+437.
 
 **Note on evidence-gathering methodology**: the full-workspace test run was
 executed via several staggered `cargo test --workspace` invocations due to a
