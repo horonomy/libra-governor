@@ -833,3 +833,84 @@ impl Policy {
 fn scale_secs(secs: u64, factor: f64) -> u64 {
     ((secs as f64) * factor).round() as u64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn quality_floor() -> CompletionContract {
+        CompletionContract::first(vec![
+            CompletionCriterion::required("all new code has passing unit tests"),
+            CompletionCriterion::optional("docs updated"),
+        ])
+    }
+
+    fn hard_resource_policy() -> Policy {
+        Policy::validated(
+            "test-hard-resource",
+            ResourceBound {
+                mode: ConstraintMode::Hard,
+                target: ResourceAmount::UsdCents(1000),
+                elastic_ceiling: None,
+                hard_ceiling: ResourceAmount::UsdCents(1000),
+            },
+            TimeBound {
+                mode: ConstraintMode::Hard,
+                target_secs: 600,
+                elastic_ceiling_secs: None,
+                hard_ceiling_secs: Some(600),
+                deadline: None,
+            },
+            quality_floor(),
+            Confidence::Medium,
+            AutonomyBoundary::AskOnApproval,
+        )
+        .expect("valid policy")
+    }
+
+    #[test]
+    fn hard_mode_admits_exactly_at_the_boundary_value() {
+        let policy = hard_resource_policy();
+        let decision = policy
+            .evaluate(ResourceAmount::UsdCents(1000), 600, Confidence::Medium)
+            .expect("compatible kind");
+        assert_eq!(decision.resource_outcome, ConstraintOutcome::Admit);
+        assert_eq!(decision.time_outcome, ConstraintOutcome::Admit);
+        assert_eq!(decision.admission, Admission::Admit);
+    }
+
+    #[test]
+    fn hard_mode_denies_exactly_one_unit_past_the_boundary() {
+        let policy = hard_resource_policy();
+        let decision = policy
+            .evaluate(ResourceAmount::UsdCents(1001), 601, Confidence::Medium)
+            .expect("compatible kind");
+        assert_eq!(
+            decision.resource_outcome,
+            ConstraintOutcome::Deny(DenyReason::ResourceExceedsHardCeiling {
+                projected: ResourceAmount::UsdCents(1001),
+                hard_ceiling: ResourceAmount::UsdCents(1000),
+            })
+        );
+        assert_eq!(
+            decision.time_outcome,
+            ConstraintOutcome::Deny(DenyReason::TimeExceedsHardCeiling {
+                projected_secs: 601,
+                hard_ceiling_secs: 600,
+            })
+        );
+        match decision.admission {
+            Admission::Deny(reasons) => assert_eq!(reasons.len(), 2),
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_mode_admits_below_the_boundary() {
+        let policy = hard_resource_policy();
+        let decision = policy
+            .evaluate(ResourceAmount::UsdCents(999), 599, Confidence::Medium)
+            .expect("compatible kind");
+        assert_eq!(decision.admission, Admission::Admit);
+    }
+}
