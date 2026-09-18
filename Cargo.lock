@@ -254,6 +254,9 @@ name = "libra-governor-estimator"
 version = "0.0.0"
 dependencies = [
  "libra-governor-domain",
+ "libra-governor-ledger",
+ "serde",
+ "serde_json",
  "time",
 ]
 
@@ -275,6 +278,7 @@ name = "libra-governor-protocol"
 version = "0.0.0"
 dependencies = [
  "libra-governor-domain",
+ "libra-governor-estimator",
  "serde",
  "serde_json",
  "thiserror",

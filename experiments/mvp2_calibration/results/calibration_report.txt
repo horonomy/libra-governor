@@ -1,0 +1,16 @@
+libra-governor calibration report
+==================================
+
+Dropped 1 locally recorded receipt(s): no usable estimate (estimate-less plan or cold-start).
+
+Duration coverage
+------------------
+insufficient data: n=2, need >= 30 non-cold-start calibration pairs. This is the honest, expected result for a pre-launch product with no real trajectory history yet.
+
+Admission replay
+-----------------
+  policy: deadline=300s, threshold_quantile=P80
+    insufficient data: n=2, need >= 30
+  policy: deadline=600s, threshold_quantile=P80
+    insufficient data: n=2, need >= 30
+

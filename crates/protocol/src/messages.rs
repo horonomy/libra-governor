@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 use libra_governor_domain::{CompletionContract, Confidence, Estimate, ExecutionReceipt, TaskId};
+use libra_governor_estimator::{AdmissionOutcome, AdmissionPolicy, CoverageReport};
 use serde::{Deserialize, Serialize};
 
 /// A request envelope: a required, non-defaulted protocol version plus
@@ -65,6 +66,13 @@ pub enum Request {
         session_id: String,
         model: Option<String>,
     },
+    /// Ask the daemon to compute real calibration evidence — duration
+    /// coverage and admission-replay metrics — over every locally
+    /// recorded receipt paired back to the estimate its plan was made
+    /// from (HORO-1132). Answered entirely from local ledger state;
+    /// never triggers new reconnaissance or any LLM call. Sent from
+    /// `libra-governor calibration report`.
+    CalibrationReport,
 }
 
 /// Summary of one bounded reconnaissance run. Never contains raw file
@@ -173,13 +181,45 @@ pub struct FinalizeResult {
     pub estimate: Option<Estimate>,
 }
 
+/// One [`AdmissionPolicy`] the daemon replayed local history against,
+/// paired with the real outcome of that replay. `CalibrationReport`
+/// carries a `Vec` of these (rather than a single `Option<AdmissionOutcome>`)
+/// because the daemon replays more than one reasonable default policy —
+/// see `handle_calibration_report` in `libra-governor-daemon`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdmissionPolicyReport {
+    pub policy: AdmissionPolicy,
+    pub outcome: AdmissionOutcome,
+}
+
+/// The result of a `CalibrationReport` request (HORO-1132): real duration
+/// coverage plus admission-replay outcomes for one or more default
+/// policies, computed over every locally recorded receipt paired back to
+/// its originating estimate. See
+/// `libra_governor_estimator::calibration` for what `coverage` and each
+/// `admission` entry can honestly say when there is not yet enough real
+/// local evidence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalibrationReportResult {
+    pub coverage: CoverageReport,
+    pub admission: Vec<AdmissionPolicyReport>,
+    /// How many locally recorded receipts were excluded from `coverage`
+    /// and `admission` because their plan carried no estimate at all, or
+    /// a cold-start one — see
+    /// `libra_governor_ledger::LedgerStore::calibration_pairs` docs.
+    /// Surfaced rather than silently dropped.
+    pub dropped_rows: usize,
+}
+
 /// One response the daemon may send back.
 ///
 /// `Preflight` is boxed: `PreflightResult` (contract draft + recon
 /// summary + `Estimate`) is materially larger than every other variant,
 /// which would otherwise trip clippy's `large_enum_variant` lint on this
 /// enum the same way it did on [`FinalizeOutcome`] — see that type's
-/// docs for the underlying reasoning.
+/// docs for the underlying reasoning. `CalibrationReport` is boxed for
+/// the same reason: it carries a full `CoverageReport` (per-quantile,
+/// per-stratum breakdowns) plus a `Vec<AdmissionPolicyReport>`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
@@ -189,6 +229,7 @@ pub enum Response {
     /// Acknowledges a fire-and-forget request (`ToolInvoked`) with no
     /// further payload.
     Ack,
+    CalibrationReport(Box<CalibrationReportResult>),
     /// The daemon could not (or would not) answer the request — e.g. a
     /// protocol version mismatch, or an internal error it caught rather
     /// than let propagate as a crash.
@@ -299,5 +340,63 @@ mod tests {
             let round_tripped: Request = serde_json::from_str(&json).unwrap();
             assert_eq!(request, round_tripped);
         }
+    }
+
+    #[test]
+    fn calibration_report_request_round_trips() {
+        let request = Request::CalibrationReport;
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(json, r#"{"kind":"calibration_report"}"#);
+        let round_tripped: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(request, round_tripped);
+    }
+
+    /// `CalibrationReportResult` embeds two internally-tagged enums of its
+    /// own (`CoverageReport` and `AdmissionOutcome`, both tagged
+    /// `"state"`) inside `Response`'s own `"kind"`-tagged enum — precisely
+    /// the shape that produced a real tag-collision bug during HORO-1126
+    /// (see [`FinalizeOutcome`]'s docs). This round-trips a full envelope
+    /// with real `Computed` variants on both nested enums to prove they
+    /// nest without colliding.
+    #[test]
+    fn calibration_report_response_round_trips_through_a_full_envelope() {
+        use libra_governor_estimator::{AdmissionStats, QuantileCoverage};
+
+        let envelope = ResponseEnvelope {
+            protocol_version: 1,
+            response: Response::CalibrationReport(Box::new(CalibrationReportResult {
+                coverage: CoverageReport::Computed {
+                    n: 40,
+                    overall: vec![QuantileCoverage {
+                        quantile: 0.5,
+                        n: 40,
+                        hits: 20,
+                        empirical_coverage: Some(0.5),
+                        pinball_loss: Some(1.5),
+                    }],
+                    by_bucket_tier: vec![],
+                    by_sample_band: vec![],
+                },
+                admission: vec![AdmissionPolicyReport {
+                    policy: AdmissionPolicy {
+                        deadline_secs: 300,
+                        threshold_quantile: 0.80,
+                    },
+                    outcome: AdmissionOutcome::Computed(AdmissionStats {
+                        n: 40,
+                        admit_count: 30,
+                        false_admit_count: 2,
+                        false_reject_count: 1,
+                        mean_overrun_secs: Some(12.5),
+                        p95_overrun_secs: Some(40.0),
+                    }),
+                }],
+                dropped_rows: 3,
+            })),
+        };
+
+        let json = serde_json::to_string(&envelope).unwrap();
+        let round_tripped: ResponseEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(envelope, round_tripped);
     }
 }

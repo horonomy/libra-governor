@@ -19,7 +19,7 @@ use libra_governor_domain::{Estimate, ResourceAmount};
 use libra_governor_protocol::{FinalizeOutcome, FinalizeResult, Request, Response};
 use serde::Deserialize;
 
-use crate::client;
+use crate::{bucket_prose::describe_bucket_tier, client};
 
 /// The subset of the Claude Code `Stop` hook payload this integration
 /// needs. `model` is included because Claude Code's `Stop` hook payload
@@ -155,8 +155,10 @@ fn format_estimate_line(estimate: &Estimate) -> String {
     let p50 = format_pair(estimate.duration_p50_secs, &estimate.resource_p50);
     let p90 = format_pair(estimate.duration_p90_secs, &estimate.resource_p90);
     format!(
-        "Estimate: P50 {p50} / P90 {p90} (confidence: {:?}, n={})",
-        estimate.confidence, estimate.sample_count
+        "Estimate: P50 {p50} / P90 {p90} (confidence: {:?}, n={}, {})",
+        estimate.confidence,
+        estimate.sample_count,
+        describe_bucket_tier(estimate.bucket_tier, estimate.sample_count),
     )
 }
 

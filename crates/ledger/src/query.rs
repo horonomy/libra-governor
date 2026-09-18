@@ -4,6 +4,7 @@ use libra_governor_domain::{
     TaskFeatures, TaskId, TaskIdentity,
 };
 use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{store::LedgerStore, LedgerError};
@@ -454,5 +455,185 @@ impl LedgerStore {
             ));
         }
         Ok(receipts)
+    }
+
+    /// Joins every locally recorded [`ExecutionReceipt`] back to the
+    /// [`Estimate`] its originating plan was actually made from — the
+    /// "receipt vs. its own estimate" pairing nothing before HORO-1132
+    /// computed. Rows are dropped (never fabricated) when the plan they
+    /// point at carries no estimate at all (a plan predating HORO-1126,
+    /// impossible in a fresh MVP 2.0 database but not in one upgraded in
+    /// place) or when the estimate is a cold-start one: a cold-start
+    /// estimate has no real bounds to be "inside" of, so including it
+    /// would be measuring nothing — the exact failure mode that made the
+    /// HORO-1127 validation corpus unusable as calibration evidence.
+    ///
+    /// Returns the kept pairs (ordered by `recorded_at` ascending) plus
+    /// the count of dropped rows, so the caller can surface that count
+    /// rather than silently discarding it.
+    pub fn calibration_pairs(&self) -> Result<(Vec<CalibrationPair>, usize), LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.actual_duration_secs, r.recorded_at, r.task_features_json, p.estimate_json
+             FROM receipts r JOIN plans p ON r.plan_id = p.id
+             ORDER BY r.recorded_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let actual_duration_secs: i64 = row.get(0)?;
+            let recorded_at: String = row.get(1)?;
+            let task_features_json: Option<String> = row.get(2)?;
+            let estimate_json: Option<String> = row.get(3)?;
+            Ok((
+                actual_duration_secs,
+                recorded_at,
+                task_features_json,
+                estimate_json,
+            ))
+        })?;
+
+        let mut pairs = Vec::new();
+        let mut dropped = 0usize;
+        for row in rows {
+            let (actual_duration_secs, recorded_at, task_features_json, estimate_json) = row?;
+
+            let Some(estimate_json) = estimate_json else {
+                dropped += 1;
+                continue;
+            };
+            let estimate: Estimate = serde_json::from_str(&estimate_json)
+                .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
+            if estimate.cold_start {
+                dropped += 1;
+                continue;
+            }
+
+            let task_features = parse_task_features(task_features_json)?;
+
+            pairs.push(CalibrationPair {
+                estimate,
+                actual_duration_secs: actual_duration_secs as u64,
+                task_features,
+                recorded_at: parse_time(&recorded_at)?,
+            });
+        }
+        Ok((pairs, dropped))
+    }
+}
+
+/// One finalized [`ExecutionReceipt`] paired with the [`Estimate`] its
+/// originating plan was actually made from — the sample set
+/// `libra-governor-estimator::calibration` computes duration coverage and
+/// admission-replay metrics from. See
+/// [`LedgerStore::calibration_pairs`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct CalibrationPair {
+    pub estimate: Estimate,
+    pub actual_duration_secs: u64,
+    /// The features the finalized receipt carried (HORO-1130), if any —
+    /// `None` for a pre-MVP-2 receipt. Kept alongside the estimate so a
+    /// caller can stratify by task class without a second query.
+    pub task_features: Option<TaskFeatures>,
+    pub recorded_at: OffsetDateTime,
+}
+
+#[cfg(test)]
+mod calibration_pairs_tests {
+    use super::*;
+    use libra_governor_domain::{BucketTier, CompletionCriterion, Confidence, TaskIdentity};
+
+    fn now() -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH
+    }
+
+    fn computed_estimate() -> Estimate {
+        Estimate {
+            duration_p50_secs: Some(30),
+            duration_p80_secs: Some(50),
+            duration_p90_secs: Some(60),
+            resource_p50: None,
+            resource_p80: None,
+            resource_p90: None,
+            confidence: Confidence::Medium,
+            sample_count: 8,
+            cold_start: false,
+            estimator_version: "v3-tiered-confidence".to_string(),
+            reason: None,
+            feature_schema_version: "fs-v1".to_string(),
+            bucket_tier: BucketTier::Global,
+        }
+    }
+
+    /// Inserts one full task -> contract -> plan -> receipt trajectory so
+    /// a `calibration_pairs()` row exists for it. `estimate` is attached
+    /// to the plan verbatim (`None` simulates a pre-HORO-1126 plan).
+    fn seed_receipt(store: &mut LedgerStore, estimate: Option<Estimate>, actual_secs: u64) {
+        let identity = TaskIdentity::new(None);
+        store.insert_task(&identity, now()).unwrap();
+        let contract = CompletionContract::first(vec![CompletionCriterion::required("c")]);
+        store
+            .insert_contract(identity.id, &contract, now())
+            .unwrap();
+
+        let mut plan = ExecutionPlan::new(identity.id, contract.revision, None, now());
+        if let Some(estimate) = estimate {
+            plan = plan.with_estimate(estimate);
+        }
+        store.insert_plan(&plan).unwrap();
+
+        let receipt = ExecutionReceipt::new(
+            identity.id,
+            contract.revision,
+            plan.id,
+            actual_secs,
+            vec![],
+            ExecutionOutcome::Unknown,
+            now(),
+        );
+        store.insert_receipt(&receipt).unwrap();
+    }
+
+    #[test]
+    fn excludes_receipts_whose_plan_has_no_estimate_at_all() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        seed_receipt(&mut store, None, 42);
+
+        let (pairs, dropped) = store.calibration_pairs().unwrap();
+        assert!(pairs.is_empty());
+        assert_eq!(dropped, 1);
+    }
+
+    #[test]
+    fn excludes_cold_start_estimates() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        seed_receipt(&mut store, Some(Estimate::cold_start()), 42);
+
+        let (pairs, dropped) = store.calibration_pairs().unwrap();
+        assert!(pairs.is_empty());
+        assert_eq!(dropped, 1);
+    }
+
+    #[test]
+    fn keeps_a_real_computed_estimate_paired_with_its_actual() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        seed_receipt(&mut store, Some(computed_estimate()), 55);
+
+        let (pairs, dropped) = store.calibration_pairs().unwrap();
+        assert_eq!(dropped, 0);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].actual_duration_secs, 55);
+        assert_eq!(pairs[0].estimate.duration_p90_secs, Some(60));
+        assert!(!pairs[0].estimate.cold_start);
+    }
+
+    #[test]
+    fn a_mix_of_rows_keeps_only_the_eligible_ones() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        seed_receipt(&mut store, Some(computed_estimate()), 10);
+        seed_receipt(&mut store, Some(computed_estimate()), 20);
+        seed_receipt(&mut store, Some(Estimate::cold_start()), 30);
+        seed_receipt(&mut store, None, 40);
+
+        let (pairs, dropped) = store.calibration_pairs().unwrap();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(dropped, 2);
     }
 }

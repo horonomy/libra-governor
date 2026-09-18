@@ -29,7 +29,7 @@ mod session;
 mod store;
 mod write;
 
-pub use query::TaskTrajectory;
+pub use query::{CalibrationPair, TaskTrajectory};
 pub use store::LedgerStore;
 
 /// Errors returned by the ledger crate.

@@ -38,7 +38,7 @@ mod task_features;
 mod task_identity;
 
 pub use completion_contract::{CompletionContract, CompletionCriterion};
-pub use confidence::Confidence;
+pub use confidence::{Confidence, MIN_CLASS_SAMPLES};
 pub use estimate::{Estimate, ESTIMATOR_VERSION};
 pub use execution_event::{ExecutionEvent, ExecutionEventKind};
 pub use execution_outcome::ExecutionOutcome;

@@ -9,7 +9,11 @@
 //! - `hook stop` — the Claude Code `Stop` hook entry point: finalizes
 //!   the session's task into an Execution Receipt (HORO-1126).
 //! - `statusline` — the Claude Code `statusLine` command.
+//! - `calibration report` — real duration-coverage and admission-replay
+//!   calibration evidence over local history (HORO-1132).
 
+mod bucket_prose;
+mod calibration_cmd;
 mod client;
 mod daemon_cmd;
 mod hook;
@@ -30,6 +34,7 @@ fn main() {
         ["hook", "post-tool-use"] => hook_post_tool_use::run(),
         ["hook", "stop"] => hook_stop::run(),
         ["statusline"] => statusline::run(),
+        ["calibration", "report"] => calibration_cmd::run(),
         _ => {
             eprintln!(
                 "libra-governor: unknown or missing subcommand\n\n\
@@ -38,7 +43,8 @@ fn main() {
                  libra-governor hook user-prompt-submit\n  \
                  libra-governor hook post-tool-use\n  \
                  libra-governor hook stop\n  \
-                 libra-governor statusline"
+                 libra-governor statusline\n  \
+                 libra-governor calibration report"
             );
             std::process::exit(2);
         }
