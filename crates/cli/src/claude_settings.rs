@@ -159,9 +159,25 @@ fn write_object_atomically(
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| SETTINGS_FILE_NAME.to_string());
-        let backup = dir.join(format!("{file_name}.libra-backup-{unix_secs}"));
-        std::fs::copy(path, &backup).map_err(io_err)?;
-        Some(backup)
+        // Two calls within the same wall-clock second (e.g. `apply`
+        // immediately followed by `remove` in a test, or two rapid CLI
+        // invocations) must never share a backup filename — a second
+        // write would silently overwrite the first backup, destroying
+        // the only copy of the user's pre-edit file. Include the pid
+        // (distinguishes concurrent processes) and then probe for the
+        // first unused suffix (distinguishes same-process, same-second,
+        // same-pid calls) rather than trusting either alone to be unique.
+        let pid = std::process::id();
+        let mut candidate = dir.join(format!("{file_name}.libra-backup-{unix_secs}-{pid}"));
+        let mut attempt = 0u32;
+        while candidate.exists() {
+            attempt += 1;
+            candidate = dir.join(format!(
+                "{file_name}.libra-backup-{unix_secs}-{pid}-{attempt}"
+            ));
+        }
+        std::fs::copy(path, &candidate).map_err(io_err)?;
+        Some(candidate)
     } else {
         None
     };
@@ -199,6 +215,10 @@ fn write_object_atomically(
 pub struct Applied {
     pub hooks_added: usize,
     pub statusline_added: bool,
+    /// `true` when `statusLine` was already present and set to something
+    /// other than this integration's own command. Left untouched rather
+    /// than overwritten — see `apply`'s doc comment.
+    pub statusline_conflict: bool,
     pub backup_path: Option<PathBuf>,
 }
 
@@ -249,12 +269,20 @@ pub fn apply(path: &Path, binary: &Path) -> Result<Applied, SettingsError> {
     }
 
     let statusline_command = format!("{binary} statusline");
-    let statusline_already_ours = root
+    let existing_statusline_command = root
         .get("statusLine")
         .and_then(|v| v.get("command"))
         .and_then(Value::as_str)
-        == Some(statusline_command.as_str());
-    let statusline_added = !statusline_already_ours;
+        .map(str::to_string);
+    let statusline_already_ours =
+        existing_statusline_command.as_deref() == Some(statusline_command.as_str());
+    // A foreign `statusLine` (any value not already ours) is left
+    // untouched — overwriting it would silently destroy a user's own
+    // statusline integration, which is exactly the kind of "conflicting
+    // config overwritten blindly" this module exists to avoid. Only an
+    // absent or already-ours `statusLine` is written.
+    let statusline_conflict = existing_statusline_command.is_some() && !statusline_already_ours;
+    let statusline_added = !statusline_already_ours && !statusline_conflict;
     if statusline_added {
         root.insert(
             "statusLine".to_string(),
@@ -266,6 +294,7 @@ pub fn apply(path: &Path, binary: &Path) -> Result<Applied, SettingsError> {
     Ok(Applied {
         hooks_added,
         statusline_added,
+        statusline_conflict,
         backup_path,
     })
 }
@@ -690,6 +719,55 @@ mod tests {
         let backup_path = removed.backup_path.expect("a backup must be written");
         let backup_bytes = std::fs::read_to_string(&backup_path).unwrap();
         assert_eq!(backup_bytes, original_bytes);
+    }
+
+    #[test]
+    fn apply_never_overwrites_a_foreign_statusline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let seed = serde_json::json!({
+            "statusLine": { "type": "command", "command": "/usr/local/bin/my-own-statusline.py" }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+
+        let applied = apply(&path, &binary()).unwrap();
+        assert!(
+            !applied.statusline_added,
+            "a foreign statusLine must not be reported as added"
+        );
+        assert!(
+            applied.statusline_conflict,
+            "a foreign statusLine must be reported as a conflict"
+        );
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            value["statusLine"]["command"], "/usr/local/bin/my-own-statusline.py",
+            "the foreign statusLine must survive install byte-for-byte in content"
+        );
+    }
+
+    #[test]
+    fn backup_filenames_never_collide_within_the_same_apply_remove_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{}").unwrap();
+
+        let applied = apply(&path, &binary()).unwrap();
+        let removed = remove(&path).unwrap();
+
+        let apply_backup = applied.backup_path.expect("apply must back up the file");
+        let remove_backup = removed.backup_path.expect("remove must back up the file");
+        assert_ne!(
+            apply_backup, remove_backup,
+            "two backups written in quick succession must never share a path"
+        );
+        assert!(
+            apply_backup.exists(),
+            "the first backup must survive the second write"
+        );
+        assert!(remove_backup.exists());
     }
 
     #[test]

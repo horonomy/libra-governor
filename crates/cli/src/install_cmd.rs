@@ -46,11 +46,21 @@ pub fn run() {
             );
             println!("  hooks added:      {}", applied.hooks_added);
             println!("  statusline added: {}", applied.statusline_added);
+            if applied.statusline_conflict {
+                println!(
+                    "  statusline:       left untouched — a non-Governor statusLine is already configured"
+                );
+            }
             if let Some(backup) = &applied.backup_path {
                 println!("  backup written:   {}", backup.display());
             }
             write_install_marker(&binary);
             println!();
+            if applied.statusline_conflict {
+                println!(
+                    "Note: your existing statusLine was not replaced. Run `libra-governor doctor` for details."
+                );
+            }
             println!("Next: submit a prompt in Claude Code, then run `libra-governor doctor`.");
         }
         Err(e) => {
