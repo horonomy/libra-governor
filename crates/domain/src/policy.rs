@@ -1130,4 +1130,190 @@ mod tests {
             .expect("compatible kind");
         assert!(decision.confidence_ok);
     }
+
+    fn preset_inputs() -> PolicyPresetInputs {
+        PolicyPresetInputs {
+            resource_target: ResourceAmount::UsdCents(1000),
+            time_target_secs: 600,
+            quality_floor: quality_floor(),
+        }
+    }
+
+    #[test]
+    fn deadline_first_preserves_quality_floor_while_spending_more() {
+        let balanced = Policy::balanced(preset_inputs()).expect("valid policy");
+        let deadline_first = Policy::deadline_first(preset_inputs()).expect("valid policy");
+
+        // The quality floor is identical, byte-for-byte — deadline
+        // pressure never relaxes required criteria.
+        assert_eq!(balanced.quality_floor, deadline_first.quality_floor);
+        assert_eq!(
+            balanced
+                .quality_floor
+                .required_criteria()
+                .collect::<Vec<_>>(),
+            deadline_first
+                .quality_floor
+                .required_criteria()
+                .collect::<Vec<_>>(),
+        );
+
+        // A spend that balanced's Elastic band would already push into
+        // ApprovalRequired territory is still a clean Admit under
+        // deadline_first's wider, pre-authorized cost elasticity.
+        let projected_spend = ResourceAmount::UsdCents(1400);
+        let time_within_both_targets = 600;
+
+        let balanced_decision = balanced
+            .evaluate(projected_spend, time_within_both_targets, Confidence::Medium)
+            .expect("compatible kind");
+        let deadline_first_decision = deadline_first
+            .evaluate(projected_spend, time_within_both_targets, Confidence::Medium)
+            .expect("compatible kind");
+
+        assert!(
+            matches!(
+                balanced_decision.resource_outcome,
+                ConstraintOutcome::ApprovalRequired(_)
+            ),
+            "expected balanced's narrower cost band to require approval at 1400, got {:?}",
+            balanced_decision.resource_outcome
+        );
+        assert_eq!(
+            deadline_first_decision.resource_outcome,
+            ConstraintOutcome::Admit,
+            "expected deadline_first's wider cost band to admit 1800 cleanly"
+        );
+        assert_eq!(deadline_first_decision.admission, Admission::Admit);
+
+        // Both decisions protect exactly the same required criteria —
+        // spending more within pre-authorized bounds never touched them.
+        assert_eq!(
+            balanced_decision.protected_criteria,
+            deadline_first_decision.protected_criteria
+        );
+        assert_eq!(
+            deadline_first_decision.protected_criteria,
+            deadline_first
+                .quality_floor
+                .required_criteria()
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn deadline_first_time_bound_is_tighter_than_balanced() {
+        let balanced = Policy::balanced(preset_inputs()).expect("valid policy");
+        let deadline_first = Policy::deadline_first(preset_inputs()).expect("valid policy");
+
+        assert_eq!(deadline_first.time.mode, ConstraintMode::Hard);
+        assert_eq!(
+            deadline_first.time.hard_ceiling_secs,
+            Some(preset_inputs().time_target_secs),
+            "deadline_first's time hard ceiling has zero slack above target"
+        );
+        assert!(
+            deadline_first.time.hard_ceiling_secs.unwrap()
+                < balanced.time.hard_ceiling_secs.unwrap(),
+            "deadline_first must be at least as tight on time as balanced"
+        );
+    }
+
+    #[test]
+    fn quality_invariant_required_criteria_survive_a_tight_projected_budget() {
+        // A policy whose quality floor has many required criteria and a
+        // Hard resource bound with essentially no room at all.
+        let many_required = CompletionContract::first(vec![
+            CompletionCriterion::required("criterion 1"),
+            CompletionCriterion::required("criterion 2"),
+            CompletionCriterion::required("criterion 3"),
+            CompletionCriterion::optional("nice to have"),
+        ]);
+        let policy = Policy::validated(
+            "tight-budget",
+            ResourceBound {
+                mode: ConstraintMode::Hard,
+                target: ResourceAmount::UsdCents(1),
+                elastic_ceiling: None,
+                hard_ceiling: ResourceAmount::UsdCents(1),
+            },
+            TimeBound {
+                mode: ConstraintMode::Hard,
+                target_secs: 1,
+                elastic_ceiling_secs: None,
+                hard_ceiling_secs: Some(1),
+                deadline: None,
+            },
+            many_required.clone(),
+            Confidence::Low,
+            AutonomyBoundary::ConfirmEachStep,
+        )
+        .expect("valid policy");
+
+        // Even a projection that blows through every bound...
+        let decision = policy
+            .evaluate(ResourceAmount::UsdCents(1_000_000), 1_000_000, Confidence::Low)
+            .expect("compatible kind");
+        assert!(matches!(decision.admission, Admission::Deny(_)));
+
+        // ...still reports the full, untrimmed set of required criteria.
+        // There is no code path — and, structurally, no parameter — by
+        // which evaluate() could have dropped one to "make it fit".
+        let expected: Vec<_> = many_required.required_criteria().cloned().collect();
+        assert_eq!(expected.len(), 3);
+        assert_eq!(decision.protected_criteria, expected);
+
+        // And a comfortably-within-bounds projection reports the exact
+        // same set — the criteria are not a function of the projection.
+        let admitting_decision = policy
+            .evaluate(ResourceAmount::UsdCents(1), 1, Confidence::Low)
+            .expect("compatible kind");
+        assert_eq!(admitting_decision.admission, Admission::Admit);
+        assert_eq!(admitting_decision.protected_criteria, expected);
+    }
+
+    #[test]
+    fn presets_are_deterministic_and_inspectable() {
+        let a = Policy::balanced(preset_inputs()).expect("valid policy");
+        let b = Policy::balanced(preset_inputs()).expect("valid policy");
+        assert_eq!(a, b, "same preset name + inputs must produce an identical Policy value");
+
+        assert_eq!(
+            a,
+            Policy {
+                policy_schema_version: POLICY_SCHEMA_VERSION.to_string(),
+                name: "balanced".to_string(),
+                resource: ResourceBound {
+                    mode: ConstraintMode::Elastic,
+                    target: ResourceAmount::UsdCents(1000),
+                    elastic_ceiling: Some(ResourceAmount::UsdCents(1250)),
+                    hard_ceiling: ResourceAmount::UsdCents(1500),
+                },
+                time: TimeBound {
+                    mode: ConstraintMode::Elastic,
+                    target_secs: 600,
+                    elastic_ceiling_secs: Some(750),
+                    hard_ceiling_secs: Some(900),
+                    deadline: None,
+                },
+                quality_floor: quality_floor(),
+                min_confidence: Confidence::Medium,
+                autonomy: AutonomyBoundary::AskOnApproval,
+            },
+            "balanced must compile to exactly this concrete Policy value, no hidden logic"
+        );
+    }
+
+    #[test]
+    fn policy_schema_version_propagates_from_policy_to_decision() {
+        let policy = hard_resource_policy();
+        assert_eq!(policy.policy_schema_version, POLICY_SCHEMA_VERSION);
+
+        let decision = policy
+            .evaluate(ResourceAmount::UsdCents(1), 1, Confidence::Medium)
+            .expect("compatible kind");
+        assert_eq!(decision.policy_schema_version, POLICY_SCHEMA_VERSION);
+        assert_eq!(decision.policy_schema_version, policy.policy_schema_version);
+    }
 }
