@@ -63,7 +63,8 @@ pub enum ConstraintMode {
     /// No admission when the projected requirement would exceed the hard
     /// ceiling. There is no band: a `Hard` constraint carries no elastic
     /// ceiling (validated at construction — see
-    /// [`PolicyValidationError::ElasticCeilingNotAllowedForMode`]).
+    /// [`PolicyValidationError::ResourceElasticCeilingSetForMode`] and
+    /// [`PolicyValidationError::TimeElasticCeilingSetForMode`]).
     Hard,
     /// Work is pre-authorized within `target..=elastic_ceiling`.
     /// Projections beyond the elastic ceiling but within the hard
@@ -81,7 +82,7 @@ pub enum ConstraintMode {
 /// (HORO-1137).
 ///
 /// `target`, `elastic_ceiling`, and `hard_ceiling` must share the same
-/// [`ResourceKind`] — validated by [`Policy::validate`]
+/// [`ResourceKind`] — validated by [`Policy::validated`]
 /// ([`PolicyValidationError::ResourceKindMismatch`]) rather than left to
 /// crash later inside [`Policy::evaluate`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -227,10 +228,7 @@ pub enum PolicyValidationError {
         hard_ceiling_secs: u64,
     },
     #[error("time elastic ceiling {elastic_secs}s is below target {target_secs}s")]
-    TimeElasticCeilingBelowTarget {
-        target_secs: u64,
-        elastic_secs: u64,
-    },
+    TimeElasticCeilingBelowTarget { target_secs: u64, elastic_secs: u64 },
     #[error("time elastic ceiling {elastic_secs}s exceeds hard ceiling {hard_ceiling_secs}s")]
     TimeElasticCeilingAboveHardCeiling {
         elastic_secs: u64,
@@ -381,7 +379,9 @@ impl Policy {
 
         match (time.mode, time.elastic_ceiling_secs) {
             (ConstraintMode::Elastic, None) => {
-                return Err(PolicyValidationError::TimeElasticModeMissingCeiling { mode: time.mode })
+                return Err(PolicyValidationError::TimeElasticModeMissingCeiling {
+                    mode: time.mode,
+                })
             }
             (ConstraintMode::Hard | ConstraintMode::Approval, Some(_)) => {
                 return Err(PolicyValidationError::TimeElasticCeilingSetForMode { mode: time.mode })
@@ -1095,7 +1095,11 @@ mod tests {
         .expect("valid policy");
 
         let decision = policy
-            .evaluate(ResourceAmount::UsdCents(1000), 1_000_000, Confidence::Medium)
+            .evaluate(
+                ResourceAmount::UsdCents(1000),
+                1_000_000,
+                Confidence::Medium,
+            )
             .expect("compatible kind");
         assert!(matches!(
             decision.time_outcome,
@@ -1165,10 +1169,18 @@ mod tests {
         let time_within_both_targets = 600;
 
         let balanced_decision = balanced
-            .evaluate(projected_spend, time_within_both_targets, Confidence::Medium)
+            .evaluate(
+                projected_spend,
+                time_within_both_targets,
+                Confidence::Medium,
+            )
             .expect("compatible kind");
         let deadline_first_decision = deadline_first
-            .evaluate(projected_spend, time_within_both_targets, Confidence::Medium)
+            .evaluate(
+                projected_spend,
+                time_within_both_targets,
+                Confidence::Medium,
+            )
             .expect("compatible kind");
 
         assert!(
@@ -1253,7 +1265,11 @@ mod tests {
 
         // Even a projection that blows through every bound...
         let decision = policy
-            .evaluate(ResourceAmount::UsdCents(1_000_000), 1_000_000, Confidence::Low)
+            .evaluate(
+                ResourceAmount::UsdCents(1_000_000),
+                1_000_000,
+                Confidence::Low,
+            )
             .expect("compatible kind");
         assert!(matches!(decision.admission, Admission::Deny(_)));
 
@@ -1277,7 +1293,10 @@ mod tests {
     fn presets_are_deterministic_and_inspectable() {
         let a = Policy::balanced(preset_inputs()).expect("valid policy");
         let b = Policy::balanced(preset_inputs()).expect("valid policy");
-        assert_eq!(a, b, "same preset name + inputs must produce an identical Policy value");
+        assert_eq!(
+            a, b,
+            "same preset name + inputs must produce an identical Policy value"
+        );
 
         assert_eq!(
             a,
