@@ -1408,7 +1408,11 @@ mod tests {
         let inputs = preset_inputs();
 
         let decision = policy
-            .evaluate(inputs.resource_target, inputs.time_target_secs, Confidence::Low)
+            .evaluate(
+                inputs.resource_target,
+                inputs.time_target_secs,
+                Confidence::Low,
+            )
             .expect("compatible kind");
 
         assert!(

@@ -385,3 +385,103 @@ fn receipt_survives_daemon_restart_and_is_queryable() {
     );
     assert_eq!(trajectory.receipts[0].task_id, task_id);
 }
+
+/// HORO-1146 defect #3 regression: before this ticket, `daemon run`
+/// hardcoded `Policy::balanced()` and `gateway: None` with no way for a
+/// real user to select a different preset or turn the gateway on. This
+/// drives the REAL compiled `libra-governor` binary end to end — a
+/// `config.json` written into the daemon's own state directory (the
+/// same directory `hook user-prompt-submit` spawns the daemon against),
+/// selecting `deadline_first` and a gateway in
+/// `pass_through_subscription` mode — and confirms both were actually
+/// loaded by the running daemon, not merely that parsing succeeded:
+///
+/// - the policy: by opening the real, on-disk SQLite ledger the daemon
+///   wrote to and reading back `task_budgets.policy.name`, the exact
+///   `Policy` the real admission decision was made against;
+/// - the gateway: via a real `Request::GatewayStatus` round trip (the
+///   `libra-governor gateway status` subcommand), which re-validates the
+///   live `DaemonConfig.gateway` rather than a cached startup result.
+#[test]
+fn daemon_loads_a_non_default_policy_and_gateway_from_config_json() {
+    let state_dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
+    std::fs::create_dir_all(repo.path().join("src")).unwrap();
+    std::fs::write(repo.path().join("src/login.rs"), "// login").unwrap();
+
+    let token_path = state_dir.path().join("gateway.token");
+    std::fs::write(
+        state_dir.path().join("config.json"),
+        serde_json::json!({
+            "policy": {
+                "preset": "deadline_first",
+                "resource_target_tokens": 50_000,
+                "time_target_secs": 1200
+            },
+            "gateway": {
+                "bind_addr": "127.0.0.1:0",
+                "token_path": token_path,
+                "credential_mode": "pass_through_subscription"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let session_id = "config-file-session";
+    let payload = serde_json::json!({
+        "session_id": session_id,
+        "cwd": repo.path(),
+        "prompt": "fix the login bug",
+        "hook_event_name": "UserPromptSubmit",
+        "transcript_path": "/tmp/does-not-matter.jsonl",
+    })
+    .to_string();
+
+    let (output, _) = run_hook(state_dir.path(), &payload);
+    assert!(
+        output.status.success(),
+        "hook must succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Policy half: read the real on-disk ledger the real daemon process
+    // wrote to.
+    let ledger_path = state_dir.path().join("ledger.sqlite3");
+    let store = libra_governor_ledger::LedgerStore::open(&ledger_path).unwrap();
+    let task_id = store
+        .task_id_for_session(session_id)
+        .unwrap()
+        .expect("session must have resolved a task during preflight");
+    let budget = store
+        .task_budget(task_id)
+        .unwrap()
+        .expect("a preflight always initializes a task_budgets row");
+    assert_eq!(
+        budget.policy.name, "deadline_first",
+        "the daemon must have admitted this task against the config.json-selected preset, \
+         not the hardcoded balanced default"
+    );
+    assert_eq!(
+        budget.policy.resource.target,
+        libra_governor_domain::ResourceAmount::Tokens(50_000),
+        "the config.json-supplied resource_target_tokens must have reached the real Policy"
+    );
+
+    // Gateway half: a real GatewayStatus round trip.
+    let (status_output, _) = run_subcommand(&["gateway", "status"], state_dir.path(), "");
+    assert!(
+        status_output.status.success(),
+        "gateway status must succeed; stderr: {}",
+        String::from_utf8_lossy(&status_output.stderr)
+    );
+    let status_text = String::from_utf8_lossy(&status_output.stdout);
+    assert!(
+        status_text.contains("State:      running on 127.0.0.1:0"),
+        "gateway status must report the gateway as running on the config.json-configured \
+         bind_addr, got: {status_text}"
+    );
+
+    kill_daemon_for(state_dir.path());
+}

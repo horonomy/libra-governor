@@ -25,15 +25,37 @@ pub fn run() {
         }
     };
 
+    let log_path = state_dir.join("daemon.log");
+
+    // Optional, additive `config.json` overrides (HORO-1146): selects a
+    // non-default Policy preset and/or turns the gateway on. Absent or
+    // partially specified is not an error — see
+    // `libra_governor_daemon::config_file` module docs — and a present
+    // but invalid file falls back to today's hardcoded defaults rather
+    // than aborting startup, logged so it is visible rather than silent.
+    let (policy, gateway) = match libra_governor_daemon::config_file::load_overrides(&state_dir) {
+        Ok((policy, gateway)) => (policy, gateway),
+        Err(e) => {
+            libra_governor_daemon::log::append_line(
+                &log_path,
+                &format!(
+                    "daemon: {} rejected — falling back to default policy/gateway: {e}",
+                    libra_governor_daemon::config_file::CONFIG_FILE_NAME
+                ),
+            );
+            (None, None)
+        }
+    };
+
     let config = DaemonConfig {
         socket_path: state_dir.join("daemon.sock"),
         ledger_path: state_dir.join("ledger.sqlite3"),
-        log_path: state_dir.join("daemon.log"),
+        log_path,
         recon_budget: ReconBudget::default(),
         replan_hysteresis: ReplanHysteresisConfig::default(),
-        policy: libra_governor_daemon::default_admission_policy(),
+        policy: policy.unwrap_or_else(libra_governor_daemon::default_admission_policy),
         reservation_ttl_secs: DEFAULT_RESERVATION_TTL_SECS,
-        gateway: None,
+        gateway,
         gateway_stats: std::sync::Arc::new(Default::default()),
         gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER.to_string(),
     };

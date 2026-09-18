@@ -358,6 +358,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "time",
+ "uuid",
 ]
 
 [[package]]
@@ -369,6 +370,7 @@ dependencies = [
  "libra-governor-gateway",
  "libra-governor-ledger",
  "libra-governor-protocol",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",
