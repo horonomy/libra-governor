@@ -1,14 +1,23 @@
 name: Phase 0 estimator harness CI
 
+# The path filter is a deliberate cost control: this harness is only relevant to
+# experiments/phase0. The workflow's own path is listed as well, because this
+# workflow is the only check on its own correctness - without it, a YAML syntax
+# error (which GitHub rejects at parse time as a 0-job, 0-second run), a broken
+# install step, or a regression to the permissions block below all merge green.
+# Deliberately not widened any further, so an unrelated change still does not
+# start this job.
 on:
   push:
     branches: [main]
     paths:
       - "experiments/phase0/**"
+      - ".github/workflows/phase0-ci.yml"
   pull_request:
     branches: [main]
     paths:
       - "experiments/phase0/**"
+      - ".github/workflows/phase0-ci.yml"
 
 defaults:
   run:
