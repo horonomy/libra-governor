@@ -29,6 +29,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import shutil
@@ -177,12 +178,22 @@ class Matrix:
         env["LIBRA_GOVERNOR_STATE_DIR"] = str(state_dir)
         return env, state_dir
 
-    # --- Scenario 1: balanced policy, normal on-budget completion -----
-    def scenario_1_balanced_on_budget_completion(self):
-        env, state_dir = self.fresh_env("s1-balanced")
+    @contextlib.contextmanager
+    def running_daemon(self, env, state_dir):
+        """Spawns a real daemon, waits for its socket, always kills it on
+        exit -- the setup/teardown every scenario needs (deduplicated to
+        satisfy the release gate's own duplication check, HORO-1146)."""
         daemon = spawn_daemon(self.binary, env)
         try:
             assert wait_for_socket(state_dir), "daemon never bound its socket"
+            yield daemon
+        finally:
+            kill_any_daemon(state_dir, proc=daemon)
+
+    # --- Scenario 1: balanced policy, normal on-budget completion -----
+    def scenario_1_balanced_on_budget_completion(self):
+        env, state_dir = self.fresh_env("s1-balanced")
+        with self.running_daemon(env, state_dir):
             sid = f"s1-{uuid.uuid4()}"
             p = preflight(self.binary, env, sid, FIXTURES / "rust-crate", "add input validation")
             preflight_ok = p.returncode == 0 and "task " in p.stdout
@@ -208,15 +219,11 @@ class Matrix:
                 f"preflight additionalContext (verbatim): {p.stdout.strip()!r}. "
                 f"stop stderr (verbatim): {s.stderr.strip()!r}",
             )
-        finally:
-            kill_any_daemon(state_dir, proc=daemon)
 
     # --- Scenario 5: material unexpected failure -> real replan -------
     def scenario_5_material_event_triggers_a_real_replan(self):
         env, state_dir = self.fresh_env("s5-replan")
-        daemon = spawn_daemon(self.binary, env)
-        try:
-            assert wait_for_socket(state_dir), "daemon never bound its socket"
+        with self.running_daemon(env, state_dir):
             sid = f"s5-{uuid.uuid4()}"
             preflight(self.binary, env, sid, FIXTURES / "rust-crate", "refactor the pagination module")
 
@@ -247,8 +254,6 @@ class Matrix:
                 f"replan_events before={before_count}, after={after_count} (rows: {after_events}). "
                 f"statusline (verbatim): {st.stdout.strip()!r}",
             )
-        finally:
-            kill_any_daemon(state_dir, proc=daemon)
 
     # --- Scenario 9: daemon crash mid-reservation, restart, reconcile -
     def scenario_9_daemon_crash_restart_reconciliation(self):
@@ -356,6 +361,8 @@ def main():
     args = ap.parse_args()
 
     binary = Path(args.binary).resolve()
+    if not (binary.is_file() and os.access(binary, os.X_OK)):
+        raise SystemExit(f"--binary does not point at an executable file: {binary}")
     work_root = Path(args.work_root).resolve()
     work_root.mkdir(parents=True, exist_ok=True)
 
