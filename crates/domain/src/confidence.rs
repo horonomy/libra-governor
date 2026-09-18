@@ -29,7 +29,13 @@ pub const MIN_CLASS_SAMPLES: usize = 5;
 
 /// How much a producer trusts a result it computed without human
 /// confirmation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Derives `PartialOrd`/`Ord` (HORO-1137) in declaration order
+/// (`Low < Medium < High`) so policy admission thresholds
+/// (`crate::policy::Policy::min_confidence`) can compare an estimate's
+/// actual confidence against a required minimum with `>=` rather than a
+/// hand-rolled match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Confidence {
     /// Insufficient evidence: an explicit reason is carried alongside
