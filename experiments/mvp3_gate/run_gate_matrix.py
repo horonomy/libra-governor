@@ -30,9 +30,9 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib.util
 import json
 import os
-import shutil
 import signal
 import sqlite3
 import subprocess
@@ -42,6 +42,19 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = REPO_ROOT / "experiments" / "mvp1_validation" / "fixtures"
+
+# Reuse the harness scaffolding (Matrix.__init__/record/fresh_env) from
+# HORO-1127's run_validation_matrix.py rather than redefining it -- this
+# harness deliberately follows that exact pattern (see module docstring),
+# and duplicating those methods verbatim tripped the release gate's own
+# SonarCloud new-code duplication check (HORO-1146).
+_mvp1_spec = importlib.util.spec_from_file_location(
+    "_mvp1_run_validation_matrix",
+    REPO_ROOT / "experiments" / "mvp1_validation" / "run_validation_matrix.py",
+)
+_mvp1_module = importlib.util.module_from_spec(_mvp1_spec)
+_mvp1_spec.loader.exec_module(_mvp1_module)
+_BaseMatrix = _mvp1_module.Matrix
 
 SOCKET_FILENAME = "daemon.sock"
 LEDGER_FILENAME = "ledger.sqlite3"
@@ -159,24 +172,13 @@ def kill_any_daemon(state_dir, proc=None, sig=signal.SIGKILL):
         pass
 
 
-class Matrix:
-    def __init__(self, binary: Path, work_root: Path):
-        self.binary = binary
-        self.work_root = work_root
-        self.results: dict[str, dict] = {}
-
-    def record(self, name, passed, detail):
-        self.results[name] = {"passed": passed, "detail": detail}
-        print(f"[{'PASS' if passed else 'FAIL'}] {name}: {detail}")
-
-    def fresh_env(self, tag):
-        state_dir = self.work_root / f"state-{tag}"
-        if state_dir.exists():
-            shutil.rmtree(state_dir)
-        state_dir.mkdir(parents=True, exist_ok=True)
-        env = dict(os.environ)
-        env["LIBRA_GOVERNOR_STATE_DIR"] = str(state_dir)
-        return env, state_dir
+class Matrix(_BaseMatrix):
+    """Reuses `_BaseMatrix.__init__`/`record`/`fresh_env` from
+    experiments/mvp1_validation/run_validation_matrix.py (HORO-1127) --
+    this harness follows the exact same pattern by construction (see the
+    module docstring), so subclassing instead of redefining those three
+    methods avoids the cross-file duplication SonarCloud's new-code gate
+    flagged on PR #21 (HORO-1146)."""
 
     @contextlib.contextmanager
     def running_daemon(self, env, state_dir):
