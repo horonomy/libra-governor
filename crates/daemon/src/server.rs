@@ -780,19 +780,24 @@ fn handle_tool_invoked(
     let reason = ReplanReason::new(trigger, detail);
 
     // HORO-1146 gate finding #2: the plan this replan is about to
-    // supersede may itself have been Denied at its own preflight — work
-    // still proceeds after a Deny (hooks are advisory-only, ADR 0001),
-    // so a task reaching this replan trigger with a denied plan is
-    // expected, not a bug to filter upstream. What must not happen is
-    // this replan silently committing real ledger capacity
-    // (`ReservationClass::RequiredWork`) on behalf of a task that was
-    // never actually authorized to spend it. The prior plan's admission
-    // is carried forward onto the new plan (rather than defaulting to
-    // `None`) so a second, later replan in the same denied chain also
-    // sees the denial and also skips reserving, instead of the signal
-    // being lost the moment this replan's own plan is superseded in
-    // turn.
-    let was_denied = matches!(plan.admission, Some(Admission::Deny(_)));
+    // supersede may itself have been Denied, or left ApprovalRequired,
+    // at its own preflight — work still proceeds after either outcome
+    // (hooks are advisory-only, ADR 0001), so a task reaching this
+    // replan trigger with a non-admitted plan is expected, not a bug to
+    // filter upstream. What must not happen is this replan silently
+    // committing real ledger capacity (`ReservationClass::RequiredWork`)
+    // on behalf of a task that was never actually authorized to spend
+    // it — `handle_preflight` writes no reservation for either Deny or
+    // ApprovalRequired, so the replan path must honor the same rule for
+    // both, not just Deny. The prior plan's admission is carried forward
+    // onto the new plan (rather than defaulting to `None`) so a second,
+    // later replan in the same non-admitted chain also sees it and also
+    // skips reserving, instead of the signal being lost the moment this
+    // replan's own plan is superseded in turn.
+    let was_not_admitted = matches!(
+        plan.admission,
+        Some(Admission::Deny(_)) | Some(Admission::ApprovalRequired(_))
+    );
     let mut new_plan = ExecutionPlan::new(
         task_id,
         plan.contract_revision,
@@ -849,19 +854,20 @@ fn handle_tool_invoked(
                 ResourceAmount::from_kind_f64(budget.resource_kind, work_envelope_value);
             // Same mutual exclusion as `handle_preflight`'s: with the
             // gateway on, the per-request reservations are the envelope.
-            if was_denied {
+            if was_not_admitted {
                 // HORO-1146 gate finding #2: the plan this replan
-                // supersedes was Denied at its own preflight — do not
-                // reserve capacity on behalf of a task that was never
-                // admitted. The Completion Reserve adjustment above still
-                // runs (it protects required completion work regardless
-                // of admission outcome); only this optional-work
-                // reservation is skipped.
+                // supersedes was Denied or left ApprovalRequired at its
+                // own preflight — do not reserve capacity on behalf of a
+                // task that was never actually admitted. The Completion
+                // Reserve adjustment above still runs (it protects
+                // required completion work regardless of admission
+                // outcome); only this optional-work reservation is
+                // skipped.
                 log::append_line(
                     &config.log_path,
                     &format!(
                         "task {task_id}: replan skipped reserving the recomputed work envelope \
-                         — the plan being replaced was Denied at admission"
+                         — the plan being replaced was not admitted (Deny or ApprovalRequired)"
                     ),
                 );
             } else if config.gateway.is_some() {

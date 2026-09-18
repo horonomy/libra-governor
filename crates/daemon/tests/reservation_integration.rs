@@ -15,8 +15,8 @@ use libra_governor_daemon::{recon::ReconBudget, DaemonConfig};
 use libra_governor_domain::{
     Admission, AutonomyBoundary, CompletionContract, CompletionCriterion, Confidence,
     ConstraintMode, ExecutionOutcome, ExecutionPlan, ExecutionReceipt, Policy, PolicyPresetInputs,
-    ReplanHysteresisConfig, ReservationClass, ResourceAmount, ResourceBound, TaskIdentity,
-    TimeBound,
+    ReplanHysteresisConfig, ReservationClass, ReservationState, ResourceAmount, ResourceBound,
+    TaskIdentity, TimeBound,
 };
 use libra_governor_ledger::{LedgerStore, ReserveOutcome, ReserveRequest};
 use libra_governor_protocol::{
@@ -727,5 +727,179 @@ fn a_material_event_replan_does_not_reserve_capacity_for_a_task_denied_at_admiss
         required_work.is_empty(),
         "the replan must not reserve capacity for a task whose original admission was \
          Denied, but found: {required_work:?}"
+    );
+}
+
+#[test]
+fn a_material_event_replan_does_not_reserve_capacity_for_a_task_left_approval_required() {
+    // Same HORO-1146 gate finding #2, but for the OTHER non-admitted
+    // outcome: `Admission::ApprovalRequired`. `handle_preflight` already
+    // writes no reservation for ApprovalRequired (see
+    // `admission_approval_required_writes_no_reservation` above); this
+    // proves the replan path honors the same rule, not just Deny — an
+    // advisor review pass caught that the original fix's `was_denied`
+    // guard matched only `Admission::Deny(_)`, silently missing
+    // `ApprovalRequired`, which is the same defect with a different
+    // discriminant.
+    let dir = tempfile::tempdir().unwrap();
+    let policy = Policy::validated(
+        "approval-test",
+        ResourceBound {
+            mode: ConstraintMode::Approval,
+            target: ResourceAmount::Tokens(100),
+            elastic_ceiling: None,
+            hard_ceiling: ResourceAmount::Tokens(1_000_000),
+        },
+        TimeBound {
+            mode: ConstraintMode::Approval,
+            target_secs: 600,
+            elastic_ceiling_secs: None,
+            hard_ceiling_secs: None,
+            deadline: None,
+        },
+        CompletionContract::first(vec![CompletionCriterion::required(
+            "required verification (tests/build/lint) passes",
+        )]),
+        Confidence::Low,
+        AutonomyBoundary::AskOnApproval,
+    )
+    .unwrap();
+    let config = base_config(dir.path(), policy);
+    let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
+    let mut current_task = None;
+    let listener = libra_governor_daemon::bind_or_detect_running(&config.socket_path).unwrap();
+    let socket_path = dir.path().join("d.sock");
+
+    let first = match send(
+        &listener,
+        &socket_path,
+        &mut ledger,
+        &mut current_task,
+        &config,
+        Request::Preflight {
+            task_hint: "fix the login bug".to_string(),
+            cwd: fixture_repo(),
+            session_id: "approval-replan-session".to_string(),
+        },
+    ) {
+        Response::Preflight(result) => *result,
+        other => panic!("expected a Preflight response, got {other:?}"),
+    };
+    assert_eq!(
+        first.admission.as_ref().map(|d| &d.admission),
+        Some(&Admission::Admit)
+    );
+
+    // Same setup as `admission_approval_required_writes_no_reservation`:
+    // an unrelated committed reservation pushes the SECOND preflight's
+    // projection past target (but under the hard ceiling), landing on
+    // ApprovalRequired.
+    let now = time::OffsetDateTime::now_utc();
+    let ReserveOutcome::Granted(_) = ledger
+        .reserve(ReserveRequest {
+            task_id: first.task_id,
+            session_id: "approval-replan-session",
+            plan_id: None,
+            class: ReservationClass::OptionalWork,
+            amount: ResourceAmount::Tokens(150),
+            idempotency_key: "unrelated-committed-work",
+            now,
+            ttl_secs: 900,
+        })
+        .unwrap()
+    else {
+        panic!("test setup: the unrelated reservation must be grantable");
+    };
+
+    let second = match send(
+        &listener,
+        &socket_path,
+        &mut ledger,
+        &mut current_task,
+        &config,
+        Request::Preflight {
+            task_hint: "fix the login bug, part two".to_string(),
+            cwd: fixture_repo(),
+            session_id: "approval-replan-session".to_string(),
+        },
+    ) {
+        Response::Preflight(result) => *result,
+        other => panic!("expected a Preflight response, got {other:?}"),
+    };
+    assert!(
+        matches!(
+            second.admission.as_ref().map(|d| &d.admission),
+            Some(Admission::ApprovalRequired(_))
+        ),
+        "committed capacity pushing the projection past target (but under the hard ceiling) \
+         must require approval, got {:?}",
+        second.admission
+    );
+    assert!(
+        ledger
+            .reservations_for_task(second.task_id)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.plan_id == Some(second.plan_id))
+            .collect::<Vec<_>>()
+            .is_empty(),
+        "no reservation should exist yet for the ApprovalRequired plan"
+    );
+
+    // 4 consecutive invocations of the SAME tool crosses the
+    // `PossibleToolLoop` streak threshold and triggers a real replan.
+    for _ in 0..4 {
+        let response = send(
+            &listener,
+            &socket_path,
+            &mut ledger,
+            &mut current_task,
+            &config,
+            Request::ToolInvoked {
+                session_id: "approval-replan-session".to_string(),
+                tool_name: "Bash".to_string(),
+            },
+        );
+        assert_eq!(response, Response::Ack);
+    }
+
+    let status = match send(
+        &listener,
+        &socket_path,
+        &mut ledger,
+        &mut current_task,
+        &config,
+        Request::Status,
+    ) {
+        Response::Status(status) => status,
+        other => panic!("expected a Status response, got {other:?}"),
+    };
+    let summary = status
+        .current_task
+        .expect("a task was preflighted; Status must reflect it");
+    assert_eq!(
+        summary.replan_state,
+        ReplanState::Replanned { count: 1 },
+        "the material-event replan must still fire for an ApprovalRequired task — hooks are \
+         advisory-only (ADR 0001), so work still proceeds"
+    );
+
+    // Filtered to `Active` (not just `RequiredWork`): the FIRST preflight
+    // above legitimately Admitted and reserved capacity for plan A, and
+    // the SECOND preflight's own supersede step correctly `Release`d it
+    // (ordinary lifecycle, not the bug under test) — an unfiltered class
+    // check would misreport that expected, already-released reservation
+    // as evidence of the defect.
+    let reservations = ledger.reservations_for_task(second.task_id).unwrap();
+    let active_required_work: Vec<_> = reservations
+        .iter()
+        .filter(|r| {
+            r.class == ReservationClass::RequiredWork && r.state == ReservationState::Active
+        })
+        .collect();
+    assert!(
+        active_required_work.is_empty(),
+        "the replan must not reserve capacity for a task whose original admission was \
+         ApprovalRequired, but found: {active_required_work:?}"
     );
 }
