@@ -16,14 +16,27 @@ env:
 permissions:
   contents: read
 
+# Every third-party action below is pinned to a full commit SHA rather than a
+# mutable tag or branch, so the code that runs in CI cannot change underneath us
+# if an upstream tag is force-moved or an upstream branch advances. The trailing
+# comment records the human-readable version each SHA corresponds to; Dependabot
+# (github-actions ecosystem, see .github/dependabot.yml) updates both the SHA and
+# the comment when a new release ships, so pinning does not freeze us.
+#
+# dtolnay/rust-toolchain is the notable one: `@stable` was a *branch*, not a tag,
+# and the branch is what supplied the action's default `toolchain` input. With a
+# SHA pin that signal is no longer in the ref, so `toolchain: stable` is now
+# stated explicitly. Behaviour is unchanged - current stable is still installed
+# at run time - but the intent is now in the file rather than in the ref.
 jobs:
   fmt:
     name: cargo fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch @ 2026-09-18
         with:
+          toolchain: stable
           components: rustfmt
       - run: cargo fmt --all -- --check
 
@@ -31,20 +44,23 @@ jobs:
     name: cargo clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch @ 2026-09-18
         with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   build-and-test:
     name: cargo build & test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch @ 2026-09-18
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace
 
