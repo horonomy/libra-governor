@@ -53,6 +53,14 @@ const MIGRATIONS: &[Migration] = &[
     },
 ];
 
+/// The highest migration version this build of the crate knows about
+/// (HORO-1150's `doctor` diagnostic compares this against a database's
+/// actually-applied version — see [`crate::LedgerStore::schema_version`]
+/// — to detect a binary that is older than the state it just opened).
+pub fn latest_known_version() -> i64 {
+    MIGRATIONS.last().map(|m| m.version).unwrap_or(0)
+}
+
 /// Applies every migration whose version is greater than the database's
 /// current recorded version, in ascending order. Safe to call on every
 /// open — an already-migrated database is left untouched.

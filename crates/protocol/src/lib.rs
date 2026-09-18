@@ -30,7 +30,7 @@ pub use libra_governor_estimator::{
     AdmissionOutcome, AdmissionPolicy, AdmissionStats, CoverageReport, QuantileCoverage, Stratum,
 };
 pub use messages::{
-    AdmissionPolicyReport, CalibrationReportResult, FinalizeOutcome, FinalizeResult,
+    AdmissionPolicyReport, CalibrationReportResult, DoctorResult, FinalizeOutcome, FinalizeResult,
     GatewayStatusResult, PreflightResult, ReconSummary, ReplanState, Request, RequestEnvelope,
     Response, ResponseEnvelope, StatusResult, TaskSummary,
 };
@@ -68,4 +68,11 @@ pub use messages::{
 /// `Response` gained the matching `GatewayStatus` variant, which a v5
 /// peer cannot decode. Same known limitation as the earlier bumps: a
 /// long-lived v5 daemon must be restarted after upgrading.
-pub const PROTOCOL_VERSION: u32 = 6;
+///
+/// Bumped 6 -> 7 for HORO-1150: `Request` gained `Doctor` and `Response`
+/// gained the matching `Doctor` variant, which a v6 peer cannot decode.
+/// Same known limitation as the earlier bumps: a long-lived v6 daemon
+/// must be restarted after upgrading — `libra-governor doctor` itself
+/// surfaces this plainly (a protocol-version-mismatch `Response::Error`
+/// renders as a failed "daemon reachable" check rather than a crash).
+pub const PROTOCOL_VERSION: u32 = 7;

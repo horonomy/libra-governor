@@ -86,6 +86,18 @@ pub enum Request {
     /// gateway is a security boundary, and a boundary that a client can
     /// turn off over an IPC socket is not one.
     GatewayStatus,
+    /// Ask the daemon for a read-only diagnostic snapshot of its own
+    /// health (HORO-1150): daemon/schema version, whether `config.json`
+    /// parsed, which policy preset is active, and the gateway's
+    /// configuration presence and capability tier. Answered entirely from
+    /// state the daemon already holds or can cheaply re-check (a fresh
+    /// re-read of `config.json`, the same pattern `GatewayStatus` already
+    /// uses) — never triggers a provider call and never returns a secret
+    /// value, only presence/absence of one. The `libra-governor doctor`
+    /// CLI subcommand pairs this with its own local-file checks (Claude
+    /// Code settings wiring, state directory permissions) that do not
+    /// require a daemon round trip.
+    Doctor,
 }
 
 /// Summary of one bounded reconnaissance run. Never contains raw file
@@ -311,6 +323,102 @@ pub struct GatewayStatusResult {
     pub bound_violations: u64,
 }
 
+/// The result of a `Doctor` request (HORO-1150).
+///
+/// Every field is either a version/count already tracked elsewhere
+/// (daemon crate version, protocol version, applied vs. latest-known
+/// schema migration) or a presence/absence boolean — never a credential,
+/// a config file path's contents beyond what is already logged, or any
+/// other secret value. `config_file_error`, when present, is the
+/// [`std::fmt::Display`] of the same `ConfigFileError` the daemon already
+/// logs to `daemon.log` on startup — never a raw credential-command
+/// argument, since `config.json`'s `credential_command`/`credential_args`
+/// fields never contain a secret themselves (they name a program to run,
+/// not the credential it prints).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DoctorResult {
+    /// This daemon build's `CARGO_PKG_VERSION`.
+    pub daemon_version: String,
+    /// The protocol version this daemon build speaks — always equal to
+    /// the responding daemon's own [`crate::PROTOCOL_VERSION`] (a client
+    /// on a different version never reaches this far; see
+    /// `libra-governor-daemon::server::handle_connection`'s pre-dispatch
+    /// version check).
+    pub protocol_version: u32,
+    /// The highest `schema_migrations.version` actually applied to this
+    /// daemon's open ledger connection.
+    pub schema_version_applied: i64,
+    /// The highest migration version this daemon build knows about.
+    /// Equal to `schema_version_applied` on a healthy, up-to-date
+    /// database; lower would mean the ledger is somehow ahead of this
+    /// binary (a downgrade), which [`Self::schema_ahead_of_binary`]
+    /// names explicitly rather than leaving the reader to compare the
+    /// two numbers themselves.
+    pub schema_version_known: i64,
+    /// `true` when `schema_version_applied > schema_version_known` — this
+    /// binary is older than the database it just opened (e.g. a
+    /// downgrade, or two builds sharing one state dir). A real, observed
+    /// condition, not a guess.
+    pub schema_ahead_of_binary: bool,
+    /// The name of the admission [`Policy`][libra_governor_domain::Policy]
+    /// preset currently in effect (`"balanced"` unless a valid
+    /// `config.json` `[policy]` table selected another one).
+    pub policy_preset: String,
+    /// `true` if `<state_dir>/config.json` exists at all.
+    pub config_file_present: bool,
+    /// `true` if `config.json` exists and parsed/validated successfully.
+    /// `false` when the file is present but rejected (in which case the
+    /// daemon is running on its hardcoded defaults, not what the file
+    /// says) — always `true` when `config_file_present` is `false`, since
+    /// there is nothing to fail to parse.
+    pub config_file_valid: bool,
+    /// Why `config.json` was rejected, when it was present but invalid.
+    pub config_file_error: Option<String>,
+    /// `true` when the running daemon's in-memory config already
+    /// reflects what's currently on disk in `config.json` — `false`
+    /// means the file was edited (policy preset and/or gateway presence
+    /// changed) since this daemon process last read it at startup, and a
+    /// restart is needed to pick the change up. Always `true` when
+    /// `config_file_present` is `false` (nothing on disk to disagree
+    /// with) or when `config_file_valid` is `false` (a rejected file
+    /// changes nothing, so there is no drift to report). Computed by
+    /// re-reading `config.json` fresh on every `doctor` call and
+    /// comparing its policy name and gateway presence against the
+    /// values the running config actually reports below.
+    pub running_config_matches_disk: bool,
+    /// `true` when a `[gateway]` table is configured at all (regardless
+    /// of whether it actually started — see `gateway_running`).
+    pub gateway_configured: bool,
+    /// `true` when the gateway is actually running right now. Mirrors
+    /// [`GatewayStatusResult::running`].
+    pub gateway_running: bool,
+    /// Why the gateway is not running, when it is not (and one was
+    /// configured) — mirrors [`GatewayStatusResult::disabled_reason`].
+    pub gateway_disabled_reason: Option<String>,
+    /// What this deployment may honestly claim to enforce — mirrors
+    /// [`GatewayStatusResult::capabilities`].
+    pub gateway_capabilities: Option<EnforcementCapabilities>,
+    /// `true` only when the gateway is configured for
+    /// `credential_mode: governor_held` — i.e. this daemon itself holds
+    /// (invokes a `credential_command` for) a credential, as opposed to
+    /// `pass_through_subscription`, where the daemon holds nothing and
+    /// simply relays the agent's own credential through unmodified.
+    /// Presence only, never the credential's value or the command's
+    /// output. Deliberately narrower than "any gateway credential mode
+    /// is configured" (which would be redundant with `gateway_configured`
+    /// whenever a `[gateway]` table exists at all) — this field exists to
+    /// answer the one question that actually varies: does the daemon
+    /// hold a credential of its own.
+    pub gateway_credential_configured: bool,
+    /// Always `false` in this build: no telemetry code path exists
+    /// anywhere in this repository (see `ARCHITECTURE.md`'s privacy
+    /// boundary) — this is a real, observed absence, not a fabricated
+    /// claim. Present as a field (rather than left to prose) so
+    /// `doctor --json` can be asserted on by a caller that wants to
+    /// verify it itself.
+    pub telemetry_enabled: bool,
+}
+
 /// One response the daemon may send back.
 ///
 /// `Preflight` is boxed: `PreflightResult` (contract draft + recon
@@ -337,6 +445,10 @@ pub enum Response {
     /// `GatewayStatusResult` carries an `EnforcementCapabilities` plus
     /// nine counters.
     GatewayStatus(Box<GatewayStatusResult>),
+    /// Boxed for the same large-enum-variant reason as its siblings:
+    /// `DoctorResult` carries an optional `EnforcementCapabilities` plus
+    /// several `String`/`Option<String>` fields.
+    Doctor(Box<DoctorResult>),
     /// The daemon could not (or would not) answer the request — e.g. a
     /// protocol version mismatch, or an internal error it caught rather
     /// than let propagate as a crash.
@@ -348,6 +460,46 @@ pub enum Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libra_governor_domain::EnforcementTier;
+
+    #[test]
+    fn doctor_request_round_trips() {
+        let json = serde_json::to_string(&Request::Doctor).unwrap();
+        assert_eq!(json, r#"{"kind":"doctor"}"#);
+        let round_tripped: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(Request::Doctor, round_tripped);
+    }
+
+    #[test]
+    fn doctor_response_round_trips_through_a_full_envelope() {
+        let envelope = ResponseEnvelope {
+            protocol_version: 7,
+            response: Response::Doctor(Box::new(DoctorResult {
+                daemon_version: "0.0.0".to_string(),
+                protocol_version: 7,
+                schema_version_applied: 8,
+                schema_version_known: 8,
+                schema_ahead_of_binary: false,
+                policy_preset: "balanced".to_string(),
+                config_file_present: false,
+                config_file_valid: true,
+                config_file_error: None,
+                running_config_matches_disk: true,
+                gateway_configured: true,
+                gateway_running: true,
+                gateway_disabled_reason: None,
+                gateway_capabilities: Some(EnforcementCapabilities::for_tier(
+                    EnforcementTier::GatewayObservedQuota,
+                    "pricing-test-v1",
+                )),
+                gateway_credential_configured: true,
+                telemetry_enabled: false,
+            })),
+        };
+        let json = serde_json::to_string(&envelope).unwrap();
+        let round_tripped: ResponseEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(envelope, round_tripped);
+    }
 
     #[test]
     fn request_envelope_round_trips_through_json() {

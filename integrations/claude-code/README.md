@@ -69,17 +69,34 @@ for how this fits the overall hooks/daemon responsibility boundary.
   report to stdout. Honestly reports "insufficient data" rather than a
   fabricated number when local history is thin — see
   `libra-governor-estimator::calibration` docs.
+- `libra-governor doctor [--json]` — a read-only diagnostic snapshot
+  (HORO-1150): daemon availability/version, SQLite schema health,
+  `config.json` validity, gateway configuration/capability tier, and
+  this Claude Code integration's own hook/statusline wiring. Never
+  spawns the daemon, never prints a secret value. See the root
+  [`README.md`](../../README.md#diagnostics-libra-governor-doctor) for
+  the full field-by-field explanation.
+- `libra-governor install` / `libra-governor uninstall [--yes]` —
+  wires/unwires exactly this integration's own hooks, statusline, and
+  (if present) the gateway's `env.ANTHROPIC_BASE_URL`/`apiKeyHelper`
+  entries described under "Setup" below, without touching any other key
+  in `~/.claude/settings.json` (HORO-1150). See the root
+  [`README.md`](../../README.md#uninstall) for the exact safety
+  guarantees.
 
-All four talk to the daemon over the versioned JSON-over-Unix-socket
+All talk to the daemon over the versioned JSON-over-Unix-socket
 protocol defined in `crates/protocol` (bumped to version 2 in HORO-1126,
 to version 3 in HORO-1132 for the `CalibrationReport` request/response,
 to version 4 in HORO-1139 for the replan-visibility fields on
 `PreflightResult`/`TaskSummary`, to version 5 in HORO-1141 for
 `PreflightResult`'s `admission`/`completion_reserve` and the receipt's
-reservation evidence, and to version 6 in HORO-1144 for the
-`GatewayStatus` request/response — see that crate's `lib.rs` docs for the
-upgrade caveat: a long-lived daemon on an older protocol version must be
-restarted, it will not understand a newer client's request variants).
+reservation evidence, to version 6 in HORO-1144 for the `GatewayStatus`
+request/response, and to version 7 in HORO-1150 for the `Doctor`
+request/response — see that crate's `lib.rs` docs for the upgrade
+caveat: a long-lived daemon on an older protocol version must be
+restarted, it will not understand a newer client's request variants;
+`libra-governor doctor` itself surfaces this as a plain error finding
+rather than a crash).
 Everything about admission, reconnaissance, estimation, and the ledger
 stays local — see the Privacy Boundary section of `ARCHITECTURE.md`.
 
@@ -96,6 +113,14 @@ stays local — see the Privacy Boundary section of `ARCHITECTURE.md`.
   `crates/domain/src/execution_receipt.rs` field docs.
 
 ## Setup
+
+The fastest path is `./scripts/install.sh` (or `cargo install --path
+crates/cli --locked && libra-governor install`) from the repository root
+— see the root [`README.md`](../../README.md#install), which does
+exactly the settings.json edit below for you, safely (see
+[`README.md#uninstall`](../../README.md#uninstall) for the guarantees).
+The manual steps below are what that command automates, for anyone who
+wants to see or do it by hand.
 
 Build the binary and put it on your `PATH` (or reference it by absolute
 path in the settings below):

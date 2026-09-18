@@ -45,6 +45,19 @@ impl LedgerStore {
         Ok(Self { conn })
     }
 
+    /// The highest `schema_migrations.version` actually applied to this
+    /// open connection (HORO-1150's `doctor` diagnostic). Always present
+    /// — `LedgerStore::open`/`open_in_memory` both run
+    /// `migrations::apply_all` before returning, which creates the
+    /// `schema_migrations` table unconditionally.
+    pub fn schema_version(&self) -> Result<i64, LedgerError> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
     fn configure(conn: &mut Connection) -> Result<(), LedgerError> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000i64)?;
@@ -112,5 +125,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(version, 8);
+    }
+
+    #[test]
+    fn schema_version_matches_the_latest_known_migration() {
+        let store = LedgerStore::open_in_memory().unwrap();
+        assert_eq!(
+            store.schema_version().unwrap(),
+            crate::migrations::latest_known_version()
+        );
     }
 }
