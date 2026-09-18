@@ -261,10 +261,14 @@ Removes exactly what this integration's own installer added:
    `statusLine`, and — if present — the gateway's `env.ANTHROPIC_BASE_URL`
    (loopback-only) and `apiKeyHelper` keys from `~/.claude/settings.json`.
    Every other key in that file — anything from another tool, or your
-   own hand edits — is left untouched (see the ownership predicate in
-   `crates/cli/src/claude_settings.rs`, and its test suite that seeds
-   foreign content and asserts it survives byte-for-byte). A
-   timestamped backup of the file is written before any change.
+   own hand edits — is preserved with its original value untouched (see
+   the ownership predicate in `crates/cli/src/claude_settings.rs`, and
+   its test suite that seeds foreign content and asserts every foreign
+   value survives). The file itself is rewritten as pretty-printed JSON
+   with keys in alphabetical order, so the surrounding bytes — key
+   order, exact whitespace — are not preserved verbatim, only the
+   values. A timestamped backup of the pre-edit file is written before
+   any change if you need the original byte-for-byte.
 2. The state directory (`ledger.sqlite3`, `daemon.sock`, `daemon.log`,
    `config.json`, `gateway.token`) — **only** with `--yes` or an
    interactive "yes" confirmation, since it holds your only local record
