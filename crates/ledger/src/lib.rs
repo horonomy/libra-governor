@@ -23,6 +23,7 @@
 //! `libra-governor-domain`'s crate-level docs for the structural
 //! guarantee this rests on.
 
+mod gateway;
 mod migrations;
 mod query;
 mod reservation;
@@ -30,6 +31,7 @@ mod session;
 mod store;
 mod write;
 
+pub use gateway::{GatewayRequestClose, GatewayRequestOpen};
 pub use query::{CalibrationPair, TaskTrajectory};
 pub use reservation::{
     AdjustOutcome, ReleaseOutcome, ReserveOutcome, ReserveRequest, SettleOutcome,
