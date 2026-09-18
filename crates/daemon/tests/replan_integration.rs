@@ -162,6 +162,8 @@ fn tool_call_count_material_deviation_triggers_a_replan_visible_in_status() {
         log_path: dir.path().join("daemon.log"),
         recon_budget: ReconBudget::default(),
         replan_hysteresis: ReplanHysteresisConfig::default(),
+        policy: libra_governor_daemon::default_admission_policy(),
+        reservation_ttl_secs: 900,
     };
 
     let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
@@ -303,6 +305,8 @@ fn possible_tool_loop_streak_triggers_a_replan_before_the_count_threshold() {
         log_path: dir.path().join("daemon.log"),
         recon_budget: ReconBudget::default(),
         replan_hysteresis: ReplanHysteresisConfig::default(),
+        policy: libra_governor_daemon::default_admission_policy(),
+        reservation_ttl_secs: 900,
     };
 
     let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
@@ -375,6 +379,8 @@ fn exhausting_the_auto_replan_budget_escalates_instead_of_replanning_again() {
             cooldown_secs: 0,
             max_auto_replans: 1,
         },
+        policy: libra_governor_daemon::default_admission_policy(),
+        reservation_ttl_secs: 900,
     };
 
     let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
