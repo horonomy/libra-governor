@@ -149,10 +149,88 @@ Add the following to `.claude/settings.json` (project-level) or
 }
 ```
 
-No further configuration is required. The daemon is started on demand —
-see "Daemon lifecycle" below — and stores its state under
+No further configuration is required to get today's defaults (the
+`balanced` admission policy, no gateway). The daemon is started on demand
+— see "Daemon lifecycle" below — and stores its state under
 `$LIBRA_GOVERNOR_STATE_DIR`, or `$XDG_STATE_HOME/libra-governor`, or
-`~/.local/state/libra-governor` (see `crates/daemon/src/paths.rs`).
+`~/.local/state/libra-governor` (see `crates/daemon/src/paths.rs`). To
+select a different admission policy preset, or to turn the enforcement
+gateway on, see "Configuring the daemon (`config.json`)" below.
+
+## Configuring the daemon (`config.json`)
+
+By default `libra-governor daemon run` uses the `balanced` admission
+policy preset and runs with no enforcement gateway (`gateway: None`) —
+exactly the behavior described above, unchanged. An optional
+`config.json` file, read once at daemon startup from the state directory
+(`$LIBRA_GOVERNOR_STATE_DIR/config.json`, or wherever `paths::state_dir()`
+resolves — see above), lets you override either or both without touching
+any code. **Absence of the file is the normal case** — every existing
+deployment with no `config.json` keeps today's defaults exactly.
+
+A present-but-invalid file does not stop the daemon from starting: the
+error is logged to `daemon.log` and the daemon falls back to the
+defaults, the same "a mistyped config must not take away the daemon's
+core function" rule applied elsewhere in this integration.
+
+```json
+{
+  "policy": {
+    "preset": "deadline_first",
+    "resource_target_tokens": 150000,
+    "time_target_secs": 1800
+  },
+  "gateway": {
+    "bind_addr": "127.0.0.1:8787",
+    "token_path": "/absolute/path/to/state-dir/gateway_token",
+    "credential_mode": "pass_through_subscription"
+  }
+}
+```
+
+Both top-level tables are optional and independent — a file with only
+`policy`, only `gateway`, or neither (`{}`) is valid.
+
+### `policy`
+
+| Field | Required | Meaning |
+|---|---|---|
+| `preset` | yes | One of the four named presets `crates/domain/src/policy.rs` ships: `"balanced"`, `"deadline_first"`, `"cost_first"`, `"strict_budget"`. Any other value is rejected at startup (falls back to defaults, logged). |
+| `resource_target_tokens` | no (default `100000`) | The preset's resource target, in tokens — this integration only ever reports token counts (see "Enforcement gateway" below for why). |
+| `time_target_secs` | no (default `3600`) | The preset's time target, in seconds. |
+
+This is a preset **selector**, not a general policy DSL — it cannot
+define a new preset, only pick one of the four existing ones and scale
+its resource/time target. That is a deliberate scope limit (HORO-1146):
+if a fifth preset shape is ever needed, it belongs in
+`crates/domain/src/policy.rs` as real, tested code, not as arbitrary
+config-file input.
+
+### `gateway`
+
+Same fields as [`GatewayConfig`](../../crates/gateway/src/config.rs), in
+`snake_case`:
+
+| Field | Required | Meaning |
+|---|---|---|
+| `bind_addr` | yes | Loopback address:port the gateway listens on, e.g. `"127.0.0.1:8787"`. Matches the `ANTHROPIC_BASE_URL` you point Claude Code at in step 2 of "Setup" below. |
+| `token_path` | yes | Where the daemon writes the local capability token `libra-governor gateway token` reads from. |
+| `credential_mode` | yes | `"governor_held"` or `"pass_through_subscription"` — see "Capability tiers" below for what each one can honestly claim. |
+| `credential_command` | only for `governor_held` | The program to run to fetch the real provider key (step 3 of "Setup" below) — e.g. `"security"`, `"op"`, `"pass"`. Its stdout is read directly into the credential; never written back to this file or any other config. |
+| `credential_args` | no (default `[]`) | Arguments to `credential_command`, e.g. `["read", "op://Private/Anthropic/api-key"]`. |
+| `upstream_host_allowlist` | no (defaults to the built-in allowlist) | Overrides which upstream hosts the gateway will forward to — see the gateway module's SSRF-prevention doctrine. Only change this if you know why. |
+
+`credential_mode: "governor_held"` without a `credential_command` is
+rejected at startup (there is nothing to run to get the key) — the daemon
+falls back to no gateway, logged.
+
+### Verifying what actually loaded
+
+`libra-governor gateway status` (or, over the daemon protocol,
+`Request::GatewayStatus`) reports the gateway tier that is actually
+running, which reflects `config.json` if one was loaded — this is the
+authoritative way to confirm a `config.json` change took effect, not just
+that the file parses.
 
 ## Daemon lifecycle
 
