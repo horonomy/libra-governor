@@ -240,12 +240,21 @@ impl LedgerStore {
             .map_err(|e| {
                 LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
             })?;
+        let reservation_evidence_json = receipt
+            .reservations
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| {
+                LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+            })?;
 
         self.conn.execute(
             "INSERT INTO receipts (task_id, plan_id, contract_revision, actual_duration_secs,
                                     actual_usage_json, outcome_json, recorded_at,
-                                    tool_call_count, model, provider, task_features_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                                    tool_call_count, model, provider, task_features_json,
+                                    reservation_evidence_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 receipt.task_id.to_string(),
                 receipt.plan_id.0.to_string(),
@@ -258,6 +267,7 @@ impl LedgerStore {
                 receipt.model,
                 receipt.provider,
                 task_features_json,
+                reservation_evidence_json,
             ],
         )?;
         Ok(())

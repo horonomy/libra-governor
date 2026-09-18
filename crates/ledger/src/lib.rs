@@ -25,11 +25,15 @@
 
 mod migrations;
 mod query;
+mod reservation;
 mod session;
 mod store;
 mod write;
 
 pub use query::{CalibrationPair, TaskTrajectory};
+pub use reservation::{
+    AdjustOutcome, ReleaseOutcome, ReserveOutcome, ReserveRequest, SettleOutcome,
+};
 pub use store::LedgerStore;
 
 /// Errors returned by the ledger crate.
@@ -39,4 +43,19 @@ pub enum LedgerError {
     Sqlite(#[from] rusqlite::Error),
     #[error("task {0} not found")]
     TaskNotFound(String),
+    /// A reservation/settlement amount's [`libra_governor_domain::ResourceKind`]
+    /// does not match the task's own `task_budgets.resource_kind`
+    /// (HORO-1141) — part of the "malicious/invalid agent event cannot
+    /// directly forge ledger spend/credit" failure case: a mismatched
+    /// kind is rejected outright rather than silently coerced.
+    #[error("resource kind {actual:?} does not match task budget kind {expected:?}")]
+    ResourceKindMismatch {
+        expected: libra_governor_domain::ResourceKind,
+        actual: libra_governor_domain::ResourceKind,
+    },
+    /// A settlement reported a negative actual-usage amount — never a
+    /// legitimate value, and rejected rather than silently treated as a
+    /// credit (HORO-1141 "malicious/invalid agent event" failure case).
+    #[error("a negative resource amount is not a valid settlement")]
+    NegativeSettlement,
 }
