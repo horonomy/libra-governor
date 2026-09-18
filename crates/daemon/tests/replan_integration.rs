@@ -29,6 +29,13 @@ fn fixture_repo() -> PathBuf {
 /// same repo lands on the `Repo` bucket tier with a real (non-cold-start)
 /// estimate — needed so a later replan's widening is observable against
 /// real P90 numbers, not cold-start `None`s.
+///
+/// Each receipt also carries a small, deliberately chosen
+/// `tool_call_count` (2, 2, 3, 3, 4) so `typical_tool_call_count_bucketed`
+/// resolves to a real bucket-specific median of `3` rather than falling
+/// back to the absolute fallback (20) — keeping the material-deviation
+/// threshold (`2x typical` = 6) small enough that these tests can drive a
+/// handful of `ToolInvoked` calls instead of dozens.
 fn seed_same_repo_history(ledger: &mut LedgerStore) {
     use libra_governor_daemon::{features::derive_task_features, recon::run_recon};
 
@@ -39,8 +46,9 @@ fn seed_same_repo_history(ledger: &mut LedgerStore) {
         &ReconBudget::default(),
     );
     let features = derive_task_features(&recon, "fix the login bug", &fixture_repo(), None);
+    let seeded_tool_call_counts = [2u64, 2, 3, 3, 4];
 
-    for n in 1..=5u64 {
+    for (i, n) in (1..=5u64).enumerate() {
         let identity = TaskIdentity::new(None);
         ledger.insert_task(&identity, now).unwrap();
         ledger
@@ -58,8 +66,39 @@ fn seed_same_repo_history(ledger: &mut LedgerStore) {
             ExecutionOutcome::Unknown,
             now,
         )
-        .with_task_features(Some(features.clone()));
+        .with_task_features(Some(features.clone()))
+        .with_tool_call_count(seeded_tool_call_counts[i]);
         ledger.insert_receipt(&receipt).unwrap();
+    }
+}
+
+/// Sends `count` `ToolInvoked` notifications for `session_id`, cycling
+/// through four distinct tool names so no same-tool streak ever reaches
+/// the loop threshold (4) — isolates the tool-call-count material-
+/// deviation signal from the loop signal.
+fn send_distinct_tool_calls(
+    listener: &std::os::unix::net::UnixListener,
+    socket_path: &Path,
+    ledger: &mut LedgerStore,
+    current_task: &mut Option<libra_governor_protocol::TaskSummary>,
+    config: &DaemonConfig,
+    session_id: &str,
+    count: u64,
+) {
+    let tools = ["Bash", "Read", "Grep", "Write"];
+    for i in 0..count {
+        let response = send(
+            listener,
+            socket_path,
+            ledger,
+            current_task,
+            config,
+            Request::ToolInvoked {
+                session_id: session_id.to_string(),
+                tool_name: tools[(i as usize) % tools.len()].to_string(),
+            },
+        );
+        assert_eq!(response, Response::Ack);
     }
 }
 
@@ -153,25 +192,23 @@ fn tool_call_count_material_deviation_triggers_a_replan_visible_in_status() {
         .expect("Repo-tier history was seeded; estimate must be real, not cold-start");
     assert!(!original_estimate.cold_start);
     let original_plan_id = preflight.plan_id;
+    let contract_before = ledger
+        .latest_contract(preflight.task_id)
+        .unwrap()
+        .expect("preflight always records a contract");
 
-    // 21 tool calls, cycling through four distinct tool names so no
-    // same-tool streak ever reaches the loop threshold (4) -- this
-    // isolates the tool-call-count material-deviation signal.
-    let tools = ["Bash", "Read", "Grep", "Write"];
-    for i in 0..21u64 {
-        let response = send(
-            &listener,
-            &socket_path,
-            &mut ledger,
-            &mut current_task,
-            &config,
-            Request::ToolInvoked {
-                session_id: "replan-session".to_string(),
-                tool_name: tools[(i as usize) % tools.len()].to_string(),
-            },
-        );
-        assert_eq!(response, Response::Ack);
-    }
+    // Seeded history gives a bucket-typical tool-call count of 3, so the
+    // material-deviation threshold is `> 2 * 3 = 6`. 7 distinct-tool
+    // calls crosses it.
+    send_distinct_tool_calls(
+        &listener,
+        &socket_path,
+        &mut ledger,
+        &mut current_task,
+        &config,
+        "replan-session",
+        7,
+    );
 
     let summary = status_task_summary(
         &listener,
@@ -183,7 +220,7 @@ fn tool_call_count_material_deviation_triggers_a_replan_visible_in_status() {
     assert_eq!(
         summary.replan_state,
         ReplanState::Replanned { count: 1 },
-        "crossing the absolute tool-call-count fallback threshold must trigger exactly one replan"
+        "crossing the bucket-typical tool-call-count threshold must trigger exactly one replan"
     );
     assert_ne!(
         summary.plan_id, original_plan_id,
@@ -195,20 +232,43 @@ fn tool_call_count_material_deviation_triggers_a_replan_visible_in_status() {
         "the deterministic tier must widen the remaining estimate's P90 above the original"
     );
 
-    // A further material event, still within the default 300s cooldown,
+    // Required-criteria protection (HORO-1139 acceptance criterion,
+    // mirroring HORO-1137's policy invariant test style): a replan must
+    // never alter or drop the task's Completion Contract criteria. The
+    // new plan's `contract_revision` must still resolve to the exact
+    // same criteria set the original preflight recorded.
+    let contract_after = ledger
+        .latest_contract(summary.task_id)
+        .unwrap()
+        .expect("contract still present after replan");
+    assert_eq!(
+        contract_before.criteria, contract_after.criteria,
+        "a replan must never alter or drop required Completion Contract criteria"
+    );
+    let new_plan = ledger
+        .get_plan(summary.plan_id)
+        .unwrap()
+        .expect("the replanned plan must be persisted");
+    assert_eq!(
+        new_plan.contract_revision, contract_before.revision,
+        "the replanned plan must still reference the same contract revision"
+    );
+
+    // A further material event -- a genuine new deviation, not stale
+    // evidence: material-event detection is re-baselined at the last
+    // replan's tool-call count (see `ReplanHysteresisState` docs), so
+    // this sends 7 MORE calls, crossing the threshold again relative to
+    // the new baseline. Still within the default 300s cooldown, so this
     // must NOT trigger a second replan.
-    let response = send(
+    send_distinct_tool_calls(
         &listener,
         &socket_path,
         &mut ledger,
         &mut current_task,
         &config,
-        Request::ToolInvoked {
-            session_id: "replan-session".to_string(),
-            tool_name: "Bash".to_string(),
-        },
+        "replan-session",
+        7,
     );
-    assert_eq!(response, Response::Ack);
     let summary_after_cooldown_suppression = status_task_summary(
         &listener,
         &socket_path,
@@ -219,7 +279,7 @@ fn tool_call_count_material_deviation_triggers_a_replan_visible_in_status() {
     assert_eq!(
         summary_after_cooldown_suppression.replan_state,
         ReplanState::Replanned { count: 1 },
-        "a second material event inside the cooldown window must not thrash another replan"
+        "a second, genuinely material event inside the cooldown window must not thrash another replan"
     );
 
     // Persisted, queryable replan history (HORO-1139 acceptance
@@ -337,22 +397,18 @@ fn exhausting_the_auto_replan_budget_escalates_instead_of_replanning_again() {
         },
     );
 
-    let tools = ["Bash", "Read", "Grep", "Write"];
-    // 21 calls crosses the absolute fallback threshold and consumes the
-    // one-replan budget.
-    for i in 0..21u64 {
-        send(
-            &listener,
-            &socket_path,
-            &mut ledger,
-            &mut current_task,
-            &config,
-            Request::ToolInvoked {
-                session_id: "escalate-session".to_string(),
-                tool_name: tools[(i as usize) % tools.len()].to_string(),
-            },
-        );
-    }
+    // Seeded history gives a bucket-typical tool-call count of 3
+    // (threshold `> 6`). 7 distinct-tool calls crosses it and consumes
+    // the one-replan budget.
+    send_distinct_tool_calls(
+        &listener,
+        &socket_path,
+        &mut ledger,
+        &mut current_task,
+        &config,
+        "escalate-session",
+        7,
+    );
     let after_first_replan = status_task_summary(
         &listener,
         &socket_path,
@@ -365,18 +421,19 @@ fn exhausting_the_auto_replan_budget_escalates_instead_of_replanning_again() {
         ReplanState::Replanned { count: 1 }
     );
 
-    // One more material tool call: the count is still (in fact further)
-    // past the threshold, but the auto-replan budget is exhausted.
-    send(
+    // A genuinely new material deviation relative to the re-baselined
+    // threshold (7 more calls, crossing the threshold again since the
+    // last replan) -- not stale evidence from the same event. The
+    // auto-replan budget is exhausted, so this must escalate instead of
+    // silently replanning again.
+    send_distinct_tool_calls(
         &listener,
         &socket_path,
         &mut ledger,
         &mut current_task,
         &config,
-        Request::ToolInvoked {
-            session_id: "escalate-session".to_string(),
-            tool_name: "Bash".to_string(),
-        },
+        "escalate-session",
+        7,
     );
     let after_escalation = status_task_summary(
         &listener,
