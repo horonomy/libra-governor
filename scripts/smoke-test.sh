@@ -56,15 +56,24 @@ echo "== doctor before install (expect: not installed, exit 0) =="
 "$bin" doctor
 echo
 
-echo "== Seeding a foreign settings.json key =="
+echo "== Seeding foreign settings.json keys (apiKeyHelper + statusLine) =="
 cat > "$LIBRA_GOVERNOR_CLAUDE_DIR/settings.json" <<'EOF'
 {
-  "apiKeyHelper": "/usr/local/bin/my-own-key-helper"
+  "apiKeyHelper": "/usr/local/bin/my-own-key-helper",
+  "statusLine": { "type": "command", "command": "/usr/local/bin/my-own-statusline.py" }
 }
 EOF
 
 echo "== install =="
 "$bin" install
+echo
+
+echo "== Foreign statusLine must survive install (never overwritten) =="
+if ! grep -q "my-own-statusline.py" "$LIBRA_GOVERNOR_CLAUDE_DIR/settings.json"; then
+    echo "error: install overwrote a foreign statusLine it does not own" >&2
+    exit 1
+fi
+echo "OK: foreign statusLine survived install."
 echo
 
 echo "== doctor after install (expect: hooks wired) =="
@@ -75,13 +84,10 @@ fi
 "$bin" doctor
 echo
 
-# uninstall --yes also removes the daemon binary itself, since the
-# install marker names this exact path (a real, intended consequence of
-# a full uninstall — see uninstall_cmd's module docs). Keep an
-# untracked copy around purely so this script can still run `doctor`
-# afterward to observe the resulting "not installed" state.
-doctor_checker="$sandbox/doctor-checker"
-cp "$bin" "$doctor_checker"
+# uninstall never deletes the daemon binary itself (it only prints how
+# to remove it via `cargo uninstall`, so it doesn't corrupt cargo's own
+# package bookkeeping — see uninstall_cmd's module docs), so "$bin"
+# stays usable for the post-uninstall doctor check below.
 
 echo "== uninstall --yes =="
 "$bin" uninstall --yes
@@ -95,15 +101,15 @@ fi
 echo "OK: foreign apiKeyHelper survived."
 echo
 
-if [[ -e "$bin" ]]; then
-    echo "error: uninstall --yes should have removed the daemon binary it installed" >&2
+if [[ ! -e "$bin" ]]; then
+    echo "error: uninstall must never delete the daemon binary directly" >&2
     exit 1
 fi
-echo "OK: uninstall removed the binary it installed."
+echo "OK: uninstall left the daemon binary in place."
 echo
 
 echo "== doctor after uninstall (expect: not installed again) =="
-"$doctor_checker" doctor
+"$bin" doctor
 
 echo
 echo "Smoke test passed."

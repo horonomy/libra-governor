@@ -152,9 +152,16 @@ trip to the daemon when one is reachable:
 - Gateway configuration presence, whether it is actually running, and
   its honest capability tier (see "Enforcement gateway" in
   [`integrations/claude-code/README.md`](integrations/claude-code/README.md#enforcement-gateway-horo-1144--optional-off-by-default)).
-- `config.json` presence and validity (a present-but-invalid file is
-  flagged as an error — the daemon is silently running on its hardcoded
-  defaults until this is fixed).
+- `config.json` presence and validity, checked both locally (so a fresh
+  install with no daemon running yet still catches a corrupt file) and,
+  when a daemon is reachable, against what it actually loaded at
+  startup — a present-but-invalid file is flagged as an error either way
+  (the daemon is silently running on its hardcoded defaults until this
+  is fixed).
+- Stale config: whether a currently-running daemon's in-memory policy
+  preset/gateway presence still matches what's on disk right now — an
+  edited `config.json` with no daemon restart since is flagged as an
+  error naming the fix (restart it).
 - Telemetry posture (see "Security & privacy" below).
 
 Exit code `0` unless at least one finding is error-severity — a daemon
@@ -171,6 +178,8 @@ advice:
 | `doctor` reports a protocol version mismatch | You upgraded the binary while an old daemon was still running (every `PROTOCOL_VERSION` bump has required this — see [`crates/protocol/src/lib.rs`](crates/protocol/src/lib.rs)'s bump history) | `pkill -f "libra-governor daemon run"`; the next hook invocation respawns it |
 | Statusline shows `libra: -` | The daemon is not running; `statusline` never spawns one by design (a refreshing statusline spawning a daemon would be a race factory) | Submit a prompt — `hook user-prompt-submit` spawns it on demand |
 | `doctor` reports `config.json ... rejected` | A typo or invalid value in `config.json` — full detail is in `daemon.log`, not swallowed | Fix the file (see the field reference in `integrations/claude-code/README.md`); the daemon keeps running on defaults meanwhile, never crashes on this |
+| `doctor` reports `stale_config` | You edited `config.json` after the daemon last started, so it's still running on the old values | `pkill -f "libra-governor daemon run"`; the next hook invocation respawns it with the new file |
+| `install` says an existing `statusLine` was left untouched | You already had a non-Governor `statusLine` configured in `~/.claude/settings.json` | Decide which one you want; `install` never overwrites a foreign `statusLine`, so wire Governor's manually (see `integrations/claude-code/README.md`) if you want to replace it |
 | `doctor` reports the ledger schema is ahead of this binary | A newer daemon build already migrated the database, and you are now running an older CLI/daemon binary | Rebuild/reinstall this binary at the newer version |
 | Gateway configured but `doctor` says `not running` | Configuration validation or credential resolution failed at daemon startup (fails open, never takes the daemon down) | Run `libra-governor gateway status` for the exact `disabled_reason`; the daemon keeps serving hooks/statusline normally either way |
 | A gateway request is refused with HTTP 403 | The gateway's own admission failed closed (see `x-libra-decision` header) | See "What a refusal looks like" in `integrations/claude-code/README.md` |
@@ -261,10 +270,13 @@ Removes exactly what this integration's own installer added:
    interactive "yes" confirmation, since it holds your only local record
    of estimate-vs-actual calibration history and deleting it is
    unrecoverable.
-3. The daemon binary itself — **only** if `install`'s own marker file
-   proves this exact binary path was installed by `libra-governor
-   install`. A binary you built or installed some other way is never
-   touched.
+3. Nothing else. The daemon binary itself is never deleted by
+   `uninstall` — it was put in place by `cargo install`, so only `cargo
+   uninstall libra-governor-cli` keeps cargo's own package bookkeeping
+   consistent. When `install`'s own marker file proves this exact binary
+   path was installed by `libra-governor install`, `uninstall` prints
+   that command for you to run; a binary you built or installed some
+   other way is never mentioned.
 
 Run `libra-governor doctor` afterward to confirm — it will report
 "not installed."
