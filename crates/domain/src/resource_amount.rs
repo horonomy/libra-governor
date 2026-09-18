@@ -63,6 +63,13 @@ impl ResourceAmount {
     /// amount (e.g. `target.scaled(1.5)`) without hardcoding a
     /// unit-specific multiplication in policy-preset code. Rounds to the
     /// unit's natural precision (whole cents, whole tokens).
+    ///
+    /// [`ResourceAmount::QuotaPercent`]'s documented domain is
+    /// `0.0..=100.0` — a subscription cannot consume more than 100% of
+    /// its own period quota. `scaled` saturates at that domain limit
+    /// (e.g. `QuotaPercent(80.0).scaled(2.0)` is `QuotaPercent(100.0)`,
+    /// not `160.0`) rather than producing a value the type's own docs
+    /// say cannot exist.
     pub fn scaled(&self, factor: f64) -> ResourceAmount {
         match self {
             ResourceAmount::UsdCents(c) => {
@@ -71,7 +78,9 @@ impl ResourceAmount {
             ResourceAmount::Tokens(t) => {
                 ResourceAmount::Tokens(((*t as f64) * factor).round() as u64)
             }
-            ResourceAmount::QuotaPercent(p) => ResourceAmount::QuotaPercent(*p * factor as f32),
+            ResourceAmount::QuotaPercent(p) => {
+                ResourceAmount::QuotaPercent((*p * factor as f32).clamp(0.0, 100.0))
+            }
         }
     }
 }
@@ -121,6 +130,15 @@ mod tests {
         assert_eq!(
             ResourceAmount::QuotaPercent(10.0).scaled(2.0),
             ResourceAmount::QuotaPercent(20.0)
+        );
+    }
+
+    #[test]
+    fn scaled_saturates_quota_percent_at_its_documented_domain() {
+        assert_eq!(
+            ResourceAmount::QuotaPercent(80.0).scaled(2.0),
+            ResourceAmount::QuotaPercent(100.0),
+            "160% of a period quota is not representable — must saturate at 100.0"
         );
     }
 }
