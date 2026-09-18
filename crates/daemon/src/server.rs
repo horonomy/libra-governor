@@ -167,6 +167,16 @@ fn dispatch(
             session_id,
         } => match handle_preflight(&task_hint, &cwd, &session_id, ledger, config) {
             Ok(result) => {
+                // A fresh preflight resolves to the SAME task on a second
+                // (or later) prompt within a session (docs/adr/0002), and
+                // that task's `replan_state` in the ledger may already
+                // carry replans/escalation from earlier in the session.
+                // Seed the displayed state from the ledger rather than
+                // hardcoding `Stable` — otherwise a task that has already
+                // exhausted its auto-replan budget would misleadingly
+                // show "stable" again until its next material event.
+                let replan_state =
+                    replan_state_for_summary(ledger, result.task_id, &config.replan_hysteresis);
                 *current_task = Some(TaskSummary {
                     task_id: result.task_id,
                     confidence: result.confidence,
@@ -176,7 +186,7 @@ fn dispatch(
                         .estimate
                         .clone()
                         .unwrap_or_else(Estimate::cold_start),
-                    replan_state: ReplanState::Stable,
+                    replan_state,
                 });
                 Response::Preflight(Box::new(result))
             }
@@ -277,6 +287,35 @@ fn handle_calibration_report(
         admission,
         dropped_rows,
     })
+}
+
+/// Maps `task_id`'s persisted [`libra_governor_domain::ReplanHysteresisState`]
+/// onto the statusline-facing [`ReplanState`] (HORO-1139): a task that has
+/// already reached `max_auto_replans` displays as escalated, one with a
+/// nonzero `auto_replan_count` displays its count, otherwise `Stable`.
+/// Used both by the `Preflight` dispatch arm (so a second prompt in the
+/// same session shows a task's real replan history, not a hardcoded
+/// `Stable`) and available for any future caller building a `TaskSummary`
+/// from scratch. A lookup failure degrades to `Stable` rather than
+/// failing the whole preflight over what is purely a display concern.
+fn replan_state_for_summary(
+    ledger: &LedgerStore,
+    task_id: libra_governor_domain::TaskId,
+    hysteresis_config: &libra_governor_domain::ReplanHysteresisConfig,
+) -> ReplanState {
+    let state = match ledger.replan_state_for_task(task_id) {
+        Ok(state) => state,
+        Err(_) => return ReplanState::Stable,
+    };
+    if state.auto_replan_count >= hysteresis_config.max_auto_replans {
+        ReplanState::EscalatedAwaitingApproval
+    } else if state.auto_replan_count > 0 {
+        ReplanState::Replanned {
+            count: state.auto_replan_count,
+        }
+    } else {
+        ReplanState::Stable
+    }
 }
 
 fn handle_preflight(
@@ -391,8 +430,21 @@ fn handle_tool_invoked(
     let history = ledger.receipts_for_estimation()?;
     let typical_tool_calls = typical_tool_call_count_bucketed(&history, &task_features);
 
+    // Hysteresis state is fetched up front (not just for the cooldown/
+    // max-count check below) because `tool_call_count_at_last_replan` is
+    // also the re-baseline for material-event detection: `total_tool_calls`
+    // is the session's raw *cumulative* count, which never goes back down,
+    // so comparing it directly against `typical` would keep flagging every
+    // tool call as "material" for the rest of the session once the first
+    // deviation fires. `calls_since_last_replan` measures fresh evidence
+    // since the plan was last adjusted — see
+    // `libra_governor_domain::ReplanHysteresisState` docs.
+    let hysteresis_state = ledger.replan_state_for_task(task_id)?;
+    let calls_since_last_replan =
+        total_tool_calls.saturating_sub(hysteresis_state.tool_call_count_at_last_replan);
+
     let loop_signal = possible_tool_loop(same_tool_streak, DEFAULT_LOOP_STREAK_THRESHOLD);
-    let count_signal = tool_call_count_is_material(total_tool_calls, typical_tool_calls);
+    let count_signal = tool_call_count_is_material(calls_since_last_replan, typical_tool_calls);
     if !loop_signal && !count_signal {
         return Ok(());
     }
@@ -410,11 +462,12 @@ fn handle_tool_invoked(
             });
         (
             ReplanTriggerKind::ToolCallCountExceeded,
-            format!("{total_tool_calls} tool calls so far vs. typical {typical_desc}"),
+            format!(
+                "{calls_since_last_replan} tool calls since the last replan vs. typical {typical_desc}"
+            ),
         )
     };
 
-    let hysteresis_state = ledger.replan_state_for_task(task_id)?;
     match evaluate_hysteresis(&config.replan_hysteresis, &hysteresis_state, now) {
         HysteresisOutcome::SuppressedCooldown => {
             log::append_line(
@@ -469,7 +522,11 @@ fn handle_tool_invoked(
         remaining_estimate: remaining.clone(),
         created_at: now,
     })?;
-    ledger.record_replan_for_task(task_id, now)?;
+    ledger.record_replan_for_task(task_id, now, total_tool_calls)?;
+    // Also re-baseline the loop-streak signal: without this, the very
+    // next repeated tool call would look like a continuation of the
+    // already-replanned-on streak rather than fresh evidence.
+    ledger.reset_tool_streak(session_id)?;
     let auto_replan_count = hysteresis_state.auto_replan_count + 1;
 
     log::append_line(
