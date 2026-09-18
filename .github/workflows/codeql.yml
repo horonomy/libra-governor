@@ -31,15 +31,19 @@ jobs:
         # without a build, and `actions` scans the workflow files themselves.
         language: [actions, python, rust]
     steps:
-      - uses: actions/checkout@v7
+      # Pinned to commit SHAs rather than the @v4 / @v7 major tags; see the note
+      # in ci.yml. Dependabot keeps these current. github/codeql-action/init and
+      # /analyze are two paths in one repository and must therefore stay on the
+      # same SHA, or init and analyze can disagree about the bundle they use.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
+        uses: github/codeql-action/init@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
         with:
           languages: ${{ matrix.language }}
           build-mode: none
 
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@v4
+        uses: github/codeql-action/analyze@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
         with:
           category: "/language:${{ matrix.language }}"
