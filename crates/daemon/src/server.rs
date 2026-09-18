@@ -43,9 +43,9 @@ use libra_governor_estimator::{
 };
 use libra_governor_ledger::{LedgerStore, ReserveOutcome, ReserveRequest};
 use libra_governor_protocol::{
-    wire, AdmissionPolicyReport, CalibrationReportResult, FinalizeOutcome, FinalizeResult,
-    GatewayStatusResult, PreflightResult, ReconSummary, ReplanState, Request, RequestEnvelope,
-    Response, ResponseEnvelope, StatusResult, TaskSummary, PROTOCOL_VERSION,
+    wire, AdmissionPolicyReport, CalibrationReportResult, DoctorResult, FinalizeOutcome,
+    FinalizeResult, GatewayStatusResult, PreflightResult, ReconSummary, ReplanState, Request,
+    RequestEnvelope, Response, ResponseEnvelope, StatusResult, TaskSummary, PROTOCOL_VERSION,
 };
 
 use crate::{contract, features, gateway_authority, log, recon, recon::ReconBudget};
@@ -347,6 +347,7 @@ fn dispatch(
             }
         }
         Request::GatewayStatus => Response::GatewayStatus(Box::new(gateway_status(config))),
+        Request::Doctor => Response::Doctor(Box::new(handle_doctor(ledger, config))),
         Request::CalibrationReport => match handle_calibration_report(ledger, config) {
             Ok(result) => Response::CalibrationReport(Box::new(result)),
             Err(e) => {
@@ -1191,6 +1192,70 @@ fn gateway_status(config: &DaemonConfig) -> GatewayStatusResult {
     }
 }
 
+/// Answers a `Doctor` request (HORO-1150) from state the daemon already
+/// holds, plus a fresh re-read of `config.json` (the same
+/// re-validate-rather-than-trust-startup-cache pattern [`gateway_status`]
+/// already uses, for the same "honest after an unrestarted config
+/// change" reason). Every field is a version/count or a
+/// presence/absence boolean — never a credential value, and never the
+/// `credential_command`'s own captured stdout (this function never runs
+/// it).
+fn handle_doctor(ledger: &LedgerStore, config: &DaemonConfig) -> DoctorResult {
+    let state_dir = config.socket_path.parent();
+    let (config_file_present, config_file_valid, config_file_error) = match state_dir {
+        Some(dir) => {
+            let path = dir.join(crate::config_file::CONFIG_FILE_NAME);
+            if !path.exists() {
+                (false, true, None)
+            } else {
+                match crate::config_file::load_overrides(dir) {
+                    Ok(_) => (true, true, None),
+                    Err(e) => (true, false, Some(e.to_string())),
+                }
+            }
+        }
+        // Only reachable if `socket_path` was hand-built with no parent
+        // (e.g. a bare relative filename) — never true for a real daemon
+        // started via `daemon_cmd::run`, which always joins onto
+        // `paths::state_dir()`.
+        None => (false, true, None),
+    };
+
+    let schema_version_applied = ledger.schema_version().unwrap_or(0);
+    let schema_version_known = libra_governor_ledger::latest_known_version();
+
+    let gw = gateway_status(config);
+    let gateway_credential_configured = config
+        .gateway
+        .as_ref()
+        .map(|g| {
+            matches!(
+                g.credential_mode,
+                libra_governor_gateway::config::GatewayCredentialMode::GovernorHeld { .. }
+                    | libra_governor_gateway::config::GatewayCredentialMode::PassThroughSubscription
+            )
+        })
+        .unwrap_or(false);
+
+    DoctorResult {
+        daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+        protocol_version: PROTOCOL_VERSION,
+        schema_version_applied,
+        schema_version_known,
+        schema_ahead_of_binary: schema_version_applied > schema_version_known,
+        policy_preset: config.policy.name.clone(),
+        config_file_present,
+        config_file_valid,
+        config_file_error,
+        gateway_configured: config.gateway.is_some(),
+        gateway_running: gw.running,
+        gateway_disabled_reason: gw.disabled_reason,
+        gateway_capabilities: gw.capabilities,
+        gateway_credential_configured,
+        telemetry_enabled: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1335,5 +1400,59 @@ mod tests {
         );
         assert_eq!(response, Response::Ack);
         assert_eq!(ledger.tool_call_count_for_session("sess-1").unwrap(), 1);
+    }
+
+    fn config_for_doctor_tests(dir: &std::path::Path) -> DaemonConfig {
+        DaemonConfig {
+            socket_path: dir.join("d.sock"),
+            ledger_path: dir.join("ledger.sqlite3"),
+            log_path: dir.join("daemon.log"),
+            recon_budget: crate::recon::ReconBudget::default(),
+            replan_hysteresis: libra_governor_domain::ReplanHysteresisConfig::default(),
+            policy: default_admission_policy(),
+            reservation_ttl_secs: 900,
+            gateway: None,
+            gateway_stats: std::sync::Arc::new(Default::default()),
+            gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER
+                .to_string(),
+        }
+    }
+
+    #[test]
+    fn doctor_reports_healthy_state_with_no_config_file_and_matching_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_for_doctor_tests(dir.path());
+        let ledger = LedgerStore::open(&config.ledger_path).unwrap();
+
+        let result = handle_doctor(&ledger, &config);
+
+        assert_eq!(result.daemon_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(result.protocol_version, PROTOCOL_VERSION);
+        assert!(!result.config_file_present);
+        assert!(result.config_file_valid);
+        assert!(result.config_file_error.is_none());
+        assert_eq!(result.policy_preset, "balanced");
+        assert!(!result.gateway_configured);
+        assert!(!result.gateway_running);
+        assert_eq!(
+            result.schema_version_applied,
+            libra_governor_ledger::latest_known_version()
+        );
+        assert!(!result.schema_ahead_of_binary);
+        assert!(!result.telemetry_enabled);
+    }
+
+    #[test]
+    fn doctor_flags_a_malformed_config_file_without_crashing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), "{ not json").unwrap();
+        let config = config_for_doctor_tests(dir.path());
+        let ledger = LedgerStore::open(&config.ledger_path).unwrap();
+
+        let result = handle_doctor(&ledger, &config);
+
+        assert!(result.config_file_present);
+        assert!(!result.config_file_valid);
+        assert!(result.config_file_error.is_some());
     }
 }
