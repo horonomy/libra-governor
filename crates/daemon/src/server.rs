@@ -550,9 +550,16 @@ fn handle_tool_invoked(
             summary.plan_id = new_plan.id;
             summary.confidence = remaining.estimate.confidence;
             summary.remaining_estimate = remaining.estimate;
-            summary.replan_state = ReplanState::Replanned {
-                count: auto_replan_count,
-            };
+            // Derived from the same mapping the `Preflight` dispatch arm
+            // uses (`replan_state_for_summary`), not constructed inline
+            // as `Replanned { count: auto_replan_count }` — at
+            // `auto_replan_count == max_auto_replans` this just-landed
+            // replan IS the one that exhausts the budget, so it must
+            // render as escalated immediately rather than waiting for
+            // the next Preflight to notice (which would otherwise
+            // disagree with `evaluate_hysteresis`'s own `>=` check).
+            summary.replan_state =
+                replan_state_for_summary(ledger, task_id, &config.replan_hysteresis);
         }
     }
 

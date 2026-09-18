@@ -416,9 +416,14 @@ fn exhausting_the_auto_replan_budget_escalates_instead_of_replanning_again() {
         &mut current_task,
         &config,
     );
+    // The budget is exactly `1`, and this replan IS the one that
+    // exhausts it -- `replan_state` must render as escalated immediately,
+    // consistent with `evaluate_hysteresis`'s own `auto_replan_count >=
+    // max_auto_replans` check, not wait for the next material event to
+    // notice.
     assert_eq!(
         after_first_replan.replan_state,
-        ReplanState::Replanned { count: 1 }
+        ReplanState::EscalatedAwaitingApproval
     );
 
     // A genuinely new material deviation relative to the re-baselined
