@@ -83,6 +83,56 @@ impl ResourceAmount {
             }
         }
     }
+
+    /// Reconstructs a non-negative amount from a stored `(kind, value)`
+    /// pair — the shape the reservation ledger persists (a `REAL` column
+    /// plus a kind discriminator) so `available` headroom can be computed
+    /// in a single SQL expression rather than summed from JSON blobs
+    /// (HORO-1141). Rounds to the unit's natural precision and saturates
+    /// `QuotaPercent` at its documented `0.0..=100.0` domain, exactly as
+    /// [`Self::scaled`] does. Negative input saturates at zero: this is
+    /// the *non-negative stored amount* constructor — signed headroom
+    /// that can genuinely go negative (an overrun) is [`Headroom`], which
+    /// exists precisely because `Tokens(u64)`/`QuotaPercent` cannot
+    /// represent that.
+    pub fn from_kind_f64(kind: ResourceKind, value: f64) -> ResourceAmount {
+        let value = value.max(0.0);
+        match kind {
+            ResourceKind::Usd => ResourceAmount::UsdCents(value.round() as i64),
+            ResourceKind::Tokens => ResourceAmount::Tokens(value.round() as u64),
+            ResourceKind::QuotaPercent => {
+                ResourceAmount::QuotaPercent((value as f32).clamp(0.0, 100.0))
+            }
+        }
+    }
+}
+
+/// Signed remaining capacity for one resource kind (HORO-1141).
+///
+/// Deliberately NOT a [`ResourceAmount`]: `Tokens(u64)` and
+/// `QuotaPercent(0.0..=100.0)` cannot represent the negative headroom an
+/// overrun produces, and saturating at zero at the storage layer would
+/// hide exactly the condition a caller needs to see (the reservation
+/// ledger's "actual cost above reservation" failure case).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Headroom {
+    pub kind: ResourceKind,
+    pub value: f64,
+}
+
+impl Headroom {
+    /// `true` when there is no remaining capacity left (zero or
+    /// negative).
+    pub fn is_exhausted(&self) -> bool {
+        self.value <= 0.0
+    }
+
+    /// For display/serialization only — clamps a negative value at zero.
+    /// Never use this for an admission comparison; compare `value`
+    /// directly so an overrun stays visible.
+    pub fn as_resource_amount_clamped(&self) -> ResourceAmount {
+        ResourceAmount::from_kind_f64(self.kind, self.value)
+    }
 }
 
 /// The unit a [`ResourceAmount`] is measured in, without the value —
@@ -139,6 +189,69 @@ mod tests {
             ResourceAmount::QuotaPercent(80.0).scaled(2.0),
             ResourceAmount::QuotaPercent(100.0),
             "160% of a period quota is not representable — must saturate at 100.0"
+        );
+    }
+
+    #[test]
+    fn from_kind_f64_reconstructs_amounts_by_kind() {
+        assert_eq!(
+            ResourceAmount::from_kind_f64(ResourceKind::Usd, 199.0),
+            ResourceAmount::UsdCents(199)
+        );
+        assert_eq!(
+            ResourceAmount::from_kind_f64(ResourceKind::Tokens, 500.0),
+            ResourceAmount::Tokens(500)
+        );
+        assert_eq!(
+            ResourceAmount::from_kind_f64(ResourceKind::QuotaPercent, 12.5),
+            ResourceAmount::QuotaPercent(12.5)
+        );
+    }
+
+    #[test]
+    fn from_kind_f64_saturates_negative_input_at_zero() {
+        assert_eq!(
+            ResourceAmount::from_kind_f64(ResourceKind::Tokens, -5.0),
+            ResourceAmount::Tokens(0)
+        );
+    }
+
+    #[test]
+    fn from_kind_f64_saturates_quota_percent_at_its_documented_domain() {
+        assert_eq!(
+            ResourceAmount::from_kind_f64(ResourceKind::QuotaPercent, 160.0),
+            ResourceAmount::QuotaPercent(100.0)
+        );
+    }
+
+    #[test]
+    fn headroom_reports_exhaustion_including_negative_overrun() {
+        let positive = Headroom {
+            kind: ResourceKind::Tokens,
+            value: 10.0,
+        };
+        let zero = Headroom {
+            kind: ResourceKind::Tokens,
+            value: 0.0,
+        };
+        let negative = Headroom {
+            kind: ResourceKind::Tokens,
+            value: -5.0,
+        };
+        assert!(!positive.is_exhausted());
+        assert!(zero.is_exhausted());
+        assert!(negative.is_exhausted());
+    }
+
+    #[test]
+    fn headroom_clamped_display_never_goes_negative() {
+        let negative = Headroom {
+            kind: ResourceKind::Tokens,
+            value: -5.0,
+        };
+        assert_eq!(
+            negative.as_resource_amount_clamped(),
+            ResourceAmount::Tokens(0)
         );
     }
 }
