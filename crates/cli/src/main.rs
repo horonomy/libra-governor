@@ -11,11 +11,17 @@
 //! - `statusline` — the Claude Code `statusLine` command.
 //! - `calibration report` — real duration-coverage and admission-replay
 //!   calibration evidence over local history (HORO-1132).
+//! - `gateway token` — prints the local capability token Claude Code's
+//!   `apiKeyHelper` presents to the enforcement gateway (HORO-1144).
+//!   Never a provider credential — see that module's docs.
+//! - `gateway status` — whether the gateway is running, what it may
+//!   honestly claim to enforce, and what it has admitted or refused.
 
 mod bucket_prose;
 mod calibration_cmd;
 mod client;
 mod daemon_cmd;
+mod gateway_cmd;
 mod hook;
 mod hook_post_tool_use;
 mod hook_stop;
@@ -35,6 +41,8 @@ fn main() {
         ["hook", "stop"] => hook_stop::run(),
         ["statusline"] => statusline::run(),
         ["calibration", "report"] => calibration_cmd::run(),
+        ["gateway", "token"] => gateway_cmd::run_token(),
+        ["gateway", "status"] => gateway_cmd::run_status(),
         _ => {
             eprintln!(
                 "libra-governor: unknown or missing subcommand\n\n\
@@ -44,7 +52,9 @@ fn main() {
                  libra-governor hook post-tool-use\n  \
                  libra-governor hook stop\n  \
                  libra-governor statusline\n  \
-                 libra-governor calibration report"
+                 libra-governor calibration report\n  \
+                 libra-governor gateway token\n  \
+                 libra-governor gateway status"
             );
             std::process::exit(2);
         }

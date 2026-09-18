@@ -1,0 +1,25 @@
+[package]
+name = "libra-governor-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Libra Governor: the optional local enforcement gateway — a loopback reverse proxy that reserves, forwards, and settles provider spend."
+
+[dependencies]
+libra-governor-domain = { path = "../domain" }
+bytes = "1"
+http-body-util = { version = "0.1", features = ["channel"] }
+hyper = { version = "1", features = ["http1", "server", "client"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12", "webpki-roots"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "server", "http1", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }

@@ -21,14 +21,18 @@
 mod messages;
 pub mod wire;
 
-pub use libra_governor_domain::{Confidence, Estimate, PolicyDecision, ResourceAmount};
+pub use libra_governor_domain::Estimate;
+pub use libra_governor_domain::{
+    Confidence, CredentialCustody, EnforcementCapabilities, EnforcementTier, MonetaryEnforcement,
+    NoMonetaryCap, PolicyDecision, ResourceAmount, UsageAccounting,
+};
 pub use libra_governor_estimator::{
     AdmissionOutcome, AdmissionPolicy, AdmissionStats, CoverageReport, QuantileCoverage, Stratum,
 };
 pub use messages::{
     AdmissionPolicyReport, CalibrationReportResult, FinalizeOutcome, FinalizeResult,
-    PreflightResult, ReconSummary, ReplanState, Request, RequestEnvelope, Response,
-    ResponseEnvelope, StatusResult, TaskSummary,
+    GatewayStatusResult, PreflightResult, ReconSummary, ReplanState, Request, RequestEnvelope,
+    Response, ResponseEnvelope, StatusResult, TaskSummary,
 };
 
 /// The protocol version this build of the crate speaks. Bump on any
@@ -59,4 +63,9 @@ pub use messages::{
 /// v4 client would silently fail to deserialize these new required
 /// fields. Same known limitation as the earlier bumps: a long-lived v4
 /// daemon must be restarted after upgrading.
-pub const PROTOCOL_VERSION: u32 = 5;
+///
+/// Bumped 5 -> 6 for HORO-1144: `Request` gained `GatewayStatus` and
+/// `Response` gained the matching `GatewayStatus` variant, which a v5
+/// peer cannot decode. Same known limitation as the earlier bumps: a
+/// long-lived v5 daemon must be restarted after upgrading.
+pub const PROTOCOL_VERSION: u32 = 6;

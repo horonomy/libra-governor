@@ -4,8 +4,8 @@
 use std::path::PathBuf;
 
 use libra_governor_domain::{
-    CompletionContract, Confidence, Estimate, ExecutionReceipt, PlanId, PolicyDecision,
-    ResourceAmount, TaskId,
+    CompletionContract, Confidence, EnforcementCapabilities, Estimate, ExecutionReceipt, PlanId,
+    PolicyDecision, ResourceAmount, TaskId,
 };
 use libra_governor_estimator::{AdmissionOutcome, AdmissionPolicy, CoverageReport};
 use serde::{Deserialize, Serialize};
@@ -76,6 +76,16 @@ pub enum Request {
     /// never triggers new reconnaissance or any LLM call. Sent from
     /// `libra-governor calibration report`.
     CalibrationReport,
+    /// Ask the daemon whether the optional enforcement gateway is
+    /// running, what enforcement tier it is operating at, and what it has
+    /// admitted/refused so far (HORO-1144). Answered entirely from state
+    /// the daemon already holds; never triggers a provider call.
+    ///
+    /// Read-only by construction: there is deliberately no request
+    /// variant that starts, stops, or reconfigures the gateway. The
+    /// gateway is a security boundary, and a boundary that a client can
+    /// turn off over an IPC socket is not one.
+    GatewayStatus,
 }
 
 /// Summary of one bounded reconnaissance run. Never contains raw file
@@ -265,6 +275,42 @@ pub struct CalibrationReportResult {
     pub dropped_rows: usize,
 }
 
+/// The result of a `GatewayStatus` request (HORO-1144).
+///
+/// Carries the honest capability statement rather than a
+/// supported/unsupported boolean — see
+/// `libra_governor_domain::EnforcementCapabilities` for why. Every
+/// counter is an aggregate; there is no per-request detail here, and no
+/// field that could carry a model name, a session id, or a credential.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GatewayStatusResult {
+    /// `false` when no gateway is configured, or when one was configured
+    /// but its validation or credential resolution failed at startup — in
+    /// which case `disabled_reason` says which.
+    pub running: bool,
+    /// Why the gateway is not running, when it is not. Never contains a
+    /// credential or any captured command output.
+    pub disabled_reason: Option<String>,
+    /// What this deployment may honestly claim to enforce. `None` when no
+    /// gateway is configured at all.
+    pub capabilities: Option<EnforcementCapabilities>,
+    /// The loopback address the gateway listens on, when running.
+    pub bind_addr: Option<String>,
+    pub forwarded: u64,
+    pub denied_budget: u64,
+    pub denied_unenforceable: u64,
+    pub denied_unauthorized: u64,
+    pub approval_gated: u64,
+    pub settled_with_known_usage: u64,
+    pub settled_without_usage: u64,
+    pub upstream_errors: u64,
+    /// How many settled requests reported more output tokens than their
+    /// own `max_tokens` declared. Should always be zero; surfaced rather
+    /// than hidden because a nonzero value means the reservation
+    /// arithmetic's bound was violated.
+    pub bound_violations: u64,
+}
+
 /// One response the daemon may send back.
 ///
 /// `Preflight` is boxed: `PreflightResult` (contract draft + recon
@@ -287,6 +333,10 @@ pub enum Response {
     /// further payload.
     Ack,
     CalibrationReport(Box<CalibrationReportResult>),
+    /// Boxed for the same large-enum-variant reason as its siblings:
+    /// `GatewayStatusResult` carries an `EnforcementCapabilities` plus
+    /// nine counters.
+    GatewayStatus(Box<GatewayStatusResult>),
     /// The daemon could not (or would not) answer the request — e.g. a
     /// protocol version mismatch, or an internal error it caught rather
     /// than let propagate as a crash.

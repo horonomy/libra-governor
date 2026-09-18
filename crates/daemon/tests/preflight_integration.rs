@@ -38,6 +38,9 @@ fn preflight_returns_sane_result_within_recon_budget() {
         replan_hysteresis: libra_governor_domain::ReplanHysteresisConfig::default(),
         policy: libra_governor_daemon::default_admission_policy(),
         reservation_ttl_secs: 900,
+        gateway: None,
+        gateway_stats: std::sync::Arc::new(Default::default()),
+        gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER.to_string(),
     };
 
     let listener = libra_governor_daemon::bind_or_detect_running(&config.socket_path).unwrap();
@@ -129,6 +132,9 @@ fn second_preflight_for_same_session_supersedes_the_first() {
         replan_hysteresis: libra_governor_domain::ReplanHysteresisConfig::default(),
         policy: libra_governor_daemon::default_admission_policy(),
         reservation_ttl_secs: 900,
+        gateway: None,
+        gateway_stats: std::sync::Arc::new(Default::default()),
+        gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER.to_string(),
     };
 
     let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
@@ -273,6 +279,9 @@ fn preflight_selects_a_bucketed_tier_once_same_repo_history_exists() {
         replan_hysteresis: libra_governor_domain::ReplanHysteresisConfig::default(),
         policy: libra_governor_daemon::default_admission_policy(),
         reservation_ttl_secs: 900,
+        gateway: None,
+        gateway_stats: std::sync::Arc::new(Default::default()),
+        gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER.to_string(),
     };
 
     let listener = libra_governor_daemon::bind_or_detect_running(&config.socket_path).unwrap();

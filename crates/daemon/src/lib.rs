@@ -9,6 +9,7 @@
 
 pub mod contract;
 pub mod features;
+pub mod gateway_authority;
 pub mod log;
 pub mod paths;
 pub mod recon;
