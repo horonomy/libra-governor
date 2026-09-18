@@ -408,3 +408,296 @@ impl Policy {
         Ok(())
     }
 }
+
+/// Why a projected estimate could not be evaluated against a [`Policy`]
+/// at all (distinct from [`PolicyValidationError`], which rejects a
+/// contradictory *policy*; this rejects incompatible *input data* against
+/// an otherwise-valid policy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PolicyEvaluationError {
+    #[error(
+        "projected resource kind {projected_kind:?} does not match policy resource kind {policy_kind:?}"
+    )]
+    ProjectedResourceKindMismatch {
+        policy_kind: ResourceKind,
+        projected_kind: ResourceKind,
+    },
+}
+
+/// The outcome of evaluating one constraint (resource or time) against
+/// its projected requirement (HORO-1137).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ConstraintOutcome {
+    /// Within the pre-authorized envelope; no decision point reached.
+    Admit,
+    /// Beyond what is pre-authorized but within the hard ceiling (or no
+    /// hard ceiling is set): a clean decision point, not a block.
+    ApprovalRequired(ApprovalRequest),
+    /// Beyond the hard ceiling: admission is refused outright.
+    Deny(DenyReason),
+}
+
+/// A specific, structured request for explicit authorization to extend a
+/// policy constraint — never an ad-hoc string (HORO-1137). Carries every
+/// value a human (or a future replanning decision, HORO-1139) needs to
+/// judge the request: what was projected, what was pre-authorized, and
+/// what the absolute limit is.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ApprovalRequest {
+    Resource {
+        projected: ResourceAmount,
+        target: ResourceAmount,
+        elastic_ceiling: Option<ResourceAmount>,
+        hard_ceiling: ResourceAmount,
+    },
+    Time {
+        projected_secs: u64,
+        target_secs: u64,
+        elastic_ceiling_secs: Option<u64>,
+        hard_ceiling_secs: Option<u64>,
+    },
+}
+
+/// Why admission was refused outright (HORO-1137). Distinct from
+/// [`ApprovalRequest`]: a [`DenyReason`] is not a decision point that
+/// more authorization can resolve within the current policy — the hard
+/// ceiling (or the confidence floor) was exceeded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum DenyReason {
+    ResourceExceedsHardCeiling {
+        projected: ResourceAmount,
+        hard_ceiling: ResourceAmount,
+    },
+    TimeExceedsHardCeiling {
+        projected_secs: u64,
+        hard_ceiling_secs: u64,
+    },
+    ConfidenceBelowThreshold {
+        actual: Confidence,
+        required: Confidence,
+    },
+}
+
+/// The aggregate admission verdict across every constraint (HORO-1137).
+/// `Deny` wins over `ApprovalRequired` wins over `Admit`: any single hard
+/// violation refuses admission regardless of what the other constraints
+/// decided; any single approval-required decision point blocks a clean
+/// `Admit` even if every other constraint is fully within band.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Admission {
+    Admit,
+    ApprovalRequired(Vec<ApprovalRequest>),
+    Deny(Vec<DenyReason>),
+}
+
+/// The full result of evaluating a [`Policy`] against one projected
+/// estimate (HORO-1137).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PolicyDecision {
+    /// Traceability tag — copied from the [`Policy`] this decision was
+    /// produced from, so any stored admission/replan/receipt record
+    /// carries which policy schema version decided it.
+    pub policy_schema_version: String,
+    pub admission: Admission,
+    pub resource_outcome: ConstraintOutcome,
+    pub time_outcome: ConstraintOutcome,
+    /// Whether the projected estimate's confidence met
+    /// [`Policy::min_confidence`].
+    pub confidence_ok: bool,
+    /// The policy's required completion criteria, verbatim. Always
+    /// exactly [`Policy::quality_floor`]'s `required_criteria()` — see
+    /// [`Policy::evaluate`] docs for why this can never be a trimmed
+    /// subset.
+    pub protected_criteria: Vec<CompletionCriterion>,
+}
+
+impl Policy {
+    /// Evaluates this policy against one projected estimate.
+    ///
+    /// # Quality invariant
+    ///
+    /// This function's signature takes `&self` — a shared, immutable
+    /// reference — and no separate "which criteria are still required"
+    /// input. There is structurally no parameter through which a caller
+    /// could ask this function to admit work while dropping or weakening
+    /// a required [`CompletionCriterion`] to make a tight budget "fit":
+    /// [`PolicyDecision::protected_criteria`] is always read straight
+    /// from `self.quality_floor.required_criteria()`, never computed,
+    /// filtered, or influenced by the projected resource/time/confidence
+    /// arguments below. See the `quality_invariant_*` tests in this
+    /// module.
+    pub fn evaluate(
+        &self,
+        projected_resource: ResourceAmount,
+        projected_duration_secs: u64,
+        estimate_confidence: Confidence,
+    ) -> Result<PolicyDecision, PolicyEvaluationError> {
+        let policy_kind = self.resource.target.kind();
+        if projected_resource.kind() != policy_kind {
+            return Err(PolicyEvaluationError::ProjectedResourceKindMismatch {
+                policy_kind,
+                projected_kind: projected_resource.kind(),
+            });
+        }
+
+        let resource_outcome = Self::evaluate_resource(&self.resource, projected_resource);
+        let time_outcome = Self::evaluate_time(&self.time, projected_duration_secs);
+        let confidence_ok = estimate_confidence >= self.min_confidence;
+
+        let mut deny_reasons = Vec::new();
+        let mut approval_requests = Vec::new();
+        for outcome in [&resource_outcome, &time_outcome] {
+            match outcome {
+                ConstraintOutcome::Deny(reason) => deny_reasons.push(reason.clone()),
+                ConstraintOutcome::ApprovalRequired(request) => {
+                    approval_requests.push(request.clone())
+                }
+                ConstraintOutcome::Admit => {}
+            }
+        }
+        if !confidence_ok {
+            deny_reasons.push(DenyReason::ConfidenceBelowThreshold {
+                actual: estimate_confidence,
+                required: self.min_confidence,
+            });
+        }
+
+        let admission = if !deny_reasons.is_empty() {
+            Admission::Deny(deny_reasons)
+        } else if !approval_requests.is_empty() {
+            Admission::ApprovalRequired(approval_requests)
+        } else {
+            Admission::Admit
+        };
+
+        Ok(PolicyDecision {
+            policy_schema_version: self.policy_schema_version.clone(),
+            admission,
+            resource_outcome,
+            time_outcome,
+            confidence_ok,
+            protected_criteria: self.quality_floor.required_criteria().cloned().collect(),
+        })
+    }
+
+    fn evaluate_resource(bound: &ResourceBound, projected: ResourceAmount) -> ConstraintOutcome {
+        let p = projected.as_f64();
+        let target = bound.target.as_f64();
+        let hard = bound.hard_ceiling.as_f64();
+
+        match bound.mode {
+            ConstraintMode::Hard => {
+                if p > hard {
+                    ConstraintOutcome::Deny(DenyReason::ResourceExceedsHardCeiling {
+                        projected,
+                        hard_ceiling: bound.hard_ceiling,
+                    })
+                } else {
+                    ConstraintOutcome::Admit
+                }
+            }
+            ConstraintMode::Elastic => {
+                let elastic = bound
+                    .elastic_ceiling
+                    .expect("validated: Elastic mode always has an elastic_ceiling");
+                if p <= target || p <= elastic.as_f64() {
+                    ConstraintOutcome::Admit
+                } else if p <= hard {
+                    ConstraintOutcome::ApprovalRequired(ApprovalRequest::Resource {
+                        projected,
+                        target: bound.target,
+                        elastic_ceiling: Some(elastic),
+                        hard_ceiling: bound.hard_ceiling,
+                    })
+                } else {
+                    ConstraintOutcome::Deny(DenyReason::ResourceExceedsHardCeiling {
+                        projected,
+                        hard_ceiling: bound.hard_ceiling,
+                    })
+                }
+            }
+            ConstraintMode::Approval => {
+                if p <= target {
+                    ConstraintOutcome::Admit
+                } else if p <= hard {
+                    ConstraintOutcome::ApprovalRequired(ApprovalRequest::Resource {
+                        projected,
+                        target: bound.target,
+                        elastic_ceiling: None,
+                        hard_ceiling: bound.hard_ceiling,
+                    })
+                } else {
+                    ConstraintOutcome::Deny(DenyReason::ResourceExceedsHardCeiling {
+                        projected,
+                        hard_ceiling: bound.hard_ceiling,
+                    })
+                }
+            }
+        }
+    }
+
+    fn evaluate_time(bound: &TimeBound, projected_secs: u64) -> ConstraintOutcome {
+        match bound.mode {
+            ConstraintMode::Hard => {
+                let hard = bound
+                    .hard_ceiling_secs
+                    .expect("validated: Hard mode always has a hard_ceiling_secs");
+                if projected_secs > hard {
+                    ConstraintOutcome::Deny(DenyReason::TimeExceedsHardCeiling {
+                        projected_secs,
+                        hard_ceiling_secs: hard,
+                    })
+                } else {
+                    ConstraintOutcome::Admit
+                }
+            }
+            ConstraintMode::Elastic => {
+                let elastic = bound
+                    .elastic_ceiling_secs
+                    .expect("validated: Elastic mode always has an elastic_ceiling_secs");
+                if projected_secs <= bound.target_secs || projected_secs <= elastic {
+                    ConstraintOutcome::Admit
+                } else if bound
+                    .hard_ceiling_secs
+                    .is_none_or(|hard| projected_secs <= hard)
+                {
+                    ConstraintOutcome::ApprovalRequired(ApprovalRequest::Time {
+                        projected_secs,
+                        target_secs: bound.target_secs,
+                        elastic_ceiling_secs: Some(elastic),
+                        hard_ceiling_secs: bound.hard_ceiling_secs,
+                    })
+                } else {
+                    ConstraintOutcome::Deny(DenyReason::TimeExceedsHardCeiling {
+                        projected_secs,
+                        hard_ceiling_secs: bound
+                            .hard_ceiling_secs
+                            .expect("checked is_none_or above"),
+                    })
+                }
+            }
+            ConstraintMode::Approval => {
+                if projected_secs <= bound.target_secs {
+                    ConstraintOutcome::Admit
+                } else if bound
+                    .hard_ceiling_secs
+                    .is_none_or(|hard| projected_secs <= hard)
+                {
+                    ConstraintOutcome::ApprovalRequired(ApprovalRequest::Time {
+                        projected_secs,
+                        target_secs: bound.target_secs,
+                        elastic_ceiling_secs: None,
+                        hard_ceiling_secs: bound.hard_ceiling_secs,
+                    })
+                } else {
+                    ConstraintOutcome::Deny(DenyReason::TimeExceedsHardCeiling {
+                        projected_secs,
+                        hard_ceiling_secs: bound
+                            .hard_ceiling_secs
+                            .expect("checked is_none_or above"),
+                    })
+                }
+            }
+        }
+    }
+}
