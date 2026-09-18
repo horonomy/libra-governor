@@ -1009,4 +1009,125 @@ mod tests {
         );
         assert!(matches!(decision.admission, Admission::Deny(_)));
     }
+
+    fn approval_resource_policy() -> Policy {
+        Policy::validated(
+            "test-approval-resource",
+            ResourceBound {
+                mode: ConstraintMode::Approval,
+                target: ResourceAmount::UsdCents(1000),
+                elastic_ceiling: None,
+                hard_ceiling: ResourceAmount::UsdCents(2000),
+            },
+            TimeBound {
+                mode: ConstraintMode::Approval,
+                target_secs: 600,
+                elastic_ceiling_secs: None,
+                hard_ceiling_secs: Some(1200),
+                deadline: None,
+            },
+            quality_floor(),
+            Confidence::Medium,
+            AutonomyBoundary::AskOnApproval,
+        )
+        .expect("valid policy")
+    }
+
+    #[test]
+    fn approval_mode_admits_at_and_below_target_with_no_pre_authorized_band() {
+        let policy = approval_resource_policy();
+        let decision = policy
+            .evaluate(ResourceAmount::UsdCents(1000), 600, Confidence::Medium)
+            .expect("compatible kind");
+        assert_eq!(decision.admission, Admission::Admit);
+    }
+
+    #[test]
+    fn approval_mode_requires_approval_for_any_amount_past_target() {
+        // Unlike Elastic, there is nothing the caller can spend past
+        // target without asking — the very next unit already requires
+        // approval.
+        let policy = approval_resource_policy();
+        let decision = policy
+            .evaluate(ResourceAmount::UsdCents(1001), 601, Confidence::Medium)
+            .expect("compatible kind");
+        assert_eq!(
+            decision.resource_outcome,
+            ConstraintOutcome::ApprovalRequired(ApprovalRequest::Resource {
+                projected: ResourceAmount::UsdCents(1001),
+                target: ResourceAmount::UsdCents(1000),
+                elastic_ceiling: None,
+                hard_ceiling: ResourceAmount::UsdCents(2000),
+            })
+        );
+    }
+
+    #[test]
+    fn approval_mode_denies_past_the_hard_ceiling() {
+        let policy = approval_resource_policy();
+        let decision = policy
+            .evaluate(ResourceAmount::UsdCents(2001), 1201, Confidence::Medium)
+            .expect("compatible kind");
+        assert!(matches!(decision.admission, Admission::Deny(_)));
+    }
+
+    #[test]
+    fn approval_mode_time_with_no_hard_ceiling_never_denies() {
+        let policy = Policy::validated(
+            "test-approval-open-ended-time",
+            ResourceBound {
+                mode: ConstraintMode::Hard,
+                target: ResourceAmount::UsdCents(1000),
+                elastic_ceiling: None,
+                hard_ceiling: ResourceAmount::UsdCents(1000),
+            },
+            TimeBound {
+                mode: ConstraintMode::Approval,
+                target_secs: 600,
+                elastic_ceiling_secs: None,
+                hard_ceiling_secs: None,
+                deadline: None,
+            },
+            quality_floor(),
+            Confidence::Medium,
+            AutonomyBoundary::AskOnApproval,
+        )
+        .expect("valid policy");
+
+        let decision = policy
+            .evaluate(ResourceAmount::UsdCents(1000), 1_000_000, Confidence::Medium)
+            .expect("compatible kind");
+        assert!(matches!(
+            decision.time_outcome,
+            ConstraintOutcome::ApprovalRequired(_)
+        ));
+    }
+
+    #[test]
+    fn confidence_below_threshold_denies_admission_independent_of_bounds() {
+        let policy = hard_resource_policy();
+        let decision = policy
+            .evaluate(ResourceAmount::UsdCents(1), 1, Confidence::Low)
+            .expect("compatible kind");
+        assert!(!decision.confidence_ok);
+        match decision.admission {
+            Admission::Deny(reasons) => assert_eq!(
+                reasons,
+                vec![DenyReason::ConfidenceBelowThreshold {
+                    actual: Confidence::Low,
+                    required: Confidence::Medium,
+                }]
+            ),
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn confidence_exactly_at_threshold_passes() {
+        let policy = hard_resource_policy();
+        let decision = policy
+            .evaluate(ResourceAmount::UsdCents(1), 1, Confidence::Medium)
+            .expect("compatible kind");
+        assert!(decision.confidence_ok);
+    }
 }
