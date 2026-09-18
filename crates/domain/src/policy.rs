@@ -701,3 +701,135 @@ impl Policy {
         }
     }
 }
+
+/// The task-specific inputs a preset compiles into a concrete [`Policy`]
+/// (HORO-1137). Presets fix *how* constraints are enforced (which
+/// [`ConstraintMode`], which multiplier); `PolicyPresetInputs` supplies
+/// the task-specific *values* (what the target spend/deadline/quality
+/// floor actually are) — see [`Policy::balanced`] and its sibling
+/// presets.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PolicyPresetInputs {
+    pub resource_target: ResourceAmount,
+    pub time_target_secs: u64,
+    pub quality_floor: CompletionContract,
+}
+
+impl Policy {
+    /// Balanced pre-authorization: both cost and time get a moderate
+    /// elastic band (target..=1.25x, hard ceiling at 1.5x), medium
+    /// confidence required, ask before crossing into either band's
+    /// approval-required zone.
+    pub fn balanced(inputs: PolicyPresetInputs) -> Result<Self, PolicyValidationError> {
+        Self::validated(
+            "balanced",
+            ResourceBound {
+                mode: ConstraintMode::Elastic,
+                target: inputs.resource_target,
+                elastic_ceiling: Some(inputs.resource_target.scaled(1.25)),
+                hard_ceiling: inputs.resource_target.scaled(1.5),
+            },
+            TimeBound {
+                mode: ConstraintMode::Elastic,
+                target_secs: inputs.time_target_secs,
+                elastic_ceiling_secs: Some(scale_secs(inputs.time_target_secs, 1.25)),
+                hard_ceiling_secs: Some(scale_secs(inputs.time_target_secs, 1.5)),
+                deadline: None,
+            },
+            inputs.quality_floor,
+            Confidence::Medium,
+            AutonomyBoundary::AskOnApproval,
+        )
+    }
+
+    /// Deadline-first: time is `Hard` with zero slack (the deadline is
+    /// firm), while cost is `Elastic` with a *wider* band than
+    /// [`Self::balanced`] (target..=2x, hard ceiling at 3x) — the
+    /// tolerated cost elasticity the ticket describes. The quality floor
+    /// is identical to every other preset: deadline pressure never
+    /// relaxes required completion criteria (see the
+    /// `deadline_first_preserves_quality_floor_while_spending_more`
+    /// test).
+    pub fn deadline_first(inputs: PolicyPresetInputs) -> Result<Self, PolicyValidationError> {
+        Self::validated(
+            "deadline_first",
+            ResourceBound {
+                mode: ConstraintMode::Elastic,
+                target: inputs.resource_target,
+                elastic_ceiling: Some(inputs.resource_target.scaled(2.0)),
+                hard_ceiling: inputs.resource_target.scaled(3.0),
+            },
+            TimeBound {
+                mode: ConstraintMode::Hard,
+                target_secs: inputs.time_target_secs,
+                elastic_ceiling_secs: None,
+                hard_ceiling_secs: Some(inputs.time_target_secs),
+                deadline: None,
+            },
+            inputs.quality_floor,
+            Confidence::Medium,
+            AutonomyBoundary::AskOnApproval,
+        )
+    }
+
+    /// Cost-first: the mirror image of [`Self::deadline_first`] — cost is
+    /// `Hard` with zero slack (the budget is firm), while time is
+    /// `Elastic` with a wide band (target..=2x, hard ceiling at 3x).
+    pub fn cost_first(inputs: PolicyPresetInputs) -> Result<Self, PolicyValidationError> {
+        Self::validated(
+            "cost_first",
+            ResourceBound {
+                mode: ConstraintMode::Hard,
+                target: inputs.resource_target,
+                elastic_ceiling: None,
+                hard_ceiling: inputs.resource_target,
+            },
+            TimeBound {
+                mode: ConstraintMode::Elastic,
+                target_secs: inputs.time_target_secs,
+                elastic_ceiling_secs: Some(scale_secs(inputs.time_target_secs, 2.0)),
+                hard_ceiling_secs: Some(scale_secs(inputs.time_target_secs, 3.0)),
+                deadline: None,
+            },
+            inputs.quality_floor,
+            Confidence::Medium,
+            AutonomyBoundary::AskOnApproval,
+        )
+    }
+
+    /// Strict budget: both cost and time are `Hard` with zero slack, the
+    /// highest confidence bar ([`Confidence::High`]), and the most
+    /// conservative autonomy boundary — confirm every spend-incurring
+    /// step. For tasks where neither cost nor schedule overrun is
+    /// tolerable at all.
+    pub fn strict_budget(inputs: PolicyPresetInputs) -> Result<Self, PolicyValidationError> {
+        Self::validated(
+            "strict_budget",
+            ResourceBound {
+                mode: ConstraintMode::Hard,
+                target: inputs.resource_target,
+                elastic_ceiling: None,
+                hard_ceiling: inputs.resource_target,
+            },
+            TimeBound {
+                mode: ConstraintMode::Hard,
+                target_secs: inputs.time_target_secs,
+                elastic_ceiling_secs: None,
+                hard_ceiling_secs: Some(inputs.time_target_secs),
+                deadline: None,
+            },
+            inputs.quality_floor,
+            Confidence::High,
+            AutonomyBoundary::ConfirmEachStep,
+        )
+    }
+}
+
+/// Scales a duration in seconds by `factor`, rounding to the nearest
+/// second. Kept local to this module (rather than a general `Duration`
+/// extension) since it only exists to derive elastic/hard ceilings for
+/// [`TimeBound`] from a target the same way [`ResourceAmount::scaled`]
+/// does for resources.
+fn scale_secs(secs: u64, factor: f64) -> u64 {
+    ((secs as f64) * factor).round() as u64
+}
