@@ -47,6 +47,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 7,
         sql: include_str!("../migrations/0007_gateway_requests.sql"),
     },
+    Migration {
+        version: 8,
+        sql: include_str!("../migrations/0008_plan_admission.sql"),
+    },
 ];
 
 /// Applies every migration whose version is greater than the database's

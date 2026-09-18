@@ -16,10 +16,23 @@ pub struct LedgerStore {
 impl LedgerStore {
     /// Opens (creating if necessary) the SQLite database at `path`,
     /// applies any pending migrations, and returns a ready-to-use store.
+    ///
+    /// The main database file (and its `-wal`/`-shm` WAL-mode sidecar
+    /// files, once [`Self::configure`] switches on WAL and they start
+    /// existing) is hardened to owner-only (`0600`) after opening
+    /// (HORO-1146 security review finding #5) — this ledger holds every
+    /// task's contract, plan, and receipt evidence. This is defense in
+    /// depth, not the primary boundary: the real protection is the
+    /// containing state directory's own `0700` mode (see
+    /// `libra-governor-daemon::paths::ensure_state_dir`), which is what
+    /// actually protects a sidecar file the instant SQLite creates it,
+    /// before this function's own `chmod` could run.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
+        let path = path.as_ref();
         let mut conn = Connection::open(path)?;
         Self::configure(&mut conn)?;
         migrations::apply_all(&mut conn)?;
+        harden_file_permissions(path)?;
         Ok(Self { conn })
     }
 
@@ -38,6 +51,30 @@ impl LedgerStore {
         conn.pragma_update(None, "foreign_keys", true)?;
         Ok(())
     }
+}
+
+/// Sets the main ledger file, and its `-wal`/`-shm` WAL-mode sidecars (if
+/// present — `open_in_memory` never has them, and even an on-disk store
+/// only grows them once [`LedgerStore::configure`] has actually switched
+/// the connection into WAL mode), to owner-only (`0600`) (HORO-1146).
+/// Missing sidecars are not an error — SQLite creates them lazily on
+/// first write, and a freshly opened, never-written-to store may not
+/// have one yet.
+fn harden_file_permissions(main_path: &Path) -> Result<(), LedgerError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sidecar = |suffix: &str| {
+        let mut name = main_path.file_name().unwrap_or_default().to_os_string();
+        name.push(suffix);
+        main_path.with_file_name(name)
+    };
+
+    for path in [main_path.to_path_buf(), sidecar("-wal"), sidecar("-shm")] {
+        if path.exists() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -74,6 +111,6 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 }

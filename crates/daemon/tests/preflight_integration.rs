@@ -256,6 +256,7 @@ fn preflight_selects_a_bucketed_tier_once_same_repo_history_exists() {
                 task_features: None,
                 replaces: None,
                 replan_reason: None,
+                admission: None,
             };
             ledger.insert_plan(&plan).unwrap();
             let receipt = ExecutionReceipt::new(

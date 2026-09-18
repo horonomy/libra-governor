@@ -1,0 +1,28 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running tests/reservation_concurrency.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/reservation_concurrency-75a8b9d50e84903e)
+
+running 3 tests
+test a_reservation_left_active_by_a_crashed_process_is_reclaimed_on_reconciliation ... ok
+test concurrent_optional_reservations_never_double_spend_the_shared_envelope ... ok
+test concurrent_required_work_reservations_never_over_draw_the_completion_reserve ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running tests/proxy_lifecycle.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/proxy_lifecycle-e413414305e2c77e)
+
+running 1 test
+test exhausted_headroom_refuses_even_though_the_completion_reserve_still_holds_capacity ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.02s
+
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running tests/gateway_enforcement.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/gateway_enforcement-8799afa54e798f18)
+
+running 1 test
+test the_completion_reserve_is_never_drawn_by_gateway_traffic ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.02s
+

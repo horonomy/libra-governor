@@ -24,3 +24,4 @@ thiserror.workspace = true
 libra-governor-ledger = { path = "../ledger" }
 tempfile.workspace = true
 time.workspace = true
+uuid.workspace = true

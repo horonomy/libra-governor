@@ -135,9 +135,19 @@ pub fn default_admission_policy() -> Policy {
 /// Binds `socket_path`, handling the stale-vs-live detection documented
 /// on this module. Returns the bound listener, or
 /// [`DaemonError::AlreadyRunning`] if a live daemon already holds it.
+///
+/// The socket file is hardened to owner-only (`0600`) immediately after
+/// each successful `bind` (HORO-1146 security review finding #5) —
+/// defense in depth on top of the containing state directory's own
+/// `0700` mode (`libra_governor_daemon::paths::ensure_state_dir`), which
+/// is the real boundary protecting the brief window between `bind`
+/// creating the file and this function's own `chmod` running.
 pub fn bind_or_detect_running(socket_path: &PathBuf) -> Result<UnixListener, DaemonError> {
     match UnixListener::bind(socket_path) {
-        Ok(listener) => Ok(listener),
+        Ok(listener) => {
+            harden_socket_permissions(socket_path)?;
+            Ok(listener)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             if UnixStream::connect(socket_path).is_ok() {
                 return Err(DaemonError::AlreadyRunning(socket_path.clone()));
@@ -148,10 +158,17 @@ pub fn bind_or_detect_running(socket_path: &PathBuf) -> Result<UnixListener, Dae
             // rather than silently — acceptable for MVP 1.0's
             // single-user local scope (documented known limitation).
             std::fs::remove_file(socket_path)?;
-            Ok(UnixListener::bind(socket_path)?)
+            let listener = UnixListener::bind(socket_path)?;
+            harden_socket_permissions(socket_path)?;
+            Ok(listener)
         }
         Err(e) => Err(e.into()),
     }
+}
+
+fn harden_socket_permissions(socket_path: &PathBuf) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
 }
 
 /// Reclaims every reservation left `Active` past its `expires_at`
@@ -538,6 +555,11 @@ fn handle_preflight(
         estimate.duration_p80_secs.unwrap_or(0),
         estimate.confidence,
     )?;
+    // Persist the verdict onto the plan (HORO-1146): a later
+    // material-event replan needs to be able to look up whether this
+    // plan was ever actually admitted before it reserves capacity on the
+    // plan's behalf — see `handle_tool_invoked`.
+    ledger.set_plan_admission(plan.id, &decision.admission)?;
 
     match &decision.admission {
         Admission::Admit => {
@@ -757,7 +779,26 @@ fn handle_tool_invoked(
     let remaining = RemainingEstimate::from_bucketed(base_estimate);
     let reason = ReplanReason::new(trigger, detail);
 
-    let new_plan = ExecutionPlan::new(
+    // HORO-1146 gate finding #2: the plan this replan is about to
+    // supersede may itself have been Denied, or left ApprovalRequired,
+    // at its own preflight — work still proceeds after either outcome
+    // (hooks are advisory-only, ADR 0001), so a task reaching this
+    // replan trigger with a non-admitted plan is expected, not a bug to
+    // filter upstream. What must not happen is this replan silently
+    // committing real ledger capacity (`ReservationClass::RequiredWork`)
+    // on behalf of a task that was never actually authorized to spend
+    // it — `handle_preflight` writes no reservation for either Deny or
+    // ApprovalRequired, so the replan path must honor the same rule for
+    // both, not just Deny. The prior plan's admission is carried forward
+    // onto the new plan (rather than defaulting to `None`) so a second,
+    // later replan in the same non-admitted chain also sees it and also
+    // skips reserving, instead of the signal being lost the moment this
+    // replan's own plan is superseded in turn.
+    let was_not_admitted = matches!(
+        plan.admission,
+        Some(Admission::Deny(_)) | Some(Admission::ApprovalRequired(_))
+    );
+    let mut new_plan = ExecutionPlan::new(
         task_id,
         plan.contract_revision,
         plan.recon_snapshot_ref.clone(),
@@ -766,6 +807,9 @@ fn handle_tool_invoked(
     .with_estimate(remaining.estimate.clone())
     .with_task_features(Some(task_features))
     .with_replan_linkage(plan.id, reason.clone());
+    if let Some(admission) = plan.admission.clone() {
+        new_plan = new_plan.with_admission(admission);
+    }
     ledger.insert_plan(&new_plan)?;
     ledger.supersede_in_flight_preflights(session_id)?;
     ledger.record_preflight(session_id, task_id, new_plan.id, now)?;
@@ -810,7 +854,23 @@ fn handle_tool_invoked(
                 ResourceAmount::from_kind_f64(budget.resource_kind, work_envelope_value);
             // Same mutual exclusion as `handle_preflight`'s: with the
             // gateway on, the per-request reservations are the envelope.
-            if config.gateway.is_some() {
+            if was_not_admitted {
+                // HORO-1146 gate finding #2: the plan this replan
+                // supersedes was Denied or left ApprovalRequired at its
+                // own preflight — do not reserve capacity on behalf of a
+                // task that was never actually admitted. The Completion
+                // Reserve adjustment above still runs (it protects
+                // required completion work regardless of admission
+                // outcome); only this optional-work reservation is
+                // skipped.
+                log::append_line(
+                    &config.log_path,
+                    &format!(
+                        "task {task_id}: replan skipped reserving the recomputed work envelope \
+                         — the plan being replaced was not admitted (Deny or ApprovalRequired)"
+                    ),
+                );
+            } else if config.gateway.is_some() {
                 log::append_line(
                     &config.log_path,
                     &format!(

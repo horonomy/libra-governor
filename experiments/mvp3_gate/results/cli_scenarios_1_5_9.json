@@ -1,0 +1,14 @@
+{
+  "s1_balanced_on_budget_completion": {
+    "passed": true,
+    "detail": "preflight_ok=True, admitted=True, stop_ok=True, receipt written with tool_call_count=3, actual_duration_secs=0. preflight additionalContext (verbatim): '{\"hookSpecificOutput\":{\"additionalContext\":\"{\\\\\"hookSpecificOutput\\\\\":{\\\\\"additionalContext\\\\\":\\\\\"[libra-governor] Preflight complete (task e27aeb1b-5089-4462-9374-50cc5e23e7df, confidence: medium, recon: 0.00s).\\\\\\\\nDraft Completion Contract (revision 1):\\\\\\\\n  - [required] Matches the user\\'s stated request\\\\\\\\n  - [required] Relevant tests pass (cargo test)\\\\\\\\nCost/time estimate: cold start \u2014 insufficient local history: no ExecutionReceipt rows recorded yet (confidence: low). This preflight is advisory only.\\\\\",\\\\\"hookEventName\\\\\":\\\\\"UserPromptSubmit\\\\\"}}\",\"hookEventName\":\"UserPromptSubmit\"}}'. stop stderr (verbatim): '[libra-governor] Execution Receipt (task e27aeb1b-5089-4462-9374-50cc5e23e7df)\\nEstimate: cold start \u2014 insufficient local history: no ExecutionReceipt rows recorded yet (confidence: Low, n=0)\\nActual:   0s / unknown (harness does not expose cost/usage data)\\nOutcome:  Unknown (no automated completion verification in MVP 1)\\nTool calls: 3\\nInside P90: n/a (cold start)'"
+  },
+  "s5_material_event_triggers_a_real_replan": {
+    "passed": true,
+    "detail": "replan_events before=0, after=1 (rows: [('20c79039-66d6-4ce9-af4b-6830dca064b8', '\"possible_tool_loop\"', 'Bash invoked 4 times in a row')]). statusline (verbatim): 'libra: task 9d158996 | plan 28107139 | preflight: low | recon: 0.0s | remaining P90: unknown | replanned 1x'"
+  },
+  "s9_daemon_crash_restart_reconciliation": {
+    "passed": true,
+    "detail": "preflight_ok=True, reservations_before_kill=[('a79c068a-1a85-4e4a-9210-765133a4dc12', '1a74292c-d592-4e78-b05b-866573480a4e', 'released', '2026-09-18T11:11:51.308655Z'), ('c55a8f54-a38f-47f2-82f8-0486f2d6b86f', '1a74292c-d592-4e78-b05b-866573480a4e', 'active', '2026-09-18T11:11:51.329839Z')], daemon confirmed dead after SIGKILL=True, active reservations right before reconcile (expires_at rewritten to the past)=[('active',)], next hook auto-respawned the daemon=True, reservations after respawn+reconcile=[('a79c068a-1a85-4e4a-9210-765133a4dc12', 'released'), ('b5b8e6d9-2ae6-4514-aed8-aa1d5502072e', 'active'), ('c55a8f54-a38f-47f2-82f8-0486f2d6b86f', 'expired')], stale reservation reclaimed to state=expired=True, completion_reserve restored to initial value for the crashed task=True, task_budgets rows=[('1a74292c-d592-4e78-b05b-866573480a4e', 30000.0, 30000.0), ('160b9821-f356-4cb0-8d89-29e3b5db4687', 30000.0, 30000.0)]"
+  }
+}

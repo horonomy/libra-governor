@@ -1,0 +1,76 @@
+   Compiling cfg-if v1.0.5
+   Compiling once_cell v1.21.4
+   Compiling itoa v1.0.18
+   Compiling pin-project-lite v0.2.17
+   Compiling bytes v1.12.1
+   Compiling smallvec v1.16.1
+   Compiling libc v0.2.189
+   Compiling zeroize v1.9.0
+   Compiling serde_core v1.0.229
+   Compiling zerocopy v0.8.57
+   Compiling futures-core v0.3.34
+   Compiling untrusted v0.9.0
+   Compiling powerfmt v0.2.0
+   Compiling time-core v0.1.9
+   Compiling num-conv v0.2.2
+   Compiling thiserror v2.0.20
+   Compiling zmij v1.0.23
+   Compiling try-lock v0.2.5
+   Compiling memchr v2.8.3
+   Compiling typenum v1.20.1
+   Compiling futures-channel v0.3.34
+   Compiling want v0.3.1
+   Compiling rustls-pki-types v1.15.1
+   Compiling tracing-core v0.1.36
+   Compiling libsqlite3-sys v0.30.1
+   Compiling httparse v1.10.1
+   Compiling atomic-waker v1.1.2
+   Compiling fallible-iterator v0.3.0
+   Compiling bitflags v2.13.2
+   Compiling httpdate v1.0.3
+   Compiling futures-task v0.3.34
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling subtle v2.6.1
+   Compiling futures-util v0.3.34
+   Compiling tower-service v0.3.3
+   Compiling webpki-roots v1.0.9
+   Compiling tracing v0.1.44
+   Compiling socket2 v0.6.5
+   Compiling mio v1.2.3
+   Compiling getrandom v0.2.17
+   Compiling getrandom v0.4.3
+   Compiling http v1.5.0
+   Compiling cpufeatures v0.2.17
+   Compiling ring v0.17.14
+   Compiling generic-array v0.14.7
+   Compiling tokio v1.53.1
+   Compiling http-body v1.1.0
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling digest v0.10.7
+   Compiling sha2 v0.10.9
+   Compiling rustls-webpki v0.103.15
+   Compiling deranged v0.5.8
+   Compiling serde v1.0.229
+   Compiling uuid v1.26.1
+   Compiling serde_json v1.0.151
+   Compiling rustls v0.23.45
+   Compiling time v0.3.55
+   Compiling ahash v0.8.12
+   Compiling hashbrown v0.14.5
+   Compiling hashlink v0.9.1
+   Compiling rusqlite v0.32.1
+   Compiling hyper v1.11.1
+   Compiling http-body-util v0.1.5
+   Compiling libra-governor-domain v0.0.0 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-mvp-3.0-HORO-1146-release_gate/crates/domain)
+   Compiling hyper-util v0.1.20
+   Compiling tokio-rustls v0.26.5
+   Compiling hyper-rustls v0.27.9
+   Compiling libra-governor-ledger v0.0.0 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-mvp-3.0-HORO-1146-release_gate/crates/ledger)
+   Compiling libra-governor-gateway v0.0.0 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-mvp-3.0-HORO-1146-release_gate/crates/gateway)
+   Compiling libra-governor-estimator v0.0.0 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-mvp-3.0-HORO-1146-release_gate/crates/estimator)
+   Compiling libra-governor-protocol v0.0.0 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-mvp-3.0-HORO-1146-release_gate/crates/protocol)
+   Compiling libra-governor-daemon v0.0.0 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-mvp-3.0-HORO-1146-release_gate/crates/daemon)
+   Compiling libra-governor-cli v0.0.0 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-mvp-3.0-HORO-1146-release_gate/crates/cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.47s
+exit=0

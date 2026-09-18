@@ -1,0 +1,17 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running tests/auth_and_routing.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/auth_and_routing-27f0437c8e282d90)
+
+running 1 test
+test pass_through_subscription_mode_forwards_the_callers_own_credential_unchanged ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.00s
+
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running unittests src/lib.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/libra_governor_domain-7b95b50005754243)
+
+running 1 test
+test capability::tests::subscription_tier_names_the_concrete_reason_it_cannot_price ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 96 filtered out; finished in 0.00s
+

@@ -1,0 +1,22 @@
+-- Persists the Admission verdict a plan's own preflight (or replan)
+-- produced, added for HORO-1146 (release-gate defect #2 fix).
+--
+-- Before this migration, `Policy::evaluate`'s `Admission` was computed
+-- and returned to the caller (`PreflightResult::admission`) but never
+-- durably recorded anywhere. That meant a later material-event replan
+-- (`handle_tool_invoked`) had no way to check whether the plan it was
+-- about to supersede had ever actually been admitted, and would write a
+-- new `ReservationClass::RequiredWork` reservation even for a task whose
+-- original admission was `Deny` -- confirmed in the HORO-1146 gate's
+-- scenario 5/9 evidence.
+--
+-- `admission_json` mirrors `estimate_json`/`task_features_json`: nullable
+-- (a pre-HORO-1146 plan, or one constructed without evaluating a policy
+-- at all, carries no admission), populated by
+-- `LedgerStore::insert_plan` straight from `ExecutionPlan::admission`.
+--
+-- Privacy: `Admission` carries only structured deny/approval reasons and
+-- numeric amounts -- never raw prompt or tool-output content, matching
+-- the invariant documented in 0001_init.sql.
+
+ALTER TABLE plans ADD COLUMN admission_json TEXT;

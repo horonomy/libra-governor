@@ -1,5 +1,6 @@
 use libra_governor_domain::{
-    CompletionContract, ExecutionEvent, ExecutionPlan, ExecutionReceipt, ReplanRecord, TaskIdentity,
+    Admission, CompletionContract, ExecutionEvent, ExecutionPlan, ExecutionReceipt, PlanId,
+    ReplanRecord, TaskIdentity,
 };
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
@@ -139,10 +140,18 @@ impl LedgerStore {
             .map_err(|e| {
                 LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
             })?;
+        let admission_json = plan
+            .admission
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| {
+                LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+            })?;
 
         self.conn.execute(
-            "INSERT INTO plans (id, task_id, contract_revision, recon_snapshot_ref, created_at, estimate_json, task_features_json, replaces_plan_id, replan_reason_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO plans (id, task_id, contract_revision, recon_snapshot_ref, created_at, estimate_json, task_features_json, replaces_plan_id, replan_reason_json, admission_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 plan.id.0.to_string(),
                 plan.task_id.to_string(),
@@ -153,7 +162,32 @@ impl LedgerStore {
                 task_features_json,
                 plan.replaces.map(|p| p.0.to_string()),
                 replan_reason_json,
+                admission_json,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Records the [`Admission`] verdict a plan's own preflight produced,
+    /// after the fact (HORO-1146): `handle_preflight` inserts the plan
+    /// before the admission decision is computed (the decision needs the
+    /// task's budget, which itself needs the plan's own contract/estimate
+    /// already committed), so the admission is written in this separate
+    /// update rather than folded into `insert_plan`. A later
+    /// material-event replan (`handle_tool_invoked`) reads this back via
+    /// `get_plan` to decide whether the plan it is about to supersede was
+    /// ever actually admitted.
+    pub fn set_plan_admission(
+        &mut self,
+        plan_id: PlanId,
+        admission: &Admission,
+    ) -> Result<(), LedgerError> {
+        let admission_json = serde_json::to_string(admission).map_err(|e| {
+            LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+        })?;
+        self.conn.execute(
+            "UPDATE plans SET admission_json = ?1 WHERE id = ?2",
+            rusqlite::params![admission_json, plan_id.0.to_string()],
         )?;
         Ok(())
     }

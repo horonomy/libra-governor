@@ -1,0 +1,20 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running tests/ssrf_and_config.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/ssrf_and_config-b2eb121853f9dd26)
+
+running 13 tests
+test a_gateway_bound_to_a_non_loopback_address_never_starts ... ok
+test a_gateway_whose_upstream_is_not_configuration_never_starts ... ok
+test a_name_that_merely_looks_like_loopback_is_not_treated_as_loopback ... ok
+test a_subscription_deployment_may_not_claim_a_usd_hard_cap ... ok
+test a_traversal_path_is_refused_rather_than_normalised_into_the_upstream_url ... ok
+test an_absolute_form_request_uri_cannot_redirect_the_outbound_call ... ok
+test an_upstream_redirect_is_relayed_rather_than_followed ... ok
+test fake_upstream::tests::every_credential_shaped_fixture_value_is_obviously_fake ... ok
+test fake_upstream::tests::the_canned_sse_stream_reports_cumulative_output_tokens ... ok
+test fake_upstream::tests::the_fake_upstream_serves_the_scenario_it_is_asked_for ... ok
+test fake_upstream::tests::the_truncated_stream_never_reaches_message_stop ... ok
+test the_configured_upstream_is_the_only_destination_any_request_reaches ... ok
+test the_plaintext_loopback_opt_in_cannot_be_turned_into_an_exfiltration_path ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.70s
+

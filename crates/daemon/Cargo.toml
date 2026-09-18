@@ -12,6 +12,7 @@ libra-governor-estimator = { path = "../estimator" }
 libra-governor-gateway = { path = "../gateway" }
 libra-governor-ledger = { path = "../ledger" }
 libra-governor-protocol = { path = "../protocol" }
+serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
 thiserror.workspace = true

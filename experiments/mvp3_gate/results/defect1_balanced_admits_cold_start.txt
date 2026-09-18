@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running unittests src/lib.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/libra_governor_domain-7b95b50005754243)
+
+running 1 test
+test policy::tests::balanced_admits_a_cold_start_low_confidence_estimate_on_confidence_alone ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 96 filtered out; finished in 0.00s
+
