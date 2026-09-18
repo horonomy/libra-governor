@@ -615,3 +615,117 @@ fn identical_preflights_produce_identical_admission_and_reserve_decisions() {
         "the Completion Reserve computation is a pure function of contract/estimate/policy"
     );
 }
+
+// --- (f) HORO-1146 gate finding #2: replan must not reserve for a task
+//         whose original admission was Denied ---------------------------
+
+#[test]
+fn a_material_event_replan_does_not_reserve_capacity_for_a_task_denied_at_admission() {
+    // Reproduces the exact HORO-1146 gate scenario 5/9 finding: the
+    // initial preflight is Denied (a real Deny, not confidence-based —
+    // `strict_budget` requires Confidence::High and a cold-start estimate
+    // is always Confidence::Low, so this Denies deterministically on the
+    // very first preflight, the same mechanism
+    // `admission_deny_writes_no_reservation_and_leaves_the_reserve_untouched`
+    // above uses), then a `PossibleToolLoop` material-event replan fires
+    // for that same task. Before the HORO-1146 fix, the replan path
+    // wrote a real, active `ReservationClass::RequiredWork` reservation
+    // for the denied task regardless.
+    let dir = tempfile::tempdir().unwrap();
+    let policy = Policy::strict_budget(PolicyPresetInputs {
+        resource_target: ResourceAmount::Tokens(1000),
+        time_target_secs: 600,
+        quality_floor: CompletionContract::first(vec![CompletionCriterion::required(
+            "required verification (tests/build/lint) passes",
+        )]),
+    })
+    .unwrap();
+    let config = base_config(dir.path(), policy);
+    let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
+    let mut current_task = None;
+    let listener = libra_governor_daemon::bind_or_detect_running(&config.socket_path).unwrap();
+    let socket_path = dir.path().join("d.sock");
+
+    let preflight = match send(
+        &listener,
+        &socket_path,
+        &mut ledger,
+        &mut current_task,
+        &config,
+        Request::Preflight {
+            task_hint: "fix the login bug".to_string(),
+            cwd: fixture_repo(),
+            session_id: "denied-replan-session".to_string(),
+        },
+    ) {
+        Response::Preflight(result) => *result,
+        other => panic!("expected a Preflight response, got {other:?}"),
+    };
+    assert!(
+        matches!(
+            preflight.admission.as_ref().map(|d| &d.admission),
+            Some(Admission::Deny(_))
+        ),
+        "a cold-start estimate under strict_budget must Deny, got {:?}",
+        preflight.admission
+    );
+    assert!(
+        ledger
+            .reservations_for_task(preflight.task_id)
+            .unwrap()
+            .is_empty(),
+        "no reservation should exist yet — the original preflight was Denied"
+    );
+
+    // 4 consecutive invocations of the SAME tool crosses the
+    // `PossibleToolLoop` streak threshold and triggers a real replan —
+    // same mechanism as
+    // `possible_tool_loop_streak_triggers_a_replan_before_the_count_threshold`
+    // in `replan_integration.rs`.
+    for _ in 0..4 {
+        let response = send(
+            &listener,
+            &socket_path,
+            &mut ledger,
+            &mut current_task,
+            &config,
+            Request::ToolInvoked {
+                session_id: "denied-replan-session".to_string(),
+                tool_name: "Bash".to_string(),
+            },
+        );
+        assert_eq!(response, Response::Ack);
+    }
+
+    let status = match send(
+        &listener,
+        &socket_path,
+        &mut ledger,
+        &mut current_task,
+        &config,
+        Request::Status,
+    ) {
+        Response::Status(status) => status,
+        other => panic!("expected a Status response, got {other:?}"),
+    };
+    let summary = status
+        .current_task
+        .expect("a task was preflighted; Status must reflect it");
+    assert_eq!(
+        summary.replan_state,
+        ReplanState::Replanned { count: 1 },
+        "the material-event replan must still fire for a denied task — hooks are \
+         advisory-only (ADR 0001), so work still proceeds after a Deny"
+    );
+
+    let reservations = ledger.reservations_for_task(preflight.task_id).unwrap();
+    let required_work: Vec<_> = reservations
+        .iter()
+        .filter(|r| r.class == ReservationClass::RequiredWork)
+        .collect();
+    assert!(
+        required_work.is_empty(),
+        "the replan must not reserve capacity for a task whose original admission was \
+         Denied, but found: {required_work:?}"
+    );
+}

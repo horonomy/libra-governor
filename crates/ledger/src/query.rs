@@ -1,7 +1,7 @@
 use libra_governor_domain::{
-    CompletionContract, CompletionCriterion, Estimate, ExecutionEvent, ExecutionEventKind,
-    ExecutionOutcome, ExecutionPlan, ExecutionReceipt, ExternalRef, PlanId, ReplanId, ReplanReason,
-    ReplanRecord, ResourceAmount, TaskFeatures, TaskId, TaskIdentity,
+    Admission, CompletionContract, CompletionCriterion, Estimate, ExecutionEvent,
+    ExecutionEventKind, ExecutionOutcome, ExecutionPlan, ExecutionReceipt, ExternalRef, PlanId,
+    ReplanId, ReplanReason, ReplanRecord, ResourceAmount, TaskFeatures, TaskId, TaskIdentity,
 };
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -38,7 +38,8 @@ fn parse_task_features(json: Option<String>) -> Result<Option<TaskFeatures>, Led
 
 /// Raw `plans` row shape for [`LedgerStore::get_plan`]: `(task_id,
 /// contract_revision, recon_snapshot_ref, created_at, estimate_json,
-/// task_features_json, replaces_plan_id, replan_reason_json)`.
+/// task_features_json, replaces_plan_id, replan_reason_json,
+/// admission_json)`.
 type PlanRow = (
     String,
     i64,
@@ -48,10 +49,21 @@ type PlanRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
 /// Deserializes a nullable `replan_reason_json` column value.
 fn parse_replan_reason(json: Option<String>) -> Result<Option<ReplanReason>, LedgerError> {
+    json.map(|s| serde_json::from_str(&s))
+        .transpose()
+        .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))
+}
+
+/// Deserializes a nullable `admission_json` column value (HORO-1146).
+/// `None` means "genuinely no admission recorded" (a pre-HORO-1146 row,
+/// or a plan constructed without evaluating a policy), not a
+/// deserialize failure.
+fn parse_admission(json: Option<String>) -> Result<Option<Admission>, LedgerError> {
     json.map(|s| serde_json::from_str(&s))
         .transpose()
         .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))
@@ -188,7 +200,7 @@ impl LedgerStore {
         task_id: TaskId,
     ) -> Result<Vec<ExecutionPlan>, LedgerError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, contract_revision, recon_snapshot_ref, created_at, estimate_json, task_features_json, replaces_plan_id, replan_reason_json
+            "SELECT id, contract_revision, recon_snapshot_ref, created_at, estimate_json, task_features_json, replaces_plan_id, replan_reason_json, admission_json
              FROM plans WHERE task_id = ?1 ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map([task_id_str], |row| {
@@ -201,6 +213,7 @@ impl LedgerStore {
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
             ))
         })?;
 
@@ -215,6 +228,7 @@ impl LedgerStore {
                 task_features_json,
                 replaces_plan_id,
                 replan_reason_json,
+                admission_json,
             ) = row?;
             let id = Uuid::parse_str(&id)
                 .map(PlanId)
@@ -234,6 +248,7 @@ impl LedgerStore {
                 task_features,
                 replaces: parse_plan_id(replaces_plan_id)?,
                 replan_reason: parse_replan_reason(replan_reason_json)?,
+                admission: parse_admission(admission_json)?,
             });
         }
         Ok(plans)
@@ -326,7 +341,7 @@ impl LedgerStore {
         let row: Option<PlanRow> = self
             .conn
             .query_row(
-                "SELECT task_id, contract_revision, recon_snapshot_ref, created_at, estimate_json, task_features_json, replaces_plan_id, replan_reason_json
+                "SELECT task_id, contract_revision, recon_snapshot_ref, created_at, estimate_json, task_features_json, replaces_plan_id, replan_reason_json, admission_json
                  FROM plans WHERE id = ?1",
                 [&plan_id_str],
                 |row| {
@@ -339,6 +354,7 @@ impl LedgerStore {
                         row.get(5)?,
                         row.get(6)?,
                         row.get(7)?,
+                        row.get(8)?,
                     ))
                 },
             )
@@ -353,6 +369,7 @@ impl LedgerStore {
             task_features_json,
             replaces_plan_id,
             replan_reason_json,
+            admission_json,
         )) = row
         else {
             return Ok(None);
@@ -377,6 +394,7 @@ impl LedgerStore {
             task_features,
             replaces: parse_plan_id(replaces_plan_id)?,
             replan_reason: parse_replan_reason(replan_reason_json)?,
+            admission: parse_admission(admission_json)?,
         }))
     }
 

@@ -10,7 +10,8 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
-    estimate::Estimate, replan::ReplanReason, task_features::TaskFeatures, task_identity::TaskId,
+    estimate::Estimate, policy::Admission, replan::ReplanReason, task_features::TaskFeatures,
+    task_identity::TaskId,
 };
 
 /// Identifier for one [`ExecutionPlan`].
@@ -71,6 +72,15 @@ pub struct ExecutionPlan {
     /// The structured reason a replan produced this plan, if any. Always
     /// `Some` iff `replaces` is `Some` — see [`Self::with_replan_linkage`].
     pub replan_reason: Option<ReplanReason>,
+    /// The [`Admission`] verdict this plan's own preflight (or replan)
+    /// produced, if any (HORO-1146). `None` only for a plan that predates
+    /// this field, or one constructed without evaluating a policy at all
+    /// (e.g. a test fixture). Persisted so a later replan trigger for the
+    /// same task can check whether the plan it is about to supersede was
+    /// ever actually admitted, rather than reserving capacity for a task
+    /// whose original admission was [`Admission::Deny`] — see
+    /// `crates/daemon/src/server.rs::handle_tool_invoked`'s HORO-1146 fix.
+    pub admission: Option<Admission>,
 }
 
 impl ExecutionPlan {
@@ -90,6 +100,7 @@ impl ExecutionPlan {
             task_features: None,
             replaces: None,
             replan_reason: None,
+            admission: None,
         }
     }
 
@@ -117,6 +128,14 @@ impl ExecutionPlan {
     pub fn with_replan_linkage(mut self, prior_plan_id: PlanId, reason: ReplanReason) -> Self {
         self.replaces = Some(prior_plan_id);
         self.replan_reason = Some(reason);
+        self
+    }
+
+    /// Attaches the [`Admission`] verdict this plan's own preflight (or
+    /// replan) produced, returning `self` for chaining at the
+    /// construction site (HORO-1146).
+    pub fn with_admission(mut self, admission: Admission) -> Self {
+        self.admission = Some(admission);
         self
     }
 }
