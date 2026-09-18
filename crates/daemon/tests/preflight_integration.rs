@@ -35,6 +35,7 @@ fn preflight_returns_sane_result_within_recon_budget() {
         ledger_path: dir.path().join("ledger.sqlite3"),
         log_path: dir.path().join("daemon.log"),
         recon_budget,
+        replan_hysteresis: libra_governor_domain::ReplanHysteresisConfig::default(),
     };
 
     let listener = libra_governor_daemon::bind_or_detect_running(&config.socket_path).unwrap();
@@ -123,6 +124,7 @@ fn second_preflight_for_same_session_supersedes_the_first() {
         ledger_path: dir.path().join("ledger.sqlite3"),
         log_path: dir.path().join("daemon.log"),
         recon_budget: ReconBudget::default(),
+        replan_hysteresis: libra_governor_domain::ReplanHysteresisConfig::default(),
     };
 
     let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
@@ -242,6 +244,8 @@ fn preflight_selects_a_bucketed_tier_once_same_repo_history_exists() {
                 created_at: now,
                 estimate: None,
                 task_features: None,
+                replaces: None,
+                replan_reason: None,
             };
             ledger.insert_plan(&plan).unwrap();
             let receipt = ExecutionReceipt::new(
@@ -262,6 +266,7 @@ fn preflight_selects_a_bucketed_tier_once_same_repo_history_exists() {
         ledger_path,
         log_path: dir.path().join("daemon.log"),
         recon_budget: ReconBudget::default(),
+        replan_hysteresis: libra_governor_domain::ReplanHysteresisConfig::default(),
     };
 
     let listener = libra_governor_daemon::bind_or_detect_running(&config.socket_path).unwrap();

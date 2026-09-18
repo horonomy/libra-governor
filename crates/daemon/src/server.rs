@@ -30,13 +30,21 @@ use std::io::BufReader;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 
-use libra_governor_domain::{ExecutionOutcome, ExecutionReceipt};
-use libra_governor_estimator::{admission_replay, duration_coverage, AdmissionPolicy};
+use libra_governor_domain::{
+    evaluate_hysteresis, possible_tool_loop, tool_call_count_is_material, Estimate,
+    ExecutionOutcome, ExecutionPlan, ExecutionReceipt, HysteresisOutcome, RemainingEstimate,
+    ReplanId, ReplanReason, ReplanRecord, ReplanTriggerKind, ABSOLUTE_TOOL_CALL_COUNT_FALLBACK,
+    DEFAULT_LOOP_STREAK_THRESHOLD,
+};
+use libra_governor_estimator::{
+    admission_replay, duration_coverage, estimate_bucketed, typical_tool_call_count_bucketed,
+    AdmissionPolicy,
+};
 use libra_governor_ledger::LedgerStore;
 use libra_governor_protocol::{
     wire, AdmissionPolicyReport, CalibrationReportResult, FinalizeOutcome, FinalizeResult,
-    PreflightResult, ReconSummary, Request, RequestEnvelope, Response, ResponseEnvelope,
-    StatusResult, TaskSummary, PROTOCOL_VERSION,
+    PreflightResult, ReconSummary, ReplanState, Request, RequestEnvelope, Response,
+    ResponseEnvelope, StatusResult, TaskSummary, PROTOCOL_VERSION,
 };
 
 use crate::{contract, features, log, recon, recon::ReconBudget};
@@ -58,6 +66,9 @@ pub struct DaemonConfig {
     pub ledger_path: PathBuf,
     pub log_path: PathBuf,
     pub recon_budget: ReconBudget,
+    /// Cooldown and max-auto-replan-count controls (HORO-1139) — see
+    /// `libra_governor_domain::ReplanHysteresisConfig` docs.
+    pub replan_hysteresis: libra_governor_domain::ReplanHysteresisConfig,
 }
 
 /// Binds `socket_path`, handling the stale-vs-live detection documented
@@ -160,6 +171,12 @@ fn dispatch(
                     task_id: result.task_id,
                     confidence: result.confidence,
                     recon_cost_seconds: result.recon_cost_seconds,
+                    plan_id: result.plan_id,
+                    remaining_estimate: result
+                        .estimate
+                        .clone()
+                        .unwrap_or_else(Estimate::cold_start),
+                    replan_state: ReplanState::Stable,
                 });
                 Response::Preflight(Box::new(result))
             }
@@ -170,13 +187,13 @@ fn dispatch(
                 }
             }
         },
-        Request::Status => Response::Status(StatusResult {
+        Request::Status => Response::Status(Box::new(StatusResult {
             current_task: current_task.clone(),
-        }),
+        })),
         Request::ToolInvoked {
             session_id,
-            tool_name: _,
-        } => match ledger.increment_tool_call_count(&session_id) {
+            tool_name,
+        } => match handle_tool_invoked(&session_id, &tool_name, ledger, current_task, config) {
             Ok(()) => Response::Ack,
             Err(e) => {
                 log::append_line(&config.log_path, &format!("tool_invoked error: {e}"));
@@ -314,7 +331,175 @@ fn handle_preflight(
         confidence: recon.confidence,
         recon_cost_seconds: recon.elapsed.as_secs_f64(),
         estimate: Some(estimate),
+        plan_id: plan.id,
     })
+}
+
+/// Handles a `ToolInvoked` notification (HORO-1139): records the tool
+/// call (count + same-tool streak), then checks whether the resulting
+/// evidence is a MATERIAL deviation from what the current plan's
+/// estimate implied. If so, subject to hysteresis (cooldown / max
+/// auto-replan count), recomputes the remaining-work estimate via the
+/// deterministic tier and records a linked replan.
+///
+/// Deliberately does not call
+/// [`libra_governor_domain::should_replan`]/[`libra_governor_domain::evaluate_replan_cost_against_policy`]
+/// here: those are the general cost/benefit gate for a replan whose cost
+/// is nontrivial (e.g. a future LLM-assisted tier). The deterministic
+/// tier's own cost is a local SQLite re-estimate — negligible enough
+/// that, once a material event clears hysteresis, it always clears
+/// `should_replan` too. Both functions are still fully implemented and
+/// tested at the domain level (see `crates/domain/src/replan.rs`) for a
+/// caller (a future tier, or a manual replan command) whose cost is not
+/// negligible.
+///
+/// Still fire-and-forget from the *client's* side
+/// ([`crate::client::fire_and_forget`] is unaffected by anything here) —
+/// this function runs entirely server-side against local SQLite state,
+/// so it does not touch the deliberate PostToolUse latency contract
+/// documented on `libra-governor-cli`'s `hook_post_tool_use` module.
+fn handle_tool_invoked(
+    session_id: &str,
+    tool_name: &str,
+    ledger: &mut LedgerStore,
+    current_task: &mut Option<TaskSummary>,
+    config: &DaemonConfig,
+) -> Result<(), DaemonError> {
+    let now = time::OffsetDateTime::now_utc();
+    ledger.increment_tool_call_count(session_id)?;
+    let same_tool_streak = ledger.record_tool_invocation(session_id, tool_name, now)?;
+
+    let Some(task_id) = ledger.task_id_for_session(session_id)? else {
+        return Ok(());
+    };
+    let Some(plan_id) = ledger.in_flight_plan_for_session(session_id)? else {
+        return Ok(());
+    };
+    let Some(plan) = ledger.get_plan(plan_id)? else {
+        return Ok(());
+    };
+    // No `TaskFeatures` recorded on the in-flight plan (a pre-MVP-2 plan,
+    // impossible in a fresh deployment): nothing to bucket a remaining
+    // estimate against. Honestly skip replanning rather than guessing —
+    // matches this crate's `resource_quantiles` precedent of returning
+    // "unavailable" over fabricating a number.
+    let Some(task_features) = plan.task_features.clone() else {
+        return Ok(());
+    };
+
+    let total_tool_calls = ledger.tool_call_count_for_session(session_id)?;
+    let history = ledger.receipts_for_estimation()?;
+    let typical_tool_calls = typical_tool_call_count_bucketed(&history, &task_features);
+
+    let loop_signal = possible_tool_loop(same_tool_streak, DEFAULT_LOOP_STREAK_THRESHOLD);
+    let count_signal = tool_call_count_is_material(total_tool_calls, typical_tool_calls);
+    if !loop_signal && !count_signal {
+        return Ok(());
+    }
+
+    let (trigger, detail) = if loop_signal {
+        (
+            ReplanTriggerKind::PossibleToolLoop,
+            format!("{tool_name} invoked {same_tool_streak} times in a row"),
+        )
+    } else {
+        let typical_desc = typical_tool_calls
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| {
+                format!("unknown (absolute fallback {ABSOLUTE_TOOL_CALL_COUNT_FALLBACK})")
+            });
+        (
+            ReplanTriggerKind::ToolCallCountExceeded,
+            format!("{total_tool_calls} tool calls so far vs. typical {typical_desc}"),
+        )
+    };
+
+    let hysteresis_state = ledger.replan_state_for_task(task_id)?;
+    match evaluate_hysteresis(&config.replan_hysteresis, &hysteresis_state, now) {
+        HysteresisOutcome::SuppressedCooldown => {
+            log::append_line(
+                &config.log_path,
+                &format!(
+                    "replan suppressed by cooldown for task {task_id}: {trigger:?} ({detail})"
+                ),
+            );
+            return Ok(());
+        }
+        HysteresisOutcome::EscalateApprovalNeeded => {
+            log::append_line(
+                &config.log_path,
+                &format!(
+                    "material event for task {task_id} escalated (auto-replan budget \
+                     exhausted): {trigger:?} ({detail})"
+                ),
+            );
+            if let Some(summary) = current_task.as_mut() {
+                if summary.task_id == task_id {
+                    summary.replan_state = ReplanState::EscalatedAwaitingApproval;
+                }
+            }
+            return Ok(());
+        }
+        HysteresisOutcome::Allow => {}
+    }
+
+    let base_estimate = estimate_bucketed(&history, &task_features);
+    let remaining = RemainingEstimate::from_bucketed(base_estimate);
+    let reason = ReplanReason::new(trigger, detail);
+
+    let new_plan = ExecutionPlan::new(
+        task_id,
+        plan.contract_revision,
+        plan.recon_snapshot_ref.clone(),
+        now,
+    )
+    .with_estimate(remaining.estimate.clone())
+    .with_task_features(Some(task_features))
+    .with_replan_linkage(plan.id, reason.clone());
+    ledger.insert_plan(&new_plan)?;
+    ledger.supersede_in_flight_preflights(session_id)?;
+    ledger.record_preflight(session_id, task_id, new_plan.id, now)?;
+
+    ledger.insert_replan_event(&ReplanRecord {
+        id: ReplanId::new(),
+        task_id,
+        prior_plan_id: plan.id,
+        new_plan_id: new_plan.id,
+        reason: reason.clone(),
+        remaining_estimate: remaining.clone(),
+        created_at: now,
+    })?;
+    ledger.record_replan_for_task(task_id, now)?;
+    let auto_replan_count = hysteresis_state.auto_replan_count + 1;
+
+    log::append_line(
+        &config.log_path,
+        &format!(
+            "replan #{auto_replan_count} for task {task_id}: {:?} ({}) — plan {} -> {} \
+             (duration P90 {:?}s -> {:?}s, confidence {:?} -> {:?})",
+            reason.trigger,
+            reason.detail.as_deref().unwrap_or(""),
+            plan.id.0,
+            new_plan.id.0,
+            plan.estimate.as_ref().and_then(|e| e.duration_p90_secs),
+            remaining.estimate.duration_p90_secs,
+            plan.estimate.as_ref().map(|e| e.confidence),
+            remaining.estimate.confidence,
+        ),
+    );
+
+    if let Some(summary) = current_task.as_mut() {
+        if summary.task_id == task_id {
+            summary.plan_id = new_plan.id;
+            summary.confidence = remaining.estimate.confidence;
+            summary.remaining_estimate = remaining.estimate;
+            summary.replan_state = ReplanState::Replanned {
+                count: auto_replan_count,
+            };
+        }
+    }
+
+    Ok(())
 }
 
 /// Finalizes the task bound to `session_id`: computes elapsed duration
@@ -437,6 +622,7 @@ mod tests {
             ledger_path: dir.path().join("ledger.sqlite3"),
             log_path: dir.path().join("daemon.log"),
             recon_budget: crate::recon::ReconBudget::default(),
+            replan_hysteresis: libra_governor_domain::ReplanHysteresisConfig::default(),
         };
         let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
 
@@ -454,6 +640,9 @@ mod tests {
             task_id: preflight.task_id,
             confidence: preflight.confidence,
             recon_cost_seconds: preflight.recon_cost_seconds,
+            plan_id: preflight.plan_id,
+            remaining_estimate: preflight.estimate.clone().unwrap(),
+            replan_state: ReplanState::Stable,
         });
 
         let outcome = handle_finalize(
@@ -492,6 +681,7 @@ mod tests {
             ledger_path: dir.path().join("ledger.sqlite3"),
             log_path: dir.path().join("daemon.log"),
             recon_budget: crate::recon::ReconBudget::default(),
+            replan_hysteresis: libra_governor_domain::ReplanHysteresisConfig::default(),
         };
 
         let response = dispatch(
