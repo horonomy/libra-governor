@@ -23,7 +23,12 @@
 -- `replan_state` is per-task hysteresis bookkeeping (auto-replan count,
 -- last-replan timestamp) so cooldown/max-replan-count survive a daemon
 -- restart -- a task, unlike a session, is expected to span more than one
--- daemon process lifetime (see docs/adr/0002).
+-- daemon process lifetime (see docs/adr/0002). `tool_call_count_at_last_replan`
+-- re-baselines material-event detection after every replan: a session's
+-- *cumulative* tool-call count never goes back down, so without this
+-- baseline every tool call after the first material deviation would
+-- look material again purely because the running total stays past the
+-- threshold -- see `libra_governor_domain::ReplanHysteresisState` docs.
 --
 -- Privacy: none of these additions store raw prompt text or raw tool
 -- output, matching the invariant documented in 0001_init.sql and
@@ -56,5 +61,6 @@ CREATE INDEX IF NOT EXISTS idx_replan_events_task_id_created_at
 CREATE TABLE IF NOT EXISTS replan_state (
     task_id TEXT PRIMARY KEY REFERENCES tasks (task_id),
     auto_replan_count INTEGER NOT NULL DEFAULT 0,
-    last_replan_at TEXT
+    last_replan_at TEXT,
+    tool_call_count_at_last_replan INTEGER NOT NULL DEFAULT 0
 );

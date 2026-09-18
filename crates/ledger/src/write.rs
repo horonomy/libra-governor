@@ -186,24 +186,39 @@ impl LedgerStore {
         Ok(())
     }
 
-    /// Records that `task_id` just had an automatic replan at `now`:
-    /// upserts `replan_state`, incrementing `auto_replan_count` and
-    /// setting `last_replan_at` — the durable half of
-    /// [`libra_governor_domain::ReplanHysteresisState`], surviving a
+    /// Records that `task_id` just had an automatic replan at `now`, with
+    /// the session's cumulative tool-call count at that moment
+    /// (`tool_call_count_at_replan`): upserts `replan_state`,
+    /// incrementing `auto_replan_count`, setting `last_replan_at`, and
+    /// re-baselining `tool_call_count_at_last_replan` — the durable half
+    /// of [`libra_governor_domain::ReplanHysteresisState`], surviving a
     /// daemon restart (a task, unlike a session, is expected to span
     /// more than one daemon process lifetime — see docs/adr/0002).
+    ///
+    /// The baseline re-set matters: without it, material-event detection
+    /// would keep comparing against the session's raw cumulative
+    /// tool-call count, which never goes back down after a replan —
+    /// every subsequent tool call would look material again purely
+    /// because the running total stays past the threshold. See
+    /// [`libra_governor_domain::ReplanHysteresisState`] docs.
     pub fn record_replan_for_task(
         &mut self,
         task_id: libra_governor_domain::TaskId,
         now: time::OffsetDateTime,
+        tool_call_count_at_replan: u64,
     ) -> Result<(), LedgerError> {
         self.conn.execute(
-            "INSERT INTO replan_state (task_id, auto_replan_count, last_replan_at)
-             VALUES (?1, 1, ?2)
+            "INSERT INTO replan_state (task_id, auto_replan_count, last_replan_at, tool_call_count_at_last_replan)
+             VALUES (?1, 1, ?2, ?3)
              ON CONFLICT(task_id) DO UPDATE SET
                 auto_replan_count = auto_replan_count + 1,
-                last_replan_at = excluded.last_replan_at",
-            rusqlite::params![task_id.to_string(), rfc3339(now)?],
+                last_replan_at = excluded.last_replan_at,
+                tool_call_count_at_last_replan = excluded.tool_call_count_at_last_replan",
+            rusqlite::params![
+                task_id.to_string(),
+                rfc3339(now)?,
+                tool_call_count_at_replan as i64
+            ],
         )?;
         Ok(())
     }

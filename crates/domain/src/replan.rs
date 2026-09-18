@@ -23,9 +23,13 @@
 //! genuinely available signal, and this module does not pretend
 //! otherwise. What IS genuinely available and used here:
 //!
-//! - [`possible_tool_loop`]: the same tool name invoked repeatedly,
-//!   back to back, within a short window — a proxy for "the agent might
-//!   be stuck retrying the same thing," not proof of failure.
+//! - [`possible_tool_loop`]: the same tool name invoked repeatedly, back
+//!   to back with no different tool in between — a proxy for "the agent
+//!   might be stuck retrying the same thing," not proof of failure. This
+//!   is a consecutive-streak signal, not a wall-clock window: Claude
+//!   Code's `PostToolUse` payload carries no elapsed-time field cheap
+//!   enough to window against per call (see
+//!   `libra_governor_ledger::session::record_tool_invocation` docs).
 //! - [`tool_call_count_is_material`]: the session's tool-call count
 //!   exceeding what history says is typical for this task's bucket tier
 //!   (or, absent enough bucket-specific history, a fixed absolute
@@ -107,9 +111,10 @@ pub fn possible_tool_loop(same_tool_streak: u64, streak_threshold: u64) -> bool 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplanTriggerKind {
-    /// The same tool name was invoked repeatedly, back to back, within a
-    /// short window — see [`possible_tool_loop`] and module docs on why
-    /// this is a proxy, not proof, of a failure/retry loop.
+    /// The same tool name was invoked repeatedly, back to back, with no
+    /// different tool in between — see [`possible_tool_loop`] and module
+    /// docs on why this is a consecutive-streak proxy, not proof, of a
+    /// failure/retry loop.
     PossibleToolLoop,
     /// The session's tool-call count materially exceeded what history
     /// implied — see [`tool_call_count_is_material`].
@@ -465,12 +470,25 @@ impl Default for ReplanHysteresisConfig {
 }
 
 /// Per-task hysteresis state (HORO-1139): how many automatic replans
-/// this task has already had, and when the most recent one happened.
-/// `Default` is a fresh task that has never been replanned.
+/// this task has already had, when the most recent one happened, and the
+/// session's cumulative tool-call count at that moment. `Default` is a
+/// fresh task that has never been replanned.
+///
+/// `tool_call_count_at_last_replan` exists so material-event detection
+/// can be re-baselined after every replan rather than measured against a
+/// fixed absolute count: once a replan has happened, the session's
+/// *cumulative* tool-call count would otherwise stay past the material
+/// threshold for the rest of the session, making every later tool call
+/// look "material" purely because the running total never goes back
+/// down. Callers should compare new evidence against
+/// `total_tool_calls.saturating_sub(tool_call_count_at_last_replan)` —
+/// calls *since* the last replan — not the raw cumulative total. See
+/// `crates/daemon/src/server.rs::handle_tool_invoked`.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct ReplanHysteresisState {
     pub auto_replan_count: u32,
     pub last_replan_at: Option<OffsetDateTime>,
+    pub tool_call_count_at_last_replan: u64,
 }
 
 /// The result of checking a candidate replan against
@@ -870,6 +888,7 @@ mod tests {
         let state = ReplanHysteresisState {
             auto_replan_count: 1,
             last_replan_at: Some(now() - time::Duration::seconds(100)),
+            tool_call_count_at_last_replan: 0,
         };
         assert_eq!(
             evaluate_hysteresis(&config, &state, now()),
@@ -886,6 +905,7 @@ mod tests {
         let state = ReplanHysteresisState {
             auto_replan_count: 1,
             last_replan_at: Some(now() - time::Duration::seconds(301)),
+            tool_call_count_at_last_replan: 0,
         };
         assert_eq!(
             evaluate_hysteresis(&config, &state, now()),
@@ -902,6 +922,7 @@ mod tests {
         let state = ReplanHysteresisState {
             auto_replan_count: 3,
             last_replan_at: Some(now() - time::Duration::seconds(10_000)),
+            tool_call_count_at_last_replan: 0,
         };
         assert_eq!(
             evaluate_hysteresis(&config, &state, now()),
