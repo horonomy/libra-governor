@@ -1,27 +1,27 @@
     Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
-     Running tests/proxy_lifecycle.rs (/Users/bryant/.cargo/shared-target/debug/deps/proxy_lifecycle-e413414305e2c77e)
+     Running tests/proxy_lifecycle.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/proxy_lifecycle-e413414305e2c77e)
 
 running 1 test
 test a_stream_cut_off_mid_flight_settles_at_the_last_observed_usage ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.02s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.16s
+
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running tests/proxy_lifecycle.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/proxy_lifecycle-e413414305e2c77e)
+
+running 2 tests
+test an_upstream_401_triggers_exactly_one_credential_refresh_retry ... ok
+test a_client_retry_is_a_fresh_reservation_not_a_double_settlement ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 25 filtered out; finished in 0.20s
 
 
     Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
-     Running tests/proxy_lifecycle.rs (/Users/bryant/.cargo/shared-target/debug/deps/proxy_lifecycle-e413414305e2c77e)
-
-running 2 tests
-test a_client_retry_is_a_fresh_reservation_not_a_double_settlement ... ok
-test an_upstream_401_triggers_exactly_one_credential_refresh_retry ... ok
-
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 25 filtered out; finished in 0.04s
-
-
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
-     Running tests/gateway_enforcement.rs (/Users/bryant/.cargo/shared-target/debug/deps/gateway_enforcement-43fd9cd9f1876368)
+     Running tests/gateway_enforcement.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/gateway_enforcement-8799afa54e798f18)
 
 running 1 test
 test settling_the_same_reservation_twice_does_not_double_charge ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.02s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.11s
 

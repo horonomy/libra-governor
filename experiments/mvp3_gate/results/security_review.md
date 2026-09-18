@@ -186,12 +186,32 @@ disclosed gap worth the coordinator's judgment on severity for a
 local-machine-trust-model product — not assessed as a severity level by
 this review.
 
-**Verdict: PASS/FAIL split** — gateway token handling: **PASS** (explicitly
-hardened). State dir / socket / ledger file permissions: **FAIL** against
-an implicit "no unintended local read access" expectation, though not
-necessarily a regression from any documented invariant (none exists in the
-codebase specifying these should be restricted) — reported as a finding for
-the coordinator to weigh.
+**Verdict at time of original review: PASS/FAIL split** — gateway token
+handling: **PASS** (explicitly hardened). State dir / socket / ledger file
+permissions: **FAIL** against an implicit "no unintended local read access"
+expectation, though not necessarily a regression from any documented
+invariant (none exists in the codebase specifying these should be
+restricted) — reported as a finding for the coordinator to weigh.
+
+**RESOLVED.** `paths::ensure_state_dir` now creates the state directory at
+`0700` (`DirBuilder` mode, plus idempotent tightening of an existing,
+looser-permissioned directory); `bind_or_detect_running` chmods the socket
+to `0600` after bind; `LedgerStore::open` chmods the ledger file and its
+`-wal`/`-shm` sidecars to `0600` after opening. Real re-verification, same
+method as the original finding:
+
+```
+$ stat -f "%N %OLp" <state_dir> <state_dir>/daemon.sock <state_dir>/ledger.sqlite3 <state_dir>/gateway.token
+<state_dir>                 700
+<state_dir>/daemon.sock     600
+<state_dir>/ledger.sqlite3  600
+<state_dir>/gateway.token   600
+```
+
+Regression test: `crates/daemon/tests/security_permissions.rs`. Full
+output at `results/security_file_permissions_fixed.txt`.
+
+**Updated verdict: PASS.**
 
 ## 6. Log/receipt/statusline privacy leakage
 
@@ -260,6 +280,6 @@ review's checks contradict.
 | 2 | Gateway SSRF / open-proxy | PASS |
 | 3 | Forged/malformed daemon protocol requests | PASS |
 | 4 | Reservation races / double settlement | PASS |
-| 5 | Local socket/state-dir file permissions | PASS (token) / FAIL (state dir, socket, ledger — disclosed gap) |
+| 5 | Local socket/state-dir file permissions | **PASS** — originally PASS (token) / FAIL (state dir, socket, ledger); RESOLVED, all four now 0700/0600, see item 5 |
 | 6 | Log/receipt/statusline privacy leakage | PASS |
 | 7 | Bypass attempt (MCP/hook absence) | Confirmed real, honestly-documented, by-design limitation — not a defect |

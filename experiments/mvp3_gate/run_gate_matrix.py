@@ -8,12 +8,19 @@ Follows the exact pattern established by
 real subprocesses, real on-disk artifacts, no in-process Rust calls, no
 fabricated numbers.
 
-Scenarios NOT covered here (balanced-policy scenarios only — the shipped
-CLI's ``daemon run`` hardcodes ``policy: default_admission_policy()`` and
-``gateway: None`` with no CLI/env override, see
-``crates/cli/src/daemon_cmd.rs``) are covered instead by real Rust
-integration tests — see ``experiments/mvp3_gate/README.md`` for the full
-scenario-to-evidence map.
+Scenarios NOT covered here (balanced-policy scenarios only) are covered
+instead by real Rust integration tests — see
+``experiments/mvp3_gate/README.md`` for the full scenario-to-evidence map.
+
+NOTE (HORO-1146 defect #3, fixed): at the time this harness was written,
+the shipped CLI's ``daemon run`` hardcoded ``policy:
+default_admission_policy()`` and ``gateway: None`` with no CLI/env
+override, which is why this harness never drives a non-``balanced``
+policy or the gateway. That gap is now fixed —
+``crates/daemon/src/config_file.rs`` reads an optional
+``<state_dir>/config.json`` — but this harness has not been rewritten to
+exercise it; see ``experiments/mvp3_gate/README.md``'s "Load-bearing
+methodology note" for why the scenario matrix below is unchanged.
 
 Usage:
     python3 run_gate_matrix.py --binary <path> --work-root <dir> --out <path>

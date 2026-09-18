@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running tests/hook_cli_integration.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/hook_cli_integration-02df8607260e660d)
+
+running 1 test
+test daemon_loads_a_non_default_policy_and_gateway_from_config_json ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 1.07s
+

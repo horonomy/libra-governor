@@ -1,8 +1,9 @@
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
-     Running tests/mvp3_gate_evidence.rs (/Users/bryant/.cargo/shared-target/debug/deps/mvp3_gate_evidence-d181e3a15a9822de)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running tests/mvp3_gate_evidence.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/mvp3_gate_evidence-621b125db5e54908)
 
 running 2 tests
-test concurrent_subagents_near_a_tight_hard_ceiling_through_the_real_ledger_spend_authority ... before concurrent subagents: hard_limit=Tokens(1600), completion_reserve=Tokens(300)
+REAL FINDING — Policy::deadline_first preset, cold-start admission: Some(PolicyDecision { policy_schema_version: "policy-v1", admission: Deny([ConfidenceBelowThreshold { actual: Low, required: Medium }]), resource_outcome: Admit, time_outcome: Admit, confidence_ok: false, protected_criteria: [CompletionCriterion { description: "required verification (tests/build/lint) passes", required: true }] })
+before concurrent subagents: hard_limit=Tokens(1600), completion_reserve=Tokens(300)
 subagent denied: PolicyDenied { detail: "ResourceExceedsHardCeiling { projected: Tokens(1800), hard_ceiling: Tokens(1600) }" }
 subagent denied: PolicyDenied { detail: "ResourceExceedsHardCeiling { projected: Tokens(1800), hard_ceiling: Tokens(1600) }" }
 subagent denied: PolicyDenied { detail: "ResourceExceedsHardCeiling { projected: Tokens(1800), hard_ceiling: Tokens(1600) }" }
@@ -13,10 +14,9 @@ subagent denied: PolicyDenied { detail: "ResourceExceedsHardCeiling { projected:
 subagent denied: PolicyDenied { detail: "ResourceExceedsHardCeiling { projected: Tokens(1800), hard_ceiling: Tokens(1600) }" }
 subagent denied: PolicyDenied { detail: "ResourceExceedsHardCeiling { projected: Tokens(1800), hard_ceiling: Tokens(1600) }" }
 concurrent subagents result: N=12, granted=3, denied=9
-ok
-test deadline_first_confidence_floor_denies_cold_start_but_the_deadline_pressure_shape_admits_at_low_confidence ... REAL FINDING — Policy::deadline_first preset, cold-start admission: Some(PolicyDecision { policy_schema_version: "policy-v1", admission: Deny([ConfidenceBelowThreshold { actual: Low, required: Medium }]), resource_outcome: Admit, time_outcome: Admit, confidence_ok: false, protected_criteria: [CompletionCriterion { description: "required verification (tests/build/lint) passes", required: true }] })
-deadline-pressure shape (Confidence::Low) admission: Some(PolicyDecision { policy_schema_version: "policy-v1", admission: Admit, resource_outcome: Admit, time_outcome: Admit, confidence_ok: true, protected_criteria: [CompletionCriterion { description: "required verification (tests/build/lint) passes", required: true }] }), plan_id=PlanId(63488304-62d6-4ca3-953d-e5d45ae19fac)
-ok
+test concurrent_subagents_near_a_tight_hard_ceiling_through_the_real_ledger_spend_authority ... ok
+deadline-pressure shape (Confidence::Low) admission: Some(PolicyDecision { policy_schema_version: "policy-v1", admission: Admit, resource_outcome: Admit, time_outcome: Admit, confidence_ok: true, protected_criteria: [CompletionCriterion { description: "required verification (tests/build/lint) passes", required: true }] }), plan_id=PlanId(5a42205e-ad83-4a8e-9bcb-84726b13b499)
+test deadline_first_confidence_floor_denies_cold_start_but_the_deadline_pressure_shape_admits_at_low_confidence ... ok
 
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.03s
 

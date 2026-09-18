@@ -13,14 +13,31 @@ HORO-1144 (provider gateway).
 
 ## Load-bearing methodology note: why some evidence is Rust tests, not CLI runs
 
-Before anything else: **the shipped `libra-governor` CLI binary cannot select
-a non-default admission policy or start the enforcement gateway.**
-`libra-governor daemon run` (`crates/cli/src/daemon_cmd.rs`) hardcodes
-`policy: default_admission_policy()` (the `balanced` preset) and
-`gateway: None`, with no CLI flag, no config file, and no environment
-variable to override either. This is a real, confirmed gap in the product's
-CLI surface (see "Defects and gaps found" below) — not a harness limitation
-we worked around silently.
+**UPDATE (defect #3 fixed — see "Defects and gaps found" below):** at the
+time this evidence was originally generated, **the shipped `libra-governor`
+CLI binary could not select a non-default admission policy or start the
+enforcement gateway.** `libra-governor daemon run`
+(`crates/cli/src/daemon_cmd.rs`) hardcoded `policy: default_admission_policy()`
+(the `balanced` preset) and `gateway: None`, with no CLI flag, no config
+file, and no environment variable to override either. This gap has since
+been fixed: the daemon now reads an optional `<state_dir>/config.json`
+(`crates/daemon/src/config_file.rs`) selecting a named preset and/or a
+`[gateway]` table, wired through `crates/cli/src/daemon_cmd.rs`. See
+`experiments/mvp3_gate/results/defect3_config_json_policy_and_gateway.txt`
+for the real CLI-E2E test confirming a `deadline_first` + gateway
+`config.json` is actually loaded by a real spawned daemon subprocess.
+
+The paragraphs below are preserved as originally written — they describe
+the state of the product *at the time each scenario's evidence was
+generated*, which is why scenarios 2/3/4/6/7/8/9(rust-half)/10/11/12 used
+Rust-integration evidence rather than a CLI-E2E run through
+`run_gate_matrix.py`: that harness itself has not been rewritten to drive
+`config.json`, so it still only exercises the `balanced` preset with no
+gateway. The underlying CLI limitation those scenarios worked around is
+fixed; the scenario matrix below is not retroactively regenerated as
+CLI-E2E, since the Rust-integration evidence already exercises the
+identical production dispatch functions and remains valid, current
+evidence of real code behavior.
 
 Consequently, scenarios that require `ConstraintMode::Hard`/`Approval`, a
 non-`balanced` preset, or the gateway are **not reachable by driving the CLI
@@ -187,7 +204,11 @@ silently promoted to `Enforced`.
 
 This gate surfaced three real, load-bearing findings during evidence
 generation, discovered incidentally while running scenarios 1, 2, and 9 —
-not sought out separately:
+not sought out separately. **All three, plus a security review finding
+(#4 below), have since been fixed** — the original finding text is
+preserved verbatim below (historical evidence trail of a real gate
+catching real bugs) with a `RESOLVED` annotation pointing at the fix and
+its regression test, rather than deleted.
 
 1. **The default `balanced` admission policy denies every cold-start task.**
    `Policy::balanced` (and `deadline_first`, and `strict_budget`) all
@@ -201,6 +222,20 @@ not sought out separately:
    under the real, shipped default policy reports a real Deny in its
    advisory text, which will read as "broken" to a new user before any
    local history exists.
+
+   **RESOLVED.** `Policy::balanced`'s `min_confidence` is now
+   `Confidence::Low` (`crates/domain/src/policy.rs`) — `deadline_first`
+   and `strict_budget` are unchanged (still `Medium`/`High`), since those
+   are deliberately chosen tighter presets, not the honest-by-default
+   shipped policy. Regression test:
+   `policy::tests::balanced_admits_a_cold_start_low_confidence_estimate_on_confidence_alone`
+   (`crates/domain/src/policy.rs`), evidence at
+   `results/defect1_balanced_admits_cold_start.txt`. Re-running the exact
+   scenario 1/9 CLI-E2E harness post-fix
+   (`results/cli_scenarios_1_5_9.json`) now shows `admitted=True` for
+   scenario 1's initial preflight, and scenario 9 now holds a real active
+   reservation before the crash (proof the initial preflight admitted and
+   reserved, rather than denying).
 2. **A material-event replan reserves capacity even for a task whose
    original admission was Denied.** Confirmed in scenario 5 and 9: the
    initial preflight was `Deny`ed (finding #1), yet the subsequent
@@ -211,11 +246,68 @@ not sought out separately:
    Real behavior, real risk surface — reported here for the coordinator's
    GO/ITERATE/PIVOT/KILL judgment, not assessed as a severity level by this
    harness.
+
+   **RESOLVED.** `ExecutionPlan` now persists the `Admission` verdict its
+   own preflight produced (`admission_json` column,
+   `crates/ledger/migrations/0008_plan_admission.sql`); a replanned plan
+   carries a prior Deny forward so a chained replan also sees it.
+   `handle_tool_invoked` (`crates/daemon/src/server.rs`) now checks the
+   plan being replaced and skips the `ReservationClass::RequiredWork`
+   reservation (logging why) when it was Denied — the Completion Reserve
+   adjustment still runs, since it protects required completion work
+   regardless of admission outcome. Note finding #1's fix changes this
+   scenario's natural reproduction path: a cold-start preflight under
+   `balanced` now Admits, so the regression test for this finding uses
+   `Policy::strict_budget` (a real, deliberate Deny, not a
+   confidence-floor artifact) rather than relying on finding #1's
+   now-fixed cold-start Deny. Regression test:
+   `a_material_event_replan_does_not_reserve_capacity_for_a_task_denied_at_admission`
+   (`crates/daemon/tests/reservation_integration.rs`) — verified to fail
+   on pre-fix code for the right reason (a real `RequiredWork` reservation
+   was found). Evidence at
+   `results/defect2_replan_does_not_reserve_for_denied_task.txt`.
 3. **No CLI/config surface for policy selection or the gateway** (see
    "Load-bearing methodology note" above) — the shipped binary can only
    ever run the hardcoded `balanced` policy with no gateway. This is why
    8 of 12 required scenarios needed Rust-integration evidence instead of
    CLI-E2E evidence.
+
+   **RESOLVED.** `crates/daemon/src/config_file.rs` reads an optional
+   `<state_dir>/config.json`, selecting one of the four named presets
+   (`balanced`/`deadline_first`/`cost_first`/`strict_budget`, with
+   optional resource/time targets) and/or a `[gateway]` table (bind
+   address, credential mode, upstream host allowlist, etc.); absent or
+   partially specified is purely additive (today's hardcoded defaults,
+   unchanged). `crates/cli/src/daemon_cmd.rs` only calls
+   `libra_governor_daemon::config_file::load_overrides` and hands the
+   result to `DaemonConfig` — no preset-selection logic lives in
+   `crates/cli`, preserving this repo's architecture rule that
+   admission/policy decisions belong in `crates/daemon`. Regression test:
+   `daemon_loads_a_non_default_policy_and_gateway_from_config_json`
+   (`crates/cli/tests/hook_cli_integration.rs`) — a real CLI-E2E test
+   spawning the real `libra-governor` binary against a `deadline_first` +
+   gateway `config.json`, confirming both were actually loaded (policy via
+   the real on-disk ledger's `task_budgets.policy.name`, gateway via a
+   real `libra-governor gateway status` round trip). Evidence at
+   `results/defect3_config_json_policy_and_gateway.txt`. This fix does
+   **not** retroactively convert scenarios 2/3/4/6/7/8/9(rust-half)/10/11/12
+   to CLI-E2E evidence — `run_gate_matrix.py` itself was not rewritten to
+   drive `config.json` — see the "Load-bearing methodology note" above.
+4. **Security review finding: state dir/socket/ledger created at
+   umask-derived (not explicitly hardened) permissions** — see
+   `results/security_review.md` item 5. Not originally numbered among the
+   three defects above (it surfaced from the separate security review
+   pass, not from scenario evidence generation), included here for a
+   single resolved-findings list.
+
+   **RESOLVED.** `paths::ensure_state_dir` now creates the state
+   directory at `0700` (and tightens an existing, looser-permissioned
+   directory); `bind_or_detect_running` chmods the Unix socket to `0600`
+   after bind; `LedgerStore::open` chmods the ledger file and its
+   `-wal`/`-shm` sidecars to `0600` after opening. Regression test:
+   `crates/daemon/tests/security_permissions.rs`. Evidence (real `stat`
+   output before/after, plus the test run) at
+   `results/security_file_permissions_fixed.txt`.
 
 ## What is honestly NOT production-equivalent
 
@@ -255,6 +347,13 @@ cargo test -p libra-governor-gateway --test proxy_lifecycle -- --nocapture
 cargo test -p libra-governor-gateway --test auth_and_routing -- --nocapture
 cargo test -p libra-governor-gateway --test ssrf_and_config -- --nocapture
 cargo test -p libra-governor-domain --lib -- --nocapture
+
+# HORO-1146 defect-fix regression tests (see "Defects and gaps found")
+cargo test -p libra-governor-domain --lib balanced_admits_a_cold_start_low_confidence_estimate_on_confidence_alone -- --nocapture
+cargo test -p libra-governor-daemon --test reservation_integration a_material_event_replan_does_not_reserve_capacity_for_a_task_denied_at_admission -- --nocapture
+cargo test -p libra-governor-daemon --lib config_file -- --nocapture
+cargo test -p libra-governor-cli --test hook_cli_integration daemon_loads_a_non_default_policy_and_gateway_from_config_json -- --nocapture
+cargo test -p libra-governor-daemon --test security_permissions -- --nocapture
 
 # Full CI-equivalent gate
 cargo fmt --all -- --check

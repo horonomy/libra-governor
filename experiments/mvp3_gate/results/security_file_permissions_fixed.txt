@@ -1,0 +1,46 @@
+HORO-1146 security review finding #5 fix verification.
+
+Real daemon startup (hook user-prompt-submit spawns 'daemon run' detached),
+real state dir, real stat after startup:
+
+$ stat -f "%N %OLp" <state_dir> <state_dir>/daemon.sock <state_dir>/ledger.sqlite3 <state_dir>/gateway.token
+/tmp/libra-horo1146-sec-check.xPENdC 700
+/tmp/libra-horo1146-sec-check.xPENdC/daemon.sock 600
+/tmp/libra-horo1146-sec-check.xPENdC/ledger.sqlite3 600
+/tmp/libra-horo1146-sec-check.xPENdC/gateway.token 600
+
+$ ls -la <state_dir>
+total 768
+drwx------@    8 bryant  wheel     256 Sep 18 18:59 .
+drwxrwxrwt  5373 root    wheel  171936 Sep 18 18:59 ..
+-rw-r--r--@    1 bryant  wheel      45 Sep 18 18:59 daemon.log
+srw-------@    1 bryant  wheel       0 Sep 18 18:59 daemon.sock
+-rw-------@    1 bryant  wheel      65 Sep 18 18:59 gateway.token
+-rw-------@    1 bryant  wheel    4096 Sep 18 18:59 ledger.sqlite3
+-rw-------@    1 bryant  wheel   32768 Sep 18 18:59 ledger.sqlite3-shm
+-rw-------@    1 bryant  wheel  346112 Sep 18 18:59 ledger.sqlite3-wal
+
+Before the fix (security_review.md item 5, original run): state dir 755,
+socket 755, ledger.sqlite3 644 — umask-derived defaults, a real
+local-multi-user information-disclosure gap. gateway.token was already
+0600 (crates/gateway/src/credential.rs::write_private, pre-existing).
+
+After the fix: state dir 0700 (paths::ensure_state_dir, DirBuilder mode +
+idempotent tightening of a pre-existing looser directory), daemon.sock
+0600 (server::bind_or_detect_running, chmod after bind), ledger.sqlite3
+AND its -wal/-shm WAL-mode sidecars 0600 (ledger::store::open, chmod
+after configure/migrate). gateway.token unchanged (already 0600).
+
+Regression test: crates/daemon/tests/security_permissions.rs — see
+'cargo test -p libra-governor-daemon --test security_permissions'
+output below.
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running tests/security_permissions.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/security_permissions-37129ae62583685a)
+
+running 3 tests
+test ensure_state_dir_creates_the_directory_owner_only ... ok
+test a_real_daemon_startup_hardens_the_socket_and_ledger_file_modes ... ok
+test ensure_state_dir_tightens_an_existing_directory_created_with_a_looser_mode ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s

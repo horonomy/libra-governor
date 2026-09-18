@@ -2,7 +2,7 @@
      Running tests/reservation_integration.rs (/tmp/libra-horo1146-target-fix-11545/debug/deps/reservation_integration-6d034428eedb15ca)
 
 running 1 test
-test admission_deny_writes_no_reservation_and_leaves_the_reserve_untouched ... ok
+test a_material_event_replan_does_not_reserve_capacity_for_a_task_denied_at_admission ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.01s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.12s
 

@@ -1,2 +1,1 @@
-   Compiling libra-governor-cli v0.0.0 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-mvp-3.0-HORO-1146-release_gate/crates/cli)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 55.45s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.13s
