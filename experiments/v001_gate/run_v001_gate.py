@@ -29,6 +29,7 @@ code under test.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -41,6 +42,7 @@ import tarfile
 import time
 import uuid
 from pathlib import Path
+from typing import Callable
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = REPO_ROOT / "experiments" / "mvp1_validation" / "fixtures"
@@ -50,11 +52,13 @@ SOCKET_FILENAME = "daemon.sock"
 LEDGER_FILENAME = "ledger.sqlite3"
 LOG_FILENAME = "daemon.log"
 
-# SonarCloud python:S1192 (duplicated literal) -- these path fragments
-# are reused across every fake-profile scenario below.
+# SonarCloud python:S1192 (duplicated literal) -- these three path
+# fragments are reused across every fake-profile scenario below.
 CLAUDE_DIR_NAME = ".claude"
 SETTINGS_FILENAME = "settings.json"
 LOCAL_STATE_DIRNAME = ".local"
+
+RecordFn = Callable[[str, object, str], None]
 
 
 def w(name: str, text: str) -> None:
@@ -131,6 +135,10 @@ def receipt_count(ledger_path: Path) -> int:
         conn.close()
 
 
+def sha(p: Path) -> str:
+    return hashlib.sha256(p.read_bytes()).hexdigest()
+
+
 def chmod_executable_copy(path: Path) -> None:
     """Set the standard permission for a CLI binary copied into a
     per-profile isolated $CARGO_HOME/bin: 0o755 (owner rwx, group/other
@@ -198,29 +206,8 @@ def new_profile(tag: str, work_root: Path) -> dict:
     return {"fake_home": fake_home, "env": env, "cargo_home": fake_cargo_home}
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--work-root", required=True)
-    ap.add_argument("--scenario", default="all")
-    args = ap.parse_args()
-
-    # SonarCloud pythonsecurity:S8707: --work-root is an externally
-    # supplied CLI argument reaching filesystem mkdir/open/extractall
-    # sinks throughout this harness. Resolve it once, here, to an
-    # absolute canonical path -- every path built from it downstream
-    # (new_profile's fake_home, item 7's old_src/archive_path) is then
-    # constrained via _resolve_within() to stay inside this root.
-    work_root = Path(args.work_root).resolve()
-    work_root.mkdir(parents=True, exist_ok=True)
-    RESULTS.mkdir(parents=True, exist_ok=True)
-
-    results = {}
-
-    def record(name, passed, detail):
-        results[name] = {"passed": passed, "detail": detail}
-        print(f"[{'PASS' if passed else 'FAIL'}] {name}: {detail}")
-
-    # ---------- Item 1: install from documented release path ----------
+def _run_item1_install(work_root: Path, record: RecordFn):
+    """Item 1: install from the documented release path."""
     profile = new_profile("main", work_root)
     fake_home = profile["fake_home"]
     env = profile["env"]
@@ -238,8 +225,12 @@ def main():
     binary = profile["cargo_home"] / "bin" / "libra-governor"
     record("item1_install", proc.returncode == 0 and binary.exists() and os.access(binary, os.X_OK),
            f"install.sh exit={proc.returncode}, binary present={binary.exists()}")
+    return binary, env, fake_home
 
-    # ---------- Item 2: first doctor ----------
+
+def _run_item2_first_doctor(binary: Path, env: dict, fake_home: Path, record: RecordFn) -> Path:
+    """Item 2: first doctor run. Also resolves the settings.json path
+    that item 8 (uninstall/reinstall) later checks."""
     doctor_proc = run([str(binary), "doctor"], env=env, timeout=30)
     w("02_first_doctor.txt",
       f"$ libra-governor doctor  (fresh install, before any Claude Code interaction)\n"
@@ -252,10 +243,14 @@ def main():
     # its settings.json is no longer absent -- record where things stand
     # after item 1 for reference, and use a *separate* fresh profile for
     # the explicit "absent settings.json" case in item 3a below.
-    settings_dir = fake_home / CLAUDE_DIR_NAME
-    settings_path = settings_dir / SETTINGS_FILENAME
+    settings_path = fake_home / CLAUDE_DIR_NAME / SETTINGS_FILENAME
+    return settings_path
 
-    # ---------- Item 3: Claude Code integration bootstrap ----------
+
+def _run_item3_bootstrap(work_root: Path, binary: Path, record: RecordFn):
+    """Item 3: Claude Code integration bootstrap (3a absent settings.json,
+    3b pre-existing settings.json with foreign keys). Returns the foreign
+    seed dict, reused verbatim by item 9's full install/uninstall cycle."""
     # 3a: absent settings.json -- a fresh profile, binary copied in
     # (not rebuilt) so this exercises `install` in isolation.
     absent_profile = new_profile("absent-settings", work_root)
@@ -293,10 +288,6 @@ def main():
         "someTopLevelKeyLibraDoesNotKnowAbout": {"nested": ["value", 1, True]},
     }
     foreign_settings_path.write_text(json.dumps(foreign_seed, indent=2))
-    import hashlib
-
-    def sha(p: Path) -> str:
-        return hashlib.sha256(p.read_bytes()).hexdigest()
 
     pristine_sha = sha(foreign_settings_path)
     pristine_text = foreign_settings_path.read_text()
@@ -335,7 +326,12 @@ def main():
            install_foreign_proc.returncode == 0 and foreign_preserved_after_install,
            f"install exit={install_foreign_proc.returncode}, foreign preserved={foreign_preserved_after_install}")
 
-    # ---------- Item 4: first bounded preflight ----------
+    return foreign_seed
+
+
+def _run_item4_first_preflight(binary: Path, env: dict, fake_home: Path, record: RecordFn) -> Path:
+    """Item 4: first bounded preflight. Returns state_dir, reused by
+    items 5, 6 and 11."""
     state_dir = fake_home / LOCAL_STATE_DIRNAME / "state" / "libra-governor"
     sid = f"gate-{uuid.uuid4()}"
     pf = preflight(binary, env, sid, FIXTURES / "rust-crate")
@@ -346,8 +342,11 @@ def main():
       f"socket present: {(state_dir/SOCKET_FILENAME).exists()}\n")
     record("item4_first_preflight", pf.returncode == 0 and "task " in pf.stdout,
            f"preflight exit={pf.returncode}, socket_up={wait_for_socket(state_dir, timeout=3)}")
+    return state_dir
 
-    # ---------- Item 5: full governed task + Execution Receipt ----------
+
+def _run_item5_full_task(binary: Path, env: dict, state_dir: Path, record: RecordFn) -> None:
+    """Item 5: full governed task + Execution Receipt."""
     sid2 = f"gate-full-{uuid.uuid4()}"
     pf2 = preflight(binary, env, sid2, FIXTURES / "rust-crate", prompt="implement a new /health endpoint")
     ptu_results = []
@@ -369,9 +368,14 @@ def main():
     record("item5_full_task_receipt", stop_proc.returncode == 0 and receipts_after >= 1,
            f"stop exit={stop_proc.returncode}, receipts={receipts_after}")
 
-    # ---------- Item 6: restart/resume ----------
+
+def _run_item6_restart_resume(binary: Path, env: dict, state_dir: Path, record: RecordFn) -> None:
+    """Item 6: restart/resume."""
     daemon = spawn_daemon(binary, env)
     restart_lines = [f"daemon spawned pid={daemon.pid}"]
+    respawn_ok = False
+    before_receipts = 0
+    after_receipts = 0
     try:
         up = wait_for_socket(state_dir, timeout=8)
         restart_lines.append(f"socket up before kill: {up}")
@@ -394,68 +398,74 @@ def main():
     record("item6_restart_resume", respawn_ok and after_receipts > before_receipts,
            f"respawn_ok={respawn_ok}, receipts {before_receipts}->{after_receipts}")
 
-    # ---------- Item 7: upgrade from mvp-3.0 ----------
+
+def _run_item7_upgrade(work_root: Path, binary: Path, record: RecordFn) -> None:
+    """Item 7: upgrade from mvp-3.0."""
     upgrade_lines = []
     tag_check = run(["git", "cat-file", "-e", "mvp-3.0"], cwd=str(REPO_ROOT))
     if tag_check.returncode != 0:
         upgrade_lines.append("SKIPPED: tag mvp-3.0 not found in this repository; genuinely infeasible.")
         record("item7_upgrade", None, "tag mvp-3.0 not found")
+        w("07_upgrade_from_mvp3.txt", "\n".join(upgrade_lines))
+        return
+
+    old_src = _resolve_within(work_root, "old-mvp-3.0-src")
+    if old_src.exists():
+        shutil.rmtree(old_src)
+    old_src.mkdir(parents=True)
+    archive_path = _resolve_within(work_root, "mvp-3.0.tar")
+    with open(archive_path, "wb") as f:
+        arch_proc = subprocess.run(["git", "archive", "mvp-3.0"], cwd=str(REPO_ROOT), stdout=f)
+    upgrade_lines.append(f"git archive mvp-3.0 exit={arch_proc.returncode}")
+    with tarfile.open(archive_path) as tf:
+        tf.extractall(old_src)
+
+    upgrade_profile = new_profile("upgrade", work_root)
+    up_home = upgrade_profile["fake_home"]
+    up_env = upgrade_profile["env"]
+    up_binpath = upgrade_profile["cargo_home"] / "bin" / "libra-governor"
+
+    old_install_proc = run(
+        ["cargo", "install", "--path", "crates/cli", "--locked"],
+        cwd=str(old_src), env=up_env, timeout=900,
+    )
+    upgrade_lines.append(f"\n$ (old mvp-3.0 tree) cargo install --path crates/cli --locked\nexit={old_install_proc.returncode}\n--- stdout ---\n{old_install_proc.stdout[-3000:]}\n--- stderr ---\n{old_install_proc.stderr[-3000:]}\n")
+
+    old_install_ok = old_install_proc.returncode == 0 and up_binpath.exists()
+    if old_install_ok:
+        up_install_cmd = run([str(up_binpath), "install"], env=up_env, timeout=30)
+        upgrade_lines.append(f"old-binary `install` exit={up_install_cmd.returncode}")
+        old_doctor = run([str(up_binpath), "doctor"], env=up_env, timeout=30)
+        upgrade_lines.append(f"old-binary `doctor` (before upgrade):\n{old_doctor.stdout}\n")
+
+        sid4 = f"upgrade-old-{uuid.uuid4()}"
+        up_state_dir = up_home / LOCAL_STATE_DIRNAME / "state" / "libra-governor"
+        pf4 = preflight(up_binpath, up_env, sid4, FIXTURES / "rust-crate")
+        stop4 = stop(up_binpath, up_env, sid4)
+        receipts_old = receipt_count(up_state_dir / LEDGER_FILENAME)
+        upgrade_lines.append(f"old-binary task run: preflight exit={pf4.returncode}, stop exit={stop4.returncode}, receipts={receipts_old}")
+
+        # Now build+install the CURRENT (main) binary over the same profile.
+        new_install_proc = run([str(REPO_ROOT / "scripts" / "install.sh")], cwd=str(REPO_ROOT), env=up_env, timeout=900)
+        upgrade_lines.append(f"\n$ (current main tree) ./scripts/install.sh  (same $HOME/$CARGO_HOME as old binary)\nexit={new_install_proc.returncode}\n--- stdout (tail) ---\n{new_install_proc.stdout[-3000:]}\n--- stderr (tail) ---\n{new_install_proc.stderr[-3000:]}\n")
+
+        new_doctor = run([str(up_binpath), "doctor"], env=up_env, timeout=30)
+        receipts_after_upgrade = receipt_count(up_state_dir / LEDGER_FILENAME)
+        upgrade_lines.append(f"new-binary `doctor` (after upgrade):\n{new_doctor.stdout}\n")
+        upgrade_lines.append(f"receipts survive upgrade: before={receipts_old}, after={receipts_after_upgrade} (state dir untouched by upgrade)")
+
+        state_survived = receipts_after_upgrade >= receipts_old and receipts_old >= 1
+        doctor_ok_after = new_doctor.returncode in (0, 1)
+        record("item7_upgrade", new_install_proc.returncode == 0 and state_survived and doctor_ok_after,
+               f"old_install_ok={old_install_ok}, new_install_exit={new_install_proc.returncode}, state_survived={state_survived}")
     else:
-        old_src = _resolve_within(work_root, "old-mvp-3.0-src")
-        if old_src.exists():
-            shutil.rmtree(old_src)
-        old_src.mkdir(parents=True)
-        archive_path = _resolve_within(work_root, "mvp-3.0.tar")
-        with open(archive_path, "wb") as f:
-            arch_proc = subprocess.run(["git", "archive", "mvp-3.0"], cwd=str(REPO_ROOT), stdout=f)
-        upgrade_lines.append(f"git archive mvp-3.0 exit={arch_proc.returncode}")
-        with tarfile.open(archive_path) as tf:
-            tf.extractall(old_src)
-
-        upgrade_profile = new_profile("upgrade", work_root)
-        up_home = upgrade_profile["fake_home"]
-        up_env = upgrade_profile["env"]
-        up_binpath = upgrade_profile["cargo_home"] / "bin" / "libra-governor"
-
-        old_install_proc = run(
-            ["cargo", "install", "--path", "crates/cli", "--locked"],
-            cwd=str(old_src), env=up_env, timeout=900,
-        )
-        upgrade_lines.append(f"\n$ (old mvp-3.0 tree) cargo install --path crates/cli --locked\nexit={old_install_proc.returncode}\n--- stdout ---\n{old_install_proc.stdout[-3000:]}\n--- stderr ---\n{old_install_proc.stderr[-3000:]}\n")
-
-        old_install_ok = old_install_proc.returncode == 0 and up_binpath.exists()
-        if old_install_ok:
-            up_install_cmd = run([str(up_binpath), "install"], env=up_env, timeout=30)
-            upgrade_lines.append(f"old-binary `install` exit={up_install_cmd.returncode}")
-            old_doctor = run([str(up_binpath), "doctor"], env=up_env, timeout=30)
-            upgrade_lines.append(f"old-binary `doctor` (before upgrade):\n{old_doctor.stdout}\n")
-
-            sid4 = f"upgrade-old-{uuid.uuid4()}"
-            up_state_dir = up_home / LOCAL_STATE_DIRNAME / "state" / "libra-governor"
-            pf4 = preflight(up_binpath, up_env, sid4, FIXTURES / "rust-crate")
-            stop4 = stop(up_binpath, up_env, sid4)
-            receipts_old = receipt_count(up_state_dir / LEDGER_FILENAME)
-            upgrade_lines.append(f"old-binary task run: preflight exit={pf4.returncode}, stop exit={stop4.returncode}, receipts={receipts_old}")
-
-            # Now build+install the CURRENT (main) binary over the same profile.
-            new_install_proc = run([str(REPO_ROOT / "scripts" / "install.sh")], cwd=str(REPO_ROOT), env=up_env, timeout=900)
-            upgrade_lines.append(f"\n$ (current main tree) ./scripts/install.sh  (same $HOME/$CARGO_HOME as old binary)\nexit={new_install_proc.returncode}\n--- stdout (tail) ---\n{new_install_proc.stdout[-3000:]}\n--- stderr (tail) ---\n{new_install_proc.stderr[-3000:]}\n")
-
-            new_doctor = run([str(up_binpath), "doctor"], env=up_env, timeout=30)
-            receipts_after_upgrade = receipt_count(up_state_dir / LEDGER_FILENAME)
-            upgrade_lines.append(f"new-binary `doctor` (after upgrade):\n{new_doctor.stdout}\n")
-            upgrade_lines.append(f"receipts survive upgrade: before={receipts_old}, after={receipts_after_upgrade} (state dir untouched by upgrade)")
-
-            state_survived = receipts_after_upgrade >= receipts_old and receipts_old >= 1
-            doctor_ok_after = new_doctor.returncode in (0, 1)
-            record("item7_upgrade", new_install_proc.returncode == 0 and state_survived and doctor_ok_after,
-                   f"old_install_ok={old_install_ok}, new_install_exit={new_install_proc.returncode}, state_survived={state_survived}")
-        else:
-            upgrade_lines.append("old mvp-3.0 tree failed to `cargo install --locked` on the current toolchain -- recording as a real finding, not faking success.")
-            record("item7_upgrade", False, "old mvp-3.0 build failed under --locked on current toolchain")
+        upgrade_lines.append("old mvp-3.0 tree failed to `cargo install --locked` on the current toolchain -- recording as a real finding, not faking success.")
+        record("item7_upgrade", False, "old mvp-3.0 build failed under --locked on current toolchain")
     w("07_upgrade_from_mvp3.txt", "\n".join(upgrade_lines))
 
-    # ---------- Item 8: uninstall/reinstall ----------
+
+def _run_item8_uninstall_reinstall(binary: Path, env: dict, settings_path: Path, record: RecordFn) -> None:
+    """Item 8: uninstall/reinstall."""
     uninstall_lines = []
     uninstall_proc = run([str(binary), "uninstall", "--yes"], env=env, timeout=30)
     uninstall_lines.append(f"$ libra-governor uninstall --yes\nexit={uninstall_proc.returncode}\n--- stdout ---\n{uninstall_proc.stdout}\n--- stderr ---\n{uninstall_proc.stderr}\n")
@@ -473,7 +483,9 @@ def main():
            uninstall_proc.returncode == 0 and reinstall_proc.returncode == 0 and reinstall_ok,
            f"uninstall_exit={uninstall_proc.returncode}, not_installed_reported={not_installed_reported}, reinstall_ok={reinstall_ok}")
 
-    # ---------- Item 9: no damage to unrelated Claude configuration, full cycle ----------
+
+def _run_item9_foreign_cycle(work_root: Path, binary: Path, foreign_seed: dict, record: RecordFn) -> None:
+    """Item 9: no damage to unrelated Claude configuration, full cycle."""
     cycle_profile = new_profile("cycle", work_root)
     cyc_home = cycle_profile["fake_home"]
     cyc_env = cycle_profile["env"]
@@ -536,7 +548,10 @@ def main():
            cyc_install.returncode == 0 and cyc_uninstall.returncode == 0 and foreign_subtree_identical_after_uninstall,
            f"byte_identical={byte_identical_after_uninstall}, foreign_subtree_identical={foreign_subtree_identical_after_uninstall}")
 
-    # ---------- Item 10: capability tier text under GovernorHeld vs PassThroughSubscription ----------
+
+def _run_item10_capability_tier(work_root: Path, binary: Path, record: RecordFn) -> None:
+    """Item 10: capability tier text under GovernorHeld vs
+    PassThroughSubscription."""
     tier_lines = []
     for mode_name, gateway_cfg in (
         ("GovernorHeld", {
@@ -580,15 +595,24 @@ def main():
     record("item10_capability_tier_text", tiers_differ,
            f"tiers_differ={tiers_differ}, suspicious_overstated_language_found={overstated_language}")
 
-    # ---------- Item 11: no secret/private data leakage ----------
-    leak_report = run_privacy_checks(state_dir, work_root)
-    w("privacy_leak_check_raw.txt", leak_report)
 
-    RESULTS.joinpath("scenario_results.json").write_text(json.dumps(results, indent=2, default=str))
-    print(json.dumps(results, indent=2, default=str))
+def _grep_nonce_count(target_name: str, path: Path, nonce: str) -> str:
+    if "sqlite3" in target_name:
+        p = run(["bash", "-c", f"strings '{path}' | grep -c -- '{nonce}'"])
+    else:
+        p = run(["grep", "-c", "--", nonce, str(path)])
+    return p.stdout.strip() or "0"
 
 
-def run_privacy_checks(state_dir: Path, work_root: Path) -> str:
+def _nonce_check_verdict(expected_absent: bool, count: str) -> str:
+    if expected_absent and count == "0":
+        return "PASS (absent, as expected)"
+    if expected_absent and count != "0":
+        return "FAIL (leaked!)"
+    return f"count={count}"
+
+
+def run_privacy_checks(state_dir: Path) -> str:
     lines = []
     nonces = {
         "fake_credential_nonce": "fake-test-credential-nonce-8f2c1a",
@@ -605,16 +629,52 @@ def run_privacy_checks(state_dir: Path, work_root: Path) -> str:
             if not path.exists():
                 lines.append(f"{target_name} :: {nonce_name}: SKIPPED (file does not exist)")
                 continue
-            if "sqlite3" in target_name:
-                p = run(["bash", "-c", f"strings '{path}' | grep -c -- '{nonce}'"])
-            else:
-                p = run(["grep", "-c", "--", nonce, str(path)])
-            count = p.stdout.strip() or "0"
-            expected_absent = nonce_name.startswith("fake_credential") or nonce_name.startswith("fake_prompt")
-            verdict = "PASS (absent, as expected)" if (expected_absent and count == "0") else (
-                "FAIL (leaked!)" if expected_absent and count != "0" else f"count={count}")
+            count = _grep_nonce_count(target_name, path, nonce)
+            expected_absent = nonce_name.startswith(("fake_credential", "fake_prompt"))
+            verdict = _nonce_check_verdict(expected_absent, count)
             lines.append(f"{target_name} :: grep for {nonce_name} ({nonce!r}): count={count} -> {verdict}")
     return "\n".join(lines)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--work-root", required=True)
+    ap.add_argument("--scenario", default="all")
+    args = ap.parse_args()
+
+    # SonarCloud pythonsecurity:S8707: --work-root is an externally
+    # supplied CLI argument reaching filesystem mkdir/open/extractall
+    # sinks throughout this harness. Resolve it once, here, to an
+    # absolute canonical path -- every path built from it downstream
+    # (new_profile's fake_home, item 7's old_src/archive_path) is then
+    # constrained via _resolve_within() to stay inside this root.
+    work_root = Path(args.work_root).resolve()
+    work_root.mkdir(parents=True, exist_ok=True)
+    RESULTS.mkdir(parents=True, exist_ok=True)
+
+    results = {}
+
+    def record(name, passed, detail):
+        results[name] = {"passed": passed, "detail": detail}
+        print(f"[{'PASS' if passed else 'FAIL'}] {name}: {detail}")
+
+    binary, env, fake_home = _run_item1_install(work_root, record)
+    settings_path = _run_item2_first_doctor(binary, env, fake_home, record)
+    foreign_seed = _run_item3_bootstrap(work_root, binary, record)
+    state_dir = _run_item4_first_preflight(binary, env, fake_home, record)
+    _run_item5_full_task(binary, env, state_dir, record)
+    _run_item6_restart_resume(binary, env, state_dir, record)
+    _run_item7_upgrade(work_root, binary, record)
+    _run_item8_uninstall_reinstall(binary, env, settings_path, record)
+    _run_item9_foreign_cycle(work_root, binary, foreign_seed, record)
+    _run_item10_capability_tier(work_root, binary, record)
+
+    # ---------- Item 11: no secret/private data leakage ----------
+    leak_report = run_privacy_checks(state_dir)
+    w("privacy_leak_check_raw.txt", leak_report)
+
+    RESULTS.joinpath("scenario_results.json").write_text(json.dumps(results, indent=2, default=str))
+    print(json.dumps(results, indent=2, default=str))
 
 
 if __name__ == "__main__":
