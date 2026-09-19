@@ -1,0 +1,13 @@
+session_id: long-67d57dcc-5453-4282-8a38-79bc7e7c1cf1
+preflight exit=0
+delivered 30 post-tool-use events, 0 unexpected failures
+stop exit=0
+--- stop stderr ---
+[libra-governor] Execution Receipt (task ea5f5b9c-18ce-4087-a7ac-5ff5bd68cff6)
+Estimate: cold start — insufficient local history: no ExecutionReceipt rows recorded yet (confidence: Low, n=0)
+Actual:   0s / unknown (harness does not expose cost/usage data)
+Outcome:  Unknown (no automated completion verification in MVP 1)
+Tool calls: 30
+Inside P90: n/a (cold start)
+
+receipts after long session: 1

@@ -1,0 +1,8 @@
+daemon.log :: fake_credential_nonce: SKIPPED (file does not exist)
+daemon.log :: fake_prompt_content: SKIPPED (file does not exist)
+daemon.log :: fake_prompt_content2: SKIPPED (file does not exist)
+daemon.log :: fake_fixture_path: SKIPPED (file does not exist)
+ledger.sqlite3 (strings) :: fake_credential_nonce: SKIPPED (file does not exist)
+ledger.sqlite3 (strings) :: fake_prompt_content: SKIPPED (file does not exist)
+ledger.sqlite3 (strings) :: fake_prompt_content2: SKIPPED (file does not exist)
+ledger.sqlite3 (strings) :: fake_fixture_path: SKIPPED (file does not exist)

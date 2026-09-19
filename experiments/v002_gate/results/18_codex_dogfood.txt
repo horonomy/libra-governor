@@ -1,0 +1,175 @@
+codex --version: codex-cli 0.154.0
+
+$ bash scripts/codex-smoke.sh
+exit=0
+--- stdout ---
+Sandbox: /var/folders/b7/6_9p89_119bcsnt8jqn98_7h0000gn/T/tmp.3s93X33VPC
+
+== Building libra-governor ==
+Binary: /var/folders/b7/6_9p89_119bcsnt8jqn98_7h0000gn/T/tmp.3s93X33VPC/target/release/libra-governor
+
+== doctor before install (expect: codex hooks not installed, exit 0) ==
+libra-governor doctor
+======================
+
+[warn] state_dir: state directory /var/folders/b7/6_9p89_119bcsnt8jqn98_7h0000gn/T/tmp.3s93X33VPC/state does not exist yet — the daemon has never run (normal before the first prompt)
+[warn] claude_settings: not installed into /private/tmp/horo1169-v002-final/home-codex-dogfood/.claude/settings.json — run `libra-governor install`
+[warn] codex_hooks: not installed into /var/folders/b7/6_9p89_119bcsnt8jqn98_7h0000gn/T/tmp.3s93X33VPC/codex-home/hooks.json — run `libra-governor install --agent codex`
+[warn] daemon_reachable: daemon is not running — it starts on demand on the next Claude Code prompt (this is normal)
+
+
+== Seeding a foreign hooks.json description + hook group ==
+== install --agent codex ==
+libra-governor install: wired into /var/folders/b7/6_9p89_119bcsnt8jqn98_7h0000gn/T/tmp.3s93X33VPC/codex-home/hooks.json
+  hooks added:      3
+  backup written:   /var/folders/b7/6_9p89_119bcsnt8jqn98_7h0000gn/T/tmp.3s93X33VPC/codex-home/hooks.json.libra-backup-1789836894-93607
+
+IMPORTANT: writing hooks.json is not enough for Codex to run these hooks. Run `/hooks` inside Codex and trust the three `libra-governor` hooks — trust is recorded by content hash; if you move the binary, you must re-trust.
+Next: submit a prompt in Codex, then run `libra-governor doctor`.
+
+== Foreign description + hook group must survive install byte-for-byte ==
+OK: foreign description and hook group survived.
+
+== hooks.json's real shape: hook groups live under the top-level "hooks" key ==
+OK: hooks.json shape verified structurally.
+
+== doctor after install (expect: codex hooks wired) ==
+libra-governor doctor
+======================
+
+[ok] state_dir_permissions: /var/folders/b7/6_9p89_119bcsnt8jqn98_7h0000gn/T/tmp.3s93X33VPC/state is owner-only (0700)
+[ok] config_file_present: no config.json — running the balanced preset with no gateway (defaults)
+[ok] gateway_token_present: gateway capability token not yet created (/var/folders/b7/6_9p89_119bcsnt8jqn98_7h0000gn/T/tmp.3s93X33VPC/state/gateway.token)
+[warn] claude_settings: not installed into /private/tmp/horo1169-v002-final/home-codex-dogfood/.claude/settings.json — run `libra-governor install`
+[ok] codex_hooks: hooks wired in /var/folders/b7/6_9p89_119bcsnt8jqn98_7h0000gn/T/tmp.3s93X33VPC/codex-home/hooks.json; trust state: unknown — /var/folders/b7/6_9p89_119bcsnt8jqn98_7h0000gn/T/tmp.3s93X33VPC/codex-home/config.toml not found or unreadable
+[warn] daemon_reachable: daemon is not running — it starts on demand on the next Claude Code prompt (this is normal)
+
+
+== Real local Codex CLI found: driving an actual end-to-end run ==
+codex version: codex-cli 0.154.0
+
+This will run 'codex exec --dangerously-bypass-hook-trust' against the
+sandboxed $CODEX_HOME above. Codex's own credentials live under
+$CODEX_HOME, so this sandboxed instance has none and cannot make a real,
+billed model call — every attempt will fail with 401 Unauthorized, which
+is expected and fine; the hook itself still fires before that failure.
+
+OK: the real Codex CLI ran our UserPromptSubmit hook.
+-- daemon.log --
+[2026-09-19T16:54:54.838859Z] daemon started
+
+== uninstall --agent codex --yes ==
+libra-governor uninstall: removed from /var/folders/b7/6_9p89_119bcsnt8jqn98_7h0000gn/T/tmp.3s93X33VPC/codex-home/hooks.json
+  hook commands removed: 3
+  backup written:        /var/folders/b7/6_9p89_119bcsnt8jqn98_7h0000gn/T/tmp.3s93X33VPC/codex-home/hooks.json.libra-backup-1789836912-95130
+libra-governor uninstall: the daemon binary at /var/folders/b7/6_9p89_119bcsnt8jqn98_7h0000gn/T/tmp.3s93X33VPC/target/release/libra-governor was installed via `cargo install`.
+  To remove it, run: cargo uninstall libra-governor-cli
+libra-governor uninstall: removed /var/folders/b7/6_9p89_119bcsnt8jqn98_7h0000gn/T/tmp.3s93X33VPC/state
+
+== Foreign description + hook group must survive uninstall ==
+OK: foreign description and hook group survived uninstall.
+
+== doctor after uninstall (expect: codex hooks not installed again) ==
+libra-governor doctor
+======================
+
+[warn] state_dir: state directory /var/folders/b7/6_9p89_119bcsnt8jqn98_7h0000gn/T/tmp.3s93X33VPC/state does not exist yet — the daemon has never run (normal before the first prompt)
+[warn] claude_settings: not installed into /private/tmp/horo1169-v002-final/home-codex-dogfood/.claude/settings.json — run `libra-governor install`
+[warn] codex_hooks: not installed into /var/folders/b7/6_9p89_119bcsnt8jqn98_7h0000gn/T/tmp.3s93X33VPC/codex-home/hooks.json — run `libra-governor install --agent codex`
+[warn] daemon_reachable: daemon is not running — it starts on demand on the next Claude Code prompt (this is normal)
+
+
+Codex smoke test passed.
+
+--- stderr ---
+   Compiling libc v0.2.189
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.26
+   Compiling cfg-if v1.0.5
+   Compiling version_check v0.9.5
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.12
+   Compiling once_cell v1.21.4
+   Compiling serde_core v1.0.229
+   Compiling itoa v1.0.18
+   Compiling bytes v1.12.1
+   Compiling pin-project-lite v0.2.17
+   Compiling getrandom v0.4.3
+   Compiling smallvec v1.16.1
+   Compiling zerocopy v0.8.57
+   Compiling zmij v1.0.23
+   Compiling cc v1.4.6
+   Compiling subtle v2.6.1
+   Compiling thiserror v2.0.20
+   Compiling futures-core v0.3.34
+   Compiling serde v1.0.229
+   Compiling ahash v0.8.12
+   Compiling generic-array v0.14.7
+   Compiling pkg-config v0.3.34
+   Compiling powerfmt v0.2.0
+   Compiling serde_json v1.0.151
+   Compiling http v1.5.0
+   Compiling zeroize v1.9.0
+   Compiling typenum v1.20.1
+   Compiling httparse v1.10.1
+   Compiling time-core v0.1.9
+   Compiling vcpkg v0.2.15
+   Compiling num-conv v0.2.2
+   Compiling rustls-pki-types v1.15.1
+   Compiling http-body v1.1.0
+   Compiling memchr v2.8.3
+   Compiling ring v0.17.14
+   Compiling libsqlite3-sys v0.30.1
+   Compiling try-lock v0.2.5
+   Compiling untrusted v0.9.0
+   Compiling want v0.3.1
+   Compiling futures-channel v0.3.34
+   Compiling tracing-core v0.1.36
+   Compiling atomic-waker v1.1.2
+   Compiling rustls v0.23.45
+   Compiling futures-task v0.3.34
+   Compiling httpdate v1.0.3
+   Compiling futures-util v0.3.34
+   Compiling tracing v0.1.44
+   Compiling socket2 v0.6.5
+   Compiling mio v1.2.3
+   Compiling getrandom v0.2.17
+   Compiling bitflags v2.13.2
+   Compiling tower-service v0.3.3
+   Compiling deranged v0.5.8
+   Compiling syn v3.0.6
+   Compiling uuid v1.26.1
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling fallible-iterator v0.3.0
+   Compiling cpufeatures v0.2.17
+   Compiling webpki-roots v1.0.9
+   Compiling time v0.3.55
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling digest v0.10.7
+   Compiling tokio-macros v2.7.2
+   Compiling serde_derive v1.0.229
+   Compiling thiserror-impl v2.0.20
+   Compiling sha2 v0.10.9
+   Compiling hmac v0.12.1
+   Compiling tokio v1.53.1
+   Compiling hashbrown v0.14.5
+   Compiling hashlink v0.9.1
+   Compiling libra-governor-domain v0.0.2 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-v0.0.2-HORO-1169-dogfood_release/crates/domain)
+   Compiling hyper v1.11.1
+   Compiling http-body-util v0.1.5
+   Compiling rustls-webpki v0.103.15
+   Compiling hyper-util v0.1.20
+   Compiling libra-governor-extension v0.0.2 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-v0.0.2-HORO-1169-dogfood_release/crates/extension)
+   Compiling tokio-rustls v0.26.5
+   Compiling hyper-rustls v0.27.9
+   Compiling libra-governor-gateway v0.0.2 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-v0.0.2-HORO-1169-dogfood_release/crates/gateway)
+   Compiling rusqlite v0.32.1
+   Compiling libra-governor-ledger v0.0.2 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-v0.0.2-HORO-1169-dogfood_release/crates/ledger)
+   Compiling libra-governor-estimator v0.0.2 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-v0.0.2-HORO-1169-dogfood_release/crates/estimator)
+   Compiling libra-governor-protocol v0.0.2 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-v0.0.2-HORO-1169-dogfood_release/crates/protocol)
+   Compiling libra-governor-daemon v0.0.2 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-v0.0.2-HORO-1169-dogfood_release/crates/daemon)
+   Compiling libra-governor-cli v0.0.2 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-v0.0.2-HORO-1169-dogfood_release/crates/cli)
+    Finished `release` profile [optimized] target(s) in 25.32s
+

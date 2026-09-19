@@ -1,0 +1,5 @@
+warm-up real task against the current daemon: preflight exit=0
+daemon pid before synthetic newer-protocol request: 90422
+sent a synthetic protocol_version=999 request directly over the socket, raw response: '{"protocol_version":8,"response":{"kind":"error","message":"protocol version mismatch: daemon speaks 8, client sent 999"}}'
+original daemon logged its own shutdown and exited: True
+next hook invocation after the old daemon exited: preflight exit=0, has real admission=True, stop exit=0, receipts_after=2

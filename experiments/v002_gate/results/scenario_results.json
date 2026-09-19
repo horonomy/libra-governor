@@ -1,0 +1,74 @@
+{
+  "item1_install": {
+    "passed": true,
+    "detail": "install.sh exit=0, binary present=True"
+  },
+  "item2_first_doctor": {
+    "passed": true,
+    "detail": "doctor exit=0"
+  },
+  "item3a_install_absent_settings": {
+    "passed": true,
+    "detail": "install exit=0, settings.json created=True"
+  },
+  "item3b_install_foreign_settings": {
+    "passed": true,
+    "detail": "install exit=0, foreign preserved=True"
+  },
+  "item4_first_preflight": {
+    "passed": true,
+    "detail": "preflight exit=0, socket_up=True"
+  },
+  "item5_full_task_receipt": {
+    "passed": true,
+    "detail": "stop exit=0, receipts=1"
+  },
+  "item6_restart_resume": {
+    "passed": true,
+    "detail": "respawn_ok=True, receipts 1->2"
+  },
+  "item8_uninstall_reinstall": {
+    "passed": true,
+    "detail": "uninstall_exit=0, not_installed_reported=True, reinstall_ok=True"
+  },
+  "item9_foreign_settings_preserved": {
+    "passed": true,
+    "detail": "byte_identical=False, foreign_subtree_identical=True"
+  },
+  "item10_capability_tier_text": {
+    "passed": true,
+    "detail": "tiers_differ=True, suspicious_overstated_language_found=False"
+  },
+  "item12_long_running_session": {
+    "passed": true,
+    "detail": "preflight_ok=True, events=30, ptu_failures=0, stop_ok=True, receipts=1"
+  },
+  "item13_concurrent_sessions": {
+    "passed": true,
+    "detail": "completed=True/8, all_ok=True, elapsed=0.03s, receipts=8"
+  },
+  "item14_failure_recovery": {
+    "passed": true,
+    "detail": "sqlite_ok=True, fresh_task_ok=True, stop_ok=True"
+  },
+  "item15_invalid_config_degrades_safely": {
+    "passed": true,
+    "detail": "all_cases_safe=True, cases=['malformed_json', 'wrong_type_for_gateway', 'unknown_top_level_key_only', 'empty_file']"
+  },
+  "item16_resource_consumption_bounded": {
+    "passed": true,
+    "detail": "rss_samples_kb=[5120, 5200, 5328, 5344, 5376], growth_ratio=1.05"
+  },
+  "item17_upgrade_from_v001": {
+    "passed": true,
+    "detail": "binary_replaced=True, data_survived=True, doctor_ok=True, governed_despite_stale_daemon=False (expected False -- disclosed, permanent, one-time v0.0.1-only limitation), workaround_resolves_it=True, receipts 1->1->1->2"
+  },
+  "item19_self_healing_daemon_upgrade": {
+    "passed": true,
+    "detail": "daemon_exited_after_newer_client=True, fresh_daemon_governs_normally=True"
+  },
+  "item18_codex_dogfood": {
+    "passed": true,
+    "detail": "codex_smoke_exit=0"
+  }
+}

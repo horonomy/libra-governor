@@ -10,18 +10,33 @@ makes replanning a deliberate, auditable decision rather than an implicit
 one. See [`PRODUCT.md`](PRODUCT.md) for the full product North Star and
 [`ARCHITECTURE.md`](ARCHITECTURE.md) for how the pieces fit together.
 
-This is the **v0.0.1 Developer Preview**: the validated MVP 3 local flow
-(HORO-1137 Policy presets, HORO-1139 runtime replanning, HORO-1141
-Completion Reserve, HORO-1144 the optional enforcement gateway), plus
-the installation, diagnostics, and documentation this file covers
-(HORO-1150). No new admission/policy/gateway logic was added to
-productize it.
+This is the **v0.0.2 Developer Preview**: everything from v0.0.1 (the
+validated MVP 3 local flow — HORO-1137 Policy presets, HORO-1139 runtime
+replanning, HORO-1141 Completion Reserve, HORO-1144 the optional
+enforcement gateway — plus installation/diagnostics/documentation,
+HORO-1150), plus:
+
+- **Codex support** (HORO-1157/1167) — Claude Code and Codex share the
+  same Governor core through a stable Agent Adapter contract; capability
+  differences between the two are reported honestly, not papered over.
+- **Local extension points** (HORO-1174) — an optional, outbound-only
+  Business Context Provider fetch and signed event/policy webhooks, plus
+  one inbound path over the existing 0600 Unix socket for external
+  Outcome Providers. Off by default; narrowing-only where it touches
+  policy (see `docs/adr/0005-local-extension-points.md`).
+
+**Team Alpha (a hosted control plane for shared team policy) is not part
+of this release.** It remains gated on real evidence that the local
+product sees repeated use — see HORO-1154.
 
 ## Requirements
 
 - A Rust toolchain (`cargo`, `rustc`) — see <https://rustup.rs> if you
   do not have one.
-- macOS or Linux. Claude Code with hook and statusline support.
+- macOS or Linux. Claude Code with hook and statusline support, and/or
+  Codex with its hooks support (run `libra-governor install --agent
+  codex`) — see `integrations/codex/README.md` for Codex-specific setup
+  and capability-tier differences.
 - No Docker. No account or login. No SaaS dependency — everything below
   runs entirely on your machine.
 
@@ -29,8 +44,8 @@ productize it.
 
 This repository's CI (`.github/workflows/ci.yml`) does not publish a
 release binary anywhere — there is no `curl | sh`-a-prebuilt-binary path
-to offer honestly at v0.0.1. The real install path is building from a
-clone with `cargo install`:
+to offer honestly. The real install path is building from a clone with
+`cargo install`:
 
 ```bash
 git clone https://github.com/horonomy/libra-governor.git
@@ -347,7 +362,18 @@ Run `libra-governor doctor` afterward to confirm — it will report
 
 - **Developer Preview, not a general release.** No published binaries
   exist yet (see "Install" above); `cargo install` from a local clone is
-  the real v0.0.1 path.
+  the real install path.
+- **No Team Alpha / hosted control plane.** Shared team policy, a
+  management console, and any cloud component are unbuilt — see
+  HORO-1154/1159/1163/1165. Everything in this release runs entirely on
+  your machine.
+- **Upgrading directly from v0.0.1 needs one manual daemon restart** if
+  Claude Code was already running before you upgraded: `pkill -f
+  "libra-governor daemon run"` (or just restart Claude Code). `doctor`
+  will tell you if this applies. This is a one-time limitation of that
+  specific transition — the v0.0.1 daemon predates the self-healing fix
+  that makes every later upgrade automatic (see
+  `experiments/v002_gate/README.md`).
 - **The gateway's session-binding header is unverified against live
   Claude Code traffic** — see
   [`integrations/claude-code/README.md`](integrations/claude-code/README.md#known-limitation-the-session-binding-header-is-unverified).

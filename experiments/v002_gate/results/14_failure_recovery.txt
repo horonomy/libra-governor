@@ -1,0 +1,9 @@
+daemon spawned pid=83718
+socket up: True
+preflight (admitted, not yet stopped) exit=0
+daemon SIGKILLed with an outstanding (never-Stopped) task in flight
+ledger opens cleanly after ungraceful kill: True 
+fresh task after respawn: exit=0, ok=True
+stdout={"hookSpecificOutput":{"additionalContext":"{\"hookSpecificOutput\":{\"additionalContext\":\"[libra-governor] Preflight complete (task c34ffa9a-3ec9-44d5-a3f9-cf1445b883f3, confidence: high, recon: 0.00s).\\nDraft Completion Contract (revision 1):\\n  - [required] Matches the user's stated request\\n  - [required] Relevant tests pass (pytest)\\n  - [optional] Changes are scoped to the likely affected area(s): app/login.py\\nCost/time estimate: cold start — insufficient local history: no ExecutionReceipt rows recorded yet (confidence: low). This preflight is advisory only.\",\"hookEventName\":\"UserPromptSubmit\"}}","hookEventName":"UserPromptSubmit"}}
+
+stop for fresh task exit=0

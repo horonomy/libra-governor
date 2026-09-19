@@ -513,7 +513,10 @@ fn daemon_findings(daemon: &Option<Result<DoctorResult, String>>) -> Vec<Finding
             severity: Severity::Error,
             message: format!(
                 "daemon reachable but returned an error: {message} — if this mentions a \
-                 protocol version mismatch, restart the daemon: \
+                 protocol version mismatch (this binary was upgraded while an older daemon \
+                 was still running), the daemon has already shut itself down after replying \
+                 to this request; the next hook invocation or `doctor` run will spawn a \
+                 fresh one automatically. To force it immediately instead of waiting: \
                  pkill -f \"libra-governor daemon run\""
             ),
         }),

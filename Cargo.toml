@@ -13,7 +13,7 @@ members = [
 exclude = ["experiments/phase0", "experiments/mvp1_validation/fixtures/rust-crate"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/horonomy/libra-governor"
