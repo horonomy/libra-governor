@@ -33,8 +33,14 @@
 //!   added, plus (with confirmation) the state directory and, if this
 //!   tool installed it, the daemon binary (HORO-1150, `--agent codex` in
 //!   HORO-1157).
+//! - `agents [--json]` — the honest per-agent capability matrix (which
+//!   hook/lifecycle/gateway capabilities each governed agent host
+//!   actually has) for every agent this integration knows about
+//!   (HORO-1157). Pure rendering of
+//!   `libra_governor_domain::AgentCapabilities::for_agent` — no probing.
 
 mod agent;
+mod agents_cmd;
 mod bucket_prose;
 mod calibration_cmd;
 mod claude_settings;
@@ -78,6 +84,8 @@ fn main() {
         ["uninstall", "--yes"] => uninstall_cmd::run(true),
         ["uninstall", "--agent", "codex"] => uninstall_cmd::run_codex(false),
         ["uninstall", "--agent", "codex", "--yes"] => uninstall_cmd::run_codex(true),
+        ["agents"] => agents_cmd::run(false),
+        ["agents", "--json"] => agents_cmd::run(true),
         _ => {
             eprintln!(
                 "libra-governor: unknown or missing subcommand\n\n\
@@ -95,7 +103,8 @@ fn main() {
                  libra-governor gateway status\n  \
                  libra-governor doctor [--json]\n  \
                  libra-governor install [--agent codex]\n  \
-                 libra-governor uninstall [--agent codex] [--yes]"
+                 libra-governor uninstall [--agent codex] [--yes]\n  \
+                 libra-governor agents [--json]"
             );
             std::process::exit(2);
         }
