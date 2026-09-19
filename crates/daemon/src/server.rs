@@ -350,8 +350,21 @@ pub fn serve(listener: UnixListener, config: &DaemonConfig) -> Result<(), Daemon
                 continue;
             }
         };
-        if let Err(e) = handle_connection(stream, &mut ledger, &mut current_task, config) {
-            log::append_line(&config.log_path, &format!("connection error: {e}"));
+        match handle_connection(stream, &mut ledger, &mut current_task, config) {
+            Ok(should_shut_down) if should_shut_down => {
+                log::append_line(
+                    &config.log_path,
+                    "shutting down: a client speaking a newer protocol version connected \
+                     (this binary was upgraded while this daemon was still running) -- the \
+                     next hook invocation's ensure_daemon_connection will spawn a fresh, \
+                     up-to-date daemon against the same socket path",
+                );
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                log::append_line(&config.log_path, &format!("connection error: {e}"));
+            }
         }
     }
     Ok(())
@@ -362,22 +375,43 @@ pub fn serve(listener: UnixListener, config: &DaemonConfig) -> Result<(), Daemon
 /// private) so integration tests can drive the real dispatch logic
 /// against a hand-rolled single-connection server without duplicating
 /// it — see `crates/daemon/tests/preflight_integration.rs`.
+///
+/// Returns `Ok(true)` exactly once: when the connecting client speaks a
+/// *newer* protocol version than this daemon does. That can only happen
+/// because this binary was upgraded while an old daemon process was
+/// still running against the same socket (HORO-1169 dogfood finding —
+/// v0.0.1 -> v0.0.2 with no daemon restart in between). Rather than
+/// leaving that stale daemon serving `Error` responses forever (every
+/// hook call fails open with "proceeding without governance" until a
+/// human notices `doctor`'s warning and manually kills it), the caller
+/// (`serve`) shuts the accept loop down after this one response so the
+/// *next* hook invocation's `ensure_daemon_connection` finds no live
+/// daemon, and spawns a fresh, current one automatically —
+/// self-healing, using the exact same spawn-on-absence path a totally
+/// fresh install already relies on. A client speaking an *older*
+/// protocol than this daemon is a different, ambiguous situation (which
+/// binary should give way is not obvious) and is left exactly as before:
+/// a returned `Error`, no shutdown.
 pub fn handle_connection(
     stream: UnixStream,
     ledger: &mut LedgerStore,
     current_task: &mut Option<TaskSummary>,
     config: &DaemonConfig,
-) -> Result<(), DaemonError> {
+) -> Result<bool, DaemonError> {
     let reader = BufReader::new(stream.try_clone()?);
     let envelope: Result<RequestEnvelope, _> = wire::read_message(reader);
 
+    let mut shut_down_after_reply = false;
     let response = match envelope {
-        Ok(envelope) if envelope.protocol_version != PROTOCOL_VERSION => Response::Error {
-            message: format!(
-                "protocol version mismatch: daemon speaks {PROTOCOL_VERSION}, client sent {}",
-                envelope.protocol_version
-            ),
-        },
+        Ok(envelope) if envelope.protocol_version != PROTOCOL_VERSION => {
+            shut_down_after_reply = envelope.protocol_version > PROTOCOL_VERSION;
+            Response::Error {
+                message: format!(
+                    "protocol version mismatch: daemon speaks {PROTOCOL_VERSION}, client sent {}",
+                    envelope.protocol_version
+                ),
+            }
+        }
         Ok(envelope) => dispatch(envelope.request, ledger, current_task, config),
         Err(e) => {
             log::append_line(&config.log_path, &format!("malformed request: {e}"));
@@ -392,7 +426,7 @@ pub fn handle_connection(
         response,
     };
     wire::write_message(&stream, &out)?;
-    Ok(())
+    Ok(shut_down_after_reply)
 }
 
 fn dispatch(
@@ -2206,6 +2240,64 @@ mod tests {
         assert!(
             !result.running_config_matches_disk,
             "a valid but disagreeing config.json must be flagged as stale"
+        );
+    }
+
+    /// HORO-1169 dogfood finding: a stale daemon (still running an older
+    /// binary) must shut itself down after replying to a client speaking
+    /// a *newer* protocol, so the next hook invocation's
+    /// `ensure_daemon_connection` spawns a fresh one automatically
+    /// instead of leaving every subsequent hook call failing open
+    /// forever until a human notices and manually kills the process.
+    #[test]
+    fn handle_connection_signals_shutdown_for_a_newer_client_protocol() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_daemon_config(dir.path());
+        let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
+        let mut current_task = None;
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let envelope = RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION + 1,
+            request: Request::Status,
+        };
+        wire::write_message(&client, &envelope).unwrap();
+
+        let should_shut_down =
+            handle_connection(server, &mut ledger, &mut current_task, &config).unwrap();
+        assert!(
+            should_shut_down,
+            "a newer client protocol must signal the accept loop to shut down"
+        );
+
+        let reader = BufReader::new(client);
+        let response: ResponseEnvelope = wire::read_message(reader).unwrap();
+        assert!(matches!(response.response, Response::Error { .. }));
+    }
+
+    /// The mirror case: an *older* client than this daemon is a
+    /// different, ambiguous situation (unclear which binary should give
+    /// way) and must not trigger a shutdown — this is exactly the
+    /// existing, unchanged "return an Error and keep serving" behavior.
+    #[test]
+    fn handle_connection_does_not_shut_down_for_an_older_client_protocol() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_daemon_config(dir.path());
+        let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
+        let mut current_task = None;
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let envelope = RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION.saturating_sub(1).max(1),
+            request: Request::Status,
+        };
+        wire::write_message(&client, &envelope).unwrap();
+
+        let should_shut_down =
+            handle_connection(server, &mut ledger, &mut current_task, &config).unwrap();
+        assert!(
+            !should_shut_down,
+            "an older client protocol must not shut the daemon down"
         );
     }
 }
