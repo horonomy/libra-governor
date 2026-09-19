@@ -26,6 +26,13 @@ expose" below for why this is the statusline's job rather than
 `PostToolUse`'s. See [`../../ARCHITECTURE.md`](../../ARCHITECTURE.md)
 for how this fits the overall hooks/daemon responsibility boundary.
 
+> **Evidence export (HORO-1154):** if you're participating in an
+> evaluation and have agreed to share your local usage signals with the
+> founder, see "Evidence export (opt-in, manual): `libra-governor
+> evidence-report`" in the top-level [`README.md`](../../README.md).
+> It's a manual, opt-in-gated, local-only export you run yourself — not
+> telemetry, no network call, nothing automatic.
+
 ## What ships
 
 - `libra-governor hook user-prompt-submit` — a `UserPromptSubmit` hook

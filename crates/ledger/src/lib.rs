@@ -33,7 +33,7 @@ mod write;
 
 pub use gateway::{GatewayRequestClose, GatewayRequestOpen};
 pub use migrations::latest_known_version;
-pub use query::{CalibrationPair, TaskTrajectory};
+pub use query::{CalibrationPair, EvidenceAggregates, TaskTrajectory};
 pub use reservation::{
     AdjustOutcome, ReleaseOutcome, ReserveOutcome, ReserveRequest, SettleOutcome,
 };

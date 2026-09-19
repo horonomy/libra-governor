@@ -15,13 +15,13 @@ path = "src/main.rs"
 libra-governor-daemon = { path = "../daemon" }
 libra-governor-domain = { path = "../domain" }
 libra-governor-gateway = { path = "../gateway" }
+libra-governor-ledger = { path = "../ledger" }
 libra-governor-protocol = { path = "../protocol" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+time.workspace = true
 
 [dev-dependencies]
-libra-governor-ledger = { path = "../ledger" }
 tempfile.workspace = true
-time.workspace = true
 uuid.workspace = true

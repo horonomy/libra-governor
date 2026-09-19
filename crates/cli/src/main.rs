@@ -38,6 +38,12 @@
 //!   actually has) for every agent this integration knows about
 //!   (HORO-1157). Pure rendering of
 //!   `libra_governor_domain::AgentCapabilities::for_agent` — no probing.
+//! - `evidence-report consent` — records explicit local opt-in for the
+//!   HORO-1154 evidence-collection tool.
+//! - `evidence-report` — refuses without that consent; with it, exports
+//!   coarse local behavioral aggregates plus evaluator-typed qualitative
+//!   answers to a local JSON/Markdown file. Off by default, opt-in only,
+//!   local-only — never a network call (HORO-1154).
 
 mod agent;
 mod agents_cmd;
@@ -49,6 +55,7 @@ mod codex_hook;
 mod codex_hooks_file;
 mod daemon_cmd;
 mod doctor_cmd;
+mod evidence_report_cmd;
 mod gateway_cmd;
 mod hook;
 mod hook_post_tool_use;
@@ -86,6 +93,8 @@ fn main() {
         ["uninstall", "--agent", "codex", "--yes"] => uninstall_cmd::run_codex(true),
         ["agents"] => agents_cmd::run(false),
         ["agents", "--json"] => agents_cmd::run(true),
+        ["evidence-report", "consent"] => evidence_report_cmd::run_consent(),
+        ["evidence-report"] => evidence_report_cmd::run(),
         _ => {
             eprintln!(
                 "libra-governor: unknown or missing subcommand\n\n\
@@ -104,7 +113,9 @@ fn main() {
                  libra-governor doctor [--json]\n  \
                  libra-governor install [--agent codex]\n  \
                  libra-governor uninstall [--agent codex] [--yes]\n  \
-                 libra-governor agents [--json]"
+                 libra-governor agents [--json]\n  \
+                 libra-governor evidence-report consent\n  \
+                 libra-governor evidence-report"
             );
             std::process::exit(2);
         }
