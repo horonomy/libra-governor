@@ -304,6 +304,10 @@ impl AgentCapabilities {
 mod tests {
     use super::*;
 
+    fn all_agents() -> [AgentKind; 2] {
+        [AgentKind::ClaudeCode, AgentKind::Codex]
+    }
+
     /// The structural invariant this module must never violate: a
     /// capability statement must never claim
     /// [`AgentCapabilities::claims_pre_spend_refusal`] while also
@@ -314,7 +318,7 @@ mod tests {
     /// silently violate it.
     #[test]
     fn hard_budget_enforcement_never_outruns_model_gateway() {
-        for agent in [AgentKind::ClaudeCode, AgentKind::Codex] {
+        for agent in all_agents() {
             let caps = AgentCapabilities::for_agent(agent);
             if caps.hard_budget_enforcement.is_available() {
                 assert!(
@@ -322,6 +326,70 @@ mod tests {
                     "{agent:?} claims hard_budget_enforcement without a usable model_gateway"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn claude_code_claims_a_gateway_and_pre_spend_refusal() {
+        let caps = AgentCapabilities::for_agent(AgentKind::ClaudeCode);
+        assert!(caps.model_gateway.is_available());
+        assert!(caps.claims_pre_spend_refusal());
+    }
+
+    #[test]
+    fn codex_names_the_concrete_wire_format_incompatibility() {
+        let caps = AgentCapabilities::for_agent(AgentKind::Codex);
+        assert!(!caps.claims_pre_spend_refusal());
+        assert_eq!(
+            caps.model_gateway,
+            Capability::Unavailable {
+                gap: CapabilityGap::Incompatible {
+                    agent_side: "responses (POST /v1/responses)".to_string(),
+                    libra_side: "anthropic messages (POST /v1/messages)".to_string(),
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn codex_has_no_persistent_status_surface() {
+        let caps = AgentCapabilities::for_agent(AgentKind::Codex);
+        assert!(!caps.persistent_status_surface.is_available());
+    }
+
+    #[test]
+    fn no_agent_hard_gates_tool_calls_in_mvp_1() {
+        for agent in all_agents() {
+            let caps = AgentCapabilities::for_agent(agent);
+            assert!(
+                !caps.tool_gate.is_available(),
+                "{agent:?} must not claim hard tool gating in MVP 1.0 — ADR 0003"
+            );
+        }
+    }
+
+    #[test]
+    fn every_agent_emits_the_same_three_wired_event_kinds() {
+        for agent in all_agents() {
+            let caps = AgentCapabilities::for_agent(agent);
+            assert_eq!(
+                caps.emitted_events,
+                vec![
+                    NormalizedEventKind::PromptSubmitted,
+                    NormalizedEventKind::ToolCompleted,
+                    NormalizedEventKind::TurnCompleted,
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn capabilities_round_trip_through_json() {
+        for agent in all_agents() {
+            let original = AgentCapabilities::for_agent(agent);
+            let json = serde_json::to_string(&original).unwrap();
+            let parsed: AgentCapabilities = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, original);
         }
     }
 }
