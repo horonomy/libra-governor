@@ -1,0 +1,8 @@
+{
+  "_source": "Claude Code UserPromptSubmit hook payload, per Claude Code's own hooks documentation (already relied on by crates/cli/tests/hook_cli_integration.rs and hook.rs).",
+  "session_id": "fixture-session",
+  "cwd": "__CWD__",
+  "prompt": "fix the login bug",
+  "hook_event_name": "UserPromptSubmit",
+  "transcript_path": "/tmp/does-not-matter.jsonl"
+}

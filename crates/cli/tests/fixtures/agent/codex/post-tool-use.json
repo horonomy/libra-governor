@@ -1,0 +1,13 @@
+{
+  "_source": "Codex CLI PostToolUse hook payload, transcribed from openai/codex's generated hook-payload JSON schemas as cited in docs/adr/0004-agent-adapter-contract.md — session_id, cwd, tool_name, tool_input, tool_response, tool_use_id, model, turn_id, permission_mode, transcript_path.",
+  "session_id": "fixture-session",
+  "cwd": "__CWD__",
+  "tool_name": "Bash",
+  "tool_input": { "command": "ls" },
+  "tool_response": "some output",
+  "tool_use_id": "call-1",
+  "model": "gpt-5-codex",
+  "turn_id": "turn-1",
+  "permission_mode": "auto",
+  "hook_event_name": "PostToolUse"
+}

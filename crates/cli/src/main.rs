@@ -8,6 +8,10 @@
 //!   point: fire-and-forget tool-call counting (HORO-1126).
 //! - `hook stop` — the Claude Code `Stop` hook entry point: finalizes
 //!   the session's task into an Execution Receipt (HORO-1126).
+//! - `codex-hook user-prompt-submit` / `post-tool-use` / `stop` — the
+//!   same three hook entry points for the Codex CLI (HORO-1157), sharing
+//!   every byte of translation logic with Claude Code's via
+//!   `crate::agent::run` — see `integrations/codex/README.md`.
 //! - `statusline` — the Claude Code `statusLine` command.
 //! - `calibration report` — real duration-coverage and admission-replay
 //!   calibration evidence over local history (HORO-1132).
@@ -21,11 +25,19 @@
 //!   statusline wiring, gateway configuration and capability tier, and
 //!   `config.json` validity (HORO-1150). Never spawns the daemon, never
 //!   prints a secret.
-//! - `install` — wires this binary's hooks and statusline into
-//!   `~/.claude/settings.json`, preserving every other key (HORO-1150).
-//! - `uninstall [--yes]` — removes exactly what `install` added, plus
-//!   (with confirmation) the state directory and, if this tool installed
-//!   it, the daemon binary (HORO-1150).
+//! - `install [--agent codex]` — wires this binary's hooks (and, for
+//!   Claude Code, statusline) into `~/.claude/settings.json` or
+//!   `~/.codex/hooks.json`, preserving every other key (HORO-1150,
+//!   `--agent codex` in HORO-1157).
+//! - `uninstall [--agent codex] [--yes]` — removes exactly what `install`
+//!   added, plus (with confirmation) the state directory and, if this
+//!   tool installed it, the daemon binary (HORO-1150, `--agent codex` in
+//!   HORO-1157).
+//! - `agents [--json]` — the honest per-agent capability matrix (which
+//!   hook/lifecycle/gateway capabilities each governed agent host
+//!   actually has) for every agent this integration knows about
+//!   (HORO-1157). Pure rendering of
+//!   `libra_governor_domain::AgentCapabilities::for_agent` — no probing.
 //! - `evidence-report consent` — records explicit local opt-in for the
 //!   HORO-1154 evidence-collection tool.
 //! - `evidence-report` — refuses without that consent; with it, exports
@@ -33,10 +45,14 @@
 //!   answers to a local JSON/Markdown file. Off by default, opt-in only,
 //!   local-only — never a network call (HORO-1154).
 
+mod agent;
+mod agents_cmd;
 mod bucket_prose;
 mod calibration_cmd;
 mod claude_settings;
 mod client;
+mod codex_hook;
+mod codex_hooks_file;
 mod daemon_cmd;
 mod doctor_cmd;
 mod evidence_report_cmd;
@@ -60,6 +76,9 @@ fn main() {
         ["hook", "user-prompt-submit"] => hook::run(),
         ["hook", "post-tool-use"] => hook_post_tool_use::run(),
         ["hook", "stop"] => hook_stop::run(),
+        ["codex-hook", "user-prompt-submit"] => codex_hook::run_prompt_submit(),
+        ["codex-hook", "post-tool-use"] => codex_hook::run_tool_completed(),
+        ["codex-hook", "stop"] => codex_hook::run_turn_completed(),
         ["statusline"] => statusline::run(),
         ["calibration", "report"] => calibration_cmd::run(),
         ["gateway", "token"] => gateway_cmd::run_token(),
@@ -67,8 +86,13 @@ fn main() {
         ["doctor"] => doctor_cmd::run(false),
         ["doctor", "--json"] => doctor_cmd::run(true),
         ["install"] => install_cmd::run(),
+        ["install", "--agent", "codex"] => install_cmd::run_codex(),
         ["uninstall"] => uninstall_cmd::run(false),
         ["uninstall", "--yes"] => uninstall_cmd::run(true),
+        ["uninstall", "--agent", "codex"] => uninstall_cmd::run_codex(false),
+        ["uninstall", "--agent", "codex", "--yes"] => uninstall_cmd::run_codex(true),
+        ["agents"] => agents_cmd::run(false),
+        ["agents", "--json"] => agents_cmd::run(true),
         ["evidence-report", "consent"] => evidence_report_cmd::run_consent(),
         ["evidence-report"] => evidence_report_cmd::run(),
         _ => {
@@ -79,13 +103,17 @@ fn main() {
                  libra-governor hook user-prompt-submit\n  \
                  libra-governor hook post-tool-use\n  \
                  libra-governor hook stop\n  \
+                 libra-governor codex-hook user-prompt-submit\n  \
+                 libra-governor codex-hook post-tool-use\n  \
+                 libra-governor codex-hook stop\n  \
                  libra-governor statusline\n  \
                  libra-governor calibration report\n  \
                  libra-governor gateway token\n  \
                  libra-governor gateway status\n  \
                  libra-governor doctor [--json]\n  \
-                 libra-governor install\n  \
-                 libra-governor uninstall [--yes]\n  \
+                 libra-governor install [--agent codex]\n  \
+                 libra-governor uninstall [--agent codex] [--yes]\n  \
+                 libra-governor agents [--json]\n  \
                  libra-governor evidence-report consent\n  \
                  libra-governor evidence-report"
             );

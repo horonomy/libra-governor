@@ -1,0 +1,11 @@
+{
+  "_source": "Codex CLI Stop hook payload, transcribed from openai/codex's generated hook-payload JSON schemas as cited in docs/adr/0004-agent-adapter-contract.md — session_id, cwd, model, turn_id, stop_hook_active, last_assistant_message, permission_mode, transcript_path.",
+  "session_id": "fixture-session",
+  "cwd": "__CWD__",
+  "model": "gpt-5-codex",
+  "turn_id": "turn-1",
+  "stop_hook_active": false,
+  "last_assistant_message": "done",
+  "permission_mode": "auto",
+  "hook_event_name": "Stop"
+}

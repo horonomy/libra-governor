@@ -1,0 +1,5 @@
+{
+  "_source": "Deliberately missing the required 'session_id' field (the only required field for Stop).",
+  "cwd": "__CWD__",
+  "model": "claude-sonnet-5"
+}

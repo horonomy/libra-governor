@@ -1,0 +1,7 @@
+{
+  "_source": "hook_event_name deliberately set to a name this integration does not recognize at all (neither a wired entry point nor a known-but-unwired lifecycle event) — exercises NormalizedEvent::Unrecognized.",
+  "session_id": "fixture-session-unrecognized-event",
+  "cwd": "__CWD__",
+  "prompt": "anything",
+  "hook_event_name": "SomeFutureHookEventNobodyHasHeardOfYet"
+}

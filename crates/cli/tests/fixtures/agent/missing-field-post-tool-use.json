@@ -1,0 +1,5 @@
+{
+  "_source": "Deliberately missing the required 'tool_name' field.",
+  "session_id": "fixture-session-missing-field",
+  "cwd": "__CWD__"
+}

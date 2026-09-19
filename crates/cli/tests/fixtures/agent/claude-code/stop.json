@@ -1,0 +1,8 @@
+{
+  "_source": "Claude Code Stop hook payload, per Claude Code's own hooks documentation.",
+  "session_id": "fixture-session",
+  "cwd": "__CWD__",
+  "model": "claude-sonnet-5",
+  "hook_event_name": "Stop",
+  "stop_hook_active": false
+}
