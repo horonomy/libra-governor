@@ -11,10 +11,8 @@
 
 use libra_governor_domain::{AgentCapabilities, AgentKind};
 
-const ALL_AGENTS: [AgentKind; 2] = [AgentKind::ClaudeCode, AgentKind::Codex];
-
 pub fn run(json: bool) {
-    let matrix: Vec<AgentCapabilities> = ALL_AGENTS
+    let matrix: Vec<AgentCapabilities> = AgentKind::ALL
         .iter()
         .map(|agent| AgentCapabilities::for_agent(*agent))
         .collect();
@@ -66,7 +64,7 @@ fn render_human(matrix: &[AgentCapabilities]) -> String {
             agent_label(caps.agent),
             caps.contract_version
         ));
-        let rows: [(&str, &libra_governor_domain::Capability); 11] = [
+        let rows: [(&str, &libra_governor_domain::Capability); 13] = [
             ("preflight_gate", &caps.preflight_gate),
             ("tool_observation", &caps.tool_observation),
             ("tool_gate", &caps.tool_gate),
@@ -80,7 +78,9 @@ fn render_human(matrix: &[AgentCapabilities]) -> String {
                 &caps.inline_explanation_channel,
             ),
             ("session_lifecycle", &caps.session_lifecycle),
+            ("subagent_lifecycle", &caps.subagent_lifecycle),
             ("interruption_signal", &caps.interruption_signal),
+            ("mcp_explain_surface", &caps.mcp_explain_surface),
         ];
         for (name, cap) in rows {
             out.push_str(&format!("  {name}: {}\n", capability_label(cap)));
@@ -102,7 +102,7 @@ mod tests {
 
     #[test]
     fn human_render_lists_every_agent_and_every_row() {
-        let matrix: Vec<AgentCapabilities> = ALL_AGENTS
+        let matrix: Vec<AgentCapabilities> = AgentKind::ALL
             .iter()
             .map(|a| AgentCapabilities::for_agent(*a))
             .collect();
@@ -111,6 +111,8 @@ mod tests {
         assert!(rendered.contains("Codex"));
         assert!(rendered.contains("model_gateway"));
         assert!(rendered.contains("hard_budget_enforcement"));
+        assert!(rendered.contains("subagent_lifecycle"));
+        assert!(rendered.contains("mcp_explain_surface"));
     }
 
     #[test]
@@ -123,7 +125,7 @@ mod tests {
 
     #[test]
     fn json_render_round_trips_and_matches_for_agent() {
-        let matrix: Vec<AgentCapabilities> = ALL_AGENTS
+        let matrix: Vec<AgentCapabilities> = AgentKind::ALL
             .iter()
             .map(|a| AgentCapabilities::for_agent(*a))
             .collect();
