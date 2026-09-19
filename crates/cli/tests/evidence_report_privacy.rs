@@ -208,7 +208,7 @@ fn evidence_report_consent_then_evidence_report_succeeds_and_writes_files() {
 #[test]
 fn evidence_report_aggregates_match_real_seeded_ledger_state_exactly() {
     let sandbox = Sandbox::new();
-    sandbox.seed_one_real_preflight_with_nonce("NONCE-HORO1154-aggregate-count-check");
+    sandbox.seed_one_real_preflight_with_nonce("MARKER-HORO1154-aggregate-count-check");
     sandbox.run(&["evidence-report", "consent"]);
     let output = sandbox.run(&["evidence-report"]);
     assert!(
@@ -237,8 +237,8 @@ fn evidence_report_aggregates_match_real_seeded_ledger_state_exactly() {
 #[test]
 fn evidence_report_export_never_contains_the_real_prompt_nonce() {
     let sandbox = Sandbox::new();
-    const NONCE: &str = "NONCE-HORO1154-7b2f9c-do-not-leak-this-prompt-text";
-    sandbox.seed_one_real_preflight_with_nonce(NONCE);
+    const PRIVACY_MARKER: &str = "MARKER-HORO1154-7b2f9c-do-not-leak-this-prompt-text";
+    sandbox.seed_one_real_preflight_with_nonce(PRIVACY_MARKER);
 
     let consent_output = sandbox.run(&["evidence-report", "consent"]);
     assert!(consent_output.status.success());
@@ -262,11 +262,11 @@ fn evidence_report_export_never_contains_the_real_prompt_nonce() {
     let stdout = String::from_utf8_lossy(&report_output.stdout);
     let stderr = String::from_utf8_lossy(&report_output.stderr);
     assert!(
-        !stdout.contains(NONCE),
+        !stdout.contains(PRIVACY_MARKER),
         "nonce leaked into evidence-report stdout"
     );
     assert!(
-        !stderr.contains(NONCE),
+        !stderr.contains(PRIVACY_MARKER),
         "nonce leaked into evidence-report stderr"
     );
 
@@ -298,7 +298,9 @@ fn evidence_report_export_never_contains_the_real_prompt_nonce() {
     for path in &all_files {
         let bytes = std::fs::read(path).unwrap();
         assert!(
-            !bytes.windows(NONCE.len()).any(|w| w == NONCE.as_bytes()),
+            !bytes
+                .windows(PRIVACY_MARKER.len())
+                .any(|w| w == PRIVACY_MARKER.as_bytes()),
             "the real prompt nonce leaked into {}",
             path.display()
         );
