@@ -26,6 +26,12 @@
 //! - `uninstall [--yes]` — removes exactly what `install` added, plus
 //!   (with confirmation) the state directory and, if this tool installed
 //!   it, the daemon binary (HORO-1150).
+//! - `evidence-report consent` — records explicit local opt-in for the
+//!   HORO-1154 evidence-collection tool.
+//! - `evidence-report` — refuses without that consent; with it, exports
+//!   coarse local behavioral aggregates plus evaluator-typed qualitative
+//!   answers to a local JSON/Markdown file. Off by default, opt-in only,
+//!   local-only — never a network call (HORO-1154).
 
 mod bucket_prose;
 mod calibration_cmd;
@@ -33,6 +39,7 @@ mod claude_settings;
 mod client;
 mod daemon_cmd;
 mod doctor_cmd;
+mod evidence_report_cmd;
 mod gateway_cmd;
 mod hook;
 mod hook_post_tool_use;
@@ -62,6 +69,8 @@ fn main() {
         ["install"] => install_cmd::run(),
         ["uninstall"] => uninstall_cmd::run(false),
         ["uninstall", "--yes"] => uninstall_cmd::run(true),
+        ["evidence-report", "consent"] => evidence_report_cmd::run_consent(),
+        ["evidence-report"] => evidence_report_cmd::run(),
         _ => {
             eprintln!(
                 "libra-governor: unknown or missing subcommand\n\n\
@@ -76,7 +85,9 @@ fn main() {
                  libra-governor gateway status\n  \
                  libra-governor doctor [--json]\n  \
                  libra-governor install\n  \
-                 libra-governor uninstall [--yes]"
+                 libra-governor uninstall [--yes]\n  \
+                 libra-governor evidence-report consent\n  \
+                 libra-governor evidence-report"
             );
             std::process::exit(2);
         }
