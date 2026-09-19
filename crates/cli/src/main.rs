@@ -25,11 +25,14 @@
 //!   statusline wiring, gateway configuration and capability tier, and
 //!   `config.json` validity (HORO-1150). Never spawns the daemon, never
 //!   prints a secret.
-//! - `install` — wires this binary's hooks and statusline into
-//!   `~/.claude/settings.json`, preserving every other key (HORO-1150).
-//! - `uninstall [--yes]` — removes exactly what `install` added, plus
-//!   (with confirmation) the state directory and, if this tool installed
-//!   it, the daemon binary (HORO-1150).
+//! - `install [--agent codex]` — wires this binary's hooks (and, for
+//!   Claude Code, statusline) into `~/.claude/settings.json` or
+//!   `~/.codex/hooks.json`, preserving every other key (HORO-1150,
+//!   `--agent codex` in HORO-1157).
+//! - `uninstall [--agent codex] [--yes]` — removes exactly what `install`
+//!   added, plus (with confirmation) the state directory and, if this
+//!   tool installed it, the daemon binary (HORO-1150, `--agent codex` in
+//!   HORO-1157).
 
 mod agent;
 mod bucket_prose;
@@ -37,6 +40,7 @@ mod calibration_cmd;
 mod claude_settings;
 mod client;
 mod codex_hook;
+mod codex_hooks_file;
 mod daemon_cmd;
 mod doctor_cmd;
 mod gateway_cmd;
@@ -69,8 +73,11 @@ fn main() {
         ["doctor"] => doctor_cmd::run(false),
         ["doctor", "--json"] => doctor_cmd::run(true),
         ["install"] => install_cmd::run(),
+        ["install", "--agent", "codex"] => install_cmd::run_codex(),
         ["uninstall"] => uninstall_cmd::run(false),
         ["uninstall", "--yes"] => uninstall_cmd::run(true),
+        ["uninstall", "--agent", "codex"] => uninstall_cmd::run_codex(false),
+        ["uninstall", "--agent", "codex", "--yes"] => uninstall_cmd::run_codex(true),
         _ => {
             eprintln!(
                 "libra-governor: unknown or missing subcommand\n\n\
@@ -87,8 +94,8 @@ fn main() {
                  libra-governor gateway token\n  \
                  libra-governor gateway status\n  \
                  libra-governor doctor [--json]\n  \
-                 libra-governor install\n  \
-                 libra-governor uninstall [--yes]"
+                 libra-governor install [--agent codex]\n  \
+                 libra-governor uninstall [--agent codex] [--yes]"
             );
             std::process::exit(2);
         }

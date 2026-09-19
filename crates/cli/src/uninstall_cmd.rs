@@ -25,7 +25,7 @@
 //!    unrecoverable. Mirrors this repo's own global policy: never delete
 //!    without explicit confirmation.
 
-use crate::{claude_settings, install_cmd};
+use crate::{claude_settings, codex_hooks_file, install_cmd};
 
 pub fn run(assume_yes: bool) {
     let settings_ok = uninstall_claude_settings();
@@ -40,6 +40,65 @@ pub fn run(assume_yes: bool) {
 
     if !settings_ok {
         std::process::exit(1);
+    }
+}
+
+/// `libra-governor uninstall --agent codex [--yes]` — removes exactly
+/// this integration's own hook groups from `~/.codex/hooks.json` (or
+/// `$CODEX_HOME/hooks.json`), then (with confirmation) the shared state
+/// directory, same as the Claude Code path. See [`run`]'s module docs
+/// for the state-directory safety discipline, unchanged here.
+pub fn run_codex(assume_yes: bool) {
+    let hooks_ok = uninstall_codex_hooks();
+
+    let state_dir = libra_governor_daemon::paths::state_dir().ok();
+    let marker_binary_path = state_dir
+        .as_deref()
+        .and_then(read_install_marker_binary_path);
+
+    report_binary(marker_binary_path.as_deref());
+    uninstall_state_dir(state_dir.as_deref(), assume_yes);
+
+    if !hooks_ok {
+        std::process::exit(1);
+    }
+}
+
+fn uninstall_codex_hooks() -> bool {
+    let hooks_path = match codex_hooks_file::hooks_path() {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("libra-governor uninstall: {e}");
+            return false;
+        }
+    };
+    match codex_hooks_file::remove(&hooks_path) {
+        Ok(removed) if removed.file_absent => {
+            println!(
+                "libra-governor uninstall: {} does not exist — nothing to remove",
+                hooks_path.display()
+            );
+            true
+        }
+        Ok(removed) => {
+            println!(
+                "libra-governor uninstall: removed from {}",
+                hooks_path.display()
+            );
+            println!("  hook commands removed: {}", removed.hook_commands_removed);
+            if let Some(backup) = &removed.backup_path {
+                println!("  backup written:        {}", backup.display());
+            }
+            true
+        }
+        Err(e) => {
+            eprintln!(
+                "libra-governor uninstall: could not update {}: {e} — nothing was changed \
+                 there; continuing with the remaining uninstall steps",
+                hooks_path.display()
+            );
+            false
+        }
     }
 }
 
