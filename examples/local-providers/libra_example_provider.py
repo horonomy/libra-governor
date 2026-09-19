@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
+import html
 import json
 import os
 import re
@@ -119,33 +120,54 @@ class TaskCostCenters:
             return self._by_task.get(task_id)
 
 
-def resolve_ticket_key(cwd: str) -> str | None:
+def resolve_ticket_key(cwd: str, workspace_root: str) -> str | None:
     """Runs a real `git` subprocess against the task's actual working
     directory and extracts a ticket key from the current branch name
     (e.g. `v0.0.2/HORO-1174/extension_contracts` -> `HORO-1174`).
 
-    `cwd` is attacker-influenced request input — it is only ever used as
-    `git -C <cwd>`'s directory argument (never shell-interpreted, since
-    `subprocess.run` is called with an argument list), but it must still
-    resolve to a real, existing directory before being handed to `git`
-    at all; anything else is rejected outright rather than passed
-    through."""
-    candidate = Path(cwd)
-    if not candidate.is_absolute() or not candidate.is_dir():
+    `cwd` is attacker-influenced request input. It is canonicalized with
+    `os.path.realpath` (resolving `..`/symlinks) and then **confined to
+    `workspace_root`**: any resolved path outside that allow-listed root
+    is rejected before it ever reaches `os.path.isdir` or the `git -C`
+    subprocess argument — the request cannot use this field to probe or
+    operate on any directory the provider operator hasn't already agreed
+    is in scope (`--workspace-root`, defaulting to the provider's own
+    cwd)."""
+    real_root = os.path.realpath(workspace_root)
+    real_cwd = os.path.realpath(cwd)
+    if os.path.commonpath([real_root, real_cwd]) != real_root:
+        return None
+    if not os.path.isdir(real_cwd):
         return None
     try:
         result = subprocess.run(
-            ["git", "-C", str(candidate), "rev-parse", "--abbrev-ref", "HEAD"],
+            ["git", "-C", real_cwd, "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True,
             text=True,
             timeout=5,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired, ValueError):
         return None
     if result.returncode != 0:
         return None
     match = TICKET_KEY_PATTERN.search(result.stdout.strip())
     return match.group(1).upper() if match else None
+
+
+def _html_escape_strings(value):
+    """Recursively HTML-escapes every string in a JSON-serializable
+    value. Applied once, at `_respond_json`'s single sink, to every
+    response this provider ever sends — so a request-derived string
+    (task_id, cwd, an error message built from a request header) can
+    never reach a client carrying unescaped HTML/script metacharacters,
+    regardless of which route or error path produced it."""
+    if isinstance(value, str):
+        return html.escape(value)
+    if isinstance(value, dict):
+        return {k: _html_escape_strings(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_html_escape_strings(v) for v in value]
+    return value
 
 
 class ProviderHandler(BaseHTTPRequestHandler):
@@ -159,6 +181,7 @@ class ProviderHandler(BaseHTTPRequestHandler):
     task_cost_centers: TaskCostCenters
     max_clock_skew_secs: float
     provider_id: str
+    workspace_root: str
 
     def log_message(self, fmt, *args):  # noqa: A003 — stdlib override
         # Keep stdout limited to what the e2e harness actually inspects;
@@ -223,14 +246,16 @@ class ProviderHandler(BaseHTTPRequestHandler):
         return body, request_id
 
     def _respond_json(self, status: int, payload: dict) -> None:
-        # `json.dumps` escapes every value it serializes, so nothing in
-        # `payload` (including request-derived fields like task_id/cwd)
-        # can break out of the JSON string context. `X-Content-Type-Options:
-        # nosniff` additionally stops a client from MIME-sniffing this
-        # response as HTML regardless of `Content-Type`, closing the
-        # reflected-content sink a browser-based client could otherwise
-        # be tricked into rendering.
-        body = json.dumps(payload).encode("utf-8")
+        # `json.dumps` already escapes every value it serializes, so
+        # nothing in `payload` can break out of the JSON string context.
+        # `_html_escape_strings` additionally neutralizes any HTML/script
+        # metacharacters in request-derived fields (task_id, cwd, error
+        # messages built from request headers) at the one choke point
+        # every response passes through, and `X-Content-Type-Options:
+        # nosniff` stops a client from MIME-sniffing this response as
+        # HTML regardless of `Content-Type` — together these remove any
+        # path from reflected request content to rendered markup.
+        body = json.dumps(_html_escape_strings(payload)).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -264,7 +289,7 @@ class ProviderHandler(BaseHTTPRequestHandler):
     def _handle_business_context(self, request: dict) -> None:
         task_id = request.get("task_id", "")
         cwd = request.get("cwd", "")
-        ticket_key = resolve_ticket_key(cwd) if cwd else None
+        ticket_key = resolve_ticket_key(cwd, self.workspace_root) if cwd else None
         ticket = self.tickets.get(ticket_key) if ticket_key else None
 
         response = {
@@ -397,6 +422,13 @@ def main() -> None:
     )
     parser.add_argument("--max-clock-skew-secs", type=float, default=120.0)
     parser.add_argument("--provider-id", default="example-provider")
+    parser.add_argument(
+        "--workspace-root",
+        default=os.getcwd(),
+        help="Allow-listed root directory: a business-context request's `cwd` must "
+        "resolve inside this root or resolve_ticket_key() refuses it. Defaults to "
+        "this provider's own working directory.",
+    )
     args = parser.parse_args()
 
     if args.host not in LOOPBACK_LITERALS:
@@ -420,6 +452,7 @@ def main() -> None:
     ProviderHandler.task_cost_centers = TaskCostCenters()
     ProviderHandler.max_clock_skew_secs = args.max_clock_skew_secs
     ProviderHandler.provider_id = args.provider_id
+    ProviderHandler.workspace_root = os.path.realpath(args.workspace_root)
 
     server = ThreadingHTTPServer((args.host, args.port), ProviderHandler)
     print(f"[provider] listening on http://{args.host}:{args.port}")
