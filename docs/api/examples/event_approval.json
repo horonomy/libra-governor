@@ -1,0 +1,34 @@
+{
+  "schema_version": "libra.extension.v1",
+  "event_id": "00000000-0000-0000-0000-000000000003",
+  "event_kind": "approval",
+  "occurred_at": "2027-01-15T08:00:00Z",
+  "daemon_version": "0.0.1",
+  "data": {
+    "task_id": "00000000-0000-0000-0000-000000000001",
+    "plan_id": "00000000-0000-0000-0000-000000000002",
+    "approval_requests": [
+      {
+        "Resource": {
+          "projected": {
+            "kind": "tokens",
+            "amount": 150000
+          },
+          "target": {
+            "kind": "tokens",
+            "amount": 100000
+          },
+          "elastic_ceiling": {
+            "kind": "tokens",
+            "amount": 125000
+          },
+          "hard_ceiling": {
+            "kind": "tokens",
+            "amount": 200000
+          }
+        }
+      }
+    ],
+    "external_approval": null
+  }
+}

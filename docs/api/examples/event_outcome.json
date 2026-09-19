@@ -1,0 +1,18 @@
+{
+  "schema_version": "libra.extension.v1",
+  "event_id": "00000000-0000-0000-0000-000000000003",
+  "event_kind": "outcome",
+  "occurred_at": "2027-01-15T08:00:00Z",
+  "daemon_version": "0.0.1",
+  "data": {
+    "task_id": "00000000-0000-0000-0000-000000000001",
+    "plan_id": "00000000-0000-0000-0000-000000000002",
+    "outcome_kind": "completed",
+    "evidence": [
+      "https://ci.example.com/runs/42"
+    ],
+    "source": "provider",
+    "source_id": "example-provider",
+    "attested_at": "2027-01-15T08:00:00Z"
+  }
+}

@@ -429,8 +429,13 @@ dependencies = [
 name = "libra-governor-daemon"
 version = "0.0.1"
 dependencies = [
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "libra-governor-domain",
  "libra-governor-estimator",
+ "libra-governor-extension",
  "libra-governor-gateway",
  "libra-governor-ledger",
  "libra-governor-protocol",
@@ -440,6 +445,8 @@ dependencies = [
  "tempfile",
  "thiserror",
  "time",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

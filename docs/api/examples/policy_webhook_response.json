@@ -1,0 +1,6 @@
+{
+  "provider_id": "example-provider",
+  "reason": null,
+  "schema_version": "libra.extension.v1",
+  "verdict": "approve"
+}

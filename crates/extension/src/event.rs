@@ -180,6 +180,15 @@ impl<T: Serialize> EventEnvelope<T> {
         }
     }
 
+    /// Overrides the `event_id` [`Self::new`] minted. Exists for
+    /// reproducible golden-fixture generation
+    /// (`crates/extension/examples/dump_goldens.rs`) and tests — normal
+    /// production use always keeps the freshly minted id.
+    pub fn with_event_id(mut self, event_id: Uuid) -> Self {
+        self.event_id = event_id;
+        self
+    }
+
     pub fn to_json_bytes(&self) -> serde_json::Result<Vec<u8>> {
         serde_json::to_vec(self)
     }
