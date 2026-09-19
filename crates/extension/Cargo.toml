@@ -24,4 +24,5 @@ hmac = "0.12"
 [dev-dependencies]
 tempfile.workspace = true
 hyper = { version = "1", features = ["http1", "client", "server"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "server", "http1", "http2", "tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
