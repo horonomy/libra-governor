@@ -78,6 +78,20 @@ Every URL must use scheme `http` and host `127.0.0.1` or `::1` — see
 `crates/extension/src/config.rs` for why `localhost` is deliberately
 refused.
 
+### Accepted exception: plain HTTP, no TLS (python:S5332)
+
+`libra_example_provider.py` speaks plain HTTP, not HTTPS. This is a
+reviewed and accepted SonarCloud exception (HORO-1174 evidence), not an
+oversight: `--host` is hard-validated to a loopback literal
+(`require_loopback_host` in the provider, exercised by
+`test_libra_example_provider.py`) so this server can never bind a
+network-reachable interface, and it is reference/demo code for local
+manual testing — not shipped product code. Adding real TLS here would
+require the daemon's own extension HTTP client
+(`crates/extension/src/client.rs`) to trust a self-signed loopback
+certificate, a materially larger change to the daemon's TLS trust model
+that is out of scope for this file.
+
 ## What the example provider actually does (not stubs)
 
 - **Business context**: runs `git -C <task cwd> rev-parse --abbrev-ref

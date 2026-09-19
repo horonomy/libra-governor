@@ -377,6 +377,21 @@ def _require_readable_file(raw_path: str, label: str) -> Path:
     return path
 
 
+def require_loopback_host(host: str) -> None:
+    """Raises `SystemExit` unless `host` is a loopback literal. This is
+    this provider's whole security boundary for speaking plain HTTP
+    without TLS (accepted as a documented exception — see
+    `README.md`/HORO-1174 evidence): the server must never be reachable
+    from anywhere but the local machine, and `--host` is the only knob
+    that could break that."""
+    if host not in LOOPBACK_LITERALS:
+        raise SystemExit(
+            f"libra_example_provider: --host must be a loopback literal ({sorted(LOOPBACK_LITERALS)}), "
+            f"got {host!r} — this provider speaks plain HTTP and must never bind a "
+            "network-reachable interface."
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
@@ -410,12 +425,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.host not in LOOPBACK_LITERALS:
-        raise SystemExit(
-            f"libra_example_provider: --host must be a loopback literal ({sorted(LOOPBACK_LITERALS)}), "
-            f"got {args.host!r} — this provider speaks plain HTTP and must never bind a "
-            "network-reachable interface."
-        )
+    require_loopback_host(args.host)
 
     secret_bytes = _require_readable_file(args.secret_file, "secret-file").read_bytes()
     tickets = json.loads(_require_readable_file(args.tickets_file, "tickets-file").read_text())
