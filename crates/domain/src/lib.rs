@@ -27,6 +27,7 @@
 //! `docs/adr/0002-task-not-session-as-economic-unit.md` for why.
 
 mod agent;
+mod business_context;
 mod capability;
 mod completion_contract;
 mod confidence;
@@ -35,6 +36,8 @@ mod execution_event;
 mod execution_outcome;
 mod execution_plan;
 mod execution_receipt;
+mod external_approval;
+mod outcome_attestation;
 mod policy;
 mod replan;
 mod reservation;
@@ -45,6 +48,10 @@ mod task_identity;
 pub use agent::{
     AgentCapabilities, AgentKind, Capability, CapabilityGap, NormalizedEventKind,
     AGENT_ADAPTER_CONTRACT_VERSION,
+};
+pub use business_context::{
+    apply_business_context, try_apply_business_context, BusinessContextSummary, NarrowingError,
+    Priority,
 };
 pub use capability::{
     CredentialCustody, EnforcementCapabilities, EnforcementTier, MonetaryEnforcement,
@@ -57,6 +64,8 @@ pub use execution_event::{ExecutionEvent, ExecutionEventKind};
 pub use execution_outcome::ExecutionOutcome;
 pub use execution_plan::{ExecutionPlan, PlanId};
 pub use execution_receipt::{ExecutionReceipt, ReservationEvidence};
+pub use external_approval::{apply_external_approval, ExternalApproval, ExternalVerdict};
+pub use outcome_attestation::{AttestationSource, OutcomeAttestation};
 pub use policy::{
     Admission, ApprovalRequest, AutonomyBoundary, ConstraintMode, ConstraintOutcome, DenyReason,
     Policy, PolicyDecision, PolicyEvaluationError, PolicyPresetInputs, PolicyValidationError,

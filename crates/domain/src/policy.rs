@@ -512,6 +512,13 @@ pub enum DenyReason {
         actual: Confidence,
         required: Confidence,
     },
+    /// An external Policy Webhook provider rejected an
+    /// `ApprovalRequired` admission (HORO-1174). Additive variant — see
+    /// `crate::external_approval::apply_external_approval` and its
+    /// `deny_reason_deserializes_the_old_variants_after_the_additive_change`
+    /// regression test, which pins that old serialized `admission_json`
+    /// rows (predating this variant) still deserialize.
+    ExternalPolicyRejected { provider_id: String, reason: String },
 }
 
 /// The aggregate admission verdict across every constraint (HORO-1137).
