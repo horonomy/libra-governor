@@ -62,12 +62,21 @@ hook schemas vs. what remains unverified.
   1s/3s max — too tight for a client-daemon round trip, which is why
   `hook stop` maps to `Stop`, not `SessionEnd` (see the ADR).
 
+**Verified by actually running a real local Codex CLI install** (v0.154.0,
+against a sandboxed `$CODEX_HOME`, never the real user's own `~/.codex`
+or real API credentials): `hooks.json`'s real top-level shape (see
+"Setup" below — an earlier draft of this integration had it wrong, caught
+by running the real binary and reading its parse warning); that the
+`hooks` feature is on (`stable`/`true`) by default in this version; that
+`--dangerously-bypass-hook-trust` is a real, distinct trust-gate
+override; and, end to end, that `codex-hook user-prompt-submit` receives
+a real Codex `UserPromptSubmit` payload and the daemon records a real
+task against Codex's own real session id.
+
 **Unverified, treated as unknown rather than asserted** — see the ADR's
 "What was verified vs. what remains open" for the complete list:
-whether Codex's `hooks` feature defaults on; `[hooks.state]`'s exact key
-shape; whether `hooks.json`'s real file shape matches what
-`codex_hooks_file.rs` assumes; whether `session_id` stays stable across
-`compact`/`fork`/`resume`.
+`[hooks.state]`'s exact key shape; whether `session_id` stays stable
+across `compact`/`fork`/`resume`.
 
 ## Setup
 
@@ -88,17 +97,25 @@ This writes `~/.codex/hooks.json` (or `$CODEX_HOME/hooks.json`) with:
 
 ```json
 {
-  "UserPromptSubmit": [
-    { "hooks": [{ "type": "command", "command": "/absolute/path/to/libra-governor codex-hook user-prompt-submit", "timeout": 15 }] }
-  ],
-  "PostToolUse": [
-    { "hooks": [{ "type": "command", "command": "/absolute/path/to/libra-governor codex-hook post-tool-use", "timeout": 15, "async": true }] }
-  ],
-  "Stop": [
-    { "hooks": [{ "type": "command", "command": "/absolute/path/to/libra-governor codex-hook stop", "timeout": 15 }] }
-  ]
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "/absolute/path/to/libra-governor codex-hook user-prompt-submit", "timeout": 15 }] }
+    ],
+    "PostToolUse": [
+      { "hooks": [{ "type": "command", "command": "/absolute/path/to/libra-governor codex-hook post-tool-use", "timeout": 15, "async": true }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "/absolute/path/to/libra-governor codex-hook stop", "timeout": 15 }] }
+    ]
+  }
 }
 ```
+
+The hook groups live under a top-level `"hooks"` key — Codex's own
+top-level schema only accepts `"description"`/`"hooks"` as top-level
+fields and rejects (fails open — every hook silently disabled, no error
+surfaced to the user) any other top-level key. Verified by running a
+real local Codex CLI install; see the ADR.
 
 Every hook gets a 15-second timeout (not Codex's own 600s default) so a
 wedged daemon cannot hang a prompt for ten minutes; `PostToolUse` also

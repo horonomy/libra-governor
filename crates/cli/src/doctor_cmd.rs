@@ -320,12 +320,17 @@ fn wired_command_matches_current_binary(hooks_path: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(hooks_path) else {
         return true;
     };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return true;
+    };
+    // Hook groups live under the top-level "hooks" key — see
+    // codex_hooks_file's module docs on the real, verified file shape.
+    let Some(hooks) = root.get("hooks") else {
         return true;
     };
     let current = current_exe.display().to_string();
     for event in ["UserPromptSubmit", "PostToolUse", "Stop"] {
-        let Some(entries) = value.get(event).and_then(serde_json::Value::as_array) else {
+        let Some(entries) = hooks.get(event).and_then(serde_json::Value::as_array) else {
             continue;
         };
         for matcher in entries {

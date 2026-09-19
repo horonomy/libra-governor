@@ -114,6 +114,27 @@ invariant `hard_budget_enforcement: Available` implies
 `model_gateway: Available` is enforced by a unit test that inspects every
 `AgentKind`, not just the two defined today.
 
+### `hooks.json`'s real top-level shape — found by running the real binary
+
+`hooks.json`'s top-level object accepts exactly two fields:
+`description` (free text) and `hooks` (the event-keyed table). This was
+**not** the first shape this ticket shipped: an earlier draft assumed the
+event names lived at the top level, the same flat shape Claude Code's
+`settings.json` `hooks` table uses. That assumption was wrong, and was
+caught by actually running a real, locally installed Codex CLI
+(v0.154.0) against a real, sandboxed `$CODEX_HOME` — `codex exec
+--dangerously-bypass-hook-trust` printed `failed to parse hooks config:
+unknown field "UserPromptSubmit", expected "description" or "hooks"`,
+and Codex's own top-level schema is strict enough that this parse
+failure silently disabled every hook in the file (fail-open — Codex
+still ran the prompt, just with no hook firing). Nesting the same
+per-event array under a `"hooks"` key fixed it: the real binary printed
+`hook: UserPromptSubmit` / `hook: UserPromptSubmit Completed`, and the
+real daemon's `ledger.sqlite3` recorded a `session_tasks` row keyed by
+Codex's own real session id from that run. `crates/cli/src/codex_hooks_file.rs`
+implements the corrected, verified shape; its module doc comment carries
+the same evidence trail.
+
 ### Trust gate
 
 Writing `~/.codex/hooks.json` (via `crates/cli/src/codex_hooks_file.rs`,
@@ -169,24 +190,33 @@ for Claude Code's `PostToolUse` hook.
 
 ## What was verified vs. what remains open
 
-**Verified** (checked against `openai/codex`'s generated JSON schemas and
-its hooks documentation, not assumed): the event names and field lists
-quoted in "Context" above; the `hookSpecificOutput` stdout contract
-shape; the 600s default hook timeout and the 1s/3s `SessionEnd`/
-`Interrupt` timeout; the `wire_api: "responses"`-only custom model
-provider; MCP client support; the macOS 12+/Ubuntu 20.04+/Debian
-10+/Windows-11-via-WSL2 platform set; the absence of a statusline key in
-Codex's config schema.
+**Verified against `openai/codex`'s generated JSON schemas and its hooks
+documentation** (not assumed): the event names and field lists quoted in
+"Context" above; the `hookSpecificOutput` stdout contract shape; the 600s
+default hook timeout and the 1s/3s `SessionEnd`/`Interrupt` timeout; the
+`wire_api: "responses"`-only custom model provider; MCP client support;
+the macOS 12+/Ubuntu 20.04+/Debian 10+/Windows-11-via-WSL2 platform set;
+the absence of a statusline key in Codex's config schema.
+
+**Verified by actually running a real local Codex CLI install**
+(v0.154.0, via `codex exec --dangerously-bypass-hook-trust` against a
+sandboxed `$CODEX_HOME` — never the real user's own `~/.codex`, and never
+against real API credentials, since a sandboxed `$CODEX_HOME` has no auth
+of its own and every attempted model call returned `401 Unauthorized`,
+confirmed before any hook-loaded run was attempted): `hooks.json`'s real
+top-level shape (`{"description"?, "hooks": {...}}` — see "`hooks.json`'s
+real top-level shape" above); that the `hooks` feature is `stable`/`true`
+by default in this installed version (`codex features list`); that
+`--dangerously-bypass-hook-trust` is a real, distinct flag confirming the
+trust gate exists as designed; and, end to end, that
+`codex-hook user-prompt-submit` genuinely receives Codex's real
+`UserPromptSubmit` payload, spawns the real daemon, and the daemon
+records a real task bound to Codex's own real session id.
 
 **Unverified — treated as unknown, never asserted as fact:**
 
-- Whether Codex's `hooks` feature is on by default in a fresh install.
 - The exact key shape of `[hooks.state]` — `doctor`'s trust-state check
   is deliberately conservative because of this (see "Trust gate" above).
-- Whether Codex's own `hooks.json` file shape matches the assumption
-  `codex_hooks_file.rs` makes (the same event-keyed
-  array-of-matcher-groups shape Claude Code's `settings.json` uses) — see
-  that module's own doc comment.
 - Whether Codex's `session_id` stays stable across `compact`/`fork`/
   `resume` — the one open empirical question a real local Codex smoke
   test was meant to help answer; see the PR/ticket evidence for whether
@@ -212,9 +242,11 @@ Codex's config schema.
 
 ### Accepted costs
 
-- `codex_hooks_file.rs`'s file-shape assumption is unverified; if wrong,
-  `install --agent codex` needs a follow-up fix (disclosed above, not
-  silently assumed correct).
+- `codex_hooks_file.rs`'s file shape was verified by running a real local
+  Codex CLI install (see above) — the risk this ADR originally flagged
+  ("if Codex's real shape differs, `install --agent codex` needs a
+  follow-up fix") materialized and was fixed within this same ticket,
+  which is the discipline that risk-flagging was for.
 - `doctor`'s trust-state reporting is conservative to the point of never
   confirming "trusted" — a real usability gap until `[hooks.state]`'s
   shape is verified, accepted deliberately over the alternative (a doctor

@@ -14,22 +14,33 @@
 //!    fsynced, then renamed over the original — never truncated in
 //!    place.
 //!
-//! # File shape, and what is verified vs. assumed
+//! # File shape — verified against a real local Codex CLI install
+//! (HORO-1157)
 //!
-//! Codex's own `hooks.json` documented shape was not independently
-//! confirmed byte-for-byte during HORO-1157 (unlike the payload field
-//! names and stdout contract, which were checked against `openai/codex`'s
-//! generated JSON schemas — see `docs/adr/0004-agent-adapter-contract.md`).
-//! This module assumes the same event-keyed array-of-matcher-groups shape
-//! Claude Code's `settings.json` `hooks` table uses
-//! (`{"<Event>": [{"hooks": [{"type": "command", "command": "...", ...}]}]}`),
-//! since that is the shape `libra-governor codex-hook`'s own commands need
-//! to be discoverable in and is consistent with Codex's own
-//! `[hooks.state]` trust-gate design (which trusts by content hash of a
-//! configured hook entry, implying the same "list of command entries per
-//! event" structure). If Codex's real shape differs, `install --agent
-//! codex` would need a follow-up fix — this is disclosed, not silently
-//! assumed correct.
+//! `hooks.json`'s **top-level** object accepts exactly two fields:
+//! `description` (optional, a free-text string) and `hooks` (an object
+//! keyed by event name). Codex's own top-level schema is strict — a real
+//! installed Codex CLI (v0.154.0, verified locally during HORO-1157)
+//! rejects *any other top-level key* with `failed to parse hooks config:
+//! unknown field "<key>", expected "description" or "hooks"` and, on that
+//! parse failure, silently disables every hook in the file (fail-open on
+//! Codex's side — it warns, but a real prompt still proceeds without any
+//! hook running). An earlier draft of this module assumed the same flat,
+//! event-keyed-at-the-top shape Claude Code's `settings.json` `hooks`
+//! table uses; that was wrong, and was caught by actually invoking the
+//! real `codex` binary (`codex exec --dangerously-bypass-hook-trust`)
+//! against a real, sandboxed `$CODEX_HOME` and observing the parse
+//! warning. The **shape of one event's entries** — the array of
+//! `{"hooks": [{"type": "command", "command": "...", ...}]}` matcher
+//! groups — matches Claude Code's shape exactly and was also confirmed
+//! by the same local run (`hook: UserPromptSubmit` / `hook:
+//! UserPromptSubmit Completed` printed by the real `codex` binary, and
+//! the real daemon's `ledger.sqlite3` recording a `session_tasks` row
+//! keyed by Codex's own real session id). See
+//! `docs/adr/0004-agent-adapter-contract.md` for the full evidence trail.
+//!
+//! `description` is never written or removed by this module — it is not
+//! Governor-owned, and a user (or another tool) may have set their own.
 //!
 //! # Ownership predicate
 //!
@@ -45,9 +56,12 @@
 //! Writing `hooks.json` is necessary but not sufficient for Codex to
 //! actually run these hooks — the user must separately run `/hooks`
 //! inside Codex to trust them by content hash (`[hooks.state]` in
-//! `~/.codex/config.toml`). `install_cmd`'s printed next-steps and
-//! `doctor_cmd`'s read-only inspection cover that; this module only ever
-//! writes/removes/inspects `hooks.json` itself.
+//! `~/.codex/config.toml`), or pass `--dangerously-bypass-hook-trust` to
+//! `codex exec`/`codex` (only ever appropriate for a vetted source, e.g.
+//! the local smoke test that verified this module's file shape).
+//! `install_cmd`'s printed next-steps and `doctor_cmd`'s read-only
+//! inspection cover that; this module only ever writes/removes/inspects
+//! `hooks.json` itself.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -55,6 +69,11 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 
 pub const HOOKS_FILE_NAME: &str = "hooks.json";
+
+/// The top-level key holding the event-keyed hook groups. See module
+/// docs: `description` is the only other top-level key Codex accepts,
+/// and this module never touches it.
+const HOOKS_KEY: &str = "hooks";
 
 /// The hook timeout (seconds) written for every Codex hook entry this
 /// integration installs — deliberately far below Codex's own 600s
@@ -94,6 +113,8 @@ pub enum CodexHooksError {
          (nothing was changed)"
     )]
     NotAnObject { path: PathBuf },
+    #[error("{path}'s top-level \"hooks\" field is present but is not a JSON object")]
+    HooksFieldNotAnObject { path: PathBuf },
 }
 
 /// Resolution order: `LIBRA_GOVERNOR_CODEX_HOME` (primarily for tests, so
@@ -139,6 +160,26 @@ fn read_object(path: &Path) -> Result<Option<Map<String, Value>>, CodexHooksErro
             path: path.to_path_buf(),
         }),
     }
+}
+
+/// Returns the `root["hooks"]` object, creating an empty one if absent.
+/// Errors (never silently replaces) if `root["hooks"]` exists but is not
+/// itself a JSON object — that would mean either a hand-edited file in a
+/// shape this module cannot safely reason about, or a future Codex
+/// version changing the field's type; either way, refuse rather than
+/// guess.
+fn hooks_object_mut<'a>(
+    root: &'a mut Map<String, Value>,
+    path: &Path,
+) -> Result<&'a mut Map<String, Value>, CodexHooksError> {
+    let entry = root
+        .entry(HOOKS_KEY.to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    entry
+        .as_object_mut()
+        .ok_or_else(|| CodexHooksError::HooksFieldNotAnObject {
+            path: path.to_path_buf(),
+        })
 }
 
 /// Writes `map` to `path`: a verbatim-bytes backup of any existing file
@@ -217,51 +258,58 @@ pub struct Applied {
 }
 
 /// Adds this integration's `UserPromptSubmit`/`PostToolUse`/`Stop` hook
-/// groups, pointing at `binary`, to `path`. Idempotent: an already-present
-/// Governor-owned entry is not duplicated. Never touches any other key or
-/// hook group. `binary` should be an absolute path. Writes
-/// [`HOOK_TIMEOUT_SECS`] on every entry and `"async": true` on the
-/// `PostToolUse` entry only (it prints nothing and must never add
-/// perceptible latency) — see that constant's docs. No `matcher` field is
-/// written: this integration observes every tool, not a filtered subset.
+/// groups, pointing at `binary`, to `path["hooks"]` (see module docs on
+/// why `"hooks"`, not the top level, is where these belong).
+/// Idempotent: an already-present Governor-owned entry is not
+/// duplicated. Never touches any other key (including the sibling
+/// top-level `description` field, or any foreign hook group). `binary`
+/// should be an absolute path. Writes [`HOOK_TIMEOUT_SECS`] on every
+/// entry and `"async": true` on the `PostToolUse` entry only (it prints
+/// nothing and must never add perceptible latency) — see that constant's
+/// docs. No `matcher` field is written: this integration observes every
+/// tool, not a filtered subset.
 pub fn apply(path: &Path, binary: &Path) -> Result<Applied, CodexHooksError> {
     let mut root = read_object(path)?.unwrap_or_default();
     let binary = binary.display().to_string();
     let mut hooks_added = 0usize;
 
-    for (event, subcommand, is_async) in [
-        ("UserPromptSubmit", "codex-hook user-prompt-submit", false),
-        ("PostToolUse", "codex-hook post-tool-use", true),
-        ("Stop", "codex-hook stop", false),
-    ] {
-        let command = format!("{binary} {subcommand}");
-        let entries = root
-            .entry(event.to_string())
-            .or_insert_with(|| Value::Array(Vec::new()));
-        let entries_arr = as_array_or_replace(entries);
+    {
+        let hooks_obj = hooks_object_mut(&mut root, path)?;
 
-        let already_present = entries_arr.iter().any(|matcher| {
-            matcher
-                .get("hooks")
-                .and_then(Value::as_array)
-                .map(|inner| {
-                    inner
-                        .iter()
-                        .any(|h| h.get("command").and_then(Value::as_str) == Some(command.as_str()))
-                })
-                .unwrap_or(false)
-        });
-        if !already_present {
-            let mut hook_entry = serde_json::json!({
-                "type": "command",
-                "command": command,
-                "timeout": HOOK_TIMEOUT_SECS,
+        for (event, subcommand, is_async) in [
+            ("UserPromptSubmit", "codex-hook user-prompt-submit", false),
+            ("PostToolUse", "codex-hook post-tool-use", true),
+            ("Stop", "codex-hook stop", false),
+        ] {
+            let command = format!("{binary} {subcommand}");
+            let entries = hooks_obj
+                .entry(event.to_string())
+                .or_insert_with(|| Value::Array(Vec::new()));
+            let entries_arr = as_array_or_replace(entries);
+
+            let already_present = entries_arr.iter().any(|matcher| {
+                matcher
+                    .get("hooks")
+                    .and_then(Value::as_array)
+                    .map(|inner| {
+                        inner.iter().any(|h| {
+                            h.get("command").and_then(Value::as_str) == Some(command.as_str())
+                        })
+                    })
+                    .unwrap_or(false)
             });
-            if is_async {
-                hook_entry["async"] = Value::Bool(true);
+            if !already_present {
+                let mut hook_entry = serde_json::json!({
+                    "type": "command",
+                    "command": command,
+                    "timeout": HOOK_TIMEOUT_SECS,
+                });
+                if is_async {
+                    hook_entry["async"] = Value::Bool(true);
+                }
+                entries_arr.push(serde_json::json!({ "hooks": [hook_entry] }));
+                hooks_added += 1;
             }
-            entries_arr.push(serde_json::json!({ "hooks": [hook_entry] }));
-            hooks_added += 1;
         }
     }
 
@@ -288,11 +336,13 @@ pub struct Removed {
     pub file_absent: bool,
 }
 
-/// Removes only Governor-owned hook groups from `path` — pruning empty
-/// matchers/event-arrays only when our removal is what emptied them,
-/// mirroring `claude_settings::remove`'s discipline exactly. Every other
-/// key, and every foreign entry inside an event's array, is left exactly
-/// as it was. A missing file is a safe no-op.
+/// Removes only Governor-owned hook groups from `path["hooks"]` —
+/// pruning empty matchers/event-arrays only when our removal is what
+/// emptied them, and pruning the `"hooks"` key itself only when doing so
+/// leaves it empty, mirroring `claude_settings::remove`'s discipline
+/// exactly. Every other key (including `description`), and every
+/// foreign entry inside an event's array, is left exactly as it was. A
+/// missing file is a safe no-op.
 pub fn remove(path: &Path) -> Result<Removed, CodexHooksError> {
     let Some(mut root) = read_object(path)? else {
         return Ok(Removed {
@@ -302,40 +352,52 @@ pub fn remove(path: &Path) -> Result<Removed, CodexHooksError> {
     };
 
     let mut hook_commands_removed = 0usize;
-    let mut events_to_drop = Vec::new();
-    for event in HOOK_EVENTS {
-        let Some(entries_value) = root.get_mut(event) else {
-            continue;
-        };
-        let Some(entries_arr) = entries_value.as_array_mut() else {
-            continue;
-        };
-        let mut matchers_to_drop = Vec::new();
-        for (idx, matcher) in entries_arr.iter_mut().enumerate() {
-            let Some(inner) = matcher.get_mut("hooks").and_then(Value::as_array_mut) else {
+    if let Some(hooks_value) = root.get_mut(HOOKS_KEY) {
+        let hooks_obj =
+            hooks_value
+                .as_object_mut()
+                .ok_or_else(|| CodexHooksError::HooksFieldNotAnObject {
+                    path: path.to_path_buf(),
+                })?;
+
+        let mut events_to_drop = Vec::new();
+        for event in HOOK_EVENTS {
+            let Some(entries_value) = hooks_obj.get_mut(event) else {
                 continue;
             };
-            let before = inner.len();
-            inner.retain(|h| {
-                h.get("command")
-                    .and_then(Value::as_str)
-                    .map(|c| !command_is_ours(c))
-                    .unwrap_or(true)
-            });
-            hook_commands_removed += before - inner.len();
-            if before > 0 && inner.is_empty() {
-                matchers_to_drop.push(idx);
+            let Some(entries_arr) = entries_value.as_array_mut() else {
+                continue;
+            };
+            let mut matchers_to_drop = Vec::new();
+            for (idx, matcher) in entries_arr.iter_mut().enumerate() {
+                let Some(inner) = matcher.get_mut("hooks").and_then(Value::as_array_mut) else {
+                    continue;
+                };
+                let before = inner.len();
+                inner.retain(|h| {
+                    h.get("command")
+                        .and_then(Value::as_str)
+                        .map(|c| !command_is_ours(c))
+                        .unwrap_or(true)
+                });
+                hook_commands_removed += before - inner.len();
+                if before > 0 && inner.is_empty() {
+                    matchers_to_drop.push(idx);
+                }
+            }
+            for idx in matchers_to_drop.into_iter().rev() {
+                entries_arr.remove(idx);
+            }
+            if entries_arr.is_empty() {
+                events_to_drop.push(event.to_string());
             }
         }
-        for idx in matchers_to_drop.into_iter().rev() {
-            entries_arr.remove(idx);
+        for event in events_to_drop {
+            hooks_obj.remove(&event);
         }
-        if entries_arr.is_empty() {
-            events_to_drop.push(event.to_string());
+        if hooks_obj.is_empty() {
+            root.remove(HOOKS_KEY);
         }
-    }
-    for event in events_to_drop {
-        root.remove(&event);
     }
 
     let backup_path = write_object_atomically(path, &root)?;
@@ -354,9 +416,10 @@ pub struct Inspection {
     pub hooks_wired: [bool; 3], // [UserPromptSubmit, PostToolUse, Stop]
 }
 
-/// Read-only inspection of `path` for `doctor`. A missing or unparsable
-/// file is reported as simply "not present"/"nothing wired" rather than
-/// propagating a parse error, mirroring `claude_settings::inspect`.
+/// Read-only inspection of `path["hooks"]` for `doctor`. A missing or
+/// unparsable file, or a `"hooks"` field that is present but not an
+/// object, is reported as simply "not present"/"nothing wired" rather
+/// than propagating a parse error, mirroring `claude_settings::inspect`.
 pub fn inspect(path: &Path) -> Inspection {
     let Ok(Some(root)) = read_object(path) else {
         return Inspection {
@@ -364,10 +427,16 @@ pub fn inspect(path: &Path) -> Inspection {
             ..Default::default()
         };
     };
+    let Some(hooks_obj) = root.get(HOOKS_KEY).and_then(Value::as_object) else {
+        return Inspection {
+            file_present: true,
+            ..Default::default()
+        };
+    };
 
     let mut hooks_wired = [false; 3];
     for (idx, event) in HOOK_EVENTS.iter().enumerate() {
-        hooks_wired[idx] = root
+        hooks_wired[idx] = hooks_obj
             .get(*event)
             .and_then(Value::as_array)
             .map(|entries| {
@@ -417,6 +486,25 @@ mod tests {
     }
 
     #[test]
+    fn apply_writes_entries_under_the_top_level_hooks_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        apply(&path, &binary()).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+
+        assert!(
+            value.get("UserPromptSubmit").is_none(),
+            "hook groups must never be written at the top level — Codex's real schema only \
+             accepts \"description\" and \"hooks\" as top-level keys"
+        );
+        assert!(value["hooks"]["UserPromptSubmit"].is_array());
+        assert!(value["hooks"]["PostToolUse"].is_array());
+        assert!(value["hooks"]["Stop"].is_array());
+    }
+
+    #[test]
     fn apply_writes_the_documented_timeout_and_async_flag() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hooks.json");
@@ -426,18 +514,18 @@ mod tests {
         let value: Value = serde_json::from_str(&text).unwrap();
 
         assert_eq!(
-            value["UserPromptSubmit"][0]["hooks"][0]["timeout"],
+            value["hooks"]["UserPromptSubmit"][0]["hooks"][0]["timeout"],
             HOOK_TIMEOUT_SECS
         );
-        assert!(value["UserPromptSubmit"][0]["hooks"][0]
+        assert!(value["hooks"]["UserPromptSubmit"][0]["hooks"][0]
             .get("async")
             .is_none());
         assert_eq!(
-            value["PostToolUse"][0]["hooks"][0]["timeout"],
+            value["hooks"]["PostToolUse"][0]["hooks"][0]["timeout"],
             HOOK_TIMEOUT_SECS
         );
-        assert_eq!(value["PostToolUse"][0]["hooks"][0]["async"], true);
-        assert!(value["Stop"][0]["hooks"][0].get("async").is_none());
+        assert_eq!(value["hooks"]["PostToolUse"][0]["hooks"][0]["async"], true);
+        assert!(value["hooks"]["Stop"][0]["hooks"][0].get("async").is_none());
     }
 
     #[test]
@@ -450,6 +538,19 @@ mod tests {
             second.hooks_added, 0,
             "re-running apply must be a no-op on an already-wired file"
         );
+    }
+
+    #[test]
+    fn apply_preserves_a_foreign_top_level_description_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        std::fs::write(&path, r#"{"description": "my own hooks file"}"#).unwrap();
+
+        apply(&path, &binary()).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["description"], "my own hooks file");
     }
 
     #[test]
@@ -467,7 +568,7 @@ mod tests {
         let value: Value = serde_json::from_str(&text).unwrap();
         assert!(
             value.as_object().unwrap().is_empty(),
-            "an emptied file must contain no leftover event keys"
+            "an emptied file must contain no leftover \"hooks\" key"
         );
     }
 
@@ -476,21 +577,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hooks.json");
         let seed = serde_json::json!({
-            "PostToolUse": [
-                {
-                    "hooks": [
-                        { "type": "command", "command": "/opt/libra/bin/libra-governor codex-hook post-tool-use", "timeout": 15, "async": true },
-                        { "type": "command", "command": "/usr/local/bin/some-other-tool notify", "timeout": 5 }
-                    ]
-                }
-            ],
-            "PreToolUse": [
-                {
-                    "hooks": [
-                        { "type": "command", "command": "/usr/local/bin/foreign-guard check" }
-                    ]
-                }
-            ]
+            "description": "my own hooks file",
+            "hooks": {
+                "PostToolUse": [
+                    {
+                        "hooks": [
+                            { "type": "command", "command": "/opt/libra/bin/libra-governor codex-hook post-tool-use", "timeout": 15, "async": true },
+                            { "type": "command", "command": "/usr/local/bin/some-other-tool notify", "timeout": 5 }
+                        ]
+                    }
+                ],
+                "PreToolUse": [
+                    {
+                        "hooks": [
+                            { "type": "command", "command": "/usr/local/bin/foreign-guard check" }
+                        ]
+                    }
+                ]
+            }
         });
         std::fs::write(&path, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
 
@@ -502,17 +606,21 @@ mod tests {
 
         let text = std::fs::read_to_string(&path).unwrap();
         let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["description"], "my own hooks file");
         assert_eq!(
-            value["PostToolUse"][0]["hooks"].as_array().unwrap().len(),
+            value["hooks"]["PostToolUse"][0]["hooks"]
+                .as_array()
+                .unwrap()
+                .len(),
             1,
             "the foreign PostToolUse entry must survive"
         );
         assert_eq!(
-            value["PostToolUse"][0]["hooks"][0]["command"],
+            value["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
             "/usr/local/bin/some-other-tool notify"
         );
         assert_eq!(
-            value["PreToolUse"][0]["hooks"][0]["command"],
+            value["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
             "/usr/local/bin/foreign-guard check"
         );
     }
@@ -553,10 +661,23 @@ mod tests {
     }
 
     #[test]
+    fn a_non_object_hooks_field_aborts_and_leaves_the_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        std::fs::write(&path, r#"{"hooks": "not an object"}"#).unwrap();
+
+        let before = std::fs::read_to_string(&path).unwrap();
+        let err = remove(&path).unwrap_err();
+        assert!(matches!(err, CodexHooksError::HooksFieldNotAnObject { .. }));
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
     fn a_backup_is_written_before_any_mutating_write() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hooks.json");
-        let seed = serde_json::json!({"UserPromptSubmit": []});
+        let seed = serde_json::json!({"hooks": {"UserPromptSubmit": []}});
         let original_bytes = serde_json::to_string_pretty(&seed).unwrap();
         std::fs::write(&path, &original_bytes).unwrap();
 
@@ -571,10 +692,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hooks.json");
         let seed = serde_json::json!({
-            "Stop": [
-                { "hooks": [{ "type": "command", "command": "/opt/libra/bin/libra-governor codex-hook stop" }] },
-                { "hooks": [{ "type": "command", "command": "/usr/local/bin/other stop-notify" }] }
-            ]
+            "hooks": {
+                "Stop": [
+                    { "hooks": [{ "type": "command", "command": "/opt/libra/bin/libra-governor codex-hook stop" }] },
+                    { "hooks": [{ "type": "command", "command": "/usr/local/bin/other stop-notify" }] }
+                ]
+            }
         });
         std::fs::write(&path, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
 
@@ -582,7 +705,7 @@ mod tests {
 
         let text = std::fs::read_to_string(&path).unwrap();
         let value: Value = serde_json::from_str(&text).unwrap();
-        let stop = value["Stop"].as_array().unwrap();
+        let stop = value["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 1, "the foreign matcher must survive");
         assert_eq!(
             stop[0]["hooks"][0]["command"],

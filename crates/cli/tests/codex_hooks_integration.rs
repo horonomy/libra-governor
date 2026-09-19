@@ -82,8 +82,15 @@ fn install_agent_codex_writes_three_hook_groups_with_a_trust_reminder() {
 
     let hooks_json = std::fs::read_to_string(sandbox.hooks_path()).unwrap();
     let value: serde_json::Value = serde_json::from_str(&hooks_json).unwrap();
+    assert!(
+        value.get("UserPromptSubmit").is_none(),
+        "hook groups must live under the top-level \"hooks\" key, never at the top level \
+         (Codex's real schema only accepts \"description\"/\"hooks\" as top-level keys)"
+    );
     for event in ["UserPromptSubmit", "PostToolUse", "Stop"] {
-        let command = value[event][0]["hooks"][0]["command"].as_str().unwrap();
+        let command = value["hooks"][event][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
         assert!(
             command.ends_with(match event {
                 "UserPromptSubmit" => "codex-hook user-prompt-submit",
@@ -93,10 +100,10 @@ fn install_agent_codex_writes_three_hook_groups_with_a_trust_reminder() {
             }),
             "unexpected command for {event}: {command}"
         );
-        assert_eq!(value[event][0]["hooks"][0]["timeout"], 15);
+        assert_eq!(value["hooks"][event][0]["hooks"][0]["timeout"], 15);
     }
-    assert_eq!(value["PostToolUse"][0]["hooks"][0]["async"], true);
-    assert!(value["UserPromptSubmit"][0]["hooks"][0]
+    assert_eq!(value["hooks"]["PostToolUse"][0]["hooks"][0]["async"], true);
+    assert!(value["hooks"]["UserPromptSubmit"][0]["hooks"][0]
         .get("async")
         .is_none());
 }
@@ -121,9 +128,12 @@ fn install_agent_codex_preserves_a_foreign_hook_group() {
     let sandbox = Sandbox::new();
     std::fs::create_dir_all(&sandbox.codex_dir).unwrap();
     let seed = serde_json::json!({
-        "PreCompact": [
-            { "hooks": [{ "type": "command", "command": "/usr/local/bin/my-own-tool precompact" }] }
-        ]
+        "description": "my own hooks file",
+        "hooks": {
+            "PreCompact": [
+                { "hooks": [{ "type": "command", "command": "/usr/local/bin/my-own-tool precompact" }] }
+            ]
+        }
     });
     std::fs::write(
         sandbox.hooks_path(),
@@ -136,9 +146,12 @@ fn install_agent_codex_preserves_a_foreign_hook_group() {
 
     let hooks_json = std::fs::read_to_string(sandbox.hooks_path()).unwrap();
     let value: serde_json::Value = serde_json::from_str(&hooks_json).unwrap();
+    assert_eq!(value["description"], "my own hooks file");
     assert_eq!(
-        value["PreCompact"][0]["hooks"][0]["command"], "/usr/local/bin/my-own-tool precompact",
-        "a foreign, unrelated hook group must survive install --agent codex byte-for-byte"
+        value["hooks"]["PreCompact"][0]["hooks"][0]["command"],
+        "/usr/local/bin/my-own-tool precompact",
+        "a foreign, unrelated hook group (and the foreign description field) must survive \
+         install --agent codex byte-for-byte"
     );
 }
 
