@@ -38,6 +38,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import os
 import re
 import subprocess
 import threading
@@ -48,8 +49,13 @@ from pathlib import Path
 
 SCHEMA_VERSION = "libra.extension.v1"
 SIGNATURE_VERSION = "v1"
-TICKET_KEY_PATTERN = re.compile(r"([A-Za-z]{2,}-\d+)")
+TICKET_KEY_PATTERN = re.compile(r"([A-Za-z]{2,10}-\d{1,6})")
 MAX_BODY_BYTES = 64 * 1024
+# Mirrors the daemon's own loopback-literal-only config validation
+# (`docs/adr/0005-local-extension-points.md`): this reference provider
+# speaks plain HTTP deliberately, which is only safe because it never
+# binds to a network-reachable interface.
+LOOPBACK_LITERALS = frozenset({"127.0.0.1", "::1"})
 
 
 def rfc3339(dt: datetime) -> str:
@@ -68,7 +74,7 @@ class ReplayGuard:
         self._event_ids: set[str] = set()
         self._lock = threading.Lock()
 
-    def check_and_record_nonce(self, nonce: str, timestamp: float) -> bool:
+    def check_and_record_nonce(self, nonce: str) -> bool:
         """Returns True if this nonce is fresh (not seen before within
         the skew window) and records it. Returns False on replay."""
         now = time.time()
@@ -116,10 +122,20 @@ class TaskCostCenters:
 def resolve_ticket_key(cwd: str) -> str | None:
     """Runs a real `git` subprocess against the task's actual working
     directory and extracts a ticket key from the current branch name
-    (e.g. `v0.0.2/HORO-1174/extension_contracts` -> `HORO-1174`)."""
+    (e.g. `v0.0.2/HORO-1174/extension_contracts` -> `HORO-1174`).
+
+    `cwd` is attacker-influenced request input — it is only ever used as
+    `git -C <cwd>`'s directory argument (never shell-interpreted, since
+    `subprocess.run` is called with an argument list), but it must still
+    resolve to a real, existing directory before being handed to `git`
+    at all; anything else is rejected outright rather than passed
+    through."""
+    candidate = Path(cwd)
+    if not candidate.is_absolute() or not candidate.is_dir():
+        return None
     try:
         result = subprocess.run(
-            ["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
+            ["git", "-C", str(candidate), "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -200,17 +216,25 @@ class ProviderHandler(BaseHTTPRequestHandler):
             self._respond_json(401, {"error": "signature mismatch"})
             return None
 
-        if not self.replay_guard.check_and_record_nonce(nonce, timestamp):
+        if not self.replay_guard.check_and_record_nonce(nonce):
             self._respond_json(409, {"error": "nonce already used (replay)"})
             return None
 
         return body, request_id
 
     def _respond_json(self, status: int, payload: dict) -> None:
+        # `json.dumps` escapes every value it serializes, so nothing in
+        # `payload` (including request-derived fields like task_id/cwd)
+        # can break out of the JSON string context. `X-Content-Type-Options:
+        # nosniff` additionally stops a client from MIME-sniffing this
+        # response as HTML regardless of `Content-Type`, closing the
+        # reflected-content sink a browser-based client could otherwise
+        # be tricked into rendering.
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
 
@@ -338,6 +362,17 @@ class ProviderHandler(BaseHTTPRequestHandler):
         self._respond_json(200, {"status": "accepted"})
 
 
+def _require_readable_file(raw_path: str, label: str) -> Path:
+    """Resolves a CLI-supplied path and requires it to be a real,
+    existing, readable regular file before anything reads it. Operator
+    input (a local CLI flag, not network-attacker input), but validated
+    anyway rather than handed straight to a filesystem read."""
+    path = Path(raw_path).expanduser().resolve()
+    if not path.is_file() or not os.access(path, os.R_OK):
+        raise SystemExit(f"libra_example_provider: --{label} does not resolve to a readable file: {raw_path!r}")
+    return path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
@@ -364,10 +399,17 @@ def main() -> None:
     parser.add_argument("--provider-id", default="example-provider")
     args = parser.parse_args()
 
-    secret_bytes = Path(args.secret_file).read_bytes()
-    tickets = json.loads(Path(args.tickets_file).read_text())
-    cost_caps = json.loads(Path(args.cost_caps_file).read_text())
-    events_log_path = Path(args.events_log)
+    if args.host not in LOOPBACK_LITERALS:
+        raise SystemExit(
+            f"libra_example_provider: --host must be a loopback literal ({sorted(LOOPBACK_LITERALS)}), "
+            f"got {args.host!r} — this provider speaks plain HTTP and must never bind a "
+            "network-reachable interface."
+        )
+
+    secret_bytes = _require_readable_file(args.secret_file, "secret-file").read_bytes()
+    tickets = json.loads(_require_readable_file(args.tickets_file, "tickets-file").read_text())
+    cost_caps = json.loads(_require_readable_file(args.cost_caps_file, "cost-caps-file").read_text())
+    events_log_path = Path(args.events_log).expanduser().resolve()
     events_log_path.parent.mkdir(parents=True, exist_ok=True)
 
     ProviderHandler.secret = secret_bytes
