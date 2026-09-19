@@ -29,26 +29,40 @@
 use std::io::BufReader;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use libra_governor_domain::{
-    completion_reserve_for, evaluate_hysteresis, possible_tool_loop, tool_call_count_is_material,
-    Admission, CompletionContract, CompletionCriterion, Estimate, ExecutionOutcome, ExecutionPlan,
-    ExecutionReceipt, HysteresisOutcome, Policy, PolicyPresetInputs, RemainingEstimate, ReplanId,
-    ReplanReason, ReplanRecord, ReplanTriggerKind, ReservationClass, ReservationState,
-    ResourceAmount, ABSOLUTE_TOOL_CALL_COUNT_FALLBACK, DEFAULT_LOOP_STREAK_THRESHOLD,
+    apply_business_context, apply_external_approval, completion_reserve_for, evaluate_hysteresis,
+    possible_tool_loop, tool_call_count_is_material, Admission, AttestationSource,
+    BusinessContextSummary, CompletionContract, CompletionCriterion, Estimate, ExecutionOutcome,
+    ExecutionPlan, ExecutionReceipt, ExternalApproval, ExternalVerdict, HysteresisOutcome, PlanId,
+    Policy, PolicyPresetInputs, RemainingEstimate, ReplanId, ReplanReason, ReplanRecord,
+    ReplanTriggerKind, ReservationClass, ReservationState, ResourceAmount, TaskId,
+    ABSOLUTE_TOOL_CALL_COUNT_FALLBACK, DEFAULT_LOOP_STREAK_THRESHOLD,
 };
 use libra_governor_estimator::{
     admission_replay, duration_coverage, estimate_bucketed, typical_tool_call_count_bucketed,
     AdmissionPolicy,
 };
-use libra_governor_ledger::{LedgerStore, ReserveOutcome, ReserveRequest};
+use libra_governor_extension::{
+    AdmissionEventData, ApprovalEventData, BusinessContextEventRef, BusinessContextRequest,
+    EventEnvelope, EventKind, ExternalApprovalEventRef, OutcomeEventData, PolicyWebhookRequest,
+    ProviderClient, ValidatedEventsConfig, ValidatedSurfaceConfig, WireVerdict,
+    MAX_ADVISORY_CRITERIA, MAX_ADVISORY_CRITERION_CHARS,
+};
+use libra_governor_ledger::{
+    BusinessContextInsert, LedgerStore, OutcomeAttestationInsert, ReserveOutcome, ReserveRequest,
+};
 use libra_governor_protocol::{
     wire, AdmissionPolicyReport, CalibrationReportResult, DoctorResult, FinalizeOutcome,
-    FinalizeResult, GatewayStatusResult, PreflightResult, ReconSummary, ReplanState, Request,
-    RequestEnvelope, Response, ResponseEnvelope, StatusResult, TaskSummary, PROTOCOL_VERSION,
+    FinalizeResult, GatewayStatusResult, OutcomeRecordedOutcome, OutcomeRecordedResult,
+    PreflightResult, ReconSummary, ReplanState, Request, RequestEnvelope, Response,
+    ResponseEnvelope, StatusResult, TaskSummary, PROTOCOL_VERSION,
 };
 
-use crate::{contract, features, gateway_authority, log, recon, recon::ReconBudget};
+use crate::{
+    contract, extension_authority, features, gateway_authority, log, recon, recon::ReconBudget,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
@@ -67,6 +81,13 @@ pub enum DaemonError {
     /// an expected one (HORO-1141).
     #[error("policy evaluation error: {0}")]
     Policy(#[from] libra_governor_domain::PolicyEvaluationError),
+    /// Only reachable if serializing an already-in-memory, well-typed
+    /// value (an `ExecutionOutcome` or a `Vec<String>` of evidence
+    /// references) somehow fails — `serde_json` has no real failure mode
+    /// for these types, so this is a defensive path (HORO-1174), same
+    /// spirit as [`Self::Policy`] above.
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 pub struct DaemonConfig {
@@ -106,6 +127,97 @@ pub struct DaemonConfig {
     /// `libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER` and the
     /// known limitation in `integrations/claude-code/README.md`.
     pub gateway_session_header: String,
+    /// The optional local extension points (HORO-1174): Business Context
+    /// Provider, Policy Webhook, and signed event delivery. `None` — the
+    /// default — means every extension surface is off. Raw/unvalidated,
+    /// mirroring `gateway`'s field above; see [`ExtensionRuntime`] for
+    /// the validated, cached-at-first-use form actually used at request
+    /// time.
+    pub extensions: Option<libra_governor_extension::ExtensionConfig>,
+    /// Lazily built and cached on first access (by [`extension_runtime`])
+    /// — validating an `[extensions]` block resolves each configured
+    /// `secret_command` by spawning a subprocess, which must happen once
+    /// at startup, never per-request. [`serve`] forces this exactly once,
+    /// before the accept loop begins, by calling [`start_extensions`].
+    pub extension_runtime: OnceLock<ExtensionRuntime>,
+}
+
+/// The validated, ready-to-use extension surfaces, built once by
+/// [`extension_runtime`] and cached on [`DaemonConfig::extension_runtime`]
+/// for the life of the daemon process. See that field's docs for why this
+/// must not be re-validated per request.
+pub struct ExtensionRuntime {
+    pub business_context_provider: Option<ValidatedSurfaceConfig>,
+    pub policy_webhook: Option<ValidatedSurfaceConfig>,
+    pub events: Option<ValidatedEventsConfig>,
+    /// `None` when `config.extensions` was `None` (nothing configured —
+    /// not an error), or when the internal Tokio runtime could not be
+    /// built (a real, if exceedingly rare, failure — logged and treated
+    /// as "no extensions available", matching this daemon's fail-open
+    /// doctrine).
+    pub client: Option<ProviderClient>,
+    /// The validation error, if `config.extensions` was `Some` but
+    /// rejected. Cached, not re-derived — see
+    /// [`libra_governor_protocol::DoctorResult::extension_config_error`]
+    /// docs for why `Doctor` reports this cached value rather than
+    /// re-running validation (which would re-spawn every configured
+    /// secret command on every `doctor` call).
+    pub config_error: Option<String>,
+}
+
+fn build_extension_runtime(config: &DaemonConfig) -> ExtensionRuntime {
+    let Some(raw) = config.extensions.clone() else {
+        return ExtensionRuntime {
+            business_context_provider: None,
+            policy_webhook: None,
+            events: None,
+            client: None,
+            config_error: None,
+        };
+    };
+
+    match libra_governor_extension::validate(raw) {
+        Ok(validated) => {
+            let client = match ProviderClient::new() {
+                Ok(client) => Some(client),
+                Err(e) => {
+                    log::append_line(
+                        &config.log_path,
+                        &format!("extensions: could not build the provider client — {e}"),
+                    );
+                    None
+                }
+            };
+            ExtensionRuntime {
+                business_context_provider: validated.business_context_provider,
+                policy_webhook: validated.policy_webhook,
+                events: validated.events,
+                client,
+                config_error: None,
+            }
+        }
+        Err(e) => {
+            log::append_line(
+                &config.log_path,
+                &format!("extensions disabled: configuration rejected — {e}"),
+            );
+            ExtensionRuntime {
+                business_context_provider: None,
+                policy_webhook: None,
+                events: None,
+                client: None,
+                config_error: Some(e.to_string()),
+            }
+        }
+    }
+}
+
+/// The validated extension runtime, built and cached on first access. See
+/// [`DaemonConfig::extension_runtime`] docs.
+fn extension_runtime(config: &DaemonConfig) -> &ExtensionRuntime {
+    config
+        .extension_runtime
+        .get_or_init(|| build_extension_runtime(config))
 }
 
 /// The default admission [`Policy`] every task's budget is initialized
@@ -223,6 +335,12 @@ pub fn serve(listener: UnixListener, config: &DaemonConfig) -> Result<(), Daemon
     // drops it immediately — which would close the shutdown channel and
     // stop the gateway the instant it started.
     let _gateway = start_gateway(config);
+    // Same `let _x = ...` (not `let _ = ...`) discipline as `_gateway`
+    // above, for the same reason: an underscore-prefixed binding holds
+    // the dispatcher's shutdown channel open for the scope, while a bare
+    // `_` pattern would drop it immediately and stop the dispatcher the
+    // instant it started.
+    let _extension_dispatcher = start_extensions(config);
 
     for incoming in listener.incoming() {
         let stream = match incoming {
@@ -336,7 +454,7 @@ fn dispatch(
             }
         },
         Request::Finalize { session_id, model } => {
-            match handle_finalize(&session_id, model, ledger, current_task) {
+            match handle_finalize(&session_id, model, ledger, current_task, config) {
                 Ok(outcome) => Response::Finalize(outcome),
                 Err(e) => {
                     log::append_line(&config.log_path, &format!("finalize error: {e}"));
@@ -354,6 +472,29 @@ fn dispatch(
                 log::append_line(&config.log_path, &format!("calibration_report error: {e}"));
                 Response::Error {
                     message: "internal error computing calibration report".to_string(),
+                }
+            }
+        },
+        Request::RecordOutcome {
+            task_id,
+            plan_id,
+            source_id,
+            idempotency_key,
+            outcome,
+        } => match handle_record_outcome(
+            task_id,
+            plan_id,
+            &source_id,
+            &idempotency_key,
+            outcome,
+            ledger,
+            config,
+        ) {
+            Ok(result) => Response::OutcomeRecorded(result),
+            Err(e) => {
+                log::append_line(&config.log_path, &format!("record_outcome error: {e}"));
+                Response::Error {
+                    message: "internal error recording outcome".to_string(),
                 }
             }
         },
@@ -504,6 +645,102 @@ fn handle_preflight(
         ledger.release_active_for_plan(task_id, previous_plan_id, now)?;
     }
 
+    // Business Context Provider fetch (HORO-1174). Deliberately BEFORE
+    // the Completion Reserve/budget block below: `initialize_task_budget`/
+    // `adjust_completion_reserve` must always use `config.policy` (the
+    // durable, unnarrowed policy) — never `effective_policy` — so the
+    // ordering here is not load-bearing, but placing the fetch first
+    // keeps every use of `effective_policy` textually after the one
+    // place it is computed. On any failure (not configured, fetch error,
+    // malformed/oversized/wrong-schema-version response, or a deadline
+    // that fails to narrow validly) this fails open: `effective_policy`
+    // stays `config.policy.clone()` and `business_context_summary` stays
+    // `None`.
+    let extension_rt = extension_runtime(config);
+    let mut effective_policy = config.policy.clone();
+    let mut business_context_summary: Option<BusinessContextSummary> = None;
+    if let (Some(surface), Some(client)) = (
+        &extension_rt.business_context_provider,
+        &extension_rt.client,
+    ) {
+        let repo_key = features::repo_key(cwd);
+        let request = BusinessContextRequest::new(
+            uuid::Uuid::new_v4().to_string(),
+            task_id,
+            session_id.to_string(),
+            repo_key,
+            cwd.to_path_buf(),
+            now,
+        );
+        match client.fetch_business_context(surface, &request) {
+            Ok(response) => {
+                let advisory_criteria: Vec<String> = response
+                    .advisory_criteria
+                    .into_iter()
+                    .take(MAX_ADVISORY_CRITERIA)
+                    .map(|s| {
+                        libra_governor_extension::truncate_chars(&s, MAX_ADVISORY_CRITERION_CHARS)
+                    })
+                    .collect();
+                let (narrowed, applied) =
+                    apply_business_context(&config.policy, response.deadline, now);
+                if response.deadline.is_some() && !applied {
+                    log::append_line(
+                        &config.log_path,
+                        &format!(
+                            "task {task_id}: business context deadline could not be applied \
+                             (past deadline or failed validation) — using the unnarrowed policy"
+                        ),
+                    );
+                }
+                effective_policy = narrowed;
+                let summary = BusinessContextSummary {
+                    provider_id: response.provider_id,
+                    schema_version: response.schema_version,
+                    priority: response.priority,
+                    cost_center: response.cost_center,
+                    deadline: response.deadline,
+                    advisory_criteria,
+                    external_refs: response.external_refs,
+                    applied,
+                    received_at: now,
+                };
+                let priority_str = summary.priority.map(priority_to_str);
+                let advisory_json = serde_json::to_string(&summary.advisory_criteria).ok();
+                let refs_json = serde_json::to_string(&summary.external_refs).ok();
+                if let Err(e) = ledger.insert_business_context(BusinessContextInsert {
+                    id: &uuid::Uuid::new_v4().to_string(),
+                    task_id,
+                    plan_id: Some(plan.id),
+                    provider_id: &summary.provider_id,
+                    schema_version: &summary.schema_version,
+                    priority: priority_str,
+                    deadline: summary.deadline,
+                    cost_center: summary.cost_center.as_deref(),
+                    advisory_criteria_json: advisory_json.as_deref(),
+                    external_refs_json: refs_json.as_deref(),
+                    applied: summary.applied,
+                    received_at: summary.received_at,
+                }) {
+                    log::append_line(
+                        &config.log_path,
+                        &format!("task {task_id}: could not persist business context row: {e}"),
+                    );
+                }
+                business_context_summary = Some(summary);
+            }
+            Err(e) => {
+                log::append_line(
+                    &config.log_path,
+                    &format!(
+                        "task {task_id}: business context fetch failed (fail-open, unnarrowed \
+                         policy) — {e}"
+                    ),
+                );
+            }
+        }
+    }
+
     // Completion Reserve + atomic admission (HORO-1141): the first real
     // wiring of HORO-1137's `Policy::evaluate` into the daemon. Every
     // task's budget is initialized (idempotently — a no-op if one
@@ -551,11 +788,72 @@ fn handle_preflight(
         .unwrap_or(0.0);
     let projected =
         ResourceAmount::from_kind_f64(budget.resource_kind, committed + requested.as_f64());
-    let decision = config.policy.evaluate(
-        projected,
-        estimate.duration_p80_secs.unwrap_or(0),
-        estimate.confidence,
-    )?;
+    let projected_duration_secs = estimate.duration_p80_secs.unwrap_or(0);
+    // `effective_policy`, not `config.policy` — the one deliberate lever
+    // business context has on admission (HORO-1174): deadline narrowing
+    // only. `initialize_task_budget`/`adjust_completion_reserve` above
+    // still used `config.policy` unconditionally.
+    let mut decision =
+        effective_policy.evaluate(projected, projected_duration_secs, estimate.confidence)?;
+
+    // Policy Webhook (HORO-1174): only ever called when the projected
+    // admission is ApprovalRequired — a hard-ceiling Deny issues ZERO
+    // webhook requests, and a clean Admit never asks. Fail-open on any
+    // failure: admission stays ApprovalRequired, matching the pre-ticket
+    // behavior.
+    let mut external_approval_ref: Option<ExternalApprovalEventRef> = None;
+    if let Admission::ApprovalRequired(ref approval_requests) = decision.admission {
+        if let (Some(surface), Some(client)) = (&extension_rt.policy_webhook, &extension_rt.client)
+        {
+            let webhook_request = PolicyWebhookRequest::new(
+                uuid::Uuid::new_v4().to_string(),
+                task_id,
+                plan.id,
+                session_id.to_string(),
+                effective_policy.name.clone(),
+                effective_policy.policy_schema_version.clone(),
+                approval_requests.clone(),
+                projected,
+                projected_duration_secs,
+                estimate.confidence,
+                now,
+            );
+            match client.request_policy_decision(surface, &webhook_request) {
+                Ok(response) => {
+                    let verdict = match response.verdict {
+                        WireVerdict::Approve => ExternalVerdict::Approve,
+                        WireVerdict::Reject => ExternalVerdict::Reject {
+                            reason: libra_governor_extension::truncate_chars(
+                                response.reason.as_deref().unwrap_or(""),
+                                MAX_ADVISORY_CRITERION_CHARS,
+                            ),
+                        },
+                        WireVerdict::Abstain => ExternalVerdict::Abstain,
+                    };
+                    external_approval_ref = Some(ExternalApprovalEventRef {
+                        provider_id: response.provider_id.clone(),
+                        verdict: verdict_to_str(&verdict).to_string(),
+                    });
+                    let approval = ExternalApproval {
+                        provider_id: response.provider_id,
+                        verdict,
+                        decided_at: now,
+                    };
+                    decision = apply_external_approval(decision, &approval);
+                }
+                Err(e) => {
+                    log::append_line(
+                        &config.log_path,
+                        &format!(
+                            "task {task_id}: policy webhook call failed (fail-open, admission \
+                             stays ApprovalRequired) — {e}"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
     // Persist the verdict onto the plan (HORO-1146): a later
     // material-event replan needs to be able to look up whether this
     // plan was ever actually admitted before it reserves capacity on the
@@ -634,6 +932,34 @@ fn handle_preflight(
 
     let completion_reserve = ledger.task_budget(task_id)?.map(|b| b.completion_reserve);
 
+    // Event delivery (HORO-1174): enqueue `admission` (the FINAL
+    // admission, post-webhook) always; enqueue `approval` only when the
+    // final admission is still ApprovalRequired (a human must still
+    // act). Both are inert no-ops when no `events` surface is
+    // configured, or when `admission`/`approval` is not in its `kinds`
+    // list — `enqueue_admission_and_approval_events` checks both.
+    let business_context_ref = business_context_summary
+        .as_ref()
+        .map(|s| BusinessContextEventRef {
+            provider_id: s.provider_id.clone(),
+            applied: s.applied,
+        });
+    enqueue_admission_and_approval_events(
+        extension_rt,
+        ledger,
+        task_id,
+        plan.id,
+        session_id,
+        &decision,
+        projected,
+        projected_duration_secs,
+        &effective_policy,
+        business_context_ref,
+        external_approval_ref,
+        now,
+        &config.log_path,
+    );
+
     Ok(PreflightResult {
         task_id,
         contract_draft: contract,
@@ -651,7 +977,121 @@ fn handle_preflight(
         plan_id: plan.id,
         admission: Some(decision),
         completion_reserve,
+        business_context: business_context_summary,
     })
+}
+
+/// Maps a [`libra_governor_domain::Priority`] onto its lowercase wire
+/// string — the same string the `business_context.priority` ledger
+/// column stores.
+fn priority_to_str(priority: libra_governor_domain::Priority) -> &'static str {
+    match priority {
+        libra_governor_domain::Priority::Low => "low",
+        libra_governor_domain::Priority::Normal => "normal",
+        libra_governor_domain::Priority::High => "high",
+        libra_governor_domain::Priority::Urgent => "urgent",
+    }
+}
+
+/// Maps an [`ExternalVerdict`] onto its closed-set wire string, for the
+/// `admission`/`approval` events' `external_approval.verdict` field.
+fn verdict_to_str(verdict: &ExternalVerdict) -> &'static str {
+    match verdict {
+        ExternalVerdict::Approve => "approve",
+        ExternalVerdict::Reject { .. } => "reject",
+        ExternalVerdict::Abstain => "abstain",
+    }
+}
+
+/// Builds and enqueues the `admission` event (always) and the `approval`
+/// event (only when `decision.admission` is still `ApprovalRequired`
+/// after any Policy Webhook resolution). Errors are logged and
+/// swallowed — a failure to enqueue an event must never fail the
+/// preflight itself.
+#[allow(clippy::too_many_arguments)]
+fn enqueue_admission_and_approval_events(
+    extension_rt: &ExtensionRuntime,
+    ledger: &mut LedgerStore,
+    task_id: TaskId,
+    plan_id: PlanId,
+    session_id: &str,
+    decision: &libra_governor_domain::PolicyDecision,
+    projected_resource: ResourceAmount,
+    projected_duration_secs: u64,
+    policy: &Policy,
+    business_context: Option<BusinessContextEventRef>,
+    external_approval: Option<ExternalApprovalEventRef>,
+    now: time::OffsetDateTime,
+    log_path: &std::path::Path,
+) {
+    let Some(events) = &extension_rt.events else {
+        return;
+    };
+
+    if events.kinds.contains(&EventKind::Admission) {
+        let data = AdmissionEventData {
+            task_id,
+            plan_id,
+            session_id: session_id.to_string(),
+            admission: decision.admission.clone(),
+            resource_outcome: decision.resource_outcome.clone(),
+            time_outcome: decision.time_outcome.clone(),
+            confidence_ok: decision.confidence_ok,
+            projected_resource,
+            projected_duration_secs,
+            policy_name: policy.name.clone(),
+            policy_schema_version: policy.policy_schema_version.clone(),
+            business_context: business_context.clone(),
+            external_approval: external_approval.clone(),
+        };
+        let envelope =
+            EventEnvelope::new(EventKind::Admission, env!("CARGO_PKG_VERSION"), data, now);
+        if let Ok(bytes) = envelope.to_json_bytes() {
+            if let Err(e) = extension_authority::enqueue_event(
+                ledger,
+                envelope.event_id,
+                EventKind::Admission,
+                &format!("plan:{}", plan_id.0),
+                Some(task_id),
+                &bytes,
+                now,
+            ) {
+                log::append_line(
+                    log_path,
+                    &format!("task {task_id}: could not enqueue admission event: {e}"),
+                );
+            }
+        }
+    }
+
+    if events.kinds.contains(&EventKind::Approval) {
+        if let Admission::ApprovalRequired(ref approval_requests) = decision.admission {
+            let data = ApprovalEventData {
+                task_id,
+                plan_id,
+                approval_requests: approval_requests.clone(),
+                external_approval,
+            };
+            let envelope =
+                EventEnvelope::new(EventKind::Approval, env!("CARGO_PKG_VERSION"), data, now);
+            if let Ok(bytes) = envelope.to_json_bytes() {
+                if let Err(e) = extension_authority::enqueue_event(
+                    ledger,
+                    envelope.event_id,
+                    EventKind::Approval,
+                    &format!("plan:{}", plan_id.0),
+                    Some(task_id),
+                    &bytes,
+                    now,
+                ) {
+                    log::append_line(
+                        log_path,
+                        &format!("task {task_id}: could not enqueue approval event: {e}"),
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Handles a `ToolInvoked` notification (HORO-1139): records the tool
@@ -929,6 +1369,44 @@ fn handle_tool_invoked(
     ledger.reset_tool_streak(session_id)?;
     let auto_replan_count = hysteresis_state.auto_replan_count + 1;
 
+    // Event delivery (HORO-1174): a `replan` event, whenever a replan
+    // actually lands. Deliberately no HTTP or ledger-enqueue on the
+    // `ToolInvoked` path itself — only here, after a replan has cleared
+    // hysteresis and been recorded, keeping `handle_tool_invoked`'s cheap
+    // common case (no material event) untouched.
+    if let Some(events) = &extension_runtime(config).events {
+        if events.kinds.contains(&EventKind::Replan) {
+            let data = libra_governor_extension::ReplanEventData {
+                task_id,
+                prior_plan_id: plan.id,
+                new_plan_id: new_plan.id,
+                trigger: reason.trigger,
+                detail: reason.detail.clone().unwrap_or_default(),
+                auto_replan_count,
+                remaining_duration_p80_secs: remaining.estimate.duration_p80_secs,
+                remaining_confidence: remaining.estimate.confidence,
+            };
+            let envelope =
+                EventEnvelope::new(EventKind::Replan, env!("CARGO_PKG_VERSION"), data, now);
+            if let Ok(bytes) = envelope.to_json_bytes() {
+                if let Err(e) = extension_authority::enqueue_event(
+                    ledger,
+                    envelope.event_id,
+                    EventKind::Replan,
+                    &format!("plan:{}", new_plan.id.0),
+                    Some(task_id),
+                    &bytes,
+                    now,
+                ) {
+                    log::append_line(
+                        &config.log_path,
+                        &format!("task {task_id}: could not enqueue replan event: {e}"),
+                    );
+                }
+            }
+        }
+    }
+
     log::append_line(
         &config.log_path,
         &format!(
@@ -977,6 +1455,7 @@ fn handle_finalize(
     model: Option<String>,
     ledger: &mut LedgerStore,
     current_task: &mut Option<TaskSummary>,
+    config: &DaemonConfig,
 ) -> Result<FinalizeOutcome, DaemonError> {
     let Some(task_id) = ledger.task_id_for_session(session_id)? else {
         return Ok(FinalizeOutcome::NoActiveTask);
@@ -1033,6 +1512,41 @@ fn handle_finalize(
 
     ledger.insert_receipt(&receipt)?;
 
+    // Event delivery (HORO-1174): an `outcome` event reflecting the
+    // receipt's outcome at finalize time. Source is `governor_local` —
+    // this is the daemon's own finalize logic, not an external push.
+    if let Some(events) = &extension_runtime(config).events {
+        if events.kinds.contains(&EventKind::Outcome) {
+            let data = OutcomeEventData {
+                task_id,
+                plan_id: Some(plan_id),
+                outcome_kind: outcome_kind_str(&receipt.outcome).to_string(),
+                evidence: receipt.outcome.evidence().to_vec(),
+                source: "governor_local".to_string(),
+                source_id: None,
+                attested_at: now,
+            };
+            let envelope =
+                EventEnvelope::new(EventKind::Outcome, env!("CARGO_PKG_VERSION"), data, now);
+            if let Ok(bytes) = envelope.to_json_bytes() {
+                if let Err(e) = extension_authority::enqueue_event(
+                    ledger,
+                    envelope.event_id,
+                    EventKind::Outcome,
+                    &format!("{task_id}:{}", plan_id.0),
+                    Some(task_id),
+                    &bytes,
+                    now,
+                ) {
+                    log::append_line(
+                        &config.log_path,
+                        &format!("task {task_id}: could not enqueue outcome event: {e}"),
+                    );
+                }
+            }
+        }
+    }
+
     if current_task.as_ref().map(|t| t.task_id) == Some(task_id) {
         *current_task = None;
     }
@@ -1041,6 +1555,118 @@ fn handle_finalize(
         receipt,
         estimate: plan.estimate,
     })))
+}
+
+/// The closed-set tag of an [`ExecutionOutcome`] — used for both the
+/// `outcome` event's `outcome_kind` field and `outcome_attestations.outcome_kind`.
+fn outcome_kind_str(outcome: &ExecutionOutcome) -> &'static str {
+    match outcome {
+        ExecutionOutcome::Completed { .. } => "completed",
+        ExecutionOutcome::Failed { .. } => "failed",
+        ExecutionOutcome::Aborted { .. } => "aborted",
+        ExecutionOutcome::Unknown => "unknown",
+    }
+}
+
+/// Handles a `RecordOutcome` push (HORO-1174): the one new *inbound*
+/// path this ticket adds, over the daemon's existing Unix socket. Resolves
+/// `task_id`, dedupes on `(task_id, source_id, idempotency_key)`, records
+/// the attestation, promotes `receipts.outcome_json` when the source is
+/// authoritative, enqueues an `outcome` event, and replies.
+///
+/// Every push through this `Request` variant is attributed
+/// `AttestationSource::Provider { provider_id: source_id }` — this
+/// specific inbound path exists for external Outcome Providers (see
+/// `examples/local-providers/report_outcome.sh`); `GovernorLocal` is used
+/// internally by `handle_finalize`, and no path yet exercises
+/// `AttestationSource::Agent`.
+fn handle_record_outcome(
+    task_id: TaskId,
+    plan_id: Option<PlanId>,
+    source_id: &str,
+    idempotency_key: &str,
+    outcome: ExecutionOutcome,
+    ledger: &mut LedgerStore,
+    config: &DaemonConfig,
+) -> Result<OutcomeRecordedOutcome, DaemonError> {
+    let now = time::OffsetDateTime::now_utc();
+
+    if !ledger.task_exists(task_id)? {
+        return Ok(OutcomeRecordedOutcome::NoSuchTask);
+    }
+
+    let source = AttestationSource::Provider {
+        provider_id: source_id.to_string(),
+    };
+    let authoritative = source.is_authoritative();
+    let outcome_kind = outcome_kind_str(&outcome);
+    let evidence_json = serde_json::to_string(outcome.evidence())?;
+
+    let inserted = ledger.insert_outcome_attestation(OutcomeAttestationInsert {
+        id: &uuid::Uuid::new_v4().to_string(),
+        task_id,
+        plan_id,
+        source: "provider",
+        source_id: Some(source_id),
+        outcome_kind,
+        evidence_json: &evidence_json,
+        idempotency_key,
+        authoritative,
+        attested_at: now,
+    })?;
+    if !inserted {
+        return Ok(OutcomeRecordedOutcome::Duplicate);
+    }
+
+    let receipt_updated = if authoritative {
+        let outcome_json = serde_json::to_string(&outcome)?;
+        ledger.promote_receipt_outcome(task_id, plan_id, &outcome_json)?
+    } else {
+        false
+    };
+
+    if let Some(events) = &extension_runtime(config).events {
+        if events.kinds.contains(&EventKind::Outcome) {
+            let data = OutcomeEventData {
+                task_id,
+                plan_id,
+                outcome_kind: outcome_kind.to_string(),
+                evidence: outcome.evidence().to_vec(),
+                source: "provider".to_string(),
+                source_id: Some(source_id.to_string()),
+                attested_at: now,
+            };
+            let dedupe_key = match plan_id {
+                Some(plan_id) => format!("{task_id}:{}", plan_id.0),
+                None => format!("{task_id}:none:{idempotency_key}"),
+            };
+            let envelope =
+                EventEnvelope::new(EventKind::Outcome, env!("CARGO_PKG_VERSION"), data, now);
+            if let Ok(bytes) = envelope.to_json_bytes() {
+                if let Err(e) = extension_authority::enqueue_event(
+                    ledger,
+                    envelope.event_id,
+                    EventKind::Outcome,
+                    &dedupe_key,
+                    Some(task_id),
+                    &bytes,
+                    now,
+                ) {
+                    log::append_line(
+                        &config.log_path,
+                        &format!("task {task_id}: could not enqueue outcome event: {e}"),
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(OutcomeRecordedOutcome::Recorded(Box::new(
+        OutcomeRecordedResult {
+            attested: outcome,
+            receipt_updated,
+        },
+    )))
 }
 
 /// A running gateway's thread and its shutdown channel.
@@ -1138,6 +1764,50 @@ fn start_gateway(config: &DaemonConfig) -> Option<GatewayHandle> {
     })
 }
 
+/// A running extension event dispatcher's thread and its shutdown
+/// channel. Same drop semantics as [`GatewayHandle`].
+pub struct ExtensionDispatcherHandle {
+    _shutdown: std::sync::mpsc::Sender<()>,
+}
+
+/// Forces [`extension_runtime`]'s one-time validation (and therefore any
+/// configured `secret_command` subprocess resolution) before the accept
+/// loop begins, and starts the event-dispatcher thread if and only if
+/// `extensions.events` is configured — see `crates/extension::dispatcher`
+/// docs on why an absent `events` surface must not start a thread at
+/// all.
+fn start_extensions(config: &DaemonConfig) -> Option<ExtensionDispatcherHandle> {
+    let runtime = extension_runtime(config);
+    let events = runtime.events.clone()?;
+
+    let ledger = match extension_authority::open_extension_ledger(&config.ledger_path) {
+        Ok(ledger) => ledger,
+        Err(e) => {
+            log::append_line(
+                &config.log_path,
+                &format!(
+                    "extension events disabled: could not open its own ledger connection — {e}"
+                ),
+            );
+            return None;
+        }
+    };
+    let queue: std::sync::Arc<dyn libra_governor_extension::DeliveryQueue> =
+        std::sync::Arc::new(extension_authority::LedgerDeliveryQueue::new(ledger));
+
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("libra-extension-dispatcher".to_string())
+        .spawn(move || {
+            libra_governor_extension::run_dispatcher(events, queue, shutdown_rx);
+        })
+        .ok()?;
+
+    Some(ExtensionDispatcherHandle {
+        _shutdown: shutdown_tx,
+    })
+}
+
 /// Answers a `GatewayStatus` request from state the daemon already holds.
 ///
 /// Read-only by construction — there is no request variant that starts,
@@ -1210,7 +1880,7 @@ fn handle_doctor(ledger: &LedgerStore, config: &DaemonConfig) -> DoctorResult {
                     (false, true, None, true)
                 } else {
                     match crate::config_file::load_overrides(dir) {
-                        Ok((policy_on_disk, gateway_on_disk)) => {
+                        Ok((policy_on_disk, gateway_on_disk, _extensions_on_disk)) => {
                             // A present, *valid* config.json can still
                             // disagree with what this already-running
                             // daemon holds in memory — the common "edited
@@ -1257,6 +1927,35 @@ fn handle_doctor(ledger: &LedgerStore, config: &DaemonConfig) -> DoctorResult {
         )
     });
 
+    // Presence checks against the raw `config.extensions` (mirrors
+    // `gateway_configured` above — no validation, no subprocess exec).
+    // `extension_config_error` is deliberately the CACHED startup
+    // validation error (from `config.extension_runtime`, read via `get`,
+    // never `get_or_init`) rather than a freshly recomputed one: unlike
+    // `config_file_error`'s cheap re-parse, re-validating `[extensions]`
+    // would re-spawn every configured `secret_command` on every `doctor`
+    // call. `get()` returns `None` before `serve()`'s one-time
+    // initialization has run (never true for a real daemon reached via
+    // its socket — `Doctor` only dispatches after `serve` has already
+    // called `start_extensions`).
+    let extension_business_context_configured = config
+        .extensions
+        .as_ref()
+        .is_some_and(|e| e.business_context_provider.is_some());
+    let extension_policy_webhook_configured = config
+        .extensions
+        .as_ref()
+        .is_some_and(|e| e.policy_webhook.is_some());
+    let extension_events_configured = config
+        .extensions
+        .as_ref()
+        .is_some_and(|e| e.events.is_some());
+    let extension_events_pending = ledger.pending_delivery_count().unwrap_or(0);
+    let extension_config_error = config
+        .extension_runtime
+        .get()
+        .and_then(|rt| rt.config_error.clone());
+
     DoctorResult {
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
         protocol_version: PROTOCOL_VERSION,
@@ -1274,6 +1973,11 @@ fn handle_doctor(ledger: &LedgerStore, config: &DaemonConfig) -> DoctorResult {
         gateway_capabilities: gw.capabilities,
         gateway_credential_configured,
         telemetry_enabled: false,
+        extension_business_context_configured,
+        extension_policy_webhook_configured,
+        extension_events_configured,
+        extension_events_pending,
+        extension_config_error,
     }
 }
 
@@ -1323,27 +2027,23 @@ mod tests {
     fn finalize_with_no_active_task_is_a_safe_no_op() {
         let mut ledger = LedgerStore::open_in_memory().unwrap();
         let mut current_task = None;
-        let outcome =
-            handle_finalize("no-such-session", None, &mut ledger, &mut current_task).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_daemon_config(dir.path());
+        let outcome = handle_finalize(
+            "no-such-session",
+            None,
+            &mut ledger,
+            &mut current_task,
+            &config,
+        )
+        .unwrap();
         assert_eq!(outcome, FinalizeOutcome::NoActiveTask);
     }
 
     #[test]
     fn finalize_after_a_real_preflight_persists_a_receipt() {
         let dir = tempfile::tempdir().unwrap();
-        let config = DaemonConfig {
-            socket_path: dir.path().join("d.sock"),
-            ledger_path: dir.path().join("ledger.sqlite3"),
-            log_path: dir.path().join("daemon.log"),
-            recon_budget: crate::recon::ReconBudget::default(),
-            replan_hysteresis: libra_governor_domain::ReplanHysteresisConfig::default(),
-            policy: default_admission_policy(),
-            reservation_ttl_secs: 900,
-            gateway: None,
-            gateway_stats: std::sync::Arc::new(Default::default()),
-            gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER
-                .to_string(),
-        };
+        let config = test_daemon_config(dir.path());
         let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
 
         let preflight =
@@ -1370,6 +2070,7 @@ mod tests {
             Some("claude-sonnet-5".to_string()),
             &mut ledger,
             &mut current_task,
+            &config,
         )
         .unwrap();
         let FinalizeOutcome::Finalized(result) = outcome else {
@@ -1396,19 +2097,7 @@ mod tests {
         let mut ledger = LedgerStore::open_in_memory().unwrap();
         let mut current_task = None;
         let dir = tempfile::tempdir().unwrap();
-        let config = DaemonConfig {
-            socket_path: dir.path().join("d.sock"),
-            ledger_path: dir.path().join("ledger.sqlite3"),
-            log_path: dir.path().join("daemon.log"),
-            recon_budget: crate::recon::ReconBudget::default(),
-            replan_hysteresis: libra_governor_domain::ReplanHysteresisConfig::default(),
-            policy: default_admission_policy(),
-            reservation_ttl_secs: 900,
-            gateway: None,
-            gateway_stats: std::sync::Arc::new(Default::default()),
-            gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER
-                .to_string(),
-        };
+        let config = test_daemon_config(dir.path());
 
         let response = dispatch(
             Request::ToolInvoked {
@@ -1423,7 +2112,10 @@ mod tests {
         assert_eq!(ledger.tool_call_count_for_session("sess-1").unwrap(), 1);
     }
 
-    fn config_for_doctor_tests(dir: &std::path::Path) -> DaemonConfig {
+    /// Shared `DaemonConfig` builder for this module's tests — every
+    /// extension surface off by default. `dir` must outlive the returned
+    /// config's paths (caller keeps the `tempfile::TempDir` alive).
+    fn test_daemon_config(dir: &std::path::Path) -> DaemonConfig {
         DaemonConfig {
             socket_path: dir.join("d.sock"),
             ledger_path: dir.join("ledger.sqlite3"),
@@ -1436,7 +2128,13 @@ mod tests {
             gateway_stats: std::sync::Arc::new(Default::default()),
             gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER
                 .to_string(),
+            extensions: None,
+            extension_runtime: OnceLock::new(),
         }
+    }
+
+    fn config_for_doctor_tests(dir: &std::path::Path) -> DaemonConfig {
+        test_daemon_config(dir)
     }
 
     #[test]

@@ -33,17 +33,19 @@ pub fn run() {
     // `libra_governor_daemon::config_file` module docs — and a present
     // but invalid file falls back to today's hardcoded defaults rather
     // than aborting startup, logged so it is visible rather than silent.
-    let (policy, gateway) = match libra_governor_daemon::config_file::load_overrides(&state_dir) {
-        Ok((policy, gateway)) => (policy, gateway),
+    let (policy, gateway, extensions) = match libra_governor_daemon::config_file::load_overrides(
+        &state_dir,
+    ) {
+        Ok((policy, gateway, extensions)) => (policy, gateway, extensions),
         Err(e) => {
             libra_governor_daemon::log::append_line(
                 &log_path,
                 &format!(
-                    "daemon: {} rejected — falling back to default policy/gateway: {e}",
+                    "daemon: {} rejected — falling back to default policy/gateway/extensions: {e}",
                     libra_governor_daemon::config_file::CONFIG_FILE_NAME
                 ),
             );
-            (None, None)
+            (None, None, None)
         }
     };
 
@@ -58,6 +60,8 @@ pub fn run() {
         gateway,
         gateway_stats: std::sync::Arc::new(Default::default()),
         gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER.to_string(),
+        extensions,
+        extension_runtime: std::sync::OnceLock::new(),
     };
 
     let listener = match libra_governor_daemon::bind_or_detect_running(&config.socket_path) {

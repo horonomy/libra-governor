@@ -99,6 +99,7 @@ pub enum ConfigFileError {
 struct RawConfigFile {
     policy: Option<RawPolicyConfig>,
     gateway: Option<RawGatewayConfig>,
+    extensions: Option<RawExtensionsConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,16 +139,98 @@ struct RawGatewayConfig {
     upstream_host_allowlist: Option<Vec<String>>,
 }
 
+/// One outbound extension surface (`business_context_provider` or
+/// `policy_webhook`) as `config.json` writes it (HORO-1174). No default
+/// for `timeout_ms` — the JSON-shape default/cap policy lives entirely in
+/// `libra_governor_extension::config`, and a config file that omits it
+/// would silently pick whichever default this module happened to
+/// hardcode; requiring it explicit here keeps the one source of truth in
+/// the extension crate itself, checked at [`libra_governor_extension::validate`]
+/// time.
+#[derive(Debug, Deserialize)]
+struct RawExtensionSurface {
+    url: String,
+    timeout_ms: u64,
+    secret_command: String,
+    #[serde(default)]
+    secret_args: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawExtensionsEvents {
+    url: String,
+    #[serde(default = "default_events_timeout_ms")]
+    timeout_ms: u64,
+    #[serde(default = "default_events_max_attempts")]
+    max_attempts: u32,
+    kinds: Vec<String>,
+    secret_command: String,
+    #[serde(default)]
+    secret_args: Vec<String>,
+}
+
+fn default_events_timeout_ms() -> u64 {
+    libra_governor_extension::EVENTS_TIMEOUT_DEFAULT_MS
+}
+
+fn default_events_max_attempts() -> u32 {
+    libra_governor_extension::EVENTS_MAX_ATTEMPTS_DEFAULT
+}
+
+/// `[extensions]` — the local extension points (HORO-1174): Business
+/// Context Provider, Policy Webhook, and signed event delivery. Every
+/// field is optional and additive — absent (`None`) means that surface is
+/// off. Actual URL/scheme/host/timeout validation happens once at daemon
+/// startup via `libra_governor_extension::validate`, not here — this
+/// struct is a pure parse, matching `RawGatewayConfig`'s own discipline
+/// (`resolve_gateway` does not resolve credentials either).
+#[derive(Debug, Deserialize, Default)]
+struct RawExtensionsConfig {
+    business_context_provider: Option<RawExtensionSurface>,
+    policy_webhook: Option<RawExtensionSurface>,
+    events: Option<RawExtensionsEvents>,
+}
+
+fn resolve_extensions(raw: RawExtensionsConfig) -> libra_governor_extension::ExtensionConfig {
+    let surface = |s: RawExtensionSurface| libra_governor_extension::SurfaceConfig {
+        url: s.url,
+        timeout_ms: s.timeout_ms,
+        secret_command: s.secret_command,
+        secret_args: s.secret_args,
+    };
+    libra_governor_extension::ExtensionConfig {
+        business_context_provider: raw.business_context_provider.map(surface),
+        policy_webhook: raw.policy_webhook.map(surface),
+        events: raw.events.map(|e| libra_governor_extension::EventsConfig {
+            url: e.url,
+            timeout_ms: e.timeout_ms,
+            max_attempts: e.max_attempts,
+            kinds: e.kinds,
+            secret_command: e.secret_command,
+            secret_args: e.secret_args,
+        }),
+    }
+}
+
 /// Reads and parses `<state_dir>/config.json`, if it exists, into the
-/// `(Policy, GatewayConfig)` overrides `daemon_cmd::run` should use in
-/// place of its own hardcoded defaults. `Ok((None, None))` when the file
-/// is simply absent — the normal case for every existing deployment.
+/// `(Policy, GatewayConfig, ExtensionConfig)` overrides `daemon_cmd::run`
+/// should use in place of its own hardcoded defaults. `Ok((None, None,
+/// None))` when the file is simply absent — the normal case for every
+/// existing deployment.
+#[allow(clippy::type_complexity)]
 pub fn load_overrides(
     state_dir: &Path,
-) -> Result<(Option<Policy>, Option<GatewayConfig>), ConfigFileError> {
+) -> Result<
+    (
+        Option<Policy>,
+        Option<GatewayConfig>,
+        Option<libra_governor_extension::ExtensionConfig>,
+    ),
+    ConfigFileError,
+> {
     let path = state_dir.join(CONFIG_FILE_NAME);
     if !path.exists() {
-        return Ok((None, None));
+        return Ok((None, None, None));
     }
 
     let raw_text = std::fs::read_to_string(&path).map_err(|source| ConfigFileError::Io {
@@ -162,7 +245,8 @@ pub fn load_overrides(
 
     let policy = raw.policy.map(resolve_policy).transpose()?;
     let gateway = raw.gateway.map(resolve_gateway).transpose()?;
-    Ok((policy, gateway))
+    let extensions = raw.extensions.map(resolve_extensions);
+    Ok((policy, gateway, extensions))
 }
 
 fn resolve_policy(raw: RawPolicyConfig) -> Result<Policy, ConfigFileError> {
@@ -220,7 +304,7 @@ mod tests {
     #[test]
     fn absent_config_file_produces_no_overrides() {
         let dir = tempfile::tempdir().unwrap();
-        let (policy, gateway) = load_overrides(dir.path()).unwrap();
+        let (policy, gateway, _extensions) = load_overrides(dir.path()).unwrap();
         assert!(policy.is_none());
         assert!(gateway.is_none());
     }
@@ -234,7 +318,7 @@ mod tests {
         )
         .unwrap();
 
-        let (policy, gateway) = load_overrides(dir.path()).unwrap();
+        let (policy, gateway, _extensions) = load_overrides(dir.path()).unwrap();
         let policy = policy.expect("policy override must be present");
         assert_eq!(policy.name, "deadline_first");
         assert!(gateway.is_none());
@@ -271,7 +355,7 @@ mod tests {
         )
         .unwrap();
 
-        let (policy, gateway) = load_overrides(dir.path()).unwrap();
+        let (policy, gateway, _extensions) = load_overrides(dir.path()).unwrap();
         assert!(policy.is_none());
         let gateway = gateway.expect("gateway override must be present");
         assert_eq!(gateway.bind_addr, "127.0.0.1:18080".parse().unwrap());

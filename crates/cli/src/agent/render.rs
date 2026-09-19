@@ -200,6 +200,7 @@ mod tests {
             estimate: None,
             admission: None,
             completion_reserve: None,
+            business_context: None,
         }
     }
 

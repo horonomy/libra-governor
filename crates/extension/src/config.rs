@@ -184,6 +184,14 @@ impl ValidatedExtensionConfig {
     }
 }
 
+/// Truncates `s` to at most `max_chars` **characters** (not bytes), so a
+/// multi-byte UTF-8 character is never split. Used to cap
+/// `advisory_criteria` entries and a Policy Webhook `reason` at
+/// [`MAX_ADVISORY_CRITERION_CHARS`].
+pub fn truncate_chars(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
+}
+
 fn is_loopback_literal(host: &str) -> bool {
     let stripped = host.trim_start_matches('[').trim_end_matches(']');
     stripped == "127.0.0.1" || stripped == "::1"
