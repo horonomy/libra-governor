@@ -8,12 +8,15 @@
 //! shared translation logic behind those two entry points into
 //! `crates/cli/src/agent/` and adds a second agent (Codex) on top of it.
 //! This file is the regression proof that the extraction does not change
-//! Claude's observable behavior one byte: the random `TaskId` is
-//! normalized out of both captured strings so the assertion is exact
-//! (not merely "contains"), and this file itself must never be edited to
-//! make a later commit pass — if it needs editing, real Claude behavior
-//! changed, which HORO-1157 forbids (see the ticket's regression-safety
-//! commit sequence, step 3).
+//! Claude's observable behavior one byte: both the random `TaskId` and
+//! the non-deterministic `recon: N.NNs` timing are normalized out of the
+//! captured strings, and the two assertions below are `assert_eq!`
+//! against a complete, literal expected string — not a handful of
+//! `contains`/`ends_with` substring checks, which could pass even if
+//! lines were dropped, reordered, or reworded between them. This file
+//! itself must never be edited to make a later commit pass — if it needs
+//! editing, real Claude behavior changed, which HORO-1157 forbids (see
+//! the ticket's regression-safety commit sequence, step 3).
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -116,6 +119,37 @@ fn uuid_len_at(s: &str, start: usize) -> Option<usize> {
     Some(pos - start)
 }
 
+/// Replaces every `recon: N.NNs` timing token with `recon: <T>s` so a
+/// golden assertion can be exact without being flaky — the reconnaissance
+/// duration is a real wall-clock measurement and varies run to run,
+/// especially on a loaded shared machine (see this repo's own notes on
+/// environmental resource contention). No `regex` dependency exists in
+/// this workspace; this is a small manual scan tailored to exactly the
+/// one shape ever produced here (`recon: ` + digits + `.` + digits + `s`).
+fn normalize_recon_time(input: &str) -> String {
+    const PREFIX: &str = "recon: ";
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(idx) = rest.find(PREFIX) {
+        out.push_str(&rest[..idx + PREFIX.len()]);
+        rest = &rest[idx + PREFIX.len()..];
+        let digit_run = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(rest.len());
+        let (number, after) = rest.split_at(digit_run);
+        if !number.is_empty() && after.starts_with('s') {
+            out.push_str("<T>s");
+            rest = &after[1..];
+        } else {
+            // Not actually the `N.NNs` shape after all — leave untouched.
+            out.push_str(number);
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn additional_context(stdout: &[u8]) -> String {
     let value: serde_json::Value = serde_json::from_slice(stdout)
         .unwrap_or_else(|e| panic!("hook stdout was not valid JSON: {e}\nstdout: {stdout:?}"));
@@ -173,28 +207,19 @@ fn claude_user_prompt_submit_additional_context_golden() {
     );
 
     let ctx = innermost_additional_context(&output.stdout);
-    let normalized = normalize_ids(&ctx);
+    let normalized = normalize_recon_time(&normalize_ids(&ctx));
 
-    assert!(
-        normalized.contains("[libra-governor] Preflight complete (task <ID>, confidence:"),
-        "{normalized}"
-    );
-    assert!(
-        normalized.contains("Draft Completion Contract (revision 1):"),
-        "{normalized}"
-    );
-    assert!(
-        normalized.contains("[required] Matches the user's stated request"),
-        "{normalized}"
-    );
-    assert!(
-        normalized.contains("[required] Relevant tests pass (cargo test)"),
-        "{normalized}"
-    );
-    assert!(
-        normalized.ends_with(" This preflight is advisory only."),
-        "{normalized}"
-    );
+    let expected = "[libra-governor] Preflight complete (task <ID>, confidence: high, \
+                     recon: <T>s).\n\
+                     Draft Completion Contract (revision 1):\n  \
+                     - [required] Matches the user's stated request\n  \
+                     - [required] Relevant tests pass (cargo test)\n  \
+                     - [optional] Changes are scoped to the likely affected area(s): \
+                     src/login.rs\n\
+                     Cost/time estimate: cold start — insufficient local history: no \
+                     ExecutionReceipt rows recorded yet (confidence: low). This preflight is \
+                     advisory only.";
+    assert_eq!(normalized, expected);
 
     kill_daemon_for(state_dir.path());
 }
@@ -250,17 +275,16 @@ fn claude_stop_stderr_summary_golden() {
     );
 
     let summary = String::from_utf8_lossy(&stop_output.stderr);
-    let normalized = normalize_ids(&summary);
+    let normalized = normalize_recon_time(&normalize_ids(&summary));
 
-    assert!(
-        normalized.starts_with("[libra-governor] Execution Receipt (task <ID>)\n"),
-        "{normalized}"
-    );
-    assert!(normalized.contains("Tool calls: 2"), "{normalized}");
-    assert!(
-        normalized.contains("Outcome:  Unknown (no automated completion verification in MVP 1)"),
-        "{normalized}"
-    );
+    let expected = "[libra-governor] Execution Receipt (task <ID>)\n\
+                     Estimate: cold start — insufficient local history: no ExecutionReceipt \
+                     rows recorded yet (confidence: Low, n=0)\n\
+                     Actual:   0s / unknown (harness does not expose cost/usage data)\n\
+                     Outcome:  Unknown (no automated completion verification in MVP 1)\n\
+                     Tool calls: 2\n\
+                     Inside P90: n/a (cold start)\n";
+    assert_eq!(normalized, expected);
 
     kill_daemon_for(state_dir.path());
 }
