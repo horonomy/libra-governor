@@ -15,10 +15,10 @@
 //!   `crates/daemon/tests/preflight_integration.rs` /
 //!   `mvp3_gate_evidence.rs`) into the ledger the CLI will read, and
 //!   asserting the exported JSON's aggregate counts match exactly.
-//! - **Privacy**: the real Preflight's `task_hint` carries a nonce.
+//! - **Privacy**: the real Preflight's `task_hint` carries a marker.
 //!   After generating a real local export, this test greps the actual
 //!   written JSON and Markdown files (and the CLI's own stdout) for that
-//!   nonce and asserts it never appears anywhere — the same nonce-grep
+//!   marker and asserts it never appears anywhere — the same marker-grep
 //!   technique `mvp3_gate_evidence.rs` uses for the gateway/prompt path,
 //!   applied here to the evidence-report export path specifically.
 
@@ -93,9 +93,9 @@ impl Sandbox {
 
     /// Seeds the sandbox's ledger with one real, admitted Preflight
     /// through the real daemon dispatch function, whose `task_hint`
-    /// carries `nonce`. This is the same file `evidence-report` will
+    /// carries `marker`. This is the same file `evidence-report` will
     /// later open at `paths::ledger_path()` for this state dir.
-    fn seed_one_real_preflight_with_nonce(&self, nonce: &str) {
+    fn seed_one_real_preflight_with_marker(&self, marker: &str) {
         std::fs::create_dir_all(&self.state_dir).unwrap();
         let config = DaemonConfig {
             socket_path: self.state_dir.join("seed.sock"),
@@ -130,7 +130,7 @@ impl Sandbox {
         let envelope = RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
             request: Request::Preflight {
-                task_hint: format!("fix the login bug — {nonce}"),
+                task_hint: format!("fix the login bug — {marker}"),
                 cwd: fixture_repo(),
                 session_id: "evidence-report-privacy-session".to_string(),
             },
@@ -208,7 +208,7 @@ fn evidence_report_consent_then_evidence_report_succeeds_and_writes_files() {
 #[test]
 fn evidence_report_aggregates_match_real_seeded_ledger_state_exactly() {
     let sandbox = Sandbox::new();
-    sandbox.seed_one_real_preflight_with_nonce("MARKER-HORO1154-aggregate-count-check");
+    sandbox.seed_one_real_preflight_with_marker("MARKER-HORO1154-aggregate-count-check");
     sandbox.run(&["evidence-report", "consent"]);
     let output = sandbox.run(&["evidence-report"]);
     assert!(
@@ -235,16 +235,16 @@ fn evidence_report_aggregates_match_real_seeded_ledger_state_exactly() {
 }
 
 #[test]
-fn evidence_report_export_never_contains_the_real_prompt_nonce() {
+fn evidence_report_export_never_contains_the_real_prompt_marker() {
     let sandbox = Sandbox::new();
     const PRIVACY_MARKER: &str = "MARKER-HORO1154-7b2f9c-do-not-leak-this-prompt-text";
-    sandbox.seed_one_real_preflight_with_nonce(PRIVACY_MARKER);
+    sandbox.seed_one_real_preflight_with_marker(PRIVACY_MARKER);
 
     let consent_output = sandbox.run(&["evidence-report", "consent"]);
     assert!(consent_output.status.success());
 
     // The qualitative-answer prompts are answered with real free text
-    // that deliberately does NOT contain the nonce, mirroring what a
+    // that deliberately does NOT contain the marker, mirroring what a
     // real evaluator would type.
     let answers = "a bit of friction at first, got used to it\n\
                     yes, probably\n\
@@ -263,11 +263,11 @@ fn evidence_report_export_never_contains_the_real_prompt_nonce() {
     let stderr = String::from_utf8_lossy(&report_output.stderr);
     assert!(
         !stdout.contains(PRIVACY_MARKER),
-        "nonce leaked into evidence-report stdout"
+        "marker leaked into evidence-report stdout"
     );
     assert!(
         !stderr.contains(PRIVACY_MARKER),
-        "nonce leaked into evidence-report stderr"
+        "marker leaked into evidence-report stderr"
     );
 
     // 2) Never in any file under the state dir — the exported JSON/MD,
@@ -301,7 +301,7 @@ fn evidence_report_export_never_contains_the_real_prompt_nonce() {
             !bytes
                 .windows(PRIVACY_MARKER.len())
                 .any(|w| w == PRIVACY_MARKER.as_bytes()),
-            "the real prompt nonce leaked into {}",
+            "the real prompt marker leaked into {}",
             path.display()
         );
     }
