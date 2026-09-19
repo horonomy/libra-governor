@@ -165,6 +165,12 @@ fn evidence_report_refuses_without_consent_and_writes_nothing() {
         !reports_dir.exists(),
         "no report should ever be written when consent is missing"
     );
+    assert!(
+        !sandbox.state_dir.exists(),
+        "a refusal must leave no trace on disk at all — not even the state directory itself \
+         (mirrors doctor_uninstall_integration.rs's 'a read-only diagnostic must not create the \
+         state dir')"
+    );
 }
 
 #[test]

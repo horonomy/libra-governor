@@ -65,9 +65,17 @@ marketing purpose without asking you again, specifically, first.
 
 You can stop using Libra, decline to run `evidence-report`, or decline
 to send an already-generated export at any point, for any reason, with
-no obligation to explain why. If you've already sent an export and want
-it deleted, contact the founder at <contact email/channel> and it will
-be deleted.
+no obligation to explain why.
+
+To revoke your local consent yourself, at any time, without contacting
+anyone: delete `~/.local/state/libra-governor/evidence_consent.json` (or
+run `libra-governor uninstall --yes` to remove Libra and all of its
+local state entirely). Once that file is gone, `evidence-report` refuses
+again until you re-run `evidence-report consent`.
+
+If you've already sent an export to the founder and want it deleted from
+their side, contact them at <contact email/channel> and it will be
+deleted.
 
 ## Questions or concerns
 

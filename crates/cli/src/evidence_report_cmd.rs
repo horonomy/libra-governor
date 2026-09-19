@@ -21,7 +21,7 @@
 //!   will run.
 //! - `evidence-report` — refuses without a consent marker; with one,
 //!   aggregates coarse local ledger signals (see
-//!   `libra_governor_ledger::query::EvidenceAggregates`), prompts the
+//!   [`EvidenceAggregates`][libra_governor_ledger::EvidenceAggregates]), prompts the
 //!   evaluator for the ticket's own open-ended questions, and writes one
 //!   JSON and one Markdown file locally. Prints the file paths and does
 //!   nothing else — the evaluator reviews the files and decides whether
@@ -32,11 +32,16 @@
 //! This module makes zero HTTP/socket-to-a-remote-host calls. The only
 //! I/O here is: reading `~/.claude/settings.json` (local), opening the
 //! local SQLite ledger (local), reading/writing files under the local
-//! state directory, and reading `stdin`/writing `stdout`. Grep this file
-//! for `TcpStream`, `reqwest`, `http`, or `ureq` and you will find none —
-//! `crates/cli/tests/evidence_report_privacy.rs` also asserts this by
-//! injecting a prompt/path nonce into the real ledger, generating a real
-//! export, and grepping the written files for it.
+//! state directory, and reading `stdin`/writing `stdout`. This module's
+//! own `tests` submodule asserts that by scanning this file's own
+//! non-test source for a small set of network-client/raw-socket symbol
+//! names — a regression guard, not just a prose claim (see
+//! `evidence_report_module_source_contains_no_network_symbols`, which
+//! names the exact forbidden symbols so this comment does not have to).
+//! Separately, `crates/cli/tests/evidence_report_privacy.rs` injects a
+//! prompt nonce into the real ledger via a real Preflight, generates a
+//! real export, and greps every file the run touched for it — that test
+//! is about prompt-content privacy, not about the network-call claim.
 //!
 //! # What is never collected
 //!
@@ -296,11 +301,83 @@ const BYPASS_DETECTION_NOTE: &str = "Libra can only report whether ~/.claude/set
 const DAEMON_RESTART_TRACKING_NOTE: &str = "This daemon build does not track process uptime or \
      restart count anywhere in its ledger or state files, so no such number is reported here.";
 
+/// Resolves the local ledger's coarse aggregates, or a default (all
+/// zero) result when no ledger has ever been created — a fresh install
+/// with no history yet is not an error.
+fn load_aggregates(ledger_path: &Path) -> EvidenceAggregatesDto {
+    if !ledger_path.exists() {
+        return EvidenceAggregatesDto::default();
+    }
+    match LedgerStore::open(ledger_path).and_then(|s| s.evidence_aggregates()) {
+        Ok(a) => a.into(),
+        Err(e) => {
+            eprintln!(
+                "libra-governor evidence-report: could not read local ledger at {}: {e}",
+                ledger_path.display()
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Serializes and writes the JSON and Markdown export files under
+/// `reports_dir` (creating it if necessary), returning their paths.
+/// Exits the process on any I/O or serialization failure.
+fn write_exports(report: &EvidenceReport, reports_dir: &Path) -> (PathBuf, PathBuf) {
+    if let Err(e) = std::fs::create_dir_all(reports_dir) {
+        exit_on_write_failure(reports_dir, &e);
+    }
+
+    let stamp = report.generated_at.replace([':', '.'], "-");
+    let json_path = reports_dir.join(format!("{stamp}.json"));
+    let md_path = reports_dir.join(format!("{stamp}.md"));
+
+    let json = match serde_json::to_string_pretty(report) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("libra-governor evidence-report: could not serialize report: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = write_owner_only(&json_path, json.as_bytes()) {
+        exit_on_write_failure(&json_path, &e);
+    }
+
+    let markdown = render_markdown(report);
+    if let Err(e) = write_owner_only(&md_path, markdown.as_bytes()) {
+        exit_on_write_failure(&md_path, &e);
+    }
+
+    (json_path, md_path)
+}
+
+fn exit_on_write_failure(path: &Path, e: &std::io::Error) -> ! {
+    eprintln!(
+        "libra-governor evidence-report: could not write {}: {e}",
+        path.display()
+    );
+    std::process::exit(1);
+}
+
 /// `libra-governor evidence-report` — refuses without consent; with
 /// consent, builds and writes the local export.
+///
+/// Consent is checked using [`libra_governor_daemon::paths::state_dir`]
+/// (never creates anything), not [`ensure_state_dir`] — a refusal must
+/// leave no trace on disk, mirroring `doctor`'s own "a read-only
+/// diagnostic must not create the state dir" discipline. The state
+/// directory is only created (via [`state_dir_or_exit`]) once consent is
+/// confirmed and this command is actually about to write something.
+///
+/// [`ensure_state_dir`]: libra_governor_daemon::paths::ensure_state_dir
 pub fn run() {
-    let state_dir = state_dir_or_exit("evidence-report");
-    let consent_path = state_dir.join(CONSENT_FILE_NAME);
+    let consent_path = match libra_governor_daemon::paths::state_dir() {
+        Ok(dir) => dir.join(CONSENT_FILE_NAME),
+        Err(e) => {
+            eprintln!("libra-governor evidence-report: could not resolve state dir: {e}");
+            std::process::exit(1);
+        }
+    };
     let Some(consent) = read_consent(&consent_path) else {
         eprintln!(
             "libra-governor evidence-report: no consent on record at {}.\n\
@@ -312,6 +389,10 @@ pub fn run() {
         std::process::exit(1);
     };
 
+    // Only now — consent confirmed — is it appropriate to ensure the
+    // state directory exists.
+    let state_dir = state_dir_or_exit("evidence-report");
+
     let ledger_path = match libra_governor_daemon::paths::ledger_path() {
         Ok(p) => p,
         Err(e) => {
@@ -320,20 +401,7 @@ pub fn run() {
         }
     };
     let ledger_present = ledger_path.exists();
-    let aggregates: EvidenceAggregatesDto = if ledger_present {
-        match LedgerStore::open(&ledger_path).and_then(|s| s.evidence_aggregates()) {
-            Ok(a) => a.into(),
-            Err(e) => {
-                eprintln!(
-                    "libra-governor evidence-report: could not read local ledger at {}: {e}",
-                    ledger_path.display()
-                );
-                std::process::exit(1);
-            }
-        }
-    } else {
-        EvidenceAggregatesDto::default()
-    };
+    let aggregates = load_aggregates(&ledger_path);
 
     let (hooks_wired, statusline_wired) = match claude_settings::settings_path() {
         Ok(path) => {
@@ -358,41 +426,7 @@ pub fn run() {
     };
 
     let reports_dir = state_dir.join(REPORTS_DIR_NAME);
-    if let Err(e) = std::fs::create_dir_all(&reports_dir) {
-        eprintln!(
-            "libra-governor evidence-report: could not create {}: {e}",
-            reports_dir.display()
-        );
-        std::process::exit(1);
-    }
-
-    let stamp = report.generated_at.replace([':', '.'], "-");
-    let json_path = reports_dir.join(format!("{stamp}.json"));
-    let md_path = reports_dir.join(format!("{stamp}.md"));
-
-    let json = match serde_json::to_string_pretty(&report) {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("libra-governor evidence-report: could not serialize report: {e}");
-            std::process::exit(1);
-        }
-    };
-    if let Err(e) = write_owner_only(&json_path, json.as_bytes()) {
-        eprintln!(
-            "libra-governor evidence-report: could not write {}: {e}",
-            json_path.display()
-        );
-        std::process::exit(1);
-    }
-
-    let markdown = render_markdown(&report);
-    if let Err(e) = write_owner_only(&md_path, markdown.as_bytes()) {
-        eprintln!(
-            "libra-governor evidence-report: could not write {}: {e}",
-            md_path.display()
-        );
-        std::process::exit(1);
-    }
+    let (json_path, md_path) = write_exports(&report, &reports_dir);
 
     println!(
         "\nLocal evidence export written:\n  {}\n  {}\n\n\
@@ -466,6 +500,83 @@ fn non_empty_or(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression guard for the "no network call, ever" claim in this
+    /// module's own doc comment: this module's embedded source must
+    /// never contain a symbol capable of dialing a remote host. Fails
+    /// the day someone adds a "just send it for them" convenience path
+    /// — exactly the failure mode this ticket is about avoiding.
+    #[test]
+    fn evidence_report_module_source_contains_no_network_symbols() {
+        let source = include_str!("evidence_report_cmd.rs");
+        // Only the production code above this test module is scanned —
+        // this test's own forbidden-symbol list below would otherwise
+        // trivially match itself.
+        let production_source = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("this file always contains its own test module marker");
+        for symbol in [
+            "TcpStream",
+            "UdpSocket",
+            "reqwest",
+            "ureq",
+            "http::",
+            "hyper",
+            "curl",
+        ] {
+            assert!(
+                !production_source.contains(symbol),
+                "found network-capable symbol {symbol:?} in evidence_report_cmd.rs's production \
+                 code — this module must never make a network call"
+            );
+        }
+    }
+
+    /// Regression guard against a future field addition silently
+    /// widening what the JSON export carries: the exported report's
+    /// top-level keys must stay exactly this allowlist. A reviewer
+    /// adding a new field must update this list deliberately, not
+    /// discover the leak later.
+    #[test]
+    fn exported_json_top_level_keys_match_the_expected_allowlist() {
+        let report = EvidenceReport {
+            generated_at: "2026-09-19T00:00:00Z".to_string(),
+            consent: ConsentMarker {
+                consented_at: "2026-09-18T00:00:00Z".to_string(),
+                tool_version: "0.0.1".to_string(),
+            },
+            ledger_present: false,
+            aggregates: EvidenceAggregatesDto::default(),
+            hooks_wired: [false; 3],
+            statusline_wired: false,
+            bypass_detection_note: BYPASS_DETECTION_NOTE.to_string(),
+            daemon_restart_tracking_note: DAEMON_RESTART_TRACKING_NOTE.to_string(),
+            qualitative_answers: QualitativeAnswers::default(),
+        };
+        let value = serde_json::to_value(&report).unwrap();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "aggregates",
+                "bypass_detection_note",
+                "consent",
+                "daemon_restart_tracking_note",
+                "generated_at",
+                "hooks_wired",
+                "ledger_present",
+                "qualitative_answers",
+                "statusline_wired",
+            ]
+        );
+    }
 
     #[test]
     fn consent_marker_round_trips_through_json() {
