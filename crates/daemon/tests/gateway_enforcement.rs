@@ -98,6 +98,8 @@ fn config(dir: &Path, policy: Policy, with_gateway: bool) -> DaemonConfig {
         gateway: with_gateway.then(|| gateway_config(dir)),
         gateway_stats: Arc::new(Default::default()),
         gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER.to_string(),
+        extensions: None,
+        extension_runtime: std::sync::OnceLock::new(),
     }
 }
 

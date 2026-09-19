@@ -9,6 +9,7 @@ description = "Libra Governor: local daemon — Unix-socket server, bounded reco
 [dependencies]
 libra-governor-domain = { path = "../domain" }
 libra-governor-estimator = { path = "../estimator" }
+libra-governor-extension = { path = "../extension" }
 libra-governor-gateway = { path = "../gateway" }
 libra-governor-ledger = { path = "../ledger" }
 libra-governor-protocol = { path = "../protocol" }
@@ -17,6 +18,12 @@ serde_json.workspace = true
 time.workspace = true
 thiserror.workspace = true
 sha2.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["server", "http1", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }

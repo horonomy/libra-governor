@@ -1,0 +1,28 @@
+{
+  "schema_version": "libra.extension.v1",
+  "event_id": "00000000-0000-0000-0000-000000000003",
+  "event_kind": "admission",
+  "occurred_at": "2027-01-15T08:00:00Z",
+  "daemon_version": "0.0.1",
+  "data": {
+    "task_id": "00000000-0000-0000-0000-000000000001",
+    "plan_id": "00000000-0000-0000-0000-000000000002",
+    "session_id": "sess-1",
+    "admission": "Admit",
+    "resource_outcome": "Admit",
+    "time_outcome": "Admit",
+    "confidence_ok": true,
+    "projected_resource": {
+      "kind": "tokens",
+      "amount": 90000
+    },
+    "projected_duration_secs": 1800,
+    "policy_name": "balanced",
+    "policy_schema_version": "policy-v1",
+    "business_context": {
+      "provider_id": "example-provider",
+      "applied": true
+    },
+    "external_approval": null
+  }
+}

@@ -79,6 +79,8 @@ fn base_config(dir: &Path, policy: Policy) -> DaemonConfig {
         gateway: None,
         gateway_stats: Arc::new(Default::default()),
         gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER.to_string(),
+        extensions: None,
+        extension_runtime: std::sync::OnceLock::new(),
     }
 }
 
@@ -462,6 +464,8 @@ fn security_evidence_credential_and_prompt_content_never_touch_persisted_state()
         gateway: Some(gateway_config),
         gateway_stats: Arc::new(Default::default()),
         gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER.to_string(),
+        extensions: None,
+        extension_runtime: std::sync::OnceLock::new(),
     };
 
     let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();

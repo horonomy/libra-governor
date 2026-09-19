@@ -1,0 +1,17 @@
+{
+  "schema_version": "libra.extension.v1",
+  "event_id": "00000000-0000-0000-0000-000000000003",
+  "event_kind": "replan",
+  "occurred_at": "2027-01-15T08:00:00Z",
+  "daemon_version": "0.0.1",
+  "data": {
+    "task_id": "00000000-0000-0000-0000-000000000001",
+    "prior_plan_id": "00000000-0000-0000-0000-000000000002",
+    "new_plan_id": "00000000-0000-0000-0000-000000000006",
+    "trigger": "tool_call_count_exceeded",
+    "detail": "9 tool calls since the last replan vs. typical 5",
+    "auto_replan_count": 1,
+    "remaining_duration_p80_secs": 1200,
+    "remaining_confidence": "medium"
+  }
+}

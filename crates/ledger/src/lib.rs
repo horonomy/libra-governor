@@ -23,6 +23,7 @@
 //! `libra-governor-domain`'s crate-level docs for the structural
 //! guarantee this rests on.
 
+mod extension;
 mod gateway;
 mod migrations;
 mod query;
@@ -31,6 +32,9 @@ mod session;
 mod store;
 mod write;
 
+pub use extension::{
+    BusinessContextInsert, DeliveryEnqueue, OutcomeAttestationInsert, QueuedDeliveryRow,
+};
 pub use gateway::{GatewayRequestClose, GatewayRequestOpen};
 pub use migrations::latest_known_version;
 pub use query::{CalibrationPair, EvidenceAggregates, TaskTrajectory};

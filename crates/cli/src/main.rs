@@ -44,6 +44,10 @@
 //!   coarse local behavioral aggregates plus evaluator-typed qualitative
 //!   answers to a local JSON/Markdown file. Off by default, opt-in only,
 //!   local-only — never a network call (HORO-1154).
+//! - `outcome record` — pushes an outcome attestation for a task, read as
+//!   JSON from stdin, over the daemon's existing Unix socket (HORO-1174).
+//!   The entry point an external Outcome Provider shells out to; see
+//!   `examples/local-providers/report_outcome.sh`.
 
 mod agent;
 mod agents_cmd;
@@ -61,6 +65,7 @@ mod hook;
 mod hook_post_tool_use;
 mod hook_stop;
 mod install_cmd;
+mod outcome_cmd;
 mod statusline;
 mod uninstall_cmd;
 
@@ -95,6 +100,7 @@ fn main() {
         ["agents", "--json"] => agents_cmd::run(true),
         ["evidence-report", "consent"] => evidence_report_cmd::run_consent(),
         ["evidence-report"] => evidence_report_cmd::run(),
+        ["outcome", "record"] => outcome_cmd::run(),
         _ => {
             eprintln!(
                 "libra-governor: unknown or missing subcommand\n\n\
@@ -115,7 +121,8 @@ fn main() {
                  libra-governor uninstall [--agent codex] [--yes]\n  \
                  libra-governor agents [--json]\n  \
                  libra-governor evidence-report consent\n  \
-                 libra-governor evidence-report"
+                 libra-governor evidence-report\n  \
+                 libra-governor outcome record"
             );
             std::process::exit(2);
         }

@@ -109,6 +109,8 @@ impl Sandbox {
             gateway_stats: std::sync::Arc::new(Default::default()),
             gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER
                 .to_string(),
+            extensions: None,
+            extension_runtime: std::sync::OnceLock::new(),
         };
         let listener = libra_governor_daemon::bind_or_detect_running(&config.socket_path).unwrap();
         let socket_path = config.socket_path.clone();

@@ -68,6 +68,8 @@ fn base_config(dir: &Path, policy: Policy) -> DaemonConfig {
         gateway: None,
         gateway_stats: std::sync::Arc::new(Default::default()),
         gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER.to_string(),
+        extensions: None,
+        extension_runtime: std::sync::OnceLock::new(),
     }
 }
 

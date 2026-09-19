@@ -1,0 +1,16 @@
+{
+  "advisory_criteria": [
+    "verify the fix against the linked ticket's reproduction steps"
+  ],
+  "cost_center": "eng-platform",
+  "deadline": "2027-01-15T12:00:00Z",
+  "external_refs": [
+    {
+      "kind": "jira",
+      "value": "HORO-1174"
+    }
+  ],
+  "priority": "high",
+  "provider_id": "example-provider",
+  "schema_version": "libra.extension.v1"
+}

@@ -1,0 +1,38 @@
+{
+  "schema_version": "libra.extension.v1",
+  "request_id": "00000000-0000-0000-0000-000000000005",
+  "task_id": "00000000-0000-0000-0000-000000000001",
+  "plan_id": "00000000-0000-0000-0000-000000000002",
+  "session_id": "sess-1",
+  "policy_name": "balanced",
+  "policy_schema_version": "policy-v1",
+  "approval_requests": [
+    {
+      "Resource": {
+        "projected": {
+          "kind": "tokens",
+          "amount": 150000
+        },
+        "target": {
+          "kind": "tokens",
+          "amount": 100000
+        },
+        "elastic_ceiling": {
+          "kind": "tokens",
+          "amount": 125000
+        },
+        "hard_ceiling": {
+          "kind": "tokens",
+          "amount": 200000
+        }
+      }
+    }
+  ],
+  "projected_resource": {
+    "kind": "tokens",
+    "amount": 150000
+  },
+  "projected_duration_secs": 2400,
+  "confidence": "medium",
+  "occurred_at": "2027-01-15T08:00:00Z"
+}

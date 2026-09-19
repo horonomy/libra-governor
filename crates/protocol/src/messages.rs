@@ -4,8 +4,8 @@
 use std::path::PathBuf;
 
 use libra_governor_domain::{
-    CompletionContract, Confidence, EnforcementCapabilities, Estimate, ExecutionReceipt, PlanId,
-    PolicyDecision, ResourceAmount, TaskId,
+    BusinessContextSummary, CompletionContract, Confidence, EnforcementCapabilities, Estimate,
+    ExecutionOutcome, ExecutionReceipt, PlanId, PolicyDecision, ResourceAmount, TaskId,
 };
 use libra_governor_estimator::{AdmissionOutcome, AdmissionPolicy, CoverageReport};
 use serde::{Deserialize, Serialize};
@@ -98,6 +98,25 @@ pub enum Request {
     /// Code settings wiring, state directory permissions) that do not
     /// require a daemon round trip.
     Doctor,
+    /// Pushes an outcome attestation for `task_id` (optionally narrowed to
+    /// `plan_id`) over the daemon's existing Unix socket (HORO-1174) —
+    /// the one new *inbound* path this ticket adds, deliberately reusing
+    /// the socket rather than opening a new HTTP listener (see
+    /// `docs/adr/0005-local-extension-points.md`). `idempotency_key`
+    /// deduplicates a retried push from the same `(task_id, source_id)`:
+    /// a duplicate is [`Response::OutcomeRecorded`]'s
+    /// [`OutcomeRecordedOutcome::Duplicate`], not a second write.
+    /// `source_id` is a recorded claim, not an authenticated identity —
+    /// the boundary is filesystem permissions on the socket itself (0600
+    /// inside the daemon's 0700 state dir), the same boundary every other
+    /// `Request` variant already relies on.
+    RecordOutcome {
+        task_id: TaskId,
+        plan_id: Option<PlanId>,
+        source_id: String,
+        idempotency_key: String,
+        outcome: ExecutionOutcome,
+    },
 }
 
 /// Summary of one bounded reconnaissance run. Never contains raw file
@@ -158,6 +177,15 @@ pub struct PreflightResult {
     /// recomputation. `None` only if a task's budget could not be
     /// resolved at all.
     pub completion_reserve: Option<ResourceAmount>,
+    /// The Business Context Provider's response, when one is configured
+    /// and the fetch succeeded (HORO-1174). `None` when no provider is
+    /// configured, or when the fetch failed/timed out/returned a
+    /// malformed response (fail-open — see
+    /// `docs/adr/0005-local-extension-points.md`). Advisory metadata
+    /// only: nothing on this type ever reaches `admission.protected_criteria`
+    /// — see `libra_governor_domain::BusinessContextSummary` docs for the
+    /// R2 trust-boundary rule this field's presence does not weaken.
+    pub business_context: Option<BusinessContextSummary>,
 }
 
 /// The result of a `Status` request.
@@ -417,6 +445,56 @@ pub struct DoctorResult {
     /// `doctor --json` can be asserted on by a caller that wants to
     /// verify it itself.
     pub telemetry_enabled: bool,
+    /// `true` when `extensions.business_context_provider` is configured
+    /// in `config.json` (HORO-1174). Presence only — never the URL or
+    /// secret command.
+    pub extension_business_context_configured: bool,
+    /// `true` when `extensions.policy_webhook` is configured.
+    pub extension_policy_webhook_configured: bool,
+    /// `true` when `extensions.events` is configured (and therefore the
+    /// event-dispatcher thread was started).
+    pub extension_events_configured: bool,
+    /// How many `webhook_deliveries` rows are still `pending` right now.
+    /// `0` when `extension_events_configured` is `false` (nothing to
+    /// deliver).
+    pub extension_events_pending: u64,
+    /// Why the `[extensions]` block was rejected, when it was present but
+    /// invalid — mirrors `config_file_error`'s discipline: the
+    /// [`std::fmt::Display`] of the same error the daemon already logs,
+    /// never a raw secret command argument (`secret_command`/
+    /// `secret_args` never contain a secret value themselves — they name
+    /// a program to run, not the secret it prints).
+    pub extension_config_error: Option<String>,
+}
+
+/// Everything recorded from a successful `RecordOutcome` push (HORO-1174).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OutcomeRecordedResult {
+    pub attested: ExecutionOutcome,
+    /// `true` if this push also promoted `receipts.outcome_json` — see
+    /// `libra_governor_ledger::LedgerStore::promote_receipt_outcome`.
+    /// `false` when the attestation was recorded but no receipt existed
+    /// yet to promote (an outcome pushed before `Finalize` ever ran for
+    /// this task), or when the attestation's
+    /// `AttestationSource::is_authoritative()` was `false` (an
+    /// `Agent`-sourced attestation is recorded but never promotes).
+    pub receipt_updated: bool,
+}
+
+/// The outcome of a `RecordOutcome` request (HORO-1174). Tagged `"state"`,
+/// mirroring [`FinalizeOutcome`]'s own discipline for the exact same
+/// reason — see that type's docs on the tag-collision bug this avoids.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum OutcomeRecordedOutcome {
+    /// `task_id` has no `tasks` row at all.
+    NoSuchTask,
+    /// This exact `(task_id, source_id, idempotency_key)` was already
+    /// recorded — a safe no-op replay, not an error.
+    Duplicate,
+    /// Boxed for the same large-enum-variant reason as
+    /// [`FinalizeOutcome::Finalized`].
+    Recorded(Box<OutcomeRecordedResult>),
 }
 
 /// One response the daemon may send back.
@@ -449,6 +527,8 @@ pub enum Response {
     /// `DoctorResult` carries an optional `EnforcementCapabilities` plus
     /// several `String`/`Option<String>` fields.
     Doctor(Box<DoctorResult>),
+    /// Answers a `RecordOutcome` request (HORO-1174).
+    OutcomeRecorded(OutcomeRecordedOutcome),
     /// The daemon could not (or would not) answer the request — e.g. a
     /// protocol version mismatch, or an internal error it caught rather
     /// than let propagate as a crash.
@@ -460,6 +540,7 @@ pub enum Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PROTOCOL_VERSION;
     use libra_governor_domain::EnforcementTier;
 
     #[test]
@@ -473,12 +554,12 @@ mod tests {
     #[test]
     fn doctor_response_round_trips_through_a_full_envelope() {
         let envelope = ResponseEnvelope {
-            protocol_version: 7,
+            protocol_version: 8,
             response: Response::Doctor(Box::new(DoctorResult {
                 daemon_version: "0.0.0".to_string(),
-                protocol_version: 7,
-                schema_version_applied: 8,
-                schema_version_known: 8,
+                protocol_version: 8,
+                schema_version_applied: 9,
+                schema_version_known: 9,
                 schema_ahead_of_binary: false,
                 policy_preset: "balanced".to_string(),
                 config_file_present: false,
@@ -494,6 +575,11 @@ mod tests {
                 )),
                 gateway_credential_configured: true,
                 telemetry_enabled: false,
+                extension_business_context_configured: false,
+                extension_policy_webhook_configured: false,
+                extension_events_configured: false,
+                extension_events_pending: 0,
+                extension_config_error: None,
             })),
         };
         let json = serde_json::to_string(&envelope).unwrap();
@@ -563,6 +649,7 @@ mod tests {
             plan_id: PlanId::new(),
             admission: None,
             completion_reserve: None,
+            business_context: None,
         };
         let json = serde_json::to_value(&result).unwrap();
         assert!(
@@ -660,5 +747,67 @@ mod tests {
         let json = serde_json::to_string(&envelope).unwrap();
         let round_tripped: ResponseEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(envelope, round_tripped);
+    }
+
+    #[test]
+    fn record_outcome_request_round_trips() {
+        let request = Request::RecordOutcome {
+            task_id: TaskId::new(),
+            plan_id: Some(PlanId::new()),
+            source_id: "example-provider".to_string(),
+            idempotency_key: "ci-run-42".to_string(),
+            outcome: libra_governor_domain::ExecutionOutcome::Completed {
+                evidence: vec!["https://ci.example.com/runs/42".to_string()],
+            },
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        let round_tripped: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(request, round_tripped);
+    }
+
+    #[test]
+    fn outcome_recorded_outcome_round_trips_every_variant() {
+        for outcome in [
+            OutcomeRecordedOutcome::NoSuchTask,
+            OutcomeRecordedOutcome::Duplicate,
+            OutcomeRecordedOutcome::Recorded(Box::new(OutcomeRecordedResult {
+                attested: libra_governor_domain::ExecutionOutcome::Completed { evidence: vec![] },
+                receipt_updated: true,
+            })),
+        ] {
+            let envelope = ResponseEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                response: Response::OutcomeRecorded(outcome.clone()),
+            };
+            let json = serde_json::to_string(&envelope).unwrap();
+            let round_tripped: ResponseEnvelope = serde_json::from_str(&json).unwrap();
+            assert_eq!(envelope, round_tripped);
+        }
+    }
+
+    #[test]
+    fn preflight_result_business_context_defaults_absent_but_present_in_schema() {
+        let result = PreflightResult {
+            task_id: TaskId::new(),
+            contract_draft: CompletionContract::first(vec![]),
+            recon_summary: ReconSummary {
+                files_scanned: 0,
+                dirs_scanned: 0,
+                likely_affected_paths: vec![],
+                detected_test_commands: vec![],
+                truncated: false,
+                reason: None,
+            },
+            confidence: Confidence::Low,
+            recon_cost_seconds: 0.01,
+            estimate: None,
+            plan_id: PlanId::new(),
+            admission: None,
+            completion_reserve: None,
+            business_context: None,
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json.get("business_context").is_some());
+        assert!(json["business_context"].is_null());
     }
 }

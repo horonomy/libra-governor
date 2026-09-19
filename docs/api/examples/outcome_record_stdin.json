@@ -1,0 +1,12 @@
+{
+  "idempotency_key": "ci-run-42",
+  "outcome": {
+    "evidence": [
+      "https://ci.example.com/runs/42"
+    ],
+    "kind": "completed"
+  },
+  "plan_id": "00000000-0000-0000-0000-000000000002",
+  "source_id": "example-provider",
+  "task_id": "00000000-0000-0000-0000-000000000001"
+}

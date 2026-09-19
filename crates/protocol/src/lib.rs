@@ -23,16 +23,18 @@ pub mod wire;
 
 pub use libra_governor_domain::Estimate;
 pub use libra_governor_domain::{
-    Confidence, CredentialCustody, EnforcementCapabilities, EnforcementTier, MonetaryEnforcement,
-    NoMonetaryCap, PolicyDecision, ResourceAmount, UsageAccounting,
+    BusinessContextSummary, Confidence, CredentialCustody, EnforcementCapabilities,
+    EnforcementTier, ExecutionOutcome, MonetaryEnforcement, NoMonetaryCap, PlanId, PolicyDecision,
+    ResourceAmount, TaskId, UsageAccounting,
 };
 pub use libra_governor_estimator::{
     AdmissionOutcome, AdmissionPolicy, AdmissionStats, CoverageReport, QuantileCoverage, Stratum,
 };
 pub use messages::{
     AdmissionPolicyReport, CalibrationReportResult, DoctorResult, FinalizeOutcome, FinalizeResult,
-    GatewayStatusResult, PreflightResult, ReconSummary, ReplanState, Request, RequestEnvelope,
-    Response, ResponseEnvelope, StatusResult, TaskSummary,
+    GatewayStatusResult, OutcomeRecordedOutcome, OutcomeRecordedResult, PreflightResult,
+    ReconSummary, ReplanState, Request, RequestEnvelope, Response, ResponseEnvelope, StatusResult,
+    TaskSummary,
 };
 
 /// The protocol version this build of the crate speaks. Bump on any
@@ -75,4 +77,15 @@ pub use messages::{
 /// must be restarted after upgrading — `libra-governor doctor` itself
 /// surfaces this plainly (a protocol-version-mismatch `Response::Error`
 /// renders as a failed "daemon reachable" check rather than a crash).
-pub const PROTOCOL_VERSION: u32 = 7;
+///
+/// Bumped 7 -> 8 for HORO-1174 (local extension points): three
+/// independent breaking shape changes, following the same precedent as
+/// every bump above. `Request` gained `RecordOutcome` and `Response`
+/// gained the matching `OutcomeRecorded` variant, which a v7 peer cannot
+/// decode; `PreflightResult` gained `business_context`; `DoctorResult`
+/// gained five new fields
+/// (`extension_business_context_configured`/`extension_policy_webhook_configured`/
+/// `extension_events_configured`/`extension_events_pending`/
+/// `extension_config_error`). Same known limitation as every earlier
+/// bump: a long-lived v7 daemon must be restarted after upgrading.
+pub const PROTOCOL_VERSION: u32 = 8;

@@ -1,0 +1,23 @@
+{
+  "HORO-1174": {
+    "priority": "high",
+    "deadline_hours_from_now": 4,
+    "cost_center": "eng-platform",
+    "advisory_criteria": [
+      "verify the fix against the linked ticket's reproduction steps",
+      "run the full workspace test suite before finalizing"
+    ],
+    "external_refs": [
+      {"kind": "jira", "value": "HORO-1174"}
+    ]
+  },
+  "HORO-0001": {
+    "priority": "low",
+    "deadline_hours_from_now": null,
+    "cost_center": "eng-experimental",
+    "advisory_criteria": [],
+    "external_refs": [
+      {"kind": "jira", "value": "HORO-0001"}
+    ]
+  }
+}
