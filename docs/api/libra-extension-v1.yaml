@@ -1,0 +1,589 @@
+openapi: 3.1.0
+info:
+  title: Libra Governor — Local Extension Points (libra.extension.v1)
+  version: "1.0.0"
+  description: |
+    The versioned customization boundary the local `libra-governor` daemon
+    speaks to a locally-run provider process, per HORO-1174 /
+    `docs/adr/0005-local-extension-points.md`.
+
+    ## Trust boundary
+
+    Every request described here is **outbound only**, from the daemon to
+    a provider the operator configured in `config.json`'s `[extensions]`
+    block. The daemon never opens a new inbound HTTP listener for any of
+    this — the only new *inbound* surface HORO-1174 adds is
+    `Request::RecordOutcome` on the existing Unix domain socket protocol
+    (see `crates/protocol`), which is out of scope for this document.
+
+    ## Loopback-only, plaintext HTTP
+
+    Every URL configured for these three surfaces MUST use scheme `http`
+    and a host that is the **literal** `127.0.0.1` or `::1` — never
+    `localhost` (no DNS dependency) and never a routable address. This is
+    a structural SSRF mitigation: the destination is operator-configured,
+    never request-derived, and a loopback literal needs no name
+    resolution at all. There is deliberately no TLS support — see
+    `crates/extension/src/config.rs` module docs for the full rationale.
+
+    ## Authentication — HMAC-SHA256 request signing
+
+    Every outbound request from the daemon (business-context fetch,
+    policy-webhook call, event delivery) carries these five headers,
+    computed **fresh on every attempt** — never persisted, never reused
+    across a retry:
+
+    | Header | Meaning |
+    |---|---|
+    | `x-libra-schema-version` | Always `libra.extension.v1` for this contract version. |
+    | `x-libra-request-id` | A fresh UUID per attempt — not a stable per-event id. |
+    | `x-libra-timestamp` | Unix seconds, current wall clock, minted at send time. |
+    | `x-libra-nonce` | 32 hex characters of CSPRNG randomness, fresh per attempt. |
+    | `x-libra-signature` | `v1=<hex HMAC-SHA256>` — see below. |
+
+    Signature computation: `HMAC-SHA256(secret, "v1." + timestamp + "." +
+    nonce + "." + raw_request_body)`, hex-encoded and prefixed `v1=`. The
+    signing secret is resolved once per daemon process (by running the
+    configured `secret_command`) and cached — see
+    `crates/extension/src/secret.rs`. A provider must recompute the same
+    HMAC over the exact raw bytes it received and reject the request on
+    any mismatch, missing header, or a `x-libra-timestamp` outside its own
+    acceptable clock-skew window.
+
+    A provider implementation should also track `x-libra-nonce` values it
+    has already seen (within its accepted timestamp window) and reject a
+    repeat — this is what makes the freshness of the header meaningful
+    rather than decorative. See `examples/local-providers/libra_example_provider.py`
+    for a real reference implementation of both checks.
+
+    ## Response size cap
+
+    A provider response body over 64 KiB is rejected by the client without
+    being parsed (`crate::client::collect_capped`).
+
+    ## Fail-open
+
+    A provider that times out, refuses, or returns a malformed/oversized
+    response never blocks or fails the governed operation — the daemon
+    proceeds as though that surface were not configured. This applies to
+    every surface below except event delivery, whose failure is retried
+    on a backoff ladder and then abandoned (see `crates/extension/src/dispatcher.rs`),
+    never surfaced synchronously to anything.
+
+servers:
+  - url: http://127.0.0.1:{port}
+    description: Loopback-only. Port and path come entirely from the operator's config.json.
+    variables:
+      port:
+        default: "8787"
+
+paths:
+  /{business_context_path}:
+    post:
+      operationId: fetchBusinessContext
+      summary: Business Context Provider fetch
+      description: |
+        Called once per `PreflightIssue`/`PreflightRequest` handling in
+        `handle_preflight`, before the admission decision is computed.
+        Timeout default 500ms, hard cap 700ms (`config.rs::BUSINESS_CONTEXT_TIMEOUT_CAP_MS`).
+
+        **R1 — structural separation from `TaskFeatures`.** The response
+        below is never merged into `TaskFeatures`; it is carried as a
+        wholly separate `BusinessContext`/`BusinessContextSummary` value
+        (`crates/domain/src/business_context.rs`).
+
+        **R2 — the sharpest rule in this contract.** A provider's
+        `advisory_criteria` are recorded and surfaced for human/agent
+        visibility (event payloads, evidence reports), but they are
+        **never** merged into `Policy.quality_floor` and **never** change
+        what admission or replan logic treats as "done." The only
+        functional effect a Business Context response can have on policy
+        evaluation is narrowing the *time* bound (`target_secs` /
+        `hard_ceiling_secs` / `elastic_ceiling_secs` / effective deadline)
+        via `deadline`, and even that narrowing is computed into an
+        **ephemeral** `effective_policy` used for that one
+        `Policy::evaluate` call — it is never written back into
+        `config.policy`, `task_budgets.policy`, or any other durable
+        state. See `crates/domain/src/business_context.rs::apply_business_context`
+        and its property tests.
+      parameters:
+        - $ref: '#/components/parameters/SchemaVersionHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+        - $ref: '#/components/parameters/TimestampHeader'
+        - $ref: '#/components/parameters/NonceHeader'
+        - $ref: '#/components/parameters/SignatureHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BusinessContextRequest'
+            example:
+              $ref: './examples/business_context_request.json'
+      responses:
+        '200':
+          description: |
+            A business context the daemon may use to narrow the deadline
+            bound of this task's policy (see R2 above). Every field is
+            optional; an absent field is simply not applied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BusinessContextResponse'
+              example:
+                $ref: './examples/business_context_response.json'
+        default:
+          description: |
+            Any non-200 status, timeout, connection refusal, oversized
+            body, or body that fails to parse is treated identically:
+            the daemon proceeds as though no business context was
+            fetched (fail-open).
+
+  /{policy_webhook_path}:
+    post:
+      operationId: requestPolicyDecision
+      summary: Policy Webhook call
+      description: |
+        Called **only** when the locally-computed admission decision is
+        `ApprovalRequired` — never for `Admit` or `Deny`. Timeout default
+        700ms, hard cap 700ms.
+
+        The provider's verdict can only affect the `ApprovalRequired`
+        outcome: `approve` moves it to `Admit`, `reject` moves it to
+        `Deny` with `DenyReason::ExternalPolicyRejected`, and `abstain`
+        (or any failure/timeout/malformed response) leaves it
+        `ApprovalRequired` unchanged. An external verdict can never widen
+        an already-`Deny`'d admission and can never narrow (skip) an
+        already-`Admit`'d one — see
+        `crates/domain/src/external_approval.rs::apply_external_approval`.
+      parameters:
+        - $ref: '#/components/parameters/SchemaVersionHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+        - $ref: '#/components/parameters/TimestampHeader'
+        - $ref: '#/components/parameters/NonceHeader'
+        - $ref: '#/components/parameters/SignatureHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PolicyWebhookRequest'
+            example:
+              $ref: './examples/policy_webhook_request.json'
+      responses:
+        '200':
+          description: The provider's approve/reject/abstain verdict.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PolicyWebhookResponse'
+              example:
+                $ref: './examples/policy_webhook_response.json'
+        default:
+          description: |
+            Any non-200 status, timeout, connection refusal, oversized
+            body, or unrecognized `verdict` string is treated identically
+            to `abstain` (fail-open) — the admission stays `ApprovalRequired`.
+
+  /{events_path}:
+    post:
+      operationId: deliverEvent
+      summary: Signed event delivery
+      description: |
+        One `EventEnvelope<T>` per delivery, enqueued durably in the
+        `webhook_deliveries` ledger table at the moment the underlying
+        fact happens (admission decided, replan triggered, approval
+        still required, or an outcome recorded) and delivered
+        asynchronously by a background dispatcher thread on a backoff
+        ladder (1s / 5s / 30s / 2m / 10m, then abandoned — see
+        `crates/extension/src/dispatcher.rs`).
+
+        An extra header not present on the other two surfaces:
+        `x-libra-delivery-attempt` (the 1-based attempt number for this
+        delivery). The event body itself — including `event_id` — is
+        byte-identical across every attempt for the same delivery; only
+        the five signing headers above are recomputed per attempt
+        (per-attempt signing, not per-enqueue — see
+        `crates/extension/src/sign.rs` module docs). A provider should
+        dedupe on `event_id`, not on `x-libra-request-id` or
+        `x-libra-nonce` (which are fresh every attempt by design).
+      parameters:
+        - $ref: '#/components/parameters/SchemaVersionHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+        - $ref: '#/components/parameters/TimestampHeader'
+        - $ref: '#/components/parameters/NonceHeader'
+        - $ref: '#/components/parameters/SignatureHeader'
+        - name: x-libra-delivery-attempt
+          in: header
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/AdmissionEventEnvelope'
+                - $ref: '#/components/schemas/ReplanEventEnvelope'
+                - $ref: '#/components/schemas/ApprovalEventEnvelope'
+                - $ref: '#/components/schemas/OutcomeEventEnvelope'
+              discriminator:
+                propertyName: event_kind
+                mapping:
+                  admission: '#/components/schemas/AdmissionEventEnvelope'
+                  replan: '#/components/schemas/ReplanEventEnvelope'
+                  approval: '#/components/schemas/ApprovalEventEnvelope'
+                  outcome: '#/components/schemas/OutcomeEventEnvelope'
+            examples:
+              admission:
+                value:
+                  $ref: './examples/event_admission.json'
+              replan:
+                value:
+                  $ref: './examples/event_replan.json'
+              approval:
+                value:
+                  $ref: './examples/event_approval.json'
+              outcome:
+                value:
+                  $ref: './examples/event_outcome.json'
+      responses:
+        '200':
+          description: Delivery accepted. Body is ignored.
+        default:
+          description: |
+            Any non-2xx status or timeout marks this attempt failed and
+            schedules the next backoff-ladder retry (or abandons delivery
+            after `events.max_attempts` failed attempts). Never
+            propagated back to the operation that originally enqueued
+            the event — this surface is fully decoupled from the
+            request path.
+
+components:
+  parameters:
+    SchemaVersionHeader:
+      name: x-libra-schema-version
+      in: header
+      required: true
+      schema:
+        type: string
+        const: libra.extension.v1
+    RequestIdHeader:
+      name: x-libra-request-id
+      in: header
+      required: true
+      schema:
+        type: string
+        format: uuid
+    TimestampHeader:
+      name: x-libra-timestamp
+      in: header
+      required: true
+      schema:
+        type: integer
+        description: Unix seconds.
+    NonceHeader:
+      name: x-libra-nonce
+      in: header
+      required: true
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{32}$'
+    SignatureHeader:
+      name: x-libra-signature
+      in: header
+      required: true
+      schema:
+        type: string
+        pattern: '^v1=[0-9a-f]{64}$'
+
+  schemas:
+    BusinessContextRequest:
+      type: object
+      required: [schema_version, request_id, task_id, session_id, repo_key, cwd, occurred_at]
+      properties:
+        schema_version:
+          type: string
+          const: libra.extension.v1
+        request_id:
+          type: string
+        task_id:
+          type: string
+          format: uuid
+        session_id:
+          type: string
+        repo_key:
+          type: string
+          description: A short, non-reversible repository identifier — never a path or URL.
+        cwd:
+          type: string
+          description: The task's working directory, as a filesystem path.
+        occurred_at:
+          type: string
+          format: date-time
+
+    BusinessContextResponse:
+      type: object
+      required: [schema_version, provider_id]
+      properties:
+        schema_version:
+          type: string
+          const: libra.extension.v1
+        provider_id:
+          type: string
+        priority:
+          $ref: '#/components/schemas/Priority'
+        deadline:
+          type: string
+          format: date-time
+          description: |
+            RFC3339. If present and in the future, narrows the task's
+            time bound only — see R2 in the path description above.
+        cost_center:
+          type: string
+          description: Advisory / recorded only — never a policy input.
+        advisory_criteria:
+          type: array
+          items:
+            type: string
+            maxLength: 200
+          maxItems: 16
+          description: |
+            Free-text completion criteria from the provider — recorded
+            and surfaced for visibility only. NEVER merged into
+            `Policy.quality_floor` or any other admission/replan input.
+            See R2.
+        external_refs:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExternalRef'
+
+    Priority:
+      type: string
+      enum: [low, normal, high, urgent]
+
+    ExternalRef:
+      type: object
+      required: [kind, value]
+      properties:
+        kind:
+          type: string
+          enum: [jira, github, other]
+        value:
+          type: string
+
+    PolicyWebhookRequest:
+      type: object
+      required:
+        - schema_version
+        - request_id
+        - task_id
+        - plan_id
+        - session_id
+        - policy_name
+        - policy_schema_version
+        - approval_requests
+        - projected_resource
+        - projected_duration_secs
+        - confidence
+        - occurred_at
+      properties:
+        schema_version:
+          type: string
+          const: libra.extension.v1
+        request_id:
+          type: string
+        task_id:
+          type: string
+          format: uuid
+        plan_id:
+          type: string
+          format: uuid
+        session_id:
+          type: string
+        policy_name:
+          type: string
+        policy_schema_version:
+          type: string
+        approval_requests:
+          type: array
+          items:
+            type: object
+            description: A `libra_governor_domain::ApprovalRequest` variant (resource or time).
+        projected_resource:
+          type: object
+          description: A `libra_governor_domain::ResourceAmount` (tagged union).
+        projected_duration_secs:
+          type: integer
+        confidence:
+          type: string
+          enum: [low, medium, high]
+        occurred_at:
+          type: string
+          format: date-time
+
+    PolicyWebhookResponse:
+      type: object
+      required: [schema_version, provider_id, verdict]
+      properties:
+        schema_version:
+          type: string
+          const: libra.extension.v1
+        provider_id:
+          type: string
+        verdict:
+          type: string
+          enum: [approve, reject, abstain]
+        reason:
+          type: string
+          maxLength: 200
+          description: Required-in-practice for `reject`; ignored for `approve`/`abstain`.
+
+    EventEnvelopeBase:
+      type: object
+      required: [schema_version, event_id, event_kind, occurred_at, daemon_version, data]
+      properties:
+        schema_version:
+          type: string
+          const: libra.extension.v1
+        event_id:
+          type: string
+          format: uuid
+          description: Stable across every delivery attempt for this event.
+        event_kind:
+          type: string
+          enum: [admission, replan, approval, outcome]
+        occurred_at:
+          type: string
+          format: date-time
+        daemon_version:
+          type: string
+
+    AdmissionEventEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelopeBase'
+        - type: object
+          properties:
+            data:
+              type: object
+              required:
+                - task_id
+                - plan_id
+                - session_id
+                - admission
+                - resource_outcome
+                - time_outcome
+                - confidence_ok
+                - projected_resource
+                - projected_duration_secs
+                - policy_name
+                - policy_schema_version
+              properties:
+                task_id: { type: string, format: uuid }
+                plan_id: { type: string, format: uuid }
+                session_id: { type: string }
+                admission:
+                  type: string
+                  enum: [admit, approval_required, deny]
+                resource_outcome: { type: string, enum: [admit, approval_required, deny] }
+                time_outcome: { type: string, enum: [admit, approval_required, deny] }
+                confidence_ok: { type: boolean }
+                projected_resource: { type: object }
+                projected_duration_secs: { type: integer }
+                policy_name: { type: string }
+                policy_schema_version: { type: string }
+                business_context:
+                  type: object
+                  nullable: true
+                  properties:
+                    provider_id: { type: string }
+                    applied: { type: boolean }
+                external_approval:
+                  type: object
+                  nullable: true
+                  properties:
+                    provider_id: { type: string }
+                    verdict: { type: string, enum: [approve, reject, abstain] }
+
+    ReplanEventEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelopeBase'
+        - type: object
+          properties:
+            data:
+              type: object
+              required:
+                - task_id
+                - prior_plan_id
+                - new_plan_id
+                - trigger
+                - detail
+                - auto_replan_count
+                - remaining_confidence
+              properties:
+                task_id: { type: string, format: uuid }
+                prior_plan_id: { type: string, format: uuid }
+                new_plan_id: { type: string, format: uuid }
+                trigger: { type: string }
+                detail: { type: string }
+                auto_replan_count: { type: integer }
+                remaining_duration_p80_secs: { type: integer, nullable: true }
+                remaining_confidence: { type: string, enum: [low, medium, high] }
+
+    ApprovalEventEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelopeBase'
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [task_id, plan_id, approval_requests]
+              properties:
+                task_id: { type: string, format: uuid }
+                plan_id: { type: string, format: uuid }
+                approval_requests:
+                  type: array
+                  items:
+                    type: object
+                external_approval:
+                  type: object
+                  nullable: true
+                  properties:
+                    provider_id: { type: string }
+                    verdict: { type: string, enum: [approve, reject, abstain] }
+
+    OutcomeEventEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelopeBase'
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [task_id, outcome_kind, evidence, source, attested_at]
+              properties:
+                task_id: { type: string, format: uuid }
+                plan_id: { type: string, format: uuid, nullable: true }
+                outcome_kind:
+                  type: string
+                  enum: [completed, failed, aborted, unknown]
+                evidence:
+                  type: array
+                  items:
+                    type: string
+                  description: References only (URLs, ids) — never inlined content.
+                source:
+                  type: string
+                  enum: [provider, governor_local, agent]
+                  description: |
+                    R3 — only `provider` and `governor_local` are
+                    authoritative and may promote a receipt outcome;
+                    `agent`-sourced attestations are recorded but never
+                    promote. See `crates/domain/src/outcome_attestation.rs::AttestationSource::is_authoritative`.
+                source_id:
+                  type: string
+                  nullable: true
+                attested_at:
+                  type: string
+                  format: date-time
