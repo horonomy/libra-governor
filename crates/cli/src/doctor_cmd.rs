@@ -261,12 +261,13 @@ fn codex_hooks_finding() -> Finding {
     };
     let inspection = codex_hooks_file::inspect(&path);
     let all_hooks_wired = inspection.hooks_wired.iter().all(|w| *w);
+    let no_hooks_wired = inspection.hooks_wired.iter().all(|w| !*w);
 
     if !inspection.file_present || !all_hooks_wired {
         return Finding {
             id: "codex_hooks",
             severity: Severity::Warn,
-            message: if !inspection.file_present {
+            message: if !inspection.file_present || no_hooks_wired {
                 format!(
                     "not installed into {} — run `libra-governor install --agent codex`",
                     path.display()
