@@ -168,6 +168,58 @@ Exit code `0` unless at least one finding is error-severity — a daemon
 that simply has not started yet (the normal state before your first
 prompt) is a warning, not a failure.
 
+## Evidence export (opt-in, manual): `libra-governor evidence-report`
+
+This is **not telemetry**. Nothing here runs automatically, nothing runs
+in the background, and nothing is ever transmitted anywhere by this tool
+— it is a manual self-report export you run deliberately, and it makes
+zero network calls.
+
+It exists for HORO-1154: when a real Claude Code/Codex power user is
+participating in an evaluation and has agreed to share their local usage
+signals with the founder, this gives them a way to do that without
+handing over prompt text, source code, or tool output.
+
+```bash
+libra-governor evidence-report consent   # records explicit opt-in, once
+libra-governor evidence-report           # refuses without the above
+```
+
+`consent` writes a timestamped marker to
+`~/.local/state/libra-governor/evidence_consent.json`. Without it,
+`evidence-report` refuses outright and explains why — it never collects
+or writes anything on your behalf without this explicit step.
+
+With consent on record, `evidence-report`:
+
+1. Reads coarse, privacy-safe **counts** out of your local ledger: how
+   many preflights you've run, how many were admitted vs. denied, how
+   many replans happened, how many tasks you finished (Execution
+   Receipts). Every one of these is a `COUNT()`-style aggregate — see
+   `libra_governor_ledger::EvidenceAggregates`, which is structurally
+   incapable of holding a prompt fragment, a file path, or tool output.
+2. Reads whether Claude Code's hooks/statusline are currently wired into
+   `~/.claude/settings.json` — a real, observable fact. It explicitly
+   **cannot** detect whether you ran a session with the hooks removed or
+   otherwise worked around them; that is invisible from inside this
+   product, and the exported report says so in plain language rather
+   than inventing a signal for it.
+3. Prompts you, interactively, for the open-ended questions HORO-1154
+   asks about: perceived friction, whether you'd route more work through
+   it, team/Codex demand, and a willingness-to-pay signal. Whatever you
+   type is included verbatim — this is genuinely your own words, never
+   inferred or fabricated on your behalf.
+4. Writes one JSON file and one Markdown file locally, under
+   `~/.local/state/libra-governor/evidence-reports/`, and prints their
+   paths. That's it. **You** decide whether and how to send either file
+   to anyone (e.g. attach the Markdown to an email) — this command never
+   does that for you.
+
+See `crates/cli/src/evidence_report_cmd.rs` for the full contract and
+`crates/cli/tests/evidence_report_privacy.rs` for the automated evidence
+that a real prompt nonce, driven through a real Preflight, never appears
+anywhere in the exported files.
+
 ## Troubleshooting
 
 Real, observed failure modes and the exact fix — not invented generic
@@ -209,10 +261,16 @@ Truthful, matching the actual implementation — not aspirational copy:
   provider-spend limits — it does not inspect, log, or exfiltrate
   request/response bodies at any level; there is deliberately no debug
   body-dump switch anywhere in the code.
-- **What is never uploaded by default:** everything. There is no
-  telemetry code path anywhere in this repository, and no Team Alpha /
-  cross-machine sync exists yet — `libra-governor doctor`'s telemetry
-  finding reflects this as a real, observed absence, not an aspiration.
+- **What is never uploaded automatically:** everything. There is no
+  telemetry code path anywhere in this repository — nothing runs on a
+  schedule, in the background, or without your explicit invocation — and
+  no Team Alpha / cross-machine sync exists yet — `libra-governor
+  doctor`'s telemetry finding reflects this as a real, observed absence,
+  not an aspiration. The one exception is `libra-governor evidence-report`
+  (see "Evidence export" above): a manual, opt-in-gated command you run
+  yourself, that writes a local file and makes no network call of its
+  own — it is a self-report export tool, not telemetry, and it never
+  decides on your behalf to send anything anywhere.
 - **Logs and receipts:** `daemon.log`
   (`crates/daemon/src/log.rs`) never receives raw prompt text or hook
   payload content. Execution receipts record structural facts (counts,

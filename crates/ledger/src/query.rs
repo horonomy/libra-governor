@@ -635,6 +635,117 @@ impl LedgerStore {
         }
         Ok((pairs, dropped))
     }
+
+    /// Coarse, privacy-safe aggregate counts over this ledger's entire
+    /// history (HORO-1154's `evidence-report` CLI command). Every number
+    /// here is a `COUNT(*)`-style aggregate or a parsed
+    /// [`Admission`]/[`ReplanRecord`] variant tag — never a task
+    /// description, prompt fragment, tool argument, or any other content
+    /// field. See `crates/cli/src/evidence_report_cmd.rs` for the caller
+    /// and its own no-network-call, opt-in-gated contract.
+    pub fn evidence_aggregates(&self) -> Result<EvidenceAggregates, LedgerError> {
+        let task_count: u64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))?;
+
+        // Every `plans` row with no `replaces_plan_id` is an original
+        // preflight plan (HORO-1146's `plan_admission` migration doc);
+        // one with a `replaces_plan_id` is a replan-produced plan,
+        // counted separately below via `replan_events` (the durable,
+        // purpose-built replan history table).
+        let preflight_count: u64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM plans WHERE replaces_plan_id IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        let replan_count: u64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM replan_events", [], |row| row.get(0))?;
+
+        let completed_task_count: u64 =
+            self.conn
+                .query_row("SELECT COUNT(DISTINCT task_id) FROM receipts", [], |row| {
+                    row.get(0)
+                })?;
+        let completed_execution_count: u64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM receipts", [], |row| row.get(0))?;
+
+        let mut admission_admit_count = 0u64;
+        let mut admission_deny_count = 0u64;
+        let mut admission_approval_required_count = 0u64;
+        let mut admission_unrecorded_count = 0u64;
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT admission_json FROM plans WHERE replaces_plan_id IS NULL")?;
+            let rows = stmt.query_map([], |row| row.get::<_, Option<String>>(0))?;
+            for row in rows {
+                match parse_admission(row?)? {
+                    None => admission_unrecorded_count += 1,
+                    Some(Admission::Admit) => admission_admit_count += 1,
+                    Some(Admission::Deny(_)) => admission_deny_count += 1,
+                    Some(Admission::ApprovalRequired(_)) => admission_approval_required_count += 1,
+                }
+            }
+        }
+
+        let earliest_task_created_at: Option<String> =
+            self.conn
+                .query_row("SELECT MIN(created_at) FROM tasks", [], |row| row.get(0))?;
+
+        Ok(EvidenceAggregates {
+            task_count,
+            preflight_count,
+            replan_count,
+            completed_task_count,
+            completed_execution_count,
+            admission_admit_count,
+            admission_deny_count,
+            admission_approval_required_count,
+            admission_unrecorded_count,
+            earliest_task_created_at,
+        })
+    }
+}
+
+/// Coarse, privacy-safe aggregate counts returned by
+/// [`LedgerStore::evidence_aggregates`]. Every field is a count, a
+/// timestamp, or an admission-outcome tally — deliberately shaped so it
+/// is structurally impossible for this type to carry a prompt fragment,
+/// file path, or tool-output string.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EvidenceAggregates {
+    /// Total distinct tasks this ledger has ever recorded.
+    pub task_count: u64,
+    /// Original (non-replan) preflight plans — one per admission attempt.
+    pub preflight_count: u64,
+    /// Replan events recorded in `replan_events` (auto or material-event
+    /// triggered), across all tasks.
+    pub replan_count: u64,
+    /// Distinct tasks with at least one finalized Execution Receipt.
+    pub completed_task_count: u64,
+    /// Total Execution Receipts recorded (a task can in principle gain
+    /// more than one plan/receipt pair across replans and restarts, so
+    /// this can exceed `completed_task_count`).
+    pub completed_execution_count: u64,
+    /// Preflight (non-replan) plans whose recorded admission was `Admit`.
+    pub admission_admit_count: u64,
+    /// Preflight (non-replan) plans whose recorded admission was `Deny`.
+    pub admission_deny_count: u64,
+    /// Preflight (non-replan) plans whose recorded admission was
+    /// `ApprovalRequired`.
+    pub admission_approval_required_count: u64,
+    /// Preflight (non-replan) plans with no recorded admission at all —
+    /// a pre-HORO-1146 row, or a plan constructed without evaluating a
+    /// policy. Reported explicitly rather than silently folded into one
+    /// of the other buckets.
+    pub admission_unrecorded_count: u64,
+    /// RFC 3339 timestamp of this ledger's earliest recorded task, if
+    /// any — the closest honest proxy this ledger has for "install
+    /// date" (the ledger file's own creation time is a filesystem
+    /// property `evidence-report` reports separately, not from here).
+    pub earliest_task_created_at: Option<String>,
 }
 
 /// One finalized [`ExecutionReceipt`] paired with the [`Estimate`] its
@@ -753,6 +864,118 @@ mod calibration_pairs_tests {
         let (pairs, dropped) = store.calibration_pairs().unwrap();
         assert_eq!(pairs.len(), 2);
         assert_eq!(dropped, 2);
+    }
+}
+
+#[cfg(test)]
+mod evidence_aggregates_tests {
+    use super::*;
+    use libra_governor_domain::{
+        BucketTier, CompletionCriterion, Confidence, DenyReason, ReplanTriggerKind, TaskIdentity,
+    };
+
+    fn now() -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH
+    }
+
+    /// Seeds one task with a contract and a preflight plan carrying the
+    /// given admission (or none), returning the task id and plan.
+    fn seed_preflight(store: &mut LedgerStore, admission: Option<Admission>) -> (TaskId, PlanId) {
+        let identity = TaskIdentity::new(None);
+        store.insert_task(&identity, now()).unwrap();
+        let contract = CompletionContract::first(vec![CompletionCriterion::required("c")]);
+        store
+            .insert_contract(identity.id, &contract, now())
+            .unwrap();
+        let mut plan = ExecutionPlan::new(identity.id, contract.revision, None, now());
+        if let Some(admission) = admission {
+            plan = plan.with_admission(admission);
+        }
+        let plan_id = plan.id;
+        store.insert_plan(&plan).unwrap();
+        (identity.id, plan_id)
+    }
+
+    #[test]
+    fn an_empty_ledger_reports_all_zero_counts_and_no_earliest_task() {
+        let store = LedgerStore::open_in_memory().unwrap();
+        let agg = store.evidence_aggregates().unwrap();
+        assert_eq!(agg, EvidenceAggregates::default());
+    }
+
+    #[test]
+    fn aggregates_reflect_real_seeded_state_exactly() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+
+        // Two admitted preflights, one denied, one with no admission
+        // recorded at all.
+        seed_preflight(&mut store, Some(Admission::Admit));
+        let (task_id, plan_id) = seed_preflight(&mut store, Some(Admission::Admit));
+        seed_preflight(
+            &mut store,
+            Some(Admission::Deny(vec![
+                DenyReason::ConfidenceBelowThreshold {
+                    actual: Confidence::Low,
+                    required: Confidence::Medium,
+                },
+            ])),
+        );
+        seed_preflight(&mut store, None);
+
+        // One replan against the second admitted task.
+        let reason = ReplanReason::new(ReplanTriggerKind::ToolCallCountExceeded, "test replan");
+        let remaining = libra_governor_domain::RemainingEstimate::from_bucketed(Estimate {
+            duration_p50_secs: Some(30),
+            duration_p80_secs: Some(50),
+            duration_p90_secs: Some(60),
+            resource_p50: None,
+            resource_p80: None,
+            resource_p90: None,
+            confidence: Confidence::Medium,
+            sample_count: 8,
+            cold_start: false,
+            estimator_version: "v3-tiered-confidence".to_string(),
+            reason: None,
+            feature_schema_version: "fs-v1".to_string(),
+            bucket_tier: BucketTier::Global,
+        });
+        let new_plan = ExecutionPlan::new(task_id, 1, None, now())
+            .with_replan_linkage(plan_id, reason.clone());
+        store.insert_plan(&new_plan).unwrap();
+        let record = ReplanRecord {
+            id: ReplanId::new(),
+            task_id,
+            prior_plan_id: plan_id,
+            new_plan_id: new_plan.id,
+            reason,
+            remaining_estimate: remaining,
+            created_at: now(),
+        };
+        store.insert_replan_event(&record).unwrap();
+
+        // One finalized receipt for that same task.
+        let receipt = ExecutionReceipt::new(
+            task_id,
+            1,
+            new_plan.id,
+            120,
+            vec![],
+            ExecutionOutcome::Unknown,
+            now(),
+        );
+        store.insert_receipt(&receipt).unwrap();
+
+        let agg = store.evidence_aggregates().unwrap();
+        assert_eq!(agg.task_count, 4);
+        assert_eq!(agg.preflight_count, 4);
+        assert_eq!(agg.replan_count, 1);
+        assert_eq!(agg.completed_task_count, 1);
+        assert_eq!(agg.completed_execution_count, 1);
+        assert_eq!(agg.admission_admit_count, 2);
+        assert_eq!(agg.admission_deny_count, 1);
+        assert_eq!(agg.admission_approval_required_count, 0);
+        assert_eq!(agg.admission_unrecorded_count, 1);
+        assert!(agg.earliest_task_created_at.is_some());
     }
 }
 
