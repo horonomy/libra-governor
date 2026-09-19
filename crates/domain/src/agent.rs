@@ -32,9 +32,11 @@
 //! `model_gateway: Unavailable` — a hard budget cannot be pre-spend
 //! enforced through a gateway that is not itself available for this
 //! host. See the `hard_budget_enforcement_never_outruns_model_gateway`
-//! test below; it inspects every [`AgentKind`] `for_agent` produces, not
-//! just the two currently defined, so a future agent variant cannot
-//! silently violate the invariant.
+//! test below; it inspects every entry in [`AgentKind::ALL`], and
+//! [`AgentKind::all_variants_is_exhaustive`]'s compile-time-only match is
+//! a tripwire that fails the build if a new [`AgentKind`] variant is
+//! added without also adding it to [`AgentKind::ALL`] — so a future
+//! agent variant cannot silently slip past this invariant unnoticed.
 
 use serde::{Deserialize, Serialize};
 
@@ -49,6 +51,30 @@ pub const AGENT_ADAPTER_CONTRACT_VERSION: &str = "agent-adapter-v1";
 pub enum AgentKind {
     ClaudeCode,
     Codex,
+}
+
+impl AgentKind {
+    /// Every [`AgentKind`] variant that exists today. The sole shared
+    /// source of "all agents" for both this module's invariant test and
+    /// `agents_cmd.rs`'s human/JSON rendering — do not duplicate this
+    /// list elsewhere.
+    ///
+    /// [`Self::all_variants_is_exhaustive`] below is a compile-time
+    /// tripwire: adding a new [`AgentKind`] variant makes that function's
+    /// `match` non-exhaustive, which fails the build until this constant
+    /// (and every other exhaustive match on [`AgentKind`]) is updated. Without
+    /// that guard, a new variant could silently miss this list while
+    /// everything still compiled.
+    pub const ALL: [AgentKind; 2] = [AgentKind::ClaudeCode, AgentKind::Codex];
+
+    /// Compile-time-only exhaustiveness check for [`Self::ALL`] — never
+    /// called at runtime. See [`Self::ALL`]'s doc comment.
+    #[allow(dead_code)]
+    fn all_variants_is_exhaustive(agent: AgentKind) {
+        match agent {
+            AgentKind::ClaudeCode | AgentKind::Codex => {}
+        }
+    }
 }
 
 /// The normalized hook-lifecycle event vocabulary this integration
@@ -305,7 +331,7 @@ mod tests {
     use super::*;
 
     fn all_agents() -> [AgentKind; 2] {
-        [AgentKind::ClaudeCode, AgentKind::Codex]
+        AgentKind::ALL
     }
 
     /// The structural invariant this module must never violate: a
