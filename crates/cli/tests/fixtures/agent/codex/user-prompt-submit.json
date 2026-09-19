@@ -1,0 +1,11 @@
+{
+  "_source": "Codex CLI UserPromptSubmit hook payload, transcribed from openai/codex's generated hook-payload JSON schemas as cited in docs/adr/0004-agent-adapter-contract.md — session_id, cwd, prompt, model, turn_id, permission_mode, hook_event_name, transcript_path (+ optional agent_id/agent_type). Uses the SAME session_id/cwd/prompt as ../claude-code/user-prompt-submit.json on purpose (see crates/cli/tests/agent_contract_v2.rs's cross-agent equivalence test).",
+  "session_id": "fixture-session",
+  "cwd": "__CWD__",
+  "prompt": "fix the login bug",
+  "model": "gpt-5-codex",
+  "turn_id": "turn-1",
+  "permission_mode": "auto",
+  "hook_event_name": "UserPromptSubmit",
+  "transcript_path": "/tmp/codex-does-not-matter.jsonl"
+}

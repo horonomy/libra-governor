@@ -1,0 +1,7 @@
+{
+  "_source": "hook_event_name deliberately set to a genuine agent lifecycle event (SessionStart) that this integration recognizes but does not wire to any daemon action in MVP 1.0 (see the HORO-1157 non-goals) — exercises NormalizedEvent::RecognizedUnwired.",
+  "session_id": "fixture-session-recognized-unwired",
+  "cwd": "__CWD__",
+  "prompt": "anything",
+  "hook_event_name": "SessionStart"
+}

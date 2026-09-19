@@ -1,0 +1,9 @@
+{
+  "_source": "Claude Code PostToolUse hook payload, per Claude Code's own hooks documentation.",
+  "session_id": "fixture-session",
+  "cwd": "__CWD__",
+  "tool_name": "Bash",
+  "tool_input": { "command": "ls" },
+  "tool_output": "some output",
+  "hook_event_name": "PostToolUse"
+}
