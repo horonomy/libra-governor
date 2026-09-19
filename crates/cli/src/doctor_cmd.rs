@@ -21,11 +21,11 @@
 //! JSON parse-position message — `config.json` never contains a secret
 //! value itself (only a *pointer* to one, e.g. `security` or `op`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use libra_governor_protocol::{DoctorResult, Request, Response};
 
-use crate::{claude_settings, client, gateway_cmd};
+use crate::{claude_settings, client, codex_hooks_file, gateway_cmd};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Severity {
@@ -107,6 +107,7 @@ fn collect_findings() -> Vec<Finding> {
     }
 
     findings.push(claude_settings_finding());
+    findings.push(codex_hooks_finding());
     findings
 }
 
@@ -236,6 +237,245 @@ fn claude_settings_finding() -> Finding {
             message: format!("hooks and statusline wired in {}", path.display()),
         }
     }
+}
+
+/// The `codex_hooks.json` mirror of [`claude_settings_finding`]
+/// (HORO-1157): whether `~/.codex/hooks.json` (or
+/// `$CODEX_HOME/hooks.json`) has this integration's three hook groups
+/// wired, whether the wired command path matches the binary currently
+/// running this `doctor` invocation (a moved binary needs re-trust —
+/// Codex's trust gate is keyed by content hash, so a relocated binary is
+/// silently a *different* hash from Codex's point of view even though
+/// its content is identical), and a best-effort, read-only look at
+/// `~/.codex/config.toml`'s `[hooks.state]` trust gate. See
+/// [`codex_trust_state`] for why that last part is conservative by
+/// design: never claim trusted when this doctor cannot confidently
+/// parse the evidence for it.
+fn codex_hooks_finding() -> Finding {
+    let Ok(path) = codex_hooks_file::hooks_path() else {
+        return Finding {
+            id: "codex_hooks",
+            severity: Severity::Warn,
+            message: "could not resolve ~/.codex/hooks.json (HOME unset)".to_string(),
+        };
+    };
+    let inspection = codex_hooks_file::inspect(&path);
+    let all_hooks_wired = inspection.hooks_wired.iter().all(|w| *w);
+
+    if !inspection.file_present || !all_hooks_wired {
+        return Finding {
+            id: "codex_hooks",
+            severity: Severity::Warn,
+            message: if !inspection.file_present {
+                format!(
+                    "not installed into {} — run `libra-governor install --agent codex`",
+                    path.display()
+                )
+            } else {
+                format!(
+                    "only some of UserPromptSubmit/PostToolUse/Stop are wired in {} — \
+                     re-run `libra-governor install --agent codex`",
+                    path.display()
+                )
+            },
+        };
+    }
+
+    let binary_matches = wired_command_matches_current_binary(&path);
+    let trust = codex_home_config_dir()
+        .map(|dir| codex_trust_state(&dir.join("config.toml")))
+        .unwrap_or(CodexTrustState::Unknown(
+            "could not resolve $CODEX_HOME".to_string(),
+        ));
+
+    let mut message = format!("hooks wired in {}", path.display());
+    if !binary_matches {
+        message.push_str(
+            "; WARNING: the wired command path does not match the binary running this doctor \
+             check — if you moved the binary, re-run `libra-governor install --agent codex` \
+             and re-trust with `/hooks` inside Codex",
+        );
+    }
+    message.push_str(&format!("; trust state: {trust}"));
+
+    Finding {
+        id: "codex_hooks",
+        severity: if binary_matches {
+            Severity::Ok
+        } else {
+            Severity::Warn
+        },
+        message,
+    }
+}
+
+/// `true` if every wired hook command in `hooks_path` names the exact
+/// binary currently running this `doctor` invocation. `false` (never a
+/// hard error) when the check cannot be completed at all — a diagnostic
+/// must degrade, never crash.
+fn wired_command_matches_current_binary(hooks_path: &Path) -> bool {
+    let Ok(current_exe) = std::env::current_exe() else {
+        return true; // can't check — don't manufacture a false warning
+    };
+    let Ok(text) = std::fs::read_to_string(hooks_path) else {
+        return true;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return true;
+    };
+    let current = current_exe.display().to_string();
+    for event in ["UserPromptSubmit", "PostToolUse", "Stop"] {
+        let Some(entries) = value.get(event).and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for matcher in entries {
+            let Some(inner) = matcher.get("hooks").and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            for hook in inner {
+                let Some(command) = hook.get("command").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                if command.contains("libra-governor")
+                    && command.ends_with(&format!(" codex-hook {}", subcommand_for(event)))
+                    && !command.starts_with(&current)
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn subcommand_for(event: &str) -> &'static str {
+    match event {
+        "UserPromptSubmit" => "user-prompt-submit",
+        "PostToolUse" => "post-tool-use",
+        "Stop" => "stop",
+        _ => "",
+    }
+}
+
+/// Resolution order matching `codex_hooks_file::codex_home` exactly, so
+/// `doctor`'s trust-state check always looks at the same directory
+/// `install --agent codex` wrote `hooks.json` into.
+fn codex_home_config_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("LIBRA_GOVERNOR_CODEX_HOME") {
+        return Some(PathBuf::from(dir));
+    }
+    if let Ok(dir) = std::env::var("CODEX_HOME") {
+        return Some(PathBuf::from(dir));
+    }
+    std::env::var("HOME")
+        .ok()
+        .map(|home| PathBuf::from(home).join(".codex"))
+}
+
+/// Codex's `hooks.json` trust gate: writing `hooks.json` is not enough
+/// for Codex to actually run a hook — the user must run `/hooks` inside
+/// Codex to trust each hook by content hash, recorded in
+/// `~/.codex/config.toml`'s `[hooks.state]`. This repo adds no TOML
+/// parser dependency to read that file (none existed in the workspace
+/// before HORO-1157, and the ticket's own scope explicitly avoids adding
+/// one) — this is a minimal, conservative text scan, not a real parser,
+/// and it is documented as such rather than pretending to be exact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexTrustState {
+    /// `[features]` with a literal `hooks = false` line was found — an
+    /// unambiguous text match regardless of TOML nesting/quoting
+    /// subtleties.
+    HooksDisabled,
+    /// No `[hooks.state]` section header was found anywhere in the file
+    /// — reasonably strong (if not proof-level) evidence the user has
+    /// not yet run `/hooks`, since Codex has nowhere else to record
+    /// trust.
+    LikelyNotYetTrusted,
+    /// A `[hooks.state]` section header was found, but this doctor does
+    /// not know its real key shape (unverified during HORO-1157 — see
+    /// `docs/adr/0004-agent-adapter-contract.md`), so it makes no claim
+    /// about *what* is trusted inside it. Carries the reason.
+    Unknown(String),
+}
+
+impl std::fmt::Display for CodexTrustState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CodexTrustState::HooksDisabled => {
+                write!(
+                    f,
+                    "hooks disabled in Codex config ([features] hooks = false)"
+                )
+            }
+            CodexTrustState::LikelyNotYetTrusted => write!(
+                f,
+                "likely not yet trusted — no [hooks.state] section found in config.toml; run \
+                 `/hooks` inside Codex"
+            ),
+            CodexTrustState::Unknown(reason) => write!(f, "unknown — {reason}"),
+        }
+    }
+}
+
+/// Reads `config_toml_path` (never writes) and returns a conservative
+/// [`CodexTrustState`]. Never claims a hook is actually trusted: this
+/// doctor cannot confidently parse `[hooks.state]`'s real shape, so the
+/// honest answer when that section exists is "unknown", not "trusted" —
+/// see the type's docs.
+fn codex_trust_state(config_toml_path: &Path) -> CodexTrustState {
+    let Ok(text) = std::fs::read_to_string(config_toml_path) else {
+        return CodexTrustState::Unknown(format!(
+            "{} not found or unreadable",
+            config_toml_path.display()
+        ));
+    };
+
+    if let Some(features_section) = toml_section_body(&text, "features") {
+        if features_section
+            .lines()
+            .any(|line| line.trim().replace(' ', "") == "hooks=false")
+        {
+            return CodexTrustState::HooksDisabled;
+        }
+    }
+
+    if text
+        .lines()
+        .any(|line| line.trim() == "[hooks.state]" || line.trim().starts_with("[hooks.state."))
+    {
+        return CodexTrustState::Unknown(
+            "a [hooks.state] section exists but its exact key shape was not verified — verify \
+             manually with `/hooks` inside Codex"
+                .to_string(),
+        );
+    }
+
+    CodexTrustState::LikelyNotYetTrusted
+}
+
+/// Returns the raw text between a `[section]` header and the next
+/// top-level `[...]` header (or end of file), or `None` if the header is
+/// never found. A minimal, line-oriented scan — not a TOML parser (see
+/// [`codex_trust_state`]'s docs on why none is used): does not handle
+/// quoted section names, inline tables, or nested `[section.sub]`
+/// headers as members of `section`.
+fn toml_section_body<'a>(text: &'a str, section: &str) -> Option<&'a str> {
+    let header = format!("[{section}]");
+    let start = text.lines().position(|line| line.trim() == header)?;
+    let lines: Vec<&str> = text.lines().collect();
+    let body_start: usize = lines[..=start].iter().map(|l| l.len() + 1).sum();
+    let end_offset = lines[start + 1..]
+        .iter()
+        .position(|line| line.trim_start().starts_with('['))
+        .map(|rel| {
+            body_start
+                + lines[start + 1..start + 1 + rel]
+                    .iter()
+                    .map(|l| l.len() + 1)
+                    .sum::<usize>()
+        })
+        .unwrap_or(text.len());
+    text.get(body_start.min(text.len())..end_offset.min(text.len()))
 }
 
 /// Connects to an already-running daemon and asks `Request::Doctor`.
@@ -454,5 +694,64 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Error);
         assert!(findings[0].message.contains("pkill"));
+    }
+
+    #[test]
+    fn trust_state_reports_disabled_when_features_hooks_is_literally_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[features]\nhooks = false\nother = true\n").unwrap();
+        assert_eq!(codex_trust_state(&path), CodexTrustState::HooksDisabled);
+    }
+
+    #[test]
+    fn trust_state_reports_likely_not_yet_trusted_when_no_hooks_state_section_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[some_other_section]\nfoo = \"bar\"\n").unwrap();
+        assert_eq!(
+            codex_trust_state(&path),
+            CodexTrustState::LikelyNotYetTrusted
+        );
+    }
+
+    #[test]
+    fn trust_state_never_claims_trusted_when_hooks_state_section_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[hooks.state]\nsome-hash = \"trusted\"\nanother-hash = \"trusted\"\n",
+        )
+        .unwrap();
+        let state = codex_trust_state(&path);
+        assert!(
+            matches!(state, CodexTrustState::Unknown(_)),
+            "must never claim a confidently-parsed trust verdict for an unverified shape: {state}"
+        );
+    }
+
+    #[test]
+    fn trust_state_reports_unknown_when_config_toml_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.toml");
+        assert!(matches!(
+            codex_trust_state(&path),
+            CodexTrustState::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn toml_section_body_extracts_only_the_named_section() {
+        let text = "[a]\nx = 1\n\n[b]\ny = 2\n";
+        let body = toml_section_body(text, "a").unwrap();
+        assert!(body.contains("x = 1"));
+        assert!(!body.contains("y = 2"));
+    }
+
+    #[test]
+    fn toml_section_body_returns_none_when_the_section_is_absent() {
+        let text = "[a]\nx = 1\n";
+        assert!(toml_section_body(text, "z").is_none());
     }
 }

@@ -348,10 +348,6 @@ pub fn remove(path: &Path) -> Result<Removed, CodexHooksError> {
 
 /// A read-only summary of what's currently wired, for `libra-governor
 /// doctor` — never mutates the file.
-// Not yet called from non-test code: wired into `doctor_cmd` in a
-// later commit of this same ticket (HORO-1157). Exercised by this
-// module's own tests in the meantime — see the `dead_code` note below.
-#[allow(dead_code)]
 #[derive(Debug, Default, PartialEq)]
 pub struct Inspection {
     pub file_present: bool,
@@ -361,7 +357,6 @@ pub struct Inspection {
 /// Read-only inspection of `path` for `doctor`. A missing or unparsable
 /// file is reported as simply "not present"/"nothing wired" rather than
 /// propagating a parse error, mirroring `claude_settings::inspect`.
-#[allow(dead_code)] // see the Inspection struct's doc comment above
 pub fn inspect(path: &Path) -> Inspection {
     let Ok(Some(root)) = read_object(path) else {
         return Inspection {
