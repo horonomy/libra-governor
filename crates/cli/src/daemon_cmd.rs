@@ -33,21 +33,20 @@ pub fn run() {
     // `libra_governor_daemon::config_file` module docs — and a present
     // but invalid file falls back to today's hardcoded defaults rather
     // than aborting startup, logged so it is visible rather than silent.
-    let (policy, gateway, extensions) = match libra_governor_daemon::config_file::load_overrides(
-        &state_dir,
-    ) {
-        Ok((policy, gateway, extensions)) => (policy, gateway, extensions),
-        Err(e) => {
-            libra_governor_daemon::log::append_line(
-                &log_path,
-                &format!(
+    let (policy, gateway, extensions) =
+        match libra_governor_daemon::config_file::load_overrides(&state_dir) {
+            Ok((policy, gateway, extensions)) => (policy, gateway, extensions),
+            Err(e) => {
+                libra_governor_daemon::log::append_line(
+                    &log_path,
+                    &format!(
                     "daemon: {} rejected — falling back to default policy/gateway/extensions: {e}",
                     libra_governor_daemon::config_file::CONFIG_FILE_NAME
                 ),
-            );
-            (None, None, None)
-        }
-    };
+                );
+                (None, None, None)
+            }
+        };
 
     let config = DaemonConfig {
         socket_path: state_dir.join("daemon.sock"),

@@ -106,89 +106,103 @@ fn main() {
 
     write(
         "event_admission.json",
-        serde_json::to_string_pretty(&EventEnvelope::new(
-            EventKind::Admission,
-            "0.0.1",
-            AdmissionEventData {
-                task_id: fixed_task_id(),
-                plan_id: fixed_plan_id(),
-                session_id: "sess-1".to_string(),
-                admission: Admission::Admit,
-                resource_outcome: ConstraintOutcome::Admit,
-                time_outcome: ConstraintOutcome::Admit,
-                confidence_ok: true,
-                projected_resource: ResourceAmount::Tokens(90_000),
-                projected_duration_secs: 1800,
-                policy_name: "balanced".to_string(),
-                policy_schema_version: "policy-v1".to_string(),
-                business_context: Some(BusinessContextEventRef {
-                    provider_id: "example-provider".to_string(),
-                    applied: true,
-                }),
-                external_approval: None,
-            },
-            fixed_time(),
-        ).with_event_id(fixed_event_id()))
+        serde_json::to_string_pretty(
+            &EventEnvelope::new(
+                EventKind::Admission,
+                "0.0.1",
+                AdmissionEventData {
+                    task_id: fixed_task_id(),
+                    plan_id: fixed_plan_id(),
+                    session_id: "sess-1".to_string(),
+                    admission: Admission::Admit,
+                    resource_outcome: ConstraintOutcome::Admit,
+                    time_outcome: ConstraintOutcome::Admit,
+                    confidence_ok: true,
+                    projected_resource: ResourceAmount::Tokens(90_000),
+                    projected_duration_secs: 1800,
+                    policy_name: "balanced".to_string(),
+                    policy_schema_version: "policy-v1".to_string(),
+                    business_context: Some(BusinessContextEventRef {
+                        provider_id: "example-provider".to_string(),
+                        applied: true,
+                    }),
+                    external_approval: None,
+                },
+                fixed_time(),
+            )
+            .with_event_id(fixed_event_id()),
+        )
         .unwrap(),
     );
 
     write(
         "event_replan.json",
-        serde_json::to_string_pretty(&EventEnvelope::new(
-            EventKind::Replan,
-            "0.0.1",
-            ReplanEventData {
-                task_id: fixed_task_id(),
-                prior_plan_id: fixed_plan_id(),
-                new_plan_id: PlanId(Uuid::parse_str("00000000-0000-0000-0000-000000000006").unwrap()),
-                trigger: libra_governor_domain::ReplanTriggerKind::ToolCallCountExceeded,
-                detail: "9 tool calls since the last replan vs. typical 5".to_string(),
-                auto_replan_count: 1,
-                remaining_duration_p80_secs: Some(1200),
-                remaining_confidence: Confidence::Medium,
-            },
-            fixed_time(),
-        ).with_event_id(fixed_event_id()))
+        serde_json::to_string_pretty(
+            &EventEnvelope::new(
+                EventKind::Replan,
+                "0.0.1",
+                ReplanEventData {
+                    task_id: fixed_task_id(),
+                    prior_plan_id: fixed_plan_id(),
+                    new_plan_id: PlanId(
+                        Uuid::parse_str("00000000-0000-0000-0000-000000000006").unwrap(),
+                    ),
+                    trigger: libra_governor_domain::ReplanTriggerKind::ToolCallCountExceeded,
+                    detail: "9 tool calls since the last replan vs. typical 5".to_string(),
+                    auto_replan_count: 1,
+                    remaining_duration_p80_secs: Some(1200),
+                    remaining_confidence: Confidence::Medium,
+                },
+                fixed_time(),
+            )
+            .with_event_id(fixed_event_id()),
+        )
         .unwrap(),
     );
 
     write(
         "event_approval.json",
-        serde_json::to_string_pretty(&EventEnvelope::new(
-            EventKind::Approval,
-            "0.0.1",
-            ApprovalEventData {
-                task_id: fixed_task_id(),
-                plan_id: fixed_plan_id(),
-                approval_requests: vec![ApprovalRequest::Resource {
-                    projected: ResourceAmount::Tokens(150_000),
-                    target: ResourceAmount::Tokens(100_000),
-                    elastic_ceiling: Some(ResourceAmount::Tokens(125_000)),
-                    hard_ceiling: ResourceAmount::Tokens(200_000),
-                }],
-                external_approval: None,
-            },
-            fixed_time(),
-        ).with_event_id(fixed_event_id()))
+        serde_json::to_string_pretty(
+            &EventEnvelope::new(
+                EventKind::Approval,
+                "0.0.1",
+                ApprovalEventData {
+                    task_id: fixed_task_id(),
+                    plan_id: fixed_plan_id(),
+                    approval_requests: vec![ApprovalRequest::Resource {
+                        projected: ResourceAmount::Tokens(150_000),
+                        target: ResourceAmount::Tokens(100_000),
+                        elastic_ceiling: Some(ResourceAmount::Tokens(125_000)),
+                        hard_ceiling: ResourceAmount::Tokens(200_000),
+                    }],
+                    external_approval: None,
+                },
+                fixed_time(),
+            )
+            .with_event_id(fixed_event_id()),
+        )
         .unwrap(),
     );
 
     write(
         "event_outcome.json",
-        serde_json::to_string_pretty(&EventEnvelope::new(
-            EventKind::Outcome,
-            "0.0.1",
-            OutcomeEventData {
-                task_id: fixed_task_id(),
-                plan_id: Some(fixed_plan_id()),
-                outcome_kind: "completed".to_string(),
-                evidence: vec!["https://ci.example.com/runs/42".to_string()],
-                source: "provider".to_string(),
-                source_id: Some("example-provider".to_string()),
-                attested_at: fixed_time(),
-            },
-            fixed_time(),
-        ).with_event_id(fixed_event_id()))
+        serde_json::to_string_pretty(
+            &EventEnvelope::new(
+                EventKind::Outcome,
+                "0.0.1",
+                OutcomeEventData {
+                    task_id: fixed_task_id(),
+                    plan_id: Some(fixed_plan_id()),
+                    outcome_kind: "completed".to_string(),
+                    evidence: vec!["https://ci.example.com/runs/42".to_string()],
+                    source: "provider".to_string(),
+                    source_id: Some("example-provider".to_string()),
+                    attested_at: fixed_time(),
+                },
+                fixed_time(),
+            )
+            .with_event_id(fixed_event_id()),
+        )
         .unwrap(),
     );
 
