@@ -1,0 +1,23 @@
+=== malformed_json ===
+config.json content: '{ this is not valid json '
+doctor exit=1 stderr=''
+preflight-with-bad-config exit=0 stderr=''
+safe (no crash/panic, degrades cleanly): True
+
+=== wrong_type_for_gateway ===
+config.json content: '{"gateway": "should-be-an-object-not-a-string"}'
+doctor exit=1 stderr=''
+preflight-with-bad-config exit=0 stderr=''
+safe (no crash/panic, degrades cleanly): True
+
+=== unknown_top_level_key_only ===
+config.json content: '{"totally_unrecognized_key": true}'
+doctor exit=0 stderr=''
+preflight-with-bad-config exit=0 stderr=''
+safe (no crash/panic, degrades cleanly): True
+
+=== empty_file ===
+config.json content: ''
+doctor exit=1 stderr=''
+preflight-with-bad-config exit=0 stderr=''
+safe (no crash/panic, degrades cleanly): True

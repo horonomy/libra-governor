@@ -1,0 +1,110 @@
+git archive v0.0.1 exit=0
+
+$ (v0.0.1 tree) cargo install --path crates/cli --locked
+exit=0
+--- stderr (tail) ---
+.1.2
+   Compiling subtle v2.6.1
+   Compiling futures-task v0.3.34
+   Compiling tracing v0.1.44
+   Compiling futures-util v0.3.34
+   Compiling tower-service v0.3.3
+   Compiling webpki-roots v1.0.9
+   Compiling socket2 v0.6.5
+   Compiling mio v1.2.3
+   Compiling getrandom v0.2.17
+   Compiling cpufeatures v0.2.17
+   Compiling syn v3.0.6
+   Compiling deranged v0.5.8
+   Compiling uuid v1.26.1
+   Compiling time v0.3.55
+   Compiling tokio-macros v2.7.2
+   Compiling serde_derive v1.0.229
+   Compiling thiserror-impl v2.0.20
+   Compiling tokio v1.53.1
+   Compiling hashbrown v0.14.5
+   Compiling hashlink v0.9.1
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling digest v0.10.7
+   Compiling sha2 v0.10.9
+   Compiling libra-governor-domain v0.0.1 (/private/tmp/horo1169-v002-final/old-v0.0.1-src/crates/domain)
+   Compiling hyper v1.11.1
+   Compiling http-body-util v0.1.5
+   Compiling hyper-util v0.1.20
+   Compiling rustls-webpki v0.103.15
+   Compiling tokio-rustls v0.26.5
+   Compiling hyper-rustls v0.27.9
+   Compiling libra-governor-gateway v0.0.1 (/private/tmp/horo1169-v002-final/old-v0.0.1-src/crates/gateway)
+   Compiling rusqlite v0.32.1
+   Compiling libra-governor-ledger v0.0.1 (/private/tmp/horo1169-v002-final/old-v0.0.1-src/crates/ledger)
+   Compiling libra-governor-estimator v0.0.1 (/private/tmp/horo1169-v002-final/old-v0.0.1-src/crates/estimator)
+   Compiling libra-governor-protocol v0.0.1 (/private/tmp/horo1169-v002-final/old-v0.0.1-src/crates/protocol)
+   Compiling libra-governor-daemon v0.0.1 (/private/tmp/horo1169-v002-final/old-v0.0.1-src/crates/daemon)
+   Compiling libra-governor-cli v0.0.1 (/private/tmp/horo1169-v002-final/old-v0.0.1-src/crates/cli)
+    Finished `release` profile [optimized] target(s) in 23.95s
+  Installing /private/tmp/horo1169-v002-final/home-upgrade-v001/.cargo/bin/libra-governor
+   Installed package `libra-governor-cli v0.0.1 (/private/tmp/horo1169-v002-final/old-v0.0.1-src/crates/cli)` (executable `libra-governor`)
+
+
+old-binary (v0.0.1) real task: preflight exit=0, stop exit=0, receipts=1
+old-binary doctor (before upgrade):
+libra-governor doctor
+======================
+
+[ok] state_dir_permissions: /private/tmp/horo1169-v002-final/home-upgrade-v001/.local/state/libra-governor is owner-only (0700)
+[ok] config_file_present: no config.json — running the balanced preset with no gateway (defaults)
+[ok] gateway_token_present: gateway capability token not yet created (/private/tmp/horo1169-v002-final/home-upgrade-v001/.local/state/libra-governor/gateway.token)
+[ok] claude_settings: hooks and statusline wired in /private/tmp/horo1169-v002-final/home-upgrade-v001/.claude/settings.json
+[ok] daemon_reachable: daemon 0.0.1 reachable, protocol v7
+[ok] schema_version: ledger schema v8 matches this daemon build
+[ok] policy_preset: admission policy preset: balanced
+[ok] telemetry: telemetry: off (local-only; no telemetry code path exists)
+
+
+
+
+$ (current v0.0.2 tree) ./scripts/install.sh  (same $HOME as v0.0.1 binary, real populated ledger)
+exit=1 (expected non-zero here -- see note above), binary_replaced=True
+--- stderr (tail) ---
+ Compiling sha2 v0.10.9
+   Compiling time v0.3.55
+   Compiling tokio v1.53.1
+   Compiling hashbrown v0.14.5
+   Compiling hashlink v0.9.1
+   Compiling libra-governor-domain v0.0.2 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-v0.0.2-HORO-1169-dogfood_release/crates/domain)
+   Compiling hyper v1.11.1
+   Compiling http-body-util v0.1.5
+   Compiling hyper-util v0.1.20
+   Compiling rustls-webpki v0.103.15
+   Compiling libra-governor-extension v0.0.2 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-v0.0.2-HORO-1169-dogfood_release/crates/extension)
+   Compiling tokio-rustls v0.26.5
+   Compiling hyper-rustls v0.27.9
+   Compiling libra-governor-gateway v0.0.2 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-v0.0.2-HORO-1169-dogfood_release/crates/gateway)
+   Compiling rusqlite v0.32.1
+   Compiling libra-governor-ledger v0.0.2 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-v0.0.2-HORO-1169-dogfood_release/crates/ledger)
+   Compiling libra-governor-estimator v0.0.2 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-v0.0.2-HORO-1169-dogfood_release/crates/estimator)
+   Compiling libra-governor-protocol v0.0.2 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-v0.0.2-HORO-1169-dogfood_release/crates/protocol)
+   Compiling libra-governor-daemon v0.0.2 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-v0.0.2-HORO-1169-dogfood_release/crates/daemon)
+   Compiling libra-governor-cli v0.0.2 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-v0.0.2-HORO-1169-dogfood_release/crates/cli)
+    Finished `release` profile [optimized] target(s) in 23.33s
+   Replacing /private/tmp/horo1169-v002-final/home-upgrade-v001/.cargo/bin/libra-governor
+    Replaced package `libra-governor-cli v0.0.1 (/private/tmp/horo1169-v002-final/old-v0.0.1-src/crates/cli)` with `libra-governor-cli v0.0.2 (/Users/bryant/Bryant-Developments/horonomy/libra-governor-v0.0.2-HORO-1169-dogfood_release/crates/cli)` (executable `libra-governor`)
+
+
+new-binary doctor (after upgrade, migration 0002..0009 applied to the real v0.0.1 ledger):
+libra-governor doctor
+======================
+
+[ok] state_dir_permissions: /private/tmp/horo1169-v002-final/home-upgrade-v001/.local/state/libra-governor is owner-only (0700)
+[ok] config_file_present: no config.json — running the balanced preset with no gateway (defaults)
+[ok] gateway_token_present: gateway capability token not yet created (/private/tmp/horo1169-v002-final/home-upgrade-v001/.local/state/libra-governor/gateway.token)
+[ok] claude_settings: hooks and statusline wired in /private/tmp/horo1169-v002-final/home-upgrade-v001/.claude/settings.json
+[warn] codex_hooks: not installed into /private/tmp/horo1169-v002-final/home-upgrade-v001/.codex/hooks.json — run `libra-governor install --agent codex`
+[error] daemon_reachable: daemon reachable but returned an error: protocol version mismatch: client speaks 8, daemon responded with 7 — if this mentions a protocol version mismatch (this binary was upgraded while an older daemon was still running), the daemon has already shut itself down after replying to this request; the next hook invocation or `doctor` run will spawn a fresh one automatically. To force it immediately instead of waiting: pkill -f "libra-governor daemon run"
+
+
+
+receipts: before=1, after=1 (must be >= before -- migration is additive, never destructive)
+task against the still-live OLD (v0.0.1) daemon: preflight exit=0, governed=False (expected False here -- this exact transition predates the self-healing fix and cannot retroactively gain it), receipts=1
+task after the documented one-time manual restart: preflight exit=0, stop exit=0, receipts_final=2

@@ -1,0 +1,10 @@
+8 concurrent sessions against one daemon, wall time=0.03s
+  concurrent-d78a2b14-b05c-4dab-83eb-42dc49aa7fc8: {'preflight_rc': 0, 'preflight_has_task': True, 'ptu_rc': 0, 'stop_rc': 0}
+  concurrent-8023a4f2-bdca-4857-8711-a280bb01abb6: {'preflight_rc': 0, 'preflight_has_task': True, 'ptu_rc': 0, 'stop_rc': 0}
+  concurrent-0525dc4e-82b4-4c54-85cb-2ab6b6087686: {'preflight_rc': 0, 'preflight_has_task': True, 'ptu_rc': 0, 'stop_rc': 0}
+  concurrent-e5d14732-3d2b-4b9e-bc52-8fc9dce814db: {'preflight_rc': 0, 'preflight_has_task': True, 'ptu_rc': 0, 'stop_rc': 0}
+  concurrent-143f59e1-62a3-4f9a-b3d2-6d95f6f189b1: {'preflight_rc': 0, 'preflight_has_task': True, 'ptu_rc': 0, 'stop_rc': 0}
+  concurrent-d09f0b33-dbf5-4c4c-a816-495e96326ff5: {'preflight_rc': 0, 'preflight_has_task': True, 'ptu_rc': 0, 'stop_rc': 0}
+  concurrent-4ac7f219-8643-467c-845f-9297799a660c: {'preflight_rc': 0, 'preflight_has_task': True, 'ptu_rc': 0, 'stop_rc': 0}
+  concurrent-c5d6ff2e-3e8a-4716-881b-775fcd9a80cc: {'preflight_rc': 0, 'preflight_has_task': True, 'ptu_rc': 0, 'stop_rc': 0}
+all_sessions_completed=True, all_ok=True, receipts_after=8

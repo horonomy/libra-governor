@@ -1,0 +1,8 @@
+daemon spawned pid=84314
+after task 0: daemon RSS = 5120 KB
+after task 1: daemon RSS = 5200 KB
+after task 2: daemon RSS = 5328 KB
+after task 3: daemon RSS = 5344 KB
+after task 4: daemon RSS = 5376 KB
+harness process ru_maxrss (for scale reference): 31178752
+RSS growth ratio (last/first over 5 real tasks): 1.05, bounded(<3x)=True
