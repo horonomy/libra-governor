@@ -8,6 +8,10 @@
 //!   point: fire-and-forget tool-call counting (HORO-1126).
 //! - `hook stop` — the Claude Code `Stop` hook entry point: finalizes
 //!   the session's task into an Execution Receipt (HORO-1126).
+//! - `codex-hook user-prompt-submit` / `post-tool-use` / `stop` — the
+//!   same three hook entry points for the Codex CLI (HORO-1157), sharing
+//!   every byte of translation logic with Claude Code's via
+//!   `crate::agent::run` — see `integrations/codex/README.md`.
 //! - `statusline` — the Claude Code `statusLine` command.
 //! - `calibration report` — real duration-coverage and admission-replay
 //!   calibration evidence over local history (HORO-1132).
@@ -32,6 +36,7 @@ mod bucket_prose;
 mod calibration_cmd;
 mod claude_settings;
 mod client;
+mod codex_hook;
 mod daemon_cmd;
 mod doctor_cmd;
 mod gateway_cmd;
@@ -54,6 +59,9 @@ fn main() {
         ["hook", "user-prompt-submit"] => hook::run(),
         ["hook", "post-tool-use"] => hook_post_tool_use::run(),
         ["hook", "stop"] => hook_stop::run(),
+        ["codex-hook", "user-prompt-submit"] => codex_hook::run_prompt_submit(),
+        ["codex-hook", "post-tool-use"] => codex_hook::run_tool_completed(),
+        ["codex-hook", "stop"] => codex_hook::run_turn_completed(),
         ["statusline"] => statusline::run(),
         ["calibration", "report"] => calibration_cmd::run(),
         ["gateway", "token"] => gateway_cmd::run_token(),
@@ -71,6 +79,9 @@ fn main() {
                  libra-governor hook user-prompt-submit\n  \
                  libra-governor hook post-tool-use\n  \
                  libra-governor hook stop\n  \
+                 libra-governor codex-hook user-prompt-submit\n  \
+                 libra-governor codex-hook post-tool-use\n  \
+                 libra-governor codex-hook stop\n  \
                  libra-governor statusline\n  \
                  libra-governor calibration report\n  \
                  libra-governor gateway token\n  \

@@ -21,23 +21,17 @@ pub mod render;
 pub mod run;
 
 /// Which governed coding agent host is calling into this shared layer.
-/// A local, cli-scoped enum: `crates/cli/src/hook.rs` only ever needs
-/// `ClaudeCode` until `crates/cli/src/codex_hook.rs` exists, at which
-/// point this type gains a `Codex` variant and (from then on) is reused
-/// as-is by `libra_governor_domain::AgentKind` — see that type's docs
-/// (HORO-1157) for the capability-matrix side of "which agent".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentKind {
-    ClaudeCode,
-}
+/// Re-exported from `libra_governor_domain` so the capability matrix
+/// (`libra-governor agents`) and the hook translation layer always agree
+/// on "which agent" — one enum, not two independently-maintained copies.
+pub use libra_governor_domain::AgentKind;
 
-impl AgentKind {
-    /// Short label used only in log lines — never in the
-    /// `hookSpecificOutput` stdout contract itself, which stays
-    /// host-agnostic text (see `render`).
-    pub fn label(self) -> &'static str {
-        match self {
-            AgentKind::ClaudeCode => "claude-code",
-        }
+/// Short label used only in log lines — never in the
+/// `hookSpecificOutput` stdout contract itself, which stays
+/// host-agnostic text (see [`render`]).
+pub fn label(agent: AgentKind) -> &'static str {
+    match agent {
+        AgentKind::ClaudeCode => "claude-code",
+        AgentKind::Codex => "codex",
     }
 }

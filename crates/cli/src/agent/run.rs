@@ -33,7 +33,10 @@ fn log(
     message: &str,
 ) {
     if let Ok(path) = log_path {
-        libra_governor_daemon::log::append_line(path, &format!("[{}] {message}", agent.label()));
+        libra_governor_daemon::log::append_line(
+            path,
+            &format!("[{}] {message}", super::label(agent)),
+        );
     }
 }
 
