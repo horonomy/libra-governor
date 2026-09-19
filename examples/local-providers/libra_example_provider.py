@@ -13,9 +13,11 @@ Every route here does real work, not a stubbed constant:
   ``x-libra-timestamp``, and tracks ``x-libra-nonce`` values it has
   already seen to reject a replay.
 - The business-context route resolves a real ticket key by running
-  ``git -C <cwd> rev-parse --abbrev-ref HEAD`` against the task's actual
-  working directory and matching the branch name against a ticket-key
-  pattern, then looks the key up in ``tickets.json``.
+  ``git -C <workspace_root> rev-parse --abbrev-ref HEAD`` (the request's
+  ``cwd`` is used only as an equality check against ``--workspace-root``,
+  never as the command's own directory argument) and matching the branch
+  name against a ticket-key pattern, then looks the key up in
+  ``tickets.json``.
 - The policy-webhook route enforces a real per-cost-center token cap
   (``cost_caps.json``) against the task's ``projected_resource``,
   remembering which cost center a task belongs to from its own earlier
@@ -37,7 +39,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
-import html
 import json
 import os
 import re
@@ -121,27 +122,25 @@ class TaskCostCenters:
 
 
 def resolve_ticket_key(cwd: str, workspace_root: str) -> str | None:
-    """Runs a real `git` subprocess against the task's actual working
-    directory and extracts a ticket key from the current branch name
-    (e.g. `v0.0.2/HORO-1174/extension_contracts` -> `HORO-1174`).
+    """Runs a real `git` subprocess against the provider's own
+    `--workspace-root` and extracts a ticket key from the current branch
+    name (e.g. `v0.0.2/HORO-1174/extension_contracts` -> `HORO-1174`).
 
-    `cwd` is attacker-influenced request input. It is canonicalized with
-    `os.path.realpath` (resolving `..`/symlinks) and then **confined to
-    `workspace_root`**: any resolved path outside that allow-listed root
-    is rejected before it ever reaches `os.path.isdir` or the `git -C`
-    subprocess argument — the request cannot use this field to probe or
-    operate on any directory the provider operator hasn't already agreed
-    is in scope (`--workspace-root`, defaulting to the provider's own
-    cwd)."""
+    `cwd` is attacker-influenced request input. It is never itself passed
+    to a filesystem or subprocess call — it is used **only as an
+    equality selector** against `workspace_root` (an operator-supplied
+    CLI argument, not request input). A request whose `cwd` does not
+    match the provider's configured workspace is simply not resolved;
+    the value that actually reaches `os.path.isdir`/`git -C` is always
+    `workspace_root`, which the request can select but never set."""
     real_root = os.path.realpath(workspace_root)
-    real_cwd = os.path.realpath(cwd)
-    if os.path.commonpath([real_root, real_cwd]) != real_root:
+    if os.path.realpath(cwd) != real_root:
         return None
-    if not os.path.isdir(real_cwd):
+    if not os.path.isdir(real_root):
         return None
     try:
         result = subprocess.run(
-            ["git", "-C", real_cwd, "rev-parse", "--abbrev-ref", "HEAD"],
+            ["git", "-C", real_root, "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -152,22 +151,6 @@ def resolve_ticket_key(cwd: str, workspace_root: str) -> str | None:
         return None
     match = TICKET_KEY_PATTERN.search(result.stdout.strip())
     return match.group(1).upper() if match else None
-
-
-def _html_escape_strings(value):
-    """Recursively HTML-escapes every string in a JSON-serializable
-    value. Applied once, at `_respond_json`'s single sink, to every
-    response this provider ever sends — so a request-derived string
-    (task_id, cwd, an error message built from a request header) can
-    never reach a client carrying unescaped HTML/script metacharacters,
-    regardless of which route or error path produced it."""
-    if isinstance(value, str):
-        return html.escape(value)
-    if isinstance(value, dict):
-        return {k: _html_escape_strings(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_html_escape_strings(v) for v in value]
-    return value
 
 
 class ProviderHandler(BaseHTTPRequestHandler):
@@ -213,7 +196,7 @@ class ProviderHandler(BaseHTTPRequestHandler):
             self._respond_json(400, {"error": "missing required signed header"})
             return None
         if schema_version != SCHEMA_VERSION:
-            self._respond_json(400, {"error": f"unsupported schema_version {schema_version!r}"})
+            self._respond_json(400, {"error": "unsupported schema_version"})
             return None
 
         try:
@@ -224,10 +207,7 @@ class ProviderHandler(BaseHTTPRequestHandler):
 
         now = time.time()
         if abs(now - timestamp) > self.max_clock_skew_secs:
-            self._respond_json(
-                401,
-                {"error": f"timestamp {timestamp} outside the {self.max_clock_skew_secs}s skew window"},
-            )
+            self._respond_json(401, {"error": "timestamp outside the allowed clock-skew window"})
             return None
 
         # Recomputes the exact signed_payload format from
@@ -246,16 +226,15 @@ class ProviderHandler(BaseHTTPRequestHandler):
         return body, request_id
 
     def _respond_json(self, status: int, payload: dict) -> None:
-        # `json.dumps` already escapes every value it serializes, so
-        # nothing in `payload` can break out of the JSON string context.
-        # `_html_escape_strings` additionally neutralizes any HTML/script
-        # metacharacters in request-derived fields (task_id, cwd, error
-        # messages built from request headers) at the one choke point
-        # every response passes through, and `X-Content-Type-Options:
-        # nosniff` stops a client from MIME-sniffing this response as
-        # HTML regardless of `Content-Type` — together these remove any
-        # path from reflected request content to rendered markup.
-        body = json.dumps(_html_escape_strings(payload)).encode("utf-8")
+        # `json.dumps` escapes every value it serializes, so nothing in
+        # `payload` can break out of the JSON string context.
+        # `X-Content-Type-Options: nosniff` additionally stops a client
+        # from MIME-sniffing this response as HTML regardless of
+        # `Content-Type`. No route ever echoes raw request content
+        # (headers, path, body fields) back into an error message —
+        # every `{"error": ...}` payload below is a static string, so
+        # there is no reflected-content path into a response at all.
+        body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -284,7 +263,7 @@ class ProviderHandler(BaseHTTPRequestHandler):
         elif self.path == "/libra/events":
             self._handle_event(request)
         else:
-            self._respond_json(404, {"error": f"no route for {self.path}"})
+            self._respond_json(404, {"error": "no route for the requested path"})
 
     def _handle_business_context(self, request: dict) -> None:
         task_id = request.get("task_id", "")
