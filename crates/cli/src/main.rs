@@ -27,6 +27,7 @@
 //!   (with confirmation) the state directory and, if this tool installed
 //!   it, the daemon binary (HORO-1150).
 
+mod agent;
 mod bucket_prose;
 mod calibration_cmd;
 mod claude_settings;
