@@ -12,6 +12,24 @@ fn rfc3339(t: time::OffsetDateTime) -> Result<String, LedgerError> {
         .map_err(|e| LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))
 }
 
+/// Env var read once per capture to stamp `dogfood_origin_profile`
+/// (HORO-1376, ADR-0012 §3/§8). Any value other than the exact string
+/// `"corporate"` is treated as `personal` — the safer default, since
+/// `personal` is the profile with no destination-eligibility
+/// consequences, whereas defaulting an ambiguous value to `corporate`
+/// would risk *widening* what a later adapter treats as
+/// permanently-corporate-scoped.
+pub const DOGFOOD_PROFILE_ENV_VAR: &str = "LIBRA_GOVERNOR_DOGFOOD_PROFILE";
+
+/// Reads [`DOGFOOD_PROFILE_ENV_VAR`], exact-matching only `"corporate"`;
+/// everything else (unset, empty, misspelled) is `"personal"`.
+fn dogfood_origin_profile() -> String {
+    match std::env::var(DOGFOOD_PROFILE_ENV_VAR) {
+        Ok(v) if v == "corporate" => "corporate".to_string(),
+        _ => "personal".to_string(),
+    }
+}
+
 impl LedgerStore {
     /// Inserts a new [`TaskIdentity`]. The durable anchor multiple
     /// sessions' events attach to via `task_id`.
@@ -149,9 +167,12 @@ impl LedgerStore {
                 LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
             })?;
 
+        let dogfood_event_id = Uuid::now_v7().to_string();
+        let dogfood_origin_profile = dogfood_origin_profile();
+
         self.conn.execute(
-            "INSERT INTO plans (id, task_id, contract_revision, recon_snapshot_ref, created_at, estimate_json, task_features_json, replaces_plan_id, replan_reason_json, admission_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO plans (id, task_id, contract_revision, recon_snapshot_ref, created_at, estimate_json, task_features_json, replaces_plan_id, replan_reason_json, admission_json, dogfood_event_id, dogfood_origin_profile)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 plan.id.0.to_string(),
                 plan.task_id.to_string(),
@@ -163,7 +184,18 @@ impl LedgerStore {
                 plan.replaces.map(|p| p.0.to_string()),
                 replan_reason_json,
                 admission_json,
+                dogfood_event_id,
+                dogfood_origin_profile,
             ],
+        )?;
+
+        // Stamped in a separate UPDATE, strictly after the row's own
+        // durable INSERT above has already returned, so `dogfood_ingested_at`
+        // is never equal-by-construction to `plan.created_at` (ADR-0012 §3).
+        let ingested_at = rfc3339(time::OffsetDateTime::now_utc())?;
+        self.conn.execute(
+            "UPDATE plans SET dogfood_ingested_at = ?1 WHERE id = ?2",
+            rusqlite::params![ingested_at, plan.id.0.to_string()],
         )?;
         Ok(())
     }
@@ -283,12 +315,15 @@ impl LedgerStore {
                 LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
             })?;
 
+        let dogfood_event_id = Uuid::now_v7().to_string();
+        let dogfood_origin_profile = dogfood_origin_profile();
+
         self.conn.execute(
             "INSERT INTO receipts (task_id, plan_id, contract_revision, actual_duration_secs,
                                     actual_usage_json, outcome_json, recorded_at,
                                     tool_call_count, model, provider, task_features_json,
-                                    reservation_evidence_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                                    reservation_evidence_json, dogfood_event_id, dogfood_origin_profile)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             rusqlite::params![
                 receipt.task_id.to_string(),
                 receipt.plan_id.0.to_string(),
@@ -302,6 +337,20 @@ impl LedgerStore {
                 receipt.provider,
                 task_features_json,
                 reservation_evidence_json,
+                dogfood_event_id,
+                dogfood_origin_profile,
+            ],
+        )?;
+
+        // See `insert_plan`'s identical rationale: `dogfood_ingested_at`
+        // is stamped only after the receipt's own durable INSERT returns.
+        let ingested_at = rfc3339(time::OffsetDateTime::now_utc())?;
+        self.conn.execute(
+            "UPDATE receipts SET dogfood_ingested_at = ?1 WHERE task_id = ?2 AND plan_id = ?3",
+            rusqlite::params![
+                ingested_at,
+                receipt.task_id.to_string(),
+                receipt.plan_id.0.to_string()
             ],
         )?;
         Ok(())

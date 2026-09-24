@@ -1,0 +1,19 @@
+[package]
+name = "libra-governor-evidence-adapter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Libra Governor: read-only DogFood evidence adapter (HORO-1376) — projects the existing native ledger into the frozen ADR-0012 v1 evidence event schema. Zero network I/O; local_only transport only."
+
+[dependencies]
+libra-governor-domain = { path = "../domain" }
+libra-governor-ledger = { path = "../ledger" }
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

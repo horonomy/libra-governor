@@ -21,6 +21,11 @@
 //!   marker and asserts it never appears anywhere — the same marker-grep
 //!   technique `mvp3_gate_evidence.rs` uses for the gateway/prompt path,
 //!   applied here to the evidence-report export path specifically.
+//!
+//! Also covers `dogfood-evidence export` (HORO-1376): the same consent
+//! gate, and the same marker-never-leaks privacy property, extended to
+//! this newer local export command rather than duplicated into a
+//! separate test file.
 
 use std::io::{BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -297,6 +302,102 @@ fn evidence_report_export_never_contains_the_real_prompt_marker() {
         !all_files.is_empty(),
         "sanity: the state dir must actually contain files to check"
     );
+    for path in &all_files {
+        let bytes = std::fs::read(path).unwrap();
+        assert!(
+            !bytes
+                .windows(PRIVACY_MARKER.len())
+                .any(|w| w == PRIVACY_MARKER.as_bytes()),
+            "the real prompt marker leaked into {}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn dogfood_evidence_export_refuses_without_consent_and_writes_nothing() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&["dogfood-evidence", "export"]);
+
+    assert!(
+        !output.status.success(),
+        "dogfood-evidence export must refuse to run without prior consent"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    assert!(
+        stderr.contains("consent"),
+        "the refusal must explain that consent is required: {stderr}"
+    );
+    let evidence_dir = sandbox.state_dir.join("dogfood-evidence");
+    assert!(
+        !evidence_dir.exists(),
+        "no export should ever be written when consent is missing"
+    );
+}
+
+#[test]
+fn dogfood_evidence_export_consent_then_export_succeeds_and_writes_one_ndjson_file() {
+    let sandbox = Sandbox::new();
+
+    // The same consent marker `evidence-report consent` writes also
+    // gates `dogfood-evidence export` — see `dogfood_evidence_cmd`'s doc
+    // comment.
+    let consent_output = sandbox.run(&["evidence-report", "consent"]);
+    assert!(
+        consent_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&consent_output.stderr)
+    );
+
+    let export_output = sandbox.run(&["dogfood-evidence", "export"]);
+    assert!(
+        export_output.status.success(),
+        "dogfood-evidence export must succeed once consent is on record: {}",
+        String::from_utf8_lossy(&export_output.stderr)
+    );
+
+    let evidence_dir = sandbox.state_dir.join("dogfood-evidence");
+    let entries: Vec<_> = std::fs::read_dir(&evidence_dir).unwrap().collect();
+    assert_eq!(entries.len(), 1, "exactly one .ndjson file per export run");
+}
+
+#[test]
+fn dogfood_evidence_export_never_contains_the_real_prompt_marker() {
+    let sandbox = Sandbox::new();
+    const PRIVACY_MARKER: &str = "MARKER-HORO1376-9d4e1a-do-not-leak-this-prompt-text";
+    sandbox.seed_one_real_preflight_with_marker(PRIVACY_MARKER);
+
+    let consent_output = sandbox.run(&["evidence-report", "consent"]);
+    assert!(consent_output.status.success());
+
+    let export_output = sandbox.run(&["dogfood-evidence", "export"]);
+    assert!(
+        export_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&export_output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&export_output.stdout);
+    let stderr = String::from_utf8_lossy(&export_output.stderr);
+    assert!(!stdout.contains(PRIVACY_MARKER));
+    assert!(!stderr.contains(PRIVACY_MARKER));
+
+    fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                walk(&path, out);
+            } else if file_type.is_file() {
+                out.push(path);
+            }
+        }
+    }
+    let mut all_files = Vec::new();
+    walk(&sandbox.state_dir, &mut all_files);
+    assert!(!all_files.is_empty());
     for path in &all_files {
         let bytes = std::fs::read(path).unwrap();
         assert!(

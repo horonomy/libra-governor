@@ -37,11 +37,14 @@ pub use extension::{
 };
 pub use gateway::{GatewayRequestClose, GatewayRequestOpen};
 pub use migrations::latest_known_version;
-pub use query::{CalibrationPair, EvidenceAggregates, TaskTrajectory};
+pub use query::{
+    CalibrationPair, DogfoodPlanRecord, DogfoodReceiptRecord, EvidenceAggregates, TaskTrajectory,
+};
 pub use reservation::{
     AdjustOutcome, ReleaseOutcome, ReserveOutcome, ReserveRequest, SettleOutcome,
 };
 pub use store::LedgerStore;
+pub use write::DOGFOOD_PROFILE_ENV_VAR;
 
 /// Errors returned by the ledger crate.
 #[derive(Debug, thiserror::Error)]
