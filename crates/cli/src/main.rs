@@ -44,6 +44,10 @@
 //!   coarse local behavioral aggregates plus evaluator-typed qualitative
 //!   answers to a local JSON/Markdown file. Off by default, opt-in only,
 //!   local-only — never a network call (HORO-1154).
+//! - `dogfood-evidence export` — projects the local ledger into
+//!   ADR-0012 §3 evidence events and writes them as local NDJSON, under
+//!   the same consent gate as `evidence-report`. Local-only transport
+//!   only, no network capability (HORO-1376).
 //! - `outcome record` — pushes an outcome attestation for a task, read as
 //!   JSON from stdin, over the daemon's existing Unix socket (HORO-1174).
 //!   The entry point an external Outcome Provider shells out to; see
@@ -59,6 +63,7 @@ mod codex_hook;
 mod codex_hooks_file;
 mod daemon_cmd;
 mod doctor_cmd;
+mod dogfood_evidence_cmd;
 mod evidence_report_cmd;
 mod gateway_cmd;
 mod hook;
@@ -100,6 +105,7 @@ fn main() {
         ["agents", "--json"] => agents_cmd::run(true),
         ["evidence-report", "consent"] => evidence_report_cmd::run_consent(),
         ["evidence-report"] => evidence_report_cmd::run(),
+        ["dogfood-evidence", "export"] => dogfood_evidence_cmd::run(),
         ["outcome", "record"] => outcome_cmd::run(),
         _ => {
             eprintln!(
@@ -122,6 +128,7 @@ fn main() {
                  libra-governor agents [--json]\n  \
                  libra-governor evidence-report consent\n  \
                  libra-governor evidence-report\n  \
+                 libra-governor dogfood-evidence export\n  \
                  libra-governor outcome record"
             );
             std::process::exit(2);
