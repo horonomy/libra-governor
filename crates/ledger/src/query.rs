@@ -707,6 +707,149 @@ impl LedgerStore {
             earliest_task_created_at,
         })
     }
+
+    /// One row per original (non-replan) preflight plan that carries a
+    /// `dogfood_event_id` (HORO-1376) — the DogFood evidence adapter's
+    /// (`crates/evidence-adapter`) read-only source for plan/admission
+    /// evidence records. Rows with `dogfood_event_id IS NULL` (written
+    /// before migration 0010 existed) are skipped entirely rather than
+    /// backfilled with a fabricated id — see that migration's header.
+    ///
+    /// `has_receipt` is computed via a correlated lookup against
+    /// `receipts.plan_id` so the adapter can distinguish "admission
+    /// verdict recorded, work actually executed" from "recorded, never
+    /// executed" without a second query per plan.
+    pub fn dogfood_plan_records(&self) -> Result<Vec<DogfoodPlanRecord>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.dogfood_event_id, p.task_id, p.created_at, p.dogfood_ingested_at,
+                    p.dogfood_origin_profile, p.admission_json,
+                    EXISTS(SELECT 1 FROM receipts r WHERE r.plan_id = p.id) AS has_receipt
+             FROM plans p
+             WHERE p.replaces_plan_id IS NULL AND p.dogfood_event_id IS NOT NULL
+             ORDER BY p.created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, bool>(6)?,
+            ))
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (
+                event_id,
+                task_id,
+                created_at,
+                ingested_at,
+                origin_profile,
+                admission_json,
+                has_receipt,
+            ) = row?;
+            out.push(DogfoodPlanRecord {
+                event_id,
+                task_id,
+                occurred_at: parse_time(&created_at)?,
+                ingested_at: ingested_at.map(|s| parse_time(&s)).transpose()?,
+                origin_profile,
+                admission: parse_admission(admission_json)?,
+                has_receipt,
+            });
+        }
+        Ok(out)
+    }
+
+    /// One row per execution receipt that carries a `dogfood_event_id`
+    /// (HORO-1376) — the DogFood evidence adapter's read-only source for
+    /// non-replayable-operation evidence records (ADR-0012 §7.1). Rows
+    /// with `dogfood_event_id IS NULL` are skipped for the same reason as
+    /// [`Self::dogfood_plan_records`].
+    pub fn dogfood_receipt_records(&self) -> Result<Vec<DogfoodReceiptRecord>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT dogfood_event_id, task_id, recorded_at, dogfood_ingested_at,
+                    dogfood_origin_profile, actual_usage_json
+             FROM receipts
+             WHERE dogfood_event_id IS NOT NULL
+             ORDER BY recorded_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (event_id, task_id, recorded_at, ingested_at, origin_profile, actual_usage_json) =
+                row?;
+            let actual_usage: Vec<ResourceAmount> = serde_json::from_str(&actual_usage_json)
+                .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
+            out.push(DogfoodReceiptRecord {
+                event_id,
+                task_id,
+                occurred_at: parse_time(&recorded_at)?,
+                ingested_at: ingested_at.map(|s| parse_time(&s)).transpose()?,
+                origin_profile,
+                actual_usage,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// One preflight/admission record read back for the DogFood evidence
+/// adapter (HORO-1376). Every field here already exists in the ledger's
+/// native schema or is a capture-time stamp added by migration 0010 —
+/// this struct adds no new source of truth, it only names the subset the
+/// adapter needs so it does not have to depend on `plans`' full row
+/// shape or re-implement [`parse_admission`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct DogfoodPlanRecord {
+    /// Stable, capture-time-generated identity (ADR-0012 §3 `event_id`).
+    pub event_id: String,
+    pub task_id: String,
+    /// The plan's own `created_at` — ADR-0012 §3 `occurred_at`.
+    pub occurred_at: time::OffsetDateTime,
+    /// Capture-time stamp, written strictly after the row's durable
+    /// insert returned — ADR-0012 §3 `ingested_at`. `None` only for a
+    /// pre-migration-0010 row that somehow also carries a
+    /// `dogfood_event_id` (should not occur in practice; the adapter
+    /// treats it the same as any other missing timestamp).
+    pub ingested_at: Option<time::OffsetDateTime>,
+    /// Profile captured at insert time — ADR-0012 §3 `origin_profile`.
+    /// `None` for a row written before this stamp existed.
+    pub origin_profile: Option<String>,
+    pub admission: Option<Admission>,
+    /// Whether a receipt exists for this plan's id — used to derive
+    /// `actual_action` without ever inferring `deny`/`warn` as something
+    /// that "actually happened" (see `evidence-adapter::adapter` docs).
+    pub has_receipt: bool,
+}
+
+/// One execution receipt record read back for the DogFood evidence
+/// adapter (HORO-1376) — see [`DogfoodPlanRecord`] docs for the general
+/// shape rationale.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DogfoodReceiptRecord {
+    pub event_id: String,
+    pub task_id: String,
+    /// The receipt's own `recorded_at` — ADR-0012 §3 `occurred_at`.
+    pub occurred_at: time::OffsetDateTime,
+    pub ingested_at: Option<time::OffsetDateTime>,
+    pub origin_profile: Option<String>,
+    /// Verbatim `actual_usage` — never re-derived or estimated from
+    /// `tool_call_count` (see the adapter's non-fabrication test).
+    pub actual_usage: Vec<ResourceAmount>,
 }
 
 /// Coarse, privacy-safe aggregate counts returned by

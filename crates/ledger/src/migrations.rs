@@ -55,6 +55,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 9,
         sql: include_str!("../migrations/0009_extension_points.sql"),
     },
+    Migration {
+        version: 10,
+        sql: include_str!("../migrations/0010_dogfood_evidence_capture.sql"),
+    },
 ];
 
 /// The highest migration version this build of the crate knows about
