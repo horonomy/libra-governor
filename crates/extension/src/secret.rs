@@ -228,6 +228,22 @@ mod tests {
     }
 
     #[test]
+    fn sign_matches_the_rfc_4231_hmac_sha256_vector() {
+        // Pins the on-the-wire signature bytes to the standard, so a future
+        // hmac/sha2/digest major bump cannot silently change what receivers
+        // must verify. RFC 4231 test case 2.
+        let secret = WebhookSecret::new(b"Jefe".to_vec());
+        let signature = secret.sign(b"what do ya want for nothing?");
+        assert_eq!(
+            signature
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
     fn resolve_trims_the_trailing_newline() {
         let command = WebhookSecretCommand::new(
             "/bin/sh",
