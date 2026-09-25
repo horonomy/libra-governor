@@ -9,6 +9,7 @@ members = [
     "crates/estimator",
     "crates/gateway",
     "crates/extension",
+    "crates/evidence-adapter",
 ]
 exclude = ["experiments/phase0", "experiments/mvp1_validation/fixtures/rust-crate"]
 
@@ -19,7 +20,7 @@ license = "Apache-2.0"
 repository = "https://github.com/horonomy/libra-governor"
 
 [workspace.dependencies]
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
