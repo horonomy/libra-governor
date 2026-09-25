@@ -25,6 +25,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
 thiserror = "2"
-rusqlite = { version = "0.32", features = ["bundled"] }
+# `fallible_uint` re-enables `FromSql`/`ToSql` for `u64`/`usize`, which rusqlite
+# 0.40 moved behind this opt-in feature. The gated impls are the same fallible
+# `i64 -> u64` conversions 0.32 provided unconditionally, so this keeps the
+# ledger's `COUNT(*)` reads (crates/ledger/src/query.rs) behaving identically.
+rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
 tempfile = "3"
 sha2 = "0.11"
