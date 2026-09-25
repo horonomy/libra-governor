@@ -1,0 +1,58 @@
+{
+  "vector_id": "canon-v1-vector-001",
+  "canonicalization": "horonom-evidence-canon-v1",
+  "_notes": [
+    "HORO-1381 sub-ticket 6 — cross-product canonicalization-vector agreement test.",
+    "This is a fully schema-v1-valid 24-field event, not the canonicalization spec's own worked example (that example is missing adapter_version, gap_reason, and imported, per Finding 9 -- it cannot be validated against schema_v1 or deserialized by Horologium's/Libra Governor's typed Event structs).",
+    "Fixture invariants -- forced by specific product/validator constraints, do not silently \"fix\" these:",
+    "payload_classification=metadata_only: Eltanin's PayloadClassification enum has only MetadataOnly.",
+    "transport_state=pending: Eltanin's TransportState enum has only Pending.",
+    "coverage=full => gap_reason=null: schema_v1.validate_event.",
+    "destination=local_only => tenant_id=null: schema_v1._is_cloud_destination.",
+    "decision_mode=observe, scope_id=null, actual_action=allow, would_action=deny: SCHEMA-12 (scope_id only under enforce), MODE-10, and the observe+deny-is-malformed rule.",
+    "origin_profile=personal (and profile=personal): avoids the corporate => permanently_ineligible latch in Circinus's and Ophiuchus's pydantic validators.",
+    "All 24 ADR-0012 section 3 fields are present, including adapter_version, gap_reason, and imported.",
+    "integrity is present and fully populated ({canonicalization, content_hash:{alg,value}, prev_event_hash:null, signature:null}); content_hash is set to this vector's own real expected value. Stripped before hashing by all five products, so it cannot affect the result.",
+    "Every string value is restricted to printable ASCII containing no '\"' and no '\\\\', which is what makes serde_jcs (Horologium), json.dumps(ensure_ascii=True) (Circinus), json.dumps(ensure_ascii=False) (Ophiuchus + this harness), and sorted serde_json (Eltanin, Libra Governor) provably byte-identical.",
+    "product=circinus is arbitrary -- pinned for continuity with the canonicalization spec's worked example. Do not \"fix\" this to any other product value; any value would work structurally."
+  ],
+  "event": {
+    "event_id": "3f9a0006-0000-7000-8000-000000000006",
+    "schema_version": 1,
+    "product": "circinus",
+    "product_version": "0.4.2",
+    "adapter_version": "0.4.2",
+    "occurred_at": "2026-09-24T10:15:03.000Z",
+    "ingested_at": "2026-09-24T10:15:03.001Z",
+    "profile": "personal",
+    "origin_profile": "personal",
+    "decision_mode": "observe",
+    "scope_id": null,
+    "actual_action": "allow",
+    "would_action": "deny",
+    "coverage": "full",
+    "gap_reason": null,
+    "dropped_count": 0,
+    "payload_classification": "metadata_only",
+    "integrity": {
+      "canonicalization": "horonom-evidence-canon-v1",
+      "content_hash": {
+        "alg": "sha256",
+        "value": "fb03c74adf689b1e2bf23f156e70036879bc438b8bcd103008528ad834fbf6d0"
+      },
+      "prev_event_hash": null,
+      "signature": null
+    },
+    "destination": "local_only",
+    "tenant_id": null,
+    "transport_state": "pending",
+    "eligibility": "replayable_evidence",
+    "permanently_ineligible": false,
+    "imported": false
+  },
+  "canonical": "{\"actual_action\":\"allow\",\"adapter_version\":\"0.4.2\",\"coverage\":\"full\",\"decision_mode\":\"observe\",\"destination\":\"local_only\",\"dropped_count\":0,\"eligibility\":\"replayable_evidence\",\"event_id\":\"3f9a0006-0000-7000-8000-000000000006\",\"gap_reason\":null,\"imported\":false,\"ingested_at\":\"2026-09-24T10:15:03.001Z\",\"occurred_at\":\"2026-09-24T10:15:03.000Z\",\"origin_profile\":\"personal\",\"payload_classification\":\"metadata_only\",\"permanently_ineligible\":false,\"product\":\"circinus\",\"product_version\":\"0.4.2\",\"profile\":\"personal\",\"schema_version\":1,\"scope_id\":null,\"tenant_id\":null,\"transport_state\":\"pending\",\"would_action\":\"deny\"}",
+  "content_hash": {
+    "alg": "sha256",
+    "value": "fb03c74adf689b1e2bf23f156e70036879bc438b8bcd103008528ad834fbf6d0"
+  }
+}
