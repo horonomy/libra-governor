@@ -414,6 +414,7 @@ version = "0.0.2"
 dependencies = [
  "libra-governor-daemon",
  "libra-governor-domain",
+ "libra-governor-evidence-adapter",
  "libra-governor-gateway",
  "libra-governor-ledger",
  "libra-governor-protocol",
@@ -468,6 +469,20 @@ dependencies = [
  "libra-governor-ledger",
  "serde",
  "serde_json",
+ "time",
+]
+
+[[package]]
+name = "libra-governor-evidence-adapter"
+version = "0.0.2"
+dependencies = [
+ "libra-governor-domain",
+ "libra-governor-ledger",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
  "time",
 ]
 
