@@ -31,7 +31,9 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use hmac::{Hmac, Mac};
+// `KeyInit` is imported separately because hmac 0.13 / digest 0.11 dropped it
+// as a supertrait of `Mac`; `new_from_slice` lives on `KeyInit` alone now.
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -223,6 +225,22 @@ mod tests {
         let c = secret.sign(b"payload-2");
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn sign_matches_the_rfc_4231_hmac_sha256_vector() {
+        // Pins the on-the-wire signature bytes to the standard, so a future
+        // hmac/sha2/digest major bump cannot silently change what receivers
+        // must verify. RFC 4231 test case 2.
+        let secret = WebhookSecret::new(b"Jefe".to_vec());
+        let signature = secret.sign(b"what do ya want for nothing?");
+        assert_eq!(
+            signature
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
     }
 
     #[test]
