@@ -2,6 +2,11 @@
 //!
 //! Subcommands:
 //! - `daemon run` — runs the Governor daemon in the foreground.
+//! - `daemon stop` — identity-checked shutdown of exactly the daemon this
+//!   operator started (HORO-1380): reads its pid record, verifies it is
+//!   alive, running the recorded executable, and answering its own
+//!   socket, then sends `SIGTERM`. Refuses (no signal, non-zero exit) if
+//!   any check fails. Never a broad `pkill -f` by process name.
 //! - `hook user-prompt-submit` — the Claude Code `UserPromptSubmit` hook
 //!   entry point (see `integrations/claude-code/README.md`).
 //! - `hook post-tool-use` — the Claude Code `PostToolUse` hook entry
@@ -83,6 +88,7 @@ fn main() {
         .as_slice()
     {
         ["daemon", "run"] => daemon_cmd::run(),
+        ["daemon", "stop"] => std::process::exit(daemon_cmd::stop()),
         ["hook", "user-prompt-submit"] => hook::run(),
         ["hook", "post-tool-use"] => hook_post_tool_use::run(),
         ["hook", "stop"] => hook_stop::run(),
@@ -112,6 +118,7 @@ fn main() {
                 "libra-governor: unknown or missing subcommand\n\n\
                  Usage:\n  \
                  libra-governor daemon run\n  \
+                 libra-governor daemon stop\n  \
                  libra-governor hook user-prompt-submit\n  \
                  libra-governor hook post-tool-use\n  \
                  libra-governor hook stop\n  \
