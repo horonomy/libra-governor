@@ -548,3 +548,116 @@ fn concurrent_sandboxes_always_exec_their_own_private_binary_copy() {
         "every worker thread must have finished all {ROUNDS} rounds"
     );
 }
+
+/// The pids whose full command line matches `needle`, via `pgrep -f` —
+/// exactly the observable `Sandbox::drop` acts on, so a test can assert on
+/// the daemon's real lifecycle instead of on the return value of a `pkill`
+/// that may have matched nothing.
+///
+/// `pgrep` exits `1` when nothing matches, so the exit status is
+/// deliberately not checked; an empty result and "no such process" are the
+/// same answer here.
+fn processes_matching(needle: &str) -> Vec<String> {
+    let mut cmd = Command::new("pgrep");
+    cmd.args(["-f", needle])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let output = try_spawn_binary(&mut cmd)
+        .unwrap_or_else(|e| {
+            panic!("this test observes process teardown through `pgrep`, which failed to run: {e}")
+        })
+        .wait_with_output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Polls `pgrep -f needle` until it reports `want_running`, and fails with
+/// `what` and the surviving pids if it has not within `budget`.
+///
+/// A bounded wait is genuinely required here rather than papering over a
+/// race: `pkill` returns once the signal is *delivered*, and a process's
+/// exit after `SIGTERM` is asynchronous by definition, so there is no
+/// synchronous handle this test could wait on instead — these daemons are
+/// deliberately not children of this process (`spawn_daemon_detached`), so
+/// `wait` is not available. What the fixture must guarantee is that the
+/// daemon does terminate, and that is asserted here on the observable
+/// itself; each poll costs a `pgrep` exec, so the loop paces itself without
+/// a `sleep` and reports the failure with the offending pids rather than
+/// timing out anonymously.
+fn await_process_state(needle: &str, want_running: bool, budget: Duration, what: &str) {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let matches = processes_matching(needle);
+        if matches.is_empty() != want_running {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: after {budget:?}, `pgrep -f` {} (pids {matches:?})",
+            if want_running {
+                "still found nothing"
+            } else {
+                "still reports live processes"
+            }
+        );
+    }
+}
+
+/// Regression coverage for the process-lifecycle half of HORO-1500: a
+/// sandbox must actually reap the daemon its binary spawned.
+///
+/// The fixture used to ask `pkill -f <state_dir>`, a pattern that can never
+/// match a detached daemon, whose argv is `<bin_path> daemon run` and whose
+/// state dir lives only in its environment. Nothing noticed, because
+/// nothing asserted on the outcome: `pkill` exiting "no processes matched"
+/// looks exactly like "there was nothing to clean up". This test asserts on
+/// the observable instead — a daemon is running before teardown, and no
+/// process with this sandbox's binary in its command line survives the drop
+/// — which fails on any teardown pattern that matches the wrong thing,
+/// including the original one.
+#[test]
+fn dropping_a_sandbox_reaps_the_daemon_its_binary_spawned() {
+    let needle;
+    {
+        let sandbox = Sandbox::new();
+        needle = sandbox.bin_path.display().to_string();
+
+        // The hook path is what makes the binary spawn a detached daemon.
+        let payload = serde_json::json!({
+            "session_id": "sandbox-teardown",
+            "cwd": sandbox.state_dir.parent().unwrap(),
+            "prompt": "anything",
+        })
+        .to_string();
+        let mut hook = Command::new(&sandbox.bin_path);
+        hook.args(["hook", "user-prompt-submit"])
+            .env("LIBRA_GOVERNOR_STATE_DIR", &sandbox.state_dir)
+            .env("LIBRA_GOVERNOR_CLAUDE_DIR", &sandbox.claude_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawn_binary(&mut hook);
+        std::io::Write::write_all(child.stdin.as_mut().unwrap(), payload.as_bytes()).unwrap();
+        child.wait().unwrap();
+
+        await_process_state(
+            &needle,
+            true,
+            Duration::from_secs(10),
+            "the hook must leave a daemon running, or this test would assert nothing",
+        );
+    }
+
+    await_process_state(
+        &needle,
+        false,
+        Duration::from_secs(10),
+        "dropping the sandbox must terminate the daemon its binary spawned; a teardown \
+         pattern that matches the state dir instead of the binary path matches nothing and \
+         leaks every daemon (HORO-1500)",
+    );
+}
