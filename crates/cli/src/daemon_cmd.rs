@@ -16,7 +16,9 @@
 use libra_governor_daemon::{recon::ReconBudget, DaemonConfig, DaemonError};
 use libra_governor_domain::ReplanHysteresisConfig;
 use libra_governor_protocol::{Request, Response};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(not(target_os = "linux"))]
+use std::path::PathBuf;
 use std::process::Command;
 
 /// Serializes tests in this module that mutate `LIBRA_GOVERNOR_STATE_DIR`
@@ -293,13 +295,31 @@ pub fn stop() -> i32 {
 mod stop_tests {
     use super::*;
 
+    /// Spawns and waits for a trivial child process, returning its pid —
+    /// a pid guaranteed to be dead (reaped, not just "a large number").
+    /// `u32::MAX` was tried here first and is wrong on Linux: `kill`
+    /// parses the pid argument into a `pid_t` (32-bit signed), and
+    /// `4294967295` truncates to `-1`, which `kill(2)` treats specially —
+    /// "signal every process this caller may signal" — so `kill -0 -1`
+    /// succeeds as long as any such process exists, making
+    /// `process_is_alive` wrongly report `true`. A real daemon's pid is
+    /// always a small positive number well inside `pid_t`'s range, so
+    /// this reaped-child pid is a realistic stand-in for "was alive, now
+    /// is not" rather than an out-of-range value that doesn't model a
+    /// real pid at all.
+    fn dead_pid() -> u32 {
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("failed to spawn `sh -c exit 0`");
+        let pid = child.id();
+        child.wait().expect("failed to wait for the child");
+        pid
+    }
+
     #[test]
     fn process_is_alive_is_false_for_a_pid_that_cannot_exist() {
-        // pid 1 always exists on a Unix system (init/launchd) but is never
-        // signalable by a non-root test user; a genuinely nonexistent pid
-        // is what this test wants. u32::MAX is not a valid pid on any
-        // real system.
-        assert!(!process_is_alive(u32::MAX));
+        assert!(!process_is_alive(dead_pid()));
     }
 
     #[test]
@@ -337,7 +357,7 @@ mod stop_tests {
         libra_governor_daemon::pidfile::write(
             dir.path(),
             &libra_governor_daemon::pidfile::PidRecord {
-                pid: u32::MAX,
+                pid: dead_pid(),
                 exe_path: std::path::PathBuf::from("/bin/does-not-matter"),
                 started_at: "2026-09-27T00:00:00Z".to_string(),
             },
