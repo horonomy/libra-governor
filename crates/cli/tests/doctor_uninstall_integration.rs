@@ -19,6 +19,28 @@
 //!   either human or `--json` form — a stronger guarantee than reasoning
 //!   about which fields exist, because it survives future field
 //!   additions to `DoctorResult`.
+//!
+//! # Two fixture invariants, both of them load-bearing (HORO-1500)
+//!
+//! `libtest` runs these tests on several threads of one process, and each
+//! [`Sandbox`] writes and then execs its own private copy of the binary. Two
+//! consequences are easy to get wrong and were:
+//!
+//! 1. **No fork may observe a writable descriptor to a binary about to be
+//!    exec'd.** A `fs::copy` on one thread and a `Command::spawn` on
+//!    another is enough to make the copying thread's own `execve` fail with
+//!    `ETXTBSY`, because the forked child transiently inherits the writable
+//!    descriptor. [`BINARY_COPY_VS_FORK`] makes that interleaving
+//!    unreachable, [`BINARY_COPIES_IN_FLIGHT`] asserts it directly on every
+//!    platform, and
+//!    `concurrent_sandboxes_always_exec_their_own_private_binary_copy`
+//!    covers the class.
+//! 2. **A sandbox must reap the daemon its binary spawned, including while
+//!    unwinding.** The daemon is detached, so it is not a child this process
+//!    can `wait` on, and it is identifiable only by its argv — see
+//!    [`Sandbox::drop`]. `dropping_a_sandbox_reaps_the_daemon_its_binary_spawned`
+//!    covers that, because a teardown whose pattern matches nothing is
+//!    otherwise indistinguishable from a teardown with nothing to do.
 
 use std::process::{Child, Command, Stdio};
 use std::sync::{Once, RwLock, RwLockReadGuard};
