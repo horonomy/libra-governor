@@ -248,14 +248,29 @@ impl Sandbox {
     }
 }
 
-fn kill_daemon_for(state_dir: &std::path::Path) {
-    let mut cmd = Command::new("pkill");
-    cmd.args(["-f", &state_dir.display().to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    if let Ok(mut child) = try_spawn_binary(&mut cmd) {
-        let _ = child.wait();
+impl Drop for Sandbox {
+    /// Best-effort teardown of any daemon this sandbox's binary spawned
+    /// detached (see `client::spawn_daemon_detached`). In `Drop` rather than
+    /// at the end of each test so it also runs on the panicking path: a
+    /// daemon that outlives a failing test can make the *next* failure look
+    /// like a different defect.
+    ///
+    /// The pattern is `bin_path`, not the state dir. A detached daemon's
+    /// command line is `<bin_path> daemon run`; the state dir it serves
+    /// reaches it through `LIBRA_GOVERNOR_STATE_DIR` in its *environment*,
+    /// and `pkill -f` matches only `/proc/<pid>/cmdline`, so the state dir
+    /// pattern this file used to pass could never match anything. `bin_path`
+    /// is inside this sandbox's own tempdir, so it is both unique to this
+    /// sandbox and actually present in the argv.
+    fn drop(&mut self) {
+        let mut cmd = Command::new("pkill");
+        cmd.args(["-f", &self.bin_path.display().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Ok(mut child) = try_spawn_binary(&mut cmd) {
+            let _ = child.wait();
+        }
     }
 }
 
@@ -331,8 +346,6 @@ fn install_doctor_uninstall_doctor_lifecycle() {
         stdout_again.to_lowercase().contains("not installed"),
         "doctor after uninstall must report not-installed again: {stdout_again}"
     );
-
-    kill_daemon_for(&sandbox.state_dir);
 }
 
 #[test]
@@ -349,8 +362,6 @@ fn uninstall_without_yes_on_a_non_interactive_stdin_never_deletes_the_state_dir(
         sandbox.state_dir.join("ledger.sqlite3").exists(),
         "a non-interactive uninstall without --yes must never delete real ledger data"
     );
-
-    kill_daemon_for(&sandbox.state_dir);
 }
 
 #[test]
@@ -398,8 +409,6 @@ fn doctor_flags_a_corrupt_config_json_with_a_live_daemon_as_unhealthy() {
             .any(|f| f["id"] == "config_file_valid" && f["severity"] == "error"),
         "expected a config_file_valid error finding: {findings:#?}"
     );
-
-    kill_daemon_for(&sandbox.state_dir);
 }
 
 #[test]
@@ -475,8 +484,6 @@ fn doctor_never_prints_a_gateway_credential_reference() {
             "doctor {args:?} leaked the credential reference:\nstdout: {stdout}\nstderr: {stderr}"
         );
     }
-
-    kill_daemon_for(&sandbox.state_dir);
 }
 
 /// Regression coverage for HORO-1500: several threads creating sandboxes
