@@ -19,24 +19,185 @@
 //!   either human or `--json` form — a stronger guarantee than reasoning
 //!   about which fields exist, because it survives future field
 //!   additions to `DoctorResult`.
+//!
+//! # Two fixture invariants, both of them load-bearing (HORO-1500)
+//!
+//! `libtest` runs these tests on several threads of one process, and each
+//! [`Sandbox`] writes and then execs its own private copy of the binary. Two
+//! consequences are easy to get wrong and were:
+//!
+//! 1. **No fork may observe a writable descriptor to a binary about to be
+//!    exec'd.** A `fs::copy` on one thread and a `Command::spawn` on
+//!    another is enough to make the copying thread's own `execve` fail with
+//!    `ETXTBSY`, because the forked child transiently inherits the writable
+//!    descriptor. [`BINARY_COPY_VS_FORK`] makes that interleaving
+//!    unreachable, [`BINARY_COPIES_IN_FLIGHT`] asserts it directly on every
+//!    platform, and
+//!    `concurrent_sandboxes_always_exec_their_own_private_binary_copy`
+//!    covers the class.
+//! 2. **A sandbox must reap the daemon its binary spawned, including while
+//!    unwinding.** The daemon is detached, so it is not a child this process
+//!    can `wait` on, and it is identifiable only by its argv — see
+//!    [`Sandbox::drop`]. `dropping_a_sandbox_reaps_the_daemon_its_binary_spawned`
+//!    covers that, because a teardown whose pattern matches nothing is
+//!    otherwise indistinguishable from a teardown with nothing to do.
 
-use std::process::{Command, Stdio};
-use std::sync::Once;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Once, RwLock, RwLockReadGuard};
 use std::time::Duration;
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_libra-governor")
 }
 
+/// Serializes "this process holds a writable descriptor to a binary this
+/// file is about to exec" against "this process forks" (HORO-1500).
+///
+/// The kernel refuses `execve` on any file that *some* process currently
+/// holds open for writing, with `ETXTBSY` /
+/// `std::io::ErrorKind::ExecutableFileBusy`. `libtest` runs this file's
+/// tests on several threads of one process, and every [`Sandbox`] writes
+/// its own private copy of the binary, so without this lock the following
+/// interleaving is reachable:
+///
+/// 1. Thread A is inside `fs::copy`, so the process holds a writable
+///    descriptor to A's `bin_path`.
+/// 2. Thread B, running a different test, calls `Command::spawn`. On Linux
+///    that is `posix_spawn`, which glibc implements as
+///    `clone(CLONE_VM | CLONE_VFORK)` followed by `execve` *in the child*;
+///    the child starts out holding a duplicate of every descriptor this
+///    process has open, including A's.
+/// 3. `O_CLOEXEC` does not close that window: it only takes effect at the
+///    child's own `execve`, and until then the descriptor is genuinely
+///    open for writing.
+/// 4. Thread A execs its own `bin_path`, the kernel sees an outstanding
+///    writable descriptor to it, and A fails with `ETXTBSY` — in a thread
+///    that did nothing wrong and for a reason unrelated to the code under
+///    test.
+///
+/// Holding the exclusive side for exactly as long as a writable descriptor
+/// to a binary copy exists, and the shared side across the fork/exec
+/// transition, makes that interleaving unreachable rather than merely
+/// unlikely — so this file needs no retry-on-`ETXTBSY` and no sleep.
+/// Descriptor tables are per-process, which is why an in-process lock is a
+/// complete answer: another process copying another file can never make
+/// this process's exec fail.
+static BINARY_COPY_VS_FORK: RwLock<()> = RwLock::new(());
+
+/// How many [`copy_binary_for_exec`] calls currently hold a writable
+/// descriptor to a binary copy open. Incremented and decremented only
+/// under the exclusive side of [`BINARY_COPY_VS_FORK`], so a holder of the
+/// shared side must observe zero.
+///
+/// This turns the invariant [`BINARY_COPY_VS_FORK`] exists to provide into
+/// something every fork in this file checks directly, which matters because
+/// the kernels this suite runs on do not agree about `ETXTBSY`: Linux
+/// enforces it, while macOS's `posix_spawn` is a single kernel call with no
+/// intermediate child to inherit a descriptor at all, so a regression here
+/// is invisible on a developer's Mac and reappears only in CI. Asserting on
+/// the *cause* rather than waiting for one platform's symptom reports the
+/// regression by name, on every platform, the first time the interleaving
+/// occurs.
+static BINARY_COPIES_IN_FLIGHT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Acquires the shared side of [`BINARY_COPY_VS_FORK`] for the duration of
+/// a fork. Every `Command` in this file goes through a holder of this
+/// guard, including the ones whose own exec target is never written to: it
+/// is the *forking* that hands a sibling thread's writable descriptor to a
+/// child, so every fork has to be excluded from a copy, not just the ones
+/// that exec a freshly copied binary.
+fn fork_guard() -> RwLockReadGuard<'static, ()> {
+    BINARY_COPY_VS_FORK
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Asserts the invariant [`fork_guard`] exists to buy, deliberately as a
+/// statement of its own rather than as part of acquiring the guard: the two
+/// then fail independently, so deleting the guard is caught by this
+/// assertion instead of silently reintroducing a race that only some
+/// kernels report and only sometimes.
+///
+/// Skipped while this thread is already panicking: a fork can happen during
+/// unwinding (fixture teardown), and a second panic there would abort the
+/// process instead of reporting anything.
+fn assert_no_binary_copy_in_flight() {
+    if std::thread::panicking() {
+        return;
+    }
+    assert_eq!(
+        BINARY_COPIES_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "this process forked while a binary copy held a writable descriptor open: the \
+         copy-versus-fork serialization documented on BINARY_COPY_VS_FORK has regressed \
+         (HORO-1500), and this fork can make an unrelated thread's exec fail with ETXTBSY"
+    );
+}
+
+/// Copies `src` over `dst` and makes `dst` executable, with no fork of this
+/// process able to observe the writable descriptor `fs::copy` opens. See
+/// [`BINARY_COPY_VS_FORK`].
+fn copy_binary_for_exec(src: &std::path::Path, dst: &std::path::Path) {
+    let _exclusive = BINARY_COPY_VS_FORK
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // `fs::copy` closes both handles before it returns, so the counter
+    // brackets exactly the window in which a writable descriptor exists.
+    BINARY_COPIES_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let copied = std::fs::copy(src, dst);
+    BINARY_COPIES_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    copied.unwrap_or_else(|e| panic!("copying {} to {} failed: {e}", src.display(), dst.display()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// Spawns `cmd` while holding [`fork_guard`], returning the error rather
+/// than panicking — for the best-effort execs (warm-ups, daemon teardown)
+/// whose failure must never fail a test.
+///
+/// The guard is released as soon as `spawn` returns, which is after the
+/// descriptor-inheriting window has closed: both glibc's `posix_spawn` and
+/// std's fork+exec fallback report the child's *exec* failure through the
+/// parent's return value, so a returned `Ok` means the child has already
+/// reached `execve` and dropped its inherited `O_CLOEXEC` descriptors. The
+/// child is never waited on under the guard, so tests still run
+/// concurrently.
+fn try_spawn_binary(cmd: &mut Command) -> std::io::Result<Child> {
+    let _guard = fork_guard();
+    assert_no_binary_copy_in_flight();
+    cmd.spawn()
+}
+
+/// [`try_spawn_binary`] for the execs a test depends on, with a failure
+/// message that names this file's invariant so a future regression is not
+/// mistaken for a flaky test.
+fn spawn_binary(cmd: &mut Command) -> Child {
+    try_spawn_binary(cmd).unwrap_or_else(|e| {
+        panic!(
+            "spawning {:?} failed: {e} (kind {:?}). An ExecutableFileBusy here means the \
+             copy-versus-fork serialization documented on BINARY_COPY_VS_FORK has regressed \
+             (HORO-1500), not that the binary is wrong",
+            cmd.get_program(),
+            e.kind()
+        )
+    })
+}
+
 /// Same one-time warm-up rationale as `hook_cli_integration.rs`.
 fn warm_up_binary() {
     static WARM_UP: Once = Once::new();
     WARM_UP.call_once(|| {
-        let _ = Command::new(bin())
-            .stdin(Stdio::null())
+        let mut cmd = Command::new(bin());
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+            .stderr(Stdio::null());
+        if let Ok(mut child) = try_spawn_binary(&mut cmd) {
+            let _ = child.wait();
+        }
     });
 }
 
@@ -69,23 +230,21 @@ impl Sandbox {
         std::fs::create_dir_all(&claude_dir).unwrap();
 
         let bin_path = bin_dir.path().join("libra-governor");
-        std::fs::copy(bin(), &bin_path).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        copy_binary_for_exec(std::path::Path::new(bin()), &bin_path);
         // Each private copy is a distinct file on disk and pays its own
         // first-execution OS validation cost (macOS Gatekeeper/AMFI) the
         // same way the original binary does — see
         // `hook_cli_integration.rs`'s `warm_up_binary` docs. Absorb it
         // here, untimed, so a test's own timing assertion only measures
         // this tool's own logic.
-        let _ = Command::new(&bin_path)
+        let mut warm_up = Command::new(&bin_path);
+        warm_up
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+            .stderr(Stdio::null());
+        if let Ok(mut child) = try_spawn_binary(&mut warm_up) {
+            let _ = child.wait();
+        }
 
         Sandbox {
             _state_parent: state_parent,
@@ -98,26 +257,43 @@ impl Sandbox {
     }
 
     fn run(&self, args: &[&str]) -> (std::process::Output, Duration) {
-        let start = std::time::Instant::now();
-        let output = Command::new(&self.bin_path)
-            .args(args)
+        let mut cmd = Command::new(&self.bin_path);
+        cmd.args(args)
             .env("LIBRA_GOVERNOR_STATE_DIR", &self.state_dir)
             .env("LIBRA_GOVERNOR_CLAUDE_DIR", &self.claude_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .unwrap();
+            .stderr(Stdio::piped());
+        let start = std::time::Instant::now();
+        let output = spawn_binary(&mut cmd).wait_with_output().unwrap();
         (output, start.elapsed())
     }
 }
 
-fn kill_daemon_for(state_dir: &std::path::Path) {
-    let _ = Command::new("pkill")
-        .args(["-f", &state_dir.display().to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+impl Drop for Sandbox {
+    /// Best-effort teardown of any daemon this sandbox's binary spawned
+    /// detached (see `client::spawn_daemon_detached`). In `Drop` rather than
+    /// at the end of each test so it also runs on the panicking path: a
+    /// daemon that outlives a failing test can make the *next* failure look
+    /// like a different defect.
+    ///
+    /// The pattern is `bin_path`, not the state dir. A detached daemon's
+    /// command line is `<bin_path> daemon run`; the state dir it serves
+    /// reaches it through `LIBRA_GOVERNOR_STATE_DIR` in its *environment*,
+    /// and `pkill -f` matches only `/proc/<pid>/cmdline`, so the state dir
+    /// pattern this file used to pass could never match anything. `bin_path`
+    /// is inside this sandbox's own tempdir, so it is both unique to this
+    /// sandbox and actually present in the argv.
+    fn drop(&mut self) {
+        let mut cmd = Command::new("pkill");
+        cmd.args(["-f", &self.bin_path.display().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Ok(mut child) = try_spawn_binary(&mut cmd) {
+            let _ = child.wait();
+        }
+    }
 }
 
 #[test]
@@ -192,8 +368,6 @@ fn install_doctor_uninstall_doctor_lifecycle() {
         stdout_again.to_lowercase().contains("not installed"),
         "doctor after uninstall must report not-installed again: {stdout_again}"
     );
-
-    kill_daemon_for(&sandbox.state_dir);
 }
 
 #[test]
@@ -210,8 +384,6 @@ fn uninstall_without_yes_on_a_non_interactive_stdin_never_deletes_the_state_dir(
         sandbox.state_dir.join("ledger.sqlite3").exists(),
         "a non-interactive uninstall without --yes must never delete real ledger data"
     );
-
-    kill_daemon_for(&sandbox.state_dir);
 }
 
 #[test]
@@ -231,15 +403,14 @@ fn doctor_flags_a_corrupt_config_json_with_a_live_daemon_as_unhealthy() {
     })
     .to_string();
     warm_up_binary();
-    let mut child = Command::new(&sandbox.bin_path)
-        .args(["hook", "user-prompt-submit"])
+    let mut hook = Command::new(&sandbox.bin_path);
+    hook.args(["hook", "user-prompt-submit"])
         .env("LIBRA_GOVERNOR_STATE_DIR", &sandbox.state_dir)
         .env("LIBRA_GOVERNOR_CLAUDE_DIR", &sandbox.claude_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::null());
+    let mut child = spawn_binary(&mut hook);
     std::io::Write::write_all(child.stdin.as_mut().unwrap(), payload.as_bytes()).unwrap();
     child.wait().unwrap();
 
@@ -260,8 +431,6 @@ fn doctor_flags_a_corrupt_config_json_with_a_live_daemon_as_unhealthy() {
             .any(|f| f["id"] == "config_file_valid" && f["severity"] == "error"),
         "expected a config_file_valid error finding: {findings:#?}"
     );
-
-    kill_daemon_for(&sandbox.state_dir);
 }
 
 #[test]
@@ -317,15 +486,14 @@ fn doctor_never_prints_a_gateway_credential_reference() {
     })
     .to_string();
     warm_up_binary();
-    let mut child = Command::new(&sandbox.bin_path)
-        .args(["hook", "user-prompt-submit"])
+    let mut hook = Command::new(&sandbox.bin_path);
+    hook.args(["hook", "user-prompt-submit"])
         .env("LIBRA_GOVERNOR_STATE_DIR", &sandbox.state_dir)
         .env("LIBRA_GOVERNOR_CLAUDE_DIR", &sandbox.claude_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::null());
+    let mut child = spawn_binary(&mut hook);
     std::io::Write::write_all(child.stdin.as_mut().unwrap(), payload.as_bytes()).unwrap();
     child.wait().unwrap();
 
@@ -338,6 +506,180 @@ fn doctor_never_prints_a_gateway_credential_reference() {
             "doctor {args:?} leaked the credential reference:\nstdout: {stdout}\nstderr: {stderr}"
         );
     }
+}
 
-    kill_daemon_for(&sandbox.state_dir);
+/// Regression coverage for HORO-1500: several threads creating sandboxes
+/// and exec'ing their own private binary copy at the same time must never
+/// fail to exec, and must never fork while a copy is in flight.
+///
+/// Both halves of the invariant are checked, and they fail for different
+/// reasons on purpose. `fork_guard`'s in-flight assertion fires on any
+/// overlap at all, which is deterministic and platform-independent;
+/// `spawn_binary`'s `ExecutableFileBusy` diagnostic fires only on the much
+/// narrower kernel window, and only on kernels that enforce it. Removing
+/// the serialization therefore fails this test loudly on macOS as well as
+/// on Linux, which is where the original defect was only ever observed.
+///
+/// The thread count matches the file's own test count, so the interleaving
+/// exercised here is the one `libtest` itself produces when it runs this
+/// file. The round count is deliberately small, and measured rather than
+/// guessed: with these values, reverting either half of the fix (the
+/// exclusive side of the copy, or the fork guard) was caught in 20 of 20
+/// runs on Linux, and in 10 of 10 runs pinned to two CPUs. Every sandbox
+/// runs `doctor`, the cheapest subcommand that both execs the copy and
+/// exits zero without spawning a daemon.
+#[test]
+fn concurrent_sandboxes_always_exec_their_own_private_binary_copy() {
+    const THREADS: usize = 6;
+    const ROUNDS: usize = 4;
+
+    let start_together = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+    let workers: Vec<_> = (0..THREADS)
+        .map(|thread| {
+            let start_together = std::sync::Arc::clone(&start_together);
+            std::thread::spawn(move || {
+                start_together.wait();
+                for round in 0..ROUNDS {
+                    let sandbox = Sandbox::new();
+                    let (output, _) = sandbox.run(&["doctor"]);
+                    assert!(
+                        output.status.success(),
+                        "doctor exited {:?} on thread {thread} round {round}; stderr: {}",
+                        output.status.code(),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            })
+        })
+        .collect();
+
+    let mut completed = 0usize;
+    for (thread, worker) in workers.into_iter().enumerate() {
+        match worker.join() {
+            Ok(()) => completed += 1,
+            Err(_) => panic!(
+                "worker thread {thread} panicked; its panic message above names the cause. \
+                 An ExecutableFileBusy or an in-flight-copy assertion there means the \
+                 copy-versus-fork serialization documented on BINARY_COPY_VS_FORK has \
+                 regressed (HORO-1500)"
+            ),
+        }
+    }
+    assert_eq!(
+        completed, THREADS,
+        "every worker thread must have finished all {ROUNDS} rounds"
+    );
+}
+
+/// The pids whose full command line matches `needle`, via `pgrep -f` —
+/// exactly the observable `Sandbox::drop` acts on, so a test can assert on
+/// the daemon's real lifecycle instead of on the return value of a `pkill`
+/// that may have matched nothing.
+///
+/// `pgrep` exits `1` when nothing matches, so the exit status is
+/// deliberately not checked; an empty result and "no such process" are the
+/// same answer here.
+fn processes_matching(needle: &str) -> Vec<String> {
+    let mut cmd = Command::new("pgrep");
+    cmd.args(["-f", needle])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let output = try_spawn_binary(&mut cmd)
+        .unwrap_or_else(|e| {
+            panic!("this test observes process teardown through `pgrep`, which failed to run: {e}")
+        })
+        .wait_with_output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Polls `pgrep -f needle` until it reports `want_running`, and fails with
+/// `what` and the surviving pids if it has not within `budget`.
+///
+/// A bounded wait is genuinely required here rather than papering over a
+/// race: `pkill` returns once the signal is *delivered*, and a process's
+/// exit after `SIGTERM` is asynchronous by definition, so there is no
+/// synchronous handle this test could wait on instead — these daemons are
+/// deliberately not children of this process (`spawn_daemon_detached`), so
+/// `wait` is not available. What the fixture must guarantee is that the
+/// daemon does terminate, and that is asserted here on the observable
+/// itself; each poll costs a `pgrep` exec, so the loop paces itself without
+/// a `sleep` and reports the failure with the offending pids rather than
+/// timing out anonymously.
+fn await_process_state(needle: &str, want_running: bool, budget: Duration, what: &str) {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let matches = processes_matching(needle);
+        if matches.is_empty() != want_running {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: after {budget:?}, `pgrep -f` {} (pids {matches:?})",
+            if want_running {
+                "still found nothing"
+            } else {
+                "still reports live processes"
+            }
+        );
+    }
+}
+
+/// Regression coverage for the process-lifecycle half of HORO-1500: a
+/// sandbox must actually reap the daemon its binary spawned.
+///
+/// The fixture used to ask `pkill -f <state_dir>`, a pattern that can never
+/// match a detached daemon, whose argv is `<bin_path> daemon run` and whose
+/// state dir lives only in its environment. Nothing noticed, because
+/// nothing asserted on the outcome: `pkill` exiting "no processes matched"
+/// looks exactly like "there was nothing to clean up". This test asserts on
+/// the observable instead — a daemon is running before teardown, and no
+/// process with this sandbox's binary in its command line survives the drop
+/// — which fails on any teardown pattern that matches the wrong thing,
+/// including the original one.
+#[test]
+fn dropping_a_sandbox_reaps_the_daemon_its_binary_spawned() {
+    let needle;
+    {
+        let sandbox = Sandbox::new();
+        needle = sandbox.bin_path.display().to_string();
+
+        // The hook path is what makes the binary spawn a detached daemon.
+        let payload = serde_json::json!({
+            "session_id": "sandbox-teardown",
+            "cwd": sandbox.state_dir.parent().unwrap(),
+            "prompt": "anything",
+        })
+        .to_string();
+        let mut hook = Command::new(&sandbox.bin_path);
+        hook.args(["hook", "user-prompt-submit"])
+            .env("LIBRA_GOVERNOR_STATE_DIR", &sandbox.state_dir)
+            .env("LIBRA_GOVERNOR_CLAUDE_DIR", &sandbox.claude_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawn_binary(&mut hook);
+        std::io::Write::write_all(child.stdin.as_mut().unwrap(), payload.as_bytes()).unwrap();
+        child.wait().unwrap();
+
+        await_process_state(
+            &needle,
+            true,
+            Duration::from_secs(10),
+            "the hook must leave a daemon running, or this test would assert nothing",
+        );
+    }
+
+    await_process_state(
+        &needle,
+        false,
+        Duration::from_secs(10),
+        "dropping the sandbox must terminate the daemon its binary spawned; a teardown \
+         pattern that matches the state dir instead of the binary path matches nothing and \
+         leaks every daemon (HORO-1500)",
+    );
 }
