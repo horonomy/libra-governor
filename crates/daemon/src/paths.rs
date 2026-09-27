@@ -83,6 +83,14 @@ pub fn ledger_path() -> Result<PathBuf, PathsError> {
     Ok(state_dir()?.join("ledger.sqlite3"))
 }
 
+/// The daemon's pid-record file path (HORO-1380) — sibling of
+/// [`socket_path`], written by the daemon that successfully binds the
+/// socket and read by `daemon stop` to identify exactly which process to
+/// signal. See [`crate::pidfile`] for the record's shape and lifecycle.
+pub fn pid_path() -> Result<PathBuf, PathsError> {
+    Ok(state_dir()?.join("daemon.pid"))
+}
+
 /// The daemon's log file path. Never receives raw prompt text or hook
 /// payload content — see `crates/daemon/src/log.rs`.
 pub fn log_path() -> Result<PathBuf, PathsError> {

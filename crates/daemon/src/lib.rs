@@ -14,6 +14,7 @@ pub mod features;
 pub mod gateway_authority;
 pub mod log;
 pub mod paths;
+pub mod pidfile;
 pub mod recon;
 pub mod server;
 
