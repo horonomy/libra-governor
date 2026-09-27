@@ -20,23 +20,118 @@
 //!   about which fields exist, because it survives future field
 //!   additions to `DoctorResult`.
 
-use std::process::{Command, Stdio};
-use std::sync::Once;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Once, RwLock, RwLockReadGuard};
 use std::time::Duration;
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_libra-governor")
 }
 
+/// Serializes "this process holds a writable descriptor to a binary this
+/// file is about to exec" against "this process forks" (HORO-1500).
+///
+/// The kernel refuses `execve` on any file that *some* process currently
+/// holds open for writing, with `ETXTBSY` /
+/// `std::io::ErrorKind::ExecutableFileBusy`. `libtest` runs this file's
+/// tests on several threads of one process, and every [`Sandbox`] writes
+/// its own private copy of the binary, so without this lock the following
+/// interleaving is reachable:
+///
+/// 1. Thread A is inside `fs::copy`, so the process holds a writable
+///    descriptor to A's `bin_path`.
+/// 2. Thread B, running a different test, calls `Command::spawn`. On Linux
+///    that is `posix_spawn`, which glibc implements as
+///    `clone(CLONE_VM | CLONE_VFORK)` followed by `execve` *in the child*;
+///    the child starts out holding a duplicate of every descriptor this
+///    process has open, including A's.
+/// 3. `O_CLOEXEC` does not close that window: it only takes effect at the
+///    child's own `execve`, and until then the descriptor is genuinely
+///    open for writing.
+/// 4. Thread A execs its own `bin_path`, the kernel sees an outstanding
+///    writable descriptor to it, and A fails with `ETXTBSY` — in a thread
+///    that did nothing wrong and for a reason unrelated to the code under
+///    test.
+///
+/// Holding the exclusive side for exactly as long as a writable descriptor
+/// to a binary copy exists, and the shared side across the fork/exec
+/// transition, makes that interleaving unreachable rather than merely
+/// unlikely — so this file needs no retry-on-`ETXTBSY` and no sleep.
+/// Descriptor tables are per-process, which is why an in-process lock is a
+/// complete answer: another process copying another file can never make
+/// this process's exec fail.
+static BINARY_COPY_VS_FORK: RwLock<()> = RwLock::new(());
+
+/// Acquires the shared side of [`BINARY_COPY_VS_FORK`] for the duration of
+/// a fork. Every `Command` in this file goes through a holder of this
+/// guard, including the ones whose own exec target is never written to: it
+/// is the *forking* that hands a sibling thread's writable descriptor to a
+/// child, so every fork has to be excluded from a copy, not just the ones
+/// that exec a freshly copied binary.
+fn fork_guard() -> RwLockReadGuard<'static, ()> {
+    BINARY_COPY_VS_FORK
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Copies `src` over `dst` and makes `dst` executable, with no fork of this
+/// process able to observe the writable descriptor `fs::copy` opens. See
+/// [`BINARY_COPY_VS_FORK`].
+fn copy_binary_for_exec(src: &std::path::Path, dst: &std::path::Path) {
+    let _exclusive = BINARY_COPY_VS_FORK
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::fs::copy(src, dst)
+        .unwrap_or_else(|e| panic!("copying {} to {} failed: {e}", src.display(), dst.display()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// Spawns `cmd` while holding [`fork_guard`], returning the error rather
+/// than panicking — for the best-effort execs (warm-ups, daemon teardown)
+/// whose failure must never fail a test.
+///
+/// The guard is released as soon as `spawn` returns, which is after the
+/// descriptor-inheriting window has closed: both glibc's `posix_spawn` and
+/// std's fork+exec fallback report the child's *exec* failure through the
+/// parent's return value, so a returned `Ok` means the child has already
+/// reached `execve` and dropped its inherited `O_CLOEXEC` descriptors. The
+/// child is never waited on under the guard, so tests still run
+/// concurrently.
+fn try_spawn_binary(cmd: &mut Command) -> std::io::Result<Child> {
+    let _guard = fork_guard();
+    cmd.spawn()
+}
+
+/// [`try_spawn_binary`] for the execs a test depends on, with a failure
+/// message that names this file's invariant so a future regression is not
+/// mistaken for a flaky test.
+fn spawn_binary(cmd: &mut Command) -> Child {
+    try_spawn_binary(cmd).unwrap_or_else(|e| {
+        panic!(
+            "spawning {:?} failed: {e} (kind {:?}). An ExecutableFileBusy here means the \
+             copy-versus-fork serialization documented on BINARY_COPY_VS_FORK has regressed \
+             (HORO-1500), not that the binary is wrong",
+            cmd.get_program(),
+            e.kind()
+        )
+    })
+}
+
 /// Same one-time warm-up rationale as `hook_cli_integration.rs`.
 fn warm_up_binary() {
     static WARM_UP: Once = Once::new();
     WARM_UP.call_once(|| {
-        let _ = Command::new(bin())
-            .stdin(Stdio::null())
+        let mut cmd = Command::new(bin());
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+            .stderr(Stdio::null());
+        if let Ok(mut child) = try_spawn_binary(&mut cmd) {
+            let _ = child.wait();
+        }
     });
 }
 
@@ -69,23 +164,21 @@ impl Sandbox {
         std::fs::create_dir_all(&claude_dir).unwrap();
 
         let bin_path = bin_dir.path().join("libra-governor");
-        std::fs::copy(bin(), &bin_path).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        copy_binary_for_exec(std::path::Path::new(bin()), &bin_path);
         // Each private copy is a distinct file on disk and pays its own
         // first-execution OS validation cost (macOS Gatekeeper/AMFI) the
         // same way the original binary does — see
         // `hook_cli_integration.rs`'s `warm_up_binary` docs. Absorb it
         // here, untimed, so a test's own timing assertion only measures
         // this tool's own logic.
-        let _ = Command::new(&bin_path)
+        let mut warm_up = Command::new(&bin_path);
+        warm_up
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+            .stderr(Stdio::null());
+        if let Ok(mut child) = try_spawn_binary(&mut warm_up) {
+            let _ = child.wait();
+        }
 
         Sandbox {
             _state_parent: state_parent,
@@ -98,26 +191,28 @@ impl Sandbox {
     }
 
     fn run(&self, args: &[&str]) -> (std::process::Output, Duration) {
-        let start = std::time::Instant::now();
-        let output = Command::new(&self.bin_path)
-            .args(args)
+        let mut cmd = Command::new(&self.bin_path);
+        cmd.args(args)
             .env("LIBRA_GOVERNOR_STATE_DIR", &self.state_dir)
             .env("LIBRA_GOVERNOR_CLAUDE_DIR", &self.claude_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .unwrap();
+            .stderr(Stdio::piped());
+        let start = std::time::Instant::now();
+        let output = spawn_binary(&mut cmd).wait_with_output().unwrap();
         (output, start.elapsed())
     }
 }
 
 fn kill_daemon_for(state_dir: &std::path::Path) {
-    let _ = Command::new("pkill")
-        .args(["-f", &state_dir.display().to_string()])
+    let mut cmd = Command::new("pkill");
+    cmd.args(["-f", &state_dir.display().to_string()])
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+        .stderr(Stdio::null());
+    if let Ok(mut child) = try_spawn_binary(&mut cmd) {
+        let _ = child.wait();
+    }
 }
 
 #[test]
@@ -231,15 +326,14 @@ fn doctor_flags_a_corrupt_config_json_with_a_live_daemon_as_unhealthy() {
     })
     .to_string();
     warm_up_binary();
-    let mut child = Command::new(&sandbox.bin_path)
-        .args(["hook", "user-prompt-submit"])
+    let mut hook = Command::new(&sandbox.bin_path);
+    hook.args(["hook", "user-prompt-submit"])
         .env("LIBRA_GOVERNOR_STATE_DIR", &sandbox.state_dir)
         .env("LIBRA_GOVERNOR_CLAUDE_DIR", &sandbox.claude_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::null());
+    let mut child = spawn_binary(&mut hook);
     std::io::Write::write_all(child.stdin.as_mut().unwrap(), payload.as_bytes()).unwrap();
     child.wait().unwrap();
 
@@ -317,15 +411,14 @@ fn doctor_never_prints_a_gateway_credential_reference() {
     })
     .to_string();
     warm_up_binary();
-    let mut child = Command::new(&sandbox.bin_path)
-        .args(["hook", "user-prompt-submit"])
+    let mut hook = Command::new(&sandbox.bin_path);
+    hook.args(["hook", "user-prompt-submit"])
         .env("LIBRA_GOVERNOR_STATE_DIR", &sandbox.state_dir)
         .env("LIBRA_GOVERNOR_CLAUDE_DIR", &sandbox.claude_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::null());
+    let mut child = spawn_binary(&mut hook);
     std::io::Write::write_all(child.stdin.as_mut().unwrap(), payload.as_bytes()).unwrap();
     child.wait().unwrap();
 
