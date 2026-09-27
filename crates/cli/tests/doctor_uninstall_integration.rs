@@ -62,16 +62,48 @@ fn bin() -> &'static str {
 /// this process's exec fail.
 static BINARY_COPY_VS_FORK: RwLock<()> = RwLock::new(());
 
+/// How many [`copy_binary_for_exec`] calls currently hold a writable
+/// descriptor to a binary copy open. Incremented and decremented only
+/// under the exclusive side of [`BINARY_COPY_VS_FORK`], so a holder of the
+/// shared side must observe zero.
+///
+/// This turns the invariant [`BINARY_COPY_VS_FORK`] exists to provide into
+/// something every fork in this file checks directly, which matters because
+/// the kernels this suite runs on do not agree about `ETXTBSY`: Linux
+/// enforces it, while macOS's `posix_spawn` is a single kernel call with no
+/// intermediate child to inherit a descriptor at all, so a regression here
+/// is invisible on a developer's Mac and reappears only in CI. Asserting on
+/// the *cause* rather than waiting for one platform's symptom reports the
+/// regression by name, on every platform, the first time the interleaving
+/// occurs.
+static BINARY_COPIES_IN_FLIGHT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Acquires the shared side of [`BINARY_COPY_VS_FORK`] for the duration of
-/// a fork. Every `Command` in this file goes through a holder of this
-/// guard, including the ones whose own exec target is never written to: it
-/// is the *forking* that hands a sibling thread's writable descriptor to a
-/// child, so every fork has to be excluded from a copy, not just the ones
-/// that exec a freshly copied binary.
+/// a fork, and asserts the invariant that guard is supposed to buy. Every
+/// `Command` in this file goes through a holder of this guard, including
+/// the ones whose own exec target is never written to: it is the *forking*
+/// that hands a sibling thread's writable descriptor to a child, so every
+/// fork has to be excluded from a copy, not just the ones that exec a
+/// freshly copied binary.
+///
+/// The assertion is skipped while this thread is already panicking: a fork
+/// can happen during unwinding (fixture teardown), and a second panic there
+/// would abort the process instead of reporting anything.
 fn fork_guard() -> RwLockReadGuard<'static, ()> {
-    BINARY_COPY_VS_FORK
+    let guard = BINARY_COPY_VS_FORK
         .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !std::thread::panicking() {
+        assert_eq!(
+            BINARY_COPIES_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "this process forked while a binary copy held a writable descriptor open: the \
+             copy-versus-fork serialization documented on BINARY_COPY_VS_FORK has regressed \
+             (HORO-1500), and this fork can make an unrelated thread's exec fail with ETXTBSY"
+        );
+    }
+    guard
 }
 
 /// Copies `src` over `dst` and makes `dst` executable, with no fork of this
@@ -81,8 +113,12 @@ fn copy_binary_for_exec(src: &std::path::Path, dst: &std::path::Path) {
     let _exclusive = BINARY_COPY_VS_FORK
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    std::fs::copy(src, dst)
-        .unwrap_or_else(|e| panic!("copying {} to {} failed: {e}", src.display(), dst.display()));
+    // `fs::copy` closes both handles before it returns, so the counter
+    // brackets exactly the window in which a writable descriptor exists.
+    BINARY_COPIES_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let copied = std::fs::copy(src, dst);
+    BINARY_COPIES_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    copied.unwrap_or_else(|e| panic!("copying {} to {} failed: {e}", src.display(), dst.display()));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
