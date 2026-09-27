@@ -478,3 +478,66 @@ fn doctor_never_prints_a_gateway_credential_reference() {
 
     kill_daemon_for(&sandbox.state_dir);
 }
+
+/// Regression coverage for HORO-1500: several threads creating sandboxes
+/// and exec'ing their own private binary copy at the same time must never
+/// fail to exec, and must never fork while a copy is in flight.
+///
+/// Both halves of the invariant are checked, and they fail for different
+/// reasons on purpose. `fork_guard`'s in-flight assertion fires on any
+/// overlap at all, which is deterministic and platform-independent;
+/// `spawn_binary`'s `ExecutableFileBusy` diagnostic fires only on the much
+/// narrower kernel window, and only on kernels that enforce it. Removing
+/// the serialization therefore fails this test loudly on macOS as well as
+/// on Linux, which is where the original defect was only ever observed.
+///
+/// The thread count matches the file's own test count, so the interleaving
+/// exercised here is the one `libtest` itself produces when it runs this
+/// file. The round count is deliberately small, and measured rather than
+/// guessed: with these values, reverting either half of the fix (the
+/// exclusive side of the copy, or the fork guard) was caught in 20 of 20
+/// runs on Linux, and in 10 of 10 runs pinned to two CPUs. Every sandbox
+/// runs `doctor`, the cheapest subcommand that both execs the copy and
+/// exits zero without spawning a daemon.
+#[test]
+fn concurrent_sandboxes_always_exec_their_own_private_binary_copy() {
+    const THREADS: usize = 6;
+    const ROUNDS: usize = 4;
+
+    let start_together = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+    let workers: Vec<_> = (0..THREADS)
+        .map(|thread| {
+            let start_together = std::sync::Arc::clone(&start_together);
+            std::thread::spawn(move || {
+                start_together.wait();
+                for round in 0..ROUNDS {
+                    let sandbox = Sandbox::new();
+                    let (output, _) = sandbox.run(&["doctor"]);
+                    assert!(
+                        output.status.success(),
+                        "doctor exited {:?} on thread {thread} round {round}; stderr: {}",
+                        output.status.code(),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            })
+        })
+        .collect();
+
+    let mut completed = 0usize;
+    for (thread, worker) in workers.into_iter().enumerate() {
+        match worker.join() {
+            Ok(()) => completed += 1,
+            Err(_) => panic!(
+                "worker thread {thread} panicked; its panic message above names the cause. \
+                 An ExecutableFileBusy or an in-flight-copy assertion there means the \
+                 copy-versus-fork serialization documented on BINARY_COPY_VS_FORK has \
+                 regressed (HORO-1500)"
+            ),
+        }
+    }
+    assert_eq!(
+        completed, THREADS,
+        "every worker thread must have finished all {ROUNDS} rounds"
+    );
+}
