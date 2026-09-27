@@ -80,30 +80,37 @@ static BINARY_COPIES_IN_FLIGHT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// Acquires the shared side of [`BINARY_COPY_VS_FORK`] for the duration of
-/// a fork, and asserts the invariant that guard is supposed to buy. Every
-/// `Command` in this file goes through a holder of this guard, including
-/// the ones whose own exec target is never written to: it is the *forking*
-/// that hands a sibling thread's writable descriptor to a child, so every
-/// fork has to be excluded from a copy, not just the ones that exec a
-/// freshly copied binary.
-///
-/// The assertion is skipped while this thread is already panicking: a fork
-/// can happen during unwinding (fixture teardown), and a second panic there
-/// would abort the process instead of reporting anything.
+/// a fork. Every `Command` in this file goes through a holder of this
+/// guard, including the ones whose own exec target is never written to: it
+/// is the *forking* that hands a sibling thread's writable descriptor to a
+/// child, so every fork has to be excluded from a copy, not just the ones
+/// that exec a freshly copied binary.
 fn fork_guard() -> RwLockReadGuard<'static, ()> {
-    let guard = BINARY_COPY_VS_FORK
+    BINARY_COPY_VS_FORK
         .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !std::thread::panicking() {
-        assert_eq!(
-            BINARY_COPIES_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "this process forked while a binary copy held a writable descriptor open: the \
-             copy-versus-fork serialization documented on BINARY_COPY_VS_FORK has regressed \
-             (HORO-1500), and this fork can make an unrelated thread's exec fail with ETXTBSY"
-        );
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Asserts the invariant [`fork_guard`] exists to buy, deliberately as a
+/// statement of its own rather than as part of acquiring the guard: the two
+/// then fail independently, so deleting the guard is caught by this
+/// assertion instead of silently reintroducing a race that only some
+/// kernels report and only sometimes.
+///
+/// Skipped while this thread is already panicking: a fork can happen during
+/// unwinding (fixture teardown), and a second panic there would abort the
+/// process instead of reporting anything.
+fn assert_no_binary_copy_in_flight() {
+    if std::thread::panicking() {
+        return;
     }
-    guard
+    assert_eq!(
+        BINARY_COPIES_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "this process forked while a binary copy held a writable descriptor open: the \
+         copy-versus-fork serialization documented on BINARY_COPY_VS_FORK has regressed \
+         (HORO-1500), and this fork can make an unrelated thread's exec fail with ETXTBSY"
+    );
 }
 
 /// Copies `src` over `dst` and makes `dst` executable, with no fork of this
@@ -139,6 +146,7 @@ fn copy_binary_for_exec(src: &std::path::Path, dst: &std::path::Path) {
 /// concurrently.
 fn try_spawn_binary(cmd: &mut Command) -> std::io::Result<Child> {
     let _guard = fork_guard();
+    assert_no_binary_copy_in_flight();
     cmd.spawn()
 }
 
