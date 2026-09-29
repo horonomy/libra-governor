@@ -364,3 +364,257 @@ pub fn run_provider() {
     };
     println!("{payload}");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libra_governor_domain::{BucketTier, Estimate, PlanId, ResourceAmount, TaskId};
+    use libra_governor_protocol::Confidence;
+
+    fn estimate_with(p90: Option<u64>, cold_start: bool, samples: usize) -> Estimate {
+        Estimate {
+            duration_p50_secs: p90.map(|s| s / 2),
+            duration_p80_secs: p90.map(|s| s * 4 / 5),
+            duration_p90_secs: p90,
+            // Present in the source state on purpose: the assertions below
+            // prove these never reach a rendering surface, and a fixture
+            // that left them `None` would prove nothing.
+            resource_p50: Some(ResourceAmount::UsdCents(1234)),
+            resource_p80: Some(ResourceAmount::UsdCents(2345)),
+            resource_p90: Some(ResourceAmount::UsdCents(3456)),
+            confidence: Confidence::Medium,
+            sample_count: samples,
+            cold_start,
+            estimator_version: "v3-tiered-confidence".to_string(),
+            reason: Some(ESTIMATOR_FREE_TEXT.to_string()),
+            feature_schema_version: "fs-v1".to_string(),
+            bucket_tier: BucketTier::Repo,
+        }
+    }
+
+    /// Stands in for whatever the estimator actually wrote. Free text by
+    /// type, so the only safe treatment is to never render it — which is
+    /// what a search for this sentinel proves.
+    const ESTIMATOR_FREE_TEXT: &str =
+        "the repo looked like /Users/someone/secret-project with token sk-live-AbC123";
+
+    fn task(replan_state: ReplanState) -> TaskSummary {
+        TaskSummary {
+            task_id: TaskId::new(),
+            confidence: Confidence::Medium,
+            recon_cost_seconds: 2.1,
+            plan_id: PlanId::new(),
+            remaining_estimate: estimate_with(Some(600), false, 7),
+            replan_state,
+        }
+    }
+
+    fn status_with(replan_state: ReplanState) -> StatusResult {
+        StatusResult {
+            current_task: Some(task(replan_state)),
+        }
+    }
+
+    fn now() -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_770_000_000).unwrap()
+    }
+
+    const ALL_NO_READINGS: [NoReading; 6] = [
+        NoReading::SocketPathUnresolved,
+        NoReading::DaemonUnreachable,
+        NoReading::DaemonTooSlow,
+        NoReading::DaemonProtocolMismatch,
+        NoReading::DaemonReportedError,
+        NoReading::ResponseNotUnderstood,
+    ];
+
+    fn segments(document: &Value) -> &Vec<Value> {
+        document["segments"].as_array().unwrap()
+    }
+
+    /// Every document this provider can emit, for the properties that must
+    /// hold in *all* of them rather than in a chosen one.
+    fn every_document() -> Vec<(String, Value)> {
+        let mut out: Vec<(String, Value)> = ALL_NO_READINGS
+            .iter()
+            .map(|kind| {
+                (
+                    format!("no_reading/{}", kind.reason_code()),
+                    no_reading(*kind),
+                )
+            })
+            .collect();
+        for (name, state) in [
+            ("stable", ReplanState::Stable),
+            ("replanned", ReplanState::Replanned { count: 3 }),
+            ("escalated", ReplanState::EscalatedAwaitingApproval),
+        ] {
+            out.push((
+                format!("reading/{name}"),
+                reading(&status_with(state), now()),
+            ));
+        }
+        out.push((
+            "reading/idle".to_string(),
+            reading(&StatusResult { current_task: None }, now()),
+        ));
+        out
+    }
+
+    fn walk_strings(value: &Value, path: &str, out: &mut Vec<(String, String)>) {
+        match value {
+            Value::String(s) => out.push((path.to_string(), s.clone())),
+            Value::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    walk_strings(item, &format!("{path}[{i}]"), out);
+                }
+            }
+            Value::Object(map) => {
+                for (key, item) in map {
+                    let child = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    walk_strings(item, &child, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn all_strings(document: &Value) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        walk_strings(document, "", &mut out);
+        out
+    }
+
+    #[test]
+    fn the_document_states_the_registered_identity_on_every_answer() {
+        // Including the failures: a host that cannot tell which provider or
+        // which contract version produced a document cannot render it, and
+        // "the failing one" is exactly when it most needs to say whose
+        // failure it is.
+        for (name, document) in every_document() {
+            assert_eq!(
+                document["contract_version"],
+                json!(CONTRACT_VERSION),
+                "{name}"
+            );
+            assert_eq!(document["provider"], json!("libra"), "{name}");
+            assert_eq!(document["scope"], json!("host"), "{name}");
+            assert_eq!(document["order_hint"], json!(ORDER_HINT), "{name}");
+            assert!(
+                document["provider_version"].is_string(),
+                "{name}: a version the host can report in doctor"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_probe_is_never_silence_and_never_a_pass() {
+        // The two failure modes the contract exists to prevent, in one
+        // assertion each: an empty segment list renders as nothing, and
+        // nothing on a statusline reads as all-clear; an `ok` state on a
+        // probe that established nothing is a health claim from a provider
+        // that measured no health.
+        for kind in ALL_NO_READINGS {
+            let document = no_reading(kind);
+            let code = kind.reason_code();
+            assert_ne!(document["availability"], json!("available"), "{code}");
+            assert_eq!(segments(&document).len(), 1, "{code}");
+            let segment = &segments(&document)[0];
+            assert_ne!(segment["state"], json!("ok"), "{code}");
+            assert_eq!(segment["reason_code"], json!(code));
+            assert!(
+                segment["label"].as_str().is_some_and(|l| !l.is_empty()),
+                "{code}: something must be rendered"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stopped_daemon_a_slow_one_and_a_broken_one_are_three_facts() {
+        // `UNKNOWN != UNAVAILABLE`. Reporting a slow daemon as not running
+        // sends the user to start one that is already up; reporting a
+        // version mismatch as not running hides the restart that would fix
+        // it.
+        assert_eq!(
+            no_reading(NoReading::DaemonUnreachable)["availability"],
+            json!("unavailable")
+        );
+        assert_eq!(
+            no_reading(NoReading::DaemonTooSlow)["availability"],
+            json!("unknown")
+        );
+        assert_eq!(
+            no_reading(NoReading::DaemonProtocolMismatch)["availability"],
+            json!("error")
+        );
+
+        let codes: Vec<&str> = ALL_NO_READINGS.iter().map(|k| k.reason_code()).collect();
+        let mut unique = codes.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            codes.len(),
+            "each outcome needs its own reason code, or doctor cannot tell them apart"
+        );
+    }
+
+    #[test]
+    fn a_failed_probe_reports_no_number_at_all() {
+        // `UNAVAILABLE != ZERO`, and its neighbours: a count of 0, a
+        // duration of 0 or a confidence attached to a reading that does not
+        // exist all read as measurements. There were none.
+        for kind in ALL_NO_READINGS {
+            for segment in segments(&no_reading(kind)) {
+                for field in ["count", "duration_seconds", "confidence", "confidence_of"] {
+                    assert!(
+                        segment.get(field).is_none(),
+                        "{}: {field} must be absent, not zero",
+                        kind.reason_code()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_client_error_never_carries_its_socket_path_into_the_label() {
+        // `ClientError::DaemonUnavailable` embeds the socket path and its
+        // `Display` renders it. That string is one `format!` away from a
+        // statusline, so the classification deliberately drops it and the
+        // label is a fixed literal.
+        let error = ClientError::DaemonUnavailable(
+            std::path::PathBuf::from("/Users/someone/.local/state/libra/daemon.sock"),
+            "No such file or directory".to_string(),
+        );
+        assert!(error.to_string().contains("/Users/someone"), "premise");
+
+        let kind = NoReading::from(&error);
+        assert_eq!(kind, NoReading::DaemonUnreachable);
+        for (path, text) in all_strings(&no_reading(kind)) {
+            assert!(!text.contains('/'), "{path} = {text:?}");
+            assert!(!text.contains("someone"), "{path} = {text:?}");
+        }
+    }
+
+    #[test]
+    fn a_socket_timeout_is_classified_as_slow_not_as_unreadable() {
+        // Both kinds are observed in practice — which one a socket timeout
+        // surfaces as depends on the platform and on whether the read or
+        // the write side expired.
+        for kind in [std::io::ErrorKind::WouldBlock, std::io::ErrorKind::TimedOut] {
+            let error = ClientError::Io(std::io::Error::from(kind));
+            assert_eq!(
+                NoReading::from(&error),
+                NoReading::DaemonTooSlow,
+                "{kind:?}"
+            );
+        }
+        let other = ClientError::Io(std::io::Error::from(std::io::ErrorKind::InvalidData));
+        assert_eq!(NoReading::from(&other), NoReading::ResponseNotUnderstood);
+    }
+}
