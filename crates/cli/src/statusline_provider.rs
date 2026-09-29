@@ -129,6 +129,11 @@ pub const ORDER_HINT: u32 = 500;
 /// nothing on a statusline reads as all-clear.
 pub const HOT_PATH_BUDGET: Duration = Duration::from_millis(200);
 
+/// How long `explain` may wait. Larger on purpose: the user asked a
+/// question and is waiting for the answer, so a slow daemon is worth
+/// waiting out rather than reporting as a timeout.
+pub const EXPLAIN_BUDGET: Duration = Duration::from_secs(3);
+
 /// Longest span the host's contract accepts, mirrored here so an absurd
 /// estimate clamps instead of making the host reject the whole document. A
 /// refused provider renders as an unknown with no reading at all, which is
@@ -437,7 +442,7 @@ const KNOWN_PRESETS: [(&str, &str); 4] = [
     ("strict_budget", "strict budget"),
 ];
 
-/// The prose form of a preset name, if it is one this build recognises.
+/// The config token for a preset, if it is one this build recognises.
 ///
 /// `Policy::name` is a `String` whose docs permit "a caller-chosen name for
 /// a custom policy", so it is not a bounded value and must not be rendered
@@ -447,6 +452,26 @@ const KNOWN_PRESETS: [(&str, &str); 4] = [
 /// is the difference between "no path exists today" and "no path can
 /// exist". A statusline is a place arbitrary product text must not be able
 /// to reach.
+///
+/// Returns the token rather than the prose because its caller is `explain`,
+/// where the useful string is the one a user would type into `config.json`.
+///
+/// An unrecognised name yields `None`, which suppresses the profile segment
+/// entirely rather than rendering a placeholder: `Running policy custom`
+/// would be a claim about a policy this build cannot describe.
+fn preset_label(name: &str) -> Option<&'static str> {
+    KNOWN_PRESETS
+        .iter()
+        .find(|(token, _)| *token == name)
+        .map(|(token, _)| *token)
+}
+
+/// The same lookup, returning the prose form a segment label may carry.
+///
+/// Separate from [`preset_label`] rather than replacing it: the two surfaces
+/// want different strings for the same fact, and collapsing them would
+/// either push an underscore into a label the host refuses or print prose
+/// where a user needs the exact config token.
 fn preset_display(name: &str) -> Option<&'static str> {
     KNOWN_PRESETS
         .iter()
@@ -578,6 +603,151 @@ pub fn run_provider() {
         Err(kind) => no_reading(kind),
     };
     println!("{payload}");
+}
+
+/// Prose for a [`ReplanState`], spelled out.
+///
+/// The escalated case is the reason this surface exists. Four lines of
+/// explanation is the right price for a state whose name
+/// (`EscalatedAwaitingApproval`) misdescribes it, and the statusline has
+/// room for none of them.
+fn replan_state_prose(state: &ReplanState) -> String {
+    match state {
+        ReplanState::Stable => "stable, no automatic replan yet".to_string(),
+        ReplanState::Replanned { count } => {
+            format!("automatically replanned {count} time(s) so far")
+        }
+        ReplanState::EscalatedAwaitingApproval => "automatic-replan budget spent".to_string(),
+    }
+}
+
+/// The read-only long form of the same state, for the shared `explain`
+/// surface.
+///
+/// Given more room than a statusline, this says everything bounded that the
+/// daemon holds — and says plainly what it does *not* hold, which is the
+/// question a user arrives here with. Spans are printed as raw seconds
+/// rather than as `12m`: the host owns span formatting for the contract, and
+/// a second formatter in this file is a second place for the two to
+/// disagree about what a minute is.
+///
+/// What it never prints: prompts, task or tool content, the estimator's
+/// free-text `reason`, the resource/cost quantiles, a credential, or a
+/// path. The ids it does print are local, ephemeral and the only handle a
+/// reader has on the work — unlike Fornax's claim and session ids, which
+/// answer no question this surface is asked.
+pub fn explain_text(status: &StatusResult, doctor: Option<&DoctorResult>) -> String {
+    let mut out = String::from("Libra — the task being governed on this machine (host-wide)\n\n");
+
+    match status.current_task.as_ref() {
+        None => {
+            out.push_str("  No task is being governed right now. The daemon is running\n");
+            out.push_str("  and has admitted nothing, which is not a judgement about\n");
+            out.push_str("  anything it has admitted before.\n");
+        }
+        Some(task) => {
+            let estimate = &task.remaining_estimate;
+            out.push_str(&format!("  task             {}\n", task.task_id));
+            out.push_str(&format!("  plan             {}\n", task.plan_id.0));
+            match estimate.duration_p90_secs {
+                Some(p90) => out.push_str(&format!("  remaining P90    {p90}s\n")),
+                None if estimate.cold_start => {
+                    out.push_str("  remaining P90    none — no local history yet\n")
+                }
+                None => out.push_str("  remaining P90    none — no duration bound computed\n"),
+            }
+            if let Some(p50) = estimate.duration_p50_secs {
+                out.push_str(&format!("  remaining P50    {p50}s\n"));
+            }
+            out.push_str(&format!(
+                "  confidence       {} — confidence in the remaining-work estimate,\n\
+                 \x20                  not a risk or priority rating for the task\n",
+                confidence_token(task.confidence)
+            ));
+            // The existing shared helper, not a third description of the
+            // same taxonomy: a preflight, the receipt that finalizes it and
+            // this surface must describe an estimate's evidentiary basis
+            // identically, or a user comparing them sees a discrepancy that
+            // is purely in the prose.
+            out.push_str(&format!(
+                "  estimate basis   {}\n",
+                crate::bucket_prose::describe_bucket_tier(
+                    estimate.bucket_tier,
+                    estimate.sample_count
+                )
+            ));
+            out.push_str(&format!(
+                "  estimator        {}\n",
+                estimate.estimator_version
+            ));
+            out.push_str(&format!(
+                "  recon cost       {:.1}s\n",
+                task.recon_cost_seconds
+            ));
+            out.push_str(&format!(
+                "  replan state     {}\n",
+                replan_state_prose(&task.replan_state)
+            ));
+            if task.replan_state == ReplanState::EscalatedAwaitingApproval {
+                out.push_str(
+                    "\n  This task has used up its automatic-replan budget, so the next\n",
+                );
+                out.push_str(
+                    "  material deviation will not be silently replanned again. Nothing\n",
+                );
+                out.push_str(
+                    "  is blocked and nothing is waiting on an answer from you — Libra's\n",
+                );
+                out.push_str("  hooks are advisory, and the task is still running. What has\n");
+                out.push_str("  changed is that the plan and estimate above will no longer be\n");
+                out.push_str("  corrected automatically, so they are worth re-reading yourself.\n");
+            }
+        }
+    }
+
+    out.push('\n');
+    match doctor {
+        None => out.push_str(
+            "  running policy   not established — the daemon did not answer the\n\
+                              \x20                  diagnostic request\n",
+        ),
+        Some(doctor) => {
+            match preset_label(&doctor.policy_preset) {
+                Some(preset) => out.push_str(&format!("  running policy   {preset}\n")),
+                None => out.push_str("  running policy   a preset this build does not recognise\n"),
+            }
+            if doctor.running_config_matches_disk {
+                out.push_str("  config.json      agrees with the running policy\n");
+            } else {
+                out.push_str("  config.json      has been edited since the daemon started; the\n");
+                out.push_str(
+                    "                   policy above is what is actually in force, and a\n",
+                );
+                out.push_str("                   daemon restart is what would apply the edit\n");
+            }
+        }
+    }
+
+    out.push_str("\n  Not shown here: prompts, task or tool content, the estimator's\n");
+    out.push_str("  free-text reasoning, and resource/cost quantiles. Libra keeps that\n");
+    out.push_str("  material local and off every rendering surface.\n");
+    out
+}
+
+/// `libra-governor statusline explain`.
+///
+/// Exits 0 in every case, for the same reason [`run_provider`] does: a
+/// non-zero exit would make a stopped daemon indistinguishable from a
+/// broken command, and the text already says which it is.
+pub fn run_explain() {
+    match probe(Instant::now() + EXPLAIN_BUDGET) {
+        Ok((status, doctor)) => print!("{}", explain_text(&status, doctor.as_ref())),
+        Err(kind) => {
+            println!("Libra — the task being governed on this machine (host-wide)\n");
+            println!("  no reading       {}", kind.label());
+            println!("  reason           {}", kind.reason_code());
+        }
+    }
 }
 
 #[cfg(test)]
