@@ -39,7 +39,9 @@
 
 use std::time::{Duration, Instant};
 
-use libra_governor_protocol::{ReplanState, Request, Response, StatusResult, TaskSummary};
+use libra_governor_protocol::{
+    Confidence, ReplanState, Request, Response, StatusResult, TaskSummary,
+};
 use serde_json::{json, Value};
 use time::OffsetDateTime;
 
@@ -83,6 +85,11 @@ pub const ORDER_HINT: u32 = 500;
 /// nothing on a statusline reads as all-clear.
 pub const HOT_PATH_BUDGET: Duration = Duration::from_millis(200);
 
+/// Longest span the host's contract accepts, mirrored here so an absurd
+/// estimate clamps instead of making the host reject the whole document. A
+/// refused provider renders as an unknown with no reading at all, which is
+/// a worse answer than "implausibly long".
+const MAX_DURATION_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
 /// Largest count the host's contract accepts. `ReplanState::Replanned`
 /// carries a `u32`, which can exceed it.
 const MAX_COUNT: u32 = 1_000_000_000;
@@ -283,6 +290,63 @@ fn task_segment(task: Option<&TaskSummary>) -> Value {
     segment
 }
 
+/// The remaining-work estimate: a span, and the confidence in that span.
+///
+/// Both facts live on one segment on purpose. The confidence is a
+/// confidence *in this estimate*, so sitting it beside the number is what
+/// makes `preflight confidence medium` unambiguous — a separate segment
+/// would put the qualifier a degradation step away from the thing it
+/// qualifies, which is how `pf:high` came to read as a risk rating.
+///
+/// The span is sent as seconds plus a noun, never as a formatted string.
+/// The host owns formatting (`statusline_render.format_duration`); a
+/// product that rendered its own `5d4h` would be one more place for two
+/// products to disagree about what a day is.
+///
+/// With no `duration_p90_secs` there is no estimate, so no confidence is
+/// emitted either: a confidence in a number that is absent reads as a
+/// judgement about the task. The reason is taken from `Estimate::cold_start`,
+/// which is authoritative and structural — the type's own docs promise a
+/// cold start is *never* inferred from `confidence` alone, and the
+/// estimator's free-text `reason` is never rendered.
+fn estimate_segment(task: &TaskSummary) -> Value {
+    let estimate = &task.remaining_estimate;
+    let Some(p90) = estimate.duration_p90_secs else {
+        return json!({
+            "key": "estimate",
+            "state": "unknown",
+            "label": "Remaining work",
+            "reason_code": if estimate.cold_start {
+                "no_local_history_yet"
+            } else {
+                "estimate_has_no_duration_bound"
+            },
+            "explain_key": "libra.estimate",
+            "order_hint": 20,
+        });
+    };
+    json!({
+        "key": "estimate",
+        "state": "neutral",
+        "label": "Remaining work",
+        "duration_seconds": p90.min(MAX_DURATION_SECONDS),
+        "duration_label": "P90",
+        "confidence": confidence_token(task.confidence),
+        "confidence_of": "preflight_estimate",
+        "explain_key": "libra.estimate",
+        "order_hint": 20,
+    })
+}
+
+/// The contract's spelling of a [`Confidence`].
+fn confidence_token(confidence: Confidence) -> &'static str {
+    match confidence {
+        Confidence::Low => "low",
+        Confidence::Medium => "medium",
+        Confidence::High => "high",
+    }
+}
+
 /// `YYYY-MM-DDTHH:MM:SSZ`, which is what the host's `observed_at` accepts.
 ///
 /// Built by hand rather than via `time`'s `Rfc3339`, which renders a UTC
@@ -314,7 +378,10 @@ fn rfc3339_utc(now: OffsetDateTime) -> String {
 /// plan as current. The founder's wrapper caches this at its own layer,
 /// which is its choice to make; the provider does not authorise it.
 pub fn reading(status: &StatusResult, now: OffsetDateTime) -> Value {
-    let segments = vec![task_segment(status.current_task.as_ref())];
+    let mut segments = vec![task_segment(status.current_task.as_ref())];
+    if let Some(task) = status.current_task.as_ref() {
+        segments.push(estimate_segment(task));
+    }
 
     json!({
         "contract_version": CONTRACT_VERSION,
