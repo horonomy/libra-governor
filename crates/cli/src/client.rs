@@ -190,4 +190,14 @@ mod tests {
             "connect_only must fail fast, not hang"
         );
     }
+
+    #[test]
+    fn connect_only_with_budget_refuses_an_exhausted_budget() {
+        // The failure this guards is silent: `None` timeouts mean "block
+        // forever", so a caller whose deadline has already passed must not
+        // be handed a stream at all.
+        let dir = tempfile::tempdir().unwrap();
+        let result = connect_only_with_budget(&dir.path().join("x.sock"), Duration::ZERO);
+        assert!(matches!(result, Err(ClientError::DaemonUnavailable(..))));
+    }
 }
