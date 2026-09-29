@@ -754,7 +754,8 @@ pub fn run_explain() {
 mod tests {
     use super::*;
     use libra_governor_domain::{BucketTier, Estimate, PlanId, ResourceAmount, TaskId};
-    use libra_governor_protocol::Confidence;
+
+    // ---------------------------------------------------------------- fixtures
 
     fn estimate_with(p90: Option<u64>, cold_start: bool, samples: usize) -> Estimate {
         Estimate {
@@ -800,23 +801,6 @@ mod tests {
         }
     }
 
-    fn now() -> OffsetDateTime {
-        OffsetDateTime::from_unix_timestamp(1_770_000_000).unwrap()
-    }
-
-    const ALL_NO_READINGS: [NoReading; 6] = [
-        NoReading::SocketPathUnresolved,
-        NoReading::DaemonUnreachable,
-        NoReading::DaemonTooSlow,
-        NoReading::DaemonProtocolMismatch,
-        NoReading::DaemonReportedError,
-        NoReading::ResponseNotUnderstood,
-    ];
-
-    fn segments(document: &Value) -> &Vec<Value> {
-        document["segments"].as_array().unwrap()
-    }
-
     fn doctor_with(preset: &str, matches_disk: bool) -> DoctorResult {
         DoctorResult {
             daemon_version: "0.0.2".to_string(),
@@ -843,27 +827,21 @@ mod tests {
         }
     }
 
-    const SECRET_PREFIXES: [&str; 8] = [
-        "sk-",
-        "sk_live_",
-        "sk_test_",
-        "ghp_",
-        "gho_",
-        "github_pat_",
-        "xoxb-",
-        "AKIA",
+    fn now() -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_770_000_000).unwrap()
+    }
+
+    const ALL_NO_READINGS: [NoReading; 6] = [
+        NoReading::SocketPathUnresolved,
+        NoReading::DaemonUnreachable,
+        NoReading::DaemonTooSlow,
+        NoReading::DaemonProtocolMismatch,
+        NoReading::DaemonReportedError,
+        NoReading::ResponseNotUnderstood,
     ];
 
-    /// A run of 20+ token characters mixing cases and digits — the shape a
-    /// key has and prose does not.
-    fn looks_high_entropy(text: &str) -> bool {
-        text.split(|c: char| !(c.is_ascii_alphanumeric() || "_+/=-".contains(c)))
-            .any(|run| {
-                run.len() >= 20
-                    && run.chars().any(|c| c.is_ascii_lowercase())
-                    && run.chars().any(|c| c.is_ascii_uppercase())
-                    && run.chars().any(|c| c.is_ascii_digit())
-            })
+    fn segments(document: &Value) -> &Vec<Value> {
+        document["segments"].as_array().unwrap()
     }
 
     /// Every document this provider can emit, for the properties that must
@@ -941,6 +919,8 @@ mod tests {
         out
     }
 
+    // ------------------------------------------------------------- identity
+
     #[test]
     fn the_document_states_the_registered_identity_on_every_answer() {
         // Including the failures: a host that cannot tell which provider or
@@ -962,6 +942,8 @@ mod tests {
             );
         }
     }
+
+    // ----------------------------------------------------------- no reading
 
     #[test]
     fn a_failed_probe_is_never_silence_and_never_a_pass() {
@@ -1070,6 +1052,8 @@ mod tests {
         assert_eq!(NoReading::from(&other), NoReading::ResponseNotUnderstood);
     }
 
+    // --------------------------------------------------------------- task
+
     #[test]
     fn a_governed_task_is_reported_as_a_state_not_as_a_verdict() {
         let document = reading(&status_with(ReplanState::Stable), None, now());
@@ -1132,30 +1116,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_live_reading_claims_no_age_and_authorises_no_cache() {
-        // The daemon answered just now, so an age would invent a staleness
-        // that does not exist — and the state can change on any tool call,
-        // so a TTL would let a host render a superseded plan as current.
-        let document = reading(&status_with(ReplanState::Stable), None, now());
-        assert_eq!(document["observed_at"], json!("2026-02-02T02:40:00Z"));
-        assert!(document.get("age_seconds").is_none());
-        assert!(document.get("cache_ttl_seconds").is_none());
-        for segment in segments(&document) {
-            assert!(segment.get("age_seconds").is_none());
-        }
-    }
-
-    #[test]
-    fn observed_at_is_utc_with_a_literal_z() {
-        // `time`'s own Rfc3339 renders UTC as `+00:00`, which the contract
-        // refuses: an age computed against a local offset is ambiguous
-        // across machines.
-        let stamp = rfc3339_utc(now());
-        assert!(stamp.ends_with('Z'), "{stamp}");
-        assert!(!stamp.contains('+'), "{stamp}");
-        assert_eq!(stamp.len(), 20, "{stamp}");
-    }
+    // ----------------------------------------------------------- estimate
 
     #[test]
     fn a_span_is_sent_as_seconds_and_a_noun_never_as_rendered_text() {
@@ -1247,6 +1208,8 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------- escalation
+
     #[test]
     fn escalation_is_reported_without_claiming_anything_awaits_the_user() {
         // The second correction to the legacy rendering. Nothing is blocked
@@ -1319,6 +1282,8 @@ mod tests {
         }
     }
 
+    // ----------------------------------------------------------- profile
+
     #[test]
     fn the_profile_segment_is_silent_while_disk_and_runtime_agree() {
         let document = reading(
@@ -1381,14 +1346,18 @@ mod tests {
         }
 
         for (token, display) in KNOWN_PRESETS {
+            assert_eq!(preset_label(token), Some(token));
             assert_eq!(preset_display(token), Some(display));
             assert!(
                 !display.contains('_'),
                 "{display:?} would be refused by the host's label allowlist"
             );
         }
+        assert_eq!(preset_label("balanced-ish"), None);
         assert_eq!(preset_display("balanced-ish"), None);
     }
+
+    // ------------------------------------------------------- the document
 
     #[test]
     fn a_doctor_that_did_not_answer_does_not_cost_the_user_the_task() {
@@ -1428,6 +1397,56 @@ mod tests {
             keys.dedup();
             assert_eq!(keys.len(), count, "{name}: duplicate segment key");
         }
+    }
+
+    #[test]
+    fn a_live_reading_claims_no_age_and_authorises_no_cache() {
+        // The daemon answered just now, so an age would invent a staleness
+        // that does not exist — and the state can change on any tool call,
+        // so a TTL would let a host render a superseded plan as current.
+        let document = reading(&status_with(ReplanState::Stable), None, now());
+        assert_eq!(document["observed_at"], json!("2026-02-02T02:40:00Z"));
+        assert!(document.get("age_seconds").is_none());
+        assert!(document.get("cache_ttl_seconds").is_none());
+        for segment in segments(&document) {
+            assert!(segment.get("age_seconds").is_none());
+        }
+    }
+
+    #[test]
+    fn observed_at_is_utc_with_a_literal_z() {
+        // `time`'s own Rfc3339 renders UTC as `+00:00`, which the contract
+        // refuses: an age computed against a local offset is ambiguous
+        // across machines.
+        let stamp = rfc3339_utc(now());
+        assert!(stamp.ends_with('Z'), "{stamp}");
+        assert!(!stamp.contains('+'), "{stamp}");
+        assert_eq!(stamp.len(), 20, "{stamp}");
+    }
+
+    // ----------------------------------------------------------- privacy
+
+    const SECRET_PREFIXES: [&str; 8] = [
+        "sk-",
+        "sk_live_",
+        "sk_test_",
+        "ghp_",
+        "gho_",
+        "github_pat_",
+        "xoxb-",
+        "AKIA",
+    ];
+
+    /// A run of 20+ token characters mixing cases and digits — the shape a
+    /// key has and prose does not.
+    fn looks_high_entropy(text: &str) -> bool {
+        text.split(|c: char| !(c.is_ascii_alphanumeric() || "_+/=-".contains(c)))
+            .any(|run| {
+                run.len() >= 20
+                    && run.chars().any(|c| c.is_ascii_lowercase())
+                    && run.chars().any(|c| c.is_ascii_uppercase())
+                    && run.chars().any(|c| c.is_ascii_digit())
+            })
     }
 
     #[test]
@@ -1498,5 +1517,120 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_estimators_free_text_never_reaches_a_rendering_surface() {
+        // `Estimate::reason` is free text by type. The fixture puts a path
+        // and a key-shaped token in it precisely so a leak here is loud.
+        let status = status_with(ReplanState::Stable);
+        let document = reading(&status, Some(&doctor_with("balanced", true)), now());
+        assert!(
+            status
+                .current_task
+                .as_ref()
+                .unwrap()
+                .remaining_estimate
+                .reason
+                .is_some(),
+            "premise: the state being rendered from does carry free text"
+        );
+        for (path, text) in all_strings(&document) {
+            assert!(!text.contains("secret-project"), "{path}");
+        }
+        assert!(
+            !explain_text(&status, Some(&doctor_with("balanced", true))).contains("secret-project")
+        );
+    }
+
+    // ----------------------------------------------------------- explain
+
+    #[test]
+    fn explain_answers_the_question_the_statusline_could_not() {
+        let status = status_with(ReplanState::Stable);
+        let text = explain_text(&status, Some(&doctor_with("balanced", true)));
+        let task = status.current_task.as_ref().unwrap();
+        assert!(text.contains(&task.task_id.to_string()), "the full task id");
+        assert!(
+            text.contains(&task.plan_id.0.to_string()),
+            "the full plan id"
+        );
+        assert!(text.contains("remaining P90    600s"));
+        assert!(text.contains("running policy   balanced"));
+        assert!(
+            text.contains("basis: this repo"),
+            "the same words the preflight and receipt renderers use"
+        );
+    }
+
+    #[test]
+    fn explain_says_a_confidence_is_about_the_estimate_not_about_the_task() {
+        let text = explain_text(&status_with(ReplanState::Stable), None);
+        assert!(text.contains("confidence in the remaining-work estimate"));
+        assert!(text.contains("not a risk or priority rating for the task"));
+    }
+
+    #[test]
+    fn explain_states_plainly_that_escalation_is_not_waiting_on_anyone() {
+        let text = explain_text(&status_with(ReplanState::EscalatedAwaitingApproval), None);
+        assert!(text.contains("automatic-replan budget"));
+        assert!(text.contains("Nothing"));
+        assert!(text.contains("waiting on an answer from you"));
+        assert!(
+            !text.contains("approve this"),
+            "explain is not an approval interface either"
+        );
+    }
+
+    #[test]
+    fn explain_never_prints_a_resource_quantile() {
+        // Cost history is the founder's, and the contract's privacy rule
+        // names it. The fixture sets all three quantiles so their absence
+        // here is a real observation.
+        let text = explain_text(&status_with(ReplanState::Stable), None);
+        for rendered in ["1234", "2345", "3456"] {
+            assert!(
+                !text.contains(rendered),
+                "{rendered} is a resource quantile"
+            );
+        }
+    }
+
+    #[test]
+    fn explain_reports_an_unestablished_diagnostic_rather_than_guessing() {
+        let text = explain_text(&status_with(ReplanState::Stable), None);
+        assert!(text.contains("not established"));
+        assert!(
+            !text.contains("agrees with the running policy"),
+            "silence about drift must not read as agreement"
+        );
+    }
+
+    #[test]
+    fn explain_reports_config_drift_and_which_side_is_in_force() {
+        let text = explain_text(
+            &status_with(ReplanState::Stable),
+            Some(&doctor_with("strict_budget", false)),
+        );
+        assert!(text.contains("running policy   strict_budget"));
+        assert!(text.contains("has been edited since the daemon started"));
+        assert!(text.contains("daemon restart is what would apply the edit"));
+    }
+
+    #[test]
+    fn explain_declines_to_name_a_preset_it_cannot_describe() {
+        let text = explain_text(
+            &status_with(ReplanState::Stable),
+            Some(&doctor_with("custom-thing", true)),
+        );
+        assert!(text.contains("a preset this build does not recognise"));
+        assert!(!text.contains("custom-thing"));
+    }
+
+    #[test]
+    fn explain_reports_no_task_without_implying_a_verdict() {
+        let text = explain_text(&StatusResult { current_task: None }, None);
+        assert!(text.contains("No task is being governed right now"));
+        assert!(text.contains("not a judgement"));
     }
 }

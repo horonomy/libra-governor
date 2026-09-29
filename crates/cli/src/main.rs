@@ -21,7 +21,7 @@
 //!   bare `statusline` is on a migration path to retirement.
 //! - `statusline explain` — the read-only long form of the same state, for
 //!   the shared statusline `explain` surface. Says plainly what the daemon
-//!   does not hold, which is the question a user arrives with (HORO-1569).
+//!   does *not* hold, and never prints task content.
 //! - `calibration report` — real duration-coverage and admission-replay
 //!   calibration evidence over local history (HORO-1132).
 //! - `gateway token` — prints the local capability token Claude Code's
