@@ -69,6 +69,20 @@ for how this fits the overall hooks/daemon responsibility boundary.
   the primary visibility surface for runtime replanning; see "What ships"
   above. Never spawns the daemon and never makes an LLM call of its own —
   see `crates/cli/src/statusline.rs`.
+
+  This one-line form cannot be composed with anything else, and Claude
+  Code gives a scope only one `statusLine.command`. The supported surface
+  is now `libra-governor statusline provider`, below; this one is kept
+  working unchanged rather than removed.
+- `libra-governor statusline provider` — Libra's side of the shared
+  Horonom statusline provider contract (HORO-1569): one versioned JSON
+  document on stdout, always exit 0, composed by a shared host alongside
+  your own statusline and other products' providers.
+  `libra-governor statusline explain` prints the read-only long form for
+  the host's explain surface. Both are read-only, host-scoped, answer from
+  state the daemon already holds, and never spawn it. What they report and
+  what they never report is in [`docs/statusline.md`](../../docs/statusline.md);
+  the render logic is `crates/cli/src/statusline_provider.rs`.
 - `libra-governor calibration report` — a manual command (not a hook):
   asks the daemon for real duration-coverage and admission-replay
   calibration evidence, computed over every locally recorded receipt
@@ -180,6 +194,12 @@ Add the following to `.claude/settings.json` (project-level) or
   }
 }
 ```
+
+The `statusLine` entry above is the legacy single-product form, and it is
+only written when the slot is free. If you already have a statusline, or
+want another Horonom product's state on the same line, leave `statusLine`
+alone and register `libra-governor statusline provider` with the shared
+statusline host instead — [`docs/statusline.md`](../../docs/statusline.md).
 
 No further configuration is required to get today's defaults (the
 `balanced` admission policy, no gateway). The daemon is started on demand
