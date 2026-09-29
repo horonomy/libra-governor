@@ -54,6 +54,42 @@ pub fn connect_only(socket_path: &Path) -> Result<UnixStream, ClientError> {
         .map_err(|e| ClientError::DaemonUnavailable(socket_path.to_path_buf(), e.to_string()))
 }
 
+/// Connects to an already-running daemon with an explicit read/write
+/// budget in place of [`REQUEST_TIMEOUT`]. Never spawns one, for the same
+/// reason [`connect_only`] does not.
+///
+/// The statusline provider needs this: [`REQUEST_TIMEOUT`] is five
+/// seconds, and the shared statusline host allows a provider 250 ms before
+/// it is killed mid-write. Inheriting the default would mean a slow daemon
+/// produces *no* answer instead of an honest "did not answer in time" one,
+/// which is the worse of the two outcomes — a killed provider renders as
+/// nothing, and nothing on a statusline reads as all-clear.
+///
+/// A zero or negative budget is refused rather than passed through.
+/// `set_read_timeout(Some(Duration::ZERO))` is an `EINVAL` on Unix, and
+/// the tempting "just use `None`" would mean *no* timeout at all — an
+/// exhausted deadline turning into an unbounded block is precisely
+/// backwards.
+pub fn connect_only_with_budget(
+    socket_path: &Path,
+    budget: Duration,
+) -> Result<UnixStream, ClientError> {
+    if budget.is_zero() {
+        return Err(ClientError::DaemonUnavailable(
+            socket_path.to_path_buf(),
+            "no time left in the caller's budget to attempt a request".to_string(),
+        ));
+    }
+    let connect = |path: &Path| -> std::io::Result<UnixStream> {
+        let stream = UnixStream::connect(path)?;
+        stream.set_read_timeout(Some(budget))?;
+        stream.set_write_timeout(Some(budget))?;
+        Ok(stream)
+    };
+    connect(socket_path)
+        .map_err(|e| ClientError::DaemonUnavailable(socket_path.to_path_buf(), e.to_string()))
+}
+
 /// Connects to the daemon, spawning it (detached, `daemon run`) if a
 /// connection attempt fails, then polling for readiness up to
 /// [`SPAWN_WAIT_BUDGET`]. Used by the `hook` subcommand only.

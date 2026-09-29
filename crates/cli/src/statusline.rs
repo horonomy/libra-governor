@@ -76,7 +76,12 @@ fn format_replan_state(state: &ReplanState) -> String {
 
 /// The first 8 hex characters of a UUID string — enough to disambiguate
 /// on a one-line status render without eating the whole line width.
-fn short_task_id(task_id: &str) -> &str {
+///
+/// Shared with [`crate::statusline_provider`] rather than reimplemented
+/// there: the two renderings must truncate identically, or the same task
+/// would carry two different short ids depending on which surface a user
+/// happened to be looking at.
+pub(crate) fn short_task_id(task_id: &str) -> &str {
     let end = task_id
         .char_indices()
         .nth(8)
