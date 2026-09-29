@@ -1125,4 +1125,85 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn the_profile_segment_is_silent_while_disk_and_runtime_agree() {
+        let document = reading(
+            &status_with(ReplanState::Stable),
+            Some(&doctor_with("balanced", true)),
+            now(),
+        );
+        assert!(segments(&document)
+            .iter()
+            .all(|s| s["key"] != json!("profile")));
+    }
+
+    #[test]
+    fn the_profile_segment_names_what_is_running_not_what_was_edited() {
+        // The "never present the configured value as if it were live" rule.
+        // A user who has edited `config.json` needs both facts: that the
+        // edit has not taken effect, and what is in effect instead.
+        let document = reading(
+            &status_with(ReplanState::Stable),
+            Some(&doctor_with("strict_budget", false)),
+            now(),
+        );
+        let profile = segments(&document)
+            .iter()
+            .find(|s| s["key"] == json!("profile"))
+            .expect("drift must be visible");
+        assert_eq!(profile["state"], json!("warn"));
+        assert_eq!(
+            profile["label"],
+            json!("Running policy strict budget"),
+            "the token's underscore is a character the host's label allowlist refuses"
+        );
+        assert_eq!(
+            profile["reason_code"],
+            json!("config_edited_restart_required")
+        );
+    }
+
+    #[test]
+    fn a_preset_name_this_build_does_not_know_cannot_reach_the_payload() {
+        // `Policy::name` is a `String` whose docs permit a caller-chosen
+        // name for a custom policy. Today's only writer rejects anything
+        // outside the four presets, so this is the difference between "no
+        // path exists" and "no path can exist".
+        let hostile = "balanced\u{1b}[31m sk-live-AbC123XyZ456 /Users/someone";
+        let document = reading(
+            &status_with(ReplanState::Stable),
+            Some(&doctor_with(hostile, false)),
+            now(),
+        );
+        assert!(
+            segments(&document)
+                .iter()
+                .all(|s| s["key"] != json!("profile")),
+            "an unnameable policy is suppressed, not rendered as a placeholder"
+        );
+        for (path, text) in all_strings(&document) {
+            assert!(!text.contains("sk-live"), "{path} = {text:?}");
+            assert!(!text.contains('\u{1b}'), "{path} = {text:?}");
+        }
+
+        for (token, display) in KNOWN_PRESETS {
+            assert_eq!(preset_display(token), Some(display));
+            assert!(
+                !display.contains('_'),
+                "{display:?} would be refused by the host's label allowlist"
+            );
+        }
+        assert_eq!(preset_display("balanced-ish"), None);
+    }
+
+    #[test]
+    fn a_doctor_that_did_not_answer_does_not_cost_the_user_the_task() {
+        // Failure isolation inside one provider: the diagnostic half is
+        // discarded to `None`, and what could be established still renders.
+        let document = reading(&status_with(ReplanState::Stable), None, now());
+        assert_eq!(document["availability"], json!("available"));
+        assert_eq!(segments(&document).len(), 2);
+        assert_eq!(segments(&document)[0]["key"], json!("task"));
+    }
 }
