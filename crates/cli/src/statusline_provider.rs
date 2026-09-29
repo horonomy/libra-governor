@@ -511,15 +511,21 @@ mod tests {
                 )
             })
             .collect();
-        for (name, state) in [
+        let states = [
             ("stable", ReplanState::Stable),
             ("replanned", ReplanState::Replanned { count: 3 }),
             ("escalated", ReplanState::EscalatedAwaitingApproval),
-        ] {
-            out.push((
-                format!("reading/{name}"),
-                reading(&status_with(state), now()),
-            ));
+        ];
+        for (state_name, state) in states {
+            for (estimate_name, p90) in [("with-p90", Some(600u64)), ("no-p90", None)] {
+                let mut status = status_with(state);
+                status.current_task.as_mut().unwrap().remaining_estimate =
+                    estimate_with(p90, p90.is_none(), 7);
+                out.push((
+                    format!("reading/{state_name}/{estimate_name}"),
+                    reading(&status, now()),
+                ));
+            }
         }
         out.push((
             "reading/idle".to_string(),
@@ -766,5 +772,95 @@ mod tests {
         assert!(stamp.ends_with('Z'), "{stamp}");
         assert!(!stamp.contains('+'), "{stamp}");
         assert_eq!(stamp.len(), 20, "{stamp}");
+    }
+
+    #[test]
+    fn a_span_is_sent_as_seconds_and_a_noun_never_as_rendered_text() {
+        let document = reading(&status_with(ReplanState::Stable), now());
+        let estimate = &segments(&document)[1];
+        assert_eq!(estimate["key"], json!("estimate"));
+        assert_eq!(estimate["duration_seconds"], json!(600));
+        assert_eq!(estimate["duration_label"], json!("P90"));
+        assert_eq!(estimate["label"], json!("Remaining work"));
+        for (path, text) in all_strings(document.get("segments").unwrap()) {
+            assert!(
+                !text.contains("10m") && !text.contains("600s"),
+                "{path} = {text:?}: the host owns span formatting"
+            );
+        }
+    }
+
+    #[test]
+    fn a_confidence_always_says_what_it_is_a_confidence_in() {
+        // The `pf:high` regression, structurally. A bare `high` beside a
+        // task reads as a risk or priority rating; the host will only render
+        // the qualifying prose if the pair is present.
+        for (name, document) in every_document() {
+            for segment in segments(&document) {
+                if segment.get("confidence").is_some() {
+                    assert_eq!(
+                        segment["confidence_of"],
+                        json!("preflight_estimate"),
+                        "{name}"
+                    );
+                }
+                assert!(
+                    segment.get("confidence_of").is_none() || segment.get("confidence").is_some(),
+                    "{name}: a qualifier with nothing to qualify"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_confidence_rides_the_estimate_it_qualifies() {
+        // One segment, not two. A separate segment would put the qualifier
+        // a degradation step away from the number it qualifies, which is
+        // how the abbreviation came to be read as a rating in the first
+        // place.
+        let document = reading(&status_with(ReplanState::Stable), now());
+        let estimate = &segments(&document)[1];
+        assert_eq!(estimate["confidence"], json!("medium"));
+        assert!(estimate.get("duration_seconds").is_some());
+    }
+
+    #[test]
+    fn an_estimate_with_no_span_carries_no_confidence_in_that_span() {
+        let mut status = status_with(ReplanState::Stable);
+        status.current_task.as_mut().unwrap().remaining_estimate = estimate_with(None, true, 0);
+        let document = reading(&status, now());
+        let estimate = &segments(&document)[1];
+        assert_eq!(estimate["state"], json!("unknown"));
+        assert!(estimate.get("duration_seconds").is_none());
+        assert!(
+            estimate.get("confidence").is_none(),
+            "a confidence in an absent number reads as a judgement about the task"
+        );
+    }
+
+    #[test]
+    fn a_missing_span_is_explained_from_cold_start_not_from_a_sample_count() {
+        // The contract's "do not infer a reason" rule. `Estimate::cold_start`
+        // is authoritative and its own docs promise it is never inferred
+        // from confidence; a sample count is not a reason.
+        let reason = |cold_start: bool, samples: usize| {
+            let mut status = status_with(ReplanState::Stable);
+            status.current_task.as_mut().unwrap().remaining_estimate =
+                estimate_with(None, cold_start, samples);
+            segments(&reading(&status, now()))[1]["reason_code"].clone()
+        };
+
+        assert_eq!(reason(true, 0), json!("no_local_history_yet"));
+        assert_eq!(
+            reason(true, 40),
+            json!("no_local_history_yet"),
+            "the count must not override the authoritative field"
+        );
+        assert_eq!(reason(false, 0), json!("estimate_has_no_duration_bound"));
+        assert_ne!(
+            reason(true, 7),
+            reason(false, 7),
+            "same count, different fact: the reason must come from cold_start"
+        );
     }
 }
