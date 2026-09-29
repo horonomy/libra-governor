@@ -673,6 +673,29 @@ mod tests {
         }
     }
 
+    const SECRET_PREFIXES: [&str; 8] = [
+        "sk-",
+        "sk_live_",
+        "sk_test_",
+        "ghp_",
+        "gho_",
+        "github_pat_",
+        "xoxb-",
+        "AKIA",
+    ];
+
+    /// A run of 20+ token characters mixing cases and digits — the shape a
+    /// key has and prose does not.
+    fn looks_high_entropy(text: &str) -> bool {
+        text.split(|c: char| !(c.is_ascii_alphanumeric() || "_+/=-".contains(c)))
+            .any(|run| {
+                run.len() >= 20
+                    && run.chars().any(|c| c.is_ascii_lowercase())
+                    && run.chars().any(|c| c.is_ascii_uppercase())
+                    && run.chars().any(|c| c.is_ascii_digit())
+            })
+    }
+
     /// Every document this provider can emit, for the properties that must
     /// hold in *all* of them rather than in a chosen one.
     fn every_document() -> Vec<(String, Value)> {
@@ -1205,5 +1228,105 @@ mod tests {
         assert_eq!(document["availability"], json!("available"));
         assert_eq!(segments(&document).len(), 2);
         assert_eq!(segments(&document)[0]["key"], json!("task"));
+    }
+
+    #[test]
+    fn the_worst_case_document_fits_the_hosts_per_provider_segment_budget() {
+        // Four is the host's `MAX_SEGMENTS_PER_PROVIDER`, and a document
+        // that exceeds it is refused whole — so Libra would render as
+        // nothing at precisely the moment it had the most to say.
+        let document = reading(
+            &status_with(ReplanState::EscalatedAwaitingApproval),
+            Some(&doctor_with("strict_budget", false)),
+            now(),
+        );
+        assert_eq!(segments(&document).len(), 4);
+        for (name, document) in every_document() {
+            assert!(segments(&document).len() <= 4, "{name}");
+        }
+    }
+
+    #[test]
+    fn segment_keys_are_unique_and_ordered_within_the_provider() {
+        for (name, document) in every_document() {
+            let mut keys: Vec<&str> = segments(&document)
+                .iter()
+                .map(|s| s["key"].as_str().unwrap())
+                .collect();
+            let count = keys.len();
+            keys.sort_unstable();
+            keys.dedup();
+            assert_eq!(keys.len(), count, "{name}: duplicate segment key");
+        }
+    }
+
+    #[test]
+    fn no_string_in_any_document_is_secret_shaped() {
+        // The permanent guard the contract requires. It runs over every
+        // document the provider can produce, not a chosen one, so a new
+        // field cannot be added without passing through here.
+        for (name, document) in every_document() {
+            for (path, text) in all_strings(&document) {
+                for prefix in SECRET_PREFIXES {
+                    assert!(
+                        !text.contains(prefix),
+                        "{name}: {path} carries a {prefix}-shaped value"
+                    );
+                }
+                assert!(
+                    !looks_high_entropy(&text),
+                    "{name}: {path} = {text:?} has the shape of a key"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_high_entropy_check_is_not_vacuous() {
+        // Guarding the guard: a check that never fires proves nothing about
+        // the documents it passed.
+        assert!(looks_high_entropy("sk-live-AbCd1234EfGh5678IjKl"));
+        assert!(!looks_high_entropy("Replan budget spent"));
+        assert!(
+            !looks_high_entropy("Task 3f2a1b9c"),
+            "a short lowercase-hex id must stay renderable"
+        );
+    }
+
+    #[test]
+    fn no_document_carries_a_filesystem_path_or_an_escape_sequence() {
+        // Paths are the contract's "avoid unless there is an explicit safe
+        // UX requirement"; there is none here. Escape sequences are worse
+        // than a leak — a statusline is written straight to a terminal.
+        for (name, document) in every_document() {
+            for (path, text) in all_strings(&document) {
+                assert!(!text.contains('/'), "{name}: {path} = {text:?}");
+                assert!(!text.contains('\\'), "{name}: {path} = {text:?}");
+                assert!(!text.contains('\u{1b}'), "{name}: {path}");
+                assert!(!text.contains('\n'), "{name}: {path} = {text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn human_labels_use_only_the_characters_the_contract_allows() {
+        // The host refuses a document whose label falls outside its ASCII
+        // allowlist, and a refused document renders as nothing.
+        const HUMAN_FIELDS: [&str; 4] = ["label", "count_label", "duration_label", "reason_label"];
+        for (name, document) in every_document() {
+            for segment in segments(&document) {
+                for field in HUMAN_FIELDS {
+                    let Some(text) = segment.get(field).and_then(Value::as_str) else {
+                        continue;
+                    };
+                    assert!(
+                        text.chars()
+                            .all(|c| c.is_ascii_alphanumeric() || " .,'-—()%+?!≤≥".contains(c)),
+                        "{name}: {field} = {text:?}"
+                    );
+                    assert!(text.len() <= 48, "{name}: {field} = {text:?} is too long");
+                }
+            }
+        }
     }
 }
