@@ -24,6 +24,30 @@
 //! below are made here and the legacy line is left to be retired by the
 //! migration in `docs/statusline.md`.
 //!
+//! # Two corrections this module makes to the legacy rendering
+//!
+//! Both were found by reading the daemon rather than the wrapper, and both
+//! are cases where the old text claims more than the state supports.
+//!
+//! 1. **`preflight: high` was an unqualified word.** A bare `high` beside a
+//!    task reads as a risk or priority rating. It is neither: it is the
+//!    estimator's confidence in the remaining-work estimate. The contract
+//!    has a field pair for exactly this (`confidence` +
+//!    `confidence_of: "preflight_estimate"`), so the host renders
+//!    `preflight confidence high` and the ambiguity is structurally gone
+//!    rather than fixed by a longer abbreviation.
+//!
+//! 2. **`escalated — awaiting approval` overstates what happened.**
+//!    [`ReplanState::EscalatedAwaitingApproval`] means the task's
+//!    *automatic*-replan budget is exhausted, so the next material
+//!    deviation will not be silently replanned again. Nothing is blocked
+//!    and nothing is waiting on an answer — hooks are advisory-only
+//!    (ADR-0001), and `server.rs`'s `EscalateApprovalNeeded` arm logs, sets
+//!    the state, and returns `Ok(())`; work proceeds. "Awaiting approval"
+//!    invites the reader to go and approve something that does not exist.
+//!    So this provider reports the budget being spent and says plainly, in
+//!    the reason clause, that the *next* replan is what would need a human.
+//!
 //! # What this module never does
 //!
 //! It never spawns the daemon (a statusline refreshes on a timer; spawning
@@ -347,6 +371,33 @@ fn confidence_token(confidence: Confidence) -> &'static str {
     }
 }
 
+/// The automatic-replan budget having been spent, when it has been.
+///
+/// `warn`, not `critical`, and the label says what is true rather than what
+/// the variant is named. Nothing is blocked: `server.rs`'s
+/// `EscalateApprovalNeeded` arm logs, records the state and returns
+/// `Ok(())`, and hooks are advisory-only, so the task keeps running. What
+/// has changed is that the plan on screen will no longer be silently
+/// corrected, which is worth acting on but is not an emergency and is
+/// certainly not a request the user can answer from here.
+///
+/// Returns `None` for the other two states. `Stable` has nothing to report
+/// and `Replanned` is already reported as the task segment's count, so a
+/// segment for either would be a column spent on "normal".
+fn escalation_segment(task: &TaskSummary) -> Option<Value> {
+    match task.replan_state {
+        ReplanState::Stable | ReplanState::Replanned { .. } => None,
+        ReplanState::EscalatedAwaitingApproval => Some(json!({
+            "key": "escalation",
+            "state": "warn",
+            "label": "Replan budget spent",
+            "reason_code": "next_replan_needs_human_approval",
+            "explain_key": "libra.escalation",
+            "order_hint": 30,
+        })),
+    }
+}
+
 /// `YYYY-MM-DDTHH:MM:SSZ`, which is what the host's `observed_at` accepts.
 ///
 /// Built by hand rather than via `time`'s `Rfc3339`, which renders a UTC
@@ -381,6 +432,7 @@ pub fn reading(status: &StatusResult, now: OffsetDateTime) -> Value {
     let mut segments = vec![task_segment(status.current_task.as_ref())];
     if let Some(task) = status.current_task.as_ref() {
         segments.push(estimate_segment(task));
+        segments.extend(escalation_segment(task));
     }
 
     json!({
