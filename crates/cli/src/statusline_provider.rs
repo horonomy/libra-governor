@@ -617,4 +617,87 @@ mod tests {
         let other = ClientError::Io(std::io::Error::from(std::io::ErrorKind::InvalidData));
         assert_eq!(NoReading::from(&other), NoReading::ResponseNotUnderstood);
     }
+
+    #[test]
+    fn a_governed_task_is_reported_as_a_state_not_as_a_verdict() {
+        let document = reading(&status_with(ReplanState::Stable), now());
+        let task = &segments(&document)[0];
+        assert_eq!(task["key"], json!("task"));
+        assert_eq!(
+            task["state"],
+            json!("neutral"),
+            "`ok` would assert the work is going well, which Libra has not measured"
+        );
+        assert!(task["label"].as_str().unwrap().starts_with("Task "));
+    }
+
+    #[test]
+    fn no_task_is_reported_explicitly_rather_than_by_omission() {
+        let document = reading(&StatusResult { current_task: None }, now());
+        assert_eq!(document["availability"], json!("available"));
+        assert_eq!(segments(&document).len(), 1);
+        assert_eq!(
+            segments(&document)[0]["label"],
+            json!("No task being governed")
+        );
+        assert_eq!(segments(&document)[0]["state"], json!("neutral"));
+    }
+
+    #[test]
+    fn the_replan_count_rides_the_task_it_describes_and_zero_is_omitted() {
+        let replanned = reading(&status_with(ReplanState::Replanned { count: 3 }), now());
+        let task = &segments(&replanned)[0];
+        assert_eq!(task["count"], json!(3));
+        assert_eq!(
+            task["count_label"],
+            json!("replans"),
+            "a bare 3 beside a task id means nothing"
+        );
+
+        for state in [ReplanState::Stable, ReplanState::Replanned { count: 0 }] {
+            let document = reading(&status_with(state), now());
+            assert!(
+                segments(&document)[0].get("count").is_none(),
+                "{state:?}: 0 replans spends columns to say nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn the_task_segment_carries_one_identifier_not_two() {
+        // The legacy line carried the plan id as well. Two opaque
+        // eight-character identifiers on a line shared with the user's own
+        // statusline and every other product is what `explain` is for.
+        let status = status_with(ReplanState::Stable);
+        let plan = status.current_task.as_ref().unwrap().plan_id.0.to_string();
+        let document = reading(&status, now());
+        for (path, text) in all_strings(&document) {
+            assert!(!text.contains(&plan[..8]), "{path} = {text:?}");
+        }
+    }
+
+    #[test]
+    fn a_live_reading_claims_no_age_and_authorises_no_cache() {
+        // The daemon answered just now, so an age would invent a staleness
+        // that does not exist — and the state can change on any tool call,
+        // so a TTL would let a host render a superseded plan as current.
+        let document = reading(&status_with(ReplanState::Stable), now());
+        assert_eq!(document["observed_at"], json!("2026-02-02T02:40:00Z"));
+        assert!(document.get("age_seconds").is_none());
+        assert!(document.get("cache_ttl_seconds").is_none());
+        for segment in segments(&document) {
+            assert!(segment.get("age_seconds").is_none());
+        }
+    }
+
+    #[test]
+    fn observed_at_is_utc_with_a_literal_z() {
+        // `time`'s own Rfc3339 renders UTC as `+00:00`, which the contract
+        // refuses: an age computed against a local offset is ambiguous
+        // across machines.
+        let stamp = rfc3339_utc(now());
+        assert!(stamp.ends_with('Z'), "{stamp}");
+        assert!(!stamp.contains('+'), "{stamp}");
+        assert_eq!(stamp.len(), 20, "{stamp}");
+    }
 }
