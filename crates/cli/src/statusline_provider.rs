@@ -915,4 +915,64 @@ mod tests {
             "same count, different fact: the reason must come from cold_start"
         );
     }
+
+    #[test]
+    fn escalation_is_reported_without_claiming_anything_awaits_the_user() {
+        // The second correction to the legacy rendering. Nothing is blocked
+        // and nothing is waiting on an answer: the daemon's
+        // `EscalateApprovalNeeded` arm logs, records the state and returns
+        // `Ok(())`, and hooks are advisory-only. "Awaiting approval" invites
+        // the reader to go and approve something that does not exist.
+        let document = reading(&status_with(ReplanState::EscalatedAwaitingApproval), now());
+        let escalation = segments(&document)
+            .iter()
+            .find(|s| s["key"] == json!("escalation"))
+            .expect("the state must be visible at all");
+
+        assert_eq!(escalation["state"], json!("warn"));
+        assert_eq!(escalation["label"], json!("Replan budget spent"));
+        assert_eq!(
+            escalation["reason_code"],
+            json!("next_replan_needs_human_approval"),
+            "the *next* replan, not this moment"
+        );
+        for (path, text) in all_strings(&document) {
+            let lower = text.to_lowercase();
+            assert!(!lower.contains("awaiting"), "{path} = {text:?}");
+            assert!(!lower.contains("blocked"), "{path} = {text:?}");
+        }
+    }
+
+    #[test]
+    fn escalation_is_never_rendered_as_an_emergency_or_as_an_affordance() {
+        let document = reading(&status_with(ReplanState::EscalatedAwaitingApproval), now());
+        for segment in segments(&document) {
+            assert_ne!(
+                segment["state"],
+                json!("critical"),
+                "the task is still running"
+            );
+            // A statusline is not an approval interface, so the document
+            // must carry nothing a host could turn into a control.
+            for field in ["action", "command", "approve_url", "href"] {
+                assert!(segment.get(field).is_none(), "{field}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_ordinary_state_renders_two_quiet_segments() {
+        // The line the founder sees almost always. Anything that warns
+        // here is a warning that means nothing, and a statusline whose
+        // warnings mean nothing is a statusline nobody reads.
+        let document = reading(&status_with(ReplanState::Stable), now());
+        assert_eq!(segments(&document).len(), 2);
+        for segment in segments(&document) {
+            assert!(
+                segment["state"] == json!("neutral"),
+                "{:?} is not quiet",
+                segment["key"]
+            );
+        }
+    }
 }
