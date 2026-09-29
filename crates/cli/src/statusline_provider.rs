@@ -48,6 +48,24 @@
 //!    So this provider reports the budget being spent and says plainly, in
 //!    the reason clause, that the *next* replan is what would need a human.
 //!
+//! # Why the profile costs a second round trip
+//!
+//! The provider answers a `Status` request and then, separately, a
+//! `Doctor` one, because the running policy preset and whether
+//! `config.json` still agrees with it live on [`DoctorResult`] and nowhere
+//! else. The alternative considered and rejected was widening
+//! [`StatusResult`] to carry them: this repository's convention is to bump
+//! `PROTOCOL_VERSION` for any response-shape change (see its docs — eight
+//! bumps, one per shape change), and a bump forces every long-lived daemon
+//! to be restarted before it will answer again. A second local round trip
+//! inside the same deadline is the cheaper price, and it keeps one
+//! implementation of "does the running config match disk" rather than two.
+//!
+//! The `Doctor` half is failure-isolated from the `Status` half: if it is
+//! slow, unreachable or unparseable, the profile segment is simply absent
+//! and the rest of the reading still renders. A diagnostic that cannot be
+//! obtained must not cost the user the state that could.
+//!
 //! # What this module never does
 //!
 //! It never spawns the daemon (a statusline refreshes on a timer; spawning
@@ -58,13 +76,15 @@
 //! approval interface.
 //!
 //! It also never prints task content, prompts, tool output, cost history,
-//! a credential, or a path. Every string it emits is a fixed literal in this
-//! file.
+//! a credential, or a path. Every string it emits is either a fixed literal
+//! in this file or a value drawn from a closed set — see
+//! [`preset_display`], which is the one place a value reaches the payload
+//! from user-writable configuration.
 
 use std::time::{Duration, Instant};
 
 use libra_governor_protocol::{
-    Confidence, ReplanState, Request, Response, StatusResult, TaskSummary,
+    Confidence, DoctorResult, ReplanState, Request, Response, StatusResult, TaskSummary,
 };
 use serde_json::{json, Value};
 use time::OffsetDateTime;
@@ -398,6 +418,71 @@ fn escalation_segment(task: &TaskSummary) -> Option<Value> {
     }
 }
 
+/// The four presets `Policy` exposes: the config token, spelled exactly as
+/// `crates/domain/src/policy.rs` spells it, paired with the prose a
+/// statusline may carry.
+///
+/// Three of the four tokens contain an underscore, and the host's label
+/// allowlist is ASCII alphanumerics plus `. , ' - — ( ) % + ? ! ≤ ≥` — no
+/// `_`, deliberately, because that is where `key=value` and shell
+/// expansions live. A label of `Running policy strict_budget` is therefore
+/// not merely ugly: the host raises on it and refuses the whole document,
+/// so Libra would render as *nothing* at precisely the moment it had drift
+/// to report. Hence a table rather than the raw name, and the prose reads
+/// better beside a user's own statusline anyway.
+const KNOWN_PRESETS: [(&str, &str); 4] = [
+    ("balanced", "balanced"),
+    ("deadline_first", "deadline first"),
+    ("cost_first", "cost first"),
+    ("strict_budget", "strict budget"),
+];
+
+/// The prose form of a preset name, if it is one this build recognises.
+///
+/// `Policy::name` is a `String` whose docs permit "a caller-chosen name for
+/// a custom policy", so it is not a bounded value and must not be rendered
+/// verbatim. Today its only production writer is `config_file::resolve_policy`,
+/// which matches a closed four-name set and rejects anything else — so this
+/// is a structural guarantee rather than a fix for an observed leak, and it
+/// is the difference between "no path exists today" and "no path can
+/// exist". A statusline is a place arbitrary product text must not be able
+/// to reach.
+fn preset_display(name: &str) -> Option<&'static str> {
+    KNOWN_PRESETS
+        .iter()
+        .find(|(token, _)| *token == name)
+        .map(|(_, display)| *display)
+}
+
+/// The policy preset the daemon is *running*, when disk no longer agrees.
+///
+/// This is the contract's "report running truth, never the configured value
+/// as if it were live" rule, and it is why the segment names the running
+/// preset in its label and puts the disagreement in the reason clause
+/// rather than the other way round. A user who has edited `config.json`
+/// wants to know two things: that the edit has not taken effect, and what
+/// is in effect instead.
+///
+/// Returns `None` when the two agree, which is the ordinary case. The
+/// alternative — always showing `Running policy balanced` — spends a column
+/// on a constant, and `explain` reports the preset unconditionally for the
+/// user who wants it. `None` also covers a preset this build cannot name;
+/// see [`preset_display`].
+fn profile_segment(doctor: &DoctorResult) -> Option<Value> {
+    if doctor.running_config_matches_disk {
+        return None;
+    }
+    let preset = preset_display(&doctor.policy_preset)?;
+    Some(json!({
+        "key": "profile",
+        "state": "warn",
+        "label": format!("Running policy {preset}"),
+        "reason_code": "config_edited_restart_required",
+        "explain_key": "libra.profile",
+        "order_hint": 40,
+    }))
+}
+
 /// `YYYY-MM-DDTHH:MM:SSZ`, which is what the host's `observed_at` accepts.
 ///
 /// Built by hand rather than via `time`'s `Rfc3339`, which renders a UTC
@@ -428,12 +513,13 @@ fn rfc3339_utc(now: OffsetDateTime) -> String {
 /// and a host reusing a cached answer across that would render a superseded
 /// plan as current. The founder's wrapper caches this at its own layer,
 /// which is its choice to make; the provider does not authorise it.
-pub fn reading(status: &StatusResult, now: OffsetDateTime) -> Value {
+pub fn reading(status: &StatusResult, doctor: Option<&DoctorResult>, now: OffsetDateTime) -> Value {
     let mut segments = vec![task_segment(status.current_task.as_ref())];
     if let Some(task) = status.current_task.as_ref() {
         segments.push(estimate_segment(task));
         segments.extend(escalation_segment(task));
     }
+    segments.extend(doctor.and_then(profile_segment));
 
     json!({
         "contract_version": CONTRACT_VERSION,
@@ -463,11 +549,21 @@ fn ask(request: Request, deadline: Instant) -> Result<Response, NoReading> {
 }
 
 /// The live state, as far as it could be established inside `deadline`.
-fn probe(deadline: Instant) -> Result<StatusResult, NoReading> {
-    match ask(Request::Status, deadline)? {
-        Response::Status(status) => Ok(*status),
-        _ => Err(NoReading::ResponseNotUnderstood),
-    }
+///
+/// The `Doctor` half is deliberately not allowed to fail the whole probe:
+/// its outcome is discarded to `None`, leaving the profile segment absent.
+/// A diagnostic that could not be obtained must not cost the user the state
+/// that could.
+fn probe(deadline: Instant) -> Result<(StatusResult, Option<DoctorResult>), NoReading> {
+    let status = match ask(Request::Status, deadline)? {
+        Response::Status(status) => *status,
+        _ => return Err(NoReading::ResponseNotUnderstood),
+    };
+    let doctor = match ask(Request::Doctor, deadline) {
+        Ok(Response::Doctor(doctor)) => Some(*doctor),
+        _ => None,
+    };
+    Ok((status, doctor))
 }
 
 /// `libra-governor statusline provider`.
@@ -478,7 +574,7 @@ fn probe(deadline: Instant) -> Result<StatusResult, NoReading> {
 /// can render and `doctor` can act on.
 pub fn run_provider() {
     let payload = match probe(Instant::now() + HOT_PATH_BUDGET) {
-        Ok(status) => reading(&status, OffsetDateTime::now_utc()),
+        Ok((status, doctor)) => reading(&status, doctor.as_ref(), OffsetDateTime::now_utc()),
         Err(kind) => no_reading(kind),
     };
     println!("{payload}");
@@ -551,6 +647,32 @@ mod tests {
         document["segments"].as_array().unwrap()
     }
 
+    fn doctor_with(preset: &str, matches_disk: bool) -> DoctorResult {
+        DoctorResult {
+            daemon_version: "0.0.2".to_string(),
+            protocol_version: 8,
+            schema_version_applied: 9,
+            schema_version_known: 9,
+            schema_ahead_of_binary: false,
+            policy_preset: preset.to_string(),
+            config_file_present: true,
+            config_file_valid: true,
+            config_file_error: None,
+            running_config_matches_disk: matches_disk,
+            gateway_configured: false,
+            gateway_running: false,
+            gateway_disabled_reason: None,
+            gateway_capabilities: None,
+            gateway_credential_configured: false,
+            telemetry_enabled: false,
+            extension_business_context_configured: false,
+            extension_policy_webhook_configured: false,
+            extension_events_configured: false,
+            extension_events_pending: 0,
+            extension_config_error: None,
+        }
+    }
+
     /// Every document this provider can emit, for the properties that must
     /// hold in *all* of them rather than in a chosen one.
     fn every_document() -> Vec<(String, Value)> {
@@ -568,20 +690,32 @@ mod tests {
             ("replanned", ReplanState::Replanned { count: 3 }),
             ("escalated", ReplanState::EscalatedAwaitingApproval),
         ];
+        let doctors = [
+            ("no-doctor", None),
+            ("agrees", Some(doctor_with("balanced", true))),
+            ("drifted", Some(doctor_with("strict_budget", false))),
+            ("unknown-preset", Some(doctor_with("custom-thing", false))),
+        ];
         for (state_name, state) in states {
-            for (estimate_name, p90) in [("with-p90", Some(600u64)), ("no-p90", None)] {
-                let mut status = status_with(state);
-                status.current_task.as_mut().unwrap().remaining_estimate =
-                    estimate_with(p90, p90.is_none(), 7);
-                out.push((
-                    format!("reading/{state_name}/{estimate_name}"),
-                    reading(&status, now()),
-                ));
+            for (doctor_name, doctor) in &doctors {
+                for (estimate_name, p90) in [("with-p90", Some(600u64)), ("no-p90", None)] {
+                    let mut status = status_with(state);
+                    status.current_task.as_mut().unwrap().remaining_estimate =
+                        estimate_with(p90, p90.is_none(), 7);
+                    out.push((
+                        format!("reading/{state_name}/{doctor_name}/{estimate_name}"),
+                        reading(&status, doctor.as_ref(), now()),
+                    ));
+                }
             }
         }
         out.push((
             "reading/idle".to_string(),
-            reading(&StatusResult { current_task: None }, now()),
+            reading(
+                &StatusResult { current_task: None },
+                Some(&doctor_with("balanced", true)),
+                now(),
+            ),
         ));
         out
     }
@@ -745,7 +879,7 @@ mod tests {
 
     #[test]
     fn a_governed_task_is_reported_as_a_state_not_as_a_verdict() {
-        let document = reading(&status_with(ReplanState::Stable), now());
+        let document = reading(&status_with(ReplanState::Stable), None, now());
         let task = &segments(&document)[0];
         assert_eq!(task["key"], json!("task"));
         assert_eq!(
@@ -758,7 +892,7 @@ mod tests {
 
     #[test]
     fn no_task_is_reported_explicitly_rather_than_by_omission() {
-        let document = reading(&StatusResult { current_task: None }, now());
+        let document = reading(&StatusResult { current_task: None }, None, now());
         assert_eq!(document["availability"], json!("available"));
         assert_eq!(segments(&document).len(), 1);
         assert_eq!(
@@ -770,7 +904,11 @@ mod tests {
 
     #[test]
     fn the_replan_count_rides_the_task_it_describes_and_zero_is_omitted() {
-        let replanned = reading(&status_with(ReplanState::Replanned { count: 3 }), now());
+        let replanned = reading(
+            &status_with(ReplanState::Replanned { count: 3 }),
+            None,
+            now(),
+        );
         let task = &segments(&replanned)[0];
         assert_eq!(task["count"], json!(3));
         assert_eq!(
@@ -780,7 +918,7 @@ mod tests {
         );
 
         for state in [ReplanState::Stable, ReplanState::Replanned { count: 0 }] {
-            let document = reading(&status_with(state), now());
+            let document = reading(&status_with(state), None, now());
             assert!(
                 segments(&document)[0].get("count").is_none(),
                 "{state:?}: 0 replans spends columns to say nothing"
@@ -795,7 +933,7 @@ mod tests {
         // statusline and every other product is what `explain` is for.
         let status = status_with(ReplanState::Stable);
         let plan = status.current_task.as_ref().unwrap().plan_id.0.to_string();
-        let document = reading(&status, now());
+        let document = reading(&status, None, now());
         for (path, text) in all_strings(&document) {
             assert!(!text.contains(&plan[..8]), "{path} = {text:?}");
         }
@@ -806,7 +944,7 @@ mod tests {
         // The daemon answered just now, so an age would invent a staleness
         // that does not exist — and the state can change on any tool call,
         // so a TTL would let a host render a superseded plan as current.
-        let document = reading(&status_with(ReplanState::Stable), now());
+        let document = reading(&status_with(ReplanState::Stable), None, now());
         assert_eq!(document["observed_at"], json!("2026-02-02T02:40:00Z"));
         assert!(document.get("age_seconds").is_none());
         assert!(document.get("cache_ttl_seconds").is_none());
@@ -828,7 +966,7 @@ mod tests {
 
     #[test]
     fn a_span_is_sent_as_seconds_and_a_noun_never_as_rendered_text() {
-        let document = reading(&status_with(ReplanState::Stable), now());
+        let document = reading(&status_with(ReplanState::Stable), None, now());
         let estimate = &segments(&document)[1];
         assert_eq!(estimate["key"], json!("estimate"));
         assert_eq!(estimate["duration_seconds"], json!(600));
@@ -870,7 +1008,7 @@ mod tests {
         // a degradation step away from the number it qualifies, which is
         // how the abbreviation came to be read as a rating in the first
         // place.
-        let document = reading(&status_with(ReplanState::Stable), now());
+        let document = reading(&status_with(ReplanState::Stable), None, now());
         let estimate = &segments(&document)[1];
         assert_eq!(estimate["confidence"], json!("medium"));
         assert!(estimate.get("duration_seconds").is_some());
@@ -880,7 +1018,7 @@ mod tests {
     fn an_estimate_with_no_span_carries_no_confidence_in_that_span() {
         let mut status = status_with(ReplanState::Stable);
         status.current_task.as_mut().unwrap().remaining_estimate = estimate_with(None, true, 0);
-        let document = reading(&status, now());
+        let document = reading(&status, None, now());
         let estimate = &segments(&document)[1];
         assert_eq!(estimate["state"], json!("unknown"));
         assert!(estimate.get("duration_seconds").is_none());
@@ -899,7 +1037,7 @@ mod tests {
             let mut status = status_with(ReplanState::Stable);
             status.current_task.as_mut().unwrap().remaining_estimate =
                 estimate_with(None, cold_start, samples);
-            segments(&reading(&status, now()))[1]["reason_code"].clone()
+            segments(&reading(&status, None, now()))[1]["reason_code"].clone()
         };
 
         assert_eq!(reason(true, 0), json!("no_local_history_yet"));
@@ -923,7 +1061,11 @@ mod tests {
         // `EscalateApprovalNeeded` arm logs, records the state and returns
         // `Ok(())`, and hooks are advisory-only. "Awaiting approval" invites
         // the reader to go and approve something that does not exist.
-        let document = reading(&status_with(ReplanState::EscalatedAwaitingApproval), now());
+        let document = reading(
+            &status_with(ReplanState::EscalatedAwaitingApproval),
+            None,
+            now(),
+        );
         let escalation = segments(&document)
             .iter()
             .find(|s| s["key"] == json!("escalation"))
@@ -945,7 +1087,11 @@ mod tests {
 
     #[test]
     fn escalation_is_never_rendered_as_an_emergency_or_as_an_affordance() {
-        let document = reading(&status_with(ReplanState::EscalatedAwaitingApproval), now());
+        let document = reading(
+            &status_with(ReplanState::EscalatedAwaitingApproval),
+            None,
+            now(),
+        );
         for segment in segments(&document) {
             assert_ne!(
                 segment["state"],
@@ -965,7 +1111,11 @@ mod tests {
         // The line the founder sees almost always. Anything that warns
         // here is a warning that means nothing, and a statusline whose
         // warnings mean nothing is a statusline nobody reads.
-        let document = reading(&status_with(ReplanState::Stable), now());
+        let document = reading(
+            &status_with(ReplanState::Stable),
+            Some(&doctor_with("balanced", true)),
+            now(),
+        );
         assert_eq!(segments(&document).len(), 2);
         for segment in segments(&document) {
             assert!(
