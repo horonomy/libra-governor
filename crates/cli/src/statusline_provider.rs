@@ -488,20 +488,30 @@ fn preset_display(name: &str) -> Option<&'static str> {
 /// wants to know two things: that the edit has not taken effect, and what
 /// is in effect instead.
 ///
-/// Returns `None` when the two agree, which is the ordinary case. The
+/// Returns `None` only when the two agree, which is the ordinary case. The
 /// alternative — always showing `Running policy balanced` — spends a column
 /// on a constant, and `explain` reports the preset unconditionally for the
-/// user who wants it. `None` also covers a preset this build cannot name;
-/// see [`preset_display`].
+/// user who wants it.
+///
+/// A preset this build cannot name costs the *name*, never the warning. The
+/// label falls back to the half of the fact that does not need a bounded
+/// value, because the drift is the actionable half: a user whose edit has
+/// not taken effect needs to know that whether or not this binary can
+/// describe what it is running instead, and `explain` says which case it is.
+/// Suppressing the segment there would make the one condition worth
+/// reporting the one condition reported as silence.
 fn profile_segment(doctor: &DoctorResult) -> Option<Value> {
     if doctor.running_config_matches_disk {
         return None;
     }
-    let preset = preset_display(&doctor.policy_preset)?;
+    let label = match preset_display(&doctor.policy_preset) {
+        Some(preset) => format!("Running policy {preset}"),
+        None => "Policy edit not in effect".to_string(),
+    };
     Some(json!({
         "key": "profile",
         "state": "warn",
-        "label": format!("Running policy {preset}"),
+        "label": label,
         "reason_code": "config_edited_restart_required",
         "explain_key": "libra.profile",
         "order_hint": 40,
@@ -1334,11 +1344,20 @@ mod tests {
             Some(&doctor_with(hostile, false)),
             now(),
         );
-        assert!(
-            segments(&document)
-                .iter()
-                .all(|s| s["key"] != json!("profile")),
-            "an unnameable policy is suppressed, not rendered as a placeholder"
+        let profile = segments(&document)
+            .iter()
+            .find(|s| s["key"] == json!("profile"))
+            .expect("an unnameable preset costs the name, never the warning")
+            .clone();
+        assert_eq!(
+            profile["label"],
+            json!("Policy edit not in effect"),
+            "the drift is the actionable half and needs no bounded value to state"
+        );
+        assert_eq!(
+            profile["reason_code"],
+            json!("config_edited_restart_required"),
+            "the same fact, whether or not the preset can be named"
         );
         for (path, text) in all_strings(&document) {
             assert!(!text.contains("sk-live"), "{path} = {text:?}");
