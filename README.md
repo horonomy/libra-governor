@@ -140,9 +140,24 @@ The statusline is the visible explanation channel for what the daemon
 has decided — not something buried in a log file you never open. It
 shows the current task id, plan id, preflight/recon status, the current
 remaining P90 estimate, and replan state (`stable`, `replanned xN`, or
-`awaiting approval`). See
-[`crates/cli/src/statusline.rs`](crates/cli/src/statusline.rs) for the
-exact render logic, which is unit-tested independently of a live socket.
+`awaiting approval`).
+
+Claude Code gives a scope exactly one `statusLine.command`, so Libra does
+not take it. The supported surface is a provider document composed by a
+shared host alongside your own statusline and any other Horonom product's:
+
+```bash
+libra-governor statusline provider   # one versioned JSON document, read-only, always exit 0
+libra-governor statusline explain    # the long form the statusline has no room for
+```
+
+[`docs/statusline.md`](docs/statusline.md) covers opting in, what the
+provider never emits, and migrating off an external wrapper. Bare
+`libra-governor statusline` still prints today's one-line render
+unchanged — see
+[`crates/cli/src/statusline.rs`](crates/cli/src/statusline.rs) for that
+logic and [`crates/cli/src/statusline_provider.rs`](crates/cli/src/statusline_provider.rs)
+for the provider's; both are unit-tested independently of a live socket.
 
 ## Diagnostics: `libra-governor doctor`
 
@@ -246,7 +261,7 @@ advice:
 | Statusline shows `libra: -` | The daemon is not running; `statusline` never spawns one by design (a refreshing statusline spawning a daemon would be a race factory) | Submit a prompt — `hook user-prompt-submit` spawns it on demand |
 | `doctor` reports `config.json ... rejected` | A typo or invalid value in `config.json` — full detail is in `daemon.log`, not swallowed | Fix the file (see the field reference in `integrations/claude-code/README.md`); the daemon keeps running on defaults meanwhile, never crashes on this |
 | `doctor` reports `stale_config` | You edited `config.json` after the daemon last started, so it's still running on the old values | `pkill -f "libra-governor daemon run"`; the next hook invocation respawns it with the new file |
-| `install` says an existing `statusLine` was left untouched | You already had a non-Governor `statusLine` configured in `~/.claude/settings.json` | Decide which one you want; `install` never overwrites a foreign `statusLine`, so wire Governor's manually (see `integrations/claude-code/README.md`) if you want to replace it |
+| `install` says an existing `statusLine` was left untouched | You already had a non-Governor `statusLine` configured in `~/.claude/settings.json` | You do not have to choose. Register `statusline provider` with the shared statusline host and both render — see [`docs/statusline.md`](docs/statusline.md). `install` never overwrites a foreign `statusLine` |
 | `doctor` reports the ledger schema is ahead of this binary | A newer daemon build already migrated the database, and you are now running an older CLI/daemon binary | Rebuild/reinstall this binary at the newer version |
 | Gateway configured but `doctor` says `not running` | Configuration validation or credential resolution failed at daemon startup (fails open, never takes the daemon down) | Run `libra-governor gateway status` for the exact `disabled_reason`; the daemon keeps serving hooks/statusline normally either way |
 | A gateway request is refused with HTTP 403 | The gateway's own admission failed closed (see `x-libra-decision` header) | See "What a refusal looks like" in `integrations/claude-code/README.md` |

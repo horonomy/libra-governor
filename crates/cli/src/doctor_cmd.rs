@@ -225,8 +225,9 @@ fn claude_settings_finding() -> Finding {
             id: "claude_settings",
             severity: Severity::Ok,
             message: format!(
-                "hooks wired in {}; statusLine is not Governor's (either none is configured, \
-                 or a foreign one was left in place by `install`)",
+                "hooks wired in {}; statusLine is not Governor's legacy one (none is \
+                 configured, or a foreign one was left in place by `install`, or the slot \
+                 is routed through the shared statusline host — see docs/statusline.md)",
                 path.display()
             ),
         }

@@ -12,7 +12,16 @@
 //!   same three hook entry points for the Codex CLI (HORO-1157), sharing
 //!   every byte of translation logic with Claude Code's via
 //!   `crate::agent::run` — see `integrations/codex/README.md`.
-//! - `statusline` — the Claude Code `statusLine` command.
+//! - `statusline` — the legacy one-line Claude Code `statusLine`
+//!   command, kept byte-for-byte because the founder's DogFood wrapper
+//!   parses its exact phrases (HORO-1569).
+//! - `statusline provider` — Libra's side of the shared Horonom
+//!   statusline provider contract: one versioned JSON document on stdout,
+//!   always exit 0 (HORO-1564/HORO-1569). This is the supported surface;
+//!   bare `statusline` is on a migration path to retirement.
+//! - `statusline explain` — the read-only long form of the same state, for
+//!   the shared statusline `explain` surface. Says plainly what the daemon
+//!   does *not* hold, and never prints task content.
 //! - `calibration report` — real duration-coverage and admission-replay
 //!   calibration evidence over local history (HORO-1132).
 //! - `gateway token` — prints the local capability token Claude Code's
@@ -72,6 +81,7 @@ mod hook_stop;
 mod install_cmd;
 mod outcome_cmd;
 mod statusline;
+mod statusline_provider;
 mod uninstall_cmd;
 
 fn main() {
@@ -90,6 +100,8 @@ fn main() {
         ["codex-hook", "post-tool-use"] => codex_hook::run_tool_completed(),
         ["codex-hook", "stop"] => codex_hook::run_turn_completed(),
         ["statusline"] => statusline::run(),
+        ["statusline", "provider"] => statusline_provider::run_provider(),
+        ["statusline", "explain"] => statusline_provider::run_explain(),
         ["calibration", "report"] => calibration_cmd::run(),
         ["gateway", "token"] => gateway_cmd::run_token(),
         ["gateway", "status"] => gateway_cmd::run_status(),
@@ -119,6 +131,8 @@ fn main() {
                  libra-governor codex-hook post-tool-use\n  \
                  libra-governor codex-hook stop\n  \
                  libra-governor statusline\n  \
+                 libra-governor statusline provider\n  \
+                 libra-governor statusline explain\n  \
                  libra-governor calibration report\n  \
                  libra-governor gateway token\n  \
                  libra-governor gateway status\n  \
