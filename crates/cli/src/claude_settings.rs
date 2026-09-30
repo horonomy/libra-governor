@@ -74,6 +74,10 @@ pub enum SettingsError {
          (nothing was changed)"
     )]
     NotAnObject { path: PathBuf },
+    #[error("{path}'s top-level \"hooks\" field is present but is not a JSON object")]
+    HooksFieldNotAnObject { path: PathBuf },
+    #[error("{path}'s \"hooks.{event}\" field is present but is not a JSON array")]
+    HookEventNotAnArray { path: PathBuf, event: String },
 }
 
 /// Resolution order: `LIBRA_GOVERNOR_CLAUDE_DIR` (primarily for tests, so
@@ -233,10 +237,7 @@ pub fn apply(path: &Path, binary: &Path) -> Result<Applied, SettingsError> {
     let binary = binary.display().to_string();
     let mut hooks_added = 0usize;
 
-    let hooks_value = root
-        .entry("hooks")
-        .or_insert_with(|| Value::Object(Map::new()));
-    let hooks_obj = as_object_or_replace(hooks_value);
+    let hooks_obj = hooks_object_mut(&mut root, path)?;
 
     for (event, subcommand) in
         HOOK_EVENTS
@@ -247,7 +248,13 @@ pub fn apply(path: &Path, binary: &Path) -> Result<Applied, SettingsError> {
         let entries = hooks_obj
             .entry((*event).to_string())
             .or_insert_with(|| Value::Array(Vec::new()));
-        let entries_arr = as_array_or_replace(entries);
+        let entries_arr =
+            entries
+                .as_array_mut()
+                .ok_or_else(|| SettingsError::HookEventNotAnArray {
+                    path: path.to_path_buf(),
+                    event: (*event).to_string(),
+                })?;
 
         let already_present = entries_arr.iter().any(|matcher| {
             matcher
@@ -299,18 +306,29 @@ pub fn apply(path: &Path, binary: &Path) -> Result<Applied, SettingsError> {
     })
 }
 
-fn as_object_or_replace(value: &mut Value) -> &mut Map<String, Value> {
-    if !value.is_object() {
-        *value = Value::Object(Map::new());
-    }
-    value.as_object_mut().expect("just ensured object")
-}
-
-fn as_array_or_replace(value: &mut Value) -> &mut Vec<Value> {
-    if !value.is_array() {
-        *value = Value::Array(Vec::new());
-    }
-    value.as_array_mut().expect("just ensured array")
+/// Returns the `root["hooks"]` object, creating an empty one if absent.
+/// Errors (never silently replaces) if `root["hooks"]` exists but is not
+/// itself a JSON object — that would mean either a hand-edited file in a
+/// shape this module cannot safely reason about, or a newer Claude Code
+/// version changing the field's type; either way, refuse rather than
+/// discard whatever is actually there (HORO-1380 S2: this function used
+/// to silently replace a non-object `hooks` field with `{}`, clobbering
+/// it on a single invocation with no concurrency required — the
+/// HORO-998 `UNKNOWN_FUTURE_FIELDS_ARE_PRESERVED` property this module's
+/// own docs already claim to uphold). Mirrors
+/// `codex_hooks_file::hooks_object_mut` exactly.
+fn hooks_object_mut<'a>(
+    root: &'a mut Map<String, Value>,
+    path: &Path,
+) -> Result<&'a mut Map<String, Value>, SettingsError> {
+    let entry = root
+        .entry("hooks".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    entry
+        .as_object_mut()
+        .ok_or_else(|| SettingsError::HooksFieldNotAnObject {
+            path: path.to_path_buf(),
+        })
 }
 
 /// What `remove` did — every field a count so a caller/test can assert
@@ -544,6 +562,50 @@ mod tests {
             "re-running apply must be a no-op on an already-wired file"
         );
         assert!(!second.statusline_added);
+    }
+
+    #[test]
+    fn apply_refuses_and_writes_nothing_when_hooks_is_not_an_object() {
+        // HORO-1380 S2 / HORO-998 UNKNOWN_FUTURE_FIELDS_ARE_PRESERVED: a
+        // top-level "hooks" field of an unexpected shape (a newer Claude
+        // Code version, or a hand-edited file) must never be silently
+        // discarded and replaced with an empty object.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let original_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "hooks": "not-an-object-or-array"
+        }))
+        .unwrap();
+        std::fs::write(&path, &original_bytes).unwrap();
+
+        let err = apply(&path, &binary()).unwrap_err();
+        assert!(matches!(err, SettingsError::HooksFieldNotAnObject { .. }));
+
+        let bytes_after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            bytes_after, original_bytes,
+            "a refused apply must leave the file byte-for-byte unchanged"
+        );
+    }
+
+    #[test]
+    fn apply_refuses_and_writes_nothing_when_a_hook_event_is_not_an_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let original_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "hooks": { "UserPromptSubmit": "not-an-array" }
+        }))
+        .unwrap();
+        std::fs::write(&path, &original_bytes).unwrap();
+
+        let err = apply(&path, &binary()).unwrap_err();
+        assert!(matches!(err, SettingsError::HookEventNotAnArray { .. }));
+
+        let bytes_after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            bytes_after, original_bytes,
+            "a refused apply must leave the file byte-for-byte unchanged"
+        );
     }
 
     #[test]

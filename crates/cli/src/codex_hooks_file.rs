@@ -115,6 +115,8 @@ pub enum CodexHooksError {
     NotAnObject { path: PathBuf },
     #[error("{path}'s top-level \"hooks\" field is present but is not a JSON object")]
     HooksFieldNotAnObject { path: PathBuf },
+    #[error("{path}'s \"hooks.{event}\" field is present but is not a JSON array")]
+    HookEventNotAnArray { path: PathBuf, event: String },
 }
 
 /// Resolution order: `LIBRA_GOVERNOR_CODEX_HOME` (primarily for tests, so
@@ -285,7 +287,13 @@ pub fn apply(path: &Path, binary: &Path) -> Result<Applied, CodexHooksError> {
             let entries = hooks_obj
                 .entry(event.to_string())
                 .or_insert_with(|| Value::Array(Vec::new()));
-            let entries_arr = as_array_or_replace(entries);
+            let entries_arr =
+                entries
+                    .as_array_mut()
+                    .ok_or_else(|| CodexHooksError::HookEventNotAnArray {
+                        path: path.to_path_buf(),
+                        event: event.to_string(),
+                    })?;
 
             let already_present = entries_arr.iter().any(|matcher| {
                 matcher
@@ -318,13 +326,6 @@ pub fn apply(path: &Path, binary: &Path) -> Result<Applied, CodexHooksError> {
         hooks_added,
         backup_path,
     })
-}
-
-fn as_array_or_replace(value: &mut Value) -> &mut Vec<Value> {
-    if !value.is_array() {
-        *value = Value::Array(Vec::new());
-    }
-    value.as_array_mut().expect("just ensured array")
 }
 
 /// What [`remove`] did.
@@ -671,6 +672,44 @@ mod tests {
         assert!(matches!(err, CodexHooksError::HooksFieldNotAnObject { .. }));
         let after = std::fs::read_to_string(&path).unwrap();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn apply_refuses_and_writes_nothing_when_hooks_is_not_an_object() {
+        // HORO-1380 S2 / HORO-998 UNKNOWN_FUTURE_FIELDS_ARE_PRESERVED.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let original_bytes = b"{\"hooks\": \"not-an-object\"}".to_vec();
+        std::fs::write(&path, &original_bytes).unwrap();
+
+        let err = apply(&path, &binary()).unwrap_err();
+        assert!(matches!(err, CodexHooksError::HooksFieldNotAnObject { .. }));
+
+        let bytes_after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            bytes_after, original_bytes,
+            "a refused apply must leave the file byte-for-byte unchanged"
+        );
+    }
+
+    #[test]
+    fn apply_refuses_and_writes_nothing_when_a_hook_event_is_not_an_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let original_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "hooks": { "UserPromptSubmit": "not-an-array" }
+        }))
+        .unwrap();
+        std::fs::write(&path, &original_bytes).unwrap();
+
+        let err = apply(&path, &binary()).unwrap_err();
+        assert!(matches!(err, CodexHooksError::HookEventNotAnArray { .. }));
+
+        let bytes_after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            bytes_after, original_bytes,
+            "a refused apply must leave the file byte-for-byte unchanged"
+        );
     }
 
     #[test]
