@@ -257,10 +257,10 @@ advice:
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `doctor` reports a protocol version mismatch | You upgraded the binary while an old daemon was still running (every `PROTOCOL_VERSION` bump has required this — see [`crates/protocol/src/lib.rs`](crates/protocol/src/lib.rs)'s bump history) | `pkill -f "libra-governor daemon run"`; the next hook invocation respawns it |
+| `doctor` reports a protocol version mismatch | You upgraded the binary while an old daemon was still running (every `PROTOCOL_VERSION` bump has required this — see [`crates/protocol/src/lib.rs`](crates/protocol/src/lib.rs)'s bump history) | `libra-governor daemon stop`; the next hook invocation respawns it |
 | Statusline shows `libra: -` | The daemon is not running; `statusline` never spawns one by design (a refreshing statusline spawning a daemon would be a race factory) | Submit a prompt — `hook user-prompt-submit` spawns it on demand |
 | `doctor` reports `config.json ... rejected` | A typo or invalid value in `config.json` — full detail is in `daemon.log`, not swallowed | Fix the file (see the field reference in `integrations/claude-code/README.md`); the daemon keeps running on defaults meanwhile, never crashes on this |
-| `doctor` reports `stale_config` | You edited `config.json` after the daemon last started, so it's still running on the old values | `pkill -f "libra-governor daemon run"`; the next hook invocation respawns it with the new file |
+| `doctor` reports `stale_config` | You edited `config.json` after the daemon last started, so it's still running on the old values | `libra-governor daemon stop`; the next hook invocation respawns it with the new file |
 | `install` says an existing `statusLine` was left untouched | You already had a non-Governor `statusLine` configured in `~/.claude/settings.json` | You do not have to choose. Register `statusline provider` with the shared statusline host and both render — see [`docs/statusline.md`](docs/statusline.md). `install` never overwrites a foreign `statusLine` |
 | `doctor` reports the ledger schema is ahead of this binary | A newer daemon build already migrated the database, and you are now running an older CLI/daemon binary | Rebuild/reinstall this binary at the newer version |
 | Gateway configured but `doctor` says `not running` | Configuration validation or credential resolution failed at daemon startup (fails open, never takes the daemon down) | Run `libra-governor gateway status` for the exact `disabled_reason`; the daemon keeps serving hooks/statusline normally either way |
@@ -383,12 +383,15 @@ Run `libra-governor doctor` afterward to confirm — it will report
   HORO-1154/1159/1163/1165. Everything in this release runs entirely on
   your machine.
 - **Upgrading directly from v0.0.1 needs one manual daemon restart** if
-  Claude Code was already running before you upgraded: `pkill -f
-  "libra-governor daemon run"` (or just restart Claude Code). `doctor`
-  will tell you if this applies. This is a one-time limitation of that
-  specific transition — the v0.0.1 daemon predates the self-healing fix
-  that makes every later upgrade automatic (see
-  `experiments/v002_gate/README.md`).
+  Claude Code was already running before you upgraded. Try
+  `libra-governor daemon stop` first; if it refuses because no pid record
+  exists (the v0.0.1 daemon predates HORO-1380's pid-record write and
+  cannot be identity-checked), fall back to `pkill -f "libra-governor
+  daemon run"` for this one specific transition only (or just restart
+  Claude Code). `doctor` will tell you if this applies. This is a
+  one-time limitation of that specific transition — the v0.0.1 daemon
+  predates the self-healing fix that makes every later upgrade automatic
+  (see `experiments/v002_gate/README.md`).
 - **The gateway's session-binding header is unverified against live
   Claude Code traffic** — see
   [`integrations/claude-code/README.md`](integrations/claude-code/README.md#known-limitation-the-session-binding-header-is-unverified).

@@ -343,7 +343,7 @@ logic and its known narrow-window limitation (documented there).
    `docs/adr/0002-task-not-session-as-economic-unit.md`) while the
    Completion Contract revision surfaced in Claude's context advances
    (revision 1 -> 2).
-6. Kill the daemon (`pkill -f "libra-governor daemon run"`) and submit
+6. Kill the daemon (`libra-governor daemon stop`) and submit
    another prompt. Confirm the hook still returns quickly (it respawns
    the daemon) and the statusline briefly shows `libra: -` before the
    new daemon comes up.
@@ -435,7 +435,7 @@ stays out of both.
    reaches Claude Code's environment, arguments, or configuration; never
    the ledger; and never a log line at any level.
 
-4. **Restart the daemon** (`pkill -f "libra-governor daemon run"`; the
+4. **Restart the daemon** (`libra-governor daemon stop`; the
    next hook invocation respawns it). The gateway is started from the
    daemon's own configuration — there is deliberately no
    `gateway start` command, because a security boundary a client can

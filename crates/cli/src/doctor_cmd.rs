@@ -518,7 +518,7 @@ fn daemon_findings(daemon: &Option<Result<DoctorResult, String>>) -> Vec<Finding
                  was still running), the daemon has already shut itself down after replying \
                  to this request; the next hook invocation or `doctor` run will spawn a \
                  fresh one automatically. To force it immediately instead of waiting: \
-                 pkill -f \"libra-governor daemon run\""
+                 libra-governor daemon stop"
             ),
         }),
         Some(Ok(result)) => {
@@ -575,7 +575,7 @@ fn daemon_findings(daemon: &Option<Result<DoctorResult, String>>) -> Vec<Finding
                     severity: Severity::Error,
                     message: "config.json on disk no longer matches what this running daemon \
                               loaded at startup — restart it to pick up the change: \
-                              pkill -f \"libra-governor daemon run\""
+                              libra-governor daemon stop"
                         .to_string(),
                 });
             }
@@ -703,7 +703,7 @@ mod tests {
         let findings = daemon_findings(&Some(Err("protocol version mismatch".to_string())));
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Error);
-        assert!(findings[0].message.contains("pkill"));
+        assert!(findings[0].message.contains("libra-governor daemon stop"));
     }
 
     #[test]
