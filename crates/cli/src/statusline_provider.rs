@@ -1567,6 +1567,46 @@ mod tests {
     }
 
     #[test]
+    fn a_share_that_cannot_be_a_share_is_named_truthfully() {
+        // `percent_left` rejects three different malformations, and the one
+        // label it produces has to be true of all three: a NaN, a share of
+        // exactly zero and a share above one are different defects, and only
+        // the first is "not a number". None of these can reach the wire from
+        // this build's daemon — `budget_posture` decides exhaustion on the
+        // headroom before it ever divides — which is precisely why the branch
+        // is asserted here. A guard no test executes is a guard nobody has
+        // read, and this one's label is the only thing the user would see.
+        for fraction in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -0.5, 1.5] {
+            let document = with_budget(Some(BudgetPosture::Remaining {
+                fraction_left: fraction,
+            }));
+            let budget = segments(&document)
+                .iter()
+                .find(|s| s["key"] == json!("budget"))
+                .expect("a malformed share is still a reading, never silence")
+                .clone();
+            assert_eq!(
+                budget["label"],
+                json!("Budget share not usable"),
+                "{fraction} earned a label that narrows the cause untruthfully"
+            );
+            assert_eq!(
+                budget["reason_code"],
+                json!("budget_share_not_usable"),
+                "{fraction}"
+            );
+            assert_eq!(budget["state"], json!("warn"), "{fraction}");
+            // Still a vital, not an exception: a share this provider cannot
+            // use is a reading it is missing, not a limit the task has hit.
+            assert_eq!(budget["clear_role"], json!("vital"), "{fraction}");
+            assert!(
+                !budget["label"].as_str().unwrap().contains('%'),
+                "{fraction} printed arithmetic instead of declining to"
+            );
+        }
+    }
+
+    #[test]
     fn no_percentage_this_provider_can_emit_lacks_an_axis() {
         // The AC is "satisfied by construction, not by luck", so this sweeps
         // the whole input domain rather than the fixture: every fraction that
@@ -1583,7 +1623,8 @@ mod tests {
             let label = budget_label(&document).expect("a budget is always reported");
             if !label.contains('%') {
                 // A fraction outside `0.0..=1.0` (only 0.0 here) is reported
-                // as unreadable rather than as a percentage.
+                // as an unusable share rather than as a percentage — see
+                // `a_share_that_cannot_be_a_share_is_named_truthfully`.
                 assert_eq!(fraction, 0.0, "{fraction}: {label}");
                 continue;
             }
