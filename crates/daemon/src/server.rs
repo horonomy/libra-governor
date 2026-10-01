@@ -624,10 +624,17 @@ fn replan_state_for_summary(
 /// What the reservation ledger says about `task_id`'s envelope right now
 /// (HORO-1634), for the `Status` reply.
 ///
-/// Two local SQLite reads, on the connection the daemon already holds. No
-/// extra round trip of any kind — the figure is computed while answering a
-/// request the statusline provider was already going to make, which is the
-/// only way a budget reading is affordable inside a 200 ms hot-path probe.
+/// Four indexed local SQLite reads on the connection the daemon already
+/// holds: `available` resolves the budget row and then sums settled and
+/// active reservations, and the `hard_limit` is read from that row again
+/// below. The repeat read is deliberate — collapsing it would mean a new
+/// `LedgerStore` method returning headroom and limit together, and
+/// widening the ledger's public API to save one indexed primary-key
+/// lookup is the wrong trade. No extra *round trip* of any kind, which is
+/// the cost that actually matters here: the figure is computed while
+/// answering a request the statusline provider was already going to make,
+/// which is the only way a budget reading is affordable inside a 200 ms
+/// hot-path probe.
 ///
 /// `RequiredWork` rather than `OptionalWork`, so the figure is the whole
 /// envelope: `hard_limit - settled - active`, with the protected Completion
