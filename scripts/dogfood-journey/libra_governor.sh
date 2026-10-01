@@ -41,6 +41,15 @@ die() { log "FATAL: $*"; exit 1; }
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT" || die "could not cd to repo root $REPO_ROOT"
 
+# Real commit identity of the checkout this journey actually builds from
+# and runs, captured up front and reported verbatim in the schema-1.2.0
+# `artifact` journey-metadata row (JOURNEY-CONTRACT.md). Guarded because
+# this script runs under `set -uo pipefail` (never `-e`): an unresolvable
+# HEAD would otherwise silently become an empty string, which the
+# contract rejects (commit_sha must be a non-empty string).
+COMMIT_SHA="$(git rev-parse HEAD 2>/dev/null || true)"
+[[ -n "$COMMIT_SHA" ]] || die "could not resolve HEAD commit for the artifact metadata row"
+
 # --- 0. Resolve/build the real binary -----------------------------------
 
 BIN_DIR="${LIBRA_GOVERNOR_BIN_DIR:-}"
@@ -212,6 +221,7 @@ NDJSON_FILE="$(command find "$EVIDENCE_DIR" -maxdepth 1 -name '*.ndjson' | head 
 python3 - "$NDJSON_FILE" "$REFUSAL_EXIT" "$REFUSAL_WROTE_DIR" "$PRIVACY_MARKER" \
   "$WORKDIR/export-ok.stdout" "$WORKDIR/export-ok.stderr" "$WORKDIR/export-refused.stdout" \
   "$WORKDIR/export-refused.stderr" "$WORKDIR/consent.stdout" "$WORKDIR/prompt-submit.stdout" \
+  "$COMMIT_SHA" \
   <<'PYEOF'
 import json
 import hashlib
@@ -219,7 +229,7 @@ import sys
 
 (ndjson_path, refusal_exit, refusal_wrote_dir, privacy_marker,
  export_ok_stdout, export_ok_stderr, export_refused_stdout, export_refused_stderr,
- consent_stdout, prompt_stdout) = sys.argv[1:11]
+ consent_stdout, prompt_stdout, commit_sha) = sys.argv[1:12]
 
 refusal_exit = int(refusal_exit)
 refusal_wrote_dir = refusal_wrote_dir == "1"
@@ -567,6 +577,87 @@ for label, path in [
 if leaked_in:
     print(f"ERROR: the real prompt marker leaked into: {leaked_in}", file=sys.stderr)
     sys.exit(1)
+
+# --- Journey-level metadata rows (JOURNEY-CONTRACT.md schema 1.2.0,
+# HORO-1381 founder ruling 2026-10-01) ---------------------------------
+#
+# These are NOT checks: they carry the reserved `journey_metadata` key,
+# are never counted as a check, and never appear in the report's `checks`
+# list. Each kind is reported exactly once per run (reporting either kind
+# twice is a hard harness error). They are appended to `rows` so the one
+# existing emission loop below prints them on the same stdout stream.
+#
+# event_counts uses the DogFood capability-matrix register's own stage
+# vocabulary (docs/registers/dogfood-capability-matrix.md), whose Libra
+# Governor row reads: Capture SHIPPED | Local persistence SHIPPED (SQLite
+# ledger) | Analysis SHIPPED (CLI/statusline) | Dashboard NOT SUPPORTED
+# (by design) | Uploader NOT SUPPORTED | Receiver NOT SUPPORTED.
+#
+#   capture                   -- len(events): the real number of events
+#                                this run captured through the real hook
+#                                path and that a real export wrote out.
+#   local_durable_persistence -- len(events): the same real number, and
+#                                not an assumed equality — `dogfood-
+#                                evidence export` reads from the already-
+#                                committed SQLite ledger, so every event
+#                                present in the exported NDJSON is by
+#                                construction one that was durably
+#                                persisted before the export ran (the
+#                                same real file DFC-ADAPT-07 above counts).
+#   local_analysis_dashboard  -- a real 0, deliberately NOT
+#                                "not_applicable": Libra Governor's
+#                                local-analysis surface genuinely ships
+#                                (`doctor`, `statusline`, `calibration
+#                                report`), this journey simply invokes
+#                                none of them. Zero is the honest "we
+#                                looked and found none"; "not_applicable"
+#                                would falsely assert the capability is
+#                                structurally absent. (The register's
+#                                Dashboard column is NOT SUPPORTED by
+#                                design, but Analysis — which this key
+#                                maps onto — is SHIPPED.)
+#   eligible_uploader /
+#   real_receiver             -- "not_applicable": Libra Governor has no
+#                                upload or receiver leg at all, by design
+#                                (ADR-0012 §10/§12 — `destination` is
+#                                fixed to local_only and events
+#                                legitimately sit at
+#                                transport_state=pending indefinitely;
+#                                that is expected, not a stuck record).
+#                                A 0 here would wrongly assert a real
+#                                stage that was measured and found empty.
+rows.append({
+    "journey_metadata": "event_counts",
+    "capture": len(events),
+    "local_durable_persistence": len(events),
+    "local_analysis_dashboard": 0,
+    "eligible_uploader": "not_applicable",
+    "real_receiver": "not_applicable",
+})
+
+# artifact is reproducible build *identity*, never installation proof.
+#
+# clean_environment_verified is false — and must stay false — because
+# this journey does `cargo build --workspace --bins` (debug) against the
+# live checkout and runs the resulting binary in place. There is no
+# clean-environment install-and-execute gate here to claim, and this repo
+# deliberately has none to point at: `scripts/install.sh` and README.md
+# both state outright that no binaries are published ("There is no
+# `curl | sh` binary-download path to offer, because no such binary
+# exists") — a deliberate honesty position. Setting this true without a
+# real gate behind it would fabricate c2 evidence.
+#
+# digest is null: no image digest or GIT_REVISION-style label mechanism
+# exists for this repo's journeys.
+rows.append({
+    "journey_metadata": "artifact",
+    "repo": "libra-governor",
+    "commit_sha": commit_sha,
+    "build_mode": "debug",
+    "invocation_shape": "source-build",
+    "digest": None,
+    "clean_environment_verified": False,
+})
 
 for row in rows:
     print(json.dumps(row))
