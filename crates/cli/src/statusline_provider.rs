@@ -71,11 +71,20 @@
 //! `config.json` still agrees with it live on [`DoctorResult`] and nowhere
 //! else. The alternative considered and rejected was widening
 //! [`StatusResult`] to carry them: this repository's convention is to bump
-//! `PROTOCOL_VERSION` for any response-shape change (see its docs — eight
+//! `PROTOCOL_VERSION` for any response-shape change (see its docs — nine
 //! bumps, one per shape change), and a bump forces every long-lived daemon
 //! to be restarted before it will answer again. A second local round trip
 //! inside the same deadline is the cheaper price, and it keeps one
 //! implementation of "does the running config match disk" rather than two.
+//!
+//! HORO-1634's budget share went the other way — onto `StatusResult`, at
+//! the cost of a bump — and the two decisions are consistent rather than
+//! contradictory. The profile is a *diagnostic* the daemon already computes
+//! for `Doctor` and that a statusline can lose without lying; the budget is
+//! part of the reading itself, so a third round trip would have had to
+//! succeed inside the same 200 ms for the line to be complete. Paying a
+//! restart once is cheaper than making the hot path depend on three
+//! connections.
 //!
 //! The `Doctor` half is failure-isolated from the `Status` half: if it is
 //! slow, unreachable or unparseable, the profile segment is simply absent
@@ -100,7 +109,8 @@
 use std::time::{Duration, Instant};
 
 use libra_governor_protocol::{
-    Confidence, DoctorResult, ReplanState, Request, Response, StatusResult, TaskSummary,
+    BudgetPosture, Confidence, DoctorResult, ReplanState, Request, Response, StatusResult,
+    TaskSummary,
 };
 use serde_json::{json, Value};
 use time::OffsetDateTime;
@@ -290,6 +300,15 @@ fn state_for(availability: &str) -> &'static str {
 /// confidence, no duration, and no empty segment list. An empty answer
 /// renders as silence and silence reads as "all clear", which is the
 /// failure mode this shape exists to prevent.
+///
+/// Declares [`CLEAR_AUTHORITY`] like every other document, and the one
+/// segment is an exception. Not for emphasis — the host already routes a
+/// non-live provider down its own single-reading path — but so that the
+/// claim "this payload declares its own projection in full" is true of
+/// *every* document Libra can emit. An envelope that declared authority in
+/// the success case and not in the failure case would be a declaration the
+/// host could only partly rely on, and the failure case is where an
+/// inferred role would do the most damage.
 pub fn no_reading(kind: NoReading) -> Value {
     let availability = kind.availability();
     json!({
@@ -337,6 +356,13 @@ pub fn no_reading(kind: NoReading) -> Value {
 /// statusline and every other product is what progressive disclosure is
 /// for; the task id stays because it is the one handle a reader has on the
 /// work, and both appear in full on the `explain` surface.
+///
+/// Clear roles, in the three shapes this returns: idle is the `posture`,
+/// because "nothing is being governed" is the entire state and there is no
+/// estimate segment to claim the part; escalated is an `exception`, a
+/// decision a human could make; and an ordinary active task is
+/// `supporting`, because an opaque id is a reader's handle on the work and
+/// not their reason to glance at the line.
 fn task_segment(task: Option<&TaskSummary>) -> Value {
     let Some(task) = task else {
         return json!({
@@ -398,6 +424,20 @@ fn task_segment(task: Option<&TaskSummary>) -> Value {
 /// which is authoritative and structural — the type's own docs promise a
 /// cold start is *never* inferred from `confidence` alone, and the
 /// estimator's free-text `reason` is never rendered.
+///
+/// The two labels differ, and that is the point rather than a cosmetic
+/// choice. Clear keeps the state marker, the label and the duration and
+/// drops the reason, so a no-estimate segment labelled `Remaining work`
+/// would render in Clear as exactly `Remaining work` — a heading with
+/// nothing under it, indistinguishable at a glance from an estimate the
+/// reader simply failed to read. `Remaining work not estimated` says the
+/// missing half in the one field Clear is guaranteed to show, and the
+/// reason still distinguishes *why* in Detail.
+///
+/// `posture`, in both shapes. For a product whose whole subject is whether
+/// work will finish, the remaining span is the posture — and an estimate
+/// that does not exist is a posture too, which is why the role does not
+/// move when the number does.
 fn estimate_segment(task: &TaskSummary) -> Value {
     let estimate = &task.remaining_estimate;
     let Some(p90) = estimate.duration_p90_secs else {
@@ -434,6 +474,94 @@ fn confidence_token(confidence: Confidence) -> &'static str {
         Confidence::Medium => "medium",
         Confidence::High => "high",
     }
+}
+
+/// The share of the task's resource envelope still available, as a whole
+/// percentage in `1..=100`.
+///
+/// Truncated rather than rounded, and floored at 1. Both bounds exist to
+/// keep the three ways a budget can be gone distinguishable from a budget
+/// that is merely nearly gone: rounding `0.004` to `0%` would print "0%
+/// budget left" for a task the ledger will still serve, and rounding
+/// `0.999` up to `100%` would claim nothing had been spent when something
+/// had. Truncation never over-reports what is left, which is the direction
+/// a budget figure should err in.
+///
+/// `None` for a share that is not a finite number in `0.0..=1.0`. The value
+/// arrives over the wire from the daemon, so this function cannot assume it
+/// is well-formed, and a percentage computed from a NaN is worse than no
+/// percentage — the caller reports it as an unreadable budget rather than
+/// printing arithmetic.
+fn percent_left(fraction_left: f64) -> Option<u32> {
+    if !fraction_left.is_finite() || fraction_left <= 0.0 || fraction_left > 1.0 {
+        return None;
+    }
+    Some(((fraction_left * 100.0).floor() as u32).max(1))
+}
+
+/// What is left of the task's resource envelope (HORO-1634).
+///
+/// A share, never an amount, and the axis is a literal in the format string
+/// rather than something assembled from a variable. The host refuses a label
+/// containing a percentage with no word saying what it measures — `62%`
+/// alone reads as used *and* as left, which are opposite answers — and a
+/// refused label costs the whole document, not the one segment. Writing the
+/// axis as part of the template is what makes the rule satisfied by
+/// construction: there is no code path that formats the number without it.
+///
+/// `vital`, except when the envelope is spent. A budget share is the one
+/// reading that qualifies a schedule — `Replans now need approval · 38%
+/// budget left` says what the decision costs, which a bare approval cannot
+/// — and the host only pairs a declared vital with an exception, never an
+/// inferred one. Exhaustion is the exception: a limit that has been reached
+/// is not a posture about how the work is going, it is the reason the next
+/// reservation will be refused.
+///
+/// The three non-numeric outcomes stay distinct instead of collapsing to
+/// one "no budget" phrase. A task that was never admitted to an envelope, an
+/// envelope that is spent, and a ledger that would not read are three
+/// different things to be told, and only the middle one is about the work.
+fn budget_segment(posture: BudgetPosture) -> Value {
+    let (state, label, reason_code) = match posture {
+        BudgetPosture::Remaining { fraction_left } => match percent_left(fraction_left) {
+            Some(percent) => ("neutral", format!("{percent}% budget left"), None),
+            None => (
+                "warn",
+                "Budget share not a number".to_string(),
+                Some("budget_share_not_a_number"),
+            ),
+        },
+        // `warn`, matching the escalation and for the same reason: hooks are
+        // advisory-only, so an exhausted envelope means the ledger will
+        // refuse the next reservation, not that work has stopped. `critical`
+        // would claim the latter.
+        BudgetPosture::Exhausted => (
+            "warn",
+            "Budget exhausted".to_string(),
+            Some("budget_hard_limit_reached"),
+        ),
+        BudgetPosture::NotEstablished => (
+            "unknown",
+            "Budget not established".to_string(),
+            Some("task_admitted_without_a_budget"),
+        ),
+        BudgetPosture::Unreadable => (
+            "warn",
+            "Budget unreadable".to_string(),
+            Some("budget_ledger_unreadable"),
+        ),
+    };
+    let mut segment = json!({
+        "key": "budget",
+        "state": state,
+        "label": label,
+        "explain_key": "libra.budget",
+        "order_hint": 25,
+    });
+    if let Some(reason_code) = reason_code {
+        segment["reason_code"] = json!(reason_code);
+    }
+    segment
 }
 
 /// The four presets `Policy` exposes: the config token, spelled exactly as
@@ -528,6 +656,13 @@ fn profile_segment(doctor: &DoctorResult) -> Option<Value> {
         "reason_code": "config_edited_restart_required",
         "explain_key": "libra.profile",
         "order_hint": 40,
+        // `vital`, not `exception`. A policy edit that has not taken effect
+        // changes how every reading above it should be understood, which is
+        // what a vital signal is for — but nothing is broken, nothing is
+        // unavailable, and nobody is being waited on, so it is not the top
+        // rung. Declaring the role also pins behaviour that the host used to
+        // infer from `warn` being an emphatic state; an inferred vital is
+        // never paired with an exception, and a declared one is.
     }))
 }
 
@@ -561,10 +696,23 @@ fn rfc3339_utc(now: OffsetDateTime) -> String {
 /// and a host reusing a cached answer across that would render a superseded
 /// plan as current. The founder's wrapper caches this at its own layer,
 /// which is its choice to make; the provider does not authorise it.
+///
+/// At most four segments, which is the host's whole per-provider allowance:
+/// the task, its estimate, its budget share, and a policy-drift warning.
+/// Nothing is appended conditionally beyond those four, and the escalation
+/// shares the task's segment rather than claiming a fifth — see
+/// [`task_segment`]. A document with five segments is refused whole, so
+/// Libra would render as nothing at the moment it had the most to say.
 pub fn reading(status: &StatusResult, doctor: Option<&DoctorResult>, now: OffsetDateTime) -> Value {
     let mut segments = vec![task_segment(status.current_task.as_ref())];
     if let Some(task) = status.current_task.as_ref() {
         segments.push(estimate_segment(task));
+        // Read from the snapshot rather than derived from it: the daemon
+        // computed this share while answering the same `Status` request, so
+        // Clear and Detail cannot disagree about it and no second round trip
+        // was spent. A task without a budget field yields no segment rather
+        // than a guessed one.
+        segments.extend(status.task_budget.map(budget_segment));
     }
     segments.extend(doctor.and_then(profile_segment));
 
@@ -643,6 +791,46 @@ fn replan_state_prose(state: &ReplanState) -> String {
     }
 }
 
+/// Prose for a [`BudgetPosture`], spelled out at `explain` length.
+///
+/// The percentage carries its axis here too. The host's label rule does not
+/// reach this surface — it is plain text, not a contract field — but a bare
+/// `38%` is ambiguous wherever it is read, and a user comparing the
+/// statusline against `explain` should not have to work out whether the two
+/// are even measuring the same direction.
+///
+/// `None` only reaches here if a daemon answered with a task and no budget
+/// field, which the current daemon does not do; it is reported as
+/// unestablished rather than silently omitted, because a missing line reads
+/// as "there is no budget" and that is a claim this function cannot make.
+fn budget_posture_prose(posture: Option<BudgetPosture>) -> String {
+    match posture {
+        Some(BudgetPosture::Remaining { fraction_left }) => match percent_left(fraction_left) {
+            Some(percent) => format!(
+                "{percent}% budget left — a share of the task's limit, not an\n\
+                 \x20                  amount; the limit itself and what has been spent are\n\
+                 \x20                  resource figures and stay off every rendering surface"
+            ),
+            None => "not reported — the daemon's share was not a usable number".to_string(),
+        },
+        Some(BudgetPosture::Exhausted) => {
+            "exhausted — the next reservation will be refused; the task is \
+             not\n\x20                  stopped, because Libra's hooks are advisory"
+                .to_string()
+        }
+        Some(BudgetPosture::NotEstablished) | None => {
+            "none — this task was admitted without a resource envelope, which\n\
+             \x20                  is not the same as having spent one"
+                .to_string()
+        }
+        Some(BudgetPosture::Unreadable) => {
+            "unknown — the local reservation ledger could not be read, so this\n\
+             \x20                  is a missing reading rather than an absent budget"
+                .to_string()
+        }
+    }
+}
+
 /// The read-only long form of the same state, for the shared `explain`
 /// surface.
 ///
@@ -709,6 +897,16 @@ pub fn explain_text(status: &StatusResult, doctor: Option<&DoctorResult>) -> Str
             out.push_str(&format!(
                 "  replan state     {}\n",
                 replan_state_prose(&task.replan_state)
+            ));
+            // A share, in both places, and for the same reason the segment
+            // carries one: the hard limit, the settled spend, the active
+            // reservations and the Completion Reserve are all resource
+            // figures, and this surface's closing paragraph promises it does
+            // not print those. "How much room is left" is answerable without
+            // disclosing what the room is measured in.
+            out.push_str(&format!(
+                "  budget           {}\n",
+                budget_posture_prose(status.task_budget)
             ));
             if task.replan_state == ReplanState::EscalatedAwaitingApproval {
                 out.push_str(
@@ -820,6 +1018,40 @@ mod tests {
     fn status_with(replan_state: ReplanState) -> StatusResult {
         StatusResult {
             current_task: Some(task(replan_state)),
+            // The ordinary active shape: an envelope with room left in it.
+            // 0.38 rather than a round fraction so a truncation or rounding
+            // bug shows up as a wrong digit instead of as the right one by
+            // luck.
+            task_budget: Some(BUDGET_LEFT),
+        }
+    }
+
+    /// The share the fixtures use for "a healthy active task".
+    const BUDGET_LEFT: BudgetPosture = BudgetPosture::Remaining {
+        fraction_left: 0.38,
+    };
+
+    /// Every budget shape the daemon can report, plus the absence of the
+    /// field.
+    ///
+    /// `None` is not reachable from the current daemon — it computes a
+    /// posture for every task it holds — but the provider parses a wire
+    /// message rather than calling a function, so a peer that omitted the
+    /// field must still produce a truthful document, and the all-documents
+    /// properties below have to cover that.
+    const ALL_BUDGETS: [(&str, Option<BudgetPosture>); 5] = [
+        ("absent", None),
+        ("remaining", Some(BUDGET_LEFT)),
+        ("exhausted", Some(BudgetPosture::Exhausted)),
+        ("unestablished", Some(BudgetPosture::NotEstablished)),
+        ("unreadable", Some(BudgetPosture::Unreadable)),
+    ];
+
+    /// The idle shape: no task, and so no share of a budget that was never
+    /// admitted.
+    fn idle() -> StatusResult {
+        StatusResult {
+            current_task: None,
             task_budget: None,
         }
     }
@@ -893,26 +1125,24 @@ mod tests {
         for (state_name, state) in states {
             for (doctor_name, doctor) in &doctors {
                 for (estimate_name, p90) in [("with-p90", Some(600u64)), ("no-p90", None)] {
-                    let mut status = status_with(state);
-                    status.current_task.as_mut().unwrap().remaining_estimate =
-                        estimate_with(p90, p90.is_none(), 7);
-                    out.push((
-                        format!("reading/{state_name}/{doctor_name}/{estimate_name}"),
-                        reading(&status, doctor.as_ref(), now()),
-                    ));
+                    for (budget_name, budget) in ALL_BUDGETS {
+                        let mut status = status_with(state);
+                        status.current_task.as_mut().unwrap().remaining_estimate =
+                            estimate_with(p90, p90.is_none(), 7);
+                        status.task_budget = budget;
+                        out.push((
+                            format!(
+                                "reading/{state_name}/{doctor_name}/{estimate_name}/{budget_name}"
+                            ),
+                            reading(&status, doctor.as_ref(), now()),
+                        ));
+                    }
                 }
             }
         }
         out.push((
             "reading/idle".to_string(),
-            reading(
-                &StatusResult {
-                    current_task: None,
-                    task_budget: None,
-                },
-                Some(&doctor_with("balanced", true)),
-                now(),
-            ),
+            reading(&idle(), Some(&doctor_with("balanced", true)), now()),
         ));
         out
     }
@@ -1095,14 +1325,7 @@ mod tests {
 
     #[test]
     fn no_task_is_reported_explicitly_rather_than_by_omission() {
-        let document = reading(
-            &StatusResult {
-                current_task: None,
-                task_budget: None,
-            },
-            None,
-            now(),
-        );
+        let document = reading(&idle(), None, now());
         assert_eq!(document["availability"], json!("available"));
         assert_eq!(segments(&document).len(), 1);
         assert_eq!(
@@ -1241,6 +1464,196 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------- budget
+
+    /// The one label shape a budget share may ever take.
+    fn budget_label(document: &Value) -> Option<String> {
+        segments(document)
+            .iter()
+            .find(|s| s["key"] == json!("budget"))
+            .map(|s| s["label"].as_str().unwrap().to_string())
+    }
+
+    fn with_budget(posture: Option<BudgetPosture>) -> Value {
+        let mut status = status_with(ReplanState::Stable);
+        status.task_budget = posture;
+        reading(&status, None, now())
+    }
+
+    #[test]
+    fn a_budget_share_is_reported_as_a_share_with_its_axis_named() {
+        let document = with_budget(Some(BudgetPosture::Remaining {
+            fraction_left: 0.38,
+        }));
+        let budget = segments(&document)
+            .iter()
+            .find(|s| s["key"] == json!("budget"))
+            .expect("an active task's envelope is a reading, not a detail");
+        assert_eq!(budget["label"], json!("38% budget left"));
+        assert_eq!(budget["state"], json!("neutral"));
+        assert!(
+            budget.get("count").is_none() && budget.get("total").is_none(),
+            "a share is not a counter; counters are dropped at Clear depth"
+        );
+    }
+
+    #[test]
+    fn no_percentage_this_provider_can_emit_lacks_an_axis() {
+        // The AC is "satisfied by construction, not by luck", so this sweeps
+        // the whole input domain rather than the fixture: every fraction that
+        // produces a percentage must produce one with its direction named.
+        // The axis lives in the format template, so there is no code path
+        // that can print the number without it — this proves the claim over
+        // every number the template can be handed.
+        let mut seen_percent = 0;
+        for permille in 0..=1000u32 {
+            let fraction = f64::from(permille) / 1000.0;
+            let document = with_budget(Some(BudgetPosture::Remaining {
+                fraction_left: fraction,
+            }));
+            let label = budget_label(&document).expect("a budget is always reported");
+            if !label.contains('%') {
+                // A fraction outside `0.0..=1.0` (only 0.0 here) is reported
+                // as unreadable rather than as a percentage.
+                assert_eq!(fraction, 0.0, "{fraction}: {label}");
+                continue;
+            }
+            seen_percent += 1;
+            assert!(
+                label.ends_with("% budget left"),
+                "{fraction} rendered {label:?} with no axis"
+            );
+        }
+        assert_eq!(
+            seen_percent, 1000,
+            "the sweep must actually have produced percentages"
+        );
+
+        // And across every document the provider can emit, including the
+        // no-reading and idle shapes, so a future field cannot reintroduce a
+        // bare number somewhere else.
+        for (name, document) in every_document() {
+            for (path, text) in all_strings(&document) {
+                if !text.contains('%') {
+                    continue;
+                }
+                assert!(
+                    text.split_whitespace()
+                        .filter(
+                            |word| word.chars().filter(|c| c.is_ascii_alphabetic()).count() >= 2
+                        )
+                        .count()
+                        >= 1,
+                    "{name}: {path} = {text:?} is a percentage with no noun"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_share_is_truncated_floored_and_never_fabricated() {
+        // Truncation never over-reports what is left, which is the direction
+        // a budget figure has to err in. The floor at 1 keeps `0%` reserved
+        // for an envelope that is actually spent.
+        assert_eq!(percent_left(1.0), Some(100));
+        assert_eq!(
+            percent_left(0.999),
+            Some(99),
+            "rounding up would claim 100%"
+        );
+        assert_eq!(percent_left(0.38), Some(38));
+        assert_eq!(
+            percent_left(0.004),
+            Some(1),
+            "a served task must not read as 0% left"
+        );
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.5, 1.5, 0.0] {
+            assert_eq!(percent_left(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_exhausted_envelope_is_an_exception_and_still_not_an_emergency() {
+        let document = with_budget(Some(BudgetPosture::Exhausted));
+        let budget = segments(&document)
+            .iter()
+            .find(|s| s["key"] == json!("budget"))
+            .unwrap();
+        assert_eq!(budget["label"], json!("Budget exhausted"));
+        assert_eq!(
+            budget["state"],
+            json!("warn"),
+            "`critical` would claim work has stopped; Libra's hooks are advisory"
+        );
+        assert_eq!(budget["reason_code"], json!("budget_hard_limit_reached"));
+    }
+
+    #[test]
+    fn the_three_ways_a_budget_can_be_gone_stay_three_facts() {
+        // Collapsing them loses the one a user could act on: a spent
+        // envelope is not an unadmitted task, and neither is a ledger that
+        // would not read.
+        let shapes = [
+            BudgetPosture::Exhausted,
+            BudgetPosture::NotEstablished,
+            BudgetPosture::Unreadable,
+        ];
+        let mut labels = Vec::new();
+        let mut reasons = Vec::new();
+        for shape in shapes {
+            let document = with_budget(Some(shape));
+            let budget = segments(&document)
+                .iter()
+                .find(|s| s["key"] == json!("budget"))
+                .unwrap()
+                .clone();
+            assert!(
+                !budget["label"].as_str().unwrap().contains('%'),
+                "{shape:?} has no share to report"
+            );
+            labels.push(budget["label"].as_str().unwrap().to_string());
+            reasons.push(budget["reason_code"].as_str().unwrap().to_string());
+        }
+        let mut unique_labels = labels.clone();
+        unique_labels.sort();
+        unique_labels.dedup();
+        assert_eq!(unique_labels.len(), 3, "{labels:?}");
+        let mut unique_reasons = reasons.clone();
+        unique_reasons.sort();
+        unique_reasons.dedup();
+        assert_eq!(unique_reasons.len(), 3, "{reasons:?}");
+    }
+
+    #[test]
+    fn an_absent_budget_field_yields_no_segment_rather_than_a_guess() {
+        let document = with_budget(None);
+        assert!(budget_label(&document).is_none());
+        assert_eq!(segments(&document).len(), 2, "task and estimate only");
+    }
+
+    #[test]
+    fn an_idle_daemon_reports_no_budget_at_all() {
+        // A share of an envelope that was never admitted is not zero, it is
+        // absent — and the idle document must not grow a reading for it even
+        // if a peer sent one.
+        let mut status = idle();
+        status.task_budget = Some(BudgetPosture::Exhausted);
+        let document = reading(&status, None, now());
+        assert!(budget_label(&document).is_none());
+        assert_eq!(segments(&document).len(), 1);
+    }
+
+    #[test]
+    fn a_budget_reading_needs_neither_the_doctor_half_nor_a_third_request() {
+        // The whole probe is budgeted at 200 ms across two round trips, and a
+        // budget figure that cost a third would not be worth a statusline.
+        // The share therefore rides the `Status` reply: it is present with no
+        // `Doctor` answer at all, which is the shape a failure-isolated or
+        // timed-out second round trip produces.
+        let document = reading(&status_with(ReplanState::Stable), None, now());
+        assert_eq!(budget_label(&document).as_deref(), Some("38% budget left"));
+    }
+
     // -------------------------------------------------------- escalation
 
     #[test]
@@ -1255,11 +1668,13 @@ mod tests {
             None,
             now(),
         );
+        // On the task segment, not one of its own: the host allows four
+        // segments per provider and the estimate, the budget and a
+        // policy-drift warning claim the other three.
         let escalation = segments(&document)
             .iter()
             .find(|s| s["key"] == json!("task"))
-            .expect("the state must be visible at all")
-            .clone();
+            .expect("the state must be visible at all");
 
         assert_eq!(escalation["state"], json!("warn"));
         assert_eq!(escalation["label"], json!("Replans now need approval"));
@@ -1269,11 +1684,10 @@ mod tests {
             "the *next* replan, not this moment"
         );
         assert!(
-            !segments(&document)
+            segments(&document)
                 .iter()
-                .any(|s| s["key"] == json!("escalation")),
-            "a segment of its own would spend a quarter of the host's \
-             per-provider allowance restating the subject"
+                .all(|s| s["key"] != json!("escalation")),
+            "a fifth segment would make the host refuse the whole document"
         );
         for (path, text) in all_strings(&document) {
             let lower = text.to_lowercase();
@@ -1323,7 +1737,7 @@ mod tests {
     }
 
     #[test]
-    fn an_ordinary_state_renders_two_quiet_segments() {
+    fn an_ordinary_state_renders_three_quiet_segments() {
         // The line the founder sees almost always. Anything that warns
         // here is a warning that means nothing, and a statusline whose
         // warnings mean nothing is a statusline nobody reads.
@@ -1332,7 +1746,7 @@ mod tests {
             Some(&doctor_with("balanced", true)),
             now(),
         );
-        assert_eq!(segments(&document).len(), 2);
+        assert_eq!(segments(&document).len(), 3);
         for segment in segments(&document) {
             assert!(
                 segment["state"] == json!("neutral"),
@@ -1434,27 +1848,37 @@ mod tests {
         // discarded to `None`, and what could be established still renders.
         let document = reading(&status_with(ReplanState::Stable), None, now());
         assert_eq!(document["availability"], json!("available"));
-        assert_eq!(segments(&document).len(), 2);
-        assert_eq!(segments(&document)[0]["key"], json!("task"));
+        let keys: Vec<&str> = segments(&document)
+            .iter()
+            .map(|s| s["key"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            keys,
+            ["task", "estimate", "budget"],
+            "only the diagnostic half is lost; everything the `Status` reply \
+             carried still renders"
+        );
     }
 
     #[test]
     fn the_worst_case_document_fits_the_hosts_per_provider_segment_budget() {
         // Four is the host's `MAX_SEGMENTS_PER_PROVIDER`, and a document
         // that exceeds it is refused whole — so Libra would render as
-        // nothing at precisely the moment it had the most to say. The fold
-        // buys back the fourth column: this is the worst case and it now
-        // spends three.
+        // nothing at precisely the moment it had the most to say. The
+        // allowance is now fully spent: task, estimate, budget, profile.
+        // This is why the escalation folded onto the task segment rather
+        // than claiming a fifth.
         let document = reading(
             &status_with(ReplanState::EscalatedAwaitingApproval),
             Some(&doctor_with("strict_budget", false)),
             now(),
         );
+        assert_eq!(segments(&document).len(), 4);
         let keys: Vec<&str> = segments(&document)
             .iter()
             .map(|s| s["key"].as_str().unwrap())
             .collect();
-        assert_eq!(keys, ["task", "estimate", "profile"]);
+        assert_eq!(keys, ["task", "estimate", "budget", "profile"]);
         for (name, document) in every_document() {
             assert!(segments(&document).len() <= 4, "{name}");
         }
@@ -1658,6 +2082,62 @@ mod tests {
     }
 
     #[test]
+    fn explain_reports_the_budget_share_with_its_axis_too() {
+        // The privacy rule bars amounts, not ratios, and `explain` is where
+        // a ratio is allowed to be a sentence rather than a segment. The
+        // axis travels with it: `explain` is read out of context of the
+        // line that produced it.
+        let text = explain_text(&status_with(ReplanState::Stable), None);
+        assert!(text.contains("38% budget left"), "{text}");
+        for rendered in ["1234", "2345", "3456"] {
+            assert!(
+                !text.contains(rendered),
+                "{rendered} is an amount, not a share"
+            );
+        }
+    }
+
+    #[test]
+    fn explain_distinguishes_a_spent_budget_from_one_that_never_existed() {
+        // The statusline has room for a label; `explain` has room for the
+        // difference, which is the whole reason the posture is four variants.
+        let mut spent = status_with(ReplanState::Stable);
+        spent.task_budget = Some(BudgetPosture::Exhausted);
+        let spent = explain_text(&spent, None);
+
+        let mut never = status_with(ReplanState::Stable);
+        never.task_budget = Some(BudgetPosture::NotEstablished);
+        let never = explain_text(&never, None);
+
+        let mut unreadable = status_with(ReplanState::Stable);
+        unreadable.task_budget = Some(BudgetPosture::Unreadable);
+        let unreadable = explain_text(&unreadable, None);
+
+        let mut lines: Vec<String> = Vec::new();
+        for text in [&spent, &never, &unreadable] {
+            let line = text
+                .lines()
+                .find(|line| line.trim_start().starts_with("budget"))
+                .expect("explain always has a budget line")
+                .to_string();
+            assert!(!line.contains('%'), "{line}: there is no share to report");
+            lines.push(line);
+        }
+        let mut unique = lines.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 3, "{lines:?}");
+
+        // The one deliberate collapse: an absent field reads as an absent
+        // envelope, because with a task present the daemon always answers
+        // and `None` only ever means "nothing was governed".
+        let mut absent = status_with(ReplanState::Stable);
+        absent.task_budget = None;
+        let absent = explain_text(&absent, None);
+        assert!(absent.contains("admitted without a resource envelope"));
+    }
+
+    #[test]
     fn explain_never_prints_a_resource_quantile() {
         // Cost history is the founder's, and the contract's privacy rule
         // names it. The fixture sets all three quantiles so their absence
@@ -1704,13 +2184,7 @@ mod tests {
 
     #[test]
     fn explain_reports_no_task_without_implying_a_verdict() {
-        let text = explain_text(
-            &StatusResult {
-                current_task: None,
-                task_budget: None,
-            },
-            None,
-        );
+        let text = explain_text(&idle(), None);
         assert!(text.contains("No task is being governed right now"));
         assert!(text.contains("not a judgement"));
     }
