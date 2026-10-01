@@ -30,7 +30,9 @@ hook schemas vs. what remains unverified.
   `crates/cli/src/codex_hooks_file.rs`, which mirrors
   `claude_settings.rs`'s exact safety discipline (parse-or-abort on
   malformed JSON, a verbatim-bytes backup before every write, atomic
-  temp-file-then-rename, never touching a foreign hook group).
+  temp-file-then-rename, a refusal to write anything at all if the file
+  changed on disk since it was read, never touching a foreign hook
+  group).
 - `libra-governor doctor` — reports whether `hooks.json`'s three groups
   are wired, whether the wired command path matches the binary currently
   running the check (a moved binary needs re-trust — see "Trust gate"

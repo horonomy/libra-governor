@@ -20,6 +20,19 @@
 //! 4. The new content is written to a temp file in the same directory,
 //!    fsynced, then renamed over the original — never truncated in
 //!    place, so a crash mid-write cannot leave a half-written file.
+//! 5. Immediately before that write, the file is re-read and its bytes
+//!    re-hashed, then compared against what this process read at the
+//!    start of the operation. If they differ, some other writer changed
+//!    the file in between and the whole operation aborts with
+//!    [`SettingsError::ConcurrentModification`] — no backup, no temp
+//!    file, no write at all, so the racing writer's content survives
+//!    exactly as it is rather than being silently clobbered by an edit
+//!    computed from stale content (HORO-1380 S2b / HORO-998
+//!    `CONCURRENT_CHANGE_DOES_NOT_CLOBBER`). This narrows the lost-update
+//!    window; it does not close it. Closing it would need an advisory
+//!    lock that the other writers of this file (Claude Code itself, a
+//!    user's `$EDITOR`) do not take, so a check-then-rename is the
+//!    strongest honest guarantee available here.
 //!
 //! # Ownership predicate
 //!
@@ -39,6 +52,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 pub const SETTINGS_FILE_NAME: &str = "settings.json";
 
@@ -78,6 +92,12 @@ pub enum SettingsError {
     HooksFieldNotAnObject { path: PathBuf },
     #[error("{path}'s \"hooks.{event}\" field is present but is not a JSON array")]
     HookEventNotAnArray { path: PathBuf, event: String },
+    #[error(
+        "{path} changed on disk after it was read and before this edit could be written; \
+         refusing to overwrite another writer's change (nothing was changed) — re-run to \
+         apply this edit on top of the new content"
+    )]
+    ConcurrentModification { path: PathBuf },
 }
 
 /// Resolution order: `LIBRA_GOVERNOR_CLAUDE_DIR` (primarily for tests, so
@@ -115,36 +135,89 @@ fn is_loopback_base_url(url: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
+/// A sha256 over a config file's exact bytes at one instant, used only
+/// to answer "is this still the file I read?" immediately before a write
+/// (see module docs property 5). A plain byte comparison would be
+/// equivalent here; sha256 keeps this module's check identical to the
+/// reference implementation of the same HORO-998 property in
+/// `circinus`'s `claude_code/installer.py::_atomic_replace`, and keeps
+/// the retained value fixed-size rather than growing with the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileDigest([u8; 32]);
+
+impl FileDigest {
+    fn of(bytes: &[u8]) -> Self {
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&Sha256::digest(bytes));
+        Self(out)
+    }
+
+    /// The digest of a file that is not there. A file created by another
+    /// writer between an absent read and the write therefore fails the
+    /// check too, rather than being overwritten.
+    fn absent() -> Self {
+        Self::of(&[])
+    }
+}
+
+/// The file's bytes, or `None` if it does not exist.
+fn read_bytes_if_present(path: &Path) -> Result<Option<Vec<u8>>, SettingsError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(SettingsError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 /// Reads and parses `path` into a JSON object, or `None` if the file does
 /// not exist yet. Errors (never falls back) on malformed JSON or a
-/// non-object root.
-fn read_object(path: &Path) -> Result<Option<Map<String, Value>>, SettingsError> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let text = std::fs::read_to_string(path).map_err(|source| SettingsError::Io {
+/// non-object root. The returned [`FileDigest`] is of the exact bytes
+/// read and must be handed to [`write_object_atomically`] so the write
+/// can refuse to clobber a change made in between.
+fn read_object(path: &Path) -> Result<(Option<Map<String, Value>>, FileDigest), SettingsError> {
+    let Some(raw) = read_bytes_if_present(path)? else {
+        return Ok((None, FileDigest::absent()));
+    };
+    let digest = FileDigest::of(&raw);
+    let text = std::str::from_utf8(&raw).map_err(|_| SettingsError::Io {
         path: path.to_path_buf(),
-        source,
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        ),
     })?;
-    let value: Value = serde_json::from_str(&text).map_err(|source| SettingsError::Parse {
+    let value: Value = serde_json::from_str(text).map_err(|source| SettingsError::Parse {
         path: path.to_path_buf(),
         source,
     })?;
     match value {
-        Value::Object(map) => Ok(Some(map)),
+        Value::Object(map) => Ok((Some(map), digest)),
         _ => Err(SettingsError::NotAnObject {
             path: path.to_path_buf(),
         }),
     }
 }
 
-/// Writes `map` to `path`: a verbatim-bytes backup of any existing file
-/// first, then a temp file in the same directory, fsynced, then renamed
-/// over the original. Never truncates `path` in place. Returns the
-/// backup path, when one was written.
+/// Writes `map` to `path`, but only if `expected` still matches what is
+/// on disk: the file is re-read and re-hashed first and a mismatch
+/// aborts with [`SettingsError::ConcurrentModification`] before anything
+/// at all is written (module docs property 5). Otherwise a
+/// verbatim-bytes backup of any existing file is taken, then a temp file
+/// in the same directory, fsynced, then renamed over the original. Never
+/// truncates `path` in place. Returns the backup path, when one was
+/// written.
+///
+/// The concurrency check and the backup live in this one function on
+/// purpose rather than being split across caller and callee: a stray
+/// backup left behind by an aborted write is only structurally
+/// impossible if nothing can take a backup before the check has passed.
 fn write_object_atomically(
     path: &Path,
     map: &Map<String, Value>,
+    expected: FileDigest,
 ) -> Result<Option<PathBuf>, SettingsError> {
     let io_err = |source: std::io::Error| SettingsError::Io {
         path: path.to_path_buf(),
@@ -154,7 +227,27 @@ fn write_object_atomically(
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir).map_err(io_err)?;
 
-    let backup_path = if path.exists() {
+    // The first thing this function observes about the file itself, and
+    // the gate on every mutating step below it.
+    let now_raw = read_bytes_if_present(path)?.unwrap_or_default();
+    if FileDigest::of(&now_raw) != expected {
+        return Err(SettingsError::ConcurrentModification {
+            path: path.to_path_buf(),
+        });
+    }
+
+    // Serialized before the backup is taken so that even a (practically
+    // impossible) serialization failure cannot leave a backup behind for
+    // a write that never happened.
+    let json_text =
+        serde_json::to_string_pretty(&Value::Object(map.clone())).map_err(|source| {
+            SettingsError::Parse {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
+
+    let backup_path = if !now_raw.is_empty() {
         let unix_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -193,23 +286,25 @@ fn write_object_atomically(
             .unwrap_or_else(|| SETTINGS_FILE_NAME.to_string()),
         std::process::id()
     ));
-    let json_text =
-        serde_json::to_string_pretty(&Value::Object(map.clone())).map_err(|source| {
-            SettingsError::Parse {
-                path: path.to_path_buf(),
-                source,
-            }
-        })?;
-    {
-        let mut file = std::fs::File::create(&tmp_path).map_err(io_err)?;
-        file.write_all(json_text.as_bytes()).map_err(io_err)?;
-        file.write_all(b"\n").map_err(io_err)?;
-        file.sync_all().map_err(io_err)?;
-    }
-    std::fs::rename(&tmp_path, path).map_err(|source| {
+    let write_result = (|| -> Result<(), std::io::Error> {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(json_text.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp_path, path)
+    })();
+    if let Err(source) = write_result {
+        // The write itself failed (disk full, a permission race): leave
+        // nothing at all behind from this attempt — not just an
+        // untouched original, but no leaked temp file and no backup of a
+        // write that never happened.
         let _ = std::fs::remove_file(&tmp_path);
-        io_err(source)
-    })?;
+        if let Some(backup) = &backup_path {
+            let _ = std::fs::remove_file(backup);
+        }
+        return Err(io_err(source));
+    }
 
     Ok(backup_path)
 }
@@ -233,7 +328,8 @@ pub struct Applied {
 /// in `settings.json` would only work when Claude Code happens to be
 /// launched from the right working directory).
 pub fn apply(path: &Path, binary: &Path) -> Result<Applied, SettingsError> {
-    let mut root = read_object(path)?.unwrap_or_default();
+    let (existing, digest) = read_object(path)?;
+    let mut root = existing.unwrap_or_default();
     let binary = binary.display().to_string();
     let mut hooks_added = 0usize;
 
@@ -297,7 +393,7 @@ pub fn apply(path: &Path, binary: &Path) -> Result<Applied, SettingsError> {
         );
     }
 
-    let backup_path = write_object_atomically(path, &root)?;
+    let backup_path = write_object_atomically(path, &root, digest)?;
     Ok(Applied {
         hooks_added,
         statusline_added,
@@ -352,7 +448,8 @@ pub struct Removed {
 /// key, and every foreign entry inside `hooks`, is left exactly as it
 /// was. A missing file is a safe no-op, not an error.
 pub fn remove(path: &Path) -> Result<Removed, SettingsError> {
-    let Some(mut root) = read_object(path)? else {
+    let (existing, digest) = read_object(path)?;
+    let Some(mut root) = existing else {
         return Ok(Removed {
             file_absent: true,
             ..Default::default()
@@ -435,7 +532,7 @@ pub fn remove(path: &Path) -> Result<Removed, SettingsError> {
         }
     }
 
-    let backup_path = write_object_atomically(path, &root)?;
+    let backup_path = write_object_atomically(path, &root, digest)?;
     Ok(Removed {
         hook_commands_removed,
         statusline_removed,
@@ -465,7 +562,7 @@ pub struct Inspection {
 /// malformed `settings.json` is Claude Code's own concern, and `doctor`
 /// degrading to "nothing wired" here is more useful than crashing.
 pub fn inspect(path: &Path) -> Inspection {
-    let Ok(Some(root)) = read_object(path) else {
+    let Ok((Some(root), _)) = read_object(path) else {
         return Inspection {
             file_present: path.exists(),
             ..Default::default()
@@ -856,6 +953,83 @@ mod tests {
             stop[0]["hooks"][0]["command"],
             "/usr/local/bin/other stop-notify"
         );
+    }
+
+    #[test]
+    fn a_concurrent_change_between_read_and_write_is_refused() {
+        // HORO-1380 S2b / HORO-998 CONCURRENT_CHANGE_DOES_NOT_CLOBBER:
+        // an edit computed from content that is no longer on disk must
+        // be thrown away, not written. Exercised at the
+        // read_object/write_object_atomically seam because that is where
+        // the property lives — `apply`/`remove` perform both halves
+        // inside one synchronous call, so no public-API test can place a
+        // racing writer between them without inventing a test hook.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{}\n").unwrap();
+
+        // What this process read, and the edit it computed from it.
+        let (root, digest) = read_object(&path).unwrap();
+        let mut root = root.unwrap();
+        root.insert(
+            "statusLine".to_string(),
+            serde_json::json!({ "type": "command", "command": "ours" }),
+        );
+
+        // What a racing writer put there in the meantime.
+        let racing_bytes = br#"{"someoneElsesEdit": true}"#.to_vec();
+        std::fs::write(&path, &racing_bytes).unwrap();
+
+        let err = write_object_atomically(&path, &root, digest).unwrap_err();
+        assert!(matches!(err, SettingsError::ConcurrentModification { .. }));
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            racing_bytes,
+            "the racing writer's content must survive byte-for-byte — never clobbered by \
+             our stale edit, never reverted to what we read"
+        );
+
+        // No backup and no temp file: the check runs before either can
+        // be created, so a refused write leaves zero artifacts.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("settings.json")]);
+    }
+
+    #[test]
+    fn a_file_created_between_an_absent_read_and_the_write_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        // Read it while it does not exist yet.
+        let (root, digest) = read_object(&path).unwrap();
+        assert!(root.is_none());
+        let mut root = root.unwrap_or_default();
+        root.insert(
+            "statusLine".to_string(),
+            serde_json::json!({ "type": "command", "command": "ours" }),
+        );
+
+        // Another writer creates it before we get to the write.
+        let racing_bytes = br#"{"someoneElsesEdit": true}"#.to_vec();
+        std::fs::write(&path, &racing_bytes).unwrap();
+
+        let err = write_object_atomically(&path, &root, digest).unwrap_err();
+        assert!(matches!(err, SettingsError::ConcurrentModification { .. }));
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            racing_bytes,
+            "a file that appeared after an absent read must not be overwritten"
+        );
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("settings.json")]);
     }
 
     #[test]
