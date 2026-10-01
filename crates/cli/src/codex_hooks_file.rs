@@ -816,6 +816,74 @@ mod tests {
     }
 
     #[test]
+    fn a_concurrent_change_between_read_and_write_is_refused() {
+        // HORO-1380 S2b / HORO-998 CONCURRENT_CHANGE_DOES_NOT_CLOBBER —
+        // mirrors `claude_settings`'s test of the same property; see
+        // there for why this is exercised at the
+        // read_object/write_object_atomically seam.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        std::fs::write(&path, "{}\n").unwrap();
+
+        let (root, digest) = read_object(&path).unwrap();
+        let mut root = root.unwrap();
+        root.insert("description".to_string(), Value::String("ours".to_string()));
+
+        let racing_bytes = br#"{"description": "someone else's edit"}"#.to_vec();
+        std::fs::write(&path, &racing_bytes).unwrap();
+
+        let err = write_object_atomically(&path, &root, digest).unwrap_err();
+        assert!(matches!(
+            err,
+            CodexHooksError::ConcurrentModification { .. }
+        ));
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            racing_bytes,
+            "the racing writer's content must survive byte-for-byte — never clobbered by \
+             our stale edit, never reverted to what we read"
+        );
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("hooks.json")]);
+    }
+
+    #[test]
+    fn a_file_created_between_an_absent_read_and_the_write_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+
+        let (root, digest) = read_object(&path).unwrap();
+        assert!(root.is_none());
+        let mut root = root.unwrap_or_default();
+        root.insert("description".to_string(), Value::String("ours".to_string()));
+
+        let racing_bytes = br#"{"description": "someone else's edit"}"#.to_vec();
+        std::fs::write(&path, &racing_bytes).unwrap();
+
+        let err = write_object_atomically(&path, &root, digest).unwrap_err();
+        assert!(matches!(
+            err,
+            CodexHooksError::ConcurrentModification { .. }
+        ));
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            racing_bytes,
+            "a file that appeared after an absent read must not be overwritten"
+        );
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("hooks.json")]);
+    }
+
+    #[test]
     fn an_event_array_survives_when_a_sibling_matcher_remains_foreign() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hooks.json");

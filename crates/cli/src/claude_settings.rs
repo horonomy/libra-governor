@@ -956,6 +956,83 @@ mod tests {
     }
 
     #[test]
+    fn a_concurrent_change_between_read_and_write_is_refused() {
+        // HORO-1380 S2b / HORO-998 CONCURRENT_CHANGE_DOES_NOT_CLOBBER:
+        // an edit computed from content that is no longer on disk must
+        // be thrown away, not written. Exercised at the
+        // read_object/write_object_atomically seam because that is where
+        // the property lives — `apply`/`remove` perform both halves
+        // inside one synchronous call, so no public-API test can place a
+        // racing writer between them without inventing a test hook.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{}\n").unwrap();
+
+        // What this process read, and the edit it computed from it.
+        let (root, digest) = read_object(&path).unwrap();
+        let mut root = root.unwrap();
+        root.insert(
+            "statusLine".to_string(),
+            serde_json::json!({ "type": "command", "command": "ours" }),
+        );
+
+        // What a racing writer put there in the meantime.
+        let racing_bytes = br#"{"someoneElsesEdit": true}"#.to_vec();
+        std::fs::write(&path, &racing_bytes).unwrap();
+
+        let err = write_object_atomically(&path, &root, digest).unwrap_err();
+        assert!(matches!(err, SettingsError::ConcurrentModification { .. }));
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            racing_bytes,
+            "the racing writer's content must survive byte-for-byte — never clobbered by \
+             our stale edit, never reverted to what we read"
+        );
+
+        // No backup and no temp file: the check runs before either can
+        // be created, so a refused write leaves zero artifacts.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("settings.json")]);
+    }
+
+    #[test]
+    fn a_file_created_between_an_absent_read_and_the_write_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        // Read it while it does not exist yet.
+        let (root, digest) = read_object(&path).unwrap();
+        assert!(root.is_none());
+        let mut root = root.unwrap_or_default();
+        root.insert(
+            "statusLine".to_string(),
+            serde_json::json!({ "type": "command", "command": "ours" }),
+        );
+
+        // Another writer creates it before we get to the write.
+        let racing_bytes = br#"{"someoneElsesEdit": true}"#.to_vec();
+        std::fs::write(&path, &racing_bytes).unwrap();
+
+        let err = write_object_atomically(&path, &root, digest).unwrap_err();
+        assert!(matches!(err, SettingsError::ConcurrentModification { .. }));
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            racing_bytes,
+            "a file that appeared after an absent read must not be overwritten"
+        );
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("settings.json")]);
+    }
+
+    #[test]
     fn is_loopback_base_url_accepts_only_loopback_hosts() {
         assert!(is_loopback_base_url("http://127.0.0.1:8787"));
         assert!(is_loopback_base_url("http://localhost:8787"));
