@@ -13,6 +13,17 @@
 //! 4. The new content is written to a temp file in the same directory,
 //!    fsynced, then renamed over the original — never truncated in
 //!    place.
+//! 5. Immediately before that write, the file is re-read and its bytes
+//!    re-hashed, then compared against what this process read at the
+//!    start of the operation. If they differ, some other writer changed
+//!    the file in between and the whole operation aborts with
+//!    [`CodexHooksError::ConcurrentModification`] — no backup, no temp
+//!    file, no write at all, so the racing writer's content survives
+//!    exactly as it is rather than being silently clobbered by an edit
+//!    computed from stale content (HORO-1380 S2b / HORO-998
+//!    `CONCURRENT_CHANGE_DOES_NOT_CLOBBER`). See
+//!    `claude_settings`'s module docs for why a check-then-rename, and
+//!    not a lock, is the strongest honest guarantee available here.
 //!
 //! # File shape — verified against a real local Codex CLI install
 //! (HORO-1157)
@@ -67,6 +78,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 pub const HOOKS_FILE_NAME: &str = "hooks.json";
 
@@ -117,6 +129,12 @@ pub enum CodexHooksError {
     HooksFieldNotAnObject { path: PathBuf },
     #[error("{path}'s \"hooks.{event}\" field is present but is not a JSON array")]
     HookEventNotAnArray { path: PathBuf, event: String },
+    #[error(
+        "{path} changed on disk after it was read and before this edit could be written; \
+         refusing to overwrite another writer's change (nothing was changed) — re-run to \
+         apply this edit on top of the new content"
+    )]
+    ConcurrentModification { path: PathBuf },
 }
 
 /// Resolution order: `LIBRA_GOVERNOR_CODEX_HOME` (primarily for tests, so
@@ -144,20 +162,62 @@ fn command_is_ours(command: &str) -> bool {
             .any(|suffix| command.ends_with(suffix))
 }
 
-fn read_object(path: &Path) -> Result<Option<Map<String, Value>>, CodexHooksError> {
-    if !path.exists() {
-        return Ok(None);
+/// A sha256 over this file's exact bytes at one instant, used only to
+/// answer "is this still the file I read?" immediately before a write
+/// (module docs property 5). Mirrors `claude_settings::FileDigest`
+/// exactly — see that type for why sha256 rather than a byte compare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileDigest([u8; 32]);
+
+impl FileDigest {
+    fn of(bytes: &[u8]) -> Self {
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&Sha256::digest(bytes));
+        Self(out)
     }
-    let text = std::fs::read_to_string(path).map_err(|source| CodexHooksError::Io {
+
+    /// The digest of a file that is not there, so a file created by
+    /// another writer between an absent read and the write fails the
+    /// check too rather than being overwritten.
+    fn absent() -> Self {
+        Self::of(&[])
+    }
+}
+
+/// The file's bytes, or `None` if it does not exist.
+fn read_bytes_if_present(path: &Path) -> Result<Option<Vec<u8>>, CodexHooksError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CodexHooksError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Reads and parses `path` into a JSON object, or `None` if the file
+/// does not exist yet. The returned [`FileDigest`] is of the exact bytes
+/// read and must be handed to [`write_object_atomically`] so the write
+/// can refuse to clobber a change made in between.
+fn read_object(path: &Path) -> Result<(Option<Map<String, Value>>, FileDigest), CodexHooksError> {
+    let Some(raw) = read_bytes_if_present(path)? else {
+        return Ok((None, FileDigest::absent()));
+    };
+    let digest = FileDigest::of(&raw);
+    let text = std::str::from_utf8(&raw).map_err(|_| CodexHooksError::Io {
         path: path.to_path_buf(),
-        source,
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        ),
     })?;
-    let value: Value = serde_json::from_str(&text).map_err(|source| CodexHooksError::Parse {
+    let value: Value = serde_json::from_str(text).map_err(|source| CodexHooksError::Parse {
         path: path.to_path_buf(),
         source,
     })?;
     match value {
-        Value::Object(map) => Ok(Some(map)),
+        Value::Object(map) => Ok((Some(map), digest)),
         _ => Err(CodexHooksError::NotAnObject {
             path: path.to_path_buf(),
         }),
@@ -184,13 +244,18 @@ fn hooks_object_mut<'a>(
         })
 }
 
-/// Writes `map` to `path`: a verbatim-bytes backup of any existing file
-/// first, then a temp file in the same directory, fsynced, then renamed
-/// over the original. Mirrors `claude_settings::write_object_atomically`
-/// exactly, including its collision-safe backup naming.
+/// Writes `map` to `path`, but only if `expected` still matches what is
+/// on disk — a mismatch aborts with
+/// [`CodexHooksError::ConcurrentModification`] before anything at all is
+/// written (module docs property 5). Otherwise: a verbatim-bytes backup
+/// of any existing file first, then a temp file in the same directory,
+/// fsynced, then renamed over the original. Mirrors
+/// `claude_settings::write_object_atomically` exactly, including its
+/// collision-safe backup naming and its check-before-backup ordering.
 fn write_object_atomically(
     path: &Path,
     map: &Map<String, Value>,
+    expected: FileDigest,
 ) -> Result<Option<PathBuf>, CodexHooksError> {
     let io_err = |source: std::io::Error| CodexHooksError::Io {
         path: path.to_path_buf(),
@@ -200,7 +265,27 @@ fn write_object_atomically(
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir).map_err(io_err)?;
 
-    let backup_path = if path.exists() {
+    // The first thing this function observes about the file itself, and
+    // the gate on every mutating step below it.
+    let now_raw = read_bytes_if_present(path)?.unwrap_or_default();
+    if FileDigest::of(&now_raw) != expected {
+        return Err(CodexHooksError::ConcurrentModification {
+            path: path.to_path_buf(),
+        });
+    }
+
+    // Serialized before the backup is taken so that even a (practically
+    // impossible) serialization failure cannot leave a backup behind for
+    // a write that never happened.
+    let json_text =
+        serde_json::to_string_pretty(&Value::Object(map.clone())).map_err(|source| {
+            CodexHooksError::Parse {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
+
+    let backup_path = if !now_raw.is_empty() {
         let unix_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -231,23 +316,25 @@ fn write_object_atomically(
             .unwrap_or_else(|| HOOKS_FILE_NAME.to_string()),
         std::process::id()
     ));
-    let json_text =
-        serde_json::to_string_pretty(&Value::Object(map.clone())).map_err(|source| {
-            CodexHooksError::Parse {
-                path: path.to_path_buf(),
-                source,
-            }
-        })?;
-    {
-        let mut file = std::fs::File::create(&tmp_path).map_err(io_err)?;
-        file.write_all(json_text.as_bytes()).map_err(io_err)?;
-        file.write_all(b"\n").map_err(io_err)?;
-        file.sync_all().map_err(io_err)?;
-    }
-    std::fs::rename(&tmp_path, path).map_err(|source| {
+    let write_result = (|| -> Result<(), std::io::Error> {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(json_text.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp_path, path)
+    })();
+    if let Err(source) = write_result {
+        // The write itself failed (disk full, a permission race): leave
+        // nothing at all behind from this attempt — not just an
+        // untouched original, but no leaked temp file and no backup of a
+        // write that never happened.
         let _ = std::fs::remove_file(&tmp_path);
-        io_err(source)
-    })?;
+        if let Some(backup) = &backup_path {
+            let _ = std::fs::remove_file(backup);
+        }
+        return Err(io_err(source));
+    }
 
     Ok(backup_path)
 }
@@ -271,7 +358,8 @@ pub struct Applied {
 /// docs. No `matcher` field is written: this integration observes every
 /// tool, not a filtered subset.
 pub fn apply(path: &Path, binary: &Path) -> Result<Applied, CodexHooksError> {
-    let mut root = read_object(path)?.unwrap_or_default();
+    let (existing, digest) = read_object(path)?;
+    let mut root = existing.unwrap_or_default();
     let binary = binary.display().to_string();
     let mut hooks_added = 0usize;
 
@@ -321,7 +409,7 @@ pub fn apply(path: &Path, binary: &Path) -> Result<Applied, CodexHooksError> {
         }
     }
 
-    let backup_path = write_object_atomically(path, &root)?;
+    let backup_path = write_object_atomically(path, &root, digest)?;
     Ok(Applied {
         hooks_added,
         backup_path,
@@ -345,7 +433,8 @@ pub struct Removed {
 /// foreign entry inside an event's array, is left exactly as it was. A
 /// missing file is a safe no-op.
 pub fn remove(path: &Path) -> Result<Removed, CodexHooksError> {
-    let Some(mut root) = read_object(path)? else {
+    let (existing, digest) = read_object(path)?;
+    let Some(mut root) = existing else {
         return Ok(Removed {
             file_absent: true,
             ..Default::default()
@@ -401,7 +490,7 @@ pub fn remove(path: &Path) -> Result<Removed, CodexHooksError> {
         }
     }
 
-    let backup_path = write_object_atomically(path, &root)?;
+    let backup_path = write_object_atomically(path, &root, digest)?;
     Ok(Removed {
         hook_commands_removed,
         backup_path,
@@ -422,7 +511,7 @@ pub struct Inspection {
 /// object, is reported as simply "not present"/"nothing wired" rather
 /// than propagating a parse error, mirroring `claude_settings::inspect`.
 pub fn inspect(path: &Path) -> Inspection {
-    let Ok(Some(root)) = read_object(path) else {
+    let Ok((Some(root), _)) = read_object(path) else {
         return Inspection {
             file_present: path.exists(),
             ..Default::default()
