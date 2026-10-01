@@ -54,10 +54,10 @@ use libra_governor_ledger::{
     BusinessContextInsert, LedgerStore, OutcomeAttestationInsert, ReserveOutcome, ReserveRequest,
 };
 use libra_governor_protocol::{
-    wire, AdmissionPolicyReport, CalibrationReportResult, DoctorResult, FinalizeOutcome,
-    FinalizeResult, GatewayStatusResult, OutcomeRecordedOutcome, OutcomeRecordedResult,
-    PreflightResult, ReconSummary, ReplanState, Request, RequestEnvelope, Response,
-    ResponseEnvelope, StatusResult, TaskSummary, PROTOCOL_VERSION,
+    wire, AdmissionPolicyReport, BudgetPosture, CalibrationReportResult, DoctorResult,
+    FinalizeOutcome, FinalizeResult, GatewayStatusResult, OutcomeRecordedOutcome,
+    OutcomeRecordedResult, PreflightResult, ReconSummary, ReplanState, Request, RequestEnvelope,
+    Response, ResponseEnvelope, StatusResult, TaskSummary, PROTOCOL_VERSION,
 };
 
 use crate::{
@@ -473,6 +473,9 @@ fn dispatch(
             }
         },
         Request::Status => Response::Status(Box::new(StatusResult {
+            task_budget: current_task
+                .as_ref()
+                .map(|task| budget_posture(ledger, task.task_id)),
             current_task: current_task.clone(),
         })),
         Request::ToolInvoked {
@@ -615,6 +618,64 @@ fn replan_state_for_summary(
         }
     } else {
         ReplanState::Stable
+    }
+}
+
+/// What the reservation ledger says about `task_id`'s envelope right now
+/// (HORO-1634), for the `Status` reply.
+///
+/// Four indexed local SQLite reads on the connection the daemon already
+/// holds: `available` resolves the budget row and then sums settled and
+/// active reservations, and the `hard_limit` is read from that row again
+/// below. The repeat read is deliberate — collapsing it would mean a new
+/// `LedgerStore` method returning headroom and limit together, and
+/// widening the ledger's public API to save one indexed primary-key
+/// lookup is the wrong trade. No extra *round trip* of any kind, which is
+/// the cost that actually matters here: the figure is computed while
+/// answering a request the statusline provider was already going to make,
+/// which is the only way a budget reading is affordable inside a 200 ms
+/// hot-path probe.
+///
+/// `RequiredWork` rather than `OptionalWork`, so the figure is the whole
+/// envelope: `hard_limit - settled - active`, with the protected Completion
+/// Reserve left in it. The reserve is earmarked, not spent, and required
+/// completion work may still draw against it, so subtracting it here would
+/// report less room than the task has. The gateway's own authority check
+/// (`gateway_authority::authorize`) takes the narrower `OptionalWork` view
+/// for the opposite and correct reason — it cannot tell whether an HTTP
+/// request is required work, so it takes the weaker claim. These are two
+/// different questions, not a disagreement.
+///
+/// The order of the two branches is load-bearing. Exhaustion is decided on
+/// the headroom alone, before the limit is read, so the share is only ever
+/// computed from a positive numerator. With `value > 0` and
+/// `value = limit - settled - active <= limit`, `limit` is necessarily
+/// positive too — which is why there is no zero-limit guard below rather
+/// than a missing one.
+///
+/// A ledger error becomes [`BudgetPosture::Unreadable`] rather than failing
+/// the whole `Status`: a budget that could not be read must not cost the
+/// user the task state that could.
+fn budget_posture(ledger: &LedgerStore, task_id: libra_governor_domain::TaskId) -> BudgetPosture {
+    let headroom = match ledger.available(task_id, ReservationClass::RequiredWork) {
+        Ok(Some(headroom)) => headroom,
+        Ok(None) => return BudgetPosture::NotEstablished,
+        Err(_) => return BudgetPosture::Unreadable,
+    };
+    if headroom.is_exhausted() {
+        return BudgetPosture::Exhausted;
+    }
+    let limit = match ledger.task_budget(task_id) {
+        // `available` already resolved a budget to compute the headroom
+        // above, so this is the same row read twice rather than a
+        // different outcome being handled — but it is read through the
+        // same fallible API and is not this function's place to unwrap.
+        Ok(Some(budget)) => budget.hard_limit.as_f64(),
+        Ok(None) => return BudgetPosture::NotEstablished,
+        Err(_) => return BudgetPosture::Unreadable,
+    };
+    BudgetPosture::Remaining {
+        fraction_left: headroom.value / limit,
     }
 }
 

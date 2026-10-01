@@ -94,7 +94,7 @@ pub(crate) fn short_task_id(task_id: &str) -> &str {
 mod tests {
     use super::*;
     use libra_governor_domain::{Estimate, PlanId, TaskId};
-    use libra_governor_protocol::TaskSummary;
+    use libra_governor_protocol::{BudgetPosture, TaskSummary};
 
     fn sample_estimate() -> Estimate {
         Estimate {
@@ -127,7 +127,10 @@ mod tests {
 
     #[test]
     fn format_status_reports_idle_when_no_current_task() {
-        let status = StatusResult { current_task: None };
+        let status = StatusResult {
+            current_task: None,
+            task_budget: None,
+        };
         assert_eq!(format_status(&status), "libra: idle");
     }
 
@@ -135,6 +138,7 @@ mod tests {
     fn format_status_renders_a_single_line_with_confidence_and_recon_cost() {
         let status = StatusResult {
             current_task: Some(sample_task(ReplanState::Stable)),
+            task_budget: None,
         };
         let line = format_status(&status);
         assert!(line.starts_with("libra: task "));
@@ -146,9 +150,39 @@ mod tests {
     }
 
     #[test]
+    fn the_parsed_compatibility_line_is_unaffected_by_the_budget_posture() {
+        // This surface exists because a founder wrapper greps it. A budget
+        // share arriving on the `Status` reply must not move a byte of it:
+        // the share belongs to the structured provider document, and adding
+        // it here would silently break every pattern downstream.
+        // One task value, reused: `sample_task` mints fresh ids per call.
+        let task = sample_task(ReplanState::Stable);
+        let baseline = format_status(&StatusResult {
+            current_task: Some(task.clone()),
+            task_budget: None,
+        });
+        for posture in [
+            BudgetPosture::Remaining {
+                fraction_left: 0.38,
+            },
+            BudgetPosture::Exhausted,
+            BudgetPosture::NotEstablished,
+            BudgetPosture::Unreadable,
+        ] {
+            let line = format_status(&StatusResult {
+                current_task: Some(task.clone()),
+                task_budget: Some(posture),
+            });
+            assert_eq!(line, baseline, "{posture:?} changed the legacy line");
+            assert!(!line.contains('%'));
+        }
+    }
+
+    #[test]
     fn format_status_reflects_a_replanned_state() {
         let status = StatusResult {
             current_task: Some(sample_task(ReplanState::Replanned { count: 2 })),
+            task_budget: None,
         };
         let line = format_status(&status);
         assert!(line.contains("replanned 2x"));
@@ -158,6 +192,7 @@ mod tests {
     fn format_status_reflects_escalation() {
         let status = StatusResult {
             current_task: Some(sample_task(ReplanState::EscalatedAwaitingApproval)),
+            task_budget: None,
         };
         let line = format_status(&status);
         assert!(line.contains("escalated"));

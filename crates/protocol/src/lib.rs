@@ -31,10 +31,10 @@ pub use libra_governor_estimator::{
     AdmissionOutcome, AdmissionPolicy, AdmissionStats, CoverageReport, QuantileCoverage, Stratum,
 };
 pub use messages::{
-    AdmissionPolicyReport, CalibrationReportResult, DoctorResult, FinalizeOutcome, FinalizeResult,
-    GatewayStatusResult, OutcomeRecordedOutcome, OutcomeRecordedResult, PreflightResult,
-    ReconSummary, ReplanState, Request, RequestEnvelope, Response, ResponseEnvelope, StatusResult,
-    TaskSummary,
+    AdmissionPolicyReport, BudgetPosture, CalibrationReportResult, DoctorResult, FinalizeOutcome,
+    FinalizeResult, GatewayStatusResult, OutcomeRecordedOutcome, OutcomeRecordedResult,
+    PreflightResult, ReconSummary, ReplanState, Request, RequestEnvelope, Response,
+    ResponseEnvelope, StatusResult, TaskSummary,
 };
 
 /// The protocol version this build of the crate speaks. Bump on any
@@ -88,4 +88,14 @@ pub use messages::{
 /// `extension_events_configured`/`extension_events_pending`/
 /// `extension_config_error`). Same known limitation as every earlier
 /// bump: a long-lived v7 daemon must be restarted after upgrading.
-pub const PROTOCOL_VERSION: u32 = 8;
+///
+/// Bumped 8 -> 9 for HORO-1634: `StatusResult` gained `task_budget`, a
+/// required field a v8 client would silently fail to deserialize. The
+/// field rides the existing `Status` round trip deliberately — the
+/// statusline provider's whole probe is budgeted at 200 ms across two
+/// round trips, and a budget figure that cost a third request would not
+/// be worth a statusline. Same known limitation as every earlier bump: a
+/// long-lived v8 daemon must be restarted after upgrading, which the
+/// statusline provider reports as its own `daemon_protocol_mismatch`
+/// no-reading rather than as "no task".
+pub const PROTOCOL_VERSION: u32 = 9;
