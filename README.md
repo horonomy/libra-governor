@@ -356,7 +356,13 @@ Removes exactly what this integration's own installer added:
    with keys in alphabetical order, so the surrounding bytes — key
    order, exact whitespace — are not preserved verbatim, only the
    values. A timestamped backup of the pre-edit file is written before
-   any change if you need the original byte-for-byte.
+   any change if you need the original byte-for-byte. If the file
+   changes on disk between the moment the command reads it and the
+   moment it would write it back — Claude Code itself, another tool, or
+   your editor saving over it — the write is refused with an error and
+   nothing is changed at all, rather than overwriting that change with
+   an edit computed from the older content; re-run the command to apply
+   it on top of the new content.
 2. The state directory (`ledger.sqlite3`, `daemon.sock`, `daemon.log`,
    `config.json`, `gateway.token`) — **only** with `--yes` or an
    interactive "yes" confirmation, since it holds your only local record
