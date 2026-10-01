@@ -579,10 +579,18 @@ fn budget_segment(posture: BudgetPosture) -> Value {
     let (state, label, reason_code, clear_role) = match posture {
         BudgetPosture::Remaining { fraction_left } => match percent_left(fraction_left) {
             Some(percent) => ("neutral", format!("{percent}% budget left"), None, "vital"),
+            // "not usable" rather than "not a number", because
+            // `percent_left` rejects three different malformations and only
+            // one of them is a NaN: a share of exactly zero and a share
+            // above one are both perfectly good numbers that cannot be a
+            // share of a live envelope. A label naming the narrowest cause
+            // would be false in two of the three cases, which is the one
+            // thing a provider whose whole job is reporting state may not
+            // be.
             None => (
                 "warn",
-                "Budget share not a number".to_string(),
-                Some("budget_share_not_a_number"),
+                "Budget share not usable".to_string(),
+                Some("budget_share_not_usable"),
                 "vital",
             ),
         },
