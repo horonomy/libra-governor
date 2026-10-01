@@ -135,6 +135,18 @@ pub enum CodexHooksError {
          apply this edit on top of the new content"
     )]
     ConcurrentModification { path: PathBuf },
+    /// ADR-0014 (HORO-1380 S4c): could not acquire the cross-process
+    /// write lock on `path`'s sidecar within the 5000ms budget, or the
+    /// attempt failed outright (e.g. `ENOTSUP`/`EACCES`/`EROFS`). Zero
+    /// bytes are ever written to `path` when this is returned. See
+    /// `claude_settings::SettingsError::WriteLockUnavailable` (mirrored
+    /// exactly) and [`crate::write_lock::LockFailure`] for the
+    /// class-A/class-B distinction this wraps.
+    #[error("{path}: {source}")]
+    WriteLockUnavailable {
+        path: PathBuf,
+        source: crate::write_lock::LockFailure,
+    },
 }
 
 /// Resolution order: `LIBRA_GOVERNOR_CODEX_HOME` (primarily for tests, so
@@ -153,6 +165,28 @@ pub fn codex_home() -> Result<PathBuf, CodexHooksError> {
 
 pub fn hooks_path() -> Result<PathBuf, CodexHooksError> {
     Ok(codex_home()?.join(HOOKS_FILE_NAME))
+}
+
+/// Ensures `path`'s parent directory exists, then acquires the
+/// cross-process write lock on `path`'s sidecar, then runs `body` while
+/// holding it. Mirrors `claude_settings::with_write_lock` exactly — see
+/// that function's docs.
+fn with_write_lock<T>(
+    path: &Path,
+    body: impl FnOnce() -> Result<T, CodexHooksError>,
+) -> Result<T, CodexHooksError> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir).map_err(|source| CodexHooksError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let _guard = crate::write_lock::acquire(path).map_err(|source| {
+        CodexHooksError::WriteLockUnavailable {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    body()
 }
 
 fn command_is_ours(command: &str) -> bool {
@@ -358,6 +392,10 @@ pub struct Applied {
 /// docs. No `matcher` field is written: this integration observes every
 /// tool, not a filtered subset.
 pub fn apply(path: &Path, binary: &Path) -> Result<Applied, CodexHooksError> {
+    with_write_lock(path, || apply_locked(path, binary))
+}
+
+fn apply_locked(path: &Path, binary: &Path) -> Result<Applied, CodexHooksError> {
     let (existing, digest) = read_object(path)?;
     let mut root = existing.unwrap_or_default();
     let binary = binary.display().to_string();
@@ -433,6 +471,10 @@ pub struct Removed {
 /// foreign entry inside an event's array, is left exactly as it was. A
 /// missing file is a safe no-op.
 pub fn remove(path: &Path) -> Result<Removed, CodexHooksError> {
+    with_write_lock(path, || remove_locked(path))
+}
+
+fn remove_locked(path: &Path) -> Result<Removed, CodexHooksError> {
     let (existing, digest) = read_object(path)?;
     let Some(mut root) = existing else {
         return Ok(Removed {

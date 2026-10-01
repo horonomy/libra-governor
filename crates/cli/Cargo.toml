@@ -18,6 +18,7 @@ libra-governor-evidence-adapter = { path = "../evidence-adapter" }
 libra-governor-gateway = { path = "../gateway" }
 libra-governor-ledger = { path = "../ledger" }
 libra-governor-protocol = { path = "../protocol" }
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
