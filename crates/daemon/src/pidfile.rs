@@ -112,6 +112,43 @@ mod tests {
         assert_eq!(read(dir.path()), Some(record));
     }
 
+    /// A pidfile written by a daemon binary built before `exe_sha256`
+    /// existed must still parse — as `None`, not a hard failure — so an
+    /// older daemon's record never breaks an identity-checked `daemon
+    /// stop` (see `PidRecord::exe_sha256`'s docs).
+    #[test]
+    fn read_of_an_old_format_pidfile_missing_exe_sha256_still_parses_with_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("daemon.pid"),
+            br#"{"pid":12345,"exe_path":"/usr/local/bin/libra-governor","started_at":"2026-09-27T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let record = read(dir.path()).expect("old-format pidfile must still parse");
+        assert_eq!(record.pid, 12345);
+        assert_eq!(record.exe_sha256, None);
+    }
+
+    #[test]
+    fn hash_file_is_none_for_a_missing_file() {
+        assert_eq!(hash_file(Path::new("/definitely/not/a/real/path")), None);
+    }
+
+    #[test]
+    fn hash_file_is_deterministic_and_content_sensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::write(&a, b"same bytes").unwrap();
+        std::fs::write(&b, b"same bytes").unwrap();
+        let hash_a = hash_file(&a).unwrap();
+        assert_eq!(hash_a, hash_file(&b).unwrap());
+        assert_eq!(hash_a.len(), 64);
+
+        std::fs::write(&b, b"different bytes").unwrap();
+        assert_ne!(hash_a, hash_file(&b).unwrap());
+    }
+
     #[test]
     fn read_of_missing_file_is_none() {
         let dir = tempfile::tempdir().unwrap();
