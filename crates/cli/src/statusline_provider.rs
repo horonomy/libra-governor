@@ -45,8 +45,24 @@
 //!    (ADR-0001), and `server.rs`'s `EscalateApprovalNeeded` arm logs, sets
 //!    the state, and returns `Ok(())`; work proceeds. "Awaiting approval"
 //!    invites the reader to go and approve something that does not exist.
-//!    So this provider reports the budget being spent and says plainly, in
-//!    the reason clause, that the *next* replan is what would need a human.
+//!    So this provider says `Replans now need approval`: future tense, about
+//!    a rule rather than a queue, naming the decision a user could make
+//!    without implying one is pending.
+//!
+//! # Why the replan state rides the task segment
+//!
+//! The host accepts at most four segments per provider and refuses the whole
+//! document on the fifth (`MAX_SEGMENTS_PER_PROVIDER`), so a segment is a
+//! scarce column rather than a free one. Two of the three
+//! [`ReplanState`] variants already rode the task segment — a replan count
+//! is "this task, replanned twice" — and the third is "this task, whose
+//! automatic-replan budget is spent", which is the same kind of fact about
+//! the same thing. Giving it a segment of its own spent a quarter of the
+//! allowance restating the subject.
+//!
+//! The cost is the eight-character task id, in the escalated state only:
+//! one label slot cannot hold both, and the actionable half wins. `explain`
+//! prints the task and plan ids unconditionally.
 //!
 //! # Why the profile costs a second round trip
 //!
@@ -302,11 +318,19 @@ pub fn no_reading(kind: NoReading) -> Value {
 /// for the same reason — "nothing is being governed" is a state, not a
 /// pass.
 ///
-/// The replan count rides here as a labelled `count` rather than as its own
-/// segment, because "this task, replanned twice" is one fact about one
-/// thing. It is omitted when zero: `0 replans` spends columns to say
-/// nothing, and the legacy line's `stable` said the same thing at more
-/// length.
+/// All three [`ReplanState`] variants ride here rather than in a segment of
+/// their own, because "this task, replanned twice" and "this task, whose
+/// replan budget is spent" are one fact about one thing. The count is
+/// omitted when zero: `0 replans` spends columns to say nothing, and the
+/// legacy line's `stable` said the same thing at more length.
+///
+/// The escalated state is the one case where the label is not the task.
+/// `Replans now need approval` replaces the id because the host accepts
+/// four segments per provider and refuses the fifth, so this segment and
+/// the escalation cannot both exist beside the estimate, the budget and a
+/// policy-drift warning — and when they compete for one label slot the
+/// actionable half wins. Clear never showed the id in any state, and
+/// `explain` prints the task and plan ids unconditionally.
 ///
 /// The plan id the legacy line also carried is deliberately dropped. Two
 /// opaque eight-character identifiers on a line shared with the user's own
@@ -323,6 +347,22 @@ fn task_segment(task: Option<&TaskSummary>) -> Value {
             "order_hint": 10,
         });
     };
+    if task.replan_state == ReplanState::EscalatedAwaitingApproval {
+        // `warn`, not `critical`, and future tense. Nothing is blocked:
+        // `server.rs`'s `EscalateApprovalNeeded` arm logs, records the state
+        // and returns `Ok(())`, and hooks are advisory-only, so the task
+        // keeps running. What has changed is that the plan on screen will no
+        // longer be silently corrected — worth acting on, not an emergency,
+        // and not a request anyone can answer from a statusline.
+        return json!({
+            "key": "task",
+            "state": "warn",
+            "label": "Replans now need approval",
+            "reason_code": "next_replan_needs_human_approval",
+            "explain_key": "libra.escalation",
+            "order_hint": 10,
+        });
+    }
     let mut segment = json!({
         "key": "task",
         "state": "neutral",
@@ -393,33 +433,6 @@ fn confidence_token(confidence: Confidence) -> &'static str {
         Confidence::Low => "low",
         Confidence::Medium => "medium",
         Confidence::High => "high",
-    }
-}
-
-/// The automatic-replan budget having been spent, when it has been.
-///
-/// `warn`, not `critical`, and the label says what is true rather than what
-/// the variant is named. Nothing is blocked: `server.rs`'s
-/// `EscalateApprovalNeeded` arm logs, records the state and returns
-/// `Ok(())`, and hooks are advisory-only, so the task keeps running. What
-/// has changed is that the plan on screen will no longer be silently
-/// corrected, which is worth acting on but is not an emergency and is
-/// certainly not a request the user can answer from here.
-///
-/// Returns `None` for the other two states. `Stable` has nothing to report
-/// and `Replanned` is already reported as the task segment's count, so a
-/// segment for either would be a column spent on "normal".
-fn escalation_segment(task: &TaskSummary) -> Option<Value> {
-    match task.replan_state {
-        ReplanState::Stable | ReplanState::Replanned { .. } => None,
-        ReplanState::EscalatedAwaitingApproval => Some(json!({
-            "key": "escalation",
-            "state": "warn",
-            "label": "Replan budget spent",
-            "reason_code": "next_replan_needs_human_approval",
-            "explain_key": "libra.escalation",
-            "order_hint": 30,
-        })),
     }
 }
 
@@ -552,7 +565,6 @@ pub fn reading(status: &StatusResult, doctor: Option<&DoctorResult>, now: Offset
     let mut segments = vec![task_segment(status.current_task.as_ref())];
     if let Some(task) = status.current_task.as_ref() {
         segments.push(estimate_segment(task));
-        segments.extend(escalation_segment(task));
     }
     segments.extend(doctor.and_then(profile_segment));
 
@@ -1245,21 +1257,48 @@ mod tests {
         );
         let escalation = segments(&document)
             .iter()
-            .find(|s| s["key"] == json!("escalation"))
-            .expect("the state must be visible at all");
+            .find(|s| s["key"] == json!("task"))
+            .expect("the state must be visible at all")
+            .clone();
 
         assert_eq!(escalation["state"], json!("warn"));
-        assert_eq!(escalation["label"], json!("Replan budget spent"));
+        assert_eq!(escalation["label"], json!("Replans now need approval"));
         assert_eq!(
             escalation["reason_code"],
             json!("next_replan_needs_human_approval"),
             "the *next* replan, not this moment"
+        );
+        assert!(
+            !segments(&document)
+                .iter()
+                .any(|s| s["key"] == json!("escalation")),
+            "a segment of its own would spend a quarter of the host's \
+             per-provider allowance restating the subject"
         );
         for (path, text) in all_strings(&document) {
             let lower = text.to_lowercase();
             assert!(!lower.contains("awaiting"), "{path} = {text:?}");
             assert!(!lower.contains("blocked"), "{path} = {text:?}");
         }
+    }
+
+    #[test]
+    fn the_replan_state_is_one_fact_about_one_thing_in_all_three_shapes() {
+        // Anti-vacuity for the fold: every variant has to be visible
+        // *somewhere*, and all three have to be visible on the same segment,
+        // or the fold has quietly lost one.
+        let labels = |state| {
+            segments(&reading(&status_with(state), None, now()))[0]["label"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert!(labels(ReplanState::Stable).starts_with("Task "));
+        assert!(labels(ReplanState::Replanned { count: 3 }).starts_with("Task "));
+        assert_eq!(
+            labels(ReplanState::EscalatedAwaitingApproval),
+            "Replans now need approval"
+        );
     }
 
     #[test]
@@ -1403,13 +1442,19 @@ mod tests {
     fn the_worst_case_document_fits_the_hosts_per_provider_segment_budget() {
         // Four is the host's `MAX_SEGMENTS_PER_PROVIDER`, and a document
         // that exceeds it is refused whole — so Libra would render as
-        // nothing at precisely the moment it had the most to say.
+        // nothing at precisely the moment it had the most to say. The fold
+        // buys back the fourth column: this is the worst case and it now
+        // spends three.
         let document = reading(
             &status_with(ReplanState::EscalatedAwaitingApproval),
             Some(&doctor_with("strict_budget", false)),
             now(),
         );
-        assert_eq!(segments(&document).len(), 4);
+        let keys: Vec<&str> = segments(&document)
+            .iter()
+            .map(|s| s["key"].as_str().unwrap())
+            .collect();
+        assert_eq!(keys, ["task", "estimate", "profile"]);
         for (name, document) in every_document() {
             assert!(segments(&document).len() <= 4, "{name}");
         }
@@ -1505,7 +1550,7 @@ mod tests {
         // Guarding the guard: a check that never fires proves nothing about
         // the documents it passed.
         assert!(looks_high_entropy("sk-live-AbCd1234EfGh5678IjKl"));
-        assert!(!looks_high_entropy("Replan budget spent"));
+        assert!(!looks_high_entropy("Replans now need approval"));
         assert!(
             !looks_high_entropy("Task 3f2a1b9c"),
             "a short lowercase-hex id must stay renderable"
