@@ -1,5 +1,12 @@
 //! `libra-governor` CLI binary.
 //!
+//! - `--help` / `-h` / `help` — prints usage and exits 0. Never spawns the
+//!   daemon or touches state (HORO-1614).
+//! - `--version` / `-V` / `version` — prints `libra-governor <version>`
+//!   from `CARGO_PKG_VERSION` (the same workspace-version source every
+//!   other version-reporting surface in this crate already uses) and
+//!   exits 0. Side-effect free, offline (HORO-1614).
+//!
 //! Subcommands:
 //! - `daemon run` — runs the Governor daemon in the foreground.
 //! - `daemon stop` — identity-checked shutdown of exactly the daemon this
@@ -89,6 +96,48 @@ mod statusline;
 mod statusline_provider;
 mod uninstall_cmd;
 
+const USAGE: &str = "\
+Usage:
+  libra-governor daemon run
+  libra-governor daemon stop
+  libra-governor hook user-prompt-submit
+  libra-governor hook post-tool-use
+  libra-governor hook stop
+  libra-governor codex-hook user-prompt-submit
+  libra-governor codex-hook post-tool-use
+  libra-governor codex-hook stop
+  libra-governor statusline
+  libra-governor statusline provider
+  libra-governor statusline explain
+  libra-governor calibration report
+  libra-governor gateway token
+  libra-governor gateway status
+  libra-governor doctor [--json]
+  libra-governor install [--agent codex]
+  libra-governor uninstall [--agent codex] [--yes]
+  libra-governor agents [--json]
+  libra-governor evidence-report consent
+  libra-governor evidence-report
+  libra-governor dogfood-evidence export
+  libra-governor outcome record
+
+Global options:
+  -h, --help     Print this help and exit
+  -V, --version  Print version and exit
+
+Run `libra-governor doctor` for a read-only health/config snapshot.";
+
+fn print_help() {
+    println!(
+        "libra-governor {} — local-first execution governor for Claude Code and Codex\n\n{USAGE}",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+fn print_version() {
+    println!("libra-governor {}", env!("CARGO_PKG_VERSION"));
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args
@@ -97,6 +146,8 @@ fn main() {
         .collect::<Vec<_>>()
         .as_slice()
     {
+        ["--help"] | ["-h"] | ["help"] => print_help(),
+        ["--version"] | ["-V"] | ["version"] => print_version(),
         ["daemon", "run"] => daemon_cmd::run(),
         ["daemon", "stop"] => std::process::exit(daemon_cmd::stop()),
         ["hook", "user-prompt-submit"] => hook::run(),
@@ -126,32 +177,7 @@ fn main() {
         ["dogfood-evidence", "export"] => dogfood_evidence_cmd::run(),
         ["outcome", "record"] => outcome_cmd::run(),
         _ => {
-            eprintln!(
-                "libra-governor: unknown or missing subcommand\n\n\
-                 Usage:\n  \
-                 libra-governor daemon run\n  \
-                 libra-governor daemon stop\n  \
-                 libra-governor hook user-prompt-submit\n  \
-                 libra-governor hook post-tool-use\n  \
-                 libra-governor hook stop\n  \
-                 libra-governor codex-hook user-prompt-submit\n  \
-                 libra-governor codex-hook post-tool-use\n  \
-                 libra-governor codex-hook stop\n  \
-                 libra-governor statusline\n  \
-                 libra-governor statusline provider\n  \
-                 libra-governor statusline explain\n  \
-                 libra-governor calibration report\n  \
-                 libra-governor gateway token\n  \
-                 libra-governor gateway status\n  \
-                 libra-governor doctor [--json]\n  \
-                 libra-governor install [--agent codex]\n  \
-                 libra-governor uninstall [--agent codex] [--yes]\n  \
-                 libra-governor agents [--json]\n  \
-                 libra-governor evidence-report consent\n  \
-                 libra-governor evidence-report\n  \
-                 libra-governor dogfood-evidence export\n  \
-                 libra-governor outcome record"
-            );
+            eprintln!("libra-governor: unknown or missing subcommand\n\n{USAGE}");
             std::process::exit(2);
         }
     }
