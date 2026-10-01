@@ -32,3 +32,8 @@ thiserror = "2"
 rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
 tempfile = "3"
 sha2 = "0.11"
+# Already present transitively (see Cargo.lock); promoted to a direct
+# dependency here, with the `fs` feature, for `rustix::fs::flock`
+# (ADR-0014 cross-process write lock). `fs` is required explicitly —
+# it is not enabled by the transitive graph.
+rustix = { version = "1", features = ["fs"] }

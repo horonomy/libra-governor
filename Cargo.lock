@@ -436,6 +436,7 @@ dependencies = [
  "libra-governor-gateway",
  "libra-governor-ledger",
  "libra-governor-protocol",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

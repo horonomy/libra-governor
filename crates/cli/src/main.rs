@@ -95,6 +95,7 @@ mod outcome_cmd;
 mod statusline;
 mod statusline_provider;
 mod uninstall_cmd;
+mod write_lock;
 
 const USAGE: &str = "\
 Usage:
