@@ -177,6 +177,20 @@ fn main() {
         ["evidence-report"] => evidence_report_cmd::run(),
         ["dogfood-evidence", "export"] => dogfood_evidence_cmd::run(),
         ["outcome", "record"] => outcome_cmd::run(),
+        // Hidden, undocumented test fixture for HORO-1380/ADR-0014's
+        // cross-process write-lock test suite
+        // (`tests/write_lock_cross_process.rs`). Not part of the public
+        // CLI surface — deliberately absent from USAGE/--help. Acquires
+        // the real cross-process lock on `<config-path>`'s sidecar via
+        // `write_lock::acquire`, prints exactly one line ("LOCKED" on
+        // success, "LOCK_FAILED: <message>" on failure) and flushes
+        // stdout immediately so a parent test process can synchronize on
+        // it without sleeping, then holds the lock for `<hold-ms>`
+        // milliseconds (releasing it on exit, or immediately on
+        // acquisition failure).
+        ["__lock_test_hold", config_path, hold_ms] => {
+            write_lock::test_hold_cmd::run(config_path, hold_ms)
+        }
         _ => {
             eprintln!("libra-governor: unknown or missing subcommand\n\n{USAGE}");
             std::process::exit(2);
