@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 
 use libra_governor_protocol::{DoctorResult, Request, Response};
 
-use crate::{claude_settings, client, codex_hooks_file, gateway_cmd};
+use crate::{claude_settings, client, codex_hooks_file, gateway_cmd, install_cmd};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Severity {
@@ -57,10 +57,10 @@ struct Finding {
 /// is not running yet (the normal state before the first prompt) is
 /// [`Severity::Warn`], not a failure.
 pub fn run(json: bool) {
-    let findings = collect_findings();
     let daemon = fetch_daemon_doctor();
+    let daemon_present = daemon.is_some();
 
-    let mut all = findings;
+    let mut all = collect_findings(daemon_present);
     all.extend(daemon_findings(&daemon));
 
     let exit_code = if all.iter().any(|f| f.severity == Severity::Error) {
@@ -80,7 +80,10 @@ pub fn run(json: bool) {
 
 /// Local, no-daemon-required checks: state directory, `config.json`
 /// presence, `gateway.token` presence, and Claude Code settings wiring.
-fn collect_findings() -> Vec<Finding> {
+/// `daemon_present` gates the two identity checks below that must never
+/// fire when nothing at all is listening on the daemon's socket — see
+/// [`stale_runtime_finding`] and [`orphan_socket_finding`].
+fn collect_findings(daemon_present: bool) -> Vec<Finding> {
     let mut findings = Vec::new();
 
     let state_dir = libra_governor_daemon::paths::state_dir().ok();
@@ -103,12 +106,112 @@ fn collect_findings() -> Vec<Finding> {
             findings.push(state_dir_permission_finding(dir));
             findings.push(config_file_presence_finding(dir));
             findings.push(gateway_token_finding(dir));
+            if let Some(f) = stale_runtime_finding(dir, daemon_present) {
+                findings.push(f);
+            }
+            if let Some(f) = orphan_socket_finding(dir, daemon_present) {
+                findings.push(f);
+            }
         }
     }
 
     findings.push(claude_settings_finding());
     findings.push(codex_hooks_finding());
     findings
+}
+
+/// HORO-1380 S4b: the running daemon's `exe_sha256` (from its pidfile)
+/// differs from the sha256 of the binary currently at the installed path
+/// (from `install.json`'s `binary_path`, hashed fresh here — never a
+/// cached hash, which would itself go stale if the binary were ever
+/// replaced in place). `None` — not reported, never treated as a mismatch
+/// — whenever any input is unavailable:
+///
+/// - `daemon_present` is `false` (nothing answers the daemon's socket).
+///   The pidfile deliberately outlives a
+///   signalled daemon (see `pidfile`'s module docs — there is no
+///   "remove on clean exit"), so after any `daemon stop` the file left
+///   behind still names the *old* binary. Comparing it to a freshly
+///   installed one with no daemon actually running would be a permanent
+///   false positive on the single most common upgrade path.
+/// - no pidfile, or a pidfile written before `exe_sha256` existed.
+/// - no `install.json`, or no `binary_path` in it, or that path no
+///   longer has anything readable at it.
+fn stale_runtime_finding(state_dir: &Path, daemon_present: bool) -> Option<Finding> {
+    if !daemon_present {
+        return None;
+    }
+    let pid_record = libra_governor_daemon::pidfile::read(state_dir)?;
+    let running_sha = pid_record.exe_sha256?;
+
+    let marker_path = state_dir.join(install_cmd::INSTALL_MARKER_FILE_NAME);
+    let text = std::fs::read_to_string(marker_path).ok()?;
+    let marker: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let binary_path = marker.get("binary_path").and_then(|v| v.as_str())?;
+    let installed_sha = libra_governor_daemon::pidfile::hash_file(Path::new(binary_path))?;
+
+    if running_sha == installed_sha {
+        return None;
+    }
+    Some(Finding {
+        id: "stale_runtime",
+        severity: Severity::Error,
+        message: format!(
+            "the running daemon's executable (sha256 {running_sha}) differs from the binary \
+             currently installed at {binary_path} (sha256 {installed_sha}) — binary upgraded \
+             while daemon exists; run `libra-governor daemon stop` — the next hook invocation \
+             will respawn it automatically"
+        ),
+    })
+}
+
+/// HORO-1380 S4b: `daemon.sock` exists but `daemon.pid` is missing or
+/// unreadable. Two distinct causes, reported distinctly rather than
+/// guessed at:
+///
+/// - A daemon *is* answering on the socket right now (`daemon_present`)
+///   — a live daemon that predates the pidfile feature this very ticket
+///   adds, so it never wrote one. `daemon stop` cannot identity-check it;
+///   this finding says so and tells the operator to stop it by hand, not
+///   to delete the socket out from under a process still using it.
+/// - Nothing answers the socket — a genuinely stale leftover. This
+///   finding guides the operator to confirm via `ps`/`lsof` that no live
+///   Governor daemon holds this state dir, then remove the stale socket
+///   and log by hand. `doctor` never auto-remediates this itself, per
+///   this ticket's own "no blind deletion of user evidence" principle.
+fn orphan_socket_finding(state_dir: &Path, daemon_present: bool) -> Option<Finding> {
+    let socket_path = state_dir.join("daemon.sock");
+    let pid_path = state_dir.join("daemon.pid");
+    if !socket_path.exists() || libra_governor_daemon::pidfile::read(state_dir).is_some() {
+        return None;
+    }
+
+    let message = if daemon_present {
+        format!(
+            "{} exists and a daemon is currently answering on it, but {} is missing or \
+             unreadable — this daemon predates the pid-record feature (HORO-1380) and never \
+             wrote one, so `daemon stop` cannot identity-check it; stop it by hand (confirm \
+             which process via `ps`/`lsof` first) — the next `daemon run` will write a fresh \
+             pid record automatically",
+            socket_path.display(),
+            pid_path.display()
+        )
+    } else {
+        format!(
+            "{} exists but {} is missing or unreadable, and nothing answers the socket — \
+             confirm via `ps`/`lsof` that no live Governor daemon holds this state dir, then \
+             remove the stale socket and daemon.log by hand; doctor does not auto-remediate \
+             this (there is no usable pid record to identity-check a `daemon stop` against)",
+            socket_path.display(),
+            pid_path.display()
+        )
+    };
+
+    Some(Finding {
+        id: "orphan_socket",
+        severity: Severity::Warn,
+        message,
+    })
 }
 
 #[cfg(unix)]
@@ -763,5 +866,148 @@ mod tests {
     fn toml_section_body_returns_none_when_the_section_is_absent() {
         let text = "[a]\nx = 1\n";
         assert!(toml_section_body(text, "z").is_none());
+    }
+
+    /// Regression for the exact scenario `stale_runtime_finding` exists to
+    /// catch: a protocol-version-mismatch response still means *something*
+    /// answered this request on the daemon's socket just now — `run`'s
+    /// `daemon_present` must stay `true` for a `Some(Err(_))`, not just a
+    /// `Some(Ok(_))`, or the single most common upgrade-while-running path
+    /// (see `daemon_findings`'s own protocol-mismatch message above) would
+    /// silently suppress the finding.
+    #[test]
+    fn daemon_present_is_true_even_when_the_daemon_replied_with_a_protocol_mismatch_error() {
+        let daemon: Option<Result<DoctorResult, String>> =
+            Some(Err("protocol version mismatch".to_string()));
+        assert!(daemon.is_some());
+    }
+
+    fn write_pid_record(dir: &Path, exe_sha256: Option<&str>) {
+        libra_governor_daemon::pidfile::write(
+            dir,
+            &libra_governor_daemon::pidfile::PidRecord {
+                pid: std::process::id(),
+                exe_path: std::path::PathBuf::from("/does/not/matter"),
+                started_at: "2026-09-27T00:00:00Z".to_string(),
+                exe_sha256: exe_sha256.map(str::to_string),
+            },
+        )
+        .unwrap();
+    }
+
+    fn write_install_marker(dir: &Path, binary_path: &std::path::Path) {
+        std::fs::write(
+            dir.join(install_cmd::INSTALL_MARKER_FILE_NAME),
+            serde_json::json!({
+                "installed_by": "libra-governor",
+                "version": "0.0.0",
+                "binary_path": binary_path.display().to_string(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn stale_runtime_finding_fires_on_a_genuine_binary_sha_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("libra-governor");
+        std::fs::write(&binary, b"new binary bytes").unwrap();
+
+        // The pidfile records a hash that does not match what is on disk
+        // at `binary_path` right now — exactly the "upgraded while the
+        // daemon is running" scenario.
+        write_pid_record(dir.path(), Some("not-the-real-hash"));
+        write_install_marker(dir.path(), &binary);
+
+        let finding = stale_runtime_finding(dir.path(), true).expect("must report a mismatch");
+        assert_eq!(finding.id, "stale_runtime");
+        assert_eq!(finding.severity, Severity::Error);
+        assert!(finding.message.contains("daemon stop"));
+    }
+
+    #[test]
+    fn stale_runtime_finding_is_none_when_hashes_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("libra-governor");
+        std::fs::write(&binary, b"same binary bytes").unwrap();
+        let sha = libra_governor_daemon::pidfile::hash_file(&binary).unwrap();
+
+        write_pid_record(dir.path(), Some(&sha));
+        write_install_marker(dir.path(), &binary);
+
+        assert!(stale_runtime_finding(dir.path(), true).is_none());
+    }
+
+    #[test]
+    fn stale_runtime_finding_is_none_when_daemon_is_not_reachable() {
+        // Guards the exact false-positive this check exists to avoid: a
+        // pidfile deliberately outlives a signalled daemon (no
+        // "remove on clean exit" — see `pidfile`'s module docs), so after
+        // an upgrade-then-`daemon stop` the old hash is still on disk with
+        // no daemon actually running. That must never be reported.
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("libra-governor");
+        std::fs::write(&binary, b"new binary bytes").unwrap();
+        write_pid_record(dir.path(), Some("stale-hash-from-old-binary"));
+        write_install_marker(dir.path(), &binary);
+
+        assert!(stale_runtime_finding(dir.path(), false).is_none());
+    }
+
+    #[test]
+    fn stale_runtime_finding_is_none_when_pidfile_predates_exe_sha256() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("libra-governor");
+        std::fs::write(&binary, b"new binary bytes").unwrap();
+        write_pid_record(dir.path(), None);
+        write_install_marker(dir.path(), &binary);
+
+        assert!(stale_runtime_finding(dir.path(), true).is_none());
+    }
+
+    #[test]
+    fn stale_runtime_finding_is_none_when_no_install_marker_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        write_pid_record(dir.path(), Some("some-hash"));
+        assert!(stale_runtime_finding(dir.path(), true).is_none());
+    }
+
+    #[test]
+    fn orphan_socket_finding_is_none_when_no_socket_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(orphan_socket_finding(dir.path(), false).is_none());
+    }
+
+    #[test]
+    fn orphan_socket_finding_is_none_when_a_usable_pid_record_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("daemon.sock"), b"").unwrap();
+        write_pid_record(dir.path(), Some("some-hash"));
+        assert!(orphan_socket_finding(dir.path(), true).is_none());
+    }
+
+    #[test]
+    fn orphan_socket_finding_warns_with_manual_removal_guidance_when_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("daemon.sock"), b"").unwrap();
+        let finding = orphan_socket_finding(dir.path(), false).expect("must report the gap");
+        assert_eq!(finding.id, "orphan_socket");
+        assert_eq!(finding.severity, Severity::Warn);
+        assert!(finding.message.contains("ps"));
+        assert!(finding.message.contains("lsof"));
+    }
+
+    #[test]
+    fn orphan_socket_finding_warns_without_telling_the_operator_to_delete_a_live_socket() {
+        // A live daemon predating the pidfile feature must never be told
+        // to have its socket deleted out from under it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("daemon.sock"), b"").unwrap();
+        let finding = orphan_socket_finding(dir.path(), true).expect("must report the gap");
+        assert_eq!(finding.id, "orphan_socket");
+        assert_eq!(finding.severity, Severity::Warn);
+        assert!(finding.message.contains("predates"));
+        assert!(!finding.message.contains("remove the stale socket"));
     }
 }

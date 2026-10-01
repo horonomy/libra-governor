@@ -111,10 +111,16 @@ pub fn run() {
     // Best-effort: a failure here does not stop the daemon from serving —
     // it only means `daemon stop` will find no usable record and refuse
     // to signal anything, which is the safe failure mode.
+    let exe_path = std::env::current_exe().unwrap_or_default();
+    // Best-effort too (HORO-1380 S4b): `None` if hashing fails, which
+    // `doctor`'s stale-runtime check treats as "nothing to report", never
+    // as a mismatch.
+    let exe_sha256 = libra_governor_daemon::pidfile::hash_file(&exe_path);
     let pid_record = libra_governor_daemon::pidfile::PidRecord {
         pid: std::process::id(),
-        exe_path: std::env::current_exe().unwrap_or_default(),
+        exe_path,
         started_at: current_rfc3339(),
+        exe_sha256,
     };
     if let Err(e) = libra_governor_daemon::pidfile::write(&state_dir, &pid_record) {
         libra_governor_daemon::log::append_line(
@@ -360,6 +366,7 @@ mod stop_tests {
                 pid: dead_pid(),
                 exe_path: std::path::PathBuf::from("/bin/does-not-matter"),
                 started_at: "2026-09-27T00:00:00Z".to_string(),
+                exe_sha256: None,
             },
         )
         .unwrap();
@@ -383,6 +390,7 @@ mod stop_tests {
                 pid: std::process::id(),
                 exe_path: std::path::PathBuf::from("/definitely/not/this/test/binary"),
                 started_at: "2026-09-27T00:00:00Z".to_string(),
+                exe_sha256: None,
             },
         )
         .unwrap();

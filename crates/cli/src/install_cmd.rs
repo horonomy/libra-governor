@@ -147,10 +147,17 @@ fn write_install_marker(binary: &std::path::Path) {
             return;
         }
     };
+    // Best-effort (HORO-1380 S4b): `None` if hashing fails, written as
+    // `null`. Not read back by `doctor`'s stale-runtime check, which
+    // always hashes the binary at `binary_path` fresh at diagnostic time
+    // instead — a cached hash here would itself go stale if the binary at
+    // this path were ever replaced in place without a re-`install`.
+    let binary_sha256 = libra_governor_daemon::pidfile::hash_file(binary);
     let marker = serde_json::json!({
         "installed_by": "libra-governor",
         "version": env!("CARGO_PKG_VERSION"),
         "binary_path": binary.display().to_string(),
+        "binary_sha256": binary_sha256,
     });
     let path = state_dir.join(INSTALL_MARKER_FILE_NAME);
     if let Err(e) = std::fs::write(
