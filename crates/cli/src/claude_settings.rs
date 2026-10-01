@@ -98,6 +98,18 @@ pub enum SettingsError {
          apply this edit on top of the new content"
     )]
     ConcurrentModification { path: PathBuf },
+    /// ADR-0014 (HORO-1380 S4c): could not acquire the cross-process
+    /// write lock on `path`'s sidecar within the 5000ms budget, or the
+    /// attempt failed outright (e.g. `ENOTSUP`/`EACCES`/`EROFS`). Zero
+    /// bytes are ever written to `path` when this is returned — nothing
+    /// in the read/plan/write sequence ran. See
+    /// [`crate::write_lock::LockFailure`] for the class-A/class-B
+    /// distinction this wraps.
+    #[error("{path}: {source}")]
+    WriteLockUnavailable {
+        path: PathBuf,
+        source: crate::write_lock::LockFailure,
+    },
 }
 
 /// Resolution order: `LIBRA_GOVERNOR_CLAUDE_DIR` (primarily for tests, so
@@ -114,6 +126,29 @@ pub fn claude_dir() -> Result<PathBuf, SettingsError> {
 
 pub fn settings_path() -> Result<PathBuf, SettingsError> {
     Ok(claude_dir()?.join(SETTINGS_FILE_NAME))
+}
+
+/// Ensures `path`'s parent directory exists, then acquires the
+/// cross-process write lock on `path`'s sidecar, then runs `body` while
+/// holding it (ADR-0014 section 3, steps 1-4 before `body`'s
+/// read/plan/re-hash/write, step 10 on return). Used by both `apply` and
+/// `remove` so the lock always covers the entire read-through-write
+/// sequence, never just the write.
+fn with_write_lock<T>(
+    path: &Path,
+    body: impl FnOnce() -> Result<T, SettingsError>,
+) -> Result<T, SettingsError> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir).map_err(|source| SettingsError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let _guard =
+        crate::write_lock::acquire(path).map_err(|source| SettingsError::WriteLockUnavailable {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    body()
 }
 
 fn command_is_ours(command: &str) -> bool {
@@ -328,6 +363,10 @@ pub struct Applied {
 /// in `settings.json` would only work when Claude Code happens to be
 /// launched from the right working directory).
 pub fn apply(path: &Path, binary: &Path) -> Result<Applied, SettingsError> {
+    with_write_lock(path, || apply_locked(path, binary))
+}
+
+fn apply_locked(path: &Path, binary: &Path) -> Result<Applied, SettingsError> {
     let (existing, digest) = read_object(path)?;
     let mut root = existing.unwrap_or_default();
     let binary = binary.display().to_string();
@@ -448,6 +487,10 @@ pub struct Removed {
 /// key, and every foreign entry inside `hooks`, is left exactly as it
 /// was. A missing file is a safe no-op, not an error.
 pub fn remove(path: &Path) -> Result<Removed, SettingsError> {
+    with_write_lock(path, || remove_locked(path))
+}
+
+fn remove_locked(path: &Path) -> Result<Removed, SettingsError> {
     let (existing, digest) = read_object(path)?;
     let Some(mut root) = existing else {
         return Ok(Removed {
@@ -844,12 +887,21 @@ mod tests {
         let after = std::fs::read_to_string(&path).unwrap();
         assert_eq!(before, after, "a malformed file must never be rewritten");
 
-        // No stray temp/backup file left behind by the aborted attempt.
-        let entries: Vec<_> = std::fs::read_dir(dir.path())
+        // No stray temp/backup file left behind by the aborted attempt —
+        // only the config file itself and the lock sidecar (ADR-0014:
+        // the lock is acquired, and the sidecar created, before the
+        // parse error is even reached).
+        let mut entries: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
-        assert_eq!(entries, vec![std::ffi::OsString::from("settings.json")]);
+        entries.sort();
+        let mut expected = vec![
+            std::ffi::OsString::from("settings.json"),
+            std::ffi::OsString::from("settings.json.horonom-write.lock"),
+        ];
+        expected.sort();
+        assert_eq!(entries, expected);
     }
 
     #[test]
