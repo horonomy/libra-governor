@@ -53,8 +53,17 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   build-and-test:
-    name: cargo build & test
-    runs-on: ubuntu-latest
+    name: cargo build & test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # ADR-0014 (HORO-1380 S4c) requires the cross-process write-lock
+        # tests to run on macOS, not just Linux — flock(2) has the same
+        # open-file-description semantics on both, but shipping to macOS
+        # on Linux-only CI evidence is explicitly called out as
+        # unacceptable there. Mirrors Circinus's existing CI matrix.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch @ 2026-09-18
