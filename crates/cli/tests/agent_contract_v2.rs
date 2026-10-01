@@ -17,8 +17,9 @@
 //!   `{claude_code,codex}_{user_prompt_submit,post_tool_use,stop}_happy_path`.
 //! - Cross-agent equivalence: the same `session_id`/`cwd`/`prompt` fed
 //!   through each agent's own fixture produces byte-identical
-//!   `additionalContext` (task id normalized out) — the concrete proof
-//!   that `crate::agent::run`'s core logic is not duplicated per agent.
+//!   `additionalContext` (task id and the measured reconnaissance duration
+//!   normalized out) — the concrete proof that `crate::agent::run`'s core
+//!   logic is not duplicated per agent.
 //! - Malformed JSON and a missing required field, for all three entry
 //!   points, for both agents: exit 0, no panic, valid/empty output.
 //! - An unrecognized `hook_event_name` and a recognized-but-unwired one
@@ -230,6 +231,37 @@ fn codex_stop_happy_path() {
 // Cross-agent equivalence — the concrete proof core logic is shared.
 // ---------------------------------------------------------------------
 
+/// Replaces the measured reconnaissance duration with `<DURATION>`.
+///
+/// The property the equivalence test below proves is that *one* translation
+/// implementation serves both agents. It is not that two separate processes
+/// spend the same number of milliseconds in reconnaissance — they cannot be
+/// made to, and nothing would be wrong if they did not. The figure is
+/// wall-clock, formatted to hundredths of a second, so under load one
+/// invocation renders `recon: 0.00s` and the next `recon: 0.01s` and a
+/// byte-identity assertion fails for a reason with no bearing on whether
+/// the logic is shared.
+///
+/// Normalizing the one measured quantity keeps the assertion strict about
+/// everything it can legitimately be strict about, which is every other
+/// byte of the context. Returns the input unchanged if the marker is
+/// missing or the value is not digits-and-dots, so a malformed or renamed
+/// field fails the test rather than being quietly normalized away.
+fn normalize_recon(input: &str) -> String {
+    const MARKER: &str = "recon: ";
+    let Some(start) = input.find(MARKER) else {
+        return input.to_string();
+    };
+    let rest = &input[start + MARKER.len()..];
+    let Some(unit) = rest.find('s') else {
+        return input.to_string();
+    };
+    if !rest[..unit].chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return input.to_string();
+    }
+    format!("{}{MARKER}<DURATION>{}", &input[..start], &rest[unit + 1..])
+}
+
 /// Replaces every UUID-shaped token with `<ID>`, mirroring
 /// `agent_contract.rs`'s `normalize_ids`.
 fn normalize_ids(input: &str) -> String {
@@ -289,7 +321,9 @@ fn cross_agent_equivalence_same_session_cwd_prompt_yields_identical_additional_c
         &claude_payload,
     );
     assert!(claude_output.status.success());
-    let claude_ctx = normalize_ids(&resilient_additional_context(&claude_output.stdout));
+    let claude_ctx = normalize_recon(&normalize_ids(&resilient_additional_context(
+        &claude_output.stdout,
+    )));
 
     let codex_state = tempfile::tempdir().unwrap();
     let codex_payload = fixture_with_cwd("codex/user-prompt-submit.json", repo.path());
@@ -299,13 +333,15 @@ fn cross_agent_equivalence_same_session_cwd_prompt_yields_identical_additional_c
         &codex_payload,
     );
     assert!(codex_output.status.success());
-    let codex_ctx = normalize_ids(&resilient_additional_context(&codex_output.stdout));
+    let codex_ctx = normalize_recon(&normalize_ids(&resilient_additional_context(
+        &codex_output.stdout,
+    )));
 
     assert_eq!(
         claude_ctx, codex_ctx,
         "identical session_id/cwd/prompt through each agent's own entry point must produce \
-         byte-identical additionalContext (id-normalized) — proof the core translation logic \
-         is not duplicated per agent"
+         byte-identical additionalContext (ids and the measured recon duration normalized) \
+         — proof the core translation logic is not duplicated per agent"
     );
 
     kill_daemon_for(claude_state.path());

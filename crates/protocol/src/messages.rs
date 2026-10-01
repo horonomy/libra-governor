@@ -192,6 +192,63 @@ pub struct PreflightResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatusResult {
     pub current_task: Option<TaskSummary>,
+    /// What the reservation ledger says about `current_task`'s resource
+    /// envelope (HORO-1634), computed while answering *this* request
+    /// rather than cached alongside the task.
+    ///
+    /// That distinction is the reason it sits here rather than on
+    /// [`TaskSummary`]. `TaskSummary` is the daemon's in-memory
+    /// projection of the task, refreshed when a replan recomputes the
+    /// plan; a budget share changes on every settled reservation, so a
+    /// copy stored beside the task would be stale for exactly as long as
+    /// nothing replanned. A sibling field cannot be read as "the budget
+    /// as of the plan" by mistake.
+    ///
+    /// `None` when there is no current task: a share of a budget that was
+    /// never admitted is not zero, it is absent.
+    pub task_budget: Option<BudgetPosture>,
+}
+
+/// What remains of a governed task's resource envelope (HORO-1634).
+///
+/// A *ratio*, never an amount. The hard limit, the settled spend, the
+/// active reservations and the protected Completion Reserve are all
+/// resource figures, and Libra's rendering surfaces do not carry resource
+/// figures — `statusline_provider::explain_text` says so in as many words
+/// and its tests assert it. A share is the one form of the fact that
+/// answers "how much room is left" without disclosing what the room is
+/// measured in or how much was bought.
+///
+/// Four variants, because the three ways there can be no share are
+/// different facts and collapsing them loses the one a user could act on:
+/// an exhausted budget is not an unadmitted task, and neither is a ledger
+/// that would not read.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum BudgetPosture {
+    /// Capacity remains. `fraction_left` is the share of the task's hard
+    /// limit that is neither settled nor held by an active reservation,
+    /// in `0.0..=1.0` and strictly greater than zero — a share that had
+    /// reached zero would be [`BudgetPosture::Exhausted`] instead.
+    ///
+    /// The protected Completion Reserve is *not* subtracted: it is
+    /// earmarked capacity, not spent capacity, and required completion
+    /// work may still draw against it (see
+    /// `libra_governor_domain::ReservationClass::RequiredWork`). A share
+    /// that excluded it would under-report what the task actually has.
+    Remaining { fraction_left: f64 },
+    /// Nothing remains: settled spend plus active reservations have
+    /// reached or passed the hard limit, so the ledger will refuse the
+    /// next reservation.
+    Exhausted,
+    /// The task has no budget row, so there is no envelope to report a
+    /// share of. Distinct from `Exhausted`: nothing has been spent, the
+    /// task was never admitted to a budget in the first place.
+    NotEstablished,
+    /// The ledger could not be read. Carried as a fact rather than
+    /// dropped to `None`, because a budget whose state is unknown and a
+    /// task that has no budget are different things to be told.
+    Unreadable,
 }
 
 /// A compact summary of the daemon's most recently produced preflight,
