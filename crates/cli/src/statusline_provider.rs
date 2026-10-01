@@ -49,20 +49,46 @@
 //!    a rule rather than a queue, naming the decision a user could make
 //!    without implying one is pending.
 //!
-//! # Why the replan state rides the task segment
+//! # The Clear projection (HORO-1634)
 //!
-//! The host accepts at most four segments per provider and refuses the whole
-//! document on the fifth (`MAX_SEGMENTS_PER_PROVIDER`), so a segment is a
-//! scarce column rather than a free one. Two of the three
-//! [`ReplanState`] variants already rode the task segment — a replan count
-//! is "this task, replanned twice" — and the third is "this task, whose
-//! automatic-replan budget is spent", which is the same kind of fact about
-//! the same thing. Giving it a segment of its own spent a quarter of the
-//! allowance restating the subject.
+//! Every document declares `clear_authority: "provider"` and a `clear_role`
+//! on every segment, so the host's one-line summary of Libra is chosen from
+//! Libra's own semantics rather than from host-side severity arithmetic. The
+//! host validates the claim and refuses a document that does not hold up
+//! (`statusline_contract.ProviderStatus._validate_clear_authority`), which
+//! is why the roles are assigned structurally below and asserted over every
+//! document this module can emit rather than spot-checked.
 //!
-//! The cost is the eight-character task id, in the escalated state only:
-//! one label slot cannot hold both, and the actionable half wins. `explain`
-//! prints the task and plan ids unconditionally.
+//! The declared map, and what each role buys:
+//!
+//! | segment | role | why |
+//! |---|---|---|
+//! | `task` (active) | supporting | an opaque id is the reader's handle on the work, not their reason to glance at the line |
+//! | `task` (idle) | posture | "nothing is being governed" *is* the whole state |
+//! | `task` (escalated) | exception | a decision a human could make |
+//! | `estimate` | posture | for a scheduling product the remaining span is the posture |
+//! | `budget` | vital, or exception when exhausted | the one reading that qualifies a schedule — and a limit that has been reached is not a posture |
+//! | `profile` | vital | a policy edit that has not taken effect changes how everything above reads |
+//! | `availability` | exception | there is no reading, which is the only thing to say |
+//!
+//! Two consequences worth naming because they are not obvious:
+//!
+//! - **The escalation is not its own segment.** The host accepts at most
+//!   four segments per provider and refuses the whole document on the fifth
+//!   (`MAX_SEGMENTS_PER_PROVIDER`), so `task` + `estimate` + `budget` +
+//!   `profile` is the entire allowance. The replan state rides on the task
+//!   segment, which is where two of its three variants already rode — "this
+//!   task, replanned twice" and "this task, whose replan budget is spent"
+//!   are one fact about one thing. The cost is the eight-character id in
+//!   the escalated state only, where the label slot is better spent on the
+//!   actionable half; `explain` prints the task and plan ids
+//!   unconditionally, and Clear never showed the id in any state.
+//! - **Severity is not inflated to win the ladder.** The escalation and an
+//!   exhausted budget are both `warn`, never `critical`: `critical` means
+//!   work has stopped, and Libra's hooks are advisory, so nothing has.
+//!   Where both are true at once the host's documented tie-break — earliest
+//!   declared `order_hint` — leads with the approval, which is the half a
+//!   user can act on rather than a limit they have already reached.
 //!
 //! # Why the profile costs a second round trip
 //!
@@ -146,6 +172,27 @@ pub const SCOPE: &str = "host";
 /// sorts earlier; Fornax is 300 and Circinus 400, and the range is
 /// deliberately sparse so products can be reordered without renegotiating.
 pub const ORDER_HINT: u32 = 500;
+
+/// Who decides which of Libra's facts earns its one Clear-mode phrase
+/// (HORO-1634).
+///
+/// `provider`, on every document including the failures. The host's fallback
+/// ladder infers a role from state and position, and for this provider those
+/// two signals cannot separate the facts that matter: the task id and the
+/// remaining-work span are both `neutral` and adjacent, while the escalation
+/// and a policy-drift warning are both `warn` and say entirely different
+/// things. Declaring the projection is what makes Libra's Clear line Libra's
+/// editorial judgement rather than an artefact of severity arithmetic — and
+/// the host switches its ladder off rather than merging with it, because a
+/// declaration that can be overridden is not a declaration.
+///
+/// The claim is validated, not trusted: the host requires a `clear_role` on
+/// every segment, at most one posture, and at least one posture or
+/// exception, and refuses the whole document otherwise. A refused document
+/// renders as nothing at all, so the roles below are assigned structurally
+/// rather than case by case, and the tests walk every document this module
+/// can produce.
+pub const CLEAR_AUTHORITY: &str = "provider";
 
 /// Total time the hot-path probe may spend, across *both* round trips.
 ///
@@ -318,12 +365,14 @@ pub fn no_reading(kind: NoReading) -> Value {
         "scope": SCOPE,
         "availability": availability,
         "order_hint": ORDER_HINT,
+        "clear_authority": CLEAR_AUTHORITY,
         "segments": [{
             "key": "availability",
             "state": state_for(availability),
             "label": kind.label(),
             "reason_code": kind.reason_code(),
             "explain_key": "libra.availability",
+            "clear_role": "exception",
         }],
     })
 }
@@ -371,6 +420,7 @@ fn task_segment(task: Option<&TaskSummary>) -> Value {
             "label": "No task being governed",
             "explain_key": "libra.task",
             "order_hint": 10,
+            "clear_role": "posture",
         });
     };
     if task.replan_state == ReplanState::EscalatedAwaitingApproval {
@@ -387,6 +437,7 @@ fn task_segment(task: Option<&TaskSummary>) -> Value {
             "reason_code": "next_replan_needs_human_approval",
             "explain_key": "libra.escalation",
             "order_hint": 10,
+            "clear_role": "exception",
         });
     }
     let mut segment = json!({
@@ -395,6 +446,7 @@ fn task_segment(task: Option<&TaskSummary>) -> Value {
         "label": format!("Task {}", crate::statusline::short_task_id(&task.task_id.to_string())),
         "explain_key": "libra.task",
         "order_hint": 10,
+        "clear_role": "supporting",
     });
     if let ReplanState::Replanned { count } = task.replan_state {
         if count > 0 {
@@ -444,7 +496,7 @@ fn estimate_segment(task: &TaskSummary) -> Value {
         return json!({
             "key": "estimate",
             "state": "unknown",
-            "label": "Remaining work",
+            "label": "Remaining work not estimated",
             "reason_code": if estimate.cold_start {
                 "no_local_history_yet"
             } else {
@@ -452,6 +504,7 @@ fn estimate_segment(task: &TaskSummary) -> Value {
             },
             "explain_key": "libra.estimate",
             "order_hint": 20,
+            "clear_role": "posture",
         });
     };
     json!({
@@ -464,6 +517,7 @@ fn estimate_segment(task: &TaskSummary) -> Value {
         "confidence_of": "preflight_estimate",
         "explain_key": "libra.estimate",
         "order_hint": 20,
+        "clear_role": "posture",
     })
 }
 
@@ -522,13 +576,14 @@ fn percent_left(fraction_left: f64) -> Option<u32> {
 /// envelope that is spent, and a ledger that would not read are three
 /// different things to be told, and only the middle one is about the work.
 fn budget_segment(posture: BudgetPosture) -> Value {
-    let (state, label, reason_code) = match posture {
+    let (state, label, reason_code, clear_role) = match posture {
         BudgetPosture::Remaining { fraction_left } => match percent_left(fraction_left) {
-            Some(percent) => ("neutral", format!("{percent}% budget left"), None),
+            Some(percent) => ("neutral", format!("{percent}% budget left"), None, "vital"),
             None => (
                 "warn",
                 "Budget share not a number".to_string(),
                 Some("budget_share_not_a_number"),
+                "vital",
             ),
         },
         // `warn`, matching the escalation and for the same reason: hooks are
@@ -539,16 +594,19 @@ fn budget_segment(posture: BudgetPosture) -> Value {
             "warn",
             "Budget exhausted".to_string(),
             Some("budget_hard_limit_reached"),
+            "exception",
         ),
         BudgetPosture::NotEstablished => (
             "unknown",
             "Budget not established".to_string(),
             Some("task_admitted_without_a_budget"),
+            "vital",
         ),
         BudgetPosture::Unreadable => (
             "warn",
             "Budget unreadable".to_string(),
             Some("budget_ledger_unreadable"),
+            "vital",
         ),
     };
     let mut segment = json!({
@@ -557,6 +615,7 @@ fn budget_segment(posture: BudgetPosture) -> Value {
         "label": label,
         "explain_key": "libra.budget",
         "order_hint": 25,
+        "clear_role": clear_role,
     });
     if let Some(reason_code) = reason_code {
         segment["reason_code"] = json!(reason_code);
@@ -663,6 +722,7 @@ fn profile_segment(doctor: &DoctorResult) -> Option<Value> {
         // rung. Declaring the role also pins behaviour that the host used to
         // infer from `warn` being an emphatic state; an inferred vital is
         // never paired with an exception, and a declared one is.
+        "clear_role": "vital",
     }))
 }
 
@@ -723,6 +783,7 @@ pub fn reading(status: &StatusResult, doctor: Option<&DoctorResult>, now: Offset
         "scope": SCOPE,
         "availability": "available",
         "order_hint": ORDER_HINT,
+        "clear_authority": CLEAR_AUTHORITY,
         "observed_at": rfc3339_utc(now),
         "segments": segments,
     })
@@ -1581,6 +1642,11 @@ mod tests {
             .unwrap();
         assert_eq!(budget["label"], json!("Budget exhausted"));
         assert_eq!(
+            budget["clear_role"],
+            json!("exception"),
+            "a limit that has been reached is not a posture about the work"
+        );
+        assert_eq!(
             budget["state"],
             json!("warn"),
             "`critical` would claim work has stopped; Libra's hooks are advisory"
@@ -1838,6 +1904,195 @@ mod tests {
         }
         assert_eq!(preset_label("balanced-ish"), None);
         assert_eq!(preset_display("balanced-ish"), None);
+    }
+
+    // --------------------------------------------------- clear projection
+
+    /// Role of a segment by key, or `None` if the document has no such
+    /// segment.
+    fn role_of(document: &Value, key: &str) -> Option<String> {
+        segments(document)
+            .iter()
+            .find(|s| s["key"] == json!(key))
+            .map(|s| s["clear_role"].as_str().unwrap().to_string())
+    }
+
+    const CLEAR_ROLES: [&str; 4] = ["exception", "posture", "vital", "supporting"];
+
+    #[test]
+    fn every_document_declares_its_own_clear_projection() {
+        for (name, document) in every_document() {
+            assert_eq!(
+                document["clear_authority"],
+                json!("provider"),
+                "{name}: an undeclared document is re-inferred by the host"
+            );
+            for segment in segments(&document) {
+                let role = segment["clear_role"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{name}: {} has no clear_role", segment["key"]));
+                assert!(CLEAR_ROLES.contains(&role), "{name}: unknown role {role:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_document_satisfies_the_hosts_declaration_rules() {
+        // Mirrors `statusline_contract.ProviderStatus._validate_clear_authority`.
+        // A declaring payload that breaks one of these is refused *whole*, so
+        // Libra would render as nothing — the failure mode is silence, which
+        // is why this is checked over every document rather than sampled.
+        for (name, document) in every_document() {
+            let segments = segments(&document);
+            assert!(!segments.is_empty(), "{name}");
+            let roles: Vec<&str> = segments
+                .iter()
+                .map(|s| s["clear_role"].as_str().unwrap())
+                .collect();
+            assert!(
+                roles.iter().filter(|r| **r == "posture").count() <= 1,
+                "{name}: more than one posture {roles:?}"
+            );
+            assert!(
+                roles.iter().any(|r| *r == "posture" || *r == "exception"),
+                "{name}: no posture and no exception {roles:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_active_task_leads_with_its_schedule_and_its_budget() {
+        // The ticket's normal case: schedule expectation plus budget posture,
+        // and the task id explicitly *not* competing with either.
+        let document = reading(
+            &status_with(ReplanState::Stable),
+            Some(&doctor_with("balanced", true)),
+            now(),
+        );
+        assert_eq!(role_of(&document, "estimate").as_deref(), Some("posture"));
+        assert_eq!(role_of(&document, "budget").as_deref(), Some("vital"));
+        assert_eq!(
+            role_of(&document, "task").as_deref(),
+            Some("supporting"),
+            "an opaque id is a handle on the work, not a reason to look"
+        );
+    }
+
+    #[test]
+    fn an_action_required_state_outranks_the_routine_metrics() {
+        // Approval and exhaustion are the two exceptions, and each must be
+        // the *only* exception in its own shape so the host's ladder has an
+        // unambiguous primary.
+        let escalated = reading(
+            &status_with(ReplanState::EscalatedAwaitingApproval),
+            None,
+            now(),
+        );
+        assert_eq!(role_of(&escalated, "task").as_deref(), Some("exception"));
+        assert_eq!(
+            role_of(&escalated, "budget").as_deref(),
+            Some("vital"),
+            "the host pairs an exception only with a *declared* vital, which \
+             is how `Replans now need approval . 38% budget left` gets to say \
+             what the decision costs"
+        );
+
+        let mut exhausted = status_with(ReplanState::Stable);
+        exhausted.task_budget = Some(BudgetPosture::Exhausted);
+        let exhausted = reading(&exhausted, None, now());
+        assert_eq!(role_of(&exhausted, "budget").as_deref(), Some("exception"));
+        assert_eq!(role_of(&exhausted, "task").as_deref(), Some("supporting"));
+    }
+
+    #[test]
+    fn an_idle_daemon_shows_no_schedule_expectation() {
+        // "A P90 with nothing being governed is a number about nothing." The
+        // guarantee is structural rather than a formatting rule: with no task
+        // there is no estimate segment for a span to live on.
+        let document = reading(&idle(), Some(&doctor_with("balanced", true)), now());
+        assert_eq!(role_of(&document, "task").as_deref(), Some("posture"));
+        for segment in segments(&document) {
+            assert!(
+                segment.get("duration_seconds").is_none()
+                    && segment.get("duration_label").is_none(),
+                "{segment:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_task_with_no_estimate_says_so_in_the_field_clear_shows() {
+        // Clear keeps the state marker, the label and the duration, and drops
+        // the reason. A no-estimate segment labelled `Remaining work` would
+        // render as a heading with nothing under it.
+        let mut status = status_with(ReplanState::Stable);
+        status.current_task.as_mut().unwrap().remaining_estimate = estimate_with(None, true, 0);
+        let document = reading(&status, None, now());
+        let estimate = &segments(&document)[1];
+        assert_eq!(estimate["label"], json!("Remaining work not estimated"));
+        assert_eq!(estimate["clear_role"], json!("posture"));
+
+        let estimated = reading(&status_with(ReplanState::Stable), None, now());
+        assert_ne!(
+            segments(&estimated)[1]["label"],
+            estimate["label"],
+            "the two shapes must not read identically once the reason is gone"
+        );
+    }
+
+    #[test]
+    fn a_preflight_confidence_can_never_become_the_primary_clear_signal() {
+        // Confidence stays Detail information. The host drops it at Clear
+        // depth, and this pins the other half: it is never attached to a
+        // segment the ladder could promote on its own declaration, so it
+        // cannot ride into Clear beside an exception either.
+        for (name, document) in every_document() {
+            for segment in segments(&document) {
+                if segment.get("confidence").is_none() {
+                    continue;
+                }
+                assert_eq!(
+                    segment["key"],
+                    json!("estimate"),
+                    "{name}: a confidence must qualify the estimate it is about"
+                );
+                assert_eq!(
+                    segment["clear_role"],
+                    json!("posture"),
+                    "{name}: a confidence on an exception or a vital would be \
+                     promoted as if it were the reading"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_clear_declaration_is_not_vacuous() {
+        // Guarding the guard: the properties above would all pass over a
+        // document set that never exercised more than one role, so prove the
+        // set spans every role and every budget shape.
+        let mut roles: Vec<String> = Vec::new();
+        let mut budget_labels: Vec<String> = Vec::new();
+        for (_, document) in every_document() {
+            for segment in segments(&document) {
+                roles.push(segment["clear_role"].as_str().unwrap().to_string());
+            }
+            if let Some(label) = budget_label(&document) {
+                budget_labels.push(label);
+            }
+        }
+        for role in CLEAR_ROLES {
+            assert!(
+                roles.iter().any(|r| r == role),
+                "no document exercises the {role:?} role"
+            );
+        }
+        budget_labels.sort();
+        budget_labels.dedup();
+        assert!(
+            budget_labels.len() >= 4,
+            "the budget shapes are not all covered: {budget_labels:?}"
+        );
     }
 
     // ------------------------------------------------------- the document
