@@ -127,7 +127,10 @@ mod tests {
 
     #[test]
     fn format_status_reports_idle_when_no_current_task() {
-        let status = StatusResult { current_task: None };
+        let status = StatusResult {
+            current_task: None,
+            task_budget: None,
+        };
         assert_eq!(format_status(&status), "libra: idle");
     }
 
@@ -135,6 +138,7 @@ mod tests {
     fn format_status_renders_a_single_line_with_confidence_and_recon_cost() {
         let status = StatusResult {
             current_task: Some(sample_task(ReplanState::Stable)),
+            task_budget: None,
         };
         let line = format_status(&status);
         assert!(line.starts_with("libra: task "));
@@ -149,6 +153,7 @@ mod tests {
     fn format_status_reflects_a_replanned_state() {
         let status = StatusResult {
             current_task: Some(sample_task(ReplanState::Replanned { count: 2 })),
+            task_budget: None,
         };
         let line = format_status(&status);
         assert!(line.contains("replanned 2x"));
@@ -158,6 +163,7 @@ mod tests {
     fn format_status_reflects_escalation() {
         let status = StatusResult {
             current_task: Some(sample_task(ReplanState::EscalatedAwaitingApproval)),
+            task_budget: None,
         };
         let line = format_status(&status);
         assert!(line.contains("escalated"));

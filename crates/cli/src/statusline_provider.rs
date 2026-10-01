@@ -808,6 +808,7 @@ mod tests {
     fn status_with(replan_state: ReplanState) -> StatusResult {
         StatusResult {
             current_task: Some(task(replan_state)),
+            task_budget: None,
         }
     }
 
@@ -893,7 +894,10 @@ mod tests {
         out.push((
             "reading/idle".to_string(),
             reading(
-                &StatusResult { current_task: None },
+                &StatusResult {
+                    current_task: None,
+                    task_budget: None,
+                },
                 Some(&doctor_with("balanced", true)),
                 now(),
             ),
@@ -1079,7 +1083,14 @@ mod tests {
 
     #[test]
     fn no_task_is_reported_explicitly_rather_than_by_omission() {
-        let document = reading(&StatusResult { current_task: None }, None, now());
+        let document = reading(
+            &StatusResult {
+                current_task: None,
+                task_budget: None,
+            },
+            None,
+            now(),
+        );
         assert_eq!(document["availability"], json!("available"));
         assert_eq!(segments(&document).len(), 1);
         assert_eq!(
@@ -1648,7 +1659,13 @@ mod tests {
 
     #[test]
     fn explain_reports_no_task_without_implying_a_verdict() {
-        let text = explain_text(&StatusResult { current_task: None }, None);
+        let text = explain_text(
+            &StatusResult {
+                current_task: None,
+                task_budget: None,
+            },
+            None,
+        );
         assert!(text.contains("No task is being governed right now"));
         assert!(text.contains("not a judgement"));
     }
