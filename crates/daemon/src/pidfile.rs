@@ -33,6 +33,8 @@
 
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 /// One daemon's identity, as recorded at the moment it started serving.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PidRecord {
@@ -42,6 +44,30 @@ pub struct PidRecord {
     /// formatted (mirrors `crate::log`'s own fallback). Never used for
     /// comparison logic, only surfaced to an operator for context.
     pub started_at: String,
+    /// SHA-256 hex digest of the running daemon's own executable bytes
+    /// (HORO-1380 S4b), computed once at startup via [`hash_file`] on
+    /// `std::env::current_exe()`. `#[serde(default)]` so a pidfile written
+    /// by a daemon binary built before this field existed still parses —
+    /// as `None`, not a hard parse failure — matching `read`'s existing
+    /// "no usable record beats a wrong one" discipline. `None` also when
+    /// hashing failed for any reason. `doctor`'s stale-runtime check
+    /// treats `None` as "nothing to report", never as a mismatch.
+    #[serde(default)]
+    pub exe_sha256: Option<String>,
+}
+
+/// SHA-256 hex digest of the bytes at `path`, or `None` if the file
+/// cannot be read. Shared by the daemon (to stamp its own executable at
+/// startup) and by `doctor` (to hash the binary currently at the
+/// installed path fresh at diagnostic time — never trusting a
+/// previously-cached hash, since an in-place binary replacement would
+/// leave a cached hash equally stale).
+pub fn hash_file(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let digest = hasher.finalize();
+    Some(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Writes `record` to `<state_dir>/daemon.pid`, replacing whatever was
@@ -80,6 +106,7 @@ mod tests {
             pid: 12345,
             exe_path: PathBuf::from("/usr/local/bin/libra-governor"),
             started_at: "2026-09-27T00:00:00Z".to_string(),
+            exe_sha256: Some("deadbeef".to_string()),
         };
         write(dir.path(), &record).unwrap();
         assert_eq!(read(dir.path()), Some(record));
@@ -107,6 +134,7 @@ mod tests {
                 pid: 1,
                 exe_path: PathBuf::from("/old/path"),
                 started_at: "2020-01-01T00:00:00Z".to_string(),
+                exe_sha256: None,
             },
         )
         .unwrap();
@@ -114,6 +142,7 @@ mod tests {
             pid: 2,
             exe_path: PathBuf::from("/new/path"),
             started_at: "2026-09-27T00:00:00Z".to_string(),
+            exe_sha256: Some("abc123".to_string()),
         };
         write(dir.path(), &fresh).unwrap();
         assert_eq!(read(dir.path()), Some(fresh));
@@ -126,6 +155,7 @@ mod tests {
             pid: 99,
             exe_path: PathBuf::from("/bin/x"),
             started_at: "2026-09-27T00:00:00Z".to_string(),
+            exe_sha256: None,
         };
         write(dir.path(), &record).unwrap();
         let names: Vec<_> = std::fs::read_dir(dir.path())
