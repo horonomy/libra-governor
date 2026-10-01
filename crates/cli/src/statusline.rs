@@ -94,7 +94,7 @@ pub(crate) fn short_task_id(task_id: &str) -> &str {
 mod tests {
     use super::*;
     use libra_governor_domain::{Estimate, PlanId, TaskId};
-    use libra_governor_protocol::TaskSummary;
+    use libra_governor_protocol::{BudgetPosture, TaskSummary};
 
     fn sample_estimate() -> Estimate {
         Estimate {
@@ -147,6 +147,35 @@ mod tests {
         assert!(line.contains("stable"));
         assert!(line.contains("60s"), "must include the remaining P90");
         assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    fn the_parsed_compatibility_line_is_unaffected_by_the_budget_posture() {
+        // This surface exists because a founder wrapper greps it. A budget
+        // share arriving on the `Status` reply must not move a byte of it:
+        // the share belongs to the structured provider document, and adding
+        // it here would silently break every pattern downstream.
+        // One task value, reused: `sample_task` mints fresh ids per call.
+        let task = sample_task(ReplanState::Stable);
+        let baseline = format_status(&StatusResult {
+            current_task: Some(task.clone()),
+            task_budget: None,
+        });
+        for posture in [
+            BudgetPosture::Remaining {
+                fraction_left: 0.38,
+            },
+            BudgetPosture::Exhausted,
+            BudgetPosture::NotEstablished,
+            BudgetPosture::Unreadable,
+        ] {
+            let line = format_status(&StatusResult {
+                current_task: Some(task.clone()),
+                task_budget: Some(posture),
+            });
+            assert_eq!(line, baseline, "{posture:?} changed the legacy line");
+            assert!(!line.contains('%'));
+        }
     }
 
     #[test]
