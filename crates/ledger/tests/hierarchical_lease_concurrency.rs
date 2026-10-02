@@ -247,8 +247,19 @@ fn replayed_sublease_with_the_same_idempotency_key_returns_the_existing_lease() 
         })
         .unwrap()
         .unwrap();
+    // Match only on the variant discriminant for the panic message — `second`
+    // carries a `Reservation` whose `idempotency_key` field trips CodeQL's
+    // generic sensitive-field-name heuristic if the whole struct is
+    // `{:?}`-formatted, even though it is a caller-supplied replay-dedup
+    // token, not a credential. Reporting the discriminant is sufficient to
+    // debug a failing assertion here.
+    let outcome_kind = match &second {
+        GrantSubleaseOutcome::Granted(_) => "Granted",
+        GrantSubleaseOutcome::AlreadyGranted(_) => "AlreadyGranted",
+        GrantSubleaseOutcome::Insufficient { .. } => "Insufficient",
+    };
     let GrantSubleaseOutcome::AlreadyGranted(second_reservation) = second else {
-        panic!("expected AlreadyGranted, got {second:?}");
+        panic!("expected AlreadyGranted, got {outcome_kind}");
     };
     assert_eq!(first_reservation.id, second_reservation.id);
     assert_eq!(second_reservation.amount, ResourceAmount::Tokens(500));
