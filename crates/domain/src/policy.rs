@@ -623,7 +623,15 @@ impl Policy {
         })
     }
 
-    fn evaluate_resource(
+    /// Evaluates the resource constraint alone, independent of time or
+    /// confidence (HORO-1670). Pure visibility change from the original
+    /// `fn evaluate_resource` — no behavior change. Exists so counterfactual
+    /// policy replay can compose per-dimension verdicts using this
+    /// already-tested logic without duplicating it, and without being
+    /// forced to call [`Self::evaluate`] (which demands both a resource
+    /// *and* a time projection, and would force a forbidden fabricated
+    /// zero when only one dimension has replay evidence).
+    pub fn evaluate_resource(
         bound: &ResourceBound,
         projected: ResourceAmount,
     ) -> Result<ConstraintOutcome, PolicyEvaluationError> {
@@ -683,7 +691,9 @@ impl Policy {
         Ok(outcome)
     }
 
-    fn evaluate_time(
+    /// Evaluates the time constraint alone. See [`Self::evaluate_resource`]
+    /// docs — same pure-visibility-change rationale (HORO-1670).
+    pub fn evaluate_time(
         bound: &TimeBound,
         projected_secs: u64,
     ) -> Result<ConstraintOutcome, PolicyEvaluationError> {
