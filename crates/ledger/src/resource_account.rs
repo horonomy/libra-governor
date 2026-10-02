@@ -22,8 +22,9 @@
 
 use libra_governor_domain::{
     AccountCapacity, AccountId, AccountLevel, AccountProvenance, AccountState, AllocationAuthority,
-    EnforcementScope, Headroom, LeaseKind, Reservation, ReservationId, ResourceAccount,
-    ResourceAmount, ResourceKind, RESOURCE_ACCOUNT_SCHEMA_VERSION,
+    EnforcementScope, Headroom, LeaseKind, NoSpendBasis, Reservation, ReservationId,
+    ResourceAccount, ResourceAmount, ResourceKind, SpendScope, SpendSoFar,
+    RESOURCE_ACCOUNT_SCHEMA_VERSION,
 };
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use time::format_description::well_known::Rfc3339;
@@ -568,6 +569,107 @@ impl LedgerStore {
         row.map(row_to_account).transpose()
     }
 
+    /// Reads `account_id`'s spend-so-far (HORO-1669): `Exclusive` sums
+    /// only `work_hold` leases held directly against this account;
+    /// `Inclusive` adds every proven descendant's exclusive spend via a
+    /// recursive CTE over `resource_accounts.parent_account_id`.
+    ///
+    /// # Read-path/write-path asymmetry, deliberate
+    ///
+    /// Migration 0011's module docs say "never a recursive CTE on the
+    /// *write* path" — this is a read-only query off the hot path, so
+    /// that rule is not violated.
+    ///
+    /// # Not `economic_rollup::inclusive_spend`
+    ///
+    /// That function sums the provider-proven agent-lineage forest (a
+    /// different tree — see ADR-0008: custody lineage is Libra-minted,
+    /// proven by the act of leasing, and may legitimately disagree with
+    /// provider lineage). This function sums the custody tree instead.
+    /// The two are cross-referenced, never unified.
+    ///
+    /// `subaccount_funding` leases are always excluded from both scopes:
+    /// that capacity belongs to the child it funds, not to the parent
+    /// that handed it down — counting it here would double-count with
+    /// the child's own exclusive spend.
+    pub fn account_spend(
+        &self,
+        account_id: AccountId,
+        scope: SpendScope,
+    ) -> Result<SpendSoFar, LedgerError> {
+        let Some(account) = self.account(account_id)? else {
+            return Ok(SpendSoFar::NoBasis {
+                reason: NoSpendBasis::NoAccount,
+            });
+        };
+
+        let (settled, active_holds, account_count): (f64, f64, u32) = match scope {
+            SpendScope::Exclusive => {
+                let settled: f64 = self.conn.query_row(
+                    "SELECT COALESCE(SUM(settled_amount), 0.0) FROM reservations
+                     WHERE account_id = ?1 AND lease_kind = 'work_hold' AND state = 'settled'",
+                    [account_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                let active: f64 = self.conn.query_row(
+                    "SELECT COALESCE(SUM(amount), 0.0) FROM reservations
+                     WHERE account_id = ?1 AND lease_kind = 'work_hold' AND state = 'active'",
+                    [account_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                (settled, active, 1)
+            }
+            SpendScope::Inclusive => {
+                let settled: f64 = self.conn.query_row(
+                    "WITH RECURSIVE subtree(account_id) AS (
+                        SELECT account_id FROM resource_accounts WHERE account_id = ?1
+                        UNION ALL
+                        SELECT a.account_id FROM resource_accounts a
+                        JOIN subtree s ON a.parent_account_id = s.account_id
+                     )
+                     SELECT COALESCE(SUM(r.settled_amount), 0.0) FROM reservations r
+                     JOIN subtree s ON r.account_id = s.account_id
+                     WHERE r.lease_kind = 'work_hold' AND r.state = 'settled'",
+                    [account_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                let active: f64 = self.conn.query_row(
+                    "WITH RECURSIVE subtree(account_id) AS (
+                        SELECT account_id FROM resource_accounts WHERE account_id = ?1
+                        UNION ALL
+                        SELECT a.account_id FROM resource_accounts a
+                        JOIN subtree s ON a.parent_account_id = s.account_id
+                     )
+                     SELECT COALESCE(SUM(r.amount), 0.0) FROM reservations r
+                     JOIN subtree s ON r.account_id = s.account_id
+                     WHERE r.lease_kind = 'work_hold' AND r.state = 'active'",
+                    [account_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                let count: u32 = self.conn.query_row(
+                    "WITH RECURSIVE subtree(account_id) AS (
+                        SELECT account_id FROM resource_accounts WHERE account_id = ?1
+                        UNION ALL
+                        SELECT a.account_id FROM resource_accounts a
+                        JOIN subtree s ON a.parent_account_id = s.account_id
+                     )
+                     SELECT COUNT(*) FROM subtree",
+                    [account_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                (settled, active, count)
+            }
+        };
+
+        Ok(SpendSoFar::Known {
+            kind: account.resource_kind,
+            settled,
+            active_holds,
+            scope,
+            account_count,
+        })
+    }
+
     /// Reads an account's capacity through `v_account_capacity` — the
     /// one place the task-vs-other-level case analysis lives. `Ok(None)`
     /// when the account itself does not exist.
@@ -719,6 +821,160 @@ mod tests {
         assert_eq!(
             capacity.protected_reserve,
             Some(ResourceAmount::Tokens(200))
+        );
+    }
+
+    /// Inserts a settled `work_hold` lease directly against `account_id`.
+    /// There is no public reserve-against-an-arbitrary-account API today
+    /// (only `reserve`, which always targets the task-level account) — a
+    /// future ticket may add one; until then this mirrors how the
+    /// existing `task_level_account_rows_never_carry_capacity_or_reserve`
+    /// test already reaches into `store.conn` directly to set up a
+    /// scenario the public API alone cannot construct.
+    fn insert_settled_work_hold(
+        store: &LedgerStore,
+        task_id: TaskId,
+        account_id: AccountId,
+        settled_amount: f64,
+    ) {
+        store
+            .conn
+            .execute(
+                "INSERT INTO reservations (
+                    id, task_id, session_id, plan_id, class, resource_kind, amount,
+                    drawn_from_reserve, state, settled_amount, usage_known, idempotency_key,
+                    created_at, expires_at, settled_at, released_at,
+                    account_id, grants_account_id, lease_kind, settled_after_expiry, legacy_pre_0011
+                 ) VALUES (?1, ?2, 'test-session', NULL, 'optional_work', 'tokens', ?3,
+                           0, 'settled', ?3, 1, ?4, ?5, ?5, ?5, NULL, ?6, NULL, 'work_hold', 0, 0)",
+                rusqlite::params![
+                    ReservationId::new().0.to_string(),
+                    task_id.to_string(),
+                    settled_amount,
+                    format!("wh-{}", uuid::Uuid::new_v4()),
+                    rfc3339(now()).unwrap(),
+                    account_id.to_string(),
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn account_spend_inclusive_reflects_a_grandchild_settlement_exclusive_does_not() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let task_account = AccountId::for_task(task_id);
+        store
+            .ensure_task_account(task_id, ResourceKind::Tokens, now())
+            .unwrap();
+
+        let session = store
+            .ensure_child_account(task_account, AccountLevel::Session, "sess-1", now())
+            .unwrap()
+            .unwrap()
+            .account;
+        store
+            .grant_sublease(GrantSubleaseRequest {
+                parent_account_id: task_account,
+                child_account_id: session.account_id,
+                child_natural_key: "sess-1",
+                amount: ResourceAmount::Tokens(500),
+                idempotency_key: "fund-session",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap()
+            .unwrap();
+
+        let agent = store
+            .ensure_child_account(session.account_id, AccountLevel::Agent, "agent-1", now())
+            .unwrap()
+            .unwrap()
+            .account;
+        store
+            .grant_sublease(GrantSubleaseRequest {
+                parent_account_id: session.account_id,
+                child_account_id: agent.account_id,
+                child_natural_key: "agent-1",
+                amount: ResourceAmount::Tokens(200),
+                idempotency_key: "fund-agent",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap()
+            .unwrap();
+
+        // Settle real work directly at the grandchild (agent) account.
+        insert_settled_work_hold(&store, task_id, agent.account_id, 150.0);
+
+        // Match only on the variant discriminant for the panic message —
+        // `SpendSoFar`/`account_spend`'s row read flows through
+        // `reservations.idempotency_key`, which trips CodeQL's generic
+        // sensitive-field-name heuristic if the whole value is
+        // `{:?}`-formatted, even though no field here is actually
+        // sensitive (same pattern as HORO-1668's PR #57 fix).
+        fn spend_kind(spend: &SpendSoFar) -> &'static str {
+            match spend {
+                SpendSoFar::NoBasis { .. } => "NoBasis",
+                SpendSoFar::Known { .. } => "Known",
+            }
+        }
+
+        let task_inclusive = store
+            .account_spend(task_account, SpendScope::Inclusive)
+            .unwrap();
+        match task_inclusive {
+            SpendSoFar::Known {
+                settled,
+                account_count,
+                ..
+            } => {
+                assert_eq!(settled, 150.0, "grandchild's settled work must roll up");
+                assert_eq!(account_count, 3, "task + session + agent");
+            }
+            other => panic!("expected Known, got {}", spend_kind(&other)),
+        }
+
+        let task_exclusive = store
+            .account_spend(task_account, SpendScope::Exclusive)
+            .unwrap();
+        match task_exclusive {
+            SpendSoFar::Known { settled, .. } => {
+                assert_eq!(
+                    settled, 0.0,
+                    "exclusive spend at the task account must not see the grandchild's spend"
+                );
+            }
+            other => panic!("expected Known, got {}", spend_kind(&other)),
+        }
+
+        // The funding leases themselves (subaccount_funding) must never
+        // be double-counted as spend.
+        let session_inclusive = store
+            .account_spend(session.account_id, SpendScope::Inclusive)
+            .unwrap();
+        match session_inclusive {
+            SpendSoFar::Known { settled, .. } => {
+                assert_eq!(
+                    settled, 150.0,
+                    "funding leases must not inflate the session's inclusive spend"
+                );
+            }
+            other => panic!("expected Known, got {}", spend_kind(&other)),
+        }
+    }
+
+    #[test]
+    fn account_spend_reports_no_basis_when_no_account_exists() {
+        let store = LedgerStore::open_in_memory().unwrap();
+        let spend = store
+            .account_spend(AccountId::new(), SpendScope::Exclusive)
+            .unwrap();
+        assert_eq!(
+            spend,
+            SpendSoFar::NoBasis {
+                reason: NoSpendBasis::NoAccount
+            }
         );
     }
 }

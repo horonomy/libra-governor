@@ -196,8 +196,9 @@ impl AccountProvenance {
 pub enum AccountState {
     /// Open to new leases against it.
     Open,
-    /// Closed deliberately (its funding lease was settled up — see
-    /// `libra_governor_ledger::resource_account::close_account`).
+    /// Closed deliberately (its funding lease was settled up). No
+    /// dedicated `close_account` function exists today — this state is
+    /// reserved for when one does.
     Closed,
     /// Reclaimed by cascade expiry (its funding lease's TTL elapsed while
     /// it, or an ancestor, was never explicitly closed).

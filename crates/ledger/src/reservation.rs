@@ -1006,8 +1006,11 @@ impl LedgerStore {
             // subtree in one pass, "deepest" and "shallowest" alike,
             // without a separate recursive walk. Marking the account
             // `expired` here (rather than only the lease row) is what
-            // makes `grant_sublease`/`reserve_in_account` against it
-            // refuse further activity.
+            // makes `grant_sublease` against it refuse further activity
+            // (a direct `reservations`/`reserve` call against a task-level
+            // account is unaffected by this — no `reserve_in_account`
+            // entry point exists; task-level reservation still goes
+            // through the pre-existing `reserve`).
             if reservation.lease_kind == libra_governor_domain::LeaseKind::SubaccountFunding {
                 if let Some(child_account_id) = reservation.grants_account {
                     tx.execute(

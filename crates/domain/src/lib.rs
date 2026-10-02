@@ -51,6 +51,7 @@ mod execution_receipt;
 mod external_approval;
 mod outcome_attestation;
 mod policy;
+mod progressive;
 mod regime;
 mod replan;
 mod reservation;
@@ -105,6 +106,14 @@ pub use policy::{
     Admission, ApprovalRequest, AutonomyBoundary, ConstraintMode, ConstraintOutcome, DenyReason,
     Policy, PolicyDecision, PolicyEvaluationError, PolicyPresetInputs, PolicyValidationError,
     ResourceBound, TimeBound, POLICY_SCHEMA_VERSION,
+};
+pub use progressive::{
+    propose_runtime_decision, replan_cost_benefit_from_remaining, Feasibility, FeasibilityBound,
+    MissingEvidence, NoSpendBasis, ProgressEvidence, ProposedAction, RemainingDuration,
+    RemainingResource, RemainingWorkEstimate, ReplanCostInputs, ReplanEconomicsInsufficient,
+    RuntimeDecision, RuntimeDecisionProposal, Shadow, ShadowDecisionSummary, SpendScope,
+    SpendSoFar, StopReason, MIN_CONDITIONAL_SAMPLES, REMAINING_WORK_SCHEMA_VERSION,
+    RUNTIME_DECISION_SCHEMA_VERSION,
 };
 pub use regime::{
     CacheClass, DimensionUnavailable, DimensionValue, RegimeBasis, RegimeComparison,
