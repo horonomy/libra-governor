@@ -5,11 +5,13 @@ is made anywhere in this file.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "common"))
@@ -82,14 +84,29 @@ class ResolveTicketKeyTest(unittest.TestCase):
         self.assertIsNone(jp.resolve_ticket_key("/definitely/does/not/exist", "/definitely/does/not/exist"))
 
     def test_resolves_a_real_ticket_key_from_the_current_branch(self):
-        # Exercises the real `git` subprocess against this repo's own
-        # worktree, whose branch name contains a real ticket key — the
-        # same "prefer real behavior" convention as
-        # `libra_example_provider.py`'s own test suite.
-        repo_root = str(Path(__file__).resolve().parents[2])
-        key = jp.resolve_ticket_key(repo_root, repo_root)
-        self.assertIsNotNone(key)
-        self.assertRegex(key, r"^[A-Z]+-\d+$")
+        # Exercises the real `git` subprocess end to end, but against a
+        # disposable temp repo with a known branch name created here —
+        # not against this worktree's own branch, which is a detached
+        # HEAD under `actions/checkout`'s `pull_request` event in CI
+        # (`rev-parse --abbrev-ref HEAD` would return `HEAD`, not a
+        # ticket key, and the real-branch form of this test would then
+        # fail in CI while passing locally).
+        with tempfile.TemporaryDirectory() as repo_root:
+            env = {
+                **os.environ,
+                "GIT_AUTHOR_NAME": "test",
+                "GIT_AUTHOR_EMAIL": "test@example.invalid",
+                "GIT_COMMITTER_NAME": "test",
+                "GIT_COMMITTER_EMAIL": "test@example.invalid",
+            }
+            subprocess.run(
+                ["git", "init", "-q", "-b", "v0.0.3/HORO-1173/feat/example"], cwd=repo_root, check=True, env=env
+            )
+            subprocess.run(
+                ["git", "-C", repo_root, "commit", "--allow-empty", "-q", "-m", "init"], check=True, env=env
+            )
+            key = jp.resolve_ticket_key(repo_root, repo_root)
+        self.assertEqual(key, "HORO-1173")
 
 
 class PushOutcomeTest(unittest.TestCase):
