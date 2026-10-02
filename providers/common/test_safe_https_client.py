@@ -320,5 +320,43 @@ class RequestWithValidatedRedirectsTest(_PinnedTransportTest):
             )
 
 
+class FetchJsonAndPostJsonRealPathTest(_PinnedTransportTest):
+    """Exercises `fetch_json`/`post_json` themselves (not just the
+    `_request_*` helpers they call) through the pinned/redirect-validated
+    real path — the public entry points every provider actually calls,
+    which the `_request_*`-level tests above never drive directly."""
+
+    def test_fetch_json_parses_a_successful_response(self):
+        _FakePinnedConnection.responses[("api.example.invalid", "/x")] = _FakeHTTPResponse(
+            200, {}, json.dumps({"ok": True}).encode("utf-8")
+        )
+        result = shc.fetch_json("https://api.example.invalid/x", headers={}, allow_private_network=False)
+        self.assertEqual(result, {"ok": True})
+
+    def test_fetch_json_raises_a_constructible_error_on_a_4xx_status(self):
+        _FakePinnedConnection.responses[("api.example.invalid", "/x")] = _FakeHTTPResponse(404, {}, b"not found")
+        with self.assertRaises(shc.urllib.error.HTTPError) as ctx:
+            shc.fetch_json("https://api.example.invalid/x", headers={}, allow_private_network=False)
+        self.assertEqual(ctx.exception.code, 404)
+
+    def test_fetch_json_follows_a_redirect_on_the_real_path(self):
+        _FakePinnedConnection.responses[("api.example.invalid", "/x")] = _FakeHTTPResponse(
+            302, {"Location": "https://redirect-target.example.invalid/y"}, b""
+        )
+        _FakePinnedConnection.responses[("redirect-target.example.invalid", "/y")] = _FakeHTTPResponse(
+            200, {}, json.dumps({"ok": True}).encode("utf-8")
+        )
+        result = shc.fetch_json("https://api.example.invalid/x", headers={}, allow_private_network=False)
+        self.assertEqual(result, {"ok": True})
+
+    def test_post_json_returns_status_and_body_on_the_real_path(self):
+        _FakePinnedConnection.responses[("api.example.invalid", "/x")] = _FakeHTTPResponse(201, {}, b"created")
+        response = shc.post_json(
+            "https://api.example.invalid/x", payload={"a": 1}, headers={}, allow_private_network=False
+        )
+        self.assertEqual(response.status, 201)
+        self.assertEqual(response.body, b"created")
+
+
 if __name__ == "__main__":
     unittest.main()
