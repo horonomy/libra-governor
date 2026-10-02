@@ -81,6 +81,8 @@ pub fn normalize(entry: EntryPoint, raw: &str) -> Result<NormalizedEvent, Normal
                 session_id: payload.session_id,
                 cwd: payload.cwd,
                 prompt: payload.prompt,
+                turn_id: payload.turn_id,
+                agent_id: payload.agent_id,
             })
         }
         EntryPoint::ToolCompleted => {
@@ -88,6 +90,8 @@ pub fn normalize(entry: EntryPoint, raw: &str) -> Result<NormalizedEvent, Normal
             Ok(NormalizedEvent::ToolCompleted {
                 session_id: payload.session_id,
                 tool_name: payload.tool_name,
+                turn_id: payload.turn_id,
+                agent_id: payload.agent_id,
             })
         }
         EntryPoint::TurnCompleted => {
@@ -95,6 +99,8 @@ pub fn normalize(entry: EntryPoint, raw: &str) -> Result<NormalizedEvent, Normal
             Ok(NormalizedEvent::TurnCompleted {
                 session_id: payload.session_id,
                 model: payload.model,
+                turn_id: payload.turn_id,
+                agent_id: payload.agent_id,
             })
         }
     }
@@ -131,6 +137,8 @@ mod tests {
                 session_id: "s".to_string(),
                 cwd: "/repo".into(),
                 prompt: "fix it".to_string(),
+                turn_id: None,
+                agent_id: None,
             }
         );
     }
@@ -144,6 +152,8 @@ mod tests {
             NormalizedEvent::ToolCompleted {
                 session_id: "s".to_string(),
                 tool_name: "Bash".to_string(),
+                turn_id: None,
+                agent_id: None,
             }
         );
     }
@@ -168,6 +178,29 @@ mod tests {
             event,
             NormalizedEvent::Unrecognized {
                 hook_event_name: "SomeFutureEvent".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn codex_turn_and_agent_id_flow_through_to_the_normalized_event() {
+        let json = r#"{
+            "session_id": "s",
+            "cwd": "/repo",
+            "prompt": "fix it",
+            "hook_event_name": "UserPromptSubmit",
+            "turn_id": "turn-1",
+            "agent_id": "sub-1"
+        }"#;
+        let event = normalize(EntryPoint::PromptSubmit, json).unwrap();
+        assert_eq!(
+            event,
+            NormalizedEvent::PromptSubmitted {
+                session_id: "s".to_string(),
+                cwd: "/repo".into(),
+                prompt: "fix it".to_string(),
+                turn_id: Some("turn-1".to_string()),
+                agent_id: Some("sub-1".to_string()),
             }
         );
     }

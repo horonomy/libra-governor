@@ -33,6 +33,7 @@ mod completion_contract;
 mod confidence;
 mod estimate;
 mod execution_event;
+mod execution_identity;
 mod execution_outcome;
 mod execution_plan;
 mod execution_receipt;
@@ -61,6 +62,10 @@ pub use completion_contract::{CompletionContract, CompletionCriterion};
 pub use confidence::{Confidence, MIN_CLASS_SAMPLES};
 pub use estimate::{Estimate, ESTIMATOR_VERSION};
 pub use execution_event::{ExecutionEvent, ExecutionEventKind};
+pub use execution_identity::{
+    is_valid_tool_provider, ExecutionIdentity, ExecutionIdentityBuilder, ExecutionIdentityError,
+    LineageStatus, Scope, ScopeIdentityMissing, EXECUTION_IDENTITY_ENVELOPE_VERSION,
+};
 pub use execution_outcome::ExecutionOutcome;
 pub use execution_plan::{ExecutionPlan, PlanId};
 pub use execution_receipt::{ExecutionReceipt, ReservationEvidence};

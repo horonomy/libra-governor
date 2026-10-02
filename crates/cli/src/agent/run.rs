@@ -44,6 +44,66 @@ fn print_context(message: &str) {
     println!("{}", render::render_context_envelope(message));
 }
 
+/// Builds this event's [`ExecutionIdentity`] (HORO-1599) and logs a
+/// redacted summary line. Never fails the hook: a host_id or validation
+/// error here is logged and swallowed, exactly like every other
+/// best-effort failure in this module.
+fn capture_and_log_identity(
+    log_path: &Result<PathBuf, libra_governor_daemon::paths::PathsError>,
+    agent: AgentKind,
+    entry_label: &str,
+    session_id: &str,
+    agent_id: Option<&str>,
+    turn_id: Option<&str>,
+) {
+    let host_id = match libra_governor_daemon::paths::ensure_state_dir()
+        .map_err(|e| e.to_string())
+        .and_then(|dir| super::identity::resolve_host_id(&dir).map_err(|e| e.to_string()))
+    {
+        Ok(host_id) => host_id,
+        Err(e) => {
+            log(
+                log_path,
+                agent,
+                &format!("{entry_label}: could not resolve host_id: {e}"),
+            );
+            return;
+        }
+    };
+
+    match super::identity::capture(
+        &host_id,
+        agent,
+        session_id,
+        agent_id,
+        turn_id,
+        time::OffsetDateTime::now_utc(),
+    ) {
+        Ok(identity) => {
+            log(
+                log_path,
+                agent,
+                &format!(
+                    "{entry_label}: execution identity host={} session={} agent={} lineage={:?}",
+                    identity.display_id("host_id", identity.host_id()),
+                    identity.display_id("provider_session_id", session_id),
+                    agent_id
+                        .map(|a| identity.display_id("agent_id", a))
+                        .unwrap_or_else(|| "none".to_string()),
+                    identity.lineage_status(),
+                ),
+            );
+        }
+        Err(e) => {
+            log(
+                log_path,
+                agent,
+                &format!("{entry_label}: execution identity invalid, not captured: {e}"),
+            );
+        }
+    }
+}
+
 fn read_stdin(
     log_path: &Result<PathBuf, libra_governor_daemon::paths::PathsError>,
     agent: AgentKind,
@@ -75,12 +135,14 @@ pub fn run_prompt_submit(agent: AgentKind) {
         }
     };
 
-    let (session_id, cwd, prompt) = match event {
+    let (session_id, cwd, prompt, turn_id, agent_id) = match event {
         NormalizedEvent::PromptSubmitted {
             session_id,
             cwd,
             prompt,
-        } => (session_id, cwd, prompt),
+            turn_id,
+            agent_id,
+        } => (session_id, cwd, prompt, turn_id, agent_id),
         NormalizedEvent::RecognizedUnwired { hook_event_name } => {
             log(
                 &log_path,
@@ -103,6 +165,15 @@ pub fn run_prompt_submit(agent: AgentKind) {
             unreachable!("normalize(EntryPoint::PromptSubmit, ..) never returns these variants")
         }
     };
+
+    capture_and_log_identity(
+        &log_path,
+        agent,
+        "preflight",
+        &session_id,
+        agent_id.as_deref(),
+        turn_id.as_deref(),
+    );
 
     let socket_path = match libra_governor_daemon::paths::socket_path() {
         Ok(p) => p,
@@ -179,11 +250,13 @@ pub fn run_tool_completed(agent: AgentKind) {
         }
     };
 
-    let (session_id, tool_name) = match event {
+    let (session_id, tool_name, turn_id, agent_id) = match event {
         NormalizedEvent::ToolCompleted {
             session_id,
             tool_name,
-        } => (session_id, tool_name),
+            turn_id,
+            agent_id,
+        } => (session_id, tool_name, turn_id, agent_id),
         NormalizedEvent::RecognizedUnwired { hook_event_name } => {
             log(
                 &log_path,
@@ -206,6 +279,15 @@ pub fn run_tool_completed(agent: AgentKind) {
             unreachable!("normalize(EntryPoint::ToolCompleted, ..) never returns these variants")
         }
     };
+
+    capture_and_log_identity(
+        &log_path,
+        agent,
+        "post-tool-use",
+        &session_id,
+        agent_id.as_deref(),
+        turn_id.as_deref(),
+    );
 
     let socket_path = match libra_governor_daemon::paths::socket_path() {
         Ok(p) => p,
@@ -257,8 +339,13 @@ pub fn run_turn_completed(agent: AgentKind) {
         }
     };
 
-    let (session_id, model) = match event {
-        NormalizedEvent::TurnCompleted { session_id, model } => (session_id, model),
+    let (session_id, model, turn_id, agent_id) = match event {
+        NormalizedEvent::TurnCompleted {
+            session_id,
+            model,
+            turn_id,
+            agent_id,
+        } => (session_id, model, turn_id, agent_id),
         NormalizedEvent::RecognizedUnwired { hook_event_name } => {
             log(
                 &log_path,
@@ -279,6 +366,15 @@ pub fn run_turn_completed(agent: AgentKind) {
             unreachable!("normalize(EntryPoint::TurnCompleted, ..) never returns these variants")
         }
     };
+
+    capture_and_log_identity(
+        &log_path,
+        agent,
+        "stop",
+        &session_id,
+        agent_id.as_deref(),
+        turn_id.as_deref(),
+    );
 
     let socket_path = match libra_governor_daemon::paths::socket_path() {
         Ok(p) => p,

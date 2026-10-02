@@ -10,6 +10,17 @@
 //! `permission_mode`, `tool_use_id`, `agent_id`, `agent_type`,
 //! `last_assistant_message`, `stop_hook_active`) and Claude's own extras
 //! (`transcript_path`) are ignored, never rejected.
+//!
+//! `turn_id`/`agent_id` (HORO-1599) are the two of those extras this
+//! integration now actually captures, for the shared execution identity
+//! envelope (`libra_governor_domain::ExecutionIdentity`) — per
+//! `docs/adr/0004-agent-adapter-contract.md`'s verified real schema,
+//! both are Codex-only fields today; Claude Code's own verified hook
+//! payload shape does not expose either, so they are always absent for
+//! Claude Code (`Option<String>`, never defaulted to a guessed value).
+//! No `parent_agent_id`-shaped field is documented in either host's
+//! schema, so lineage is always `LineageStatus::Unknown` for both hosts
+//! today — see `crates/cli/src/agent/identity.rs`.
 
 use std::path::PathBuf;
 
@@ -21,6 +32,10 @@ pub struct PromptSubmitPayload {
     pub session_id: String,
     pub cwd: PathBuf,
     pub prompt: String,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// `PostToolUse` payload.
@@ -28,6 +43,10 @@ pub struct PromptSubmitPayload {
 pub struct ToolCompletedPayload {
     pub session_id: String,
     pub tool_name: String,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// `Stop` payload. `model` is optional because it is not guaranteed
@@ -38,6 +57,10 @@ pub struct TurnCompletedPayload {
     pub session_id: String,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -103,5 +126,46 @@ mod tests {
         let json = r#"{"session_id": "sess-1", "model": "claude-sonnet-5"}"#;
         let payload: TurnCompletedPayload = serde_json::from_str(json).unwrap();
         assert_eq!(payload.model.as_deref(), Some("claude-sonnet-5"));
+    }
+
+    #[test]
+    fn prompt_submit_payload_captures_codex_turn_and_agent_id() {
+        let json = r#"{
+            "session_id": "sess-1",
+            "cwd": "/repo",
+            "prompt": "fix the bug",
+            "turn_id": "turn-1",
+            "agent_id": "sub-1"
+        }"#;
+        let payload: PromptSubmitPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(payload.agent_id.as_deref(), Some("sub-1"));
+    }
+
+    #[test]
+    fn prompt_submit_payload_leaves_turn_and_agent_id_absent_when_the_host_sends_neither() {
+        // Claude Code's verified real hook payload shape does not expose
+        // either field (docs/adr/0004-agent-adapter-contract.md) — this
+        // must be an explicit absence, never a guessed/defaulted value.
+        let json = r#"{"session_id": "sess-1", "cwd": "/repo", "prompt": "fix the bug"}"#;
+        let payload: PromptSubmitPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.turn_id, None);
+        assert_eq!(payload.agent_id, None);
+    }
+
+    #[test]
+    fn tool_completed_payload_captures_codex_turn_and_agent_id() {
+        let json = r#"{"session_id": "sess-1", "tool_name": "Bash", "turn_id": "turn-1", "agent_id": "sub-1"}"#;
+        let payload: ToolCompletedPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(payload.agent_id.as_deref(), Some("sub-1"));
+    }
+
+    #[test]
+    fn turn_completed_payload_captures_codex_turn_and_agent_id() {
+        let json = r#"{"session_id": "sess-1", "turn_id": "turn-1", "agent_id": "sub-1"}"#;
+        let payload: TurnCompletedPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(payload.agent_id.as_deref(), Some("sub-1"));
     }
 }

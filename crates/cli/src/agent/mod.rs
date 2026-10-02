@@ -15,6 +15,7 @@
 //! compatibility.
 
 pub mod event;
+pub mod identity;
 pub mod normalize;
 pub mod payload;
 pub mod render;
