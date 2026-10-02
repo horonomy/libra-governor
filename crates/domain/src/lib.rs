@@ -25,12 +25,22 @@
 //! [`TaskIdentity`], not a session or a token, is the anchor every other
 //! type in this crate attaches to. See
 //! `docs/adr/0002-task-not-session-as-economic-unit.md` for why.
+//!
+//! # Economic attribution ("who owns this economic fact")
+//!
+//! [`EconomicAttribution`]/[`EconomicEvent`] (HORO-1666) are Libra's own
+//! "who owns this economic fact" contract, built on top of — never
+//! duplicating — the shared [`ExecutionIdentity`] envelope. See
+//! `docs/adr/0007-economic-attribution-vs-execution-identity.md`.
 
 mod agent;
 mod business_context;
 mod capability;
 mod completion_contract;
 mod confidence;
+mod economic_attribution;
+mod economic_event;
+mod economic_rollup;
 mod estimate;
 mod execution_event;
 mod execution_identity;
@@ -60,6 +70,19 @@ pub use capability::{
 };
 pub use completion_contract::{CompletionContract, CompletionCriterion};
 pub use confidence::{Confidence, MIN_CLASS_SAMPLES};
+pub use economic_attribution::{
+    Attributed, DimensionKey, DimensionSource, EconomicAttribution, EconomicDimension,
+    GatewayRequestId, ModelRequest, OrganizationId, PrincipalId, ProvenParent, UnknownReason,
+    ECONOMIC_ATTRIBUTION_CONTRACT_VERSION,
+};
+pub use economic_event::{
+    EconomicEvent, EconomicEventError, EconomicEventId, EconomicScope, FactRole, ResourceBasis,
+    ResourceFact, TruthStrength, EXECUTION_CHAIN,
+};
+pub use economic_rollup::{
+    exclusive_spend, inclusive_spend, project, AgentLineage, Projection, RollupError, SpendTotals,
+    Subtotal,
+};
 pub use estimate::{Estimate, ESTIMATOR_VERSION};
 pub use execution_event::{ExecutionEvent, ExecutionEventKind};
 pub use execution_identity::{

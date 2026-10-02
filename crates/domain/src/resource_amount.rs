@@ -138,7 +138,7 @@ impl Headroom {
 /// The unit a [`ResourceAmount`] is measured in, without the value —
 /// useful for comparing/grouping amounts by kind before deciding whether
 /// they may be combined.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceKind {
     Usd,
