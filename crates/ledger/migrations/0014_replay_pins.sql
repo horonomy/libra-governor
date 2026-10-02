@@ -1,0 +1,31 @@
+-- HORO-1670: version-pinning substrate for counterfactual policy replay.
+--
+-- Counterfactual replay must pin the policy a decision was actually made
+-- under, plus the handful of version constants not already transitively
+-- carried inside `shadow_runtime_decisions.decision_json` (a
+-- `Shadow<RuntimeDecision>`, which already embeds the policy schema
+-- version, estimator version, regime schema, feature schema, and pricing
+-- version via `RemainingWorkEstimate.regime`). `policy_json`/`pins_json`
+-- close the remaining gap: the recorded `Policy` itself (needed to build
+-- an apples-to-apples counterfactual `PolicyPresetInputs`), and the 4
+-- constants `ReplayPins` cannot derive from the recorded decision alone
+-- (`economic_attribution_contract_version`, `execution_identity_envelope_version`,
+-- `resource_account_schema_version`, `reservation_schema_version`).
+--
+-- Nullable, additive -- same pattern as `0008_plan_admission.sql`
+-- (`admission_json`) and `0012_receipt_regime.sql` (`regime_json`).
+-- Shadow decisions only began recording at all as of HORO-1669's daemon
+-- wiring (merged the same day this migration was authored), so pre-0014
+-- rows are, practically, every row recorded so far -- they honestly
+-- report `ReplayEligibility::Unpinned` at replay time, never a guessed
+-- policy or pin set.
+--
+-- Privacy: `Policy` (see `libra_governor_domain::policy` module docs)
+-- carries only numeric resource/time bounds, `ConstraintMode`/
+-- `AutonomyBoundary` enum tags, a `Confidence` tag, and
+-- `CompletionCriterion` descriptions (short, human-authored quality-floor
+-- labels, e.g. "all new code has passing unit tests") -- no prompt, tool
+-- output, or credential content, the same invariant `0001_init.sql`
+-- establishes for this schema as a whole.
+ALTER TABLE shadow_runtime_decisions ADD COLUMN policy_json TEXT;
+ALTER TABLE shadow_runtime_decisions ADD COLUMN pins_json TEXT;
