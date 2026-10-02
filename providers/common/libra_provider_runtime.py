@@ -257,12 +257,14 @@ def run_server(handler_cls: type[BaseProviderHandler], host: str, port: int, *, 
     """Starts `handler_cls` as a `ThreadingHTTPServer` on `host:port`.
     Refuses to start unless `host` is a loopback literal."""
     require_loopback_host(host, program_name=program_name)
+    # Accepted SonarCloud exception (python:S5332, "Using HTTP protocol is
+    # insecure"), same won't-fix precedent already recorded for
+    # libra_example_provider.py under HORO-1174: `require_loopback_host`
+    # above is the actual, test-covered security boundary. A provider
+    # built on this runtime speaks plain HTTP deliberately because it can
+    # never bind a network-reachable interface — see
+    # `providers/README.md`'s "Accepted exception" section.
     server = ThreadingHTTPServer((host, port), handler_cls)
-    # Deliberately no "http://" in this message: it's a log line, not a
-    # URL anyone follows, and a literal scheme prefix here is exactly the
-    # substring a naive static scanner flags as "plain HTTP in use" even
-    # though require_loopback_host (above) is the actual, already-tested
-    # security boundary for that choice.
     print(f"[{program_name}] listening on {host}:{port} (plain HTTP, loopback-only — see require_loopback_host)")
     try:
         server.serve_forever()

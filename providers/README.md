@@ -17,6 +17,23 @@ the wire is unchanged, only its implementation now shares one copy of
 that logic instead of keeping a second. The adapters here are real,
 usable providers backed by a real external system.
 
+## Accepted exception: plain HTTP, no TLS (python:S5332)
+
+`providers/common/libra_provider_runtime.py` (and every provider built on
+it) speaks plain HTTP, not HTTPS, on its inbound loopback surface. This
+is the same reviewed and accepted SonarCloud exception already recorded
+for `libra_example_provider.py` under HORO-1174 (see
+`examples/local-providers/README.md`'s own "Accepted exception"
+section), extended to this shared runtime now that the HMAC/loopback
+logic lives there: `--host` is hard-validated to a loopback literal
+(`require_loopback_host`, exercised by
+`providers/common/test_libra_provider_runtime.py`'s
+`RequireLoopbackHostTest`) so a provider built on this runtime can never
+bind a network-reachable interface. Real TLS here would require the
+daemon's own extension HTTP client to trust a self-signed loopback
+certificate — the same materially larger, out-of-scope change HORO-1174
+already declined for the same reason.
+
 ## Layout
 
 ```
