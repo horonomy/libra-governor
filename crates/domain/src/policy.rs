@@ -922,6 +922,68 @@ fn scale_secs(secs: u64, factor: f64) -> u64 {
     ((secs as f64) * factor).round() as u64
 }
 
+/// The human-readable preset names [`preset_by_name`] accepts — the
+/// single source of truth for "which named presets exist" (HORO-1670).
+/// `crates/daemon::config_file::resolve_policy` and counterfactual policy
+/// replay both resolve a preset name through this list rather than each
+/// keeping their own copy of the match arms, so the two can never
+/// silently drift apart.
+pub const NAMED_PRESETS: [&str; 4] = ["balanced", "deadline_first", "cost_first", "strict_budget"];
+
+/// Why [`preset_by_name`] could not produce a [`Policy`] — distinct from
+/// [`PolicyValidationError`] (a known preset name whose compiled-out
+/// `Policy` was still somehow invalid, which the four shipped presets
+/// never produce in practice) versus an unrecognized name entirely.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum PresetError {
+    #[error("unknown policy preset {name:?} (known presets: {known:?})")]
+    UnknownPreset {
+        name: String,
+        known: &'static [&'static str],
+    },
+    #[error(transparent)]
+    Invalid(#[from] PolicyValidationError),
+}
+
+/// Compiles a named preset ([`NAMED_PRESETS`]) against task-specific
+/// [`PolicyPresetInputs`] — the single source of truth both the daemon's
+/// own config resolution and counterfactual policy replay call, so a
+/// recorded policy can always be reproduced from `(preset name, inputs)`
+/// without a second, independently-maintained match arm (HORO-1670).
+pub fn preset_by_name(name: &str, inputs: PolicyPresetInputs) -> Result<Policy, PresetError> {
+    let policy = match name {
+        "balanced" => Policy::balanced(inputs),
+        "deadline_first" => Policy::deadline_first(inputs),
+        "cost_first" => Policy::cost_first(inputs),
+        "strict_budget" => Policy::strict_budget(inputs),
+        other => {
+            return Err(PresetError::UnknownPreset {
+                name: other.to_string(),
+                known: &NAMED_PRESETS,
+            })
+        }
+    };
+    Ok(policy?)
+}
+
+impl PolicyPresetInputs {
+    /// Recovers the task-specific inputs a recorded [`Policy`] was
+    /// compiled from (HORO-1670) — the inverse of [`preset_by_name`].
+    /// Exact for all four shipped presets: each passes `resource_target`
+    /// straight through to [`ResourceBound::target`] and
+    /// `time_target_secs` straight through to [`TimeBound::target_secs`]
+    /// with no transformation (see each preset's doc comment) — recovering
+    /// a counterfactual's inputs from a historical policy is therefore
+    /// lossless, never a reconstruction/approximation.
+    pub fn from_recorded_policy(policy: &Policy) -> Self {
+        PolicyPresetInputs {
+            resource_target: policy.resource.target,
+            time_target_secs: policy.time.target_secs,
+            quality_floor: policy.quality_floor.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

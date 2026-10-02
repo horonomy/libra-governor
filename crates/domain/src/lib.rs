@@ -103,9 +103,10 @@ pub use execution_receipt::{ExecutionReceipt, ReservationEvidence};
 pub use external_approval::{apply_external_approval, ExternalApproval, ExternalVerdict};
 pub use outcome_attestation::{AttestationSource, OutcomeAttestation};
 pub use policy::{
-    Admission, ApprovalRequest, AutonomyBoundary, ConstraintMode, ConstraintOutcome, DenyReason,
-    Policy, PolicyDecision, PolicyEvaluationError, PolicyPresetInputs, PolicyValidationError,
-    ResourceBound, TimeBound, POLICY_SCHEMA_VERSION,
+    preset_by_name, Admission, ApprovalRequest, AutonomyBoundary, ConstraintMode,
+    ConstraintOutcome, DenyReason, Policy, PolicyDecision, PolicyEvaluationError,
+    PolicyPresetInputs, PolicyValidationError, PresetError, ResourceBound, TimeBound,
+    NAMED_PRESETS, POLICY_SCHEMA_VERSION,
 };
 pub use progressive::{
     propose_runtime_decision, replan_cost_benefit_from_remaining, Feasibility, FeasibilityBound,

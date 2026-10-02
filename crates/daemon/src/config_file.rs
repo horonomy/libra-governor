@@ -44,8 +44,8 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use libra_governor_domain::{
-    CompletionContract, CompletionCriterion, Policy, PolicyPresetInputs, PolicyValidationError,
-    ResourceAmount,
+    preset_by_name, CompletionContract, CompletionCriterion, Policy, PolicyPresetInputs,
+    PolicyValidationError, PresetError, ResourceAmount,
 };
 use libra_governor_gateway::config::{GatewayConfig, GatewayCredentialMode};
 use libra_governor_gateway::credential::CredentialCommand;
@@ -54,10 +54,6 @@ use serde::Deserialize;
 /// The file name resolved under the daemon's state directory (see
 /// `crates/daemon/src/paths.rs`). Not itself TOML — see module docs.
 pub const CONFIG_FILE_NAME: &str = "config.json";
-
-/// The four preset names [`Policy`] exposes, exactly as spelled in
-/// `crates/domain/src/policy.rs`'s doc comments and `Policy::name`.
-const KNOWN_PRESETS: [&str; 4] = ["balanced", "deadline_first", "cost_first", "strict_budget"];
 
 /// Same resource/time targets `crates/daemon::default_admission_policy`
 /// hardcodes, reused here as this config surface's own defaults so a
@@ -80,7 +76,7 @@ pub enum ConfigFileError {
     },
     #[error(
         "unknown policy preset {preset:?} (expected one of: {})",
-        KNOWN_PRESETS.join(", ")
+        libra_governor_domain::NAMED_PRESETS.join(", ")
     )]
     UnknownPreset { preset: String },
     #[error("[policy] preset {preset:?} rejected its inputs: {source}")]
@@ -257,21 +253,13 @@ fn resolve_policy(raw: RawPolicyConfig) -> Result<Policy, ConfigFileError> {
             "required verification (tests/build/lint) passes",
         )]),
     };
-    let build = |source: Result<Policy, PolicyValidationError>| {
-        source.map_err(|source| ConfigFileError::InvalidPolicy {
+    preset_by_name(&raw.preset, inputs).map_err(|err| match err {
+        PresetError::UnknownPreset { name, .. } => ConfigFileError::UnknownPreset { preset: name },
+        PresetError::Invalid(source) => ConfigFileError::InvalidPolicy {
             preset: raw.preset.clone(),
             source,
-        })
-    };
-    match raw.preset.as_str() {
-        "balanced" => build(Policy::balanced(inputs)),
-        "deadline_first" => build(Policy::deadline_first(inputs)),
-        "cost_first" => build(Policy::cost_first(inputs)),
-        "strict_budget" => build(Policy::strict_budget(inputs)),
-        other => Err(ConfigFileError::UnknownPreset {
-            preset: other.to_string(),
-        }),
-    }
+        },
+    })
 }
 
 fn resolve_gateway(raw: RawGatewayConfig) -> Result<GatewayConfig, ConfigFileError> {
