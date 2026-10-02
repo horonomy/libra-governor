@@ -5,10 +5,8 @@ is made anywhere in this file.
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -76,37 +74,18 @@ class IsDoneTest(unittest.TestCase):
         self.assertFalse(jp.is_done({"fields": {}}, jp.DEFAULT_DONE_STATUSES))
 
 
-class ResolveTicketKeyTest(unittest.TestCase):
-    def test_cwd_must_match_workspace_root_exactly(self):
-        self.assertIsNone(jp.resolve_ticket_key("/some/other/path", "/tmp"))
+class ResolveTicketKeyReExportTest(unittest.TestCase):
+    """`resolve_ticket_key` itself is shared and fully tested in
+    `providers/common/test_libra_provider_runtime.py` (extracted there to
+    eliminate real, Sonar-flagged duplication between this adapter and
+    `libra_example_provider.py`). This is a thin smoke test confirming
+    the re-export this module relies on actually resolves to that same
+    function, not a second copy of its behavioral tests."""
 
-    def test_nonexistent_workspace_root_resolves_to_none(self):
-        self.assertIsNone(jp.resolve_ticket_key("/definitely/does/not/exist", "/definitely/does/not/exist"))
+    def test_is_the_same_function_object_as_the_shared_runtime_exports(self):
+        import libra_provider_runtime as runtime
 
-    def test_resolves_a_real_ticket_key_from_the_current_branch(self):
-        # Exercises the real `git` subprocess end to end, but against a
-        # disposable temp repo with a known branch name created here —
-        # not against this worktree's own branch, which is a detached
-        # HEAD under `actions/checkout`'s `pull_request` event in CI
-        # (`rev-parse --abbrev-ref HEAD` would return `HEAD`, not a
-        # ticket key, and the real-branch form of this test would then
-        # fail in CI while passing locally).
-        with tempfile.TemporaryDirectory() as repo_root:
-            env = {
-                **os.environ,
-                "GIT_AUTHOR_NAME": "test",
-                "GIT_AUTHOR_EMAIL": "test@example.invalid",
-                "GIT_COMMITTER_NAME": "test",
-                "GIT_COMMITTER_EMAIL": "test@example.invalid",
-            }
-            subprocess.run(
-                ["git", "init", "-q", "-b", "v0.0.3/HORO-1173/feat/example"], cwd=repo_root, check=True, env=env
-            )
-            subprocess.run(
-                ["git", "-C", repo_root, "commit", "--allow-empty", "-q", "-m", "init"], check=True, env=env
-            )
-            key = jp.resolve_ticket_key(repo_root, repo_root)
-        self.assertEqual(key, "HORO-1173")
+        self.assertIs(jp.resolve_ticket_key, runtime.resolve_ticket_key)
 
 
 class PushOutcomeTest(unittest.TestCase):

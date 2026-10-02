@@ -50,7 +50,6 @@ import argparse
 import base64
 import json
 import os
-import re
 import subprocess
 import sys
 import threading
@@ -63,6 +62,7 @@ from libra_provider_runtime import (  # noqa: E402
     BaseProviderHandler,
     ReplayGuard,
     require_readable_file,
+    resolve_ticket_key,
     run_server,
 )
 from safe_https_client import fetch_json, post_json, validate_https_base_url  # noqa: E402
@@ -70,7 +70,6 @@ from safe_https_client import fetch_json, post_json, validate_https_base_url  # 
 SCHEMA_VERSION = "libra.extension.v1"
 PROVIDER_ID = "jira"
 DEFAULT_DONE_STATUSES = frozenset({"Done", "Closed", "Resolved"})
-TICKET_KEY_PATTERN = re.compile(r"([A-Za-z]{2,10}-\d{1,6})")
 
 # The wire contract's `Priority` is a closed four-value enum
 # (`docs/api/libra-extension-v1.yaml`), not Jira's own priority
@@ -89,36 +88,6 @@ JIRA_PRIORITY_TO_WIRE_PRIORITY = {
     "Low": "low",
     "Lowest": "low",
 }
-
-
-def resolve_ticket_key(cwd: str, workspace_root: str) -> str | None:
-    """Resolves a Jira issue key from the real task's current branch name
-    (e.g. `v0.0.3/HORO-1173/feat/...` -> `HORO-1173`), the same real
-    mechanism `libra_example_provider.py` already proved for HORO-1174 —
-    including its exact fix for the SonarCloud command-injection/
-    filesystem-oracle findings that first design hit: `cwd` is request
-    input and is used **only as an equality selector** against
-    `workspace_root` (an operator-supplied CLI argument). The value that
-    actually reaches `os.path.isdir`/`git -C` is always `workspace_root`,
-    never the request's `cwd`."""
-    real_root = os.path.realpath(workspace_root)
-    if os.path.realpath(cwd) != real_root:
-        return None
-    if not os.path.isdir(real_root):
-        return None
-    try:
-        result = subprocess.run(
-            ["git", "-C", real_root, "rev-parse", "--abbrev-ref", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired, ValueError):
-        return None
-    if result.returncode != 0:
-        return None
-    match = TICKET_KEY_PATTERN.search(result.stdout.strip())
-    return match.group(1).upper() if match else None
 
 
 def _basic_auth_header(email: str, api_token: str) -> str:
@@ -285,7 +254,8 @@ class JiraProviderHandler(BaseProviderHandler):
             issue = fetch_jira_issue(
                 self.jira_base_url, issue_key, self.auth_header, allow_private_network=self.allow_private_network
             )
-        except Exception as exc:  # noqa: BLE001 — any fetch failure degrades to minimal response, never raises
+        # Any fetch failure degrades to minimal response, never raises.
+        except Exception as exc:  # noqa: BLE001
             self.log_message("business-context: task=%s issue=%s fetch failed: %s", task_id, issue_key, exc)
             self._respond_json(200, {"schema_version": SCHEMA_VERSION, "provider_id": PROVIDER_ID})
             return
@@ -323,7 +293,8 @@ class JiraProviderHandler(BaseProviderHandler):
                 allow_private_network=self.allow_private_network,
             )
             self.log_message("write-back: task=%s issue=%s -> status=%s", task_id, issue_key, result.status)
-        except Exception as exc:  # noqa: BLE001 — write-back is best-effort, never raises into the handler
+        # Write-back is best-effort and must never raise into the handler.
+        except Exception as exc:  # noqa: BLE001
             self.log_message("write-back: task=%s issue=%s failed: %s", task_id, issue_key, exc)
 
 
