@@ -29,9 +29,10 @@
 //! rather than double-applying the effect.
 
 use libra_governor_domain::{
-    CompletionReserveBasis, CompletionReserveEstimate, Headroom, PlanId, Policy, Reservation,
-    ReservationClass, ReservationEvidence, ReservationId, ReservationState, ResourceAmount,
-    ResourceKind, TaskBudget, TaskId, RESERVATION_SCHEMA_VERSION,
+    AccountId, CompletionReserveBasis, CompletionReserveEstimate, Headroom, LeaseKind, PlanId,
+    Policy, Reservation, ReservationClass, ReservationEvidence, ReservationId, ReservationState,
+    ResourceAmount, ResourceKind, TaskBudget, TaskId, RESERVATION_SCHEMA_VERSION,
+    RESOURCE_ACCOUNT_SCHEMA_VERSION,
 };
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use time::format_description::well_known::Rfc3339;
@@ -155,7 +156,7 @@ fn row_to_budget(task_id: TaskId, row: BudgetRow) -> Result<TaskBudget, LedgerEr
 
 /// Raw `reservations` row shape.
 #[allow(clippy::type_complexity)]
-type ReservationRow = (
+pub(crate) type ReservationRow = (
     String,         // id
     String,         // task_id
     String,         // session_id
@@ -172,9 +173,23 @@ type ReservationRow = (
     String,         // expires_at
     Option<String>, // settled_at
     Option<String>, // released_at
+    Option<String>, // account_id
+    Option<String>, // grants_account_id
+    Option<String>, // lease_kind
+    bool,           // settled_after_expiry
+    bool,           // legacy_pre_0011
 );
 
-fn row_to_reservation(row: ReservationRow) -> Result<Reservation, LedgerError> {
+/// Columns every full `reservations` read selects, in the order
+/// [`row_to_reservation`] expects — kept as one constant so every call
+/// site stays in sync with the row shape above.
+pub(crate) const RESERVATION_COLUMNS: &str =
+    "id, task_id, session_id, plan_id, class, resource_kind, amount,
+     drawn_from_reserve, state, settled_amount, usage_known,
+     idempotency_key, created_at, expires_at, settled_at, released_at,
+     account_id, grants_account_id, lease_kind, settled_after_expiry, legacy_pre_0011";
+
+pub(crate) fn row_to_reservation(row: ReservationRow) -> Result<Reservation, LedgerError> {
     let (
         id,
         task_id,
@@ -192,25 +207,39 @@ fn row_to_reservation(row: ReservationRow) -> Result<Reservation, LedgerError> {
         expires_at,
         settled_at,
         released_at,
+        account_id,
+        grants_account_id,
+        lease_kind,
+        settled_after_expiry,
+        legacy_pre_0011,
     ) = row;
     let resource_kind = kind_from_str(&resource_kind)?;
+    let invalid = || LedgerError::Sqlite(rusqlite::Error::InvalidQuery);
+    let task_id = TaskId(uuid::Uuid::parse_str(&task_id).map_err(|_| invalid())?);
+    // Pre-0011 rows have NULL account_id/lease_kind: the migration backfill
+    // sets both for every existing row, but a defensive fallback keeps this
+    // reader correct even against a row written outside that backfill.
+    let account_id = account_id
+        .map(|s| uuid::Uuid::parse_str(&s).map(AccountId))
+        .transpose()
+        .map_err(|_| invalid())?
+        .unwrap_or_else(|| AccountId::for_task(task_id));
+    let grants_account = grants_account_id
+        .map(|s| uuid::Uuid::parse_str(&s).map(AccountId))
+        .transpose()
+        .map_err(|_| invalid())?;
+    let lease_kind = lease_kind
+        .as_deref()
+        .and_then(LeaseKind::parse)
+        .unwrap_or(LeaseKind::WorkHold);
     Ok(Reservation {
-        id: ReservationId(
-            uuid::Uuid::parse_str(&id)
-                .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?,
-        ),
-        task_id: TaskId(
-            uuid::Uuid::parse_str(&task_id)
-                .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?,
-        ),
+        id: ReservationId(uuid::Uuid::parse_str(&id).map_err(|_| invalid())?),
+        task_id,
         session_id,
         plan_id: plan_id
-            .map(|s| {
-                uuid::Uuid::parse_str(&s)
-                    .map(PlanId)
-                    .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))
-            })
-            .transpose()?,
+            .map(|s| uuid::Uuid::parse_str(&s).map(PlanId))
+            .transpose()
+            .map_err(|_| invalid())?,
         class: class_from_str(&class)?,
         amount: ResourceAmount::from_kind_f64(resource_kind, amount),
         drawn_from_reserve: ResourceAmount::from_kind_f64(resource_kind, drawn_from_reserve),
@@ -222,7 +251,39 @@ fn row_to_reservation(row: ReservationRow) -> Result<Reservation, LedgerError> {
         expires_at: parse_time(&expires_at)?,
         settled_at: settled_at.map(|s| parse_time(&s)).transpose()?,
         released_at: released_at.map(|s| parse_time(&s)).transpose()?,
+        account_id,
+        grants_account,
+        lease_kind,
+        settled_after_expiry,
+        legacy_pre_0011,
     })
+}
+
+#[allow(clippy::type_complexity)]
+pub(crate) fn read_reservation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReservationRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
+        row.get(14)?,
+        row.get(15)?,
+        row.get(16)?,
+        row.get(17)?,
+        row.get(18)?,
+        row.get(19)?,
+        row.get(20)?,
+    ))
 }
 
 /// Request to reserve resource capacity (HORO-1141). See
@@ -353,6 +414,29 @@ impl LedgerStore {
                 now_str,
             ],
         )?;
+        // The task-level resource account (HORO-1668): deterministic id
+        // (`AccountId::for_task`), task-vs-other-level capacity lives in
+        // `task_budgets` not here (see migration 0011's CHECK constraint
+        // and `v_account_capacity`). Must exist before `reserve()` can
+        // insert a reservation row carrying this task's `account_id`
+        // (FK-enforced).
+        tx.execute(
+            "INSERT INTO resource_accounts (
+                account_id, level, parent_account_id, resource_kind, natural_key, task_id,
+                granted_capacity, protected_reserve, funding_lease_id, authority_source,
+                enforcement_scope, provider_lineage_status, execution_dimension_key_json,
+                provenance, account_schema_version, state, created_at, updated_at, closed_at
+             ) VALUES (?1, 'task', NULL, ?2, ?3, ?3, NULL, NULL, NULL, 'local_user_config',
+                       'local_device', NULL, NULL, 'native', ?4, 'open', ?5, ?5, NULL)
+             ON CONFLICT(account_id) DO NOTHING",
+            rusqlite::params![
+                AccountId::for_task(task_id).to_string(),
+                kind_to_str(resource_kind),
+                task_id.to_string(),
+                RESOURCE_ACCOUNT_SCHEMA_VERSION,
+                now_str,
+            ],
+        )?;
         let row: BudgetRow = tx.query_row(
             "SELECT resource_kind, hard_limit, initial_completion_reserve, completion_reserve,
                     completion_reserve_basis, policy_json, policy_schema_version,
@@ -462,31 +546,12 @@ impl LedgerStore {
 
         let existing: Option<ReservationRow> = tx
             .query_row(
-                "SELECT id, task_id, session_id, plan_id, class, resource_kind, amount,
-                        drawn_from_reserve, state, settled_amount, usage_known,
-                        idempotency_key, created_at, expires_at, settled_at, released_at
-                 FROM reservations WHERE task_id = ?1 AND idempotency_key = ?2",
+                &format!(
+                    "SELECT {RESERVATION_COLUMNS}
+                     FROM reservations WHERE task_id = ?1 AND idempotency_key = ?2"
+                ),
                 rusqlite::params![req.task_id.to_string(), req.idempotency_key],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                        row.get(9)?,
-                        row.get(10)?,
-                        row.get(11)?,
-                        row.get(12)?,
-                        row.get(13)?,
-                        row.get(14)?,
-                        row.get(15)?,
-                    ))
-                },
+                read_reservation_row,
             )
             .optional()?;
         if let Some(row) = existing {
@@ -588,12 +653,15 @@ impl LedgerStore {
 
         let id = ReservationId::new();
         let expires_at = req.now + time::Duration::seconds(req.ttl_secs as i64);
+        let account_id = AccountId::for_task(req.task_id);
         tx.execute(
             "INSERT INTO reservations (
                 id, task_id, session_id, plan_id, class, resource_kind, amount,
                 drawn_from_reserve, state, settled_amount, usage_known, idempotency_key,
-                created_at, expires_at, settled_at, released_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', NULL, NULL, ?9, ?10, ?11, NULL, NULL)",
+                created_at, expires_at, settled_at, released_at,
+                account_id, grants_account_id, lease_kind, settled_after_expiry, legacy_pre_0011
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', NULL, NULL, ?9, ?10, ?11, NULL, NULL,
+                       ?12, NULL, 'work_hold', 0, 0)",
             rusqlite::params![
                 id.0.to_string(),
                 req.task_id.to_string(),
@@ -606,6 +674,7 @@ impl LedgerStore {
                 req.idempotency_key,
                 rfc3339(req.now)?,
                 rfc3339(expires_at)?,
+                account_id.to_string(),
             ],
         )?;
         tx.commit()?;
@@ -626,6 +695,11 @@ impl LedgerStore {
             expires_at,
             settled_at: None,
             released_at: None,
+            account_id,
+            grants_account: None,
+            lease_kind: LeaseKind::WorkHold,
+            settled_after_expiry: false,
+            legacy_pre_0011: false,
         })))
     }
 
@@ -635,31 +709,22 @@ impl LedgerStore {
     ) -> Result<Option<Reservation>, LedgerError> {
         let row: Option<ReservationRow> = tx
             .query_row(
-                "SELECT id, task_id, session_id, plan_id, class, resource_kind, amount,
-                        drawn_from_reserve, state, settled_amount, usage_known,
-                        idempotency_key, created_at, expires_at, settled_at, released_at
-                 FROM reservations WHERE id = ?1",
+                &format!("SELECT {RESERVATION_COLUMNS} FROM reservations WHERE id = ?1"),
                 [id.0.to_string()],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                        row.get(9)?,
-                        row.get(10)?,
-                        row.get(11)?,
-                        row.get(12)?,
-                        row.get(13)?,
-                        row.get(14)?,
-                        row.get(15)?,
-                    ))
-                },
+                read_reservation_row,
+            )
+            .optional()?;
+        row.map(row_to_reservation).transpose()
+    }
+
+    /// Reads one reservation/lease row by id, outside any transaction.
+    pub fn get_reservation(&self, id: ReservationId) -> Result<Option<Reservation>, LedgerError> {
+        let row: Option<ReservationRow> = self
+            .conn
+            .query_row(
+                &format!("SELECT {RESERVATION_COLUMNS} FROM reservations WHERE id = ?1"),
+                [id.0.to_string()],
+                read_reservation_row,
             )
             .optional()?;
         row.map(row_to_reservation).transpose()
@@ -694,7 +759,19 @@ impl LedgerStore {
             tx.commit()?;
             return Ok(SettleOutcome::NotFound);
         };
-        if reservation.state != ReservationState::Active {
+        // Late settlement (HORO-1668): a reservation reclaimed by
+        // `expire_stale_reservations`/cascade expiry that THEN reports a
+        // real actual cost must not have that cost silently discarded —
+        // its capacity was already reclaimed at expiry time, so this path
+        // never re-touches `completion_reserve`/account capacity, only
+        // records the real spend as evidence (surfacing a visible overrun
+        // when it exceeds the already-expired reservation's amount,
+        // exactly like an ordinary overrun — never clamped, never
+        // dropped). `Released` stays genuinely final: a release means the
+        // caller itself declared the work never happened, so there is no
+        // "late actual" to honor.
+        let late_after_expiry = reservation.state == ReservationState::Expired;
+        if reservation.state != ReservationState::Active && !late_after_expiry {
             tx.commit()?;
             return Ok(SettleOutcome::AlreadyFinal(Box::new(reservation)));
         }
@@ -712,13 +789,31 @@ impl LedgerStore {
             None => (reservation.amount.as_f64(), false),
         };
         let refund = (reservation.amount.as_f64() - settled_value).max(0.0);
-        let restore = refund.min(reservation.drawn_from_reserve.as_f64());
+        // A late settlement's `drawn_from_reserve` was already restored by
+        // the expiry path, so it restores nothing further here.
+        let restore = if late_after_expiry {
+            0.0
+        } else {
+            refund.min(reservation.drawn_from_reserve.as_f64())
+        };
 
+        let expected_prior_state = if late_after_expiry {
+            "expired"
+        } else {
+            "active"
+        };
         let updated = tx.execute(
             "UPDATE reservations SET state = 'settled', settled_amount = ?1, usage_known = ?2,
-                                      settled_at = ?3
-             WHERE id = ?4 AND state = 'active'",
-            rusqlite::params![settled_value, usage_known, rfc3339(now)?, id.0.to_string()],
+                                      settled_at = ?3, settled_after_expiry = ?4
+             WHERE id = ?5 AND state = ?6",
+            rusqlite::params![
+                settled_value,
+                usage_known,
+                rfc3339(now)?,
+                late_after_expiry,
+                id.0.to_string(),
+                expected_prior_state,
+            ],
         )?;
         if updated == 0 {
             // Lost a race against a concurrent settle/release/expire on
@@ -901,6 +996,28 @@ impl LedgerStore {
                     ],
                 )?;
             }
+            // Cascade: a `subaccount_funding` lease expiring reclaims the
+            // child account it funded. Because `grant_sublease` clamps a
+            // child's TTL to never exceed its own parent's funding
+            // lease's expiry, every lease in a subtree rooted at an
+            // expired funding lease has an `expires_at` that already
+            // falls at or before `now` too — so this same `expires_at <=
+            // now` sweep independently reaches every level of the
+            // subtree in one pass, "deepest" and "shallowest" alike,
+            // without a separate recursive walk. Marking the account
+            // `expired` here (rather than only the lease row) is what
+            // makes `grant_sublease`/`reserve_in_account` against it
+            // refuse further activity.
+            if reservation.lease_kind == libra_governor_domain::LeaseKind::SubaccountFunding {
+                if let Some(child_account_id) = reservation.grants_account {
+                    tx.execute(
+                        "UPDATE resource_accounts SET state = 'expired', closed_at = ?1,
+                                                       updated_at = ?1
+                         WHERE account_id = ?2 AND state = 'open'",
+                        rusqlite::params![now_str, child_account_id.to_string()],
+                    )?;
+                }
+            }
             expired.push(Self::get_reservation_tx(&tx, id)?.expect("just updated"));
         }
         tx.commit()?;
@@ -1013,32 +1130,26 @@ impl LedgerStore {
     /// Returns every reservation recorded for `task_id`, most recent
     /// first.
     pub fn reservations_for_task(&self, task_id: TaskId) -> Result<Vec<Reservation>, LedgerError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, task_id, session_id, plan_id, class, resource_kind, amount,
-                    drawn_from_reserve, state, settled_amount, usage_known,
-                    idempotency_key, created_at, expires_at, settled_at, released_at
-             FROM reservations WHERE task_id = ?1 ORDER BY created_at DESC",
-        )?;
-        let rows = stmt.query_map([task_id.to_string()], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-                row.get(7)?,
-                row.get(8)?,
-                row.get(9)?,
-                row.get(10)?,
-                row.get(11)?,
-                row.get(12)?,
-                row.get(13)?,
-                row.get(14)?,
-                row.get(15)?,
-            ))
-        })?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {RESERVATION_COLUMNS}
+             FROM reservations WHERE task_id = ?1 ORDER BY created_at DESC"
+        ))?;
+        let rows = stmt.query_map([task_id.to_string()], read_reservation_row)?;
+        rows.map(|r| row_to_reservation(r?)).collect()
+    }
+
+    /// Returns every reservation (both `work_hold` and
+    /// `subaccount_funding`) held directly against `account_id`, most
+    /// recent first.
+    pub fn reservations_for_account(
+        &self,
+        account_id: AccountId,
+    ) -> Result<Vec<Reservation>, LedgerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {RESERVATION_COLUMNS}
+             FROM reservations WHERE account_id = ?1 ORDER BY created_at DESC"
+        ))?;
+        let rows = stmt.query_map([account_id.to_string()], read_reservation_row)?;
         rows.map(|r| row_to_reservation(r?)).collect()
     }
 

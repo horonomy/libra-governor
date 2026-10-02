@@ -28,6 +28,7 @@ mod gateway;
 mod migrations;
 mod query;
 mod reservation;
+mod resource_account;
 mod session;
 mod store;
 mod write;
@@ -42,6 +43,9 @@ pub use query::{
 };
 pub use reservation::{
     AdjustOutcome, ReleaseOutcome, ReserveOutcome, ReserveRequest, SettleOutcome,
+};
+pub use resource_account::{
+    AccountError, EnsureAccountOutcome, GrantSubleaseOutcome, GrantSubleaseRequest,
 };
 pub use store::LedgerStore;
 pub use write::DOGFOOD_PROFILE_ENV_VAR;

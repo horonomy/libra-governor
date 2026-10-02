@@ -31,7 +31,8 @@ use uuid::Uuid;
 
 use crate::{
     completion_contract::CompletionContract, estimate::Estimate, execution_plan::PlanId,
-    policy::Policy, resource_amount::ResourceAmount, task_identity::TaskId,
+    policy::Policy, resource_account::AccountId, resource_amount::ResourceAmount,
+    task_identity::TaskId,
 };
 
 /// Traceability tag every produced [`Reservation`]/[`TaskBudget`] is
@@ -79,6 +80,36 @@ pub enum ReservationClass {
     /// Reserve — the enforcement half of "Completion Reserve has higher
     /// priority than optional activity."
     OptionalWork,
+}
+
+/// What a lease (HORO-1668) funds: ordinary work held against its own
+/// account, or capacity handed down to fund a child account. Funding
+/// leases are excluded from a parent's `exclusive` spend (see
+/// `libra_governor_domain::economic_rollup` — that money belongs to the
+/// child) and are only ever settled up as a whole, never with a
+/// caller-supplied actual (see `libra_governor_ledger::resource_account::close_account`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseKind {
+    WorkHold,
+    SubaccountFunding,
+}
+
+impl LeaseKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LeaseKind::WorkHold => "work_hold",
+            LeaseKind::SubaccountFunding => "subaccount_funding",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "work_hold" => Some(LeaseKind::WorkHold),
+            "subaccount_funding" => Some(LeaseKind::SubaccountFunding),
+            _ => None,
+        }
+    }
 }
 
 /// The lifecycle state of one [`Reservation`] (HORO-1141).
@@ -135,6 +166,24 @@ pub struct Reservation {
     pub expires_at: OffsetDateTime,
     pub settled_at: Option<OffsetDateTime>,
     pub released_at: Option<OffsetDateTime>,
+    /// The account this lease is held against (HORO-1668). For a
+    /// pre-0011 row this equals `AccountId::for_task(task_id)` — the
+    /// migration's backfill makes this identity-preserving, never
+    /// guessed.
+    pub account_id: AccountId,
+    /// `Some` iff `lease_kind == SubaccountFunding`: the child account
+    /// this lease funds.
+    pub grants_account: Option<AccountId>,
+    pub lease_kind: LeaseKind,
+    /// Whether this lease settled after its `expires_at` had already
+    /// elapsed (and possibly after cascade expiry reclaimed its
+    /// account) — see [`crate::ResourceBasis`]-style discipline: a late
+    /// settlement never silently discards real spend, it surfaces as a
+    /// visible overrun instead.
+    pub settled_after_expiry: bool,
+    /// Whether this row predates HORO-1668's hierarchical accounts
+    /// (backfilled by migration 0011 at `account_id == task_id`).
+    pub legacy_pre_0011: bool,
 }
 
 impl Reservation {
@@ -410,6 +459,11 @@ mod tests {
             expires_at: now,
             settled_at: None,
             released_at: None,
+            account_id: AccountId::for_task(TaskId::new()),
+            grants_account: None,
+            lease_kind: LeaseKind::WorkHold,
+            settled_after_expiry: false,
+            legacy_pre_0011: false,
         };
         assert_eq!(base.outstanding_draw(), ResourceAmount::Tokens(200));
 
@@ -458,6 +512,11 @@ mod tests {
             expires_at: now,
             settled_at: Some(now),
             released_at: None,
+            account_id: AccountId::for_task(TaskId::new()),
+            grants_account: None,
+            lease_kind: LeaseKind::WorkHold,
+            settled_after_expiry: false,
+            legacy_pre_0011: false,
         };
         assert_eq!(reservation.overrun(), Some(ResourceAmount::Tokens(300)));
         assert_eq!(reservation.refunded(), None);
