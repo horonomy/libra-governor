@@ -54,6 +54,7 @@ mod policy;
 mod progressive;
 mod regime;
 mod replan;
+mod replay;
 mod reservation;
 mod resource_account;
 mod resource_amount;
@@ -103,9 +104,10 @@ pub use execution_receipt::{ExecutionReceipt, ReservationEvidence};
 pub use external_approval::{apply_external_approval, ExternalApproval, ExternalVerdict};
 pub use outcome_attestation::{AttestationSource, OutcomeAttestation};
 pub use policy::{
-    Admission, ApprovalRequest, AutonomyBoundary, ConstraintMode, ConstraintOutcome, DenyReason,
-    Policy, PolicyDecision, PolicyEvaluationError, PolicyPresetInputs, PolicyValidationError,
-    ResourceBound, TimeBound, POLICY_SCHEMA_VERSION,
+    preset_by_name, Admission, ApprovalRequest, AutonomyBoundary, ConstraintMode,
+    ConstraintOutcome, DenyReason, Policy, PolicyDecision, PolicyEvaluationError,
+    PolicyPresetInputs, PolicyValidationError, PresetError, ResourceBound, TimeBound,
+    NAMED_PRESETS, POLICY_SCHEMA_VERSION,
 };
 pub use progressive::{
     propose_runtime_decision, replan_cost_benefit_from_remaining, Feasibility, FeasibilityBound,
@@ -127,6 +129,14 @@ pub use replan::{
     ReplanId, ReplanReason, ReplanRecord, ReplanTier, ReplanTriggerKind,
     ABSOLUTE_TOOL_CALL_COUNT_FALLBACK, DEFAULT_LOOP_STREAK_THRESHOLD,
     DETERMINISTIC_WIDENING_FACTOR, REPLAN_SCHEMA_VERSION, TOOL_CALL_COUNT_MATERIAL_MULTIPLIER,
+};
+pub use replay::{
+    aggregate_regret, replay_point, replay_trajectory, AggregateRegret, AggregationError,
+    AlternateOutcomeEffect, CounterfactualDecision, DecisionPoint, DimensionVerdict, Disagreement,
+    DisagreementCounts, FirstRefusal, PersistedPins, PinComparison, PinDimension, PinDrift,
+    PolicyComparison, PostHocRegret, ReplayDimension, ReplayEligibility, ReplayNoBasis, ReplayPins,
+    ReplayedAdmission, ResourceNoBasis, ResourceProjection, TimeProjection, TrajectoryRegret,
+    UnpinnedReason, MIN_REPLAY_SAMPLES, REPLAY_PINS_SCHEMA_VERSION,
 };
 pub use reservation::{
     completion_reserve_for, CompletionReserveBasis, CompletionReserveEstimate, LeaseKind,

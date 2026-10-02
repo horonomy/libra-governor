@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 use libra_governor_daemon::{recon::ReconBudget, DaemonConfig};
 use libra_governor_domain::{
-    CompletionContract, ExecutionOutcome, ExecutionPlan, ExecutionReceipt, ReplanHysteresisConfig,
-    TaskIdentity,
+    CompletionContract, ExecutionOutcome, ExecutionPlan, ExecutionReceipt, PersistedPins, Policy,
+    ReplanHysteresisConfig, RuntimeDecision, TaskIdentity, REPLAY_PINS_SCHEMA_VERSION,
 };
 use libra_governor_ledger::LedgerStore;
 use libra_governor_protocol::{
@@ -127,6 +127,21 @@ fn shadow_decision_count(ledger_path: &Path) -> i64 {
     .unwrap()
 }
 
+/// `(policy_json, pins_json, decision_json)` of the most recently
+/// recorded shadow decision (HORO-1670) — `policy_json`/`pins_json` must
+/// be present (non-NULL) once the daemon's `record_shadow_decision` call
+/// site passes them.
+fn shadow_decision_policy_and_pins(ledger_path: &Path) -> (Option<String>, Option<String>, String) {
+    let conn = rusqlite::Connection::open(ledger_path).unwrap();
+    conn.query_row(
+        "SELECT policy_json, pins_json, decision_json FROM shadow_runtime_decisions \
+         ORDER BY decided_at DESC LIMIT 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .unwrap()
+}
+
 /// The cadence gate firing alone (no loop/count material-event signal)
 /// must record exactly one `shadow_runtime_decisions` row and leave
 /// every mutating ledger table — `task_budgets`, `reservations`,
@@ -215,4 +230,26 @@ fn cadence_only_shadow_decision_never_mutates_existing_ledger_state() {
         1,
         "the cadence gate must have recorded exactly one shadow decision"
     );
+
+    let (policy_json, pins_json, decision_json) =
+        shadow_decision_policy_and_pins(&config.ledger_path);
+    let policy_json = policy_json
+        .expect("HORO-1670: the recorded policy must be persisted alongside the shadow decision");
+    let pins_json = pins_json.expect(
+        "HORO-1670: the replay version pins must be persisted alongside the shadow decision",
+    );
+
+    // End-to-end proof, not just presence: a real daemon-written row must
+    // decode cleanly through the exact path the HORO-1670 replay harness
+    // uses (`crates/daemon/examples/v003_replay.rs`) — `decision_json`
+    // straight into `RuntimeDecision` (relying on `Shadow<T>`'s
+    // `#[serde(transparent)]` serialization, never on giving `Shadow`
+    // itself a `Deserialize` impl), `policy_json` into `Policy`, and
+    // `pins_json` into `PersistedPins`.
+    let _: RuntimeDecision =
+        serde_json::from_str(&decision_json).expect("decision_json must decode as RuntimeDecision");
+    let _: Policy = serde_json::from_str(&policy_json).expect("policy_json must decode as Policy");
+    let pins: PersistedPins =
+        serde_json::from_str(&pins_json).expect("pins_json must decode as PersistedPins");
+    assert_eq!(pins.schema_version, REPLAY_PINS_SCHEMA_VERSION);
 }

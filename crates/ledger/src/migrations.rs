@@ -71,6 +71,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 13,
         sql: include_str!("../migrations/0013_shadow_runtime_decisions.sql"),
     },
+    Migration {
+        version: 14,
+        sql: include_str!("../migrations/0014_replay_pins.sql"),
+    },
 ];
 
 /// The highest migration version this build of the crate knows about

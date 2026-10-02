@@ -22,7 +22,7 @@
 
 use libra_governor_domain::{
     AccountCapacity, AccountId, AccountLevel, AccountProvenance, AccountState, AllocationAuthority,
-    EnforcementScope, Headroom, LeaseKind, NoSpendBasis, Reservation, ReservationId,
+    EnforcementScope, Headroom, LeaseKind, NoSpendBasis, Policy, Reservation, ReservationId,
     ResourceAccount, ResourceAmount, ResourceKind, SpendScope, SpendSoFar,
     RESOURCE_ACCOUNT_SCHEMA_VERSION,
 };
@@ -58,6 +58,23 @@ fn kind_from_str(s: &str) -> Result<ResourceKind, LedgerError> {
         "quota_percent" => Ok(ResourceKind::QuotaPercent),
         _ => Err(LedgerError::Sqlite(rusqlite::Error::InvalidQuery)),
     }
+}
+
+/// One row from `shadow_runtime_decisions`, decoded but not yet
+/// classified — `decision_json`/`policy_json`/`pins_json` are handed to
+/// `libra_governor_domain::replay` verbatim, since eligibility
+/// classification (`Unpinned`/`Drifted`/`Identical`) is pure domain logic,
+/// not a ledger concern. `policy_json`/`pins_json` are `None` for any row
+/// recorded before migration `0014`.
+#[derive(Debug, Clone)]
+pub struct RecordedShadowDecision {
+    pub task_id: libra_governor_domain::TaskId,
+    pub plan_id: libra_governor_domain::PlanId,
+    pub session_id: String,
+    pub decided_at: OffsetDateTime,
+    pub decision_json: String,
+    pub policy_json: Option<String>,
+    pub pins_json: Option<String>,
 }
 
 #[allow(clippy::type_complexity)]
@@ -679,6 +696,13 @@ impl LedgerStore {
     /// only `Shadow::summary()`'s non-addressable fields are used to
     /// populate the indexable columns, consistent with the type's own
     /// no-accessor guarantee.
+    /// `policy`/`pins` close the HORO-1670 version-pinning gap: the
+    /// recorded policy itself, plus the 4 version constants a recorded
+    /// decision cannot derive on its own. See
+    /// `libra_governor_domain::replay` module docs. Additive —
+    /// `policy_json`/`pins_json` (migration `0014`) are nullable, so a
+    /// row recorded before this change simply has `NULL` there, read back
+    /// as `ReplayEligibility::Unpinned`, never a guessed value.
     #[allow(clippy::too_many_arguments)]
     pub fn record_shadow_decision(
         &self,
@@ -689,17 +713,25 @@ impl LedgerStore {
         elapsed_secs: u64,
         tool_calls_total: u64,
         decided_at: OffsetDateTime,
+        policy: &Policy,
+        pins: &libra_governor_domain::PersistedPins,
     ) -> Result<(), LedgerError> {
         let summary = shadow.summary();
         let decision_json = serde_json::to_string(shadow).map_err(|e| {
+            LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+        })?;
+        let policy_json = serde_json::to_string(policy).map_err(|e| {
+            LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+        })?;
+        let pins_json = serde_json::to_string(pins).map_err(|e| {
             LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
         })?;
         self.conn.execute(
             "INSERT INTO shadow_runtime_decisions (
                 decision_id, task_id, plan_id, session_id, proposal_kind,
                 decision_json, decision_schema_version, elapsed_secs,
-                tool_calls_total, decided_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                tool_calls_total, decided_at, policy_json, pins_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT (task_id, plan_id, decided_at) DO NOTHING",
             rusqlite::params![
                 uuid::Uuid::new_v4().to_string(),
@@ -712,9 +744,89 @@ impl LedgerStore {
                 elapsed_secs,
                 tool_calls_total,
                 rfc3339(decided_at)?,
+                policy_json,
+                pins_json,
             ],
         )?;
         Ok(())
+    }
+
+    /// Every shadow decision recorded for `task_id`, ordered
+    /// `decided_at ASC` — one row is exactly one replay decision point
+    /// (HORO-1670). Returns the raw decoded columns; classifying
+    /// eligibility (`Unpinned`/`Drifted`/`Identical`) and assembling
+    /// [`libra_governor_domain::DecisionPoint`] is the pure domain
+    /// layer's job (`libra_governor_domain::replay`), not this ledger
+    /// query's — this function does no more than read rows back.
+    pub fn shadow_decisions_for_task(
+        &self,
+        task_id: libra_governor_domain::TaskId,
+    ) -> Result<Vec<RecordedShadowDecision>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT plan_id, session_id, decided_at, decision_json, policy_json, pins_json
+             FROM shadow_runtime_decisions
+             WHERE task_id = ?1
+             ORDER BY decided_at ASC",
+        )?;
+        let rows = stmt
+            .query_map([task_id.0.to_string()], |row| {
+                let plan_id: String = row.get(0)?;
+                let session_id: String = row.get(1)?;
+                let decided_at: String = row.get(2)?;
+                let decision_json: String = row.get(3)?;
+                let policy_json: Option<String> = row.get(4)?;
+                let pins_json: Option<String> = row.get(5)?;
+                Ok((
+                    plan_id,
+                    session_id,
+                    decided_at,
+                    decision_json,
+                    policy_json,
+                    pins_json,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        rows.into_iter()
+            .map(
+                |(plan_id, session_id, decided_at, decision_json, policy_json, pins_json)| {
+                    Ok(RecordedShadowDecision {
+                        task_id,
+                        plan_id: libra_governor_domain::PlanId(
+                            uuid::Uuid::parse_str(&plan_id)
+                                .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?,
+                        ),
+                        session_id,
+                        decided_at: parse_time(&decided_at)?,
+                        decision_json,
+                        policy_json,
+                        pins_json,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// Every distinct `task_id` with at least one recorded shadow
+    /// decision — the enumeration the HORO-1670 replay runner needs to
+    /// find what it can replay, since there is no dedicated "list all
+    /// tasks" query elsewhere in this crate.
+    pub fn shadow_decision_task_ids(
+        &self,
+    ) -> Result<Vec<libra_governor_domain::TaskId>, LedgerError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT task_id FROM shadow_runtime_decisions ORDER BY task_id")?;
+        let ids: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<_, _>>()?;
+        ids.into_iter()
+            .map(|s| {
+                uuid::Uuid::parse_str(&s)
+                    .map(libra_governor_domain::TaskId)
+                    .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))
+            })
+            .collect()
     }
 
     /// The most recent `decided_at` recorded for this task in
