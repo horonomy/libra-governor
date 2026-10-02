@@ -70,6 +70,86 @@ fn render_report(result: &libra_governor_protocol::CalibrationReportResult) -> S
         out.push_str(&render_admission(report));
     }
 
+    out.push_str("\nRegime-aware confidence (HORO-1671)\n------------------------------------\n");
+    out.push_str(&render_regime(&result.regime));
+
+    out
+}
+
+fn render_regime(report: &libra_governor_estimator::RegimeCalibrationReport) -> String {
+    use libra_governor_estimator::{ActiveRegimeStatus, ConfidenceChangeReason, DriftVerdict};
+
+    let mut out = String::new();
+    match &report.active {
+        ActiveRegimeStatus::Established { n, .. } => {
+            out.push_str(&format!("active regime: established, n={n}\n"));
+        }
+        ActiveRegimeStatus::NewRegime { superseded, .. } => {
+            out.push_str("active regime: new (no exact prior cohort)\n");
+            for epoch in superseded {
+                out.push_str(&format!(
+                    "  superseded cohort: n={}, differs on {:?}\n",
+                    epoch.n, epoch.differing
+                ));
+            }
+        }
+    }
+
+    out.push_str(&format!(
+        "confidence: {:?} (in-regime n={}, out-of-regime n={})\n",
+        report.confidence_basis.confidence,
+        report.confidence_basis.in_regime_n,
+        report.confidence_basis.out_of_regime_n
+    ));
+    match &report.confidence_basis.reason {
+        ConfidenceChangeReason::FullInRegimeEvidence => {
+            out.push_str("reason: full in-regime evidence\n");
+        }
+        ConfidenceChangeReason::RegimeChanged { differing } => {
+            out.push_str(&format!("reason: regime changed on {differing:?}\n"));
+        }
+        ConfidenceChangeReason::InsufficientInRegimeEvidence { n, required } => {
+            out.push_str(&format!(
+                "reason: insufficient in-regime evidence (n={n}, need >= {required})\n"
+            ));
+        }
+    }
+    out.push_str(&format!(
+        "out-of-regime data contributes at bounds_weight={}, confidence_weight={} (n={})\n",
+        report.out_of_regime.bounds_weight,
+        report.out_of_regime.confidence_weight,
+        report.out_of_regime.n
+    ));
+
+    match &report.drift {
+        DriftVerdict::InsufficientWindow { usable, required } => {
+            out.push_str(&format!(
+                "drift: insufficient window (usable={usable}, need >= {required})\n"
+            ));
+        }
+        DriftVerdict::Stable {
+            window,
+            exceedances,
+            rate,
+            ..
+        } => {
+            out.push_str(&format!(
+                "drift: stable (window={window}, exceedances={exceedances}, rate={rate:.2})\n"
+            ));
+        }
+        DriftVerdict::Drifting {
+            window,
+            exceedances,
+            rate,
+            ..
+        } => {
+            out.push_str(&format!(
+                "drift: DRIFTING (window={window}, exceedances={exceedances}, rate={rate:.2})\n"
+            ));
+        }
+    }
+
+    out.push_str(&format!("prior epochs: {}\n", report.epochs.len()));
     out
 }
 
@@ -188,6 +268,13 @@ mod tests {
                 outcome: AdmissionOutcome::Insufficient { n: 0, required: 1 },
             }],
             dropped_rows: 0,
+            regime: libra_governor_estimator::build_report(
+                &[],
+                &libra_governor_domain::RegimeKey::builder()
+                    .feature_schema("fs-v1")
+                    .build(),
+                libra_governor_domain::BucketTier::Global,
+            ),
         };
         let report = render_report(&result);
         assert!(report.contains("insufficient data: n=2"));
@@ -224,6 +311,13 @@ mod tests {
                 }),
             }],
             dropped_rows: 3,
+            regime: libra_governor_estimator::build_report(
+                &[],
+                &libra_governor_domain::RegimeKey::builder()
+                    .feature_schema("fs-v1")
+                    .build(),
+                libra_governor_domain::BucketTier::Global,
+            ),
         };
         let report = render_report(&result);
         assert!(report.contains("Dropped 3"));

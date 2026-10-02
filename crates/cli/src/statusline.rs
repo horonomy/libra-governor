@@ -111,6 +111,7 @@ mod tests {
             reason: None,
             feature_schema_version: "fs-v1".to_string(),
             bucket_tier: libra_governor_domain::BucketTier::Global,
+            regime: Default::default(),
         }
     }
 
