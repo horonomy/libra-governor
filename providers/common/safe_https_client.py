@@ -144,7 +144,17 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
     so certificate validation is unaffected by connecting to a raw IP."""
 
     def __init__(self, hostname: str, pinned_ip: str, port: int, *, timeout: float):
-        super().__init__(hostname, port, timeout=timeout, context=ssl.create_default_context())
+        context = ssl.create_default_context()
+        # Stated explicitly rather than relied on as create_default_context()'s
+        # implicit default: this connection dials a raw, pinned IP address
+        # rather than `hostname`, which is exactly the shape a static SSRF
+        # scanner expects to see a verification bypass in. There is none —
+        # certificate hostname verification against the real `hostname` (via
+        # `server_hostname` in `connect()` below) is mandatory here, not
+        # merely the unstated default.
+        context.check_hostname = True
+        context.verify_mode = ssl.CERT_REQUIRED
+        super().__init__(hostname, port, timeout=timeout, context=context)
         self._pinned_ip = pinned_ip
 
     def connect(self) -> None:
