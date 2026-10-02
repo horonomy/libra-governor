@@ -29,7 +29,8 @@
 //! [`MIN_CLASS_SAMPLES`] wins.
 
 use libra_governor_domain::{
-    BucketTier, Confidence, Estimate, ExecutionReceipt, ResourceAmount, ResourceKind, TaskFeatures,
+    BucketTier, Confidence, Estimate, ExecutionReceipt, RegimeBasis, RegimeKey, RegimeProvenance,
+    ResourceAmount, ResourceKind, TaskFeatures,
 };
 
 pub mod calibration;
@@ -37,6 +38,14 @@ pub use calibration::{
     admission_replay, duration_coverage, AdmissionOutcome, AdmissionPolicy, AdmissionStats,
     CostCoverage, CoverageReport, QuantileCoverage, Stratum, CALIBRATION_QUANTILES,
     REQUIRED_CALIBRATION_PAIRS,
+};
+
+pub mod regime;
+pub use regime::{
+    active_regime_status, build_report, confidence_basis, detect_drift, epochs_from_pairs,
+    ActiveRegimeStatus, CalibrationEpoch, ConfidenceBasis, ConfidenceChangeReason, DriftVerdict,
+    OutOfRegimeContribution, RegimeCalibrationReport, SupersededEpoch, DRIFT_EXCEEDANCE_THRESHOLD,
+    DRIFT_WINDOW, OUT_OF_REGIME_BOUNDS_WEIGHT, OUT_OF_REGIME_CONFIDENCE_WEIGHT,
 };
 
 /// Minimum number of same-task-class samples required to prefer the
@@ -63,12 +72,20 @@ pub fn estimate(
     global_receipts: &[ExecutionReceipt],
     class_receipts: Option<&[ExecutionReceipt]>,
 ) -> Estimate {
+    // The legacy entry point has no regime input of its own — pass the
+    // honest "pre-regime" provenance, which the positive-evidence rule
+    // treats as comparable to everything, preserving this function's
+    // pre-HORO-1671 confidence behavior exactly (see the regression test
+    // `todays_real_data_shape_produces_identical_confidence_to_pre_1671`
+    // in `regime.rs`).
+    let regime = RegimeProvenance::pre_regime_record();
     if let Some(class) = class_receipts {
         if class.len() >= MIN_CLASS_SAMPLES {
             return compute(
                 class,
                 BucketTier::Repo,
                 libra_governor_domain::FEATURE_SCHEMA_VERSION,
+                &regime,
             );
         }
     }
@@ -77,6 +94,7 @@ pub fn estimate(
             global_receipts,
             BucketTier::Global,
             libra_governor_domain::FEATURE_SCHEMA_VERSION,
+            &regime,
         );
     }
     Estimate::cold_start()
@@ -100,6 +118,7 @@ pub fn estimate(
 pub fn estimate_bucketed(
     history: &[(Option<TaskFeatures>, ExecutionReceipt)],
     current: &TaskFeatures,
+    current_regime: &RegimeProvenance,
 ) -> Estimate {
     for tier in bucket_ladder(current) {
         let bucketed: Vec<ExecutionReceipt> = history
@@ -108,17 +127,32 @@ pub fn estimate_bucketed(
             .map(|(_, receipt)| receipt.clone())
             .collect();
         if bucketed.len() >= MIN_CLASS_SAMPLES {
-            return compute(&bucketed, tier, &current.feature_schema_version);
+            return compute(
+                &bucketed,
+                tier,
+                &current.feature_schema_version,
+                current_regime,
+            );
         }
     }
 
     let global: Vec<ExecutionReceipt> = history.iter().map(|(_, r)| r.clone()).collect();
     if !global.is_empty() {
-        return compute(&global, BucketTier::Global, &current.feature_schema_version);
+        return compute(
+            &global,
+            BucketTier::Global,
+            &current.feature_schema_version,
+            current_regime,
+        );
     }
 
     let mut cold = Estimate::cold_start();
     cold.feature_schema_version = current.feature_schema_version.clone();
+    cold.regime = RegimeBasis {
+        provenance: current_regime.clone(),
+        in_regime_sample_count: 0,
+        out_of_regime_sample_count: 0,
+    };
     cold
 }
 
@@ -191,10 +225,19 @@ fn matches(tier: BucketTier, a: &TaskFeatures, b: &TaskFeatures) -> bool {
 /// an empty slice — callers route the empty case to
 /// [`Estimate::cold_start`] instead, so this function can assume at least
 /// one sample.
+/// Computes real quantiles over a non-empty sample set, and (HORO-1671)
+/// partitions it into in-/out-of-regime by [`RegimeKey::comparison`]
+/// against `current_regime`. Quantile bounds still pool every receipt
+/// (out-of-regime weight 1.0 — a bound exists at all rather than
+/// cold-starting on every regime change); `confidence` is computed via
+/// the UNCHANGED [`Confidence::from_evidence`], but now over the
+/// in-regime count only (out-of-regime weight 0.0 for confidence) — see
+/// `regime.rs` module docs for the full rationale.
 fn compute(
     receipts: &[ExecutionReceipt],
     bucket_tier: BucketTier,
     feature_schema_version: &str,
+    current_regime: &RegimeProvenance,
 ) -> Estimate {
     debug_assert!(!receipts.is_empty());
 
@@ -203,6 +246,16 @@ fn compute(
 
     let (resource_p50, resource_p80, resource_p90) = resource_quantiles(receipts);
 
+    let pre_regime = RegimeKey::pre_regime_record();
+    let in_regime_sample_count = receipts
+        .iter()
+        .filter(|r| {
+            let key = r.regime.as_ref().map(|p| &p.key).unwrap_or(&pre_regime);
+            key.comparison(&current_regime.key).is_comparable()
+        })
+        .count();
+    let out_of_regime_sample_count = receipts.len() - in_regime_sample_count;
+
     Estimate {
         duration_p50_secs: Some(quantile_u64(&durations, 0.50)),
         duration_p80_secs: Some(quantile_u64(&durations, 0.80)),
@@ -210,13 +263,18 @@ fn compute(
         resource_p50,
         resource_p80,
         resource_p90,
-        confidence: Confidence::from_evidence(bucket_tier, receipts.len()),
+        confidence: Confidence::from_evidence(bucket_tier, in_regime_sample_count),
         sample_count: receipts.len(),
         cold_start: false,
         estimator_version: libra_governor_domain::ESTIMATOR_VERSION.to_string(),
         reason: None,
         feature_schema_version: feature_schema_version.to_string(),
         bucket_tier,
+        regime: RegimeBasis {
+            provenance: current_regime.clone(),
+            in_regime_sample_count,
+            out_of_regime_sample_count,
+        },
     }
 }
 
@@ -501,7 +559,7 @@ mod tests {
     #[test]
     fn estimate_bucketed_reaches_cold_start_with_no_history_at_all() {
         let current = features("repo-a", BuildTopology::Cargo, Some("claude-sonnet-5"));
-        let result = estimate_bucketed(&[], &current);
+        let result = estimate_bucketed(&[], &current, &RegimeProvenance::pre_regime_record());
         assert!(result.cold_start);
         assert_eq!(result.bucket_tier, BucketTier::ColdStart);
         assert_eq!(
@@ -516,7 +574,7 @@ mod tests {
         // Unfeatured (pre-MVP-2) history: cannot match any bucketed tier,
         // but must still contribute to the global tier.
         let history: Vec<_> = (1..=6).map(|n| dated_receipt(n * 10, None)).collect();
-        let result = estimate_bucketed(&history, &current);
+        let result = estimate_bucketed(&history, &current, &RegimeProvenance::pre_regime_record());
         assert_eq!(result.bucket_tier, BucketTier::Global);
         assert_eq!(result.sample_count, 6);
         assert!(!result.cold_start);
@@ -538,7 +596,7 @@ mod tests {
         // chosen instead.
         history.extend((1..=50).map(|n| dated_receipt(n * 100, None)));
 
-        let result = estimate_bucketed(&history, &current);
+        let result = estimate_bucketed(&history, &current, &RegimeProvenance::pre_regime_record());
         assert_eq!(
             result.bucket_tier,
             BucketTier::Repo,
@@ -568,24 +626,26 @@ mod tests {
             )
         }));
 
-        let result = estimate_bucketed(&history, &current);
+        let result = estimate_bucketed(&history, &current, &RegimeProvenance::pre_regime_record());
         assert_eq!(result.bucket_tier, BucketTier::RepoTopologyModel);
         assert_eq!(result.sample_count, 5);
     }
 
     #[test]
-    fn estimate_bucketed_tags_every_estimate_with_v3_tiered_confidence() {
+    fn estimate_bucketed_tags_every_estimate_with_the_current_estimator_version() {
         let current = features("repo-a", BuildTopology::Cargo, None);
         assert_eq!(
-            estimate_bucketed(&[], &current).estimator_version,
-            "v3-tiered-confidence"
+            estimate_bucketed(&[], &current, &RegimeProvenance::pre_regime_record())
+                .estimator_version,
+            "v4-regime-aware"
         );
         let history: Vec<_> = (1..=5)
             .map(|n| dated_receipt(n, Some(current.clone())))
             .collect();
         assert_eq!(
-            estimate_bucketed(&history, &current).estimator_version,
-            "v3-tiered-confidence"
+            estimate_bucketed(&history, &current, &RegimeProvenance::pre_regime_record())
+                .estimator_version,
+            "v4-regime-aware"
         );
     }
 
@@ -661,7 +721,7 @@ mod tests {
         let history: Vec<_> = (1..=10)
             .map(|n| dated_receipt(n, Some(current.clone())))
             .collect();
-        let result = estimate_bucketed(&history, &current);
+        let result = estimate_bucketed(&history, &current, &RegimeProvenance::pre_regime_record());
         assert!(result.resource_p50.is_none());
         assert!(result.resource_p80.is_none());
         assert!(result.resource_p90.is_none());

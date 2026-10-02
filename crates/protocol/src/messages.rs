@@ -7,7 +7,9 @@ use libra_governor_domain::{
     BusinessContextSummary, CompletionContract, Confidence, EnforcementCapabilities, Estimate,
     ExecutionOutcome, ExecutionReceipt, PlanId, PolicyDecision, ResourceAmount, TaskId,
 };
-use libra_governor_estimator::{AdmissionOutcome, AdmissionPolicy, CoverageReport};
+use libra_governor_estimator::{
+    AdmissionOutcome, AdmissionPolicy, CoverageReport, RegimeCalibrationReport,
+};
 use serde::{Deserialize, Serialize};
 
 /// A request envelope: a required, non-defaulted protocol version plus
@@ -370,6 +372,9 @@ pub struct CalibrationReportResult {
     /// `libra_governor_ledger::LedgerStore::calibration_pairs` docs.
     /// Surfaced rather than silently dropped.
     pub dropped_rows: usize,
+    /// Regime-aware confidence/drift reporting (HORO-1671) — see
+    /// `libra_governor_estimator::regime` module docs.
+    pub regime: RegimeCalibrationReport,
 }
 
 /// The result of a `GatewayStatus` request (HORO-1144).
@@ -798,6 +803,13 @@ mod tests {
                     }),
                 }],
                 dropped_rows: 3,
+                regime: libra_governor_estimator::build_report(
+                    &[],
+                    &libra_governor_domain::RegimeKey::builder()
+                        .feature_schema("fs-v1")
+                        .build(),
+                    libra_governor_domain::BucketTier::Global,
+                ),
             })),
         };
 

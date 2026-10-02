@@ -51,6 +51,7 @@ mod execution_receipt;
 mod external_approval;
 mod outcome_attestation;
 mod policy;
+mod regime;
 mod replan;
 mod reservation;
 mod resource_account;
@@ -104,6 +105,11 @@ pub use policy::{
     Admission, ApprovalRequest, AutonomyBoundary, ConstraintMode, ConstraintOutcome, DenyReason,
     Policy, PolicyDecision, PolicyEvaluationError, PolicyPresetInputs, PolicyValidationError,
     ResourceBound, TimeBound, POLICY_SCHEMA_VERSION,
+};
+pub use regime::{
+    CacheClass, DimensionUnavailable, DimensionValue, RegimeBasis, RegimeComparison,
+    RegimeDimension, RegimeKey, RegimeKeyBuilder, RegimeProvenance, ESTIMATOR_REGIME_SCHEMA,
+    REGIME_SCHEMA_VERSION,
 };
 pub use replan::{
     evaluate_hysteresis, evaluate_replan_cost_against_policy, possible_tool_loop, should_replan,

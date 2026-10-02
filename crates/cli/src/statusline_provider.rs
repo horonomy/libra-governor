@@ -1064,6 +1064,7 @@ mod tests {
             reason: Some(ESTIMATOR_FREE_TEXT.to_string()),
             feature_schema_version: "fs-v1".to_string(),
             bucket_tier: BucketTier::Repo,
+            regime: Default::default(),
         }
     }
 

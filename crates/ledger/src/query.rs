@@ -1,7 +1,8 @@
 use libra_governor_domain::{
     Admission, CompletionContract, CompletionCriterion, Estimate, ExecutionEvent,
     ExecutionEventKind, ExecutionOutcome, ExecutionPlan, ExecutionReceipt, ExternalRef, PlanId,
-    ReplanId, ReplanReason, ReplanRecord, ResourceAmount, TaskFeatures, TaskId, TaskIdentity,
+    RegimeProvenance, ReplanId, ReplanReason, ReplanRecord, ResourceAmount, TaskFeatures, TaskId,
+    TaskIdentity,
 };
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -87,6 +88,15 @@ fn parse_plan_id(id: Option<String>) -> Result<Option<PlanId>, LedgerError> {
 fn parse_reservation_evidence(
     json: Option<String>,
 ) -> Result<Option<libra_governor_domain::ReservationEvidence>, LedgerError> {
+    json.map(|s| serde_json::from_str(&s))
+        .transpose()
+        .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))
+}
+
+/// Deserializes a nullable `regime_json` column value into an
+/// `Option<RegimeProvenance>`. `None` means "genuinely no regime
+/// recorded" (a pre-HORO-1671 row), not a deserialize failure.
+fn parse_regime(json: Option<String>) -> Result<Option<RegimeProvenance>, LedgerError> {
     json.map(|s| serde_json::from_str(&s))
         .transpose()
         .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))
@@ -262,7 +272,7 @@ impl LedgerStore {
         let mut stmt = self.conn.prepare(
             "SELECT plan_id, contract_revision, actual_duration_secs, actual_usage_json,
                     outcome_json, recorded_at, tool_call_count, model, provider, task_features_json,
-                    reservation_evidence_json
+                    reservation_evidence_json, regime_json
              FROM receipts WHERE task_id = ?1 ORDER BY recorded_at ASC",
         )?;
         let rows = stmt.query_map([task_id_str], |row| {
@@ -277,6 +287,7 @@ impl LedgerStore {
             let provider: Option<String> = row.get(8)?;
             let task_features_json: Option<String> = row.get(9)?;
             let reservation_evidence_json: Option<String> = row.get(10)?;
+            let regime_json: Option<String> = row.get(11)?;
             Ok((
                 plan_id,
                 contract_revision,
@@ -289,6 +300,7 @@ impl LedgerStore {
                 provider,
                 task_features_json,
                 reservation_evidence_json,
+                regime_json,
             ))
         })?;
 
@@ -306,6 +318,7 @@ impl LedgerStore {
                 provider,
                 task_features_json,
                 reservation_evidence_json,
+                regime_json,
             ) = row?;
             let plan_id = Uuid::parse_str(&plan_id)
                 .map(PlanId)
@@ -316,6 +329,7 @@ impl LedgerStore {
                 .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
             let task_features = parse_task_features(task_features_json)?;
             let reservations = parse_reservation_evidence(reservation_evidence_json)?;
+            let regime = parse_regime(regime_json)?;
 
             receipts.push(ExecutionReceipt {
                 task_id,
@@ -330,6 +344,7 @@ impl LedgerStore {
                 provider,
                 task_features,
                 reservations,
+                regime,
             });
         }
         Ok(receipts)
@@ -493,7 +508,7 @@ impl LedgerStore {
         let mut stmt = self.conn.prepare(
             "SELECT task_id, plan_id, contract_revision, actual_duration_secs,
                     actual_usage_json, outcome_json, recorded_at, tool_call_count, model, provider,
-                    task_features_json, reservation_evidence_json
+                    task_features_json, reservation_evidence_json, regime_json
              FROM receipts ORDER BY recorded_at ASC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -509,6 +524,7 @@ impl LedgerStore {
             let provider: Option<String> = row.get(9)?;
             let task_features_json: Option<String> = row.get(10)?;
             let reservation_evidence_json: Option<String> = row.get(11)?;
+            let regime_json: Option<String> = row.get(12)?;
             Ok((
                 task_id,
                 plan_id,
@@ -522,6 +538,7 @@ impl LedgerStore {
                 provider,
                 task_features_json,
                 reservation_evidence_json,
+                regime_json,
             ))
         })?;
 
@@ -540,6 +557,7 @@ impl LedgerStore {
                 provider,
                 task_features_json,
                 reservation_evidence_json,
+                regime_json,
             ) = row?;
             let task_id = Uuid::parse_str(&task_id)
                 .map(TaskId)
@@ -553,6 +571,7 @@ impl LedgerStore {
                 .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
             let task_features = parse_task_features(task_features_json)?;
             let reservations = parse_reservation_evidence(reservation_evidence_json)?;
+            let regime = parse_regime(regime_json)?;
 
             receipts.push((
                 task_features.clone(),
@@ -569,6 +588,7 @@ impl LedgerStore {
                     provider,
                     task_features,
                     reservations,
+                    regime,
                 },
             ));
         }
@@ -591,7 +611,8 @@ impl LedgerStore {
     /// rather than silently discarding it.
     pub fn calibration_pairs(&self) -> Result<(Vec<CalibrationPair>, usize), LedgerError> {
         let mut stmt = self.conn.prepare(
-            "SELECT r.actual_duration_secs, r.recorded_at, r.task_features_json, p.estimate_json
+            "SELECT r.actual_duration_secs, r.recorded_at, r.task_features_json, p.estimate_json,
+                    r.regime_json
              FROM receipts r JOIN plans p ON r.plan_id = p.id
              ORDER BY r.recorded_at ASC",
         )?;
@@ -600,18 +621,21 @@ impl LedgerStore {
             let recorded_at: String = row.get(1)?;
             let task_features_json: Option<String> = row.get(2)?;
             let estimate_json: Option<String> = row.get(3)?;
+            let regime_json: Option<String> = row.get(4)?;
             Ok((
                 actual_duration_secs,
                 recorded_at,
                 task_features_json,
                 estimate_json,
+                regime_json,
             ))
         })?;
 
         let mut pairs = Vec::new();
         let mut dropped = 0usize;
         for row in rows {
-            let (actual_duration_secs, recorded_at, task_features_json, estimate_json) = row?;
+            let (actual_duration_secs, recorded_at, task_features_json, estimate_json, regime_json) =
+                row?;
 
             let Some(estimate_json) = estimate_json else {
                 dropped += 1;
@@ -625,12 +649,14 @@ impl LedgerStore {
             }
 
             let task_features = parse_task_features(task_features_json)?;
+            let regime = parse_regime(regime_json)?;
 
             pairs.push(CalibrationPair {
                 estimate,
                 actual_duration_secs: actual_duration_secs as u64,
                 task_features,
                 recorded_at: parse_time(&recorded_at)?,
+                regime,
             });
         }
         Ok((pairs, dropped))
@@ -905,6 +931,9 @@ pub struct CalibrationPair {
     /// caller can stratify by task class without a second query.
     pub task_features: Option<TaskFeatures>,
     pub recorded_at: OffsetDateTime,
+    /// The execution regime the finalized receipt carried (HORO-1671),
+    /// if any — `None` for a pre-HORO-1671 receipt.
+    pub regime: Option<RegimeProvenance>,
 }
 
 #[cfg(test)]
@@ -931,6 +960,7 @@ mod calibration_pairs_tests {
             reason: None,
             feature_schema_version: "fs-v1".to_string(),
             bucket_tier: BucketTier::Global,
+            regime: Default::default(),
         }
     }
 
@@ -1081,6 +1111,7 @@ mod evidence_aggregates_tests {
             reason: None,
             feature_schema_version: "fs-v1".to_string(),
             bucket_tier: BucketTier::Global,
+            regime: Default::default(),
         });
         let new_plan = ExecutionPlan::new(task_id, 1, None, now())
             .with_replan_linkage(plan_id, reason.clone());
@@ -1160,6 +1191,7 @@ mod replan_persistence_tests {
             reason: None,
             feature_schema_version: "fs-v1".to_string(),
             bucket_tier: libra_governor_domain::BucketTier::Global,
+            regime: Default::default(),
         })
     }
 

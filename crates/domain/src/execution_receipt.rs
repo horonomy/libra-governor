@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::{
-    execution_outcome::ExecutionOutcome, execution_plan::PlanId, resource_amount::ResourceAmount,
-    task_features::TaskFeatures, task_identity::TaskId,
+    execution_outcome::ExecutionOutcome, execution_plan::PlanId, regime::RegimeProvenance,
+    resource_amount::ResourceAmount, task_features::TaskFeatures, task_identity::TaskId,
 };
 
 /// Reservation/release/overrun evidence recorded onto an
@@ -77,6 +77,13 @@ pub struct ExecutionReceipt {
     /// with no `task_budgets` row — a genuinely absent value, not a
     /// placeholder.
     pub reservations: Option<ReservationEvidence>,
+    /// The execution regime this task finalized under, computed once at
+    /// finalize time from the task's own gateway requests plus whatever
+    /// the harness reported (HORO-1671). `None` for a pre-HORO-1671
+    /// receipt — never backfilled or guessed; still contributes to
+    /// global-tier estimation (an honestly pre-regime record), just like
+    /// a `None` `task_features`.
+    pub regime: Option<RegimeProvenance>,
 }
 
 impl ExecutionReceipt {
@@ -103,6 +110,7 @@ impl ExecutionReceipt {
             provider: None,
             task_features: None,
             reservations: None,
+            regime: None,
         }
     }
 
@@ -139,6 +147,13 @@ impl ExecutionReceipt {
     /// (HORO-1141).
     pub fn with_reservation_evidence(mut self, evidence: Option<ReservationEvidence>) -> Self {
         self.reservations = evidence;
+        self
+    }
+
+    /// Attaches the execution regime this task finalized under
+    /// (HORO-1671), if computed.
+    pub fn with_regime(mut self, regime: Option<RegimeProvenance>) -> Self {
+        self.regime = regime;
         self
     }
 }

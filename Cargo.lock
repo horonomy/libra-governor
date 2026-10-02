@@ -432,6 +432,7 @@ version = "0.0.2"
 dependencies = [
  "libra-governor-daemon",
  "libra-governor-domain",
+ "libra-governor-estimator",
  "libra-governor-evidence-adapter",
  "libra-governor-gateway",
  "libra-governor-ledger",
