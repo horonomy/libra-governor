@@ -461,6 +461,7 @@ dependencies = [
  "libra-governor-gateway",
  "libra-governor-ledger",
  "libra-governor-protocol",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
