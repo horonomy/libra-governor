@@ -36,10 +36,11 @@ use libra_governor_domain::{
     possible_tool_loop, propose_runtime_decision, tool_call_count_is_material, AccountId,
     Admission, AttestationSource, BusinessContextSummary, CacheClass, CompletionContract,
     CompletionCriterion, Estimate, ExecutionOutcome, ExecutionPlan, ExecutionReceipt,
-    ExternalApproval, ExternalVerdict, HysteresisOutcome, PlanId, Policy, PolicyPresetInputs,
-    ProgressEvidence, RegimeKey, RegimeProvenance, RemainingEstimate, ReplanId, ReplanReason,
-    ReplanRecord, ReplanTriggerKind, ReservationClass, ReservationState, ResourceAmount, Shadow,
-    SpendScope, TaskId, ABSOLUTE_TOOL_CALL_COUNT_FALLBACK, DEFAULT_LOOP_STREAK_THRESHOLD,
+    ExternalApproval, ExternalVerdict, HysteresisOutcome, PersistedPins, PlanId, Policy,
+    PolicyPresetInputs, ProgressEvidence, RegimeKey, RegimeProvenance, RemainingEstimate, ReplanId,
+    ReplanReason, ReplanRecord, ReplanTriggerKind, ReservationClass, ReservationState,
+    ResourceAmount, Shadow, SpendScope, TaskId, ABSOLUTE_TOOL_CALL_COUNT_FALLBACK,
+    DEFAULT_LOOP_STREAK_THRESHOLD,
 };
 use libra_governor_estimator::{
     admission_replay, build_report, duration_coverage, estimate_bucketed, remaining_bucketed,
@@ -1367,6 +1368,8 @@ fn handle_tool_invoked(
             evidence.elapsed_secs,
             total_tool_calls,
             now,
+            &config.policy,
+            &PersistedPins::current(),
         )?;
     }
 
