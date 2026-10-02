@@ -633,6 +633,7 @@ mod tests {
             reason: None,
             feature_schema_version: crate::task_features::FEATURE_SCHEMA_VERSION.to_string(),
             bucket_tier: BucketTier::Repo,
+            regime: Default::default(),
         }
     }
 
