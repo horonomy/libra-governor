@@ -34,15 +34,16 @@ use std::sync::OnceLock;
 use libra_governor_domain::{
     apply_business_context, apply_external_approval, completion_reserve_for, evaluate_hysteresis,
     possible_tool_loop, tool_call_count_is_material, Admission, AttestationSource,
-    BusinessContextSummary, CompletionContract, CompletionCriterion, Estimate, ExecutionOutcome,
-    ExecutionPlan, ExecutionReceipt, ExternalApproval, ExternalVerdict, HysteresisOutcome, PlanId,
-    Policy, PolicyPresetInputs, RemainingEstimate, ReplanId, ReplanReason, ReplanRecord,
-    ReplanTriggerKind, ReservationClass, ReservationState, ResourceAmount, TaskId,
-    ABSOLUTE_TOOL_CALL_COUNT_FALLBACK, DEFAULT_LOOP_STREAK_THRESHOLD,
+    BusinessContextSummary, CacheClass, CompletionContract, CompletionCriterion, Estimate,
+    ExecutionOutcome, ExecutionPlan, ExecutionReceipt, ExternalApproval, ExternalVerdict,
+    HysteresisOutcome, PlanId, Policy, PolicyPresetInputs, RegimeKey, RegimeProvenance,
+    RemainingEstimate, ReplanId, ReplanReason, ReplanRecord, ReplanTriggerKind, ReservationClass,
+    ReservationState, ResourceAmount, TaskId, ABSOLUTE_TOOL_CALL_COUNT_FALLBACK,
+    DEFAULT_LOOP_STREAK_THRESHOLD,
 };
 use libra_governor_estimator::{
-    admission_replay, duration_coverage, estimate_bucketed, typical_tool_call_count_bucketed,
-    AdmissionPolicy,
+    admission_replay, build_report, duration_coverage, estimate_bucketed,
+    typical_tool_call_count_bucketed, AdmissionPolicy,
 };
 use libra_governor_extension::{
     AdmissionEventData, ApprovalEventData, BusinessContextEventRef, BusinessContextRequest,
@@ -585,10 +586,18 @@ fn handle_calibration_report(
         })
         .collect();
 
+    let active_regime = current_regime(config, libra_governor_domain::FEATURE_SCHEMA_VERSION);
+    let regime = build_report(
+        &pairs,
+        &active_regime.key,
+        libra_governor_domain::BucketTier::Global,
+    );
+
     Ok(CalibrationReportResult {
         coverage,
         admission,
         dropped_rows,
+        regime,
     })
 }
 
@@ -679,6 +688,33 @@ fn budget_posture(ledger: &LedgerStore, task_id: libra_governor_domain::TaskId) 
     }
 }
 
+/// Builds the execution regime the daemon can honestly observe right
+/// now (HORO-1671). `model`/`harness`/`harness_version`/`effort` are
+/// genuinely latent today — no hook payload exposes them at preflight,
+/// and `ExecutionReceipt::provider` is always `None` at finalize (see
+/// `libra_governor_domain::execution_receipt` docs) — so this never
+/// fakes a value for them; `RegimeKeyBuilder::build` leaves them
+/// `Unavailable` by default. `pricing_version`/`enforcement_tier` are
+/// real facts of the daemon's own gateway configuration when one is
+/// configured, `Unavailable { NoGatewayConfigured }` otherwise — never
+/// the bare build-time pricing constant asserted against nothing.
+fn current_regime(config: &DaemonConfig, feature_schema_version: &str) -> RegimeProvenance {
+    let key = match &config.gateway {
+        Some(gateway) => RegimeKey::builder()
+            .gateway_pricing(Some(libra_governor_gateway::pricing::PRICING_VERSION))
+            .enforcement_tier(Some(gateway.credential_mode.tier()))
+            .feature_schema(feature_schema_version)
+            .build(),
+        None => RegimeKey::builder()
+            .feature_schema(feature_schema_version)
+            .build(),
+    };
+    // Per-task cache-class/topology facts require a real gateway-request
+    // aggregate query this ticket does not build (see ADR 0010) —
+    // reported as "no cache observed" rather than guessed.
+    RegimeProvenance::new(key, None, CacheClass::NoCacheObserved)
+}
+
 fn handle_preflight(
     task_hint: &str,
     cwd: &std::path::Path,
@@ -717,7 +753,8 @@ fn handle_preflight(
     // up front.
     let task_features = features::derive_task_features(&recon, task_hint, cwd, None);
     let history = ledger.receipts_for_estimation()?;
-    let estimate = libra_governor_estimator::estimate_bucketed(&history, &task_features);
+    let regime = current_regime(config, &task_features.feature_schema_version);
+    let estimate = libra_governor_estimator::estimate_bucketed(&history, &task_features, &regime);
 
     let plan = libra_governor_domain::ExecutionPlan::new(task_id, contract.revision, None, now)
         .with_estimate(estimate.clone())
@@ -1311,7 +1348,8 @@ fn handle_tool_invoked(
         HysteresisOutcome::Allow => {}
     }
 
-    let base_estimate = estimate_bucketed(&history, &task_features);
+    let regime = current_regime(config, &task_features.feature_schema_version);
+    let base_estimate = estimate_bucketed(&history, &task_features, &regime);
     let remaining = RemainingEstimate::from_bucketed(base_estimate);
     let reason = ReplanReason::new(trigger, detail);
 
