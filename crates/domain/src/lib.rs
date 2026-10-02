@@ -52,6 +52,7 @@ mod outcome_attestation;
 mod policy;
 mod replan;
 mod reservation;
+mod resource_account;
 mod resource_amount;
 mod task_features;
 mod task_identity;
@@ -108,10 +109,14 @@ pub use replan::{
     DETERMINISTIC_WIDENING_FACTOR, REPLAN_SCHEMA_VERSION, TOOL_CALL_COUNT_MATERIAL_MULTIPLIER,
 };
 pub use reservation::{
-    completion_reserve_for, CompletionReserveBasis, CompletionReserveEstimate, Reservation,
-    ReservationClass, ReservationId, ReservationState, TaskBudget,
+    completion_reserve_for, CompletionReserveBasis, CompletionReserveEstimate, LeaseKind,
+    Reservation, ReservationClass, ReservationId, ReservationState, TaskBudget,
     COMPLETION_RESERVE_BASE_FRACTION, COMPLETION_RESERVE_MAX_FRACTION,
     COMPLETION_RESERVE_PER_REQUIRED_CRITERION, RESERVATION_SCHEMA_VERSION,
+};
+pub use resource_account::{
+    AccountCapacity, AccountId, AccountLevel, AccountProvenance, AccountState, AllocationAuthority,
+    EnforcementScope, ResourceAccount, RESOURCE_ACCOUNT_SCHEMA_VERSION,
 };
 pub use resource_amount::{Headroom, ResourceAmount, ResourceKind};
 pub use task_features::{BucketTier, BuildTopology, TaskFeatures, FEATURE_SCHEMA_VERSION};
