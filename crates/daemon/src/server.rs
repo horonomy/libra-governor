@@ -33,16 +33,16 @@ use std::sync::OnceLock;
 
 use libra_governor_domain::{
     apply_business_context, apply_external_approval, completion_reserve_for, evaluate_hysteresis,
-    possible_tool_loop, tool_call_count_is_material, Admission, AttestationSource,
-    BusinessContextSummary, CacheClass, CompletionContract, CompletionCriterion, Estimate,
-    ExecutionOutcome, ExecutionPlan, ExecutionReceipt, ExternalApproval, ExternalVerdict,
-    HysteresisOutcome, PlanId, Policy, PolicyPresetInputs, RegimeKey, RegimeProvenance,
-    RemainingEstimate, ReplanId, ReplanReason, ReplanRecord, ReplanTriggerKind, ReservationClass,
-    ReservationState, ResourceAmount, TaskId, ABSOLUTE_TOOL_CALL_COUNT_FALLBACK,
-    DEFAULT_LOOP_STREAK_THRESHOLD,
+    possible_tool_loop, propose_runtime_decision, tool_call_count_is_material, AccountId,
+    Admission, AttestationSource, BusinessContextSummary, CacheClass, CompletionContract,
+    CompletionCriterion, Estimate, ExecutionOutcome, ExecutionPlan, ExecutionReceipt,
+    ExternalApproval, ExternalVerdict, HysteresisOutcome, PlanId, Policy, PolicyPresetInputs,
+    ProgressEvidence, RegimeKey, RegimeProvenance, RemainingEstimate, ReplanId, ReplanReason,
+    ReplanRecord, ReplanTriggerKind, ReservationClass, ReservationState, ResourceAmount, Shadow,
+    SpendScope, TaskId, ABSOLUTE_TOOL_CALL_COUNT_FALLBACK, DEFAULT_LOOP_STREAK_THRESHOLD,
 };
 use libra_governor_estimator::{
-    admission_replay, build_report, duration_coverage, estimate_bucketed,
+    admission_replay, build_report, duration_coverage, estimate_bucketed, remaining_bucketed,
     typical_tool_call_count_bucketed, AdmissionPolicy,
 };
 use libra_governor_extension::{
@@ -141,7 +141,23 @@ pub struct DaemonConfig {
     /// at startup, never per-request. [`serve`] forces this exactly once,
     /// before the accept loop begins, by calling [`start_extensions`].
     pub extension_runtime: OnceLock<ExtensionRuntime>,
+    /// How often (in seconds) `handle_tool_invoked` recomputes the
+    /// progressive remaining-work estimate and records a shadow decision
+    /// even when neither of the existing material-event gates (loop/
+    /// count signal) fired (HORO-1669). `Request::ToolInvoked`'s own
+    /// protocol docs commit to staying cheap enough not to add
+    /// perceptible latency to every tool call, so the progressive
+    /// recomputation runs on this cadence instead of on every call. The
+    /// remaining estimate can be up to this many seconds stale; every
+    /// recorded shadow decision carries its own `decided_at`, so a later
+    /// evidence-gate ticket can measure empirically whether that
+    /// staleness ever mattered.
+    pub progressive_interval_secs: u64,
 }
+
+/// Default [`DaemonConfig::progressive_interval_secs`] — see that
+/// field's docs for the latency trade-off this cadence exists to honor.
+pub const DEFAULT_PROGRESSIVE_INTERVAL_SECS: u64 = 60;
 
 /// The validated, ready-to-use extension surfaces, built once by
 /// [`extension_runtime`] and cached on [`DaemonConfig::extension_runtime`]
@@ -1297,6 +1313,63 @@ fn handle_tool_invoked(
 
     let loop_signal = possible_tool_loop(same_tool_streak, DEFAULT_LOOP_STREAK_THRESHOLD);
     let count_signal = tool_call_count_is_material(calls_since_last_replan, typical_tool_calls);
+
+    // HORO-1669: record a shadow progressive decision whenever either the
+    // existing material-event gate fires, OR the cadence interval has
+    // elapsed — purely additive, never altering what happens below. This
+    // keeps `Request::ToolInvoked` cheap on every call that hits neither
+    // gate (no history read, no estimate), honoring that request's own
+    // latency commitment, while still giving HORO-1673 a steady stream of
+    // shadow decisions to compare against eventual outcomes.
+    let last_progressive_at = ledger.last_shadow_decision_at(task_id)?;
+    let cadence_due = match last_progressive_at {
+        None => true,
+        Some(last) => {
+            (now - last).whole_seconds().max(0) as u64 >= config.progressive_interval_secs
+        }
+    };
+    if loop_signal || count_signal || cadence_due {
+        let regime = current_regime(config, &task_features.feature_schema_version);
+        let task_account = AccountId::for_task(task_id);
+        let spend_so_far = ledger.account_spend(task_account, SpendScope::Inclusive)?;
+        let (active_lease_count, child_account_count) = ledger.subtree_counts(task_account)?;
+        let (gateway_request_count, _) = ledger.gateway_spend_for_task(task_id)?;
+        let evidence = ProgressEvidence {
+            // Time elapsed under *this* plan's estimate — the quantity
+            // `remaining_bucketed` conditions the base `Estimate`'s
+            // distribution on, not time since the last replan (a
+            // different plan may have produced a different estimate).
+            elapsed_secs: (now - plan.created_at).whole_seconds().max(0) as u64,
+            spend_so_far,
+            tool_calls_total: total_tool_calls,
+            tool_calls_since_last_replan: calls_since_last_replan,
+            same_tool_streak,
+            plan_revision: plan.contract_revision,
+            auto_replan_count: hysteresis_state.auto_replan_count,
+            active_lease_count,
+            child_account_count,
+            gateway_request_count,
+            observed_at: now,
+        };
+        let remaining = remaining_bucketed(&history, &task_features, &regime, &evidence);
+        let decision = propose_runtime_decision(
+            &config.policy,
+            &config.policy.quality_floor,
+            &remaining,
+            now,
+        );
+        let shadow = Shadow::record(decision);
+        ledger.record_shadow_decision(
+            task_id,
+            plan_id,
+            session_id,
+            &shadow,
+            evidence.elapsed_secs,
+            total_tool_calls,
+            now,
+        )?;
+    }
+
     if !loop_signal && !count_signal {
         return Ok(());
     }
@@ -2263,6 +2336,7 @@ mod tests {
                 .to_string(),
             extensions: None,
             extension_runtime: OnceLock::new(),
+            progressive_interval_secs: DEFAULT_PROGRESSIVE_INTERVAL_SECS,
         }
     }
 
