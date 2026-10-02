@@ -123,5 +123,64 @@ class PushOutcomeTest(unittest.TestCase):
         self.assertIn("github-https://github.com/x/y/pull/1-completed", call_args.kwargs["input"])
 
 
+class _FakeHandler:
+    """A minimal stand-in for `GitHubProviderHandler` carrying only the
+    attributes `_handle_event` actually reads — avoids standing up a real
+    `BaseHTTPRequestHandler` (which needs a real socket) just to exercise
+    this one route's business logic."""
+
+    def __init__(self):
+        self.api_base_url = gp.DEFAULT_GITHUB_API_BASE_URL
+        self.auth_header = "Bearer test-token"
+        self.allow_private_network = False
+        self.outcome_cli_binary = "libra-governor"
+        self.task_repo_context = gp.TaskRepoContext()
+        self.responded: list[tuple[int, dict]] = []
+        self.logged: list[str] = []
+
+    def _respond_json(self, status, payload):
+        self.responded.append((status, payload))
+
+    def log_message(self, fmt, *args):
+        self.logged.append(fmt % args)
+
+
+class HandleEventTest(unittest.TestCase):
+    def test_unknown_task_is_a_noop_after_accepting_the_delivery(self):
+        handler = _FakeHandler()
+        gp.GitHubProviderHandler._handle_event(handler, {"data": {"task_id": "unknown-task"}})
+        self.assertEqual(handler.responded, [(200, {"status": "accepted"})])
+
+    @patch("libra_github_provider.push_outcome")
+    @patch("libra_github_provider.fetch_combined_check_status")
+    @patch("libra_github_provider.fetch_pull_request_for_branch")
+    def test_merged_pr_pushes_a_completed_outcome(self, mock_fetch_pr, mock_fetch_status, mock_push):
+        handler = _FakeHandler()
+        handler.task_repo_context.remember("task-123", "horonomy", "libra-governor", "v0.0.3/HORO-1173/feat/x")
+        mock_fetch_pr.return_value = {
+            "merged": True,
+            "html_url": "https://github.com/horonomy/libra-governor/pull/42",
+            "head": {"sha": "abc123"},
+        }
+        mock_fetch_status.return_value = {"state": "success"}
+        mock_push.return_value = _completed()
+
+        gp.GitHubProviderHandler._handle_event(handler, {"data": {"task_id": "task-123"}})
+
+        mock_push.assert_called_once()
+        pushed_outcome = mock_push.call_args.args[3]
+        self.assertEqual(pushed_outcome["kind"], "completed")
+
+    @patch("libra_github_provider.fetch_pull_request_for_branch")
+    def test_no_pr_yet_skips_without_pushing_an_outcome(self, mock_fetch_pr):
+        handler = _FakeHandler()
+        handler.task_repo_context.remember("task-123", "horonomy", "libra-governor", "v0.0.3/HORO-1173/feat/x")
+        mock_fetch_pr.return_value = None
+
+        with patch("libra_github_provider.push_outcome") as mock_push:
+            gp.GitHubProviderHandler._handle_event(handler, {"data": {"task_id": "task-123"}})
+            mock_push.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
