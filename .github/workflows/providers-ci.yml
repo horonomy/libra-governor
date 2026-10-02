@@ -1,0 +1,48 @@
+name: First-class providers CI
+
+# HORO-1173's providers/ tree is stdlib-only Python, not part of the Rust
+# workspace ci.yml already covers — without a dedicated job here, these
+# tests would never run in CI at all (not Rust, so cargo test skips them;
+# CodeQL's python language only does static "none"-build-mode extraction,
+# it never executes a test). Path-filtered the same way
+# phase0-ci.yml is, so unrelated changes never trigger this job.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "providers/**"
+      - ".github/workflows/providers-ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "providers/**"
+      - ".github/workflows/providers-ci.yml"
+
+# Least privilege: this job only checks out the repository and runs the
+# stdlib-only test suite with the system python3 — no install step, no
+# third-party action beyond checkout.
+permissions:
+  contents: read
+
+jobs:
+  provider-tests:
+    name: provider unit tests (stdlib unittest, no network)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Each file manipulates its own sys.path to import its sibling
+      # module under test (see providers/README.md's "Running the tests"
+      # section for why `unittest discover` across all four at once is
+      # not used), so each is invoked as its own process here.
+      - name: Run provider test suites
+        run: |
+          set -euo pipefail
+          for f in \
+            providers/common/test_safe_https_client.py \
+            providers/common/test_libra_provider_runtime.py \
+            providers/jira/test_libra_jira_provider.py \
+            providers/github/test_libra_github_provider.py; do
+            echo "=== $f ==="
+            python3 "$f" -v
+          done
