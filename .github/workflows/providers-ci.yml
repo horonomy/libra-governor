@@ -34,15 +34,14 @@ jobs:
       # Each file manipulates its own sys.path to import its sibling
       # module under test (see providers/README.md's "Running the tests"
       # section for why `unittest discover` across all four at once is
-      # not used), so each is invoked as its own process here.
+      # not used), so each is invoked as its own process here. A glob
+      # rather than a hardcoded file list, so a future fifth provider's
+      # test file is picked up automatically instead of silently never
+      # running in CI until someone remembers to edit this workflow.
       - name: Run provider test suites
         run: |
           set -euo pipefail
-          for f in \
-            providers/common/test_safe_https_client.py \
-            providers/common/test_libra_provider_runtime.py \
-            providers/jira/test_libra_jira_provider.py \
-            providers/github/test_libra_github_provider.py; do
+          for f in providers/*/test_*.py; do
             echo "=== $f ==="
             python3 "$f" -v
           done
