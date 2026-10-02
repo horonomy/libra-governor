@@ -907,6 +907,19 @@ mod tests {
         // Settle real work directly at the grandchild (agent) account.
         insert_settled_work_hold(&store, task_id, agent.account_id, 150.0);
 
+        // Match only on the variant discriminant for the panic message —
+        // `SpendSoFar`/`account_spend`'s row read flows through
+        // `reservations.idempotency_key`, which trips CodeQL's generic
+        // sensitive-field-name heuristic if the whole value is
+        // `{:?}`-formatted, even though no field here is actually
+        // sensitive (same pattern as HORO-1668's PR #57 fix).
+        fn spend_kind(spend: &SpendSoFar) -> &'static str {
+            match spend {
+                SpendSoFar::NoBasis { .. } => "NoBasis",
+                SpendSoFar::Known { .. } => "Known",
+            }
+        }
+
         let task_inclusive = store
             .account_spend(task_account, SpendScope::Inclusive)
             .unwrap();
@@ -919,7 +932,7 @@ mod tests {
                 assert_eq!(settled, 150.0, "grandchild's settled work must roll up");
                 assert_eq!(account_count, 3, "task + session + agent");
             }
-            other => panic!("expected Known, got {other:?}"),
+            other => panic!("expected Known, got {}", spend_kind(&other)),
         }
 
         let task_exclusive = store
@@ -932,7 +945,7 @@ mod tests {
                     "exclusive spend at the task account must not see the grandchild's spend"
                 );
             }
-            other => panic!("expected Known, got {other:?}"),
+            other => panic!("expected Known, got {}", spend_kind(&other)),
         }
 
         // The funding leases themselves (subaccount_funding) must never
@@ -947,7 +960,7 @@ mod tests {
                     "funding leases must not inflate the session's inclusive spend"
                 );
             }
-            other => panic!("expected Known, got {other:?}"),
+            other => panic!("expected Known, got {}", spend_kind(&other)),
         }
     }
 
