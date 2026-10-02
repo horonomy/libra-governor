@@ -132,8 +132,14 @@ pub struct ScopeIdentityMissing(String);
 /// never "does not apply" and never a zero/empty-string stand-in. Fields
 /// are private; construct via [`ExecutionIdentity::validated`] so the
 /// lineage tri-state/parent coupling and the UTC/shape checks below can
-/// never be bypassed by a struct literal.
+/// never be bypassed by a struct literal — including via deserialization:
+/// `#[serde(try_from = "ExecutionIdentityWire")]` routes every
+/// deserialization through [`ExecutionIdentity::validated`], so an
+/// unsupported `envelope_version`, a non-UTC `observed_at`, or a
+/// `lineage_status: child` with no `parent_agent_id` is refused on parse,
+/// not merely on construction through Rust code.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "ExecutionIdentityWire")]
 pub struct ExecutionIdentity {
     envelope_version: i64,
     #[serde(with = "observed_at_wire")]
@@ -516,6 +522,62 @@ impl ExecutionIdentity {
                 "UNKNOWN scope has no stable identity-keyed cache key by definition",
             )),
         }
+    }
+}
+
+/// The raw deserialization shape for [`ExecutionIdentity`], mirroring its
+/// field names and wire conventions exactly. Exists only so
+/// `#[serde(try_from = "ExecutionIdentityWire")]` can route every
+/// deserialization through [`ExecutionIdentity::validated`] — this type is
+/// never constructed directly by callers.
+#[derive(serde::Deserialize)]
+struct ExecutionIdentityWire {
+    envelope_version: i64,
+    #[serde(with = "observed_at_wire")]
+    observed_at: OffsetDateTime,
+    host_id: String,
+    tool_provider: String,
+    #[serde(default)]
+    tool_instance_id: Option<String>,
+    #[serde(default)]
+    provider_session_id: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    turn_id: Option<String>,
+    lineage_status: LineageStatus,
+    #[serde(default)]
+    parent_agent_id: Option<String>,
+    #[serde(default)]
+    session_lineage_id: Option<String>,
+    #[serde(default)]
+    event_id: Option<String>,
+    #[serde(default)]
+    repo_id: Option<String>,
+    #[serde(default)]
+    worktree_id: Option<String>,
+}
+
+impl TryFrom<ExecutionIdentityWire> for ExecutionIdentity {
+    type Error = ExecutionIdentityError;
+
+    fn try_from(wire: ExecutionIdentityWire) -> Result<Self, Self::Error> {
+        Self::validated(
+            wire.envelope_version,
+            wire.observed_at,
+            wire.host_id,
+            wire.tool_provider,
+            wire.tool_instance_id,
+            wire.provider_session_id,
+            wire.agent_id,
+            wire.turn_id,
+            wire.lineage_status,
+            wire.parent_agent_id,
+            wire.session_lineage_id,
+            wire.event_id,
+            wire.repo_id,
+            wire.worktree_id,
+        )
     }
 }
 
@@ -946,6 +1008,32 @@ mod tests {
     fn unrecognised_scope_is_refused_not_guessed() {
         let result: Result<Scope, _> = serde_json::from_value(serde_json::json!("galaxy"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn deserialization_refuses_an_unsupported_envelope_version() {
+        let mut json = serde_json::to_value(make()).unwrap();
+        json["envelope_version"] = serde_json::json!(999);
+        let result: Result<ExecutionIdentity, _> = serde_json::from_value(json);
+        assert!(
+            result.is_err(),
+            "deserialization must route through validated() and refuse an unsupported version, \
+             not merely construction through Rust code"
+        );
+    }
+
+    #[test]
+    fn deserialization_refuses_child_lineage_missing_parent_agent_id() {
+        let mut json = serde_json::to_value(make()).unwrap();
+        json["lineage_status"] = serde_json::json!("child");
+        // `make()` has no parent_agent_id set and root_lineage() emits none.
+        assert!(json.get("parent_agent_id").is_none());
+        let result: Result<ExecutionIdentity, _> = serde_json::from_value(json);
+        assert!(
+            result.is_err(),
+            "deserialization must refuse lineage_status=child with no parent_agent_id, \
+             exactly as validated() does for direct construction"
+        );
     }
 
     #[test]
