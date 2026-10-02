@@ -75,6 +75,36 @@ impl AgentKind {
             AgentKind::ClaudeCode | AgentKind::Codex => {}
         }
     }
+
+    /// This agent's `tool_provider` string for the shared execution
+    /// identity envelope (HORO-1599) —
+    /// <https://github.com/horonomy/.github/blob/main/governance/product/execution-identity-contract.md>.
+    /// The one place this mapping is written; callers convert through
+    /// this method rather than writing the string literal themselves.
+    pub fn as_tool_provider(self) -> &'static str {
+        match self {
+            AgentKind::ClaudeCode => "claude_code",
+            AgentKind::Codex => "codex",
+        }
+    }
+}
+
+#[cfg(test)]
+mod agent_kind_tests {
+    use super::*;
+
+    #[test]
+    fn every_agent_kind_maps_to_a_valid_tool_provider_string() {
+        for agent in AgentKind::ALL {
+            assert!(crate::is_valid_tool_provider(agent.as_tool_provider()));
+        }
+    }
+
+    #[test]
+    fn tool_provider_strings_match_the_execution_identity_contract() {
+        assert_eq!(AgentKind::ClaudeCode.as_tool_provider(), "claude_code");
+        assert_eq!(AgentKind::Codex.as_tool_provider(), "codex");
+    }
 }
 
 /// The normalized hook-lifecycle event vocabulary this integration
