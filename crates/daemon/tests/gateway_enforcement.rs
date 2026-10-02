@@ -100,6 +100,7 @@ fn config(dir: &Path, policy: Policy, with_gateway: bool) -> DaemonConfig {
         gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER.to_string(),
         extensions: None,
         extension_runtime: std::sync::OnceLock::new(),
+        progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
     }
 }
 
