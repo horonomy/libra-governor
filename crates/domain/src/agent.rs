@@ -191,6 +191,18 @@ pub struct AgentCapabilities {
     /// A hook payload exposes per-request token count, cost, or
     /// provider id.
     pub model_event_observation: Capability,
+    /// The host's own status/statusline surface exposes economic signals
+    /// (estimated cost, quota/rate-limit posture, duration) beyond what
+    /// any hook payload carries (HORO-1667). Distinct from
+    /// [`Self::model_event_observation`]: that field is about hook
+    /// payloads specifically. Always [`Capability::Unavailable`] today —
+    /// capturing Claude Code's `statusLine` stdin payload was evaluated
+    /// and explicitly deferred (founder decision, 2026-10-02): the
+    /// `horonomy/.github` statusline compositor deliberately withholds
+    /// that payload from providers so none of them grows a dependency on
+    /// it. See
+    /// `docs/adr/0009-economics-ingestion-provenance-and-deferred-host-capture.md`.
+    pub host_reported_economic_observation: Capability,
     /// The provider gateway (ADR 0003) can sit in front of this host's
     /// model calls at all — a wire-format precondition, independent of
     /// whether a hard budget is actually configured.
@@ -268,6 +280,25 @@ impl AgentCapabilities {
                 follow_up: None,
             },
         };
+        let host_reported_economic_observation = match agent {
+            AgentKind::ClaudeCode => Capability::Unavailable {
+                gap: CapabilityGap::NotWiredByLibra {
+                    detail: "statusLine stdin exposes cost/quota/rate-limit signals, but capture \
+                              is deferred: the horonomy/.github statusline compositor \
+                              deliberately withholds that payload from providers so none of \
+                              them grows a dependency on it (founder decision, 2026-10-02)"
+                        .to_string(),
+                    follow_up: None,
+                },
+            },
+            AgentKind::Codex => Capability::Unavailable {
+                gap: CapabilityGap::HostExposesNoPrimitive {
+                    detail: "no statusline/status surface exists in the Codex config schema at \
+                              any level, so there is no economic signal to capture"
+                        .to_string(),
+                },
+            },
+        };
 
         let (
             model_gateway,
@@ -333,6 +364,7 @@ impl AgentCapabilities {
             tool_gate,
             completion_receipt: Capability::Available,
             model_event_observation,
+            host_reported_economic_observation,
             model_gateway,
             hard_budget_enforcement,
             persistent_status_surface,
@@ -382,6 +414,16 @@ mod tests {
                     "{agent:?} claims hard_budget_enforcement without a usable model_gateway"
                 );
             }
+        }
+    }
+
+    /// Host-payload capture is explicitly deferred for every agent today
+    /// (HORO-1667) — never silently `Available`.
+    #[test]
+    fn host_reported_economic_observation_is_unavailable_for_every_agent() {
+        for agent in all_agents() {
+            let caps = AgentCapabilities::for_agent(agent);
+            assert!(!caps.host_reported_economic_observation.is_available());
         }
     }
 

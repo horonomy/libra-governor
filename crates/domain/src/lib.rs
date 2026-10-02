@@ -40,6 +40,7 @@ mod completion_contract;
 mod confidence;
 mod economic_attribution;
 mod economic_event;
+mod economic_ingest;
 mod economic_rollup;
 mod estimate;
 mod execution_event;
@@ -79,6 +80,10 @@ pub use economic_attribution::{
 pub use economic_event::{
     EconomicEvent, EconomicEventError, EconomicEventId, EconomicScope, FactRole, ResourceBasis,
     ResourceFact, TruthStrength, EXECUTION_CHAIN,
+};
+pub use economic_ingest::{
+    deltas_from_snapshots, events_from_gateway_request, CounterKind, GatewayRequestObservation,
+    HostCounterSnapshot,
 };
 pub use economic_rollup::{
     exclusive_spend, inclusive_spend, project, AgentLineage, Projection, RollupError, SpendTotals,

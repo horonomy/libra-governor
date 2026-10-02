@@ -25,9 +25,26 @@ use uuid::Uuid;
 #[serde(transparent)]
 pub struct EconomicEventId(pub Uuid);
 
+/// Fixed namespace for [`EconomicEventId::deterministic`] (HORO-1667).
+/// An arbitrary, permanently-fixed UUID — never regenerate this constant,
+/// or every previously-derived deterministic id silently changes.
+const DETERMINISTIC_NAMESPACE: Uuid = Uuid::from_bytes([
+    0x6f, 0x1b, 0x3a, 0x2c, 0x9d, 0x44, 0x4e, 0x7a, 0x8f, 0x61, 0x02, 0xaa, 0x3c, 0x5d, 0x71, 0x9e,
+]);
+
 impl EconomicEventId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
+    }
+
+    /// A deterministic id derived from `name` (UUIDv5). Two calls with the
+    /// same `name` always produce the same id, so replaying the same
+    /// upstream fact (e.g. the same `(gateway_request_id, resource_kind)`
+    /// pair) is structurally idempotent — every rollup in
+    /// [`crate::economic_rollup`] already de-duplicates by this id before
+    /// summing, so a replayed ingest can never double count.
+    pub fn deterministic(name: &str) -> Self {
+        Self(Uuid::new_v5(&DETERMINISTIC_NAMESPACE, name.as_bytes()))
     }
 }
 
@@ -546,5 +563,19 @@ mod tests {
                 .kind(),
             ResourceKind::Tokens
         );
+    }
+
+    #[test]
+    fn deterministic_id_is_stable_across_calls() {
+        let a = EconomicEventId::deterministic("gw-1:usd");
+        let b = EconomicEventId::deterministic("gw-1:usd");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn deterministic_id_differs_by_name() {
+        let usd = EconomicEventId::deterministic("gw-1:usd");
+        let tokens = EconomicEventId::deterministic("gw-1:tokens");
+        assert_ne!(usd, tokens);
     }
 }
