@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     confidence::Confidence,
+    regime::RegimeBasis,
     resource_amount::ResourceAmount,
     task_features::{BucketTier, FEATURE_SCHEMA_VERSION},
 };
@@ -36,7 +37,15 @@ use crate::{
 /// capped at [`crate::Confidence::Medium`] no matter how large it gets),
 /// not just the bare sample count [`crate::Confidence::from_sample_count`]
 /// used to use.
-pub const ESTIMATOR_VERSION: &str = "v3-tiered-confidence";
+///
+/// Bumped `v3-tiered-confidence` -> `v4-regime-aware` for HORO-1671:
+/// confidence is now computed from the *in-regime* sample count only
+/// (see [`RegimeBasis`]), not the raw bucket sample count. This is a
+/// traceability bump only — it is deliberately NOT the same constant as
+/// [`crate::ESTIMATOR_REGIME_SCHEMA`], which stays unchanged here; see
+/// that constant's docs for why conflating the two would self-invalidate
+/// every pre-upgrade calibration sample.
+pub const ESTIMATOR_VERSION: &str = "v4-regime-aware";
 
 /// A probabilistic preflight estimate: P50/P80/P90 for both wall-clock
 /// duration and resource usage, plus the confidence/provenance metadata
@@ -84,6 +93,12 @@ pub struct Estimate {
     /// Which tier of the hierarchical backoff ladder this estimate was
     /// actually computed from — see `libra-governor-estimator` crate docs.
     pub bucket_tier: BucketTier,
+    /// The execution regime this estimate was computed under, and how
+    /// many of its samples were in- vs. out-of-regime (HORO-1671).
+    /// `#[serde(default)]` so a pre-HORO-1671 `estimate_json` blob still
+    /// deserializes — see [`RegimeBasis::default`].
+    #[serde(default)]
+    pub regime: RegimeBasis,
 }
 
 impl Estimate {
@@ -106,6 +121,7 @@ impl Estimate {
             ),
             feature_schema_version: FEATURE_SCHEMA_VERSION.to_string(),
             bucket_tier: BucketTier::ColdStart,
+            regime: RegimeBasis::default(),
         }
     }
 }
