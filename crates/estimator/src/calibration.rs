@@ -310,7 +310,7 @@ fn mean(values: &[f64]) -> Option<f64> {
     }
 }
 
-fn quantile_coverage_for(pairs: &[&CalibrationPair], quantile: f64) -> QuantileCoverage {
+pub(crate) fn quantile_coverage_for(pairs: &[&CalibrationPair], quantile: f64) -> QuantileCoverage {
     let n = pairs.len();
     if n == 0 {
         return QuantileCoverage {
@@ -433,6 +433,7 @@ mod tests {
             actual_duration_secs,
             task_features: None,
             recorded_at: OffsetDateTime::UNIX_EPOCH,
+            regime: None,
         }
     }
 
@@ -457,6 +458,7 @@ mod tests {
             reason: None,
             feature_schema_version: libra_governor_domain::FEATURE_SCHEMA_VERSION.to_string(),
             bucket_tier,
+            regime: Default::default(),
         }
     }
 
