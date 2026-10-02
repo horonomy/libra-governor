@@ -87,7 +87,9 @@ pub enum ReservationClass {
 /// leases are excluded from a parent's `exclusive` spend (see
 /// `libra_governor_domain::economic_rollup` — that money belongs to the
 /// child) and are only ever settled up as a whole, never with a
-/// caller-supplied actual (see `libra_governor_ledger::resource_account::close_account`).
+/// caller-supplied actual — settle-up happens via the cascade-expiry
+/// sweep in `libra_governor_ledger::reservation::expire_stale_reservations`,
+/// not a dedicated `close_account` function (none exists today).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LeaseKind {
