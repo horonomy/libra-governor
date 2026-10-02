@@ -1,0 +1,6 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running `/Users/bryant/.cargo/shared-target/debug/examples/v003_gate /tmp/v003_test_ledger.sqlite3`
+v0.0.3 progressive-estimator benchmark gate
+ledger: "/tmp/v003_test_ledger.sqlite3"
+calibration pairs: 0 (of 0 total receipts)
+INSUFFICIENT — 0 pairs < required 30. This is the honest result for a fresh checkout or CI run; it is not a harness failure. Re-run against a ledger with real dogfood history to get a real comparison.

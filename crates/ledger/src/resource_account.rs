@@ -670,6 +670,105 @@ impl LedgerStore {
         })
     }
 
+    /// Persists a [`Shadow`]-wrapped runtime decision to
+    /// `shadow_runtime_decisions` (HORO-1669 Stage B) — the comparison
+    /// substrate a later evidence-gate ticket (HORO-1673) reads.
+    /// Purely additive: this is the only write this module makes on the
+    /// shadow-recording path, and it touches no other table. The
+    /// decision itself is never read back as a `RuntimeDecision` here —
+    /// only `Shadow::summary()`'s non-addressable fields are used to
+    /// populate the indexable columns, consistent with the type's own
+    /// no-accessor guarantee.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_shadow_decision(
+        &self,
+        task_id: libra_governor_domain::TaskId,
+        plan_id: libra_governor_domain::PlanId,
+        session_id: &str,
+        shadow: &libra_governor_domain::Shadow<libra_governor_domain::RuntimeDecision>,
+        elapsed_secs: u64,
+        tool_calls_total: u64,
+        decided_at: OffsetDateTime,
+    ) -> Result<(), LedgerError> {
+        let summary = shadow.summary();
+        let decision_json = serde_json::to_string(shadow).map_err(|e| {
+            LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+        })?;
+        self.conn.execute(
+            "INSERT INTO shadow_runtime_decisions (
+                decision_id, task_id, plan_id, session_id, proposal_kind,
+                decision_json, decision_schema_version, elapsed_secs,
+                tool_calls_total, decided_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT (task_id, plan_id, decided_at) DO NOTHING",
+            rusqlite::params![
+                uuid::Uuid::new_v4().to_string(),
+                task_id.0.to_string(),
+                plan_id.0.to_string(),
+                session_id,
+                summary.proposal_kind,
+                decision_json,
+                libra_governor_domain::RUNTIME_DECISION_SCHEMA_VERSION,
+                elapsed_secs,
+                tool_calls_total,
+                rfc3339(decided_at)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The most recent `decided_at` recorded for this task in
+    /// `shadow_runtime_decisions`, or `None` if no shadow decision has
+    /// ever been recorded for it. The daemon's cadence gate uses this
+    /// directly instead of tracking a separate "last progressive run"
+    /// timestamp in its own state — the shadow table is already the
+    /// authoritative record of when a progressive computation last ran,
+    /// so a second copy of that fact would be exactly the kind of
+    /// duplicated bookkeeping this campaign avoids elsewhere.
+    pub fn last_shadow_decision_at(
+        &self,
+        task_id: libra_governor_domain::TaskId,
+    ) -> Result<Option<OffsetDateTime>, LedgerError> {
+        // A bare aggregate with no GROUP BY always returns exactly one
+        // row (NULL when nothing matches) — no `.optional()` needed.
+        let row: Option<String> = self.conn.query_row(
+            "SELECT MAX(decided_at) FROM shadow_runtime_decisions WHERE task_id = ?1",
+            [task_id.0.to_string()],
+            |row| row.get(0),
+        )?;
+        row.map(|s| parse_time(&s)).transpose()
+    }
+
+    /// `(active_lease_count, child_account_count)` over `account_id`'s
+    /// subtree — audit/evidence metadata for [`ProgressEvidence`], not
+    /// used by the remaining-estimate arithmetic itself (that only reads
+    /// [`Self::account_spend`]). `child_account_count` excludes the
+    /// account itself. `(0, 0)` when the account does not exist.
+    pub fn subtree_counts(&self, account_id: AccountId) -> Result<(u32, u32), LedgerError> {
+        if self.account(account_id)?.is_none() {
+            return Ok((0, 0));
+        }
+        let active_leases: u32 = self.conn.query_row(
+            "WITH RECURSIVE subtree(account_id) AS (
+                SELECT account_id FROM resource_accounts WHERE account_id = ?1
+                UNION ALL
+                SELECT a.account_id FROM resource_accounts a
+                JOIN subtree s ON a.parent_account_id = s.account_id
+             )
+             SELECT COUNT(*) FROM reservations r
+             JOIN subtree s ON r.account_id = s.account_id
+             WHERE r.state = 'active'",
+            [account_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let child_accounts: u32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM resource_accounts WHERE parent_account_id = ?1",
+            [account_id.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok((active_leases, child_accounts))
+    }
+
     /// Reads an account's capacity through `v_account_capacity` — the
     /// one place the task-vs-other-level case analysis lives. `Ok(None)`
     /// when the account itself does not exist.

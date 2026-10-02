@@ -20,5 +20,5 @@ pub mod server;
 
 pub use server::{
     bind_or_detect_running, default_admission_policy, handle_connection, serve, DaemonConfig,
-    DaemonError,
+    DaemonError, DEFAULT_PROGRESSIVE_INTERVAL_SECS,
 };
