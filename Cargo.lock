@@ -476,6 +476,7 @@ version = "0.0.2"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "time",
  "uuid",
