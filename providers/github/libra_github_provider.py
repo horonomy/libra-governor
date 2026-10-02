@@ -250,7 +250,8 @@ class GitHubProviderHandler(BaseProviderHandler):
                 self.auth_header,
                 allow_private_network=self.allow_private_network,
             )
-        except Exception as exc:  # noqa: BLE001 — any fetch failure degrades to minimal response, never raises
+        # Any fetch failure degrades to minimal response, never raises.
+        except Exception as exc:  # noqa: BLE001
             self.log_message("business-context: task=%s %s/%s#%s fetch failed: %s", task_id, owner, repo, branch, exc)
             self._respond_json(200, minimal)
             return
@@ -298,7 +299,8 @@ class GitHubProviderHandler(BaseProviderHandler):
                 self.auth_header,
                 allow_private_network=self.allow_private_network,
             )
-        except Exception as exc:  # noqa: BLE001 — a fetch failure must never raise into the handler
+        # A fetch failure must never raise into the handler.
+        except Exception as exc:  # noqa: BLE001
             self.log_message("outcome: task=%s %s/%s#%s fetch failed: %s", task_id, owner, repo, branch, exc)
             return
 
