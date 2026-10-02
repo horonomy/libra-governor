@@ -40,16 +40,26 @@ example's, validated against the same schema, subject to the same R1/R2
 rules (`BusinessContext` never merges into `TaskFeatures`;
 `advisory_criteria` never enters `quality_floor`).
 
-### 1. Shared security scaffolding is extracted, not duplicated, and not merged into the already-reviewed example
+### 1. Shared security scaffolding is extracted, and the example provider was updated to actually use it once duplication was measured, not just described as intentional
 
 `providers/common/libra_provider_runtime.py` is new, but it is an
 *extraction* of logic `libra_example_provider.py` (HORO-1174, already
 merged, already CI-green, already reviewed for exactly this HMAC/replay
-surface) proves correct — not a reimplementation, and not an edit to that
-file. A second real adapter reusing the same module means the
-signature-verification and replay-rejection code path has exactly one
-implementation to review, not two that could silently diverge. A third
-future adapter (Linear, Asana, whatever comes next) extends this module's
+surface) proves correct. This ADR's first draft stopped at "extracted,
+not an edit to that file" — on the theory that `libra_example_provider.py`
+keeping its own copy was an acceptable, documented tradeoff. A
+SonarCloud quality-gate failure on this PR's own diff measured that
+tradeoff's actual cost (real, flagged duplication between the two
+copies) and the right correction was to finish the extraction:
+`libra_example_provider.py` now subclasses `BaseProviderHandler` and
+calls `resolve_ticket_key` from the shared module, with its own test
+suite passing unmodified and a manual signed-request round-trip
+confirming identical wire behavior. A second real adapter reusing the
+same module means the signature-verification and replay-rejection code
+path has exactly one implementation to review, not two that could
+silently diverge — now true of the reference provider as well, not just
+the new adapters. A third future adapter (Linear, Asana, whatever comes
+next) extends this module's
 `BaseProviderHandler`, it does not re-derive HMAC verification again.
 
 ### 2. Each adapter owns a narrow, named, auditable credential surface

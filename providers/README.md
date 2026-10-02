@@ -9,9 +9,13 @@ for why these exist as loopback processes against the existing contract
 rather than as new daemon capability.
 
 `examples/local-providers/libra_example_provider.py` (HORO-1174) remains
-the minimal, illustrative reference implementation and is untouched by
-this work. The adapters here are real, usable providers backed by a real
-external system.
+the minimal, illustrative reference implementation. It now builds on
+`providers/common/` too (refactored to eliminate real duplication a
+SonarCloud quality gate caught between its original HMAC/ticket-key
+logic and this work's extraction of the same logic) — its behavior on
+the wire is unchanged, only its implementation now shares one copy of
+that logic instead of keeping a second. The adapters here are real,
+usable providers backed by a real external system.
 
 ## Layout
 
