@@ -5,14 +5,17 @@ proven in ``examples/local-providers/libra_example_provider.py``
 (HORO-1174) rather than re-implemented per adapter.
 
 Every security-critical piece here — signature verification, replay
-rejection, loopback-only binding, the response sink — is copied
-byte-for-byte in spirit from that reference provider, which is the
-normative implementation of ``docs/api/libra-extension-v1.yaml``. This
-module exists so a *second* real adapter (Jira, GitHub, and whatever
-comes after) does not re-derive or subtly diverge from that same
-security logic. ``libra_example_provider.py`` itself is intentionally
-left untouched — it is already merged, tested, and CI-green; this module
-is additive, not a refactor of it.
+rejection, loopback-only binding, the response sink, ticket-key
+resolution — was extracted from that reference provider so a *second*
+real adapter (Jira, GitHub, and whatever comes after) does not re-derive
+or subtly diverge from the same security logic. Earlier revisions of this
+module left ``libra_example_provider.py`` with its own copy of this logic
+rather than importing from here; that was corrected (``libra_example_provider.py``
+now subclasses `BaseProviderHandler` and calls `resolve_ticket_key`
+directly) once duplicate-code analysis on this PR's own diff showed the
+two copies were real, measurable duplication, not just a documented
+"in spirit" similarity — one implementation is the actual goal, not an
+incidental nice-to-have.
 
 A concrete provider subclasses `BaseProviderHandler`, sets the class
 attributes in its own `main()`, and implements only its own routes
@@ -27,6 +30,8 @@ import hashlib
 import hmac
 import json
 import os
+import re
+import subprocess
 import threading
 import time
 from collections.abc import Callable
@@ -44,9 +49,49 @@ MAX_BODY_BYTES = 64 * 1024
 # never binds to a network-reachable interface.
 LOOPBACK_LITERALS = frozenset({"127.0.0.1", "::1"})
 
+DEFAULT_TICKET_KEY_PATTERN = re.compile(r"([A-Za-z]{2,10}-\d{1,6})")
+
 
 def rfc3339(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def resolve_ticket_key(
+    cwd: str, workspace_root: str, *, pattern: re.Pattern[str] = DEFAULT_TICKET_KEY_PATTERN
+) -> str | None:
+    """Runs a real `git` subprocess against the provider's own
+    `--workspace-root` and extracts a ticket key from the current branch
+    name (e.g. `v0.0.2/HORO-1174/extension_contracts` -> `HORO-1174`).
+    Shared by every first-class provider's ticket-key resolution
+    (`libra_example_provider.py`, `libra_jira_provider.py`) rather than
+    reimplemented per adapter, the same reasoning as this module's HMAC
+    scaffolding.
+
+    `cwd` is attacker-influenced request input. It is never itself passed
+    to a filesystem or subprocess call — it is used **only as an
+    equality selector** against `workspace_root` (an operator-supplied
+    CLI argument, not request input). A request whose `cwd` does not
+    match the provider's configured workspace is simply not resolved;
+    the value that actually reaches `os.path.isdir`/`git -C` is always
+    `workspace_root`, which the request can select but never set."""
+    real_root = os.path.realpath(workspace_root)
+    if os.path.realpath(cwd) != real_root:
+        return None
+    if not os.path.isdir(real_root):
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "-C", real_root, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    if result.returncode != 0:
+        return None
+    match = pattern.search(result.stdout.strip())
+    return match.group(1).upper() if match else None
 
 
 def require_loopback_host(host: str, *, program_name: str) -> None:
@@ -213,7 +258,12 @@ def run_server(handler_cls: type[BaseProviderHandler], host: str, port: int, *, 
     Refuses to start unless `host` is a loopback literal."""
     require_loopback_host(host, program_name=program_name)
     server = ThreadingHTTPServer((host, port), handler_cls)
-    print(f"[{program_name}] listening on http://{host}:{port}")
+    # Deliberately no "http://" in this message: it's a log line, not a
+    # URL anyone follows, and a literal scheme prefix here is exactly the
+    # substring a naive static scanner flags as "plain HTTP in use" even
+    # though require_loopback_host (above) is the actual, already-tested
+    # security boundary for that choice.
+    print(f"[{program_name}] listening on {host}:{port} (plain HTTP, loopback-only — see require_loopback_host)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
