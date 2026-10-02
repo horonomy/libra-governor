@@ -29,8 +29,10 @@
 //! [`MIN_CLASS_SAMPLES`] wins.
 
 use libra_governor_domain::{
-    BucketTier, Confidence, Estimate, ExecutionReceipt, RegimeBasis, RegimeKey, RegimeProvenance,
-    ResourceAmount, ResourceKind, TaskFeatures,
+    BucketTier, Confidence, Estimate, ExecutionReceipt, Feasibility, FeasibilityBound,
+    ProgressEvidence, RegimeBasis, RegimeKey, RegimeProvenance, RemainingDuration,
+    RemainingResource, RemainingWorkEstimate, ResourceAmount, ResourceKind, SpendSoFar,
+    TaskFeatures, TruthStrength, MIN_CONDITIONAL_SAMPLES,
 };
 
 pub mod calibration;
@@ -154,6 +156,146 @@ pub fn estimate_bucketed(
         out_of_regime_sample_count: 0,
     };
     cold
+}
+
+/// Computes a progressive "remaining work" estimate (HORO-1669):
+/// conditions the same bucketed history [`estimate_bucketed`] would use
+/// on the runtime evidence in `progress`, via conditional empirical
+/// quantiles over truncated history — see
+/// `libra_governor_domain::progressive` module docs for why this is not
+/// `total_pX - elapsed`.
+///
+/// Reuses [`bucket_ladder`]/[`matches`] to select the same sample set
+/// `estimate_bucketed` would use for `current` — "this task's bucket" is
+/// never a second, silently-drifting notion.
+pub fn remaining_bucketed(
+    history: &[(Option<TaskFeatures>, ExecutionReceipt)],
+    current: &TaskFeatures,
+    current_regime: &RegimeProvenance,
+    progress: &ProgressEvidence,
+) -> RemainingWorkEstimate {
+    let base = estimate_bucketed(history, current, current_regime);
+
+    let bucketed: Vec<ExecutionReceipt> = bucket_ladder(current)
+        .into_iter()
+        .find_map(|tier| {
+            let matching: Vec<ExecutionReceipt> = history
+                .iter()
+                .filter(|(features, _)| {
+                    features.as_ref().is_some_and(|f| matches(tier, f, current))
+                })
+                .map(|(_, r)| r.clone())
+                .collect();
+            (matching.len() >= MIN_CLASS_SAMPLES).then_some(matching)
+        })
+        .unwrap_or_else(|| history.iter().map(|(_, r)| r.clone()).collect());
+
+    let duration = remaining_duration(&bucketed, progress.elapsed_secs);
+    let resource = remaining_resource(&bucketed, &progress.spend_so_far);
+    let feasibility = remaining_feasibility(&bucketed, progress.elapsed_secs);
+
+    RemainingWorkEstimate::assemble(&base, duration, resource, feasibility, progress.clone())
+}
+
+fn remaining_duration(receipts: &[ExecutionReceipt], elapsed_secs: u64) -> RemainingDuration {
+    let mut remaining: Vec<u64> = receipts
+        .iter()
+        .map(|r| r.actual_duration_secs)
+        .filter(|d| *d > elapsed_secs)
+        .map(|d| d - elapsed_secs)
+        .collect();
+    let conditional_n = remaining.len();
+    if conditional_n < MIN_CONDITIONAL_SAMPLES {
+        return RemainingDuration::Insufficient {
+            conditional_n,
+            required: MIN_CONDITIONAL_SAMPLES,
+            elapsed_secs,
+        };
+    }
+    remaining.sort_unstable();
+    RemainingDuration::Quantiles {
+        p50_secs: quantile_u64(&remaining, 0.50),
+        p80_secs: quantile_u64(&remaining, 0.80),
+        p90_secs: quantile_u64(&remaining, 0.90),
+        conditional_n,
+    }
+}
+
+fn remaining_resource(
+    receipts: &[ExecutionReceipt],
+    spend_so_far: &SpendSoFar,
+) -> RemainingResource {
+    let amounts: Vec<&ResourceAmount> = receipts
+        .iter()
+        .flat_map(|r| r.actual_usage.iter())
+        .collect();
+    if amounts.is_empty() {
+        return RemainingResource::Unavailable {
+            reason: "no receipt carries resource usage at the current enforcement tier".to_string(),
+        };
+    }
+
+    let most_common_kind = most_common_kind(&amounts);
+    // Absent a known spend-so-far, condition on zero progress — a real,
+    // if coarse, "remaining from the start" figure, never fabricated: it
+    // is still computed from real historical quantiles, just without
+    // narrowing by elapsed spend.
+    let spent = match spend_so_far {
+        SpendSoFar::Known { kind, settled, .. } if *kind == most_common_kind => *settled,
+        _ => 0.0,
+    };
+
+    let mut remaining: Vec<f64> = amounts
+        .iter()
+        .filter(|a| a.kind() == most_common_kind)
+        .map(|a| numeric_value(a))
+        .filter(|v| *v > spent)
+        .map(|v| v - spent)
+        .collect();
+    let conditional_n = remaining.len();
+    if conditional_n < MIN_CONDITIONAL_SAMPLES {
+        return RemainingResource::Insufficient {
+            conditional_n,
+            required: MIN_CONDITIONAL_SAMPLES,
+        };
+    }
+    remaining.sort_by(f64::total_cmp);
+    let to_amount = |v: f64| rebuild_amount(most_common_kind, v);
+    RemainingResource::Quantiles {
+        kind: most_common_kind,
+        p50: to_amount(quantile_f64(&remaining, 0.50)),
+        p80: to_amount(quantile_f64(&remaining, 0.80)),
+        p90: to_amount(quantile_f64(&remaining, 0.90)),
+        conditional_n,
+        // No receipt-level provenance tag exists yet for historical
+        // resource usage (that's HORO-1667's gateway_requests territory,
+        // not receipts) -- `Estimated` is the honest, conservative
+        // floor until a stronger per-receipt provenance exists.
+        weakest_truth: TruthStrength::Estimated,
+    }
+}
+
+fn remaining_feasibility(receipts: &[ExecutionReceipt], elapsed_secs: u64) -> Feasibility {
+    let conditional_n = receipts
+        .iter()
+        .filter(|r| r.actual_duration_secs > elapsed_secs)
+        .count();
+    if receipts.len() < MIN_CONDITIONAL_SAMPLES {
+        return Feasibility::Insufficient {
+            conditional_n: receipts.len(),
+            required: MIN_CONDITIONAL_SAMPLES,
+        };
+    }
+    let fraction = conditional_n as f64 / receipts.len() as f64;
+    Feasibility::ObservedFrequency {
+        conditional_n: receipts.len(),
+        fitting_n: conditional_n,
+        fraction,
+        against: FeasibilityBound {
+            kind: ResourceKind::Usd,
+            remaining_headroom: 0.0,
+        },
+    }
 }
 
 /// The hierarchical backoff ladder, most specific to least specific.
@@ -725,5 +867,140 @@ mod tests {
         assert!(result.resource_p50.is_none());
         assert!(result.resource_p80.is_none());
         assert!(result.resource_p90.is_none());
+    }
+
+    // -- remaining_bucketed (HORO-1669) ------------------------------------
+
+    fn progress_at(elapsed_secs: u64) -> ProgressEvidence {
+        ProgressEvidence {
+            elapsed_secs,
+            spend_so_far: SpendSoFar::NoBasis {
+                reason: libra_governor_domain::NoSpendBasis::NoAccount,
+            },
+            tool_calls_total: 1,
+            tool_calls_since_last_replan: 1,
+            same_tool_streak: 1,
+            plan_revision: 1,
+            auto_replan_count: 0,
+            active_lease_count: 0,
+            child_account_count: 0,
+            gateway_request_count: 0,
+            observed_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn remaining_bucketed_is_insufficient_with_no_history() {
+        let current = features("repo-a", BuildTopology::Cargo, None);
+        let result = remaining_bucketed(
+            &[],
+            &current,
+            &RegimeProvenance::pre_regime_record(),
+            &progress_at(10),
+        );
+        assert!(matches!(
+            result.duration,
+            RemainingDuration::Insufficient { .. }
+        ));
+    }
+
+    #[test]
+    fn remaining_bucketed_never_reads_zero_at_the_moment_of_overrunning() {
+        // The pathology this ticket exists to avoid: `total_p90 -
+        // elapsed` would read 0 (or saturate) once elapsed exceeds every
+        // historical sample. The conditional-quantile method must
+        // instead report Insufficient, never a fabricated zero duration.
+        let current = features("repo-a", BuildTopology::Cargo, None);
+        let history: Vec<_> = (1..=10)
+            .map(|n| dated_receipt(n * 10, Some(current.clone())))
+            .collect();
+        // Elapsed already exceeds every sample in history (max is 100).
+        let result = remaining_bucketed(
+            &history,
+            &current,
+            &RegimeProvenance::pre_regime_record(),
+            &progress_at(1000),
+        );
+        match result.duration {
+            RemainingDuration::Insufficient { conditional_n, .. } => {
+                assert_eq!(conditional_n, 0);
+            }
+            RemainingDuration::Quantiles { p50_secs, .. } => {
+                panic!("expected Insufficient, not a fabricated quantile (got p50={p50_secs})")
+            }
+        }
+    }
+
+    #[test]
+    fn remaining_bucketed_shrinks_the_conditional_sample_set_as_elapsed_grows() {
+        let current = features("repo-a", BuildTopology::Cargo, None);
+        // Durations 10..=200 step 10 (20 samples): plenty to clear
+        // MIN_CONDITIONAL_SAMPLES at low elapsed, fewer qualify as
+        // elapsed grows.
+        let history: Vec<_> = (1..=20)
+            .map(|n| dated_receipt(n * 10, Some(current.clone())))
+            .collect();
+
+        let early = remaining_bucketed(
+            &history,
+            &current,
+            &RegimeProvenance::pre_regime_record(),
+            &progress_at(10),
+        );
+        let late = remaining_bucketed(
+            &history,
+            &current,
+            &RegimeProvenance::pre_regime_record(),
+            &progress_at(150),
+        );
+
+        let early_n = match early.duration {
+            RemainingDuration::Quantiles { conditional_n, .. } => conditional_n,
+            RemainingDuration::Insufficient { conditional_n, .. } => conditional_n,
+        };
+        let late_n = match late.duration {
+            RemainingDuration::Quantiles { conditional_n, .. } => conditional_n,
+            RemainingDuration::Insufficient { conditional_n, .. } => conditional_n,
+        };
+        assert!(
+            late_n < early_n,
+            "conditional sample set must shrink monotonically as elapsed grows: early={early_n}, late={late_n}"
+        );
+    }
+
+    #[test]
+    fn remaining_bucketed_resource_arm_is_unavailable_with_no_usage_data() {
+        let current = features("repo-a", BuildTopology::Cargo, None);
+        let history: Vec<_> = (1..=10)
+            .map(|n| dated_receipt(n, Some(current.clone())))
+            .collect();
+        let result = remaining_bucketed(
+            &history,
+            &current,
+            &RegimeProvenance::pre_regime_record(),
+            &progress_at(1),
+        );
+        assert!(matches!(
+            result.resource,
+            RemainingResource::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn remaining_bucketed_consumes_confidence_and_regime_from_the_base_estimate() {
+        let current = features("repo-a", BuildTopology::Cargo, None);
+        let history: Vec<_> = (1..=20)
+            .map(|n| dated_receipt(n * 10, Some(current.clone())))
+            .collect();
+        let base = estimate_bucketed(&history, &current, &RegimeProvenance::pre_regime_record());
+        let remaining = remaining_bucketed(
+            &history,
+            &current,
+            &RegimeProvenance::pre_regime_record(),
+            &progress_at(10),
+        );
+        assert_eq!(remaining.confidence, base.confidence);
+        assert_eq!(remaining.regime, base.regime);
+        assert_eq!(remaining.bucket_tier, base.bucket_tier);
     }
 }
