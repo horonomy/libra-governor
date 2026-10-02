@@ -130,13 +130,22 @@ def _basic_auth_header(email: str, api_token: str) -> str:
     return "Basic " + base64.b64encode(pair).decode("ascii")
 
 
-def fetch_jira_issue(base_url: str, issue_key: str, auth_header: str, *, opener=None) -> dict:
-    """Fetches one issue's fields from Jira Cloud. `base_url` must already
-    be validated (see `main()`); `issue_key` is a bounded, already-matched
-    ticket key, never raw request/user text interpolated without
-    validation."""
+def fetch_jira_issue(
+    base_url: str, issue_key: str, auth_header: str, *, opener=None, allow_private_network: bool = False
+) -> dict:
+    """Fetches one issue's fields from Jira Cloud. `issue_key` is a
+    bounded, already-matched ticket key, never raw request/user text
+    interpolated without validation. `allow_private_network` must match
+    whatever `main()` was given for this provider's configured base URL
+    — `fetch_json` re-validates `base_url` on every call (see
+    `safe_https_client.py`)."""
     url = f"{base_url.rstrip('/')}/rest/api/3/issue/{issue_key}?fields=priority,duedate,project,status"
-    return fetch_json(url, headers={"Authorization": auth_header, "Accept": "application/json"}, opener=opener)
+    return fetch_json(
+        url,
+        headers={"Authorization": auth_header, "Accept": "application/json"},
+        opener=opener,
+        allow_private_network=allow_private_network,
+    )
 
 
 def business_context_from_issue(issue: dict, provider_id: str = PROVIDER_ID) -> dict:
@@ -179,7 +188,13 @@ def is_done(issue: dict, done_statuses: frozenset[str]) -> bool:
 
 
 def post_execution_receipt_comment(
-    base_url: str, issue_key: str, auth_header: str, receipt_summary: str, *, opener=None
+    base_url: str,
+    issue_key: str,
+    auth_header: str,
+    receipt_summary: str,
+    *,
+    opener=None,
+    allow_private_network: bool = False,
 ):
     """Posts Libra's execution receipt as a comment on the Jira issue —
     the one path in this adapter that actually mutates Jira. Only ever
@@ -192,7 +207,13 @@ def post_execution_receipt_comment(
     body = {"body": {"type": "doc", "version": 1, "content": [
         {"type": "paragraph", "content": [{"type": "text", "text": receipt_summary}]}
     ]}}
-    return post_json(url, payload=body, headers={"Authorization": auth_header}, opener=opener)
+    return post_json(
+        url,
+        payload=body,
+        headers={"Authorization": auth_header},
+        opener=opener,
+        allow_private_network=allow_private_network,
+    )
 
 
 def push_outcome(binary: str, task_id: str, issue_key: str, evidence_url: str) -> subprocess.CompletedProcess:
@@ -239,6 +260,7 @@ class JiraProviderHandler(BaseProviderHandler):
     workspace_root: str
     enable_write_back: bool
     task_issue_keys: TaskIssueKeys
+    allow_private_network: bool
 
     def route_table(self):
         return {
@@ -260,7 +282,9 @@ class JiraProviderHandler(BaseProviderHandler):
             self.task_issue_keys.remember(task_id, issue_key)
 
         try:
-            issue = fetch_jira_issue(self.jira_base_url, issue_key, self.auth_header)
+            issue = fetch_jira_issue(
+                self.jira_base_url, issue_key, self.auth_header, allow_private_network=self.allow_private_network
+            )
         except Exception as exc:  # noqa: BLE001 — any fetch failure degrades to minimal response, never raises
             self.log_message("business-context: task=%s issue=%s fetch failed: %s", task_id, issue_key, exc)
             self._respond_json(200, {"schema_version": SCHEMA_VERSION, "provider_id": PROVIDER_ID})
@@ -291,7 +315,13 @@ class JiraProviderHandler(BaseProviderHandler):
         admission = data.get("admission", "unknown")
         summary = f"Libra Governor: task {task_id} finished (admission: {admission})."
         try:
-            result = post_execution_receipt_comment(self.jira_base_url, issue_key, self.auth_header, summary)
+            result = post_execution_receipt_comment(
+                self.jira_base_url,
+                issue_key,
+                self.auth_header,
+                summary,
+                allow_private_network=self.allow_private_network,
+            )
             self.log_message("write-back: task=%s issue=%s -> status=%s", task_id, issue_key, result.status)
         except Exception as exc:  # noqa: BLE001 — write-back is best-effort, never raises into the handler
             self.log_message("write-back: task=%s issue=%s failed: %s", task_id, issue_key, exc)
@@ -338,6 +368,7 @@ def main() -> None:
     JiraProviderHandler.workspace_root = os.path.realpath(args.workspace_root)
     JiraProviderHandler.enable_write_back = args.enable_write_back
     JiraProviderHandler.task_issue_keys = TaskIssueKeys()
+    JiraProviderHandler.allow_private_network = args.allow_private_network
 
     run_server(JiraProviderHandler, args.host, args.port, program_name="libra_jira_provider")
 
