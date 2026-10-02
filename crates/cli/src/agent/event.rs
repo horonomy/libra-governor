@@ -18,16 +18,26 @@ pub enum NormalizedEvent {
         session_id: String,
         cwd: PathBuf,
         prompt: String,
+        /// Codex-only today — see `agent::payload`'s module docs
+        /// (HORO-1599).
+        turn_id: Option<String>,
+        /// Codex-only today — see `agent::payload`'s module docs
+        /// (HORO-1599).
+        agent_id: Option<String>,
     },
     /// `PostToolUse`.
     ToolCompleted {
         session_id: String,
         tool_name: String,
+        turn_id: Option<String>,
+        agent_id: Option<String>,
     },
     /// `Stop`.
     TurnCompleted {
         session_id: String,
         model: Option<String>,
+        turn_id: Option<String>,
+        agent_id: Option<String>,
     },
     /// A hook event name this integration recognizes as a genuine agent
     /// lifecycle event (`SessionStart`, `SessionEnd`, `SubagentStart`,
