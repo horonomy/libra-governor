@@ -46,6 +46,7 @@ pub use reservation::{
 };
 pub use resource_account::{
     AccountError, EnsureAccountOutcome, GrantSubleaseOutcome, GrantSubleaseRequest,
+    RecordedShadowDecision,
 };
 pub use store::LedgerStore;
 pub use write::DOGFOOD_PROFILE_ENV_VAR;
