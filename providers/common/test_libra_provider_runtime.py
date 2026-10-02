@@ -12,6 +12,9 @@ import hashlib
 import hmac
 import http.client
 import json
+import os
+import subprocess
+import tempfile
 import threading
 import time
 import unittest
@@ -65,6 +68,37 @@ class RequireReadableFileTest(unittest.TestCase):
     def test_accepts_this_test_file_itself(self):
         resolved = runtime.require_readable_file(__file__, "secret-file", program_name="test")
         self.assertTrue(resolved.is_file())
+
+
+class ResolveTicketKeyTest(unittest.TestCase):
+    """`resolve_ticket_key` is shared by `libra_example_provider.py` and
+    `libra_jira_provider.py` (extracted here to eliminate the real,
+    measurable Sonar-flagged duplication the two copies used to be) —
+    tested once, at the one place the logic actually lives."""
+
+    def test_cwd_must_match_workspace_root_exactly(self):
+        self.assertIsNone(runtime.resolve_ticket_key("/some/other/path", "/tmp"))
+
+    def test_nonexistent_workspace_root_resolves_to_none(self):
+        self.assertIsNone(runtime.resolve_ticket_key("/definitely/does/not/exist", "/definitely/does/not/exist"))
+
+    def test_resolves_a_real_ticket_key_from_the_current_branch(self):
+        with tempfile.TemporaryDirectory() as repo_root:
+            env = {
+                **os.environ,
+                "GIT_AUTHOR_NAME": "test",
+                "GIT_AUTHOR_EMAIL": "test@example.invalid",
+                "GIT_COMMITTER_NAME": "test",
+                "GIT_COMMITTER_EMAIL": "test@example.invalid",
+            }
+            subprocess.run(
+                ["git", "init", "-q", "-b", "v0.0.3/HORO-1173/feat/example"], cwd=repo_root, check=True, env=env
+            )
+            subprocess.run(
+                ["git", "-C", repo_root, "commit", "--allow-empty", "-q", "-m", "init"], check=True, env=env
+            )
+            key = runtime.resolve_ticket_key(repo_root, repo_root)
+        self.assertEqual(key, "HORO-1173")
 
 
 class ReplayGuardTest(unittest.TestCase):
