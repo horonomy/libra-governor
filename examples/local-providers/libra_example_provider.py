@@ -11,7 +11,13 @@ Every route here does real work, not a stubbed constant:
 - Signature verification recomputes the HMAC-SHA256 exactly as
   ``crates/extension/src/sign.rs`` does, checks a clock-skew window on
   ``x-libra-timestamp``, and tracks ``x-libra-nonce`` values it has
-  already seen to reject a replay.
+  already seen to reject a replay. This logic, and the loopback-only
+  server scaffolding around it, now live in
+  ``providers/common/libra_provider_runtime.py`` (HORO-1173) rather than
+  being duplicated here — that module was extracted *from* this file so
+  a second real adapter (Jira, GitHub) would share one audited
+  implementation instead of re-deriving it. This module imports that
+  shared runtime rather than keeping its own copy.
 - The business-context route resolves a real ticket key by running
   ``git -C <workspace_root> rev-parse --abbrev-ref HEAD`` (the request's
   ``cwd`` is used only as an equality check against ``--workspace-root``,
@@ -37,68 +43,37 @@ existing experiment harnesses under ``experiments/``.
 from __future__ import annotations
 
 import argparse
-import hashlib
-import hmac
 import json
 import os
 import re
 import subprocess
+import sys
 import threading
-import time
 from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-SCHEMA_VERSION = "libra.extension.v1"
-SIGNATURE_VERSION = "v1"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "providers" / "common"))
+
+from libra_provider_runtime import (  # noqa: E402
+    SCHEMA_VERSION,
+    BaseProviderHandler,
+    ReplayGuard,
+    require_loopback_host as _shared_require_loopback_host,
+    require_readable_file,
+    rfc3339,
+    run_server,
+)
+# Re-exported for this module's own test suite (test_libra_example_provider.py).
+from libra_provider_runtime import LOOPBACK_LITERALS  # noqa: E402,F401
+
 TICKET_KEY_PATTERN = re.compile(r"([A-Za-z]{2,10}-\d{1,6})")
-MAX_BODY_BYTES = 64 * 1024
-# Mirrors the daemon's own loopback-literal-only config validation
-# (`docs/adr/0005-local-extension-points.md`): this reference provider
-# speaks plain HTTP deliberately, which is only safe because it never
-# binds to a network-reachable interface.
-LOOPBACK_LITERALS = frozenset({"127.0.0.1", "::1"})
 
 
-def rfc3339(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-class ReplayGuard:
-    """Tracks accepted (nonce -> expiry) pairs so the same signed request
-    cannot be replayed within the clock-skew window, and accepted
-    event_id values for delivery-retry dedup. Both are real, mutated
-    state — not decorative."""
-
-    def __init__(self, skew_secs: float):
-        self._skew_secs = skew_secs
-        self._nonces: dict[str, float] = {}
-        self._event_ids: set[str] = set()
-        self._lock = threading.Lock()
-
-    def check_and_record_nonce(self, nonce: str) -> bool:
-        """Returns True if this nonce is fresh (not seen before within
-        the skew window) and records it. Returns False on replay."""
-        now = time.time()
-        with self._lock:
-            self._nonces = {
-                n: exp for n, exp in self._nonces.items() if exp > now
-            }
-            if nonce in self._nonces:
-                return False
-            self._nonces[nonce] = now + self._skew_secs
-            return True
-
-    def check_and_record_event_id(self, event_id: str) -> bool:
-        """Returns True the first time this event_id is seen (accept and
-        record); False on every subsequent delivery attempt for the same
-        event (dedup, not a replay rejection — the caller still returns
-        200 so the dispatcher stops retrying)."""
-        with self._lock:
-            if event_id in self._event_ids:
-                return False
-            self._event_ids.add(event_id)
-            return True
+def require_loopback_host(host: str) -> None:
+    """Thin wrapper over the shared runtime's check, preserving this
+    module's original single-argument public API (this file's own test
+    suite, `test_libra_example_provider.py`, calls it this way)."""
+    _shared_require_loopback_host(host, program_name="libra_example_provider")
 
 
 class TaskCostCenters:
@@ -153,117 +128,21 @@ def resolve_ticket_key(cwd: str, workspace_root: str) -> str | None:
     return match.group(1).upper() if match else None
 
 
-class ProviderHandler(BaseHTTPRequestHandler):
+class ProviderHandler(BaseProviderHandler):
     # Set by main() via a subclass/functools.partial-free pattern:
     # these are class attributes assigned once at startup.
-    secret: bytes
     tickets: dict
     cost_caps: dict
     events_log_path: Path
-    replay_guard: ReplayGuard
     task_cost_centers: TaskCostCenters
-    max_clock_skew_secs: float
-    provider_id: str
     workspace_root: str
 
-    def log_message(self, fmt, *args):  # noqa: A003 — stdlib override
-        # Keep stdout limited to what the e2e harness actually inspects;
-        # BaseHTTPRequestHandler's default is one line per request to
-        # stderr, which is fine — just make the format explicit instead
-        # of the default combined-log-format string.
-        print(f"[provider] {self.address_string()} {fmt % args}")
-
-    # -- signature verification -----------------------------------------
-
-    def _verify_and_read_body(self) -> tuple[bytes, str] | None:
-        """Reads the raw body, verifies the five signed headers against
-        it, and returns (body, request_id) on success. On any failure,
-        writes the appropriate error response itself and returns None."""
-        content_length = int(self.headers.get("Content-Length", "0"))
-        if content_length > MAX_BODY_BYTES:
-            self.send_response(413)
-            self.end_headers()
-            return None
-        body = self.rfile.read(content_length)
-
-        schema_version = self.headers.get("x-libra-schema-version")
-        request_id = self.headers.get("x-libra-request-id")
-        timestamp_raw = self.headers.get("x-libra-timestamp")
-        nonce = self.headers.get("x-libra-nonce")
-        signature = self.headers.get("x-libra-signature")
-
-        if not all([schema_version, request_id, timestamp_raw, nonce, signature]):
-            self._respond_json(400, {"error": "missing required signed header"})
-            return None
-        if schema_version != SCHEMA_VERSION:
-            self._respond_json(400, {"error": "unsupported schema_version"})
-            return None
-
-        try:
-            timestamp = int(timestamp_raw)
-        except ValueError:
-            self._respond_json(400, {"error": "x-libra-timestamp is not an integer"})
-            return None
-
-        now = time.time()
-        if abs(now - timestamp) > self.max_clock_skew_secs:
-            self._respond_json(401, {"error": "timestamp outside the allowed clock-skew window"})
-            return None
-
-        # Recomputes the exact signed_payload format from
-        # crates/extension/src/sign.rs: "v1.<timestamp>.<nonce>." + body.
-        payload = f"{SIGNATURE_VERSION}.{timestamp}.{nonce}.".encode("utf-8") + body
-        expected_mac = hmac.new(self.secret, payload, hashlib.sha256).hexdigest()
-        expected_signature = f"{SIGNATURE_VERSION}={expected_mac}"
-        if not hmac.compare_digest(signature, expected_signature):
-            self._respond_json(401, {"error": "signature mismatch"})
-            return None
-
-        if not self.replay_guard.check_and_record_nonce(nonce):
-            self._respond_json(409, {"error": "nonce already used (replay)"})
-            return None
-
-        return body, request_id
-
-    def _respond_json(self, status: int, payload: dict) -> None:
-        # `json.dumps` escapes every value it serializes, so nothing in
-        # `payload` can break out of the JSON string context.
-        # `X-Content-Type-Options: nosniff` additionally stops a client
-        # from MIME-sniffing this response as HTML regardless of
-        # `Content-Type`. No route ever echoes raw request content
-        # (headers, path, body fields) back into an error message —
-        # every `{"error": ...}` payload below is a static string, so
-        # there is no reflected-content path into a response at all.
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.end_headers()
-        self.wfile.write(body)
-
-    # -- routes ------------------------------------------------------------
-
-    def do_POST(self):  # noqa: N802 — stdlib override
-        verified = self._verify_and_read_body()
-        if verified is None:
-            return
-        body, _request_id = verified
-
-        try:
-            request = json.loads(body)
-        except json.JSONDecodeError:
-            self._respond_json(400, {"error": "malformed JSON body"})
-            return
-
-        if self.path == "/libra/business-context":
-            self._handle_business_context(request)
-        elif self.path == "/libra/policy-decision":
-            self._handle_policy_decision(request)
-        elif self.path == "/libra/events":
-            self._handle_event(request)
-        else:
-            self._respond_json(404, {"error": "no route for the requested path"})
+    def route_table(self):
+        return {
+            "/libra/business-context": self._handle_business_context,
+            "/libra/policy-decision": self._handle_policy_decision,
+            "/libra/events": self._handle_event,
+        }
 
     def _handle_business_context(self, request: dict) -> None:
         task_id = request.get("task_id", "")
@@ -366,32 +245,6 @@ class ProviderHandler(BaseHTTPRequestHandler):
         self._respond_json(200, {"status": "accepted"})
 
 
-def _require_readable_file(raw_path: str, label: str) -> Path:
-    """Resolves a CLI-supplied path and requires it to be a real,
-    existing, readable regular file before anything reads it. Operator
-    input (a local CLI flag, not network-attacker input), but validated
-    anyway rather than handed straight to a filesystem read."""
-    path = Path(raw_path).expanduser().resolve()
-    if not path.is_file() or not os.access(path, os.R_OK):
-        raise SystemExit(f"libra_example_provider: --{label} does not resolve to a readable file: {raw_path!r}")
-    return path
-
-
-def require_loopback_host(host: str) -> None:
-    """Raises `SystemExit` unless `host` is a loopback literal. This is
-    this provider's whole security boundary for speaking plain HTTP
-    without TLS (accepted as a documented exception — see
-    `README.md`/HORO-1174 evidence): the server must never be reachable
-    from anywhere but the local machine, and `--host` is the only knob
-    that could break that."""
-    if host not in LOOPBACK_LITERALS:
-        raise SystemExit(
-            f"libra_example_provider: --host must be a loopback literal ({sorted(LOOPBACK_LITERALS)}), "
-            f"got {host!r} — this provider speaks plain HTTP and must never bind a "
-            "network-reachable interface."
-        )
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
@@ -427,9 +280,13 @@ def main() -> None:
 
     require_loopback_host(args.host)
 
-    secret_bytes = _require_readable_file(args.secret_file, "secret-file").read_bytes()
-    tickets = json.loads(_require_readable_file(args.tickets_file, "tickets-file").read_text())
-    cost_caps = json.loads(_require_readable_file(args.cost_caps_file, "cost-caps-file").read_text())
+    secret_bytes = require_readable_file(args.secret_file, "secret-file", program_name="libra_example_provider").read_bytes()
+    tickets = json.loads(
+        require_readable_file(args.tickets_file, "tickets-file", program_name="libra_example_provider").read_text()
+    )
+    cost_caps = json.loads(
+        require_readable_file(args.cost_caps_file, "cost-caps-file", program_name="libra_example_provider").read_text()
+    )
     events_log_path = Path(args.events_log).expanduser().resolve()
     events_log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -443,14 +300,7 @@ def main() -> None:
     ProviderHandler.provider_id = args.provider_id
     ProviderHandler.workspace_root = os.path.realpath(args.workspace_root)
 
-    server = ThreadingHTTPServer((args.host, args.port), ProviderHandler)
-    print(f"[provider] listening on http://{args.host}:{args.port}")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
+    run_server(ProviderHandler, args.host, args.port, program_name="libra_example_provider")
 
 
 if __name__ == "__main__":
