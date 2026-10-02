@@ -71,21 +71,45 @@ writing to the PR, issue, or any check run. Jira's adapter has exactly
 one mutating code path (an outcome receipt comment), and it is opt-in,
 off by default, gated behind a CLI flag an operator must pass explicitly.
 
-### 3. The outbound call gets its own SSRF-safety discipline, symmetric to but distinct from ADR 0005's inbound one
+### 3. The outbound call gets its own SSRF-safety discipline, symmetric to but distinct from ADR 0005's inbound one, and closed against DNS-rebinding and redirect bypass specifically
 
-`providers/common/safe_https_client.py` validates a provider's configured
-base URL before every call: must be `https`, must have no embedded
-credentials, and — unless `allow_private_network=True` is passed
-explicitly for a genuinely self-hosted Jira/GitHub Enterprise instance —
-must not resolve (on **any** of its DNS answers, not just the first) to a
-loopback, link-local, private, reserved, or multicast address. This is
-the mirror image of ADR 0005's loopback-only rule: there, the daemon's
+`providers/common/safe_https_client.py` validates every real request
+before it connects: must be `https`, must have no embedded credentials,
+and — unless `allow_private_network=True` is passed explicitly for a
+genuinely self-hosted Jira/GitHub Enterprise instance — must not resolve
+to a loopback, link-local, private, reserved, or multicast address. This
+is the mirror image of ADR 0005's loopback-only rule: there, the daemon's
 *inbound* target must only ever be loopback; here, the provider's
 *outbound* target must only ever be a real public (or deliberately
-opted-in private) endpoint. Treating "operator config" as still requiring
-per-call validation, rather than a one-time startup check, follows the
-same discipline this repo already applies to request-supplied data — a
-provider that loads its base URL from a file an attacker could modify
+opted-in private) endpoint.
+
+A "validate the configured URL once, then let the HTTP client do its own
+thing" design has two well-known SSRF bypass gaps a review of this ADR's
+first draft caught, and both are closed structurally, not by convention:
+
+- **DNS rebinding / TOCTOU.** If validation resolves a hostname and the
+  actual connection independently re-resolves it moments later, an
+  attacker controlling DNS for that hostname can answer safely the first
+  time and unsafely the second. `_resolve_validated_ip` is the **only**
+  resolution call in the real request path, and `_PinnedHTTPSConnection`
+  connects directly to the IP that call validated — there is no second,
+  independent resolution anywhere in between for a rebinding attacker to
+  race. (TLS SNI and certificate hostname verification still use the real
+  hostname via `server_hostname`, so pinning the socket to an IP does not
+  weaken certificate validation.)
+- **Redirect-following bypass.** Letting the HTTP client auto-follow
+  redirects without re-validating the `Location` target reopens exactly
+  the hole validation exists to close — a safe initial URL can redirect
+  to `169.254.169.254` or similar. `_request_with_validated_redirects`
+  never delegates to automatic redirect handling: it follows redirects
+  itself, in a bounded loop, and every hop goes through the same
+  validate-then-pin `_request_once` call as the initial request, with no
+  exception for "it's just a redirect."
+
+Treating "operator config" as still requiring per-call validation, rather
+than a one-time startup check, follows the same discipline this repo
+already applies to request-supplied data — a provider that loads its base
+URL from a file an attacker could modify
 deserves the same protection as one reading from a request body.
 
 ### 4. Ticket-key and repo/branch resolution is selector, never value — reusing HORO-1174's proven pattern
