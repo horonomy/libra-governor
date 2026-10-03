@@ -23,6 +23,7 @@
 //! `libra-governor-domain`'s crate-level docs for the structural
 //! guarantee this rests on.
 
+mod economic_truth;
 mod extension;
 mod gateway;
 mod migrations;
