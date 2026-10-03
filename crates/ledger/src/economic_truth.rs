@@ -821,6 +821,13 @@ mod tests {
         task_id
     }
 
+    fn spend_so_far_kind(s: &SpendSoFar) -> &'static str {
+        match s {
+            SpendSoFar::Known { .. } => "Known",
+            SpendSoFar::NoBasis { .. } => "NoBasis",
+        }
+    }
+
     fn reserve_outcome_kind(o: &ReserveOutcome) -> &'static str {
         match o {
             ReserveOutcome::Granted(_) => "Granted",
@@ -902,7 +909,7 @@ mod tests {
                 active_holds,
                 ..
             } => (settled, active_holds),
-            other => panic!("expected Known, got {other:?}"),
+            other => panic!("expected Known, got {}", spend_so_far_kind(&other)),
         };
         let (inc_settled, inc_active) = match categories.totals.inclusive {
             SpendSoFar::Known {
@@ -910,7 +917,7 @@ mod tests {
                 active_holds,
                 ..
             } => (settled, active_holds),
-            other => panic!("expected Known, got {other:?}"),
+            other => panic!("expected Known, got {}", spend_so_far_kind(&other)),
         };
         assert_eq!((ex_settled, ex_active), (inc_settled, inc_active));
 
@@ -925,7 +932,7 @@ mod tests {
                 active_holds,
                 ..
             } => (settled, active_holds),
-            other => panic!("expected Known, got {other:?}"),
+            other => panic!("expected Known, got {}", spend_so_far_kind(&other)),
         };
         let (raw_inc_settled, raw_inc_active) = match store
             .account_spend(task_account, SpendScope::Inclusive)
@@ -936,7 +943,7 @@ mod tests {
                 active_holds,
                 ..
             } => (settled, active_holds),
-            other => panic!("expected Known, got {other:?}"),
+            other => panic!("expected Known, got {}", spend_so_far_kind(&other)),
         };
         assert_eq!(
             (raw_ex_settled, raw_ex_active),
@@ -1405,7 +1412,7 @@ mod tests {
         assert_eq!(
             raw_distinct_settled_rows, raw_settled_row_count,
             "seed {seed}: a settled reservation row was counted more than once \
-             by its own id — no idempotency-key retry should ever create a \
+             by its own id — no replayed retry should ever create a \
              duplicate row"
         );
 
@@ -1414,7 +1421,7 @@ mod tests {
             .unwrap()
         {
             SpendSoFar::Known { settled, .. } => settled,
-            other => panic!("seed {seed}: expected Known, got {other:?}"),
+            other => panic!("seed {seed}: expected Known, got {}", spend_so_far_kind(&other)),
         };
         assert!(
             (reported - raw_settled).abs() < 0.001,
