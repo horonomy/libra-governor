@@ -61,8 +61,24 @@ impl LedgerStore {
     /// Builds the full [`EconomicTruth`] report for a `--session`
     /// selector: resolves the session's bound task via
     /// [`Self::task_id_for_session`] (reused verbatim), then reports
-    /// that task's account scope, labeled [`AmountScope::EnclosingAccount`]
-    /// since v0.0.3 mints no dedicated session-level account by default.
+    /// that task's account.
+    ///
+    /// HORO-1673 finding I9 (fixed here): this used to delegate to
+    /// [`Self::economic_truth_for_task`] wholesale, which overwrote the
+    /// returned report's [`SelectorEcho`] to `{selector: "task", value:
+    /// task_id}` — a session query's own identity was lost on every
+    /// success path, and two sessions sharing one task received
+    /// byte-identical reports with no session identifier anywhere in
+    /// the output. The selector is now preserved. The totals
+    /// themselves are still genuinely the task account's own figures
+    /// (v0.0.3 mints no dedicated session-level account — see
+    /// `ADR-0008`), labeled [`AmountScope::OwnAccountExclusive`]/
+    /// [`AmountScope::OwnAccountInclusive`] same as a direct `--task`
+    /// query, **not** [`AmountScope::EnclosingAccount`] — relabeling the
+    /// totals themselves to `EnclosingAccount` would change a
+    /// documented ADR-0013 contract and is tracked separately
+    /// (HORO-1673 evidence README) rather than done as part of this
+    /// fix.
     pub fn economic_truth_for_session(
         &self,
         session_id: &str,
@@ -76,7 +92,12 @@ impl LedgerStore {
                 NoEconomicBasis::NoSuchSession,
             ));
         };
-        self.economic_truth_for_task(task_id)
+        let mut truth = self.economic_truth_for_task(task_id)?;
+        truth.selector = SelectorEcho {
+            selector: "session".to_string(),
+            value: session_id.to_string(),
+        };
+        Ok(truth)
     }
 
     /// Builds the full [`EconomicTruth`] report for an `--account`
@@ -270,7 +291,7 @@ impl LedgerStore {
         };
 
         let forecast = self.forecast_for_account(&account)?;
-        let unattributed = self.unattributed_for_account(account_id, legacy_count)?;
+        let unattributed = self.unattributed_for_account(account.task_id, legacy_count)?;
         let custody_tree = self.custody_tree(account_id, TreeBudget::default())?;
         let reconciliation = self.reconciliation_for_account(account_id, &totals, &custody_tree)?;
 
@@ -376,18 +397,50 @@ impl LedgerStore {
     /// gateway row with no `task_id`, a gateway row whose
     /// `settled_amount` is populated but has no linked reservation, and
     /// leases legacy-backfilled from pre-0011 `task_budgets` rows.
+    /// Scoped by `task_id`, not `account_id`: `gateway_requests` and
+    /// `resource_accounts` both carry a `task_id` column, but gateway
+    /// rows with no task at all (`task_id IS NULL`) and orphan accounts
+    /// belonging to a *different* task must never be reported under
+    /// this account's report — doing so attributed an unrelated task's
+    /// unattributed-row counts to this one (HORO-1673 finding D4).
+    /// `task_id = ?1` never matches a NULL column, so a row with no
+    /// task at all correctly contributes zero to every task-scoped
+    /// report, not the ledger-wide count.
     fn unattributed_for_account(
         &self,
-        _account_id: AccountId,
+        task_id: Option<TaskId>,
         legacy_count: u32,
     ) -> Result<Unattributed, LedgerError> {
+        let Some(task_id) = task_id else {
+            return Ok(Unattributed {
+                legacy_backfilled: PartialBucket {
+                    amount: None,
+                    row_count: legacy_count,
+                    reason: UnattributedReason::LegacyPreMigration0011,
+                },
+                gateway_rows_without_task: PartialBucket {
+                    amount: None,
+                    row_count: 0,
+                    reason: UnattributedReason::GatewayRowWithoutTask,
+                },
+                gateway_settled_without_lease: PartialBucket {
+                    amount: None,
+                    row_count: 0,
+                    reason: UnattributedReason::GatewaySettledWithoutLease,
+                },
+                accounts_without_proven_lineage: 0,
+                orphan_accounts: Vec::new(),
+            });
+        };
+        let task_id_str = task_id.to_string();
+
         let orphan_account_ids: Vec<String> = {
             let mut stmt = self.conn.prepare(
                 "SELECT account_id FROM resource_accounts
-                 WHERE level <> 'task' AND parent_account_id IS NULL",
+                 WHERE level <> 'task' AND parent_account_id IS NULL AND task_id = ?1",
             )?;
             let rows = stmt
-                .query_map([], |row| {
+                .query_map([&task_id_str], |row| {
                     let s: String = row.get(0)?;
                     Ok(s)
                 })?
@@ -399,15 +452,17 @@ impl LedgerStore {
             .filter_map(|s| uuid::Uuid::parse_str(&s).ok().map(AccountId))
             .collect();
 
-        let gateway_rows_without_task: u32 = self.conn.query_row(
-            "SELECT COUNT(*) FROM gateway_requests WHERE task_id IS NULL",
-            [],
-            |row| row.get(0),
-        )?;
+        // A gateway row with `task_id IS NULL` cannot belong to any
+        // specific task's report by construction — it has no task at
+        // all. The ledger-wide count of these rows is a separate,
+        // whole-ledger diagnostic (not currently surfaced by any
+        // per-task/per-account selector) and must never be folded into
+        // this task's figure.
+        let gateway_rows_without_task: u32 = 0;
         let gateway_settled_without_lease: u32 = self.conn.query_row(
             "SELECT COUNT(*) FROM gateway_requests
-             WHERE reservation_id IS NULL AND settled_amount IS NOT NULL",
-            [],
+             WHERE reservation_id IS NULL AND settled_amount IS NOT NULL AND task_id = ?1",
+            [&task_id_str],
             |row| row.get(0),
         )?;
 
@@ -582,7 +637,7 @@ impl LedgerStore {
         };
 
         let envelope_formula = self.envelope_formula_check(account_id)?;
-        let gateway_agreement = self.gateway_ledger_agreement_check(tree)?;
+        let gateway_agreement = self.gateway_ledger_agreement_check(tree, kind)?;
 
         Ok(Reconciliation::from_checks(vec![
             subtree_additivity,
@@ -647,10 +702,18 @@ impl LedgerStore {
         })
     }
 
+    /// `kind` is the account's resource kind, when known — the same
+    /// value `SubtreeAdditivity` already uses for its epsilon. Without
+    /// it this check fell back to a hardcoded `> 1.0` tolerance, which
+    /// is roughly 100x too loose for `QuotaPercent` (whose own epsilon
+    /// is `0.01`) and silently treated a near-$1 USD disagreement as
+    /// reconciled (HORO-1673 finding D2).
     fn gateway_ledger_agreement_check(
         &self,
         tree: &CustodyTree,
+        kind: Option<libra_governor_domain::ResourceKind>,
     ) -> Result<ReconciliationCheck, LedgerError> {
+        let epsilon = kind.map(|k| k.reconciliation_epsilon()).unwrap_or(1.0);
         let account_ids: Vec<String> = tree
             .nodes
             .iter()
@@ -673,12 +736,14 @@ impl LedgerStore {
              WHERE r.account_id IN ({placeholders})
                AND g.settled_amount IS NOT NULL
                AND r.settled_amount IS NOT NULL
-               AND ABS(g.settled_amount - r.settled_amount) > 1.0"
+               AND ABS(g.settled_amount - r.settled_amount) > ?{}",
+            account_ids.len() + 1
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let params: Vec<&dyn rusqlite::ToSql> = account_ids
             .iter()
             .map(|s| s as &dyn rusqlite::ToSql)
+            .chain(std::iter::once(&epsilon as &dyn rusqlite::ToSql))
             .collect();
         let discrepant_count: i64 = stmt.query_row(params.as_slice(), |row| row.get(0))?;
 
@@ -710,3 +775,4 @@ impl LedgerStore {
         })
     }
 }
+
