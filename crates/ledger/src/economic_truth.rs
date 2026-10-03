@@ -1421,7 +1421,10 @@ mod tests {
             .unwrap()
         {
             SpendSoFar::Known { settled, .. } => settled,
-            other => panic!("seed {seed}: expected Known, got {}", spend_so_far_kind(&other)),
+            other => panic!(
+                "seed {seed}: expected Known, got {}",
+                spend_so_far_kind(&other)
+            ),
         };
         assert!(
             (reported - raw_settled).abs() < 0.001,
