@@ -73,6 +73,11 @@
 //!   JSON from stdin, over the daemon's existing Unix socket (HORO-1174).
 //!   The entry point an external Outcome Provider shells out to; see
 //!   `examples/local-providers/report_outcome.sh`.
+//! - `economics explain --task|--session|--account|--principal|--organization <value> [--json]`
+//!   — reconstructs "what did this cost, really" entirely from the real
+//!   persisted ledger tables (HORO-1672). `--principal`/`--organization`
+//!   are accepted selectors, always answered honestly as not-yet-configured
+//!   in v0.0.3 rather than rejected as unknown.
 
 mod agent;
 mod agents_cmd;
@@ -85,6 +90,7 @@ mod codex_hooks_file;
 mod daemon_cmd;
 mod doctor_cmd;
 mod dogfood_evidence_cmd;
+mod economics_cmd;
 mod evidence_report_cmd;
 mod gateway_cmd;
 mod hook;
@@ -121,6 +127,7 @@ Usage:
   libra-governor evidence-report
   libra-governor dogfood-evidence export
   libra-governor outcome record
+  libra-governor economics explain --task|--session|--account|--principal|--organization <value> [--json]
 
 Global options:
   -h, --help     Print this help and exit
@@ -177,6 +184,22 @@ fn main() {
         ["evidence-report"] => evidence_report_cmd::run(),
         ["dogfood-evidence", "export"] => dogfood_evidence_cmd::run(),
         ["outcome", "record"] => outcome_cmd::run(),
+        ["economics", "explain", sel, value]
+            if matches!(
+                *sel,
+                "--task" | "--session" | "--account" | "--principal" | "--organization"
+            ) =>
+        {
+            economics_cmd::run(sel, value, false)
+        }
+        ["economics", "explain", sel, value, "--json"]
+            if matches!(
+                *sel,
+                "--task" | "--session" | "--account" | "--principal" | "--organization"
+            ) =>
+        {
+            economics_cmd::run(sel, value, true)
+        }
         // Hidden, undocumented test fixture for HORO-1380/ADR-0014's
         // cross-process write-lock test suite
         // (`tests/write_lock_cross_process.rs`). Not part of the public
