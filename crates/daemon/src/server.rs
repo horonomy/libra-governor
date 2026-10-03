@@ -508,8 +508,12 @@ fn dispatch(
                 }
             }
         },
-        Request::Finalize { session_id, model } => {
-            match handle_finalize(&session_id, model, ledger, current_task, config) {
+        Request::Finalize {
+            session_id,
+            model,
+            provider,
+        } => {
+            match handle_finalize(&session_id, model, provider, ledger, current_task, config) {
                 Ok(outcome) => Response::Finalize(outcome),
                 Err(e) => {
                     log::append_line(&config.log_path, &format!("finalize error: {e}"));
@@ -1662,6 +1666,7 @@ fn handle_tool_invoked(
 fn handle_finalize(
     session_id: &str,
     model: Option<String>,
+    provider: Option<String>,
     ledger: &mut LedgerStore,
     current_task: &mut Option<TaskSummary>,
     config: &DaemonConfig,
@@ -1700,8 +1705,15 @@ fn handle_finalize(
     )
     .with_tool_call_count(tool_call_count)
     .with_model(model)
-    .with_provider(None)
-    .with_task_features(plan.task_features.clone());
+    .with_provider(provider)
+    .with_task_features(plan.task_features.clone())
+    .with_regime(Some(current_regime(
+        config,
+        plan.task_features
+            .as_ref()
+            .map(|tf| tf.feature_schema_version.as_str())
+            .unwrap_or(libra_governor_domain::FEATURE_SCHEMA_VERSION),
+    )));
 
     // Settle every reservation still active on this plan (HORO-1141).
     // `None` as the actual cost: Claude Code's hook payloads expose no
@@ -2241,6 +2253,7 @@ mod tests {
         let outcome = handle_finalize(
             "no-such-session",
             None,
+            None,
             &mut ledger,
             &mut current_task,
             &config,
@@ -2277,6 +2290,7 @@ mod tests {
         let outcome = handle_finalize(
             "sess-1",
             Some("claude-sonnet-5".to_string()),
+            Some("claude-code".to_string()),
             &mut ledger,
             &mut current_task,
             &config,
@@ -2288,6 +2302,13 @@ mod tests {
         assert_eq!(result.receipt.task_id, preflight.task_id);
         assert_eq!(result.receipt.tool_call_count, 2);
         assert_eq!(result.receipt.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(result.receipt.provider.as_deref(), Some("claude-code"));
+        assert!(
+            result.receipt.regime.is_some(),
+            "finalize must attach a regime to every receipt (HORO-1689: a real \
+             production ledger was found with regime_json NULL on every real \
+             receipt because this field was never set here)"
+        );
         assert_eq!(result.receipt.outcome, ExecutionOutcome::Unknown);
         assert!(result.estimate.is_some());
         assert!(

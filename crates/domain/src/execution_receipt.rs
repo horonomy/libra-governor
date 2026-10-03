@@ -57,12 +57,15 @@ pub struct ExecutionReceipt {
     /// [`Self::provider`] docs — this is a real, honestly-`None`-able
     /// field, not a placeholder that will always be populated later).
     pub model: Option<String>,
-    /// The provider identifier, if the harness's hook payload exposes
-    /// one. As of MVP 1.0, Claude Code's `Stop`/`PostToolUse` hook
-    /// payloads do not expose a provider field at all (only `model`), so
-    /// this is always `None` in practice today — a real platform
-    /// limitation, not a bug. The field exists so a future harness that
-    /// does expose it does not require another schema change.
+    /// The provider identifier. Neither host's `Stop` hook payload
+    /// exposes a provider field of its own (only `model`, and even that
+    /// is absent on Claude Code's real `Stop` payload — see `model`
+    /// docs above), so this is never parsed from harness payload data.
+    /// Instead it is the calling CLI entry point's own known agent-kind
+    /// label (`"claude-code"` / `"codex"`) — see `Request::Finalize`
+    /// docs (HORO-1689) — which is always known with certainty
+    /// regardless of what either harness's payload does or does not
+    /// expose.
     pub provider: Option<String>,
     /// The preflight-knowable [`TaskFeatures`] this task's plan was
     /// estimated against, if any (HORO-1130). `None` for a pre-MVP-2
