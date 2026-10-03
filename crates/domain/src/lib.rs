@@ -42,6 +42,7 @@ mod economic_attribution;
 mod economic_event;
 mod economic_ingest;
 mod economic_rollup;
+mod economic_truth;
 mod estimate;
 mod execution_event;
 mod execution_identity;
@@ -91,6 +92,14 @@ pub use economic_ingest::{
 pub use economic_rollup::{
     exclusive_spend, inclusive_spend, project, AgentLineage, Projection, RollupError, SpendTotals,
     Subtotal,
+};
+pub use economic_truth::{
+    Allocation, AmountScope, Availability, CheckId, CheckOutcome, CompletionReservePosture,
+    CustodyNode, CustodyTree, EconomicCategories, EconomicTruth, Forecast, LeaseHolds,
+    NoEconomicBasis, NodeLineage, PartialBucket, Reconciliation, ReconciliationCheck,
+    ReleasedCapacity, ScopeFilter, ScopeResolution, ScopedAmount, SelectorEcho, SettledSpend,
+    Totals, TreeBudget, Truncation, TruthProvenance, TruthSource, Unattributed, UnattributedReason,
+    ECONOMIC_TRUTH_SCHEMA_VERSION,
 };
 pub use estimate::{Estimate, ESTIMATOR_VERSION};
 pub use execution_event::{ExecutionEvent, ExecutionEventKind};

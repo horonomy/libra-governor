@@ -41,6 +41,22 @@ fn is_supported_envelope_version(version: i64) -> bool {
     version == EXECUTION_IDENTITY_ENVELOPE_VERSION
 }
 
+/// A short, deterministic, non-reversible token for display/logs. Free
+/// function (HORO-1672) so other redaction call sites — e.g. a custody
+/// tree's `natural_key_display` — can redact a raw value without needing
+/// an [`ExecutionIdentity`] instance. `field_name` is included in the
+/// digest input so two different dimensions holding the same raw string
+/// never redact identically.
+pub fn redacted_display_id(field_name: &str, raw_value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(field_name.as_bytes());
+    hasher.update(b":");
+    hasher.update(raw_value.as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    format!("{field_name}:{hex}")
+}
+
 /// Whether `value` is syntactically a legal `tool_provider` string:
 /// `^[a-z][a-z0-9_-]{0,31}$`. Deliberately permissive about *which*
 /// provider (open-ended — a new provider is a new string, never a version
@@ -442,13 +458,7 @@ impl ExecutionIdentity {
     /// two different dimensions holding the same raw string never redact
     /// identically.
     pub fn display_id(&self, field_name: &str, raw_value: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(field_name.as_bytes());
-        hasher.update(b":");
-        hasher.update(raw_value.as_bytes());
-        let digest = hasher.finalize();
-        let hex: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
-        format!("{field_name}:{hex}")
+        redacted_display_id(field_name, raw_value)
     }
 
     fn scope_identity_missing(message: impl Into<String>) -> ScopeIdentityMissing {
