@@ -1,0 +1,1 @@
+timeout 280 claude -p  --output-format json > /tmp/dogfood-evidence/task1.jso  8.05s user 2.97s system 26% cpu 40.823 total
