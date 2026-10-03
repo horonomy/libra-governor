@@ -30,9 +30,16 @@ fn parse_time(s: &str) -> Result<time::OffsetDateTime, LedgerError> {
 
 /// Deserializes a nullable `task_features_json` column value into an
 /// `Option<TaskFeatures>`. `None` means "genuinely no features recorded"
-/// (a pre-HORO-1130 row), not a deserialize failure.
+/// (a pre-HORO-1130 row), not a deserialize failure. A real production
+/// ledger was found (HORO-1689 real-DogFood evidence) to contain at
+/// least one row where this column holds an empty string rather than
+/// SQL `NULL` (an older binary's serialization, predating this
+/// function's own doc-commented "genuinely absent" contract) — treated
+/// the same as absent, not as a parse failure, so one historical row
+/// does not abort every query over the whole ledger.
 fn parse_task_features(json: Option<String>) -> Result<Option<TaskFeatures>, LedgerError> {
-    json.map(|s| serde_json::from_str(&s))
+    json.filter(|s| !s.trim().is_empty())
+        .map(|s| serde_json::from_str(&s))
         .transpose()
         .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))
 }
@@ -95,9 +102,12 @@ fn parse_reservation_evidence(
 
 /// Deserializes a nullable `regime_json` column value into an
 /// `Option<RegimeProvenance>`. `None` means "genuinely no regime
-/// recorded" (a pre-HORO-1671 row), not a deserialize failure.
+/// recorded" (a pre-HORO-1671 row), not a deserialize failure. See
+/// [`parse_task_features`] for why an empty string is treated the same
+/// as absent rather than a parse failure.
 fn parse_regime(json: Option<String>) -> Result<Option<RegimeProvenance>, LedgerError> {
-    json.map(|s| serde_json::from_str(&s))
+    json.filter(|s| !s.trim().is_empty())
+        .map(|s| serde_json::from_str(&s))
         .transpose()
         .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))
 }
@@ -637,7 +647,7 @@ impl LedgerStore {
             let (actual_duration_secs, recorded_at, task_features_json, estimate_json, regime_json) =
                 row?;
 
-            let Some(estimate_json) = estimate_json else {
+            let Some(estimate_json) = estimate_json.filter(|s| !s.trim().is_empty()) else {
                 dropped += 1;
                 continue;
             };

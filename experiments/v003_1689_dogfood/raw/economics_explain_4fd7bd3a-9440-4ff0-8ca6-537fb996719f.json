@@ -1,0 +1,427 @@
+{
+  "schema_version": "economic-truth-v1",
+  "selector": {
+    "selector": "task",
+    "value": "4fd7bd3a-9440-4ff0-8ca6-537fb996719f"
+  },
+  "resolution": {
+    "account": {
+      "account_id": "4fd7bd3a-9440-4ff0-8ca6-537fb996719f"
+    }
+  },
+  "categories": {
+    "allocation": {
+      "granted_capacity": {
+        "kind": "tokens",
+        "value": 150000.0,
+        "basis": "imported_allocation_snapshot",
+        "scope": "own_account_exclusive"
+      },
+      "authority": "local_user_config",
+      "enforcement_scope": "local_device",
+      "funding_lease": null
+    },
+    "forecast": {
+      "at_admission": {
+        "duration_p50_secs": 4,
+        "duration_p80_secs": 9,
+        "duration_p90_secs": 31,
+        "resource_p50": null,
+        "resource_p80": null,
+        "resource_p90": null,
+        "confidence": "medium",
+        "sample_count": 5,
+        "cold_start": false,
+        "estimator_version": "v4-regime-aware",
+        "reason": null,
+        "feature_schema_version": "fs-v1",
+        "bucket_tier": "topology",
+        "regime": {
+          "provenance": {
+            "schema_version": "regime-v1",
+            "key": {
+              "model": {
+                "state": "unavailable",
+                "value": "host_exposes_no_primitive"
+              },
+              "harness": {
+                "state": "unavailable",
+                "value": "host_exposes_no_primitive"
+              },
+              "harness_version": {
+                "state": "unavailable",
+                "value": "host_exposes_no_primitive"
+              },
+              "effort": {
+                "state": "unavailable",
+                "value": "host_exposes_no_primitive"
+              },
+              "pricing_version": {
+                "state": "unavailable",
+                "value": "no_gateway_configured"
+              },
+              "enforcement_tier": {
+                "state": "unavailable",
+                "value": "no_gateway_configured"
+              },
+              "estimator_regime_schema": {
+                "state": "known",
+                "value": "esr-v1"
+              },
+              "feature_schema": {
+                "state": "known",
+                "value": "fs-v1"
+              }
+            },
+            "topology": {
+              "state": "unavailable",
+              "value": "host_exposes_no_primitive"
+            },
+            "cache_class": {
+              "state": "known",
+              "value": "no_cache_observed"
+            }
+          },
+          "in_regime_sample_count": 5,
+          "out_of_regime_sample_count": 0
+        }
+      },
+      "latest_remaining": {
+        "schema_version": "remaining-work-v1",
+        "estimator_version": "v4-regime-aware",
+        "duration": {
+          "Insufficient": {
+            "conditional_n": 1,
+            "required": 5,
+            "elapsed_secs": 9
+          }
+        },
+        "resource": {
+          "Unavailable": {
+            "reason": "no receipt carries resource usage at the current enforcement tier"
+          }
+        },
+        "feasibility": {
+          "ObservedFrequency": {
+            "conditional_n": 5,
+            "fitting_n": 1,
+            "fraction": 0.2,
+            "against": {
+              "kind": "usd",
+              "remaining_headroom": 0.0
+            }
+          }
+        },
+        "confidence": "medium",
+        "regime": {
+          "provenance": {
+            "schema_version": "regime-v1",
+            "key": {
+              "model": {
+                "state": "unavailable",
+                "value": "host_exposes_no_primitive"
+              },
+              "harness": {
+                "state": "unavailable",
+                "value": "host_exposes_no_primitive"
+              },
+              "harness_version": {
+                "state": "unavailable",
+                "value": "host_exposes_no_primitive"
+              },
+              "effort": {
+                "state": "unavailable",
+                "value": "host_exposes_no_primitive"
+              },
+              "pricing_version": {
+                "state": "unavailable",
+                "value": "no_gateway_configured"
+              },
+              "enforcement_tier": {
+                "state": "unavailable",
+                "value": "no_gateway_configured"
+              },
+              "estimator_regime_schema": {
+                "state": "known",
+                "value": "esr-v1"
+              },
+              "feature_schema": {
+                "state": "known",
+                "value": "fs-v1"
+              }
+            },
+            "topology": {
+              "state": "unavailable",
+              "value": "host_exposes_no_primitive"
+            },
+            "cache_class": {
+              "state": "known",
+              "value": "no_cache_observed"
+            }
+          },
+          "in_regime_sample_count": 5,
+          "out_of_regime_sample_count": 0
+        },
+        "bucket_tier": "topology",
+        "evidence": {
+          "elapsed_secs": 9,
+          "spend_so_far": {
+            "Known": {
+              "kind": "tokens",
+              "settled": 0.0,
+              "active_holds": 75000.0,
+              "scope": "inclusive",
+              "account_count": 1
+            }
+          },
+          "tool_calls_total": 1,
+          "tool_calls_since_last_replan": 1,
+          "same_tool_streak": 1,
+          "plan_revision": 1,
+          "auto_replan_count": 0,
+          "active_lease_count": 1,
+          "child_account_count": 0,
+          "gateway_request_count": 0,
+          "observed_at": [
+            2026,
+            276,
+            11,
+            49,
+            51,
+            628667000,
+            0,
+            0,
+            0
+          ]
+        }
+      },
+      "latest_decided_at": [
+        2026,
+        276,
+        11,
+        49,
+        51,
+        628667000,
+        0,
+        0,
+        0
+      ],
+      "decision_points_recorded": 1
+    },
+    "active_leases": {
+      "work_hold_required": null,
+      "work_hold_optional": null,
+      "subaccount_funding": null,
+      "count": 0,
+      "next_expiry": null
+    },
+    "completion_reserve": {
+      "protected": {
+        "kind": "tokens",
+        "value": 25000.0,
+        "basis": "libra_reservation_hold",
+        "scope": "enclosing_account"
+      },
+      "outstanding_draw": null,
+      "basis": "policy_target",
+      "required_criteria_count": 0
+    },
+    "settled": {
+      "observed": null,
+      "assumed": {
+        "kind": "tokens",
+        "value": 75000.0,
+        "basis": "libra_reservation_hold",
+        "scope": "own_account_exclusive"
+      },
+      "overrun": null,
+      "refunded": null,
+      "settled_after_expiry_count": 0,
+      "count_observed": 0,
+      "count_assumed": 1
+    },
+    "released": {
+      "released": null,
+      "expired": null,
+      "released_count": 0,
+      "expired_count": 0
+    },
+    "totals": {
+      "exclusive": {
+        "Known": {
+          "kind": "tokens",
+          "settled": 75000.0,
+          "active_holds": 0.0,
+          "scope": "exclusive",
+          "account_count": 1
+        }
+      },
+      "inclusive": {
+        "Known": {
+          "kind": "tokens",
+          "settled": 75000.0,
+          "active_holds": 0.0,
+          "scope": "inclusive",
+          "account_count": 1
+        }
+      }
+    },
+    "unattributed": {
+      "legacy_backfilled": {
+        "amount": null,
+        "row_count": 0,
+        "reason": "legacy_pre_migration0011"
+      },
+      "gateway_rows_without_task": {
+        "amount": null,
+        "row_count": 0,
+        "reason": "gateway_row_without_task"
+      },
+      "gateway_settled_without_lease": {
+        "amount": null,
+        "row_count": 0,
+        "reason": "gateway_settled_without_lease"
+      },
+      "accounts_without_proven_lineage": 0,
+      "orphan_accounts": []
+    }
+  },
+  "custody_tree": {
+    "root": "4fd7bd3a-9440-4ff0-8ca6-537fb996719f",
+    "nodes": [
+      {
+        "account_id": "4fd7bd3a-9440-4ff0-8ca6-537fb996719f",
+        "parent": null,
+        "depth": 0,
+        "level": "task",
+        "natural_key_display": "natural_key:4fd7bd3a-9440-4ff0-8ca6-537fb996719f:aa0af8df",
+        "state": "open",
+        "provenance": "native",
+        "exclusive": {
+          "Known": {
+            "kind": "tokens",
+            "settled": 75000.0,
+            "active_holds": 0.0,
+            "scope": "exclusive",
+            "account_count": 1
+          }
+        },
+        "provider_lineage": "not_recorded"
+      }
+    ],
+    "truncated": null
+  },
+  "reconciliation": {
+    "checks": [
+      {
+        "check": "subtree_additivity",
+        "outcome": {
+          "outcome": "not_applicable"
+        }
+      },
+      {
+        "check": "envelope_formula",
+        "outcome": {
+          "outcome": "reconciled"
+        }
+      },
+      {
+        "check": "gateway_ledger_agreement",
+        "outcome": {
+          "outcome": "not_applicable"
+        }
+      }
+    ],
+    "all_reconciled": true
+  },
+  "provenance": {
+    "weakest_truth": null,
+    "account_provenance": "native",
+    "account_schema_version": "resource-account-v1",
+    "sources_read": [
+      "resource_accounts",
+      "reservations",
+      "gateway_requests",
+      "task_budgets",
+      "shadow_decisions"
+    ],
+    "pricing_versions": []
+  },
+  "task_budget": {
+    "task_id": "4fd7bd3a-9440-4ff0-8ca6-537fb996719f",
+    "resource_kind": "tokens",
+    "hard_limit": {
+      "kind": "tokens",
+      "amount": 150000
+    },
+    "initial_completion_reserve": {
+      "kind": "tokens",
+      "amount": 25000
+    },
+    "completion_reserve": {
+      "kind": "tokens",
+      "amount": 25000
+    },
+    "completion_reserve_basis": "policy_target",
+    "policy": {
+      "policy_schema_version": "policy-v1",
+      "name": "balanced",
+      "resource": {
+        "mode": "elastic",
+        "target": {
+          "kind": "tokens",
+          "amount": 100000
+        },
+        "elastic_ceiling": {
+          "kind": "tokens",
+          "amount": 125000
+        },
+        "hard_ceiling": {
+          "kind": "tokens",
+          "amount": 150000
+        }
+      },
+      "time": {
+        "mode": "elastic",
+        "target_secs": 3600,
+        "elastic_ceiling_secs": 4500,
+        "hard_ceiling_secs": 5400,
+        "deadline": null
+      },
+      "quality_floor": {
+        "revision": 1,
+        "criteria": [
+          {
+            "description": "required verification (tests/build/lint) passes",
+            "required": true
+          }
+        ]
+      },
+      "min_confidence": "low",
+      "autonomy": "ask_on_approval"
+    },
+    "reservation_schema_version": "reservation-v1",
+    "created_at": [
+      2026,
+      276,
+      11,
+      49,
+      41,
+      687997000,
+      0,
+      0,
+      0
+    ],
+    "updated_at": [
+      2026,
+      276,
+      11,
+      49,
+      41,
+      687997000,
+      0,
+      0,
+      0
+    ]
+  }
+}

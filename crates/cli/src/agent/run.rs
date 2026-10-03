@@ -402,7 +402,11 @@ pub fn run_turn_completed(agent: AgentKind) {
         }
     };
 
-    let request = Request::Finalize { session_id, model };
+    let request = Request::Finalize {
+        session_id,
+        model,
+        provider: Some(super::label(agent).to_string()),
+    };
 
     match client::roundtrip(&stream, request) {
         Ok(Response::Finalize(FinalizeOutcome::NoActiveTask)) => {

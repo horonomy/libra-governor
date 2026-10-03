@@ -86,12 +86,22 @@ pub struct Estimate {
     pub reason: Option<String>,
     /// Traceability tag for the [`crate::TaskFeatures`] schema this
     /// estimate's bucketing decision was made against (HORO-1130). Always
-    /// non-empty, even on a cold-start estimate, so every `Estimate` is
-    /// traceable to the exact feature-derivation logic in force when it
-    /// was produced.
+    /// non-empty for any `Estimate` this crate itself constructs, even a
+    /// cold-start one, so every `Estimate` is traceable to the exact
+    /// feature-derivation logic in force when it was produced.
+    /// `#[serde(default)]` (HORO-1689 real-DogFood evidence: a real
+    /// production ledger was found to contain a pre-HORO-1130
+    /// `estimate_json` blob with no such field at all) — an empty string
+    /// read back from storage means "predates this field", never a
+    /// fabricated claim about which schema was actually used.
+    #[serde(default)]
     pub feature_schema_version: String,
     /// Which tier of the hierarchical backoff ladder this estimate was
     /// actually computed from — see `libra-governor-estimator` crate docs.
+    /// `#[serde(default)]` for the same pre-HORO-1130 reason as
+    /// `feature_schema_version` above — see [`BucketTier`]'s own docs for
+    /// why `ColdStart` is the correct (not fabricated) default.
+    #[serde(default)]
     pub bucket_tier: BucketTier,
     /// The execution regime this estimate was computed under, and how
     /// many of its samples were in- vs. out-of-regime (HORO-1671).

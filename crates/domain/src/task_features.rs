@@ -64,7 +64,14 @@ pub enum BuildTopology {
 /// [`crate::Estimate`] was actually computed from, most to least
 /// specific. See `libra-governor-estimator` crate docs for the ladder
 /// itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Default` is `ColdStart` solely so `#[serde(default)]` on
+/// [`crate::Estimate::bucket_tier`] has a value to fall back to for a
+/// pre-HORO-1130 `estimate_json` blob with no `bucket_tier` field at all
+/// (HORO-1689 real-DogFood evidence: found in a real production ledger)
+/// — every such blob is, in fact, the honest cold-start estimate, so
+/// this is never a fabricated guess for real post-HORO-1130 data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum BucketTier {
     RepoTopologyModel,
@@ -72,6 +79,7 @@ pub enum BucketTier {
     Repo,
     Topology,
     Global,
+    #[default]
     ColdStart,
 }
 

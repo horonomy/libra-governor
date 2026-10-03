@@ -164,14 +164,14 @@ fn main() {
         }
     };
 
-    let (pairs, total_receipts) = ledger
+    let (pairs, dropped) = ledger
         .calibration_pairs()
         .expect("calibration_pairs query must succeed against a valid ledger schema");
 
     println!("v0.0.3 progressive-estimator benchmark gate");
     println!("ledger: {ledger_path:?}");
     println!(
-        "calibration pairs: {} (of {total_receipts} total receipts)",
+        "calibration pairs: {} ({dropped} receipts dropped — no estimate, or cold-start)",
         pairs.len()
     );
 

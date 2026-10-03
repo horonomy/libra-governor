@@ -65,11 +65,17 @@ pub enum Request {
     /// [`Response::Finalize`]. Sent from `hook stop`
     /// (HORO-1126). `model`, if the harness's hook payload exposed one,
     /// is recorded on the receipt as-is; harnesses that do not expose it
-    /// (see [`libra_governor_domain::ExecutionReceipt::provider`] docs)
-    /// leave it `None`.
+    /// leave it `None`. `provider` is never guessed from the harness's
+    /// own payload (neither host's `Stop` payload exposes one) — it is
+    /// the calling CLI entry point's own known agent-kind label
+    /// (`"claude-code"` / `"codex"`), set by `hook stop` /
+    /// `codex-hook stop` respectively (HORO-1689 follow-up: distinct
+    /// from `model`, which still requires a `SessionStart` hook to
+    /// capture and remains `None` until that's wired).
     Finalize {
         session_id: String,
         model: Option<String>,
+        provider: Option<String>,
     },
     /// Ask the daemon to compute real calibration evidence — duration
     /// coverage and admission-replay metrics — over every locally
@@ -746,6 +752,7 @@ mod tests {
             let request = Request::Finalize {
                 session_id: "sess-1".to_string(),
                 model,
+                provider: Some("claude-code".to_string()),
             };
             let json = serde_json::to_string(&request).unwrap();
             let round_tripped: Request = serde_json::from_str(&json).unwrap();

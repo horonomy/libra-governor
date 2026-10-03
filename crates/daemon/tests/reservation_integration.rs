@@ -532,6 +532,7 @@ fn finalize_settles_active_reservations_and_records_receipt_evidence() {
         Request::Finalize {
             session_id: "finalize-session".to_string(),
             model: None,
+            provider: None,
         },
     );
     let Response::Finalize(FinalizeOutcome::Finalized(result)) = outcome else {
