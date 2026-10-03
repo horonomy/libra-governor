@@ -512,17 +512,15 @@ fn dispatch(
             session_id,
             model,
             provider,
-        } => {
-            match handle_finalize(&session_id, model, provider, ledger, current_task, config) {
-                Ok(outcome) => Response::Finalize(outcome),
-                Err(e) => {
-                    log::append_line(&config.log_path, &format!("finalize error: {e}"));
-                    Response::Error {
-                        message: "internal error finalizing task".to_string(),
-                    }
+        } => match handle_finalize(&session_id, model, provider, ledger, current_task, config) {
+            Ok(outcome) => Response::Finalize(outcome),
+            Err(e) => {
+                log::append_line(&config.log_path, &format!("finalize error: {e}"));
+                Response::Error {
+                    message: "internal error finalizing task".to_string(),
                 }
             }
-        }
+        },
         Request::GatewayStatus => Response::GatewayStatus(Box::new(gateway_status(config))),
         Request::Doctor => Response::Doctor(Box::new(handle_doctor(ledger, config))),
         Request::CalibrationReport => match handle_calibration_report(ledger, config) {
