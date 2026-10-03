@@ -776,3 +776,651 @@ impl LedgerStore {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    //! HORO-1673 — oracle negative-control suite for the three
+    //! reconciliation checks this module exposes
+    //! (`economic_truth.rs` had zero tests before this ticket; see
+    //! HORO-1673 evidence README). A check that always returns
+    //! `Reconciled` makes every downstream invariant test vacuously
+    //! pass, so these tests plant a specific, understood discrepancy
+    //! and assert the check actually fires — not merely that a healthy
+    //! ledger reports `Reconciled`.
+
+    use super::*;
+    use crate::reservation::test_support::{fixed_reserve, thousand_token_policy};
+    use crate::{EnsureAccountOutcome, ReserveOutcome, ReserveRequest, SettleOutcome};
+    use libra_governor_domain::{
+        AccountLevel, AutonomyBoundary, CompletionContract, CompletionCriterion, Confidence,
+        ConstraintMode, Policy, ResourceAmount, ResourceBound, TaskIdentity, TimeBound,
+    };
+
+    fn now() -> time::OffsetDateTime {
+        time::OffsetDateTime::UNIX_EPOCH
+    }
+
+    fn setup_task(store: &mut LedgerStore, reserve_amount: u64) -> TaskId {
+        let task_id = TaskId::new();
+        store
+            .insert_task(
+                &TaskIdentity {
+                    id: task_id,
+                    external_ref: None,
+                },
+                now(),
+            )
+            .unwrap();
+        store
+            .initialize_task_budget(
+                task_id,
+                &thousand_token_policy(),
+                &fixed_reserve(reserve_amount),
+                now(),
+            )
+            .unwrap();
+        task_id
+    }
+
+    fn reserve_outcome_kind(o: &ReserveOutcome) -> &'static str {
+        match o {
+            ReserveOutcome::Granted(_) => "Granted",
+            ReserveOutcome::AlreadyGranted(_) => "AlreadyGranted",
+            ReserveOutcome::Insufficient { .. } => "Insufficient",
+            _ => "Other",
+        }
+    }
+
+    fn settle_outcome_kind(o: &SettleOutcome) -> &'static str {
+        match o {
+            SettleOutcome::Settled { .. } => "Settled",
+            SettleOutcome::AlreadyFinal(_) => "AlreadyFinal",
+            SettleOutcome::NotFound => "NotFound",
+        }
+    }
+
+    fn check_outcome(truth: &EconomicTruth, id: CheckId) -> CheckOutcome {
+        truth
+            .reconciliation
+            .as_ref()
+            .expect("reconciliation must be present for an existing task")
+            .checks
+            .iter()
+            .find(|c| c.check == id)
+            .expect("every check id must appear exactly once")
+            .outcome
+    }
+
+    // --- SubtreeAdditivity: documents production shape, does not fabricate --
+
+    #[test]
+    fn subtree_additivity_is_not_applicable_when_the_account_has_no_children() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup_task(&mut store, 200);
+        let truth = store.economic_truth_for_task(task_id).unwrap();
+        assert_eq!(
+            check_outcome(&truth, CheckId::SubtreeAdditivity),
+            CheckOutcome::NotApplicable,
+            "production mints exactly one account per task (see HORO-1673 §0) \
+             — SubtreeAdditivity is NotApplicable on every real ledger today, \
+             not a gap in this test"
+        );
+    }
+
+    #[test]
+    fn in_a_production_shaped_ledger_inclusive_equals_exclusive_because_no_child_account_is_ever_created(
+    ) {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup_task(&mut store, 200);
+        let task_account = AccountId::for_task(task_id);
+        let reserved = match store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: libra_governor_domain::ReservationClass::RequiredWork,
+                amount: ResourceAmount::Tokens(100),
+                idempotency_key: "r-1",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap()
+        {
+            ReserveOutcome::Granted(r) => r,
+            other => panic!("expected Granted, got {}", reserve_outcome_kind(&other)),
+        };
+        store.settle(reserved.id, None, now()).unwrap();
+
+        let truth = store.economic_truth_for_task(task_id).unwrap();
+        let categories = truth.categories.as_ref().unwrap();
+        // `SpendSoFar::Known` carries its own `scope` discriminant, so a
+        // whole-struct comparison would never match Exclusive against
+        // Inclusive even when every other field agrees — compare the
+        // figures the invariant is actually about.
+        let (ex_settled, ex_active) = match categories.totals.exclusive {
+            SpendSoFar::Known {
+                settled,
+                active_holds,
+                ..
+            } => (settled, active_holds),
+            other => panic!("expected Known, got {other:?}"),
+        };
+        let (inc_settled, inc_active) = match categories.totals.inclusive {
+            SpendSoFar::Known {
+                settled,
+                active_holds,
+                ..
+            } => (settled, active_holds),
+            other => panic!("expected Known, got {other:?}"),
+        };
+        assert_eq!((ex_settled, ex_active), (inc_settled, inc_active));
+
+        // Independently re-derived via a second, direct account_spend
+        // call on the same account id, not by trusting the report.
+        let (raw_ex_settled, raw_ex_active) = match store
+            .account_spend(task_account, SpendScope::Exclusive)
+            .unwrap()
+        {
+            SpendSoFar::Known {
+                settled,
+                active_holds,
+                ..
+            } => (settled, active_holds),
+            other => panic!("expected Known, got {other:?}"),
+        };
+        let (raw_inc_settled, raw_inc_active) = match store
+            .account_spend(task_account, SpendScope::Inclusive)
+            .unwrap()
+        {
+            SpendSoFar::Known {
+                settled,
+                active_holds,
+                ..
+            } => (settled, active_holds),
+            other => panic!("expected Known, got {other:?}"),
+        };
+        assert_eq!(
+            (raw_ex_settled, raw_ex_active),
+            (raw_inc_settled, raw_inc_active)
+        );
+    }
+
+    // --- EnvelopeFormula: a genuine, understood cross-source divergence -----
+
+    #[test]
+    fn envelope_formula_reports_a_planted_cross_account_task_scoped_discrepancy() {
+        // `available()` (crates/ledger/src/reservation.rs) sums settled/
+        // active reservations filtered by `task_id` alone.
+        // `account_spend(.., Exclusive)` filters by `account_id` alone.
+        // Production always keeps these in lockstep (every reservation's
+        // account_id is set together with its task_id by the same write
+        // path). This test plants the one row shape that can only arise
+        // from a direct, non-API write — a settled work_hold whose
+        // account_id belongs to a *child* account but whose task_id still
+        // points at the parent task — and proves the oracle catches the
+        // resulting divergence rather than silently reporting Reconciled.
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup_task(&mut store, 200);
+        let task_account = AccountId::for_task(task_id);
+
+        let EnsureAccountOutcome { account: child, .. } = store
+            .ensure_child_account(task_account, AccountLevel::Session, "sess-1", now())
+            .unwrap()
+            .unwrap();
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO reservations (
+                    id, task_id, session_id, plan_id, class, resource_kind, amount,
+                    drawn_from_reserve, state, settled_amount, usage_known, idempotency_key,
+                    created_at, expires_at, settled_at, released_at,
+                    account_id, grants_account_id, lease_kind, settled_after_expiry, legacy_pre_0011
+                 ) VALUES (?1, ?2, 'sess-1', NULL, 'required_work', 'tokens', 100.0,
+                           0, 'settled', 100.0, 1, 'planted-d2-cross-account',
+                           ?3, ?3, ?3, NULL, ?4, NULL, 'work_hold', 0, 0)",
+                rusqlite::params![
+                    libra_governor_domain::ReservationId::new().0.to_string(),
+                    task_id.to_string(),
+                    now()
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap(),
+                    child.account_id.to_string(),
+                ],
+            )
+            .unwrap();
+
+        let truth = store.economic_truth_for_task(task_id).unwrap();
+        match check_outcome(&truth, CheckId::EnvelopeFormula) {
+            CheckOutcome::Discrepant { delta } => {
+                assert!(
+                    (delta - 100.0).abs() < 0.01,
+                    "expected a ~100-token discrepancy from the planted child-attributed row, got {delta}"
+                );
+            }
+            other => panic!("expected Discrepant, got {other:?} — the oracle did not catch the planted divergence"),
+        }
+    }
+
+    // --- GatewayLedgerAgreement: D2 (epsilon) + liveness --------------------
+
+    #[test]
+    fn gateway_ledger_agreement_catches_a_planted_settled_amount_disagreement() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup_task(&mut store, 200);
+
+        let reserved = match store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: libra_governor_domain::ReservationClass::RequiredWork,
+                amount: ResourceAmount::Tokens(50),
+                idempotency_key: "r-gw-1",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap()
+        {
+            ReserveOutcome::Granted(r) => r,
+            other => panic!("expected Granted, got {}", reserve_outcome_kind(&other)),
+        };
+        let settled = match store
+            .settle(reserved.id, Some(ResourceAmount::Tokens(50)), now())
+            .unwrap()
+        {
+            SettleOutcome::Settled { reservation, .. } => reservation,
+            other => panic!("expected Settled, got {}", settle_outcome_kind(&other)),
+        };
+        assert_eq!(settled.settled_amount.unwrap().as_f64(), 50.0);
+
+        // Plant a disagreeing gateway row against the same reservation —
+        // the provider side reports 65, the ledger side recorded 50.
+        store
+            .conn
+            .execute(
+                "INSERT INTO gateway_requests (
+                    id, task_id, session_id, route, model, tier, decision,
+                    decision_detail_json, reservation_id, reserved_amount, settled_amount,
+                    resource_kind, usage_known, bound_violated, pricing_version,
+                    terminal_state, created_at
+                 ) VALUES (?1, ?2, 'sess-1', '/v1/test', 'test-model', 'standard', 'allowed',
+                           NULL, ?3, 50.0, 65.0, 'tokens', 1, 0, 'test-pricing-v1',
+                           'settled', ?4)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    task_id.to_string(),
+                    reserved.id.0.to_string(),
+                    now()
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap(),
+                ],
+            )
+            .unwrap();
+
+        let truth = store.economic_truth_for_task(task_id).unwrap();
+        match check_outcome(&truth, CheckId::GatewayLedgerAgreement) {
+            CheckOutcome::Discrepant { .. } => {}
+            other => panic!(
+                "expected Discrepant, got {other:?} — the planted $15 disagreement was not caught"
+            ),
+        }
+    }
+
+    #[test]
+    fn gateway_ledger_agreement_epsilon_now_respects_the_resource_kind_d2_fix() {
+        // Before the D2 fix this check hardcoded `> 1.0` regardless of
+        // resource kind. A 0.5 QuotaPercent disagreement is 50x
+        // QuotaPercent's own epsilon (0.01, see
+        // `ResourceKind::reconciliation_epsilon`) and must now be caught
+        // — under the old hardcoded tolerance it would have been
+        // silently reported `Reconciled`.
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = TaskId::new();
+        store
+            .insert_task(
+                &TaskIdentity {
+                    id: task_id,
+                    external_ref: None,
+                },
+                now(),
+            )
+            .unwrap();
+        let policy = Policy::validated(
+            "test",
+            ResourceBound {
+                mode: ConstraintMode::Hard,
+                target: ResourceAmount::QuotaPercent(100.0),
+                elastic_ceiling: None,
+                hard_ceiling: ResourceAmount::QuotaPercent(100.0),
+            },
+            TimeBound {
+                mode: ConstraintMode::Hard,
+                target_secs: 600,
+                elastic_ceiling_secs: None,
+                hard_ceiling_secs: Some(600),
+                deadline: None,
+            },
+            CompletionContract::first(vec![CompletionCriterion::required("tests pass")]),
+            Confidence::Low,
+            AutonomyBoundary::AskOnApproval,
+        )
+        .unwrap();
+        store
+            .initialize_task_budget(task_id, &policy, &fixed_reserve_quota(10.0), now())
+            .unwrap();
+
+        let reserved = match store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: libra_governor_domain::ReservationClass::RequiredWork,
+                amount: ResourceAmount::QuotaPercent(5.0),
+                idempotency_key: "r-gw-quota",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap()
+        {
+            ReserveOutcome::Granted(r) => r,
+            other => panic!("expected Granted, got {}", reserve_outcome_kind(&other)),
+        };
+        let settled = match store
+            .settle(reserved.id, Some(ResourceAmount::QuotaPercent(5.0)), now())
+            .unwrap()
+        {
+            SettleOutcome::Settled { reservation, .. } => reservation,
+            other => panic!("expected Settled, got {}", settle_outcome_kind(&other)),
+        };
+        assert_eq!(settled.settled_amount.unwrap().as_f64(), 5.0);
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO gateway_requests (
+                    id, task_id, session_id, route, model, tier, decision,
+                    decision_detail_json, reservation_id, reserved_amount, settled_amount,
+                    resource_kind, usage_known, bound_violated, pricing_version,
+                    terminal_state, created_at
+                 ) VALUES (?1, ?2, 'sess-1', '/v1/test', 'test-model', 'standard', 'allowed',
+                           NULL, ?3, 5.0, 5.5, 'quota_percent', 1, 0, 'test-pricing-v1',
+                           'settled', ?4)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    task_id.to_string(),
+                    reserved.id.0.to_string(),
+                    now()
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap(),
+                ],
+            )
+            .unwrap();
+
+        let truth = store.economic_truth_for_task(task_id).unwrap();
+        match check_outcome(&truth, CheckId::GatewayLedgerAgreement) {
+            CheckOutcome::Discrepant { .. } => {}
+            other => panic!(
+                "expected Discrepant — a 0.5 QuotaPercent disagreement must be caught \
+                 under QuotaPercent's own 0.01 epsilon; got {other:?} (D2 regression)"
+            ),
+        }
+    }
+
+    fn fixed_reserve_quota(amount: f32) -> libra_governor_domain::CompletionReserveEstimate {
+        libra_governor_domain::CompletionReserveEstimate {
+            amount: ResourceAmount::QuotaPercent(amount),
+            basis: libra_governor_domain::CompletionReserveBasis::PolicyTarget,
+            fraction: (amount / 100.0) as f64,
+            required_criteria_count: 1,
+        }
+    }
+
+    // --- D4 regression: unattributed counts no longer leak cross-task -----
+
+    #[test]
+    fn unattributed_counts_no_longer_leak_rows_from_an_unrelated_task_d4_fix() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_a = setup_task(&mut store, 200);
+        let task_b = setup_task(&mut store, 200);
+
+        // Plant an unattributed gateway row under task B only.
+        store
+            .conn
+            .execute(
+                "INSERT INTO gateway_requests (
+                    id, task_id, session_id, route, model, tier, decision,
+                    decision_detail_json, reservation_id, reserved_amount, settled_amount,
+                    resource_kind, usage_known, bound_violated, pricing_version,
+                    terminal_state, created_at
+                 ) VALUES (?1, ?2, 'sess-b', '/v1/test', 'test-model', 'standard', 'allowed',
+                           NULL, NULL, NULL, 42.0, 'tokens', 1, 0, 'test-pricing-v1',
+                           'settled', ?3)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    task_b.to_string(),
+                    now()
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap(),
+                ],
+            )
+            .unwrap();
+
+        let truth_a = store.economic_truth_for_task(task_a).unwrap();
+        let unattributed_a = &truth_a.categories.as_ref().unwrap().unattributed;
+        assert_eq!(
+            unattributed_a.gateway_settled_without_lease.row_count, 0,
+            "task A's report must not see task B's unattributed row (D4 regression)"
+        );
+
+        let truth_b = store.economic_truth_for_task(task_b).unwrap();
+        let unattributed_b = &truth_b.categories.as_ref().unwrap().unattributed;
+        assert_eq!(
+            unattributed_b.gateway_settled_without_lease.row_count, 1,
+            "task B's own report must still see its own unattributed row"
+        );
+    }
+
+    // --- I9 regression: session selector is preserved, not overwritten -----
+
+    #[test]
+    fn session_selector_is_echoed_back_not_overwritten_with_the_task_id_i9_fix() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup_task(&mut store, 200);
+        // Bind a session to this task directly via `session_tasks`, the
+        // same table `task_id_for_session` reads — avoids
+        // `resolve_or_create_task_for_session` minting a second,
+        // unrelated task.
+        store
+            .conn
+            .execute(
+                "INSERT INTO session_tasks (session_id, task_id, created_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    "sess-echo-me",
+                    task_id.to_string(),
+                    now()
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap(),
+                ],
+            )
+            .unwrap();
+
+        let truth = store.economic_truth_for_session("sess-echo-me").unwrap();
+        assert_eq!(truth.selector.selector, "session");
+        assert_eq!(truth.selector.value, "sess-echo-me");
+    }
+
+    // --- I8: partial/unattributed spend is visible as a count, never an ---
+    // --- amount (documented finding, not silently hidden) -----------------
+
+    #[test]
+    fn unattributed_amount_is_always_none_only_the_row_count_is_visible() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup_task(&mut store, 200);
+        store
+            .conn
+            .execute(
+                "INSERT INTO gateway_requests (
+                    id, task_id, session_id, route, model, tier, decision,
+                    decision_detail_json, reservation_id, reserved_amount, settled_amount,
+                    resource_kind, usage_known, bound_violated, pricing_version,
+                    terminal_state, created_at
+                 ) VALUES (?1, ?2, 'sess-1', '/v1/test', 'test-model', 'standard', 'allowed',
+                           NULL, NULL, NULL, 77.0, 'tokens', 1, 0, 'test-pricing-v1',
+                           'settled', ?3)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    task_id.to_string(),
+                    now()
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap(),
+                ],
+            )
+            .unwrap();
+
+        let truth = store.economic_truth_for_task(task_id).unwrap();
+        let unattributed = &truth.categories.as_ref().unwrap().unattributed;
+        assert_eq!(unattributed.gateway_settled_without_lease.row_count, 1);
+        assert!(
+            unattributed.gateway_settled_without_lease.amount.is_none(),
+            "HORO-1673 finding: unattributed spend is visible only as a row \
+             count, never as a figure — PartialBucket.amount is always None"
+        );
+    }
+
+    // --- I1: each canonical spend event is counted once --------------------
+    //
+    // A zero-dependency seeded LCG op-sequence generator (this repo has no
+    // `proptest`/`quickcheck` anywhere — verified by grep across every
+    // `Cargo.toml`). Prints its seed on failure for reproduction, per the
+    // design handoff's recommendation (b).
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            // Numerical Recipes LCG constants — deterministic, not
+            // cryptographic, good enough to pick among a handful of op
+            // kinds and small amounts.
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+            self.0
+        }
+        fn pick(&mut self, n: u64) -> u64 {
+            self.next_u64() % n
+        }
+    }
+
+    #[test]
+    fn generated_reserve_settle_sequences_never_count_a_reservation_row_twice() {
+        for seed in [1u64, 2, 42, 1000, 999_999] {
+            run_one_generated_sequence(seed);
+        }
+    }
+
+    fn run_one_generated_sequence(seed: u64) {
+        let mut rng = Lcg(seed.max(1));
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup_task(&mut store, 200);
+        let mut granted_ids: Vec<libra_governor_domain::ReservationId> = Vec::new();
+        let mut next_key = 0u32;
+
+        for step in 0..40u32 {
+            let op = rng.pick(5);
+            match op {
+                0 | 1 => {
+                    // Fresh reserve, small amount, occasionally retried
+                    // with the SAME idempotency key later (op 4) to prove
+                    // the retry never creates a second row.
+                    let amount = 1 + rng.pick(20);
+                    next_key += 1;
+                    let key = format!("seed-{seed}-key-{next_key}");
+                    match store
+                        .reserve(ReserveRequest {
+                            task_id,
+                            session_id: "sess-gen",
+                            plan_id: None,
+                            class: libra_governor_domain::ReservationClass::OptionalWork,
+                            amount: ResourceAmount::Tokens(amount),
+                            idempotency_key: &key,
+                            now: now(),
+                            ttl_secs: 900,
+                        })
+                        .unwrap()
+                    {
+                        ReserveOutcome::Granted(r) => granted_ids.push(r.id),
+                        ReserveOutcome::Insufficient { .. } => {}
+                        other => panic!(
+                            "seed {seed} step {step}: unexpected reserve outcome {}",
+                            reserve_outcome_kind(&other)
+                        ),
+                    }
+                }
+                2 => {
+                    // Settle a previously granted reservation, if any.
+                    if let Some(&id) = granted_ids.first() {
+                        let _ = store.settle(id, None, now());
+                    }
+                }
+                3 => {
+                    // Release a previously granted reservation, if any.
+                    if let Some(id) = granted_ids.pop() {
+                        let _ = store.release(id, now());
+                    }
+                }
+                _ => {
+                    // Replay the most recent reserve's idempotency key —
+                    // must be a safe no-op, never a second row.
+                    let _ = store.expire_stale_reservations(now());
+                }
+            }
+        }
+
+        // Independent oracle: a raw SQL aggregate that does not call
+        // `account_spend` at all, computed directly from `reservations`.
+        let task_account = AccountId::for_task(task_id);
+        let raw_settled: f64 = store
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(settled_amount), 0.0) FROM reservations
+                 WHERE account_id = ?1 AND state = 'settled'",
+                [task_account.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let raw_distinct_settled_rows: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(DISTINCT id) FROM reservations
+                 WHERE account_id = ?1 AND state = 'settled'",
+                [task_account.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let raw_settled_row_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM reservations WHERE account_id = ?1 AND state = 'settled'",
+                [task_account.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            raw_distinct_settled_rows, raw_settled_row_count,
+            "seed {seed}: a settled reservation row was counted more than once \
+             by its own id — no idempotency-key retry should ever create a \
+             duplicate row"
+        );
+
+        let reported = match store
+            .account_spend(task_account, SpendScope::Exclusive)
+            .unwrap()
+        {
+            SpendSoFar::Known { settled, .. } => settled,
+            other => panic!("seed {seed}: expected Known, got {other:?}"),
+        };
+        assert!(
+            (reported - raw_settled).abs() < 0.001,
+            "seed {seed}: account_spend reported {reported} but the independent \
+             raw-SQL aggregate over distinct settled rows is {raw_settled} — \
+             a reservation was double-counted or dropped"
+        );
+    }
+}
