@@ -1,0 +1,14 @@
+v0.0.3 counterfactual policy replay
+ledger: "/tmp/dogfood-evidence/ledger-snapshot-gate-run2.sqlite3"
+
+== candidate preset: balanced ==
+points_replayed=496 points_skipped=0 agree=496 more_restrictive=0 more_permissive=0 mixed=0 no_comparable_dimension=0 quality_floor_violations=0
+
+== candidate preset: deadline_first ==
+points_replayed=496 points_skipped=0 agree=496 more_restrictive=0 more_permissive=0 mixed=0 no_comparable_dimension=0 quality_floor_violations=0
+
+== candidate preset: cost_first ==
+points_replayed=496 points_skipped=0 agree=496 more_restrictive=0 more_permissive=0 mixed=0 no_comparable_dimension=0 quality_floor_violations=0
+
+== candidate preset: strict_budget ==
+points_replayed=496 points_skipped=0 agree=343 more_restrictive=153 more_permissive=0 mixed=0 no_comparable_dimension=0 quality_floor_violations=0

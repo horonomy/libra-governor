@@ -70,17 +70,22 @@ inventing synthetic-feeling "make it take longer" tasks. The remaining gap (9 mo
 pairs) is expected to close from continued real work in this and other real
 sessions, not from more toy generators.
 
-## Finding 3 — real adversarial case: a killed task's reservation is honestly reported, never silently settled
+## Finding 3 — real adversarial case: a killed task's reservation is honestly reported, never silently settled, and correctly expires
 
 Real dogfood task 2 (queue implementation) exceeded its 280s wrapper timeout and was
 SIGKILLed mid-execution — unplanned, but a genuine adversarial case (item 4's
 "adversarial/failure cases where appropriate"). Its reservation
 (`task_id=0291afb7-b3ff-40ac-be39-2ece34ec2b83`, 75000 tokens, `work_hold`) was
-checked via `economics explain --task 0291afb7-… --json` and confirmed **active and
-unsettled** (`settled=0.0`) — the system does not silently drop or fabricate a
-settlement for a task that never reached its own `Stop` hook. Re-check after TTL
-expiry (~2026-10-03T11:58:43Z) to confirm `expire_stale_reservations`/reconciliation
-correctly reclaims it is still outstanding (see Pending below).
+checked via `economics explain --task 0291afb7-… --json` immediately after the kill
+and confirmed **active and unsettled** (`settled=0.0`) — the system does not
+silently drop or fabricate a settlement for a task that never reached its own
+`Stop` hook. **Re-checked again ~2h later** (well past the reservation's TTL,
+`raw/economics_explain_0291afb7-crashed-task-post-expiry.json`): the reservation
+correctly transitioned to `released.expired` (75000 tokens, `expired_count: 1`),
+`active_leases.count` dropped to `0`, and — critically — `settled.observed` and
+`settled.assumed` are both `null`/`count_assumed: 0`, i.e. the system never
+fabricates a completed settlement for a task that crashed. `expire_stale_reservations`/
+reconciliation works correctly on this real crash case.
 
 ## Finding 4 — real defect: `model`/`provider` were always `None` on every real receipt
 
@@ -115,17 +120,65 @@ ground-truth agreement. This is recorded as a finding, not "fixed" — fixing it
 would require standing up the enforcement gateway, which is new scope, not a
 defect in the existing hypothesis.
 
+## Finding 6 — real defect: `v003_gate`/`calibration_pairs()` could not parse the real ledger's own oldest history at all
+
+Running `v003_gate` against the real production ledger for the first time (this
+phase's whole point) immediately panicked: `calibration_pairs query must succeed
+against a valid ledger schema: Sqlite(InvalidQuery)`. Root-caused to three separate,
+real schema-drift issues in the *actual* ledger, none hypothetical:
+
+1. The ledger's single oldest row (2026-09-17, pre-dating this campaign's current
+   HORO-1130/1671 migrations) has `task_features_json` stored as an **empty
+   string**, not SQL `NULL` — `parse_task_features`/`parse_regime`/the inline
+   `estimate_json` parse in `calibration_pairs()` all treated "non-NULL" as "must be
+   valid JSON", so this one real historical row aborted the entire query.
+2. That same row's `estimate_json` (a real pre-HORO-1130 cold-start estimate) has
+   neither `feature_schema_version` nor `bucket_tier` — both fields added by
+   HORO-1130, after this estimate was written — and neither had `#[serde(default)]`
+   (unlike `regime`, which already does, for the identical pre-HORO-1671 reason).
+3. `v003_gate.rs` itself mislabeled `calibration_pairs()`'s second return value
+   (`dropped`) as `"total receipts"` in its own printed output — a correct real
+   ledger with only 1 dropped row out of 36 total would print "(of 1 total
+   receipts)", reading as if almost no real data existed.
+
+All three fixed (see commits on this branch); `cargo test --workspace` (706 tests)
+still green. **Separately**, once the gate could actually run, it reported `n=0,
+skipped=0` for every one of its three predictors despite 35 real qualifying
+pairs — root-caused to a *fourth*, more consequential real defect: `handle_finalize`
+never attached a `regime` to any `ExecutionReceipt` at all (`receipts.regime_json`
+was `NULL` on literally every real row, confirmed via direct query), even though
+`current_regime()` was already computed and used at preflight/tool-invoked time
+elsewhere in the same file. The gate's comparison loop requires `pair.regime` to be
+`Some` and silently `continue`s otherwise — so with it always `None`, *no* real
+receipt could ever contribute a scored comparison, regardless of how many
+qualifying pairs existed. Fixed by attaching `current_regime(...)` at finalize time
+too, matching the preflight/tool-invoked pattern. This is the single most consequential
+fix in this phase: without it, the gate could never produce a real n>0 result from
+any amount of real dogfood evidence, ever — exactly the kind of instrumentation gap
+item 6 of the founder's ITERATE instruction anticipated.
+
+**Not yet re-verified**: the fix only affects receipts recorded *after* the fixed
+binary is built, merged, and the live daemon (which real Claude Code sessions
+actually talk to) is rebuilt and restarted from `main`. Every existing real receipt
+in the production ledger still has `regime_json = NULL` and will stay that way
+permanently — they are frozen historical data, not retroactively fixed. The gate
+must be rerun against *newly recorded* real receipts, post-merge-and-redeploy, to
+get a real n>0 comparison. See Pending.
+
 ## Pending (not yet done as of this snapshot)
 
-- Re-check `0291afb7-…`'s reservation after TTL expiry to confirm reclaim.
+- Push this branch, open the PR, get CI green, merge (merge commit, per repo policy).
+- Rebuild the live daemon binary from `main` and restart it so real future Claude
+  Code sessions actually produce receipts with `provider`/`regime` attached (Finding
+  4 and Finding 6's fourth defect only affect receipts recorded by a rebuilt daemon,
+  not retroactively).
+- Accumulate ~9 more real qualifying pairs (organic work, not contrived — see
+  Finding 2) and rerun `v003_gate` to get a real, non-zero-n scored comparison.
 - Kill-daemon-mid-task adversarial case (not yet attempted).
-- Run `v003_gate`/`v003_replay`/`v003_decision_quality` against this real ledger
-  (build in progress at time of this snapshot) and record per-axis INSUFFICIENT/
-  sufficient output here.
 - Real Codex (`codex exec`) arm — now meaningfully testable post-Finding-4's
   `provider` fix; not yet exercised.
 - Regenerate the founder decision packet with explicit before/after vs. HORO-1673,
-  once the gate has been run against this real data.
+  once the gate has been run against this real, post-fix data.
 
 ## Explicit non-goals (per the founder's ITERATE instruction)
 

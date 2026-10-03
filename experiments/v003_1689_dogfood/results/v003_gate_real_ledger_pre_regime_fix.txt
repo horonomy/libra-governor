@@ -1,0 +1,7 @@
+v0.0.3 progressive-estimator benchmark gate
+ledger: "/tmp/dogfood-evidence/ledger-snapshot-gate-run2.sqlite3"
+calibration pairs: 35 (1 receipts dropped — no estimate, or cold-start)
+
+baseline-0 mean|P50 error| = n/a        P90 coverage = n/a        (n=0, skipped=0)
+baseline-1 mean|P50 error| = n/a        P90 coverage = n/a        (n=0, skipped=0)
+candidate  mean|P50 error| = n/a        P90 coverage = n/a        (n=0, skipped=0)
