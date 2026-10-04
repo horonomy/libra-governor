@@ -284,15 +284,33 @@ improved, not regressed:
 
 Full real output for all three: `results/v003_decision_quality_real_ledger_post_fix.txt`.
 
+## Finding 10 — resolved: Finding 9's `repo_topology_model` 0%-coverage is a sample-shape artifact, not a real estimator defect
+
+Root-caused (`results/repo_topology_model_root_cause.txt`): pulled the first 15
+`repo_topology_model`-bucketed (estimate, receipt) pairs for one real task_id in
+recorded order. `actual_duration_secs` is strictly monotonically increasing (780,
+808, 813, 846, 851, 893, 934, 946, 1375, 1925, 1934, 1944, 2436, 2878, 3836 —
+because this is one real session's cumulative duration, re-finalized at every real
+`Stop` event, not 15 independent tasks). Each estimate's own `p90` bound tracks
+roughly one step behind the growing actual (e.g. `actual=780`/`p90=775`;
+`actual=851`/`p90=846`) because the estimator's history is built from this same
+monotonic sequence's own prior values. **A quantile estimator fed a monotonically
+increasing series will structurally undershoot every new point by construction** —
+this is not evidence that the conditional/bucketed estimator mis-predicts real,
+independent task durations.
+
+No Jira follow-up filed for "estimator defect", since there isn't one demonstrated
+here. The real, generalizable finding is methodological, not product-specific:
+**repeatedly re-finalizing one long-running session at growing cumulative durations
+is not a valid way to test a duration-quantile estimator's real-world accuracy**,
+regardless of which estimator or which product this pattern shows up in. This
+caveat already applied to Finding 9's raw numbers; this closes the open question
+the founder packet flagged rather than leaving it undiagnosed.
+
 ## Pending (not yet done as of this snapshot)
 
 - A real Codex task large/long enough to individually clear the 120s/5-call
   qualifying floor (both real Codex tasks so far were sub-floor, like Finding 1).
-- Investigate why the `repo_topology_model` bucket is 0%-covered on real data
-  (Finding 9) — file a Jira follow-up if it looks like a real estimator defect
-  rather than purely a sample-shape artifact of the cumulative-session receipts.
-- Regenerate the founder decision packet with explicit before/after vs. HORO-1673
-  (now unblocked — Finding 9 is the real evidence this ticket needed).
 
 ## Explicit non-goals (per the founder's ITERATE instruction)
 
