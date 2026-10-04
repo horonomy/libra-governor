@@ -157,26 +157,63 @@ fix in this phase: without it, the gate could never produce a real n>0 result fr
 any amount of real dogfood evidence, ever — exactly the kind of instrumentation gap
 item 6 of the founder's ITERATE instruction anticipated.
 
-**Not yet re-verified**: the fix only affects receipts recorded *after* the fixed
-binary is built, merged, and the live daemon (which real Claude Code sessions
-actually talk to) is rebuilt and restarted from `main`. Every existing real receipt
-in the production ledger still has `regime_json = NULL` and will stay that way
-permanently — they are frozen historical data, not retroactively fixed. The gate
-must be rerun against *newly recorded* real receipts, post-merge-and-redeploy, to
-get a real n>0 comparison. See Pending.
+**Verified fixed** (PR #65 merged as `1c290b0`): the live daemon
+(`/Users/bryant/.cargo/shared-target/debug/libra-governor`) was rebuilt from merged
+`main` and restarted. A real `hook user-prompt-submit` → `hook stop` round trip
+produced a receipt (`task_id=3f5ca53f-...`) with `model`, `provider`, and
+`regime_json` all populated, confirmed by direct query against the real production
+ledger. Every receipt recorded *before* the restart (the entire HORO-1673-era
+history, including all 21 qualifying pairs from Finding 2) still has
+`regime_json = NULL` and stays that way permanently — frozen historical data, not
+retroactively fixed. The gate must accumulate *newly recorded* real receipts,
+post-redeploy, before it can report a real n>0 comparison.
+
+## Finding 7 — real Codex evidence: `codex exec` requires either interactive hook-trust or `--dangerously-bypass-hook-trust`, and its `Stop` payload *does* expose `model` (unlike Claude Code's)
+
+Installing Codex hooks (`libra-governor install --agent codex`, wiring
+`~/.codex/hooks.json`) is **not sufficient** on its own: Codex's hook system
+requires a one-time interactive trust step (`/hooks` inside an interactive `codex`
+session, recorded by content hash) before hooks actually execute. A first real
+`codex exec --skip-git-repo-check` run (to-do-list CLI task) completed successfully
+but produced **zero** new ledger receipt — confirmed via `grep -i codex
+daemon.log` showing no hook activity at all — an honest, real negative result, not
+a bug: untrusted hooks are silently skipped by Codex, by design. Non-interactive
+automation has no way to complete the interactive trust flow.
+
+Codex exposes `--dangerously-bypass-hook-trust`, documented as "intended only for
+automation that already vets hook sources" — applicable here since the hook
+command is this repository's own, already-reviewed `libra-governor codex-hook`
+binary. Re-running with that flag (two real tasks: URL shortener, LRU cache) did
+produce real receipts:
+
+| task_id | duration | tool_calls | model | provider |
+|---|---|---|---|---|
+| `6efdd0c8-...` | 66s | 4 | `gpt-5.6-sol` | `codex` |
+| `2a84b5b2-...` | 33s | 3 | `gpt-5.6-sol` | `codex` |
+
+This is real, direct falsification of the `TurnCompletedPayload` doc comment's
+"treated the same way for Codex until proven otherwise" hedge (see Finding 4):
+**Codex's real `Stop` payload does expose `model`** (`"gpt-5.6-sol"`, correctly
+captured with zero additional code changes — `model` was already wired through for
+whichever host's payload carries it), while Claude Code's genuinely does not. The
+`provider` fix (Finding 4) is what made this cross-agent distinction visible and
+queryable at all. Neither Codex task individually qualifies under the 120s/5-call
+floor (consistent with Finding 1 — small greenfield Python tasks finish fast
+regardless of which agent/provider executes them), but both are real,
+non-fabricated cross-agent/provider evidence, satisfying the ITERATE instruction's
+item 4 requirement for a real Codex arm. Ground truth for the third real Codex run
+(LRU cache, `--json` JSONL event stream) independently confirms real token usage
+(`input_tokens: 66639, cached_input_tokens: 62720, output_tokens: 1042`) — Codex's
+own `--json` mode is this arm's equivalent of `claude -p --output-format json`.
 
 ## Pending (not yet done as of this snapshot)
 
-- Push this branch, open the PR, get CI green, merge (merge commit, per repo policy).
-- Rebuild the live daemon binary from `main` and restart it so real future Claude
-  Code sessions actually produce receipts with `provider`/`regime` attached (Finding
-  4 and Finding 6's fourth defect only affect receipts recorded by a rebuilt daemon,
-  not retroactively).
 - Accumulate ~9 more real qualifying pairs (organic work, not contrived — see
-  Finding 2) and rerun `v003_gate` to get a real, non-zero-n scored comparison.
+  Finding 2) *after* the daemon restart, and rerun `v003_gate` to get a real,
+  non-zero-n scored comparison with `regime` actually populated.
 - Kill-daemon-mid-task adversarial case (not yet attempted).
-- Real Codex (`codex exec`) arm — now meaningfully testable post-Finding-4's
-  `provider` fix; not yet exercised.
+- A real Codex task large/long enough to individually clear the 120s/5-call
+  qualifying floor (both real Codex tasks so far were sub-floor, like Finding 1).
 - Regenerate the founder decision packet with explicit before/after vs. HORO-1673,
   once the gate has been run against this real, post-fix data.
 
