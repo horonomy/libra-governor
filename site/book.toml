@@ -1,0 +1,18 @@
+[book]
+title = "Libra Governor · Developer Preview"
+language = "en"
+src = "../build/book-src"
+
+[build]
+build-dir = "../build/site/docs"
+
+[output.html]
+site-url = "/docs/"
+git-repository-url = "https://github.com/horonomy/libra-governor"
+default-theme = "navy"
+preferred-dark-theme = "navy"
+additional-css = ["docs.css"]
+no-section-label = true
+
+[output.html.print]
+enable = false
