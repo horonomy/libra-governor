@@ -17,6 +17,11 @@ independently reviewed upstream revision.
 
 ## Activation and rollback
 
+Source preparation and merge do not authorize publication. Before creating a
+Pages deployment or attaching DNS, resolve HORO-1701's experimental/public-preview
+release-contract decision with the product owner. Keep Developer Preview maturity;
+the existing public release is v0.0.2, and Team Alpha remains outside this surface.
+
 Build and validate the artifact before deployment. Reuse the established static
 Cloudflare Pages pattern and attach only `libra.horonom.com`; Libra is local-first,
 so no runtime hostname is warranted. After deployment, verify external DNS, TLS,
