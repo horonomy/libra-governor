@@ -75,11 +75,21 @@ jobs:
       - name: fresh install and first preflight (Ubuntu)
         if: matrix.os == 'ubuntu-latest'
         run: |
+          cleanup() {
+            libra-governor daemon stop || true
+          }
+          trap cleanup EXIT
           ./scripts/install.sh
           libra-governor doctor --json
-          printf '%s\n' '{"session_id":"ci-fresh-install","cwd":".","prompt":"fresh install preflight","hook_event_name":"UserPromptSubmit"}' \
-            | libra-governor hook user-prompt-submit
-          libra-governor daemon stop || true
+          preflight_output="$(printf '%s\n' '{"session_id":"ci-fresh-install","cwd":".","prompt":"fresh install preflight","hook_event_name":"UserPromptSubmit"}' | libra-governor hook user-prompt-submit)"
+          printf '%s\n' "$preflight_output"
+          PRELIGHT_OUTPUT="$preflight_output" python3 - <<'PY'
+          import json, os
+          value = json.loads(os.environ["PRELIGHT_OUTPUT"])
+          context = value["hookSpecificOutput"]["additionalContext"]
+          if "Preflight complete" not in context:
+              raise SystemExit(f"fresh install preflight was unavailable: {context!r}")
+          PY
 
   # Secret scanning is provided by GitHub's native secret scanning + push
   # protection (enabled at the repository level; see SECURITY.md), not by
