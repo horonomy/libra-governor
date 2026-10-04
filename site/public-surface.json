@@ -1,0 +1,6 @@
+{
+  "base_url": "https://libra.horonom.com",
+  "docs_url": "/docs/",
+  "required_navigation": ["/docs/"],
+  "analytics": {"enabled": false, "payload_fields": []}
+}

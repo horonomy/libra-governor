@@ -1,0 +1,21 @@
+:root {
+  --bg: #0d1118;
+  --sidebar-bg: #111822;
+  --fg: #eaf0f7;
+  --links: #72c2ff;
+  --icons: #9bb0c5;
+  --quote-bg: #162131;
+  --quote-border: #4ca7ff;
+  --table-border-color: #344252;
+  --table-header-bg: #17202b;
+  --table-alternate-bg: #111923;
+  --searchbar-border-color: #405267;
+  --searchbar-bg: #121a24;
+  --searchbar-fg: #eef5fb;
+}
+
+.menu-title { font-weight: 750; letter-spacing: -.02em; }
+.content main { max-width: 56rem; }
+.content h1, .content h2, .content h3 { letter-spacing: -.025em; }
+.content a { text-underline-offset: .18em; }
+code { border-radius: .22rem; }

@@ -72,6 +72,29 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace
+      - name: fresh install and first preflight (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cleanup() {
+            libra-governor daemon stop || true
+          }
+          trap cleanup EXIT
+          ./scripts/install.sh
+          libra-governor doctor --json
+          preflight_output="$(printf '%s\n' '{"session_id":"ci-fresh-install","cwd":".","prompt":"fresh install preflight","hook_event_name":"UserPromptSubmit"}' | libra-governor hook user-prompt-submit)"
+          printf '%s\n' "$preflight_output"
+          PRELIGHT_OUTPUT="$preflight_output" python3 - <<'PY'
+          import json, os
+          value = json.loads(os.environ["PRELIGHT_OUTPUT"])
+          context = value["hookSpecificOutput"]["additionalContext"]
+          if "Preflight complete" not in context:
+              raise SystemExit(f"fresh install preflight was unavailable: {context!r}")
+          PY
+      - name: build and verify public surface (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo install mdbook --version 0.5.2 --locked
+          python3 tools/build_site.py
 
   # Secret scanning is provided by GitHub's native secret scanning + push
   # protection (enabled at the repository level; see SECURITY.md), not by
