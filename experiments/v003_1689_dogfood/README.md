@@ -206,16 +206,93 @@ item 4 requirement for a real Codex arm. Ground truth for the third real Codex r
 (`input_tokens: 66639, cached_input_tokens: 62720, output_tokens: 1042`) — Codex's
 own `--json` mode is this arm's equivalent of `claude -p --output-format json`.
 
+## Finding 8 — kill-daemon-mid-task adversarial case: no data loss, correct self-heal
+
+Killed the live daemon (`kill -9`) ~6s into a real `claude -p` task. Ground truth
+(the task's own `claude -p --output-format json`): 4 turns, 22.4s API time, $0.298
+— it completed successfully despite the daemon dying mid-flight. A fresh daemon
+process self-healed (auto-spawned by the next hook call, new pid). The resulting
+ledger receipt is accurate: `actual_duration_secs=28`, `tool_call_count=3` (matches
+reality — not reset to 0, not corrupted by the daemon restart), `regime`/
+`task_features` populated, `model=NULL` (expected — Claude Code's `Stop` payload
+never exposes it). SQLite, not daemon memory, is the real source of truth here, and
+it held up under this adversarial condition.
+
+## Finding 9 — real calibration evidence from the actual production reporting path, not a bespoke harness
+
+`libra-governor calibration report` (the real command a real user would run — not
+`v003_gate`, which is a research harness built for HORO-1673) against the real
+ledger (141 total receipts, 140 after dropping 1 cold-start) reports:
+
+```
+Duration coverage — computed over n=140 real calibration pairs.
+  overall:  P50 coverage=2.9% (4/140)   P80=6.4% (9/140)   P90=8.6% (12/140)
+  by bucket tier:
+    global:               P50=30.0% (3/10)   P80=50.0% (5/10)   P90=70.0% (7/10)
+    repo_topology_model:   P50=0.0%  (0/99)   P80=0.0%  (0/99)   P90=0.0%  (0/99)
+    topology:              P50=3.2%  (1/31)   P80=12.9% (4/31)   P90=16.1% (5/31)
+```
+
+Full output: `results/calibration_report_real_ledger_post_fix.txt`. This is a real,
+substantive finding, not a harness artifact: **the `repo_topology_model` bucket
+(the estimator's most specific, most-trusted tier, n=99) is 0% covered at every
+quantile on real data**, while the coarsest `global` fallback tier (n=10) does far
+better (70% P90 coverage). The pre-registered qualifying-pair predicate
+(`actual_duration_secs >= 120 AND tool_calls >= 5 AND task_features.is_some()` —
+`docs/research/horo-1673/promotion-criteria.md` §2, which says nothing about
+`regime`) is satisfied by a wide margin: **N_total=141, N_qualifying=127**, far
+above the pre-registered 30-pair floor.
+
+**Necessary caveat, stated plainly rather than smoothed over**: almost all of these
+141 receipts come from only 2-3 real but long-running organic sessions
+(`be5fa983`/this session, `8c9623a3`/an independent concurrent session), each
+re-finalized repeatedly at growing cumulative durations (up to ~48,000s, 640+ tool
+calls) rather than 30+ independent short tasks. The predicate as pre-registered
+does not require independence between pairs, and this evidence satisfies it
+exactly as written — but a reader should not treat "141 ≥ 30" as "141 independent
+real-world task observations." It is a smaller number of real sessions sampled
+repeatedly over time. This is disclosed, not hidden, and is exactly the kind of
+caveat the founder packet must carry forward rather than paper over.
+
+`v003_gate`'s own scored comparison (`results/v003_gate_real_ledger_post_fix.txt`)
+additionally requires `regime.is_some()` — a stricter gate than the pre-registered
+predicate itself (which never mentions `regime`) — so today it only scores the 10
+real receipts recorded after the Finding-6 daemon restart (×3 `ELAPSED_FRACTIONS` =
+"n=30" in its own output, a different "30" than the pre-registered calibration-pair
+floor and easy to conflate with it): `baseline-0 mean|P50 error|=7847.9s`,
+`baseline-1 mean|P50 error|=7847.9s P90 coverage=100%`, `candidate mean|P50
+error|=9159.4s P90 coverage=44% (5 skipped)`. These absolute error magnitudes are
+driven by the same cumulative-session-duration shape as above and should be read
+with the same caveat — not as "the candidate estimator is bad," but as "this
+sample shape does not cleanly test the candidate estimator's real accuracy." The
+real production `calibration report` path (Finding 9's own numbers) is the more
+trustworthy real-evidence source of the two, since it does not require `regime`
+and so draws from the full real qualifying population, not just the 10
+post-restart receipts.
+
+The three remaining decision-quality axes are **unchanged from the HORO-1673
+baseline and structurally out of reach in this phase** — not re-measured, not
+improved, not regressed:
+- False-stop/false-degrade rate: `N_classifiable=0` (floor: 20) — the shadow-decision
+  cadence condition flagged in HORO-1673 (`DEFAULT_PROGRESSIVE_INTERVAL_SECS=60`
+  plus a live `ToolInvoked` request) still does not appear to fire in real sessions
+  at the rate needed.
+- Early-warning lead time: `N_observations=0` (floor: 10) — same root cause.
+- Cost per successful task: `NOT APPLICABLE` — no Outcome Provider/`RecordOutcome`
+  configured in this ledger; this phase did not wire one (out of scope — a real
+  Outcome Provider is new product surface, not an instrumentation-defect fix).
+
+Full real output for all three: `results/v003_decision_quality_real_ledger_post_fix.txt`.
+
 ## Pending (not yet done as of this snapshot)
 
-- Accumulate ~9 more real qualifying pairs (organic work, not contrived — see
-  Finding 2) *after* the daemon restart, and rerun `v003_gate` to get a real,
-  non-zero-n scored comparison with `regime` actually populated.
-- Kill-daemon-mid-task adversarial case (not yet attempted).
 - A real Codex task large/long enough to individually clear the 120s/5-call
   qualifying floor (both real Codex tasks so far were sub-floor, like Finding 1).
-- Regenerate the founder decision packet with explicit before/after vs. HORO-1673,
-  once the gate has been run against this real, post-fix data.
+- Investigate why the `repo_topology_model` bucket is 0%-covered on real data
+  (Finding 9) — file a Jira follow-up if it looks like a real estimator defect
+  rather than purely a sample-shape artifact of the cumulative-session receipts.
+- Regenerate the founder decision packet with explicit before/after vs. HORO-1673
+  (now unblocked — Finding 9 is the real evidence this ticket needed).
 
 ## Explicit non-goals (per the founder's ITERATE instruction)
 
