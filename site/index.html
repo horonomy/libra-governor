@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Libra Governor is a local-first budget and replanning governor for coding agents.">
+  <link rel="canonical" href="https://libra.horonom.com/">
+  <title>Libra Governor — local-first task admission</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { max-width: 58rem; margin: 0 auto; padding: 3rem 1.25rem; background: #10131a; color: #f2f4f8; line-height: 1.6; }
+    a { color: #9bd4ff; } .eyebrow { color: #9bd4ff; letter-spacing: .08em; text-transform: uppercase; font-size: .8rem; }
+    h1 { max-width: 13ch; font-size: clamp(2.5rem, 8vw, 5rem); line-height: 1.02; margin: .5rem 0 1rem; }
+    .lede { max-width: 42rem; font-size: 1.2rem; color: #cbd2df; }
+    nav { display: flex; gap: 1rem; flex-wrap: wrap; margin-top: 2rem; } nav a { padding: .7rem 1rem; border: 1px solid #4d6a83; border-radius: .5rem; text-decoration: none; }
+    section { border-top: 1px solid #35404e; margin-top: 3rem; padding-top: 2rem; } footer { margin-top: 4rem; color: #aeb8c6; font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <p class="eyebrow">Libra Governor · Developer Preview</p>
+  <h1>Never start work you are unlikely to afford to finish.</h1>
+  <p class="lede">Libra is a local Governor for Claude Code and Codex. It estimates cost and time before admission, tracks the estimate as work runs, and makes replanning deliberate and auditable.</p>
+  <nav aria-label="Primary"><a href="/docs/">Read the docs</a><a href="https://github.com/horonomy/libra-governor">Source on GitHub</a></nav>
+  <section><h2>Local by default</h2><p>Libra runs on your machine. Prompts, source code, tool output, ledger state, and policy decisions stay local by default. There is no account, login, hosted control plane, or SaaS dependency in this Developer Preview.</p></section>
+  <section><h2>What it governs</h2><p>Libra admits tasks only after a probabilistic estimate and reserved budget exist, then records estimated versus actual spend and makes material replans visible. The existing coding-agent UI remains the user experience.</p></section>
+  <section><h2>Honest boundaries</h2><p>Libra is not a generic token counter, LLM router, or coding-agent chat UI. Its optional gateway enforces limits only for traffic explicitly routed through it; it does not decide policy.</p></section>
+  <footer><a href="/privacy">Privacy</a> · <a href="/docs/">Documentation</a> · <a href="https://github.com/horonomy/libra-governor/issues">Support via GitHub Issues</a><p>Developer Preview · local-first · source installation only · no hosted runtime is provided.</p></footer>
+</body>
+</html>
