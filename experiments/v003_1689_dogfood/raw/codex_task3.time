@@ -1,0 +1,1 @@
+timeout 280 codex exec --skip-git-repo-check --dangerously-bypass-hook-trust   3.08s user 1.80s system 12% cpu 38.592 total
