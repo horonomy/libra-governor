@@ -1,0 +1,37 @@
+Root-cause check for Finding 9's repo_topology_model 0%-coverage result.
+
+First 15 repo_topology_model-bucketed (estimate, receipt) pairs for task_id
+8c9623a3-... (ordered by recorded_at), showing actual_duration_secs alongside
+the estimate's own p50/p90 bounds and sample_count at that point:
+
+task_id   actual   p50   p90   n
+8c9623a3  780      690   775   5
+8c9623a3  808      690   780   6
+8c9623a3  813      700   808   7
+8c9623a3  846      700   813   8
+8c9623a3  851      775   846   9
+8c9623a3  893      775   846   10
+8c9623a3  934      780   851   11
+8c9623a3  946      780   893   12
+8c9623a3  1375     808   934   13
+8c9623a3  1925     808   946   14
+8c9623a3  1934     813   1375  15
+8c9623a3  1944     813   1925  16
+8c9623a3  2436     846   1934  17
+8c9623a3  2878     846   1944  18
+8c9623a3  3836     851   2436  19
+
+Verdict: sample-shape artifact, not a real estimator defect. `actual` is
+monotonically increasing because this is the same session's cumulative
+duration, re-finalized at every Stop event. Each estimate's p90 bound tracks
+roughly one step behind the growing actual (e.g. actual=780/p90=775,
+actual=851/p90=846) because the estimator's own history is built from this
+same monotonic sequence's prior values. A quantile estimator fed a
+monotonically-increasing series will structurally undershoot every new
+point by construction -- this is not evidence that the conditional/bucketed
+estimator mis-predicts real, independent task durations. No Jira follow-up
+filed for "estimator defect"; the real, generalizable finding is
+methodological: repeatedly re-finalizing one long-running session at growing
+cumulative durations is not a valid way to test a duration-quantile
+estimator's real-world accuracy, regardless of which product this pattern
+shows up in.
