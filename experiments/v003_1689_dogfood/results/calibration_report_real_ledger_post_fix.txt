@@ -1,0 +1,58 @@
+libra-governor calibration report
+==================================
+
+Dropped 1 locally recorded receipt(s): no usable estimate (estimate-less plan or cold-start).
+
+Duration coverage
+------------------
+computed over n=140 real calibration pairs.
+
+  overall:
+    P50: coverage=2.9% (hits=4/140), pinball_loss=5238.38
+    P80: coverage=6.4% (hits=9/140), pinball_loss=4179.41
+    P90: coverage=8.6% (hits=12/140), pinball_loss=2904.22
+
+  by bucket tier:
+    global:
+      P50: coverage=30.0% (hits=3/10), pinball_loss=38.50
+      P80: coverage=50.0% (hits=5/10), pinball_loss=45.76
+      P90: coverage=70.0% (hits=7/10), pinball_loss=26.63
+    repo_topology_model:
+      P50: coverage=0.0% (hits=0/99), pinball_loss=5379.30
+      P80: coverage=0.0% (hits=0/99), pinball_loss=4119.98
+      P90: coverage=0.0% (hits=0/99), pinball_loss=2907.47
+    topology:
+      P50: coverage=3.2% (hits=1/31), pinball_loss=6465.73
+      P80: coverage=12.9% (hits=4/31), pinball_loss=5702.63
+      P90: coverage=16.1% (hits=5/31), pinball_loss=3822.11
+
+  by sample-count band:
+    n_5_19:
+      P50: coverage=3.1% (hits=2/65), pinball_loss=2916.25
+      P80: coverage=9.2% (hits=6/65), pinball_loss=1788.23
+      P90: coverage=13.8% (hits=9/65), pinball_loss=895.37
+    n_ge_20:
+      P50: coverage=0.0% (hits=0/71), pinball_loss=7659.29
+      P80: coverage=0.0% (hits=0/71), pinball_loss=6603.83
+      P90: coverage=0.0% (hits=0/71), pinball_loss=4906.80
+    n_lt_5:
+      P50: coverage=50.0% (hits=2/4), pinball_loss=1.75
+      P80: coverage=75.0% (hits=3/4), pinball_loss=2.60
+      P90: coverage=75.0% (hits=3/4), pinball_loss=2.42
+
+Admission replay
+-----------------
+  policy: deadline=300s, threshold_quantile=P80
+    n=140, admit=16, false_admit=0, false_reject=0, mean_overrun_secs=n/a, p95_overrun_secs=n/a
+  policy: deadline=600s, threshold_quantile=P80
+    n=140, admit=20, false_admit=2, false_reject=0, mean_overrun_secs=95.0, p95_overrun_secs=100.0
+
+Regime-aware confidence (HORO-1671)
+------------------------------------
+active regime: established, n=10
+confidence: Medium (in-regime n=140, out-of-regime n=0)
+reason: full in-regime evidence
+out-of-regime data contributes at bounds_weight=1, confidence_weight=0 (n=0)
+drift: insufficient window (usable=10, need >= 20)
+prior epochs: 2
+

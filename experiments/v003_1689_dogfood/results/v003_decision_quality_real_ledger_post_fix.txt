@@ -1,0 +1,17 @@
+v0.0.3 decision-quality metrics (HORO-1673)
+ledger: /tmp/dogfood-evidence/ledger-snapshot-post-fix.sqlite3
+
+== false-stop rate ==
+N_total=0 N_classifiable=0 (floor: 20)
+INSUFFICIENT — 0 classifiable Stop proposals < required 20. No rate is reported. This is the honest result for a fresh checkout or a short dogfood session; it is not a harness failure.
+
+== false-degrade rate ==
+N_total=0 N_classifiable=0 (floor: 20)
+INSUFFICIENT — 0 classifiable Degrade proposals < required 20. No rate is reported.
+
+== early-warning lead time ==
+N_observations=0 (floor: 10)
+INSUFFICIENT — 0 observations < required 10. No lead time is reported.
+
+== cost per successful task ==
+NOT APPLICABLE — requires an Outcome Provider and at least one outcome attestation (`RecordOutcome`); none is configured in this ledger.
