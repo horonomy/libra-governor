@@ -9,6 +9,7 @@ import html
 import re
 import shutil
 import subprocess
+from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
@@ -34,7 +35,32 @@ CHAPTERS: tuple[tuple[str, str, str], ...] = (
 
 INLINE_LINK = re.compile(r"(?P<prefix>!?)\[(?P<label>[^]]+)\]\((?P<target>[^\s)]+)(?P<title>\s+[^)]*)?\)")
 REFERENCE_LINK = re.compile(r"^(?P<prefix>\s*\[[^]]+\]:\s*)(?P<target>\S+)(?P<suffix>.*)$", re.MULTILINE)
-SCRIPT_BODY = re.compile(r"<script(?:\s[^>]*)?>(.*?)</script>", re.IGNORECASE | re.DOTALL)
+
+
+class InlineScriptParser(HTMLParser):
+    """Collect exact inline script bodies for the deployed CSP."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.bodies: list[str] = []
+        self._body: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() == "script" and not any(name.lower() == "src" for name, _ in attrs):
+            self._body = []
+
+    def handle_data(self, data: str) -> None:
+        if self._body is not None:
+            self._body.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "script" and self._body is not None:
+            self.bodies.append("".join(self._body))
+            self._body = None
+
+    @property
+    def has_unclosed_script(self) -> bool:
+        return self._body is not None
 
 
 def run(*command: str) -> None:
@@ -139,7 +165,12 @@ def inject_metadata() -> list[str]:
 def script_hashes() -> list[str]:
     hashes: set[str] = set()
     for page in OUTPUT.rglob("*.html"):
-        for body in SCRIPT_BODY.findall(page.read_text(encoding="utf-8")):
+        parser = InlineScriptParser()
+        parser.feed(page.read_text(encoding="utf-8"))
+        parser.close()
+        if parser.has_unclosed_script:
+            raise RuntimeError(f"unclosed inline script in {page.relative_to(OUTPUT)}")
+        for body in parser.bodies:
             if not body.strip():
                 continue
             digest = base64.b64encode(hashlib.sha256(body.encode("utf-8")).digest()).decode("ascii")
