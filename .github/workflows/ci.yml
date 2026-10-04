@@ -72,6 +72,14 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace
+      - name: fresh install and first preflight (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          ./scripts/install.sh
+          libra-governor doctor --json
+          printf '%s\n' '{"session_id":"ci-fresh-install","cwd":".","prompt":"fresh install preflight","hook_event_name":"UserPromptSubmit"}' \
+            | libra-governor hook user-prompt-submit
+          libra-governor daemon stop || true
 
   # Secret scanning is provided by GitHub's native secret scanning + push
   # protection (enabled at the repository level; see SECURITY.md), not by
