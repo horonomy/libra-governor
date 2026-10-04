@@ -89,6 +89,11 @@ jobs:
           context = value["hookSpecificOutput"]["additionalContext"]
           if "Preflight complete" not in context:
               raise SystemExit(f"fresh install preflight was unavailable: {context!r}")
+      - name: build and verify public surface (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo install mdbook --version 0.5.2 --locked
+          python3 tools/build_site.py
           PY
 
   # Secret scanning is provided by GitHub's native secret scanning + push
