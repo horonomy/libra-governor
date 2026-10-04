@@ -22,6 +22,8 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::Once;
 
+mod support;
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_libra-governor")
 }
@@ -58,14 +60,6 @@ fn run_subcommand(
         .write_all(stdin_payload.as_bytes())
         .unwrap();
     child.wait_with_output().unwrap()
-}
-
-fn kill_daemon_for(state_dir: &std::path::Path) {
-    let _ = Command::new("pkill")
-        .args(["-f", &state_dir.display().to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
 }
 
 /// Replaces every UUID-shaped token (`TaskId`/`PlanId`'s `Display` form,
@@ -186,7 +180,7 @@ fn innermost_additional_context(stdout: &[u8]) -> String {
 /// repo and prompt, task/plan ids normalized out.
 #[test]
 fn claude_user_prompt_submit_additional_context_golden() {
-    let state_dir = tempfile::tempdir().unwrap();
+    let state_dir = support::DaemonState::new();
     let repo = tempfile::tempdir().unwrap();
     std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
     std::fs::create_dir_all(repo.path().join("src")).unwrap();
@@ -220,15 +214,13 @@ fn claude_user_prompt_submit_additional_context_golden() {
                      ExecutionReceipt rows recorded yet (confidence: low). This preflight is \
                      advisory only.";
     assert_eq!(normalized, expected);
-
-    kill_daemon_for(state_dir.path());
 }
 
 /// Golden: `Stop`'s stderr Execution Receipt summary for a full
 /// preflight -> tool-calls -> stop loop, task id normalized out.
 #[test]
 fn claude_stop_stderr_summary_golden() {
-    let state_dir = tempfile::tempdir().unwrap();
+    let state_dir = support::DaemonState::new();
     let repo = tempfile::tempdir().unwrap();
     std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
 
@@ -285,6 +277,4 @@ fn claude_stop_stderr_summary_golden() {
                      Tool calls: 2\n\
                      Inside P90: n/a (cold start)\n";
     assert_eq!(normalized, expected);
-
-    kill_daemon_for(state_dir.path());
 }

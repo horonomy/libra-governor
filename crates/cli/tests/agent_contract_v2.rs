@@ -32,6 +32,8 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::Once;
 
+mod support;
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_libra-governor")
 }
@@ -91,14 +93,6 @@ fn run_subcommand(
     child.wait_with_output().unwrap()
 }
 
-fn kill_daemon_for(state_dir: &std::path::Path) {
-    let _ = Command::new("pkill")
-        .args(["-f", &state_dir.display().to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
 fn additional_context(stdout: &[u8]) -> String {
     let value: serde_json::Value = serde_json::from_slice(stdout)
         .unwrap_or_else(|e| panic!("hook stdout was not valid JSON: {e}\nstdout: {stdout:?}"));
@@ -129,7 +123,7 @@ fn resilient_additional_context(stdout: &[u8]) -> String {
 
 #[test]
 fn claude_code_user_prompt_submit_happy_path() {
-    let state_dir = tempfile::tempdir().unwrap();
+    let state_dir = support::DaemonState::new();
     let repo = sample_repo();
     let payload = fixture_with_cwd("claude-code/user-prompt-submit.json", repo.path());
 
@@ -137,8 +131,6 @@ fn claude_code_user_prompt_submit_happy_path() {
     assert!(output.status.success());
     let ctx = resilient_additional_context(&output.stdout);
     assert!(ctx.contains("Preflight complete"), "{ctx}");
-
-    kill_daemon_for(state_dir.path());
 }
 
 #[test]
@@ -154,7 +146,7 @@ fn claude_code_post_tool_use_happy_path() {
 
 #[test]
 fn claude_code_stop_happy_path() {
-    let state_dir = tempfile::tempdir().unwrap();
+    let state_dir = support::DaemonState::new();
     let repo = sample_repo();
     let preflight = fixture_with_cwd("claude-code/user-prompt-submit.json", repo.path());
     run_subcommand(
@@ -169,13 +161,11 @@ fn claude_code_stop_happy_path() {
     assert!(output.stdout.is_empty());
     let summary = String::from_utf8_lossy(&output.stderr);
     assert!(summary.contains("Execution Receipt"), "{summary}");
-
-    kill_daemon_for(state_dir.path());
 }
 
 #[test]
 fn codex_user_prompt_submit_happy_path() {
-    let state_dir = tempfile::tempdir().unwrap();
+    let state_dir = support::DaemonState::new();
     let repo = sample_repo();
     let payload = fixture_with_cwd("codex/user-prompt-submit.json", repo.path());
 
@@ -191,8 +181,6 @@ fn codex_user_prompt_submit_happy_path() {
     );
     let ctx = resilient_additional_context(&output.stdout);
     assert!(ctx.contains("Preflight complete"), "{ctx}");
-
-    kill_daemon_for(state_dir.path());
 }
 
 #[test]
@@ -208,7 +196,7 @@ fn codex_post_tool_use_happy_path() {
 
 #[test]
 fn codex_stop_happy_path() {
-    let state_dir = tempfile::tempdir().unwrap();
+    let state_dir = support::DaemonState::new();
     let repo = sample_repo();
     let preflight = fixture_with_cwd("codex/user-prompt-submit.json", repo.path());
     run_subcommand(
@@ -223,8 +211,6 @@ fn codex_stop_happy_path() {
     assert!(output.stdout.is_empty());
     let summary = String::from_utf8_lossy(&output.stderr);
     assert!(summary.contains("Execution Receipt"), "{summary}");
-
-    kill_daemon_for(state_dir.path());
 }
 
 // ---------------------------------------------------------------------
@@ -313,7 +299,7 @@ fn cross_agent_equivalence_same_session_cwd_prompt_yields_identical_additional_c
     // _source comments.
     let repo = sample_repo();
 
-    let claude_state = tempfile::tempdir().unwrap();
+    let claude_state = support::DaemonState::new();
     let claude_payload = fixture_with_cwd("claude-code/user-prompt-submit.json", repo.path());
     let claude_output = run_subcommand(
         &["hook", "user-prompt-submit"],
@@ -325,7 +311,7 @@ fn cross_agent_equivalence_same_session_cwd_prompt_yields_identical_additional_c
         &claude_output.stdout,
     )));
 
-    let codex_state = tempfile::tempdir().unwrap();
+    let codex_state = support::DaemonState::new();
     let codex_payload = fixture_with_cwd("codex/user-prompt-submit.json", repo.path());
     let codex_output = run_subcommand(
         &["codex-hook", "user-prompt-submit"],
@@ -343,9 +329,6 @@ fn cross_agent_equivalence_same_session_cwd_prompt_yields_identical_additional_c
          byte-identical additionalContext (ids and the measured recon duration normalized) \
          — proof the core translation logic is not duplicated per agent"
     );
-
-    kill_daemon_for(claude_state.path());
-    kill_daemon_for(codex_state.path());
 }
 
 // ---------------------------------------------------------------------
@@ -469,7 +452,7 @@ fn a_recognized_but_unwired_lifecycle_event_is_handled_gracefully() {
 fn codex_extra_fields_are_tolerated_at_every_entry_point() {
     let repo = sample_repo();
 
-    let state_dir = tempfile::tempdir().unwrap();
+    let state_dir = support::DaemonState::new();
     let prompt_payload = fixture_with_cwd("codex/user-prompt-submit.json", repo.path());
     let prompt_output = run_subcommand(
         &["codex-hook", "user-prompt-submit"],
@@ -489,6 +472,4 @@ fn codex_extra_fields_are_tolerated_at_every_entry_point() {
     let stop_payload = fixture_with_cwd("codex/stop.json", repo.path());
     let stop_output = run_subcommand(&["codex-hook", "stop"], state_dir.path(), &stop_payload);
     assert!(stop_output.status.success());
-
-    kill_daemon_for(state_dir.path());
 }

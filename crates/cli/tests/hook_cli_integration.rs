@@ -11,6 +11,8 @@ use std::process::{Command, Stdio};
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
+mod support;
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_libra-governor")
 }
@@ -93,26 +95,9 @@ fn run_subcommand(
     (output, start.elapsed())
 }
 
-/// Best-effort cleanup for a daemon this test's `hook user-prompt-submit`
-/// spawned detached (see `client::ensure_daemon_connection`). The daemon
-/// process inherits `LIBRA_GOVERNOR_STATE_DIR` from the hook process that
-/// spawned it, so its command line contains the unique tempdir path —
-/// enough to find and kill it without a pid handle. Never fails the test
-/// if the daemon already exited or `pkill` is unavailable; this exists
-/// only to avoid multiplying orphaned daemon processes across CI runs
-/// (each test uses its own tempdir, so this never touches another
-/// test's daemon).
-fn kill_daemon_for(state_dir: &std::path::Path) {
-    let _ = Command::new("pkill")
-        .args(["-f", &state_dir.display().to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
 #[test]
 fn hook_spawns_daemon_and_returns_a_preflight_summary() {
-    let state_dir = tempfile::tempdir().unwrap();
+    let state_dir = support::DaemonState::new();
     let repo = tempfile::tempdir().unwrap();
     std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
     std::fs::create_dir_all(repo.path().join("src")).unwrap();
@@ -143,8 +128,6 @@ fn hook_spawns_daemon_and_returns_a_preflight_summary() {
     assert!(ctx.contains("Preflight complete"));
     assert!(ctx.contains("required"));
     assert!(ctx.contains("Cost/time estimate"));
-
-    kill_daemon_for(state_dir.path());
 }
 
 #[test]
@@ -229,7 +212,7 @@ fn statusline_never_spawns_and_reports_placeholder_when_daemon_is_down() {
 /// acceptance-critical "full local loop" test (HORO-1126).
 #[test]
 fn full_loop_preflight_tool_calls_stop_produces_a_receipt() {
-    let state_dir = tempfile::tempdir().unwrap();
+    let state_dir = support::DaemonState::new();
     let repo = tempfile::tempdir().unwrap();
     std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
 
@@ -287,8 +270,6 @@ fn full_loop_preflight_tool_calls_stop_produces_a_receipt() {
         summary.contains("Outcome:  Unknown"),
         "MVP 1 has no automated completion verification: {summary}"
     );
-
-    kill_daemon_for(state_dir.path());
 }
 
 /// `Stop` firing with no preceding `Preflight` for the session must be a
@@ -342,7 +323,7 @@ fn post_tool_use_never_spawns_a_daemon_and_stays_fast_when_daemon_is_down() {
 /// dying and being restarted — it lives in SQLite, not daemon memory.
 #[test]
 fn receipt_survives_daemon_restart_and_is_queryable() {
-    let state_dir = tempfile::tempdir().unwrap();
+    let state_dir = support::DaemonState::new();
     let repo = tempfile::tempdir().unwrap();
     let session_id = "restart-session";
 
@@ -367,8 +348,12 @@ fn receipt_survives_daemon_restart_and_is_queryable() {
 
     // Kill the daemon (simulating a crash/restart) before reading the
     // ledger back — the receipt must already be durably on disk.
-    kill_daemon_for(state_dir.path());
+    state_dir.stop();
     std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        std::os::unix::net::UnixStream::connect(state_dir.path().join("daemon.sock")).is_err(),
+        "identity-checked test teardown must stop the daemon before the ledger is inspected"
+    );
 
     let ledger_path = state_dir.path().join("ledger.sqlite3");
     let store = libra_governor_ledger::LedgerStore::open(&ledger_path).unwrap();
@@ -404,7 +389,7 @@ fn receipt_survives_daemon_restart_and_is_queryable() {
 ///   live `DaemonConfig.gateway` rather than a cached startup result.
 #[test]
 fn daemon_loads_a_non_default_policy_and_gateway_from_config_json() {
-    let state_dir = tempfile::tempdir().unwrap();
+    let state_dir = support::DaemonState::new();
     let repo = tempfile::tempdir().unwrap();
     std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
     std::fs::create_dir_all(repo.path().join("src")).unwrap();
@@ -482,6 +467,4 @@ fn daemon_loads_a_non_default_policy_and_gateway_from_config_json() {
         "gateway status must report the gateway as running on the config.json-configured \
          bind_addr, got: {status_text}"
     );
-
-    kill_daemon_for(state_dir.path());
 }

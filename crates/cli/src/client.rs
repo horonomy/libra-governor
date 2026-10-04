@@ -21,10 +21,8 @@ use libra_governor_protocol::{
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Total time budget for spawning a fresh daemon and waiting for it to
 /// start accepting connections, before the hook gives up and degrades
-/// gracefully. A fresh binary can spend several seconds opening its ledger
-/// on a contended Linux runner; keep this below Claude Code's hook timeout
-/// while avoiding a false unavailable result during ordinary startup.
-const SPAWN_WAIT_BUDGET: Duration = Duration::from_secs(5);
+/// gracefully. Comfortably inside Claude Code's own hook timeout.
+const SPAWN_WAIT_BUDGET: Duration = Duration::from_secs(3);
 const SPAWN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, thiserror::Error)]
