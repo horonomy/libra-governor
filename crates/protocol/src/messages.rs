@@ -4,8 +4,9 @@
 use std::path::PathBuf;
 
 use libra_governor_domain::{
-    BusinessContextSummary, CompletionContract, Confidence, EnforcementCapabilities, Estimate,
-    ExecutionOutcome, ExecutionReceipt, PlanId, PolicyDecision, ResourceAmount, TaskId,
+    BudgetSnapshot, BusinessContextSummary, CompletionContract, Confidence,
+    EnforcementCapabilities, Estimate, ExecutionOutcome, ExecutionReceipt, PlanId, PolicyDecision,
+    ResourceAmount, TaskId,
 };
 use libra_governor_estimator::{
     AdmissionOutcome, AdmissionPolicy, CoverageReport, RegimeCalibrationReport,
@@ -230,17 +231,137 @@ pub struct StatusResult {
     /// `None` when there is no current task: a share of a budget that was
     /// never admitted is not zero, it is absent.
     pub task_budget: Option<BudgetPosture>,
+    /// The amounts behind `task_budget` (HORO-1709), in the unit the
+    /// task's envelope is actually denominated in.
+    ///
+    /// This and `task_budget` are two projections of **one**
+    /// [`BudgetSnapshot`], read in one ledger transaction, and that is the
+    /// whole reason the snapshot type exists. A percentage and a set of
+    /// amounts obtained from separate reads can each be correct and still
+    /// contradict each other on screen, which is the defect this field
+    /// would otherwise have introduced rather than fixed.
+    ///
+    /// `None` whenever `task_budget` is [`BudgetPosture::NotEstablished`]
+    /// or [`BudgetPosture::Unreadable`]: there is no snapshot to project
+    /// in either case. It is deliberately `Some` for
+    /// [`BudgetPosture::Uncommitted`] — the *ceiling* is authoritative
+    /// there even though consumption has never been observed, and
+    /// [`BudgetSnapshot::is_observed`] is how a renderer tells the
+    /// difference. Withholding the whole snapshot would discard a figure
+    /// the ledger genuinely holds.
+    ///
+    /// Scope: the **active task**, always. Never the daemon's configured
+    /// default, and never a host or principal cap — see
+    /// `configured_budget` and [`BudgetScope`].
+    pub task_budget_amounts: Option<BudgetSnapshot>,
+    /// The envelope that would govern the *next* task admitted on this
+    /// machine (HORO-1709) — the daemon's running policy ceiling, not a
+    /// measurement of anything.
+    ///
+    /// A different scope from `task_budget_amounts`, carried in a
+    /// different field for that reason. The two can disagree in normal
+    /// operation and neither is wrong when they do: a task's ceiling is
+    /// fixed at admission for the life of the task
+    /// (`LedgerStore::initialize_task_budget` never overwrites an
+    /// existing row), so editing `config.json` changes what the next task
+    /// gets without touching what the running one has.
+    ///
+    /// It exists because the honest alternative while idle was to report
+    /// nothing at all. A daemon with no current task has no active-task
+    /// percentage to show — and a surface that filled the gap with
+    /// "100% budget left" would be inventing a measurement — but it does
+    /// know, authoritatively, what the next task's ceiling would be.
+    /// Reporting that as its own scope is the one way to be more
+    /// informative than silence without being false.
+    ///
+    /// Always `Some` on a daemon that resolved a policy, including while
+    /// a task is active, so a renderer can show "this task has X, the
+    /// next would get Y" without a second request. A renderer must
+    /// nonetheless never present it as consumption: see
+    /// [`BudgetScope::ConfiguredDefault`].
+    pub configured_budget: Option<ConfiguredBudget>,
+}
+
+/// Which envelope an economic figure is a figure *of* (HORO-1709).
+///
+/// Two members, and the distinction is load-bearing rather than
+/// bookkeeping: `$32.63` means two different things depending on which
+/// one it describes, and a statusline that conflated them would answer
+/// "how much do I have left" with a number that was never about this
+/// task. Every amount Libra publishes is tagged with one of these.
+///
+/// There is deliberately **no host/principal/global cap member**. Such a
+/// cap is a real thing — a subscription ceiling, an organisation budget —
+/// and nothing on this machine holds an authoritative value for one. A
+/// variant would have had exactly one possible source: a figure guessed
+/// from local configuration and then labelled as if a provider had
+/// confirmed it. That is a worse outcome than the absence, because a cap
+/// is precisely the figure a user would act on. When an authoritative
+/// source exists, the variant arrives with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetScope {
+    /// The envelope of the task being governed right now, backed by the
+    /// reservation ledger. The only scope whose figures describe
+    /// consumption, and therefore the only one a pressure/urgency reading
+    /// may be computed from.
+    ActiveTask,
+    /// The ceiling the daemon's running policy would give the next task.
+    /// Context, not consumption: nothing has been spent against it,
+    /// because it is not an account — it is a setting. A renderer must
+    /// not derive a utilization band from it, and must not show it as a
+    /// remaining amount.
+    ConfiguredDefault,
+}
+
+/// The daemon's running resource ceiling (HORO-1709) — scope
+/// [`BudgetScope::ConfiguredDefault`].
+///
+/// A ceiling and its unit, and nothing else. There is no `used`, no
+/// `remaining` and no percentage here, and their absence is the type's
+/// main assertion: a configured default has no consumption to report, so
+/// a field that could carry one would eventually be filled in with a
+/// task's figure.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ConfiguredBudget {
+    /// `policy.resource.hard_ceiling` as the running daemon resolved it —
+    /// the same value `initialize_task_budget` would copy into the next
+    /// task's budget row, read from the policy actually in force rather
+    /// than from disk. A daemon whose `config.json` has been edited since
+    /// it started reports what it is running; the `profile` segment is
+    /// what says the edit has not taken effect yet.
+    pub ceiling: ResourceAmount,
 }
 
 /// What remains of a governed task's resource envelope (HORO-1634).
 ///
-/// A *ratio*, never an amount. The hard limit, the settled spend, the
-/// active reservations and the protected Completion Reserve are all
-/// resource figures, and Libra's rendering surfaces do not carry resource
-/// figures — `statusline_provider::explain_text` says so in as many words
-/// and its tests assert it. A share is the one form of the fact that
-/// answers "how much room is left" without disclosing what the room is
-/// measured in or how much was bought.
+/// A *classification*, not a measurement: which of five economically
+/// distinct situations the task is in, plus the one share that situation
+/// implies. The amounts are a sibling field —
+/// [`StatusResult::task_budget_amounts`] — and the split is on purpose.
+/// This type is what a renderer branches on; a figure is what it then
+/// prints. Fusing the two would mean every surface that wanted to know
+/// "is this exhausted" had to first decide what a negative token count
+/// meant.
+///
+/// # On amounts
+///
+/// Until HORO-1709 this doc said "a ratio, never an amount", on the
+/// ground that a share answers "how much room is left" without
+/// disclosing what the room is measured in or how much was bought. That
+/// reasoning was wrong about who it protected. The figures in question
+/// are the user's own ceiling and the user's own consumption, on the
+/// user's own machine, and withholding them did not make the statusline
+/// safer — it made it unactionable, because "38% left" of an unstated
+/// quantity cannot tell anyone whether to keep going. So amounts are now
+/// published, in the envelope's own unit, beside this classification.
+///
+/// What remains withheld is unchanged and is a different thing: the
+/// estimator's resource and cost quantiles, its free-text reasoning, and
+/// any prompt or tool content. Those describe *predictions about the
+/// user's behaviour* derived across tasks, not the envelope in force now.
+/// `statusline_provider::explain_text` still says so, and its tests
+/// still assert it.
 ///
 /// Five variants, because the four ways there can be no reportable share
 /// are different facts and collapsing them loses the one a user could act
@@ -305,6 +426,64 @@ pub enum BudgetPosture {
     /// dropped to `None`, because a budget whose state is unknown and a
     /// task that has no budget are different things to be told.
     Unreadable,
+}
+
+impl BudgetPosture {
+    /// Classifies one [`BudgetSnapshot`] (HORO-1709).
+    ///
+    /// Pure, and that is the point. Before this the daemon derived the
+    /// posture with four separate ledger reads of its own; publishing
+    /// amounts alongside it would have made that six, against a 200 ms
+    /// statusline budget, with every read free to observe a different
+    /// instant. Now the ledger reads once and this decides what the
+    /// single value means, so the share below and the amounts beside it
+    /// are the same measurement seen twice rather than two measurements
+    /// hoped to agree.
+    ///
+    /// [`BudgetPosture::NotEstablished`] is not reachable from here: a
+    /// task with no budget row has no snapshot at all, so the absence is
+    /// the caller's `None` and never a classification of something.
+    ///
+    /// # Why the branches are in this order
+    ///
+    /// Exhaustion first. It is the only posture that changes what the
+    /// user should do next, and it is a fact about the ledger's own
+    /// refusal threshold rather than about the share — an exhausted
+    /// envelope that happens to have had no reservation attributed to it
+    /// is still exhausted.
+    ///
+    /// Observation second. An envelope nothing has ever drawn against has
+    /// `settled == 0` and `active == 0`, so the canonical share evaluates
+    /// to exactly `1.0` and renders as "100% budget left" (HORO-1708).
+    /// That is arithmetically correct and still false: it reads as
+    /// measured-and-full when what happened is that no economic event was
+    /// ever attributed to this task. Taken from
+    /// [`BudgetSnapshot::is_observed`] — a reservation count — rather than
+    /// from the share being `1.0`, because a float equality standing in
+    /// for "nothing happened" would start lying the first time a
+    /// settlement rounded back to the limit.
+    pub fn from_snapshot(snapshot: &BudgetSnapshot) -> Self {
+        if snapshot.remaining().is_exhausted() {
+            return BudgetPosture::Exhausted;
+        }
+        if !snapshot.is_observed() {
+            return BudgetPosture::Uncommitted;
+        }
+        match snapshot.fraction_left() {
+            Some(fraction_left) => BudgetPosture::Remaining { fraction_left },
+            // Unreachable on any row this workspace writes, and mapped
+            // deliberately rather than unwrapped. `fraction_left` is
+            // `None` only for a non-positive or non-finite hard limit;
+            // non-positive was already caught as exhaustion above, so
+            // what is left is a limit that is NaN or infinite — a budget
+            // row whose own ceiling is not a quantity. "Unreadable" is
+            // the truthful reading of that: the envelope's state is
+            // unknown. Fabricating a share from it, or reporting it as an
+            // envelope that was never established, would both claim to
+            // know which.
+            None => BudgetPosture::Unreadable,
+        }
+    }
 }
 
 /// A compact summary of the daemon's most recently produced preflight,
@@ -952,5 +1131,264 @@ mod tests {
         let json = serde_json::to_value(&result).unwrap();
         assert!(json.get("business_context").is_some());
         assert!(json["business_context"].is_null());
+    }
+
+    // --- HORO-1709: budget amounts, scopes, and posture classification ---
+
+    use libra_governor_domain::ResourceKind;
+
+    /// 150,000 tokens of envelope, 18,000 settled, 70,000 held, two
+    /// reservation rows: a live mid-task state.
+    fn observed_snapshot() -> BudgetSnapshot {
+        BudgetSnapshot::new(
+            ResourceKind::Tokens,
+            150_000.0,
+            30_000.0,
+            18_000.0,
+            70_000.0,
+            2,
+        )
+    }
+
+    /// The HORO-1708 case: an envelope exists, nothing was ever
+    /// attributed to it.
+    fn unobserved_snapshot() -> BudgetSnapshot {
+        BudgetSnapshot::new(ResourceKind::Tokens, 150_000.0, 30_000.0, 0.0, 0.0, 0)
+    }
+
+    #[test]
+    fn a_posture_and_its_amounts_describe_the_same_envelope() {
+        let snapshot = observed_snapshot();
+        let BudgetPosture::Remaining { fraction_left } = BudgetPosture::from_snapshot(&snapshot)
+        else {
+            panic!("a partly-spent observed envelope has remaining capacity");
+        };
+        // The claim this pins is HORO-1709 AC 5: the share and the
+        // amounts cannot contradict each other. Not "they happen to
+        // agree" — the share *is* the amounts, so reconstructing one
+        // from the other is exact.
+        let remaining = snapshot.remaining().value;
+        let total = snapshot.total().as_f64();
+        assert!(
+            (fraction_left - remaining / total).abs() < f64::EPSILON,
+            "share {fraction_left} must be remaining {remaining} over total {total}"
+        );
+    }
+
+    /// HORO-1708's defect, re-pinned at the layer that now owns the
+    /// branch. A full envelope nothing drew against must not read as a
+    /// measured 100%.
+    #[test]
+    fn an_unobserved_envelope_is_uncommitted_rather_than_fully_remaining() {
+        assert_eq!(
+            BudgetPosture::from_snapshot(&unobserved_snapshot()),
+            BudgetPosture::Uncommitted
+        );
+    }
+
+    /// Exhaustion is tested before observation, so an envelope that is
+    /// over its limit reports the fact that matters even if no
+    /// reservation row survived to explain it.
+    #[test]
+    fn exhaustion_outranks_the_absence_of_an_observation() {
+        let spent_out =
+            BudgetSnapshot::new(ResourceKind::Tokens, 150_000.0, 0.0, 150_000.0, 0.0, 0);
+        assert_eq!(
+            BudgetPosture::from_snapshot(&spent_out),
+            BudgetPosture::Exhausted
+        );
+    }
+
+    #[test]
+    fn an_overrun_is_exhausted_not_a_negative_share() {
+        let overrun = BudgetSnapshot::new(ResourceKind::Tokens, 100.0, 0.0, 130.0, 0.0, 3);
+        assert_eq!(
+            BudgetPosture::from_snapshot(&overrun),
+            BudgetPosture::Exhausted
+        );
+    }
+
+    /// A zero-ceiling envelope has no room by construction. It must not
+    /// become a share of zero-over-zero, and it must not be reported as
+    /// an envelope that was never established — the row exists.
+    #[test]
+    fn a_zero_ceiling_envelope_is_exhausted_rather_than_a_nonsense_share() {
+        let zero = BudgetSnapshot::new(ResourceKind::Tokens, 0.0, 0.0, 0.0, 0.0, 0);
+        assert_eq!(
+            BudgetPosture::from_snapshot(&zero),
+            BudgetPosture::Exhausted
+        );
+    }
+
+    /// The protected Completion Reserve is earmarked, not spent:
+    /// required completion work may still draw against it, so a share
+    /// that subtracted it would under-report what the task has.
+    #[test]
+    fn the_completion_reserve_does_not_reduce_the_reported_share() {
+        let with_reserve = BudgetSnapshot::new(ResourceKind::Tokens, 1_000.0, 400.0, 100.0, 0.0, 1);
+        let without_reserve =
+            BudgetSnapshot::new(ResourceKind::Tokens, 1_000.0, 0.0, 100.0, 0.0, 1);
+        assert_eq!(
+            BudgetPosture::from_snapshot(&with_reserve),
+            BudgetPosture::from_snapshot(&without_reserve)
+        );
+    }
+
+    /// Every live envelope on this machine is denominated in tokens, not
+    /// currency (HORO-1725/HORO-1727). The amounts must come back in the
+    /// unit the ledger actually stores, never coerced to a default one.
+    ///
+    /// The fixture's share is deliberately `0.5` — exactly representable
+    /// — because a *share* does not survive this wire bit-for-bit. See
+    /// `a_transported_share_can_shift_by_one_ulp_but_the_amounts_cannot`.
+    #[test]
+    fn amounts_keep_the_envelopes_own_unit_across_the_wire() {
+        let half_spent =
+            BudgetSnapshot::new(ResourceKind::Tokens, 160_000.0, 0.0, 20_000.0, 60_000.0, 2);
+        let envelope = ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            response: Response::Status(Box::new(StatusResult {
+                current_task: None,
+                task_budget: Some(BudgetPosture::from_snapshot(&half_spent)),
+                task_budget_amounts: Some(half_spent),
+                configured_budget: Some(ConfiguredBudget {
+                    ceiling: ResourceAmount::Tokens(150_000),
+                }),
+            })),
+        };
+        let json = serde_json::to_string(&envelope).unwrap();
+        let round_tripped: ResponseEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(envelope, round_tripped);
+
+        let value = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(value["response"]["task_budget_amounts"]["kind"], "tokens");
+        assert_eq!(
+            value["response"]["configured_budget"]["ceiling"]["kind"],
+            "tokens"
+        );
+    }
+
+    /// A finding worth a test rather than a comment: this wire does not
+    /// preserve an arbitrary `f64` bit-for-bit. `serde_json`'s default
+    /// parser is a fast approximate one — exact round-tripping is behind
+    /// its `float_roundtrip` feature, which this workspace does not
+    /// enable — so a share like `62_000 / 150_000` can come back one ULP
+    /// away from what was sent.
+    ///
+    /// Harmless for the amounts, which are integral: a token count, a
+    /// ceiling and a settled sum are whole numbers whose `f64`
+    /// representation is exact and whose shortest decimal form parses
+    /// back exactly. Not harmless for a share, and that is the point of
+    /// this test. A displayed percentage is `floor(share * 100)`, so a
+    /// share sitting exactly on an integer boundary could render one
+    /// point lower after transport than the amounts beside it imply —
+    /// which is HORO-1709's AC 5 violated by the transport rather than
+    /// by any arithmetic.
+    ///
+    /// The fix lives in the provider, and this test is what justifies it:
+    /// the displayed percentage is recomputed from the transported
+    /// *amounts* (exact) rather than read from the transported *share*
+    /// (approximate). `BudgetPosture` keeps carrying `fraction_left`
+    /// because it is the classification's own datum and the only
+    /// available one when a peer sends no snapshot.
+    #[test]
+    fn a_transported_share_can_shift_by_one_ulp_but_the_amounts_cannot() {
+        let snapshot = observed_snapshot();
+        let sent = BudgetPosture::from_snapshot(&snapshot);
+        let round_tripped: BudgetPosture =
+            serde_json::from_str(&serde_json::to_string(&sent).unwrap()).unwrap();
+
+        let (
+            BudgetPosture::Remaining {
+                fraction_left: before,
+            },
+            BudgetPosture::Remaining {
+                fraction_left: after,
+            },
+        ) = (sent, round_tripped)
+        else {
+            panic!("the fixture is a partly-spent observed envelope");
+        };
+        assert!(
+            (before - after).abs() <= f64::EPSILON,
+            "a share must survive transport to within an ULP: {before} vs {after}"
+        );
+
+        // The amounts, by contrast, are integral and must be exact — this
+        // is what makes recomputing the percentage from them sound.
+        let amounts: BudgetSnapshot =
+            serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+        assert_eq!(amounts, snapshot);
+        assert_eq!(amounts.total().as_f64(), 150_000.0);
+        assert_eq!(amounts.remaining().value, 62_000.0);
+    }
+
+    /// Pins what the shape alone does *not* protect, so nobody relies on
+    /// it. A v10 `StatusResult` decodes cleanly into a v11 one: both new
+    /// fields are `Option`, and serde defaults a missing `Option` to
+    /// `None`. The result is indistinguishable from a daemon that has a
+    /// task with no budget row — stale silently read as unknown.
+    ///
+    /// That is why [`PROTOCOL_VERSION`] was bumped and why the envelope
+    /// carries a required, non-defaulted version: the version check is
+    /// the whole protection here, not the field shape. Deleting the bump
+    /// on the grounds that "it deserializes fine" would reintroduce the
+    /// silent downgrade.
+    #[test]
+    fn a_missing_budget_field_decodes_to_none_so_the_version_gate_is_the_protection() {
+        let v10_shaped = r#"{"current_task":null,"task_budget":null}"#;
+        let decoded: StatusResult = serde_json::from_str(v10_shaped)
+            .expect("an Option field absent from the payload is not a decode error");
+        assert_eq!(decoded.task_budget_amounts, None);
+        assert_eq!(decoded.configured_budget, None);
+
+        // And the envelope that would actually carry it does fail, which
+        // is the behaviour the bump buys.
+        let skewed = r#"{"request":{"kind":"status"}}"#;
+        assert!(serde_json::from_str::<RequestEnvelope>(skewed).is_err());
+    }
+
+    /// The two scopes are distinguishable on the wire. A renderer that
+    /// could not tell them apart would answer "how much do I have left"
+    /// with a configured setting (HORO-1709's Idle refinement).
+    #[test]
+    fn the_two_budget_scopes_round_trip_distinguishably() {
+        for (scope, expected) in [
+            (BudgetScope::ActiveTask, "\"active_task\""),
+            (BudgetScope::ConfiguredDefault, "\"configured_default\""),
+        ] {
+            let json = serde_json::to_string(&scope).unwrap();
+            assert_eq!(json, expected);
+            let round_tripped: BudgetScope = serde_json::from_str(&json).unwrap();
+            assert_eq!(scope, round_tripped);
+        }
+    }
+
+    /// An idle daemon carries a configured ceiling and no active-task
+    /// figures at all. Nothing in this shape can be mistaken for
+    /// consumption: there is no posture, no snapshot, and
+    /// [`ConfiguredBudget`] has no field that could hold a spend.
+    #[test]
+    fn an_idle_status_carries_a_configured_ceiling_and_no_task_amounts() {
+        let idle = StatusResult {
+            current_task: None,
+            task_budget: None,
+            task_budget_amounts: None,
+            configured_budget: Some(ConfiguredBudget {
+                ceiling: ResourceAmount::Tokens(150_000),
+            }),
+        };
+        let value = serde_json::to_value(&idle).unwrap();
+        assert!(value["task_budget"].is_null());
+        assert!(value["task_budget_amounts"].is_null());
+        assert_eq!(value["configured_budget"]["ceiling"]["amount"], 150_000);
+        let configured = value["configured_budget"].as_object().unwrap();
+        assert_eq!(
+            configured.len(),
+            1,
+            "a configured ceiling has exactly one field: the ceiling. A \
+             `used` or `remaining` here would eventually be filled in \
+             with an active task's figure."
+        );
     }
 }

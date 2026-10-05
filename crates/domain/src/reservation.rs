@@ -326,7 +326,11 @@ impl BudgetSnapshot {
     /// read. Only the ledger has a legitimate reason to call this; it is
     /// public because the ledger is a separate crate, not because a
     /// caller holding four loose numbers should assemble one.
-    pub fn new(
+    ///
+    /// `const` so a test fixture can be a `const` item: a snapshot
+    /// written once at the top of a test module, rather than rebuilt by a
+    /// helper each call, is one a reader can check the arithmetic of.
+    pub const fn new(
         kind: crate::resource_amount::ResourceKind,
         hard_limit: f64,
         completion_reserve: f64,
