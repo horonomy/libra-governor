@@ -571,10 +571,19 @@ fn percent_left(fraction_left: f64) -> Option<u32> {
 /// is not a posture about how the work is going, it is the reason the next
 /// reservation will be refused.
 ///
-/// The three non-numeric outcomes stay distinct instead of collapsing to
+/// The four non-numeric outcomes stay distinct instead of collapsing to
 /// one "no budget" phrase. A task that was never admitted to an envelope, an
-/// envelope that is spent, and a ledger that would not read are three
-/// different things to be told, and only the middle one is about the work.
+/// envelope nothing has drawn against, an envelope that is spent, and a
+/// ledger that would not read are four different things to be told, and
+/// only the spent one is about the work.
+///
+/// `Uncommitted` is worded as a statement about *usage* rather than about
+/// the envelope (HORO-1708), and that is the whole point of the label. The
+/// state it describes is "nothing has been attributed to this task", whose
+/// natural phrasings — untouched, unspent, full — all read as "none of it
+/// is gone", which is the "100% budget left" claim this variant exists to
+/// stop making. Naming the unknown thing instead is the only phrasing that
+/// cannot be mistaken for the measurement it lacks.
 fn budget_segment(posture: BudgetPosture) -> Value {
     let (state, label, reason_code, clear_role) = match posture {
         BudgetPosture::Remaining { fraction_left } => match percent_left(fraction_left) {
@@ -603,6 +612,17 @@ fn budget_segment(posture: BudgetPosture) -> Value {
             "Budget exhausted".to_string(),
             Some("budget_hard_limit_reached"),
             "exception",
+        ),
+        // `unknown`, not `neutral`: this is the absence of a reading, and
+        // `neutral` is how a reading that happens to be comfortable is
+        // reported. Sharing the state with `NotEstablished` is right —
+        // neither surface has a share to show — and the `reason_code` is
+        // what separates "no envelope" from "no draw against one".
+        BudgetPosture::Uncommitted => (
+            "unknown",
+            "Budget usage unknown".to_string(),
+            Some("no_commitment_against_envelope"),
+            "vital",
         ),
         BudgetPosture::NotEstablished => (
             "unknown",
@@ -882,6 +902,17 @@ fn budget_posture_prose(posture: Option<BudgetPosture>) -> String {
             ),
             None => "not reported — the daemon's share was not a usable number".to_string(),
         },
+        // The one line here that explains an *omission*, so it says what
+        // would otherwise be assumed: the share is withheld deliberately,
+        // and the envelope being intact is not the same fact as the work
+        // having been measured.
+        Some(BudgetPosture::Uncommitted) => {
+            "unknown — this task holds an envelope but nothing has been \
+             committed\n\x20                  against it, so there is no measured share to \
+             report; an\n\x20                  untouched envelope is not the same as a \
+             measured full one"
+                .to_string()
+        }
         Some(BudgetPosture::Exhausted) => {
             "exhausted — the next reservation will be refused; the task is \
              not\n\x20                  stopped, because Libra's hooks are advisory"
