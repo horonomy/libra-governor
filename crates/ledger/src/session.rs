@@ -142,11 +142,17 @@ impl LedgerStore {
     }
 
     /// Returns when `session_id` first resolved a task (i.e. its first
-    /// `Preflight`), if it has ever done so. Used as "task start" for
-    /// elapsed-duration computation at `Finalize` — see
+    /// `Preflight`), if it has ever done so. See
     /// [`Self::resolve_or_create_task_for_session`], which is the only
     /// writer of `session_tasks.created_at` and writes it exactly once
     /// per session.
+    ///
+    /// This is the age of the *session*, which is not a work duration:
+    /// it spans every turn the session has served plus all the operator's
+    /// idle time between them. It was previously used as the "task start"
+    /// anchor for a receipt's `actual_duration_secs` and that was
+    /// HORO-1723 — use
+    /// [`crate::LedgerStore::plan_lineage_started_at`] for that.
     pub fn session_started_at(
         &self,
         session_id: &str,
