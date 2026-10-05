@@ -227,9 +227,10 @@ pub struct StatusResult {
 /// answers "how much room is left" without disclosing what the room is
 /// measured in or how much was bought.
 ///
-/// Four variants, because the three ways there can be no share are
-/// different facts and collapsing them loses the one a user could act on:
-/// an exhausted budget is not an unadmitted task, and neither is a ledger
+/// Five variants, because the four ways there can be no reportable share
+/// are different facts and collapsing them loses the one a user could act
+/// on: an exhausted budget is not an unadmitted task, an envelope nothing
+/// has ever drawn against is neither, and none of the three is a ledger
 /// that would not read.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -245,13 +246,45 @@ pub enum BudgetPosture {
     /// `libra_governor_domain::ReservationClass::RequiredWork`). A share
     /// that excluded it would under-report what the task actually has.
     Remaining { fraction_left: f64 },
+    /// An envelope exists, but nothing has ever been committed against it:
+    /// the task holds no reservation in any state, so settled spend and
+    /// active holds are both structurally zero.
+    ///
+    /// This is the one case that may *not* be reported as
+    /// [`BudgetPosture::Remaining`], and it is why this variant exists
+    /// (HORO-1708). The canonical share is
+    /// `(hard_limit - settled - active) / hard_limit`, which for a task
+    /// that never drew against its envelope is `hard_limit / hard_limit`
+    /// — exactly `1.0`, rendered as "100% budget left". That number is
+    /// arithmetically correct and still a false statement: it reads as
+    /// "measured, and all of it is available", when what happened is that
+    /// no economic event was ever attributed to this task at all. Absence
+    /// of observation is not observation of fullness.
+    ///
+    /// It is reachable in normal operation, not only in theory. A plan
+    /// whose admission came back `Deny` or `ApprovalRequired` gets no
+    /// plan-level reservation by design, so every task in that state
+    /// reports a full envelope for its entire life — and because a
+    /// successfully admitted task has its work envelope reserved before
+    /// any `Status` can be answered, a share of exactly `1.0` in practice
+    /// *means* this case rather than a lucky rounding.
+    ///
+    /// Distinct from the three below: the envelope is readable, present
+    /// and unspent. The missing thing is a draw against it, which is a
+    /// fact about attribution rather than about capacity — so it is
+    /// reported as the unknown it is, and the share is withheld rather
+    /// than fabricated.
+    Uncommitted,
     /// Nothing remains: settled spend plus active reservations have
     /// reached or passed the hard limit, so the ledger will refuse the
     /// next reservation.
     Exhausted,
     /// The task has no budget row, so there is no envelope to report a
     /// share of. Distinct from `Exhausted`: nothing has been spent, the
-    /// task was never admitted to a budget in the first place.
+    /// task was never admitted to a budget in the first place. Distinct
+    /// from `Uncommitted` in the other direction: there the envelope
+    /// exists and nothing drew against it, here there is no envelope to
+    /// draw against.
     NotEstablished,
     /// The ledger could not be read. Carried as a fact rather than
     /// dropped to `None`, because a budget whose state is unknown and a
