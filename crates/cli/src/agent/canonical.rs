@@ -143,6 +143,8 @@ pub fn normalize_builtin(
             model,
             turn_id,
             agent_id,
+            // This inactive projection does not replace the live daemon usage relay.
+            transcript_path: _,
         } => (
             HostEventKind::Lifecycle,
             json!({"event_type": "turn_end"}),
@@ -381,6 +383,32 @@ mod tests {
         let encoded = serde_json::to_string(&result.event).unwrap();
         assert!(!encoded.contains("gpt-5-codex"));
         assert!(!encoded.contains("last_assistant_message"));
+    }
+
+    #[test]
+    fn stop_transcript_path_stays_in_the_live_relay_not_the_inactive_projection() {
+        let native = br#"{"hook_event_name":"Stop","session_id":"native-session","model":"observed-model","transcript_path":"/private/native-transcript.jsonl"}"#;
+        let legacy = normalize(
+            EntryPoint::TurnCompleted,
+            std::str::from_utf8(native).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(legacy, NormalizedEvent::TurnCompleted {
+            transcript_path: Some(ref path), ..
+        } if path == &std::path::PathBuf::from("/private/native-transcript.jsonl")));
+        let bundle = normalize_builtin(
+            AgentKind::ClaudeCode,
+            EntryPoint::TurnCompleted,
+            native,
+            &context(AgentKind::ClaudeCode),
+        )
+        .unwrap();
+        let encoded = serde_json::to_string(bundle.event()).unwrap();
+        assert!(!encoded.contains("transcript"));
+        assert!(matches!(
+            bundle.bind(),
+            HostBindingOutcome::RecordOnly { .. }
+        ));
     }
 
     #[test]
