@@ -492,7 +492,9 @@ fn spend_recorded_between_two_turns_is_attributed_to_the_next_receipt() {
 
     assert_eq!(
         second_receipt.actual_usage,
-        vec![ResourceAmount::Tokens(LARGE_TURN_TOKENS + SMALL_TURN_TOKENS)],
+        vec![ResourceAmount::Tokens(
+            LARGE_TURN_TOKENS + SMALL_TURN_TOKENS
+        )],
         "the host recorded {LARGE_TURN_TOKENS} tokens after the first Stop and \
          {SMALL_TURN_TOKENS} during the second turn; a window anchored at this turn's plan \
          reports only {SMALL_TURN_TOKENS} and loses the rest, which biases every quantile \
@@ -675,7 +677,9 @@ fn a_task_with_measured_history_gets_a_real_resource_p80() {
     harness.turn("history-1", SMALL_TURN_TOKENS);
 
     let next = harness.preflight("history-2");
-    let estimate = next.estimate.expect("a preflight always carries an estimate");
+    let estimate = next
+        .estimate
+        .expect("a preflight always carries an estimate");
 
     let p80 = estimate.resource_p80.unwrap_or_else(|| {
         panic!(

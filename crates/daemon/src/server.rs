@@ -1771,7 +1771,9 @@ fn handle_finalize(
             usage_window_start,
             crate::usage::DEFAULT_SCAN_CAP_BYTES,
         ),
-        None => crate::usage::UsageObservation::Unavailable(crate::usage::UsageUnavailable::NoTranscriptPath),
+        None => crate::usage::UsageObservation::Unavailable(
+            crate::usage::UsageUnavailable::NoTranscriptPath,
+        ),
     };
     // One `Tokens` entry or none — never a second amount of the same
     // kind, which `resource_quantiles` would treat as an independent
