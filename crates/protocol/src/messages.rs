@@ -76,6 +76,21 @@ pub enum Request {
         session_id: String,
         model: Option<String>,
         provider: Option<String>,
+        /// The host's own transcript for this session, when its hook
+        /// payload exposed one (Claude Code does as `transcript_path`;
+        /// Codex does not, so this is `None` there — see
+        /// `docs/adr/0004-agent-adapter-contract.md`).
+        ///
+        /// A path, not a token count, on purpose (HORO-1725). The CLI
+        /// could parse the four usage counts itself and send integers,
+        /// but that would make a spend figure caller-supplied, and
+        /// `libra_governor_domain::Reservation`'s docs are explicit that
+        /// no caller-supplied value may "forge a spend or credit by
+        /// itself". Measurement authority stays in the daemon; the CLI
+        /// relays only what the host told it. See
+        /// `libra_governor_daemon::usage` for the bounded read and for
+        /// what is (and is not) extracted from the file.
+        transcript_path: Option<String>,
     },
     /// Ask the daemon to compute real calibration evidence — duration
     /// coverage and admission-replay metrics — over every locally
@@ -786,6 +801,25 @@ mod tests {
                 session_id: "sess-1".to_string(),
                 model,
                 provider: Some("claude-code".to_string()),
+                transcript_path: None,
+            };
+            let json = serde_json::to_string(&request).unwrap();
+            let round_tripped: Request = serde_json::from_str(&json).unwrap();
+            assert_eq!(request, round_tripped);
+        }
+    }
+
+    /// A host that exposes a transcript and one that does not must both
+    /// survive the round trip — Codex has no `transcript_path`, so `None`
+    /// is a normal value on this wire, not a degraded one (HORO-1725).
+    #[test]
+    fn finalize_request_round_trips_with_and_without_a_transcript_path() {
+        for transcript_path in [None, Some("/tmp/horo-1725/session.jsonl".to_string())] {
+            let request = Request::Finalize {
+                session_id: "sess-1".to_string(),
+                model: None,
+                provider: Some("claude-code".to_string()),
+                transcript_path,
             };
             let json = serde_json::to_string(&request).unwrap();
             let round_tripped: Request = serde_json::from_str(&json).unwrap();

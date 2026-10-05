@@ -557,6 +557,48 @@ impl LedgerStore {
         created_at.map(|s| parse_time(&s)).transpose()
     }
 
+    /// When this task last had a receipt written, if ever (HORO-1725).
+    ///
+    /// This is the lower bound of the window a host-usage measurement may
+    /// claim, and the reason successive receipts tile a session's spend
+    /// rather than sampling it. Everything up to the previous receipt was
+    /// already recorded there and settled against its own reservations,
+    /// so the window may not reach back past it; and because this is
+    /// strictly *earlier* than the next turn's
+    /// [`Self::plan_lineage_started_at`], nothing the host recorded
+    /// between the two falls outside every window. Spend attributed to no
+    /// receipt at all biases the estimator low just as surely as a
+    /// fabricated amount biases it high.
+    ///
+    /// `None` means no receipt yet, in which case the caller's own window
+    /// start (the plan lineage's beginning) is already correct.
+    pub fn last_receipt_recorded_at(
+        &self,
+        task_id: TaskId,
+    ) -> Result<Option<OffsetDateTime>, LedgerError> {
+        use rusqlite::OptionalExtension;
+        let recorded: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT MAX(recorded_at) FROM receipts WHERE task_id = ?1",
+                [task_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        recorded
+            .map(|r| {
+                OffsetDateTime::parse(&r, &Rfc3339).map_err(|e| {
+                    LedgerError::Sqlite(rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    ))
+                })
+            })
+            .transpose()
+    }
+
     /// Returns every locally recorded [`ExecutionReceipt`], across all
     /// tasks, paired with the [`TaskFeatures`] its originating plan was
     /// estimated against (`None` for a pre-HORO-1130 receipt) — the

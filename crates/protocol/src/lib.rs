@@ -98,4 +98,13 @@ pub use messages::{
 /// long-lived v8 daemon must be restarted after upgrading, which the
 /// statusline provider reports as its own `daemon_protocol_mismatch`
 /// no-reading rather than as "no task".
-pub const PROTOCOL_VERSION: u32 = 9;
+///
+/// Bumped 9 -> 10 for HORO-1725: `Request::Finalize` gained
+/// `transcript_path`, a required field a v9 peer cannot decode. It is
+/// what lets a receipt record *measured* token usage instead of an empty
+/// `actual_usage`, which in turn is what lets
+/// `Estimate::resource_p80` ever be `Some` — before this, every task on
+/// a live store reserved the identical policy-target constant. Same known
+/// limitation as every earlier bump: a long-lived v9 daemon must be
+/// restarted after upgrading.
+pub const PROTOCOL_VERSION: u32 = 10;

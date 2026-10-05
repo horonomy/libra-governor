@@ -895,6 +895,7 @@ fn record_outcome_writes_attestation_and_promotes_the_receipt() {
             session_id: "sess-1".to_string(),
             model: None,
             provider: None,
+            transcript_path: None,
         },
     );
     assert!(matches!(
