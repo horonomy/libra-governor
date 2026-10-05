@@ -2647,4 +2647,264 @@ mod tests {
             "an older client protocol must not shut the daemon down"
         );
     }
+
+    // ------------------------------------------- HORO-1709: Status budget
+
+    fn status_reply(
+        ledger: &mut LedgerStore,
+        current_task: &mut Option<TaskSummary>,
+        config: &DaemonConfig,
+    ) -> Box<StatusResult> {
+        match dispatch(Request::Status, ledger, current_task, config) {
+            Response::Status(result) => result,
+            other => panic!("Status must answer with Status, got {other:?}"),
+        }
+    }
+
+    /// The Idle refinement's central requirement: a daemon with nothing
+    /// running must not present a configured ceiling as an active task's
+    /// remaining capacity, and must not fabricate a percentage in its
+    /// place. So the active-task fields are absent — not zero, not full —
+    /// while the ceiling that *would* govern the next task is reported as
+    /// its own scope.
+    #[test]
+    fn an_idle_status_reports_the_configured_ceiling_and_no_task_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_daemon_config(dir.path());
+        let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
+        let mut current_task = None;
+
+        let result = status_reply(&mut ledger, &mut current_task, &config);
+
+        assert!(result.current_task.is_none());
+        assert!(
+            result.task_budget.is_none(),
+            "no task means no share, not a full one"
+        );
+        assert!(
+            result.task_budget_amounts.is_none(),
+            "no task means no amounts, not zeroes"
+        );
+        assert_eq!(
+            result.configured_budget,
+            Some(ConfiguredBudget {
+                ceiling: config.policy.resource.hard_ceiling
+            }),
+            "the next task's ceiling is a fact an idle daemon knows"
+        );
+    }
+
+    /// The configured ceiling comes from the policy the daemon is
+    /// *running*, which is what the next task will actually get. Pinned
+    /// against a non-default value so the assertion cannot pass by
+    /// matching a constant.
+    #[test]
+    fn the_configured_ceiling_is_the_running_policys_not_a_build_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_daemon_config(dir.path());
+        let default_ceiling = config.policy.resource.hard_ceiling;
+        config.policy.resource.hard_ceiling = ResourceAmount::Tokens(777_000);
+        assert_ne!(default_ceiling, config.policy.resource.hard_ceiling);
+
+        let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
+        let mut current_task = None;
+        let result = status_reply(&mut ledger, &mut current_task, &config);
+
+        assert_eq!(
+            result.configured_budget.unwrap().ceiling,
+            ResourceAmount::Tokens(777_000)
+        );
+    }
+
+    /// HORO-1709 AC 5, end to end through the real dispatch: the share
+    /// and the amounts in one reply must be projections of one
+    /// observation, so reconstructing either from the other is exact.
+    /// Driven through a real preflight so the envelope, its reservation
+    /// and its unit all come from the daemon rather than from a fixture.
+    #[test]
+    fn an_active_status_reports_a_share_and_amounts_that_reconcile() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_daemon_config(dir.path());
+        let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
+        let mut current_task = None;
+
+        let preflight = dispatch(
+            Request::Preflight {
+                task_hint: "add a regression test".to_string(),
+                cwd: dir.path().to_path_buf(),
+                session_id: "sess-h1709".to_string(),
+            },
+            &mut ledger,
+            &mut current_task,
+            &config,
+        );
+        assert!(matches!(preflight, Response::Preflight(_)));
+        assert!(current_task.is_some(), "preflight must bind a current task");
+
+        let result = status_reply(&mut ledger, &mut current_task, &config);
+        let amounts = result
+            .task_budget_amounts
+            .expect("an admitted task has an envelope with amounts");
+
+        // The unit is the envelope's own. Every envelope a live daemon
+        // writes is denominated in tokens (HORO-1725/HORO-1727); nothing
+        // here assumes currency, and this would fail loudly if it did.
+        assert_eq!(amounts.kind(), ResourceKind::Tokens);
+        assert_eq!(amounts.total(), config.policy.resource.hard_ceiling);
+
+        // used + reserved + remaining == total, in one unit, from one read.
+        let reconstructed =
+            amounts.used().as_f64() + amounts.reserved().as_f64() + amounts.remaining().value;
+        assert!(
+            (reconstructed - amounts.total().as_f64()).abs() < 1e-9,
+            "amounts must reconcile to the total: {reconstructed} vs {:?}",
+            amounts.total()
+        );
+
+        // The share and the amounts must be the same observation. This
+        // assertion is what a split read would break: classify the
+        // transported amounts yourself and you must land on the
+        // transported posture, whichever posture that is.
+        assert_eq!(
+            result.task_budget,
+            Some(BudgetPosture::from_snapshot(&amounts)),
+            "the posture and the amounts in one reply must describe one instant"
+        );
+    }
+
+    /// The `Remaining` branch with figures a reader can check: a 150,000
+    /// token envelope with 15,000 settled and 45,000 held leaves 90,000,
+    /// so the reading must be 0.6 *and* those three amounts — a share
+    /// computed one way and amounts fetched another could not both land
+    /// here.
+    #[test]
+    fn a_budget_reading_is_one_set_of_amounts_and_not_a_second_sum() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_daemon_config(dir.path());
+        let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
+        let task_id = TaskId::new();
+        let now = time::OffsetDateTime::now_utc();
+
+        // A zero completion reserve, so the envelope's arithmetic is only
+        // the three figures under test. (The reserve has its own test in
+        // the protocol crate: it must not move the reported share.)
+        let reserve = libra_governor_domain::CompletionReserveEstimate {
+            amount: ResourceAmount::Tokens(0),
+            basis: libra_governor_domain::CompletionReserveBasis::PolicyTarget,
+            fraction: 0.0,
+            required_criteria_count: 0,
+        };
+        ledger
+            .insert_task(
+                &libra_governor_domain::TaskIdentity {
+                    id: task_id,
+                    external_ref: None,
+                },
+                now,
+            )
+            .unwrap();
+        ledger
+            .initialize_task_budget(task_id, &config.policy, &reserve, now)
+            .unwrap();
+        assert_eq!(
+            config.policy.resource.hard_ceiling,
+            ResourceAmount::Tokens(150_000),
+            "this test's figures are a sixth of the default ceiling"
+        );
+
+        let hold = |ledger: &mut LedgerStore, amount, key: &str| {
+            let outcome = ledger
+                .reserve(ReserveRequest {
+                    task_id,
+                    session_id: "sess-h1709-share",
+                    plan_id: None,
+                    class: ReservationClass::RequiredWork,
+                    amount: ResourceAmount::Tokens(amount),
+                    idempotency_key: key,
+                    now,
+                    ttl_secs: 900,
+                })
+                .unwrap();
+            match outcome {
+                ReserveOutcome::Granted(reservation) => reservation,
+                other => panic!("a {amount}-token hold must fit this envelope: {other:?}"),
+            }
+        };
+
+        let spent = hold(&mut ledger, 15_000, "settled");
+        ledger
+            .settle(spent.id, Some(ResourceAmount::Tokens(15_000)), now)
+            .unwrap();
+        hold(&mut ledger, 45_000, "held");
+
+        let (posture, amounts) = budget_reading(&ledger, task_id);
+        let amounts = amounts.expect("an initialized envelope has amounts");
+
+        assert_eq!(amounts.kind(), ResourceKind::Tokens);
+        assert_eq!(amounts.total(), ResourceAmount::Tokens(150_000));
+        assert_eq!(amounts.used(), ResourceAmount::Tokens(15_000));
+        assert_eq!(amounts.reserved(), ResourceAmount::Tokens(45_000));
+        assert_eq!(amounts.remaining().value, 90_000.0);
+        assert_eq!(posture, BudgetPosture::Remaining { fraction_left: 0.6 });
+    }
+
+    /// The scopes must be able to disagree without either being wrong: a
+    /// task's ceiling is fixed at admission for its whole life, so
+    /// editing the running policy afterwards changes what the *next* task
+    /// gets and nothing about this one. A reply that collapsed the two
+    /// would answer "how much is left" with a setting.
+    #[test]
+    fn the_task_envelope_and_the_configured_ceiling_are_separate_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_daemon_config(dir.path());
+        let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
+        let mut current_task = None;
+
+        dispatch(
+            Request::Preflight {
+                task_hint: "add a regression test".to_string(),
+                cwd: dir.path().to_path_buf(),
+                session_id: "sess-h1709-scopes".to_string(),
+            },
+            &mut ledger,
+            &mut current_task,
+            &config,
+        );
+        let admitted_ceiling = status_reply(&mut ledger, &mut current_task, &config)
+            .task_budget_amounts
+            .expect("an admitted task has an envelope")
+            .total();
+
+        // The operator raises the ceiling mid-task.
+        config.policy.resource.hard_ceiling = ResourceAmount::Tokens(900_000);
+        let result = status_reply(&mut ledger, &mut current_task, &config);
+
+        assert_eq!(
+            result
+                .task_budget_amounts
+                .expect("the running task still has its envelope")
+                .total(),
+            admitted_ceiling,
+            "the limit in force at admission is the limit for the life of the task"
+        );
+        assert_eq!(
+            result.configured_budget.unwrap().ceiling,
+            ResourceAmount::Tokens(900_000),
+            "the next task would get the new ceiling"
+        );
+        assert_ne!(admitted_ceiling, ResourceAmount::Tokens(900_000));
+    }
+
+    /// A task with no budget row reports the absence as an absence. Not
+    /// an empty snapshot, which a renderer would read as a measured zero.
+    #[test]
+    fn a_task_without_a_budget_row_has_no_amounts_rather_than_zeroes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_daemon_config(dir.path());
+        let ledger = LedgerStore::open(&config.ledger_path).unwrap();
+
+        let (posture, amounts) = budget_reading(&ledger, TaskId::new());
+        assert_eq!(posture, BudgetPosture::NotEstablished);
+        assert!(amounts.is_none());
+    }
 }
