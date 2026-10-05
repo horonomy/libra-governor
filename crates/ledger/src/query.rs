@@ -1330,3 +1330,212 @@ mod replan_persistence_tests {
         assert_eq!(history[0].reason.detail, reason.detail);
     }
 }
+
+/// HORO-1723: which row a work duration is measured from.
+///
+/// Every timestamp in this module is an explicit offset from a fixed
+/// base, never the wall clock. The defect being guarded against is a
+/// duration anchored to the wrong row, and under a live clock every row
+/// in a test is the same age — so a test that let the clock supply the
+/// timestamps could not tell the right anchor from any other one. That
+/// is exactly why the original bug survived a green suite.
+#[cfg(test)]
+mod plan_lineage_tests {
+    use super::*;
+    use libra_governor_domain::{
+        CompletionCriterion, ReplanReason, ReplanTriggerKind, TaskIdentity,
+    };
+    use time::Duration;
+
+    fn at(hours: i64) -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH + Duration::hours(hours)
+    }
+
+    fn seed_task(
+        store: &mut LedgerStore,
+        created_at: OffsetDateTime,
+    ) -> (TaskId, CompletionContract) {
+        let identity = TaskIdentity::new(None);
+        store.insert_task(&identity, created_at).unwrap();
+        let contract = CompletionContract::first(vec![CompletionCriterion::required("c")]);
+        store
+            .insert_contract(identity.id, &contract, created_at)
+            .unwrap();
+        (identity.id, contract)
+    }
+
+    /// Inserts a plan that starts a fresh lineage (`replaces` is `None`),
+    /// which is the shape every new prompt produces.
+    fn plan(
+        store: &mut LedgerStore,
+        task_id: TaskId,
+        contract: &CompletionContract,
+        created_at: OffsetDateTime,
+    ) -> ExecutionPlan {
+        let plan = ExecutionPlan::new(task_id, contract.revision, None, created_at);
+        store.insert_plan(&plan).unwrap();
+        plan
+    }
+
+    /// Inserts a plan that supersedes `prior`, the shape the daemon's
+    /// replan path writes.
+    fn replan_of(
+        store: &mut LedgerStore,
+        task_id: TaskId,
+        contract: &CompletionContract,
+        prior: &ExecutionPlan,
+        created_at: OffsetDateTime,
+    ) -> ExecutionPlan {
+        let plan = ExecutionPlan::new(task_id, contract.revision, None, created_at)
+            .with_replan_linkage(
+                prior.id,
+                ReplanReason::new(ReplanTriggerKind::ToolCallCountExceeded, "seeded"),
+            );
+        store.insert_plan(&plan).unwrap();
+        plan
+    }
+
+    #[test]
+    fn an_unreplanned_plan_anchors_to_its_own_creation() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let (task_id, contract) = seed_task(&mut store, at(0));
+        // The task is 100 hours older than the plan. An anchor that read
+        // the task — or the session, which is what HORO-1723 actually
+        // did — would return `at(0)` here.
+        let only = plan(&mut store, task_id, &contract, at(100));
+
+        assert_eq!(
+            store.plan_lineage_started_at(only.id).unwrap(),
+            Some(at(100))
+        );
+    }
+
+    #[test]
+    fn a_replanned_plan_anchors_to_the_turns_start_not_to_the_replan() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let (task_id, contract) = seed_task(&mut store, at(0));
+        let root = plan(&mut store, task_id, &contract, at(100));
+        let replacement = replan_of(&mut store, task_id, &contract, &root, at(101));
+
+        assert_eq!(
+            store.plan_lineage_started_at(replacement.id).unwrap(),
+            Some(at(100)),
+            "the hour of work that preceded the replan is part of this turn; \
+             anchoring to the replacement plan would silently discard it"
+        );
+    }
+
+    #[test]
+    fn a_chain_of_replans_walks_all_the_way_to_the_lineage_root() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let (task_id, contract) = seed_task(&mut store, at(0));
+        let root = plan(&mut store, task_id, &contract, at(100));
+        let second = replan_of(&mut store, task_id, &contract, &root, at(101));
+        let third = replan_of(&mut store, task_id, &contract, &second, at(102));
+        let fourth = replan_of(&mut store, task_id, &contract, &third, at(103));
+
+        assert_eq!(
+            store.plan_lineage_started_at(fourth.id).unwrap(),
+            Some(at(100)),
+            "a single-hop walk would stop at the third plan and under-report by two hours"
+        );
+    }
+
+    /// The property that stops HORO-1723 from reappearing in a different
+    /// shape. Anchoring to the *session* made each successive turn report
+    /// a longer duration than the last; anchoring to the lineage root
+    /// gives each turn its own start, because only the replan path ever
+    /// writes `replaces_plan_id`.
+    #[test]
+    fn a_later_turn_on_the_same_task_anchors_to_its_own_start() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let (task_id, contract) = seed_task(&mut store, at(0));
+
+        let first_turn_root = plan(&mut store, task_id, &contract, at(100));
+        let first_turn_replan =
+            replan_of(&mut store, task_id, &contract, &first_turn_root, at(101));
+        // A second prompt, 99 hours of idle time later, on the same task.
+        let second_turn = plan(&mut store, task_id, &contract, at(200));
+
+        assert_eq!(
+            store.plan_lineage_started_at(first_turn_replan.id).unwrap(),
+            Some(at(100))
+        );
+        assert_eq!(
+            store.plan_lineage_started_at(second_turn.id).unwrap(),
+            Some(at(200)),
+            "the second turn must not absorb the first turn's work or the idle time between them"
+        );
+    }
+
+    #[test]
+    fn an_unknown_plan_has_no_lineage_anchor() {
+        let store = LedgerStore::open_in_memory().unwrap();
+        assert_eq!(
+            store.plan_lineage_started_at(PlanId::new()).unwrap(),
+            None,
+            "an absent plan must be reported as absent, so the caller chooses its own fallback"
+        );
+    }
+
+    /// A lineage whose ancestor row is absent must degrade to an
+    /// under-estimate rather than fail: `Finalize` runs inside the `Stop`
+    /// hook, and an error there costs the operator the receipt entirely.
+    ///
+    /// The dangling link is created by inserting a plan that points at a
+    /// `PlanId` which was never inserted, rather than by deleting the
+    /// ancestor. `replaces_plan_id` carries no foreign key, so the two
+    /// are equivalent to the walk — and the ledger crate deliberately
+    /// contains no row-eviction statement at all, which is how
+    /// `libra-governor-evidence-adapter`'s
+    /// `dropped_count_zero_is_provable_no_eviction_path_exists_in_ledger`
+    /// proves its `dropped_total` is a real zero. Writing a `DELETE` here
+    /// would break that proof to make this test more convenient.
+    #[test]
+    fn a_lineage_whose_ancestor_row_is_absent_degrades_to_the_deepest_survivor() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let (task_id, contract) = seed_task(&mut store, at(0));
+
+        let orphan = ExecutionPlan::new(task_id, contract.revision, None, at(101))
+            .with_replan_linkage(
+                PlanId::new(),
+                ReplanReason::new(ReplanTriggerKind::ToolCallCountExceeded, "ancestor absent"),
+            );
+        store.insert_plan(&orphan).unwrap();
+
+        assert_eq!(
+            store.plan_lineage_started_at(orphan.id).unwrap(),
+            Some(at(101)),
+            "a dangling replaces_plan_id must resolve to the deepest plan still present, \
+             not error and not report absence"
+        );
+    }
+
+    /// `replaces_plan_id` is a plain `TEXT` column with no foreign key —
+    /// SQLite cannot add one via `ALTER TABLE` — so a cycle is reachable
+    /// through corruption, and an unbounded recursive walk would spin
+    /// inside SQLite and wedge the `Stop` hook rather than fail.
+    #[test]
+    fn a_cyclic_replaces_link_terminates_rather_than_spinning() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let (task_id, contract) = seed_task(&mut store, at(0));
+        let first = plan(&mut store, task_id, &contract, at(100));
+        let second = replan_of(&mut store, task_id, &contract, &first, at(101));
+        store
+            .conn
+            .execute(
+                "UPDATE plans SET replaces_plan_id = ?1 WHERE id = ?2",
+                [second.id.0.to_string(), first.id.0.to_string()],
+            )
+            .unwrap();
+
+        let anchor = store
+            .plan_lineage_started_at(second.id)
+            .expect("a cyclic lineage must not error")
+            .expect("a cyclic lineage must still yield a timestamp");
+        assert!(
+            anchor == at(100) || anchor == at(101),
+            "the bounded walk must return one of the two plans in the cycle, got {anchor}"
+        );
+    }
+}
