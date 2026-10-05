@@ -135,8 +135,8 @@
 use std::time::{Duration, Instant};
 
 use libra_governor_protocol::{
-    BudgetPosture, BudgetSnapshot, Confidence, DoctorResult, ReplanState, Request, ResourceKind,
-    Response, StatusResult, TaskSummary,
+    BudgetPosture, BudgetSnapshot, Confidence, ConfiguredBudget, DoctorResult, ReplanState,
+    Request, ResourceKind, Response, StatusResult, TaskSummary,
 };
 use serde_json::{json, Value};
 use time::OffsetDateTime;
@@ -981,6 +981,56 @@ fn budget_segment(
     segment
 }
 
+/// The envelope a *new* task would be admitted to, shown while nothing is
+/// being governed (HORO-1709's Idle refinement).
+///
+/// Three things make this safe to show and would make the obvious
+/// alternatives unsafe:
+///
+/// - `budget_configured`, not `budget`. The idle line must not carry a
+///   figure that reads as the active task's remaining budget, and the
+///   surest way to guarantee that is for it not to be in that segment.
+/// - `budget_scope: "configured_default"` on the figure itself, so no
+///   downstream renderer can lose track of which of the four envelopes it
+///   is looking at.
+/// - a `count` with no `total`. A configured ceiling is a ceiling, not a
+///   remainder of anything; pairing it with a total would invite "150,000
+///   of 150,000", which is the measured-full claim with no measurement
+///   behind it.
+///
+/// `neutral`, never a pressure band: a ceiling nobody has drawn against
+/// exerts no pressure, and this segment has no consumption figures at all
+/// to compute one from. `supporting` rather than `posture` because the idle
+/// `task` segment already owns Clear's single posture.
+///
+/// Only emitted when the user has asked for amounts. Percentage-only users
+/// get nothing here, which is what makes this genuinely optional rather
+/// than a new line everyone acquires on upgrade.
+fn configured_budget_segment(
+    configured: &ConfiguredBudget,
+    display: BudgetDisplay,
+) -> Option<Value> {
+    if display == BudgetDisplay::Percent {
+        return None;
+    }
+    let ceiling = configured.ceiling;
+    let unit = unit_noun(ceiling.kind())?;
+    let count = count_value(ceiling.as_f64())?;
+    Some(json!({
+        "key": "budget_configured",
+        "state": "neutral",
+        "label": "Budget ceiling for a new task",
+        "count": count,
+        "count_label": unit,
+        "budget_scope": "configured_default",
+        "budget_unit": unit,
+        "budget_total": ceiling.as_f64(),
+        "explain_key": "libra.budget",
+        "order_hint": 26,
+        "clear_role": "supporting",
+    }))
+}
+
 /// The four presets `Policy` exposes: the config token, spelled exactly as
 /// `crates/domain/src/policy.rs` spells it, paired with the prose a
 /// statusline may carry.
@@ -1122,6 +1172,12 @@ fn rfc3339_utc(now: OffsetDateTime) -> String {
 /// [`task_segment`]. A document with five segments is refused whole, so
 /// Libra would render as nothing at the moment it had the most to say.
 ///
+/// That allowance is also why the configured-ceiling segment (HORO-1709) is
+/// an idle-only thing: while a task is governed all four slots are taken,
+/// and the active envelope is the one the user needs. Idle has two of them
+/// free and no active envelope to report, which is exactly when a ceiling
+/// for a *prospective* task is worth a line.
+///
 /// The wording preference is a parameter rather than something read in
 /// here, deliberately. A function that reached for the user's state
 /// directory could not be asserted on without the suite depending on
@@ -1148,6 +1204,13 @@ pub fn reading(
             status.task_budget.map(|posture| {
                 budget_segment(posture, status.task_budget_amounts.as_ref(), display)
             }),
+        );
+    } else {
+        segments.extend(
+            status
+                .configured_budget
+                .as_ref()
+                .and_then(|configured| configured_budget_segment(configured, display)),
         );
     }
     segments.extend(doctor.and_then(profile_segment));
@@ -1518,6 +1581,37 @@ pub fn explain_text(status: &StatusResult, doctor: Option<&DoctorResult>) -> Str
             }
         }
     }
+
+    // The configured default, in both states and labelled as a different
+    // scope in both (HORO-1709).
+    //
+    // Shown beside an active task rather than only while idle, because
+    // this is the surface on which the distinction is *explainable*: the
+    // task's envelope was fixed at admission and the configured default
+    // can be edited mid-task, so the two legitimately differ and a user
+    // comparing them needs to be told which is which rather than left to
+    // guess that the bigger number is the real one.
+    if let Some(configured) = status.configured_budget.as_ref() {
+        let ceiling = configured.ceiling;
+        out.push_str(&format!(
+            "\n  configured limit {} {} — the ceiling a new task would be\n\
+             \x20                  admitted to, from the policy now in force. Not a\n\
+             \x20                  remaining balance, and not the envelope of any task\n\
+             \x20                  already running.\n",
+            grouped_f64(ceiling.as_f64()),
+            unit_noun(ceiling.kind()).unwrap_or("percent of quota"),
+        ));
+    }
+    // And the one envelope with no local source at all. Said out loud
+    // rather than omitted: a reader who has been shown two envelopes will
+    // otherwise assume the absence of a third means there is no cap above
+    // them, which is a claim this machine has no way to make.
+    out.push_str(
+        "  host cap         not established — nothing on this machine records a\n\
+         \x20                  per-principal or organisation ceiling, so none is\n\
+         \x20                  reported. That is an absence of a record, not a\n\
+         \x20                  finding that no such ceiling exists.\n",
+    );
 
     if status
         .current_task
