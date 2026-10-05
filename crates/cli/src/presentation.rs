@@ -54,39 +54,51 @@ const PRESENTATION_FILE_NAME: &str = "presentation.json";
 /// ("Clear: percentage-only for fresh general-user installs. Detail:
 /// both percentage and amount when authoritative monetary data exists.")
 ///
-/// # Why the amounts are a ladder rather than a fixed string
+/// # Which route each figure takes
 ///
-/// The host refuses a label over 48 characters, and refusing a label
-/// costs the whole provider document. A token envelope in the millions
-/// does not fit "used, left of total" in 48 characters, so each variant
-/// below names the *most* it will ever show; the renderer drops to the
-/// next shorter form when the longer one would not fit. The preference
-/// is a ceiling on detail, never a promise of it.
+/// `remaining` and `total` have contract fields of their own
+/// (`count`/`total`/`count_label`), and the contract is explicit that the
+/// host formats those numbers — so asking for them adds *fields*, not
+/// text, and the host decides how "57,000 of 150,000 tokens" reads in
+/// its own line. `used` and `reserved` have no contract field yet, so the
+/// two variants that include them have to put them in the label.
+///
+/// That label is capped at 48 characters by the host, and an over-long
+/// label costs the *whole* provider document, not just the segment. A
+/// token envelope in the millions does not fit two grouped figures in
+/// what is left of 48 characters after the percentage, so the renderer
+/// drops to the next shorter phrase when the longer one would not fit.
+/// Each variant below names the *most* it will ever show: the preference
+/// is a ceiling on detail, never a promise of it. Whatever does not fit
+/// is still in the structured fields and in `statusline explain`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum BudgetDisplay {
-    /// A share of the envelope and nothing else: `38% budget left`.
-    /// The wording every install had before HORO-1709, and so the
-    /// default.
+    /// A share of the envelope and nothing else: `38% budget left`, with
+    /// no amount fields at all. The wording every install had before
+    /// HORO-1709, and so the default.
     #[default]
     #[serde(rename = "percent")]
     Percent,
-    /// What is still available, in the envelope's own unit:
-    /// `57,000 tokens left`.
+    /// Adds what is still available as a contract `count`, in the
+    /// envelope's own unit, for the host to render beside the share.
     #[serde(rename = "remaining")]
     Remaining,
-    /// Available against the envelope it is available from:
-    /// `57,000 of 150,000 tokens left (38%)`.
+    /// Adds the envelope that remainder is available *from*, as the
+    /// contract's `total`. A bare "57,000 tokens left" is a number
+    /// without a scale; this is the first level at which the user can
+    /// tell a large envelope nearly spent from a small one barely
+    /// touched.
     #[serde(rename = "remaining+total")]
     RemainingAndTotal,
-    /// Adds what has actually been settled:
-    /// `18,000 used, 57,000 of 150,000 left (38%)`.
+    /// Adds what has actually been settled, in the label: `38% left,
+    /// 18,000 used`.
     #[serde(rename = "used+remaining+total")]
     UsedRemainingAndTotal,
-    /// Adds capacity that is held but not yet settled. Reserved is
-    /// never folded into used — the ticket is explicit that they are
-    /// different facts — so this is the only variant that can show all
-    /// four figures, and the only one that routinely runs out of
-    /// characters and falls back.
+    /// Adds capacity that is held but not yet settled: `38% left, 18,000
+    /// used, 75,000 held`. Reserved is never folded into used — the
+    /// ticket is explicit that they are different facts — so this is the
+    /// only variant that shows all four figures, and the only one that
+    /// routinely runs out of characters and falls back.
     #[serde(rename = "full")]
     Full,
 }
@@ -186,6 +198,27 @@ fn read_from(path: &Path) -> Result<Option<Presentation>, PresentationError> {
         })
 }
 
+/// The collapse rule, on a named path so it can be tested on one.
+///
+/// Every failure mode collapses to the default — no file, a file someone
+/// broke, a spelling from a newer version. The statusline provider runs on
+/// a 200 ms budget, exits 0 by contract, and has nowhere to put a
+/// complaint; dropping the budget segment, or the document, over a
+/// *wording preference* would be a far worse answer than rendering the
+/// wording that shipped before this ticket. The `presentation` command is
+/// where the same file is read strictly and the problem is reported to a
+/// user who can act on it.
+fn load_from(path: &Path) -> Presentation {
+    read_from(path).unwrap_or_default().unwrap_or_default()
+}
+
+/// The preference as the renderer sees it: never fails, never explains.
+/// [`load_from`] at its real location, with an unresolvable state
+/// directory collapsing the same way an unreadable file does.
+pub fn load() -> Presentation {
+    path().map(|path| load_from(&path)).unwrap_or_default()
+}
+
 /// Writes the preference owner-only, via a temp file in the same
 /// directory and a rename, so a reader never observes a half-written
 /// document — the statusline provider reads this file on a 200 ms budget
@@ -248,8 +281,14 @@ pub fn run(budget_display: Option<&str>) {
     let path = dir.join(PRESENTATION_FILE_NAME);
 
     // Preserve anything already recorded: this command owns one field of
-    // the document, not the document.
-    let mut presentation = read_from(&path).unwrap_or_default().unwrap_or_default();
+    // the document, not the document. With one field, that is not yet
+    // observable from outside — `Presentation::default()` here would
+    // write the same bytes, because the next line overwrites the only
+    // field there is. It is written this way so that the second
+    // preference is a field rather than a bug, and the rule itself is
+    // asserted at the level where it can be:
+    // `a_write_preserves_a_previously_recorded_choice_it_does_not_change`.
+    let mut presentation = load_from(&path);
     presentation.budget_display = Some(choice);
 
     if let Err(e) = write(&path, &presentation) {
@@ -400,11 +439,10 @@ mod tests {
             matches!(read_from(&path), Err(PresentationError::Parse { .. })),
             "the command surface must still see the problem"
         );
-        // `load()` reads the real state dir, so exercise its rule
-        // directly rather than reaching into a global: an unreadable
-        // file collapses to the default.
-        let rendered: Presentation = read_from(&path).unwrap_or_default().unwrap_or_default();
-        assert_eq!(rendered.budget_display(), BudgetDisplay::Percent);
+        // `load()` reads the real state dir, so its rule is exercised on
+        // a path of our own: an unreadable file collapses to the default
+        // rather than costing the renderer its budget segment.
+        assert_eq!(load_from(&path).budget_display(), BudgetDisplay::Percent);
     }
 
     /// An unknown spelling in the file is a parse error, not a silent
