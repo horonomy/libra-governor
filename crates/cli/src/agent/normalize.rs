@@ -90,6 +90,7 @@ pub fn normalize(entry: EntryPoint, raw: &str) -> Result<NormalizedEvent, Normal
             Ok(NormalizedEvent::ToolCompleted {
                 session_id: payload.session_id,
                 tool_name: payload.tool_name,
+                native_call_id: payload.tool_use_id,
                 turn_id: payload.turn_id,
                 agent_id: payload.agent_id,
             })
@@ -153,6 +154,7 @@ mod tests {
             NormalizedEvent::ToolCompleted {
                 session_id: "s".to_string(),
                 tool_name: "Bash".to_string(),
+                native_call_id: None,
                 turn_id: None,
                 agent_id: None,
             }

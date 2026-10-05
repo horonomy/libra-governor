@@ -58,6 +58,10 @@ pub struct ToolCompletedPayload {
     pub turn_id: Option<String>,
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// Codex's native tool call identifier; absent in Claude payloads and
+    /// retained verbatim as canonical provenance when supplied.
+    #[serde(default, deserialize_with = "optional_native_call_id")]
+    pub tool_use_id: Option<String>,
 }
 
 /// `Stop` payload. `model` is optional because it is not guaranteed
@@ -77,6 +81,14 @@ pub struct TurnCompletedPayload {
     /// rather than being guessed at, exactly as `model`/`turn_id` do.
     #[serde(default)]
     pub transcript_path: Option<PathBuf>,
+}
+
+fn optional_native_call_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_str().map(str::to_owned))
 }
 
 #[cfg(test)]
@@ -121,6 +133,7 @@ mod tests {
         let payload: ToolCompletedPayload = serde_json::from_str(json).unwrap();
         assert_eq!(payload.session_id, "sess-1");
         assert_eq!(payload.tool_name, "Bash");
+        assert_eq!(payload.tool_use_id.as_deref(), Some("call-1"));
     }
 
     #[test]

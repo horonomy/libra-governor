@@ -254,6 +254,7 @@ pub fn run_tool_completed(agent: AgentKind) {
         NormalizedEvent::ToolCompleted {
             session_id,
             tool_name,
+            native_call_id: _,
             turn_id,
             agent_id,
         } => (session_id, tool_name, turn_id, agent_id),

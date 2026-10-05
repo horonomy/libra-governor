@@ -18,9 +18,15 @@
 //! [`Response::Error`]) rather than silently misinterpret a message shape
 //! it does not actually understand.
 
+pub mod host_event;
 mod messages;
 pub mod wire;
 
+pub use host_event::{
+    validate_host_event, validate_host_json, validate_host_snapshot, HostBindingFailure,
+    HostBindingReason, HostBindingStage, HostCapabilitySnapshot, HostEventKind, HostEventScope,
+    ValidatedHostCapabilitySnapshot, ValidatedHostEvent,
+};
 pub use libra_governor_domain::Estimate;
 pub use libra_governor_domain::{
     BudgetSnapshot, BusinessContextSummary, Confidence, CredentialCustody, EnforcementCapabilities,

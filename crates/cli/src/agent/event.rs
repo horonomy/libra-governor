@@ -29,6 +29,8 @@ pub enum NormalizedEvent {
     ToolCompleted {
         session_id: String,
         tool_name: String,
+        /// Native call ID where the host exposes one (Codex `tool_use_id`).
+        native_call_id: Option<String>,
         turn_id: Option<String>,
         agent_id: Option<String>,
     },

@@ -1,0 +1,18 @@
+{
+  "files": {
+    "canonical-host-event.schema.json": "sha256:38ff7b5426781b10e7743c4909609d285b12f4080901f5263ca0c54aa42ac94a",
+    "host-capability-snapshot.schema.json": "sha256:41fea89b3c854745a4d8b8c41e06b84bfd56ff8e4c4d18da642a351d652210b2"
+  },
+  "source_repository": "https://github.com/horonomy/.github",
+  "source_revision": "c63d29398767490a47858231ada95ee4c8e757af",
+  "fixture_sha256": {
+    "valid-event-codex-tool-before.json": "fa54d939437059a42486d8344caae1e34c40addec6eaa1d78750413f2afd9b6b",
+    "valid-event-record-only.json": "f411721e69395693493bd278e30e876c81d888936ef3564c8fc422119706432e",
+    "valid-event-synthetic-usage.json": "06c226079c886b3b9ca0ed85b243c09630d5477393c0f6749731b4f7e29c084a",
+    "invalid-event-absent-identity.json": "272f1371cd8f737c508350450227a1dbefed97b2bf95ec12cedb90b1ddc6e90a",
+    "invalid-malformed-event.json": "085099b69571e8dd6e5cf45fa3626e3acf78cea976e6ae91c70c4e9e4883409f",
+    "valid-snapshot-claude-trust-required.json": "6db9a69be5a12b52432be6ed29ded52a55388459bcd06621fc0b217f1ac68e7e",
+    "valid-snapshot-admin-disabled.json": "f4d643ce8495332b13b313b0f34aba470074d8f934fca40d5d916e75ec108722",
+    "valid-snapshot-codex-shape-only-unknown.json": "bdf1474081ed2c7e19752a57ce137f7d09d783dd977b8d467a319abe7e00d81d"
+  }
+}
