@@ -41,22 +41,67 @@ question and is waiting for the answer.
 |---|---|---|
 | `task` | always | the task being governed and its replan state, or explicitly that none is |
 | `estimate` | while a task is governed | the remaining-work P90 and the confidence *in that estimate* |
-| `escalation` | automatic-replan budget spent | that the next material deviation would need a human |
+| `budget` | while a task is governed | how much of *that task's* envelope is left, and how much of it has been measured at all |
+| `budget_configured` | idle, and only if amounts were asked for | the ceiling a *new* task would be admitted to — never a remainder |
 | `profile` | running config no longer matches disk | which policy preset is actually running |
 
-Four segments is the host's per-provider maximum, so this is the whole surface,
-not a sample of it.
+Four segments is the host's per-provider maximum and a document that exceeds it
+is refused whole, so Libra would render as *nothing* at precisely the moment it
+had the most to say. The allowance is fully spent by `task`, `estimate`,
+`budget` and `profile`, which is why `budget_configured` can only appear while
+idle — where there is no estimate to show — and why an escalation is worded onto
+the `task` segment rather than claiming a fifth.
 
 Spans leave as seconds plus a noun (`P90`), never as `5d4h`: the host owns span
 formatting, so two products cannot disagree about what a day is. Glyphs are the
 same — the provider emits no emoji at all and the host chooses one, with a
 deterministic text fallback.
 
+Amounts work the same way. `remaining` and `total` leave as the contract's own
+`count`/`total` fields with a `count_label` naming what is being counted, so the
+host decides how `57,000 of 150,000 tokens` reads in its own line. Each figure
+is denominated in the envelope's own resource kind, which on every build today
+is **tokens** — a currency is never assumed because a number exists, and an
+envelope denominated in quota percentage shows its share rather than a second
+unmarked percentage beside it.
+
+### Choosing how much the budget phrase spells out
+
+```bash
+libra-governor statusline presentation                                   # what is recorded, and where
+libra-governor statusline presentation --budget-display remaining+total  # record a choice
+```
+
+| Choice | The most the label will say |
+|---|---|
+| `percent` *(default)* | `53% budget left` |
+| `remaining` | the same phrase, plus a `count` for the host to render |
+| `remaining+total` | plus the envelope that remainder is drawn from, as `total` |
+| `used+remaining+total` | `53% left, 18,000 used` |
+| `full` | `53% left, 18,000 used, 70,000 held` |
+
+Each row names the *most* that choice will ever show: the host caps a label at
+48 characters and refuses the whole document over an over-long one, so the
+renderer drops to the next shorter phrase rather than risk it. Whatever does not
+fit is still in the structured fields and in `statusline explain`.
+
+The preference lives in `presentation.json` in Libra's own state directory.
+Nothing else reads or writes it, deleting it restores the default, and an
+upgrade does not create it — which is what makes "an existing statusline does
+not change by itself" true rather than merely intended. It is deliberately
+*not* in `~/.claude/settings.json`, which belongs to the user and to Claude
+Code, and deliberately not in the daemon's `config.json`, which is read at
+startup and would make a wording change wait for a restart.
+
+Held capacity is never folded into settled spend. A reservation that has not
+been drawn against and a charge that has are different facts, and only `full`
+shows both.
+
 ### What it never reports
 
-Prompts, task or tool content, the estimator's free-text reason, resource or
-cost quantiles, a credential, a filesystem path, or an ANSI escape. Every string
-in the document is a fixed literal in
+Prompts, task or tool content, the estimator's free-text reason, the
+estimator's resource or cost quantiles, a credential, a filesystem path, or an
+ANSI escape. Every string in the document is a fixed literal in
 [`crates/cli/src/statusline_provider.rs`](../crates/cli/src/statusline_provider.rs)
 or a value drawn from a closed set. That is enforced by tests over every
 document the provider can emit, not by review.
@@ -153,6 +198,11 @@ ticket, and it will not happen silently.
 | A `Running policy ...` segment appeared | You edited `config.json` after the daemon started, so the edit has not taken effect | `pkill -f "libra-governor daemon run"`; the next hook invocation respawns it |
 | The estimate says no local history yet | A genuine cold start — the estimator has no comparable local receipts | Nothing to fix; it resolves as receipts accumulate. `statusline explain` names the basis it did use |
 | No confidence is shown beside the estimate | There is no P90 to be confident *in* | Expected: a confidence attached to an absent number would read as a verdict on the task |
+| The budget phrase is a percentage with no amount | The default is percentage-only, so an existing statusline does not change on upgrade | `statusline presentation --budget-display remaining+total` (or `full`) |
+| An amount was asked for and the phrase is still a bare percentage | Either the envelope is unmeasured, or the longer phrase would not fit the host's 48-character label | `statusline explain` shows the whole envelope regardless of either |
+| The budget says usage unknown | Nothing has been attributed to this task yet — which is not the same as nothing having been spent | Expected: reporting it as `100% budget left` would be a measurement nobody made |
+| The amount is in tokens where a cost was expected | The envelope is denominated in tokens, and a currency is never assumed because a number exists | Nothing to fix; `statusline explain` names the unit it used |
+| The segment carries no colour | Colour is the shared renderer's, from the `semantic_state` the provider sends; text is authoritative on its own | The host's documentation covers palette and `NO_COLOR` |
 
 For anything about the slot itself — who owns it, what a drift report means, how
 uninstall restores your original — see the host's own documentation. This
