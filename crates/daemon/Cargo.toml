@@ -19,6 +19,10 @@ time.workspace = true
 thiserror.workspace = true
 sha2.workspace = true
 uuid.workspace = true
+jsonschema.workspace = true
+semver.workspace = true
+num-cmp.workspace = true
+rustix.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

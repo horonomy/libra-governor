@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://horonomy.github.io/contracts/host-adapter/v1/cli-operation-envelope.schema.json",
+  "title": "Adapter CLI operation envelope v1",
+  "type": "object", "additionalProperties": false,
+  "required": ["schema_version", "operation", "outcome", "reasons", "verification_state"],
+  "properties": {
+    "schema_version": {"const": 1}, "operation": {"enum": ["list", "inspect", "capabilities", "register", "unregister", "install", "uninstall", "enable", "disable", "status", "doctor", "explain", "plan"]},
+    "adapter_id": {"type": ["string", "null"], "pattern": "^[a-z][a-z0-9_-]{0,63}$"}, "scope": {"enum": ["user", "project", null]}, "profile": {"type": ["string", "null"]},
+    "outcome": {"enum": ["success", "partial", "refused", "failed", "unknown"]}, "reasons": {"type": "array", "items": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,63}$"}},
+    "plan": {"type": "object"}, "result": {"type": "object"}, "verification_state": {"enum": ["verified", "unverified", "not_applicable", "failed"]}
+  }
+}

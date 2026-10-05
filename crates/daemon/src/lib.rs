@@ -12,6 +12,7 @@ pub mod contract;
 pub mod extension_authority;
 pub mod features;
 pub mod gateway_authority;
+pub mod host_runtime;
 pub mod log;
 pub mod paths;
 pub mod pidfile;
@@ -23,3 +24,5 @@ pub use server::{
     bind_or_detect_running, default_admission_policy, handle_connection, serve, DaemonConfig,
     DaemonError, DEFAULT_PROGRESSIVE_INTERVAL_SECS,
 };
+
+pub mod write_lock;
