@@ -1245,16 +1245,29 @@ fn replan_state_prose(state: &ReplanState) -> String {
 /// field, which the current daemon does not do; it is reported as
 /// unestablished rather than silently omitted, because a missing line reads
 /// as "there is no budget" and that is a claim this function cannot make.
-fn budget_posture_prose(posture: Option<BudgetPosture>) -> String {
+fn budget_posture_prose(
+    posture: Option<BudgetPosture>,
+    amounts: Option<&BudgetSnapshot>,
+) -> String {
     match posture {
-        Some(BudgetPosture::Remaining { fraction_left }) => match percent_left(fraction_left) {
-            Some(percent) => format!(
-                "{percent}% budget left — a share of the task's limit, not an\n\
-                 \x20                  amount; the limit itself and what has been spent are\n\
-                 \x20                  resource figures and stay off every rendering surface"
-            ),
-            None => "not reported — the daemon's share was not a usable number".to_string(),
-        },
+        Some(BudgetPosture::Remaining { fraction_left }) => {
+            match percent_left(share_to_display(fraction_left, amounts)) {
+                // No longer followed by "and the amounts stay off every
+                // surface", because under HORO-1709 they do not: the four
+                // lines below this one are the task's own ledger figures.
+                // What the share still *is* is a share of this task's
+                // envelope and of nothing wider — which is the sentence
+                // worth keeping, because the three other envelopes that
+                // could produce a percentage here are reported separately
+                // or not at all.
+                Some(percent) => format!(
+                    "{percent}% budget left — a share of this task's own limit, not\n\
+                     \x20                  of a configured default, a host cap or an\n\
+                     \x20                  organisation's"
+                ),
+                None => "not reported — the daemon's share was not a usable number".to_string(),
+            }
+        }
         // The one line here that explains an *omission*, so it says what
         // would otherwise be assumed: the share is withheld deliberately,
         // and the envelope being intact is not the same fact as the work
@@ -1319,6 +1332,93 @@ fn grouped_f64(value: f64) -> String {
     }
 }
 
+/// The task envelope's own figures, one per line, for `explain`
+/// (HORO-1709).
+///
+/// Every line names its unit. A column of bare numbers under a heading
+/// invites the reader to carry the unit across from whichever line
+/// mentioned it, and the one envelope that must never be read that way is
+/// a quota envelope, whose figures are themselves percentages.
+///
+/// The Completion Reserve is reported and said not to be subtracted,
+/// because it is the one figure here that does not fit the arithmetic a
+/// reader will try: `total - used - held` is `remaining`, and the reserve
+/// sits inside that remainder rather than beside it. Required completion
+/// work may draw against it, so a remaining figure that excluded it would
+/// under-report what the task has.
+fn budget_amounts_prose(amounts: &BudgetSnapshot) -> String {
+    let unit = unit_noun(amounts.kind()).unwrap_or("percent of quota");
+    let mut out = format!(
+        "  budget limit     {} {} — this task's envelope, fixed when it was\n\
+         \x20                  admitted and never amended since\n",
+        grouped_f64(amounts.total().as_f64()),
+        unit,
+    );
+    if !amounts.is_observed() {
+        // The envelope is real, so its ceiling is reported. Its
+        // consumption is not measured, so no consumption figure is
+        // printed — not even a zero, which is the "nothing has been spent"
+        // claim this state cannot support.
+        out.push_str(
+            "  budget used      not measured — no reservation has ever been made\n\
+             \x20                  against this envelope, so there is no settled spend\n\
+             \x20                  and no held capacity to report. Zero spend measured\n\
+             \x20                  and no measurement are different facts.\n",
+        );
+        return out;
+    }
+    out.push_str(&format!(
+        "  budget used      {} {} — settled: what finished turns actually cost\n",
+        grouped_f64(amounts.used().as_f64()),
+        unit,
+    ));
+    out.push_str(&format!(
+        "  budget held      {} {} — reserved by active reservations and not yet\n\
+         \x20                  settled. Never added to used: it becomes settled\n\
+         \x20                  spend when the turn finishes, and summing the two\n\
+         \x20                  would count it twice.\n",
+        grouped_f64(amounts.reserved().as_f64()),
+        unit,
+    ));
+    let remaining = amounts.remaining().value;
+    if remaining < 0.0 {
+        out.push_str(&format!(
+            "  budget remaining {} {} — negative: this envelope is overrun, which\n\
+             \x20                  is why it is reported signed rather than floored\n\
+             \x20                  at zero\n",
+            grouped_f64(remaining),
+            unit,
+        ));
+    } else {
+        out.push_str(&format!(
+            "  budget remaining {} {} — limit minus used minus held, which is the\n\
+             \x20                  ledger's own admission formula and not a second\n\
+             \x20                  sum computed for display\n",
+            grouped_f64(remaining),
+            unit,
+        ));
+    }
+    out.push_str(&format!(
+        "  completion res.  {} {} — protected for required completion work. Part\n\
+         \x20                  of the remainder above, not subtracted from it:\n\
+         \x20                  required work may draw against it.\n",
+        grouped_f64(amounts.completion_reserve().as_f64()),
+        unit,
+    ));
+    if let Some(utilization) = amounts.utilization() {
+        if utilization.is_finite() {
+            out.push_str(&format!(
+                "  budget pressure  {}% committed — used plus held, over the limit.\n\
+                 \x20                  This is the axis a risk reading belongs on; it is\n\
+                 \x20                  not the complement of the share above by\n\
+                 \x20                  coincidence, both come from these same figures.\n",
+                (utilization * 100.0).floor(),
+            ));
+        }
+    }
+    out
+}
+
 /// The read-only long form of the same state, for the shared `explain`
 /// surface.
 ///
@@ -1330,10 +1430,19 @@ fn grouped_f64(value: f64) -> String {
 /// disagree about what a minute is.
 ///
 /// What it never prints: prompts, task or tool content, the estimator's
-/// free-text `reason`, resource or cost figures of any kind, a credential,
-/// or a path. The ids it does print are local, ephemeral and the only
-/// handle a reader has on the work — unlike Fornax's claim and session ids,
-/// which answer no question this surface is asked.
+/// free-text `reason`, the estimator's resource/cost quantiles, a
+/// credential, or a path. The ids it does print are local, ephemeral and
+/// the only handle a reader has on the work — unlike Fornax's claim and
+/// session ids, which answer no question this surface is asked.
+///
+/// It *does* print the task's own budget figures as of HORO-1709 — limit,
+/// settled spend, held capacity, remainder, Completion Reserve and
+/// pressure — which is a deliberate narrowing of what used to be a blanket
+/// "no resource figures" promise. The estimator's quantiles are a
+/// prediction about work nobody has done and stay off every surface; the
+/// ledger's record of this task's envelope is the question the user came
+/// here to have answered, and withholding it was costing them the ability
+/// to tell a nearly-spent envelope from a nearly-untouched one.
 pub fn explain_text(status: &StatusResult, doctor: Option<&DoctorResult>) -> String {
     let mut out = String::from("Libra — the task being governed on this machine (host-wide)\n\n");
 
@@ -1388,8 +1497,25 @@ pub fn explain_text(status: &StatusResult, doctor: Option<&DoctorResult>) -> Str
             ));
             out.push_str(&format!(
                 "  budget           {}\n",
-                budget_posture_prose(status.task_budget)
+                budget_posture_prose(status.task_budget, status.task_budget_amounts.as_ref())
             ));
+            // The figures behind that share, unconditionally (HORO-1709).
+            //
+            // The wording preference does not reach this surface: it exists
+            // because a statusline has one line, and `explain` is the place
+            // a user comes precisely to be told the whole thing. There is
+            // nothing to abbreviate here and no 48-character ceiling.
+            //
+            // `used` and `held` are separate lines and never added together.
+            // A reservation is capacity committed and not yet spent; it
+            // becomes settled spend when the turn finishes, and a surface
+            // that had presented the sum as "used" would then count it
+            // twice. `remaining` is `total - used - held`, which is the
+            // ledger's own admission formula and not a display-side variant
+            // of it.
+            if let Some(amounts) = status.task_budget_amounts.as_ref() {
+                out.push_str(&budget_amounts_prose(amounts));
+            }
         }
     }
 
@@ -1432,6 +1558,16 @@ pub fn explain_text(status: &StatusResult, doctor: Option<&DoctorResult>) -> Str
     out.push_str("\n  Not shown here: prompts, task or tool content, the estimator's\n");
     out.push_str("  free-text reasoning, and its resource/cost quantiles. Libra keeps\n");
     out.push_str("  that material local and off every rendering surface.\n");
+    // The distinction the previous line is now careful about: the
+    // *estimator's* resource and cost quantiles are a prediction about work
+    // nobody has done, and they stay off. The budget figures above are the
+    // ledger's record of this task's own envelope, which HORO-1709 is
+    // specifically about showing. Both sentences are needed, because a
+    // reader who has just been shown four budget figures and then told
+    // "resource figures are not shown" would reasonably conclude the tool
+    // is lying about one of the two.
+    out.push_str("  The budget figures above are not in that category: they are this\n");
+    out.push_str("  task's own ledger record, not a prediction, and they are local.\n");
     out
 }
 
@@ -2289,7 +2425,7 @@ mod tests {
         // The statusline has room only to name the unknown; `explain` is
         // where a user finds out that the omission is deliberate rather
         // than a missing reading.
-        let prose = budget_posture_prose(Some(BudgetPosture::Uncommitted));
+        let prose = budget_posture_prose(Some(BudgetPosture::Uncommitted), None);
         assert!(prose.starts_with("unknown — "), "{prose}");
         assert!(prose.contains("nothing has been"), "{prose}");
         assert!(!prose.contains('%'), "{prose}");
@@ -2297,9 +2433,12 @@ mod tests {
         // read as saying the task has no envelope at all.
         assert_ne!(
             prose,
-            budget_posture_prose(Some(BudgetPosture::NotEstablished))
+            budget_posture_prose(Some(BudgetPosture::NotEstablished), None)
         );
-        assert_ne!(prose, budget_posture_prose(Some(BudgetPosture::Unreadable)));
+        assert_ne!(
+            prose,
+            budget_posture_prose(Some(BudgetPosture::Unreadable), None)
+        );
     }
 
     #[test]
