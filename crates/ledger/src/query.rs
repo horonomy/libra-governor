@@ -557,6 +557,46 @@ impl LedgerStore {
         created_at.map(|s| parse_time(&s)).transpose()
     }
 
+    /// When this task last had a receipt written, if ever (HORO-1725).
+    ///
+    /// This is the lower bound of the window a host-usage measurement may
+    /// claim: everything up to the previous receipt was already accounted
+    /// for by that receipt, and by the reservations it settled. Measuring
+    /// from the task's (or plan lineage's) start instead would re-count
+    /// every earlier turn on every subsequent `Stop`, inflating each
+    /// receipt by the sum of all its predecessors — the same shape of
+    /// error HORO-1723 fixed for duration, and the reason the one-snapshot
+    /// accounting invariant exists.
+    ///
+    /// `None` means no receipt yet, in which case the caller's own window
+    /// start (the plan lineage's beginning) is already correct.
+    pub fn last_receipt_recorded_at(
+        &self,
+        task_id: TaskId,
+    ) -> Result<Option<OffsetDateTime>, LedgerError> {
+        use rusqlite::OptionalExtension;
+        let recorded: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT MAX(recorded_at) FROM receipts WHERE task_id = ?1",
+                [task_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        recorded
+            .map(|r| {
+                OffsetDateTime::parse(&r, &Rfc3339).map_err(|e| {
+                    LedgerError::Sqlite(rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    ))
+                })
+            })
+            .transpose()
+    }
+
     /// Returns every locally recorded [`ExecutionReceipt`], across all
     /// tasks, paired with the [`TaskFeatures`] its originating plan was
     /// estimated against (`None` for a pre-HORO-1130 receipt) — the
