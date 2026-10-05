@@ -23,6 +23,9 @@ repository = "https://github.com/horonomy/libra-governor"
 uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+jsonschema = { version = "=0.56.0", default-features = false }
+semver = "1"
+num-cmp = "0.1"
 time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
 thiserror = "2"
 # `fallible_uint` re-enables `FromSql`/`ToSql` for `u64`/`usize`, which rusqlite
@@ -36,4 +39,4 @@ sha2 = "0.11"
 # dependency here, with the `fs` feature, for `rustix::fs::flock`
 # (ADR-0014 cross-process write lock). `fs` is required explicitly —
 # it is not enabled by the transitive graph.
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "process"] }

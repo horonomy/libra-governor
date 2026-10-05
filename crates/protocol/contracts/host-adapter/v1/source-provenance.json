@@ -1,10 +1,13 @@
 {
   "files": {
     "canonical-host-event.schema.json": "sha256:38ff7b5426781b10e7743c4909609d285b12f4080901f5263ca0c54aa42ac94a",
-    "host-capability-snapshot.schema.json": "sha256:41fea89b3c854745a4d8b8c41e06b84bfd56ff8e4c4d18da642a351d652210b2"
+    "host-capability-snapshot.schema.json": "sha256:41fea89b3c854745a4d8b8c41e06b84bfd56ff8e4c4d18da642a351d652210b2",
+    "cli-operation-envelope.schema.json": "sha256:f16bc73c52fa7614d9cd1142d759570aac6fefc75b9cc0864613c2896488af39",
+    "executable-adapter-manifest.schema.json": "sha256:9d9e66b0ee578097ceeeba34d5219b60169cbb9d4aa51ac7ff1ef2139e626cd1",
+    "protocol-message.schema.json": "sha256:1f109f74cecb26ac06be93198face6c73a2b41d9df7cec1f93e3b10463ba98a3"
   },
   "source_repository": "https://github.com/horonomy/.github",
-  "source_revision": "c63d29398767490a47858231ada95ee4c8e757af",
+  "source_revision": "98f7cf041e89bed8ba10484470cfb48592ff1e77",
   "fixture_sha256": {
     "valid-event-codex-tool-before.json": "fa54d939437059a42486d8344caae1e34c40addec6eaa1d78750413f2afd9b6b",
     "valid-event-record-only.json": "f411721e69395693493bd278e30e876c81d888936ef3564c8fc422119706432e",
@@ -13,6 +16,12 @@
     "invalid-malformed-event.json": "085099b69571e8dd6e5cf45fa3626e3acf78cea976e6ae91c70c4e9e4883409f",
     "valid-snapshot-claude-trust-required.json": "6db9a69be5a12b52432be6ed29ded52a55388459bcd06621fc0b217f1ac68e7e",
     "valid-snapshot-admin-disabled.json": "f4d643ce8495332b13b313b0f34aba470074d8f934fca40d5d916e75ec108722",
-    "valid-snapshot-codex-shape-only-unknown.json": "bdf1474081ed2c7e19752a57ce137f7d09d783dd977b8d467a319abe7e00d81d"
+    "valid-snapshot-codex-shape-only-unknown.json": "bdf1474081ed2c7e19752a57ce137f7d09d783dd977b8d467a319abe7e00d81d",
+    "invalid-extra-manifest-execution-field.json": "00ca37b4f1bd00943db25ac05a775906518904d8b876477196cfe2791d25daca",
+    "invalid-unsupported-protocol-version.json": "01557613eb3fcebb5165856e5ba2d960aa4495fd65d8bed9fee9dfea6dc0b58a",
+    "trust-drift-executable-digest.json": "6d789250bf4b533a9e1cb6c37978f5945e274305bdbb82efecdd2d6f798cd2b9",
+    "valid-cli-envelope.json": "deee8af4892d387e48a683e4fcfaeaa44ae518f9afa02d1559a669bd2471db15",
+    "valid-manifest-synthetic.json": "e5b4b3eea63399e853395d7110b8252496865a24672db4978ab6be5d6bf44982",
+    "valid-protocol.json": "d017a76aa931af456c91ed76e6adbc255604b4a32f5d613184958f3150f36e60"
   }
 }

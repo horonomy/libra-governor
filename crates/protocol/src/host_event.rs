@@ -163,7 +163,18 @@ impl<'de> Visitor<'de> for UniqueValueVisitor {
 }
 
 pub fn validate_host_json(bytes: &[u8]) -> Result<Value, HostBindingFailure> {
-    if bytes.len() > MAX_EVENT_BYTES {
+    validate_bounded_json(bytes, MAX_EVENT_BYTES, MAX_EVENT_DEPTH, MAX_EVENT_NODES)
+}
+
+/// Parse product-owned JSON profiles without duplicate keys or implicit bounds changes.
+/// This validates syntax and limits only; callers retain their own schema/semantic checks.
+pub fn validate_bounded_json(
+    bytes: &[u8],
+    max_bytes: usize,
+    max_depth: usize,
+    max_nodes: usize,
+) -> Result<Value, HostBindingFailure> {
+    if bytes.len() > max_bytes {
         return Err(HostBindingFailure::new(
             HostBindingStage::Json,
             HostBindingReason::InputTooLarge,
@@ -172,7 +183,7 @@ pub fn validate_host_json(bytes: &[u8]) -> Result<Value, HostBindingFailure> {
     let text = std::str::from_utf8(bytes).map_err(|_| {
         HostBindingFailure::new(HostBindingStage::Json, HostBindingReason::MalformedJson)
     })?;
-    scan_json_limits(text.as_bytes())?;
+    scan_json_limits(text.as_bytes(), max_depth, max_nodes)?;
     let mut deserializer = serde_json::Deserializer::from_str(text);
     let value = UniqueValue::deserialize(&mut deserializer).map_err(|error| {
         let reason = if error.to_string().contains("duplicate key") {
@@ -189,7 +200,11 @@ pub fn validate_host_json(bytes: &[u8]) -> Result<Value, HostBindingFailure> {
 }
 
 /// Pre-scans syntax delimiters before serde allocation to enforce public bounds.
-fn scan_json_limits(bytes: &[u8]) -> Result<(), HostBindingFailure> {
+fn scan_json_limits(
+    bytes: &[u8],
+    max_depth: usize,
+    max_nodes: usize,
+) -> Result<(), HostBindingFailure> {
     let mut in_string = false;
     let mut escaped = false;
     let mut in_atom = false;
@@ -217,7 +232,7 @@ fn scan_json_limits(bytes: &[u8]) -> Result<(), HostBindingFailure> {
                 nodes += 1;
                 depth += 1;
                 in_atom = false;
-                if depth > MAX_EVENT_DEPTH {
+                if depth > max_depth {
                     return Err(HostBindingFailure::new(
                         HostBindingStage::Json,
                         HostBindingReason::InputTooDeep,
@@ -235,7 +250,7 @@ fn scan_json_limits(bytes: &[u8]) -> Result<(), HostBindingFailure> {
             }
             _ => {}
         }
-        if nodes > MAX_EVENT_NODES {
+        if nodes > max_nodes {
             return Err(HostBindingFailure::new(
                 HostBindingStage::Json,
                 HostBindingReason::TooManyNodes,
@@ -1403,7 +1418,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             provenance["source_revision"],
-            "c63d29398767490a47858231ada95ee4c8e757af"
+            "98f7cf041e89bed8ba10484470cfb48592ff1e77"
         );
         let event_schema: Value = serde_json::from_str(CANONICAL_EVENT_SCHEMA).unwrap();
         let snapshot_schema: Value = serde_json::from_str(HOST_CAPABILITY_SNAPSHOT_SCHEMA).unwrap();

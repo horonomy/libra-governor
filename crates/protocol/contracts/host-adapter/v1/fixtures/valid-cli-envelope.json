@@ -1,0 +1,1 @@
+{"schema_version":1,"operation":"doctor","adapter_id":"codex","scope":"user","profile":null,"outcome":"partial","reasons":["host_capture_pending"],"result":{"registered":true},"verification_state":"unverified"}

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://horonomy.github.io/contracts/host-adapter/v1/executable-adapter-manifest.schema.json",
+  "title": "Executable host adapter manifest v1",
+  "type": "object", "additionalProperties": false,
+  "required": ["manifest_kind", "manifest_version", "adapter_id", "adapter_version", "protocol_versions", "contract_version_range", "roles", "capabilities", "host_version_constraints", "configuration_schema", "launch", "runtime_files", "input_limits", "needs"],
+  "properties": {
+    "manifest_kind": {"const": "host-adapter"}, "manifest_version": {"const": 1},
+    "adapter_id": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$"}, "adapter_version": {"type": "string", "minLength": 1},
+    "protocol_versions": {"type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true, "items": {"type": "integer", "minimum": 1, "maximum": 2147483647}},
+    "contract_version_range": {"$ref": "#/$defs/versionRange"},
+    "roles": {"type": "array", "uniqueItems": true, "items": {"enum": ["LifecycleSource", "ToolBoundarySource", "PolicyControlSink", "UsageEvidenceSource", "IdentitySource", "OperatorSurface", "ConfigDriver"]}},
+    "capabilities": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$"}},
+    "host_version_constraints": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "required": ["provider", "minimum", "maximum"], "properties": {"provider": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,31}$"}, "minimum": {"type": ["string", "null"], "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$"}, "maximum": {"type": ["string", "null"], "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$"}}}},
+    "configuration_schema": {"type": "object"},
+    "launch": {"type": "object", "additionalProperties": false, "required": ["executable", "argv"], "properties": {"executable": {"type": "string", "pattern": "^/[^\u0000\r\n]*$"}, "argv": {"type": "array", "items": {"type": "string", "pattern": "^[^\u0000\r\n]*$"}}}},
+    "runtime_files": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["path", "kind", "digest"], "properties": {"path": {"type": "string", "pattern": "^/[^\u0000\r\n]*$"}, "kind": {"enum": ["dependency", "entrypoint"]}, "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}}}},
+    "input_limits": {"type": "object", "additionalProperties": false, "required": ["max_bytes"], "properties": {"max_bytes": {"type": "integer", "minimum": 1, "maximum": 1048576}}},
+    "needs": {"type": "object", "additionalProperties": false, "required": ["environment", "read_paths", "write_paths"], "properties": {"environment": {"type": "array", "items": {"type": "string", "pattern": "^[A-Z_][A-Z0-9_]*$"}}, "read_paths": {"type": "array", "items": {"type": "string"}}, "write_paths": {"type": "array", "items": {"type": "string"}}}}
+  },
+  "$defs": {
+    "versionRange": {"type": "object", "additionalProperties": false, "required": ["minimum", "maximum"], "properties": {"minimum": {"type": "integer", "minimum": 1, "maximum": 2147483647}, "maximum": {"type": "integer", "minimum": 1, "maximum": 2147483647}}}
+  }
+}

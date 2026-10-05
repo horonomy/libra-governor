@@ -36,9 +36,9 @@ pub fn run(assume_yes: bool) {
         .and_then(read_install_marker_binary_path);
 
     report_binary(marker_binary_path.as_deref());
-    uninstall_state_dir(state_dir.as_deref(), assume_yes);
+    let state_ok = uninstall_state_dir(state_dir.as_deref(), assume_yes);
 
-    if !settings_ok {
+    if !settings_ok || !state_ok {
         std::process::exit(1);
     }
 }
@@ -57,9 +57,9 @@ pub fn run_codex(assume_yes: bool) {
         .and_then(read_install_marker_binary_path);
 
     report_binary(marker_binary_path.as_deref());
-    uninstall_state_dir(state_dir.as_deref(), assume_yes);
+    let state_ok = uninstall_state_dir(state_dir.as_deref(), assume_yes);
 
-    if !hooks_ok {
+    if !hooks_ok || !state_ok {
         std::process::exit(1);
     }
 }
@@ -193,16 +193,17 @@ fn report_binary(marker_binary_path: Option<&str>) {
     println!("  To remove it, run: cargo uninstall libra-governor-cli");
 }
 
-fn uninstall_state_dir(state_dir: Option<&std::path::Path>, assume_yes: bool) {
+fn uninstall_state_dir(state_dir: Option<&std::path::Path>, assume_yes: bool) -> bool {
     let Some(state_dir) = state_dir else {
-        return;
+        return true;
     };
-    if !state_dir.exists() {
+    if matches!(std::fs::symlink_metadata(state_dir), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    {
         println!(
             "libra-governor uninstall: state dir {} does not exist — nothing to remove",
             state_dir.display()
         );
-        return;
+        return true;
     }
 
     let confirmed = assume_yes
@@ -218,15 +219,18 @@ fn uninstall_state_dir(state_dir: Option<&std::path::Path>, assume_yes: bool) {
              --yes, or delete it yourself, to remove it.",
             state_dir.display()
         );
-        return;
+        return true;
     }
 
-    match std::fs::remove_dir_all(state_dir) {
-        Ok(()) => println!("libra-governor uninstall: removed {}", state_dir.display()),
-        Err(e) => eprintln!(
-            "libra-governor uninstall: could not remove {}: {e}",
-            state_dir.display()
-        ),
+    match libra_governor_daemon::host_runtime::state::delete_legacy_state(state_dir) {
+        Ok(()) => {
+            println!("libra-governor uninstall: removed {}", state_dir.display());
+            true
+        }
+        Err(_) => {
+            eprintln!("libra-governor uninstall: state deletion refused; prior hook cleanup may already have applied. Adapter registrations require explicit unregister and ownership review.");
+            false
+        }
     }
 }
 

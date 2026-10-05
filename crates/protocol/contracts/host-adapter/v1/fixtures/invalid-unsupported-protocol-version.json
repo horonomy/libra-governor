@@ -1,0 +1,1 @@
+{"protocol":"horonom.host-adapter","protocol_version":2,"host_contract_version":1,"request_id":"bad-version","operation":"probe","input":{"context":{"scope":"session"}}}

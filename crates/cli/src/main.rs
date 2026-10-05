@@ -83,6 +83,7 @@
 //!   are accepted selectors, always answered honestly as not-yet-configured
 //!   in v0.0.3 rather than rejected as unknown.
 
+mod adapter_cmd;
 mod agent;
 mod agents_cmd;
 mod bucket_prose;
@@ -129,6 +130,7 @@ Usage:
   libra-governor doctor [--json]
   libra-governor install [--agent codex]
   libra-governor uninstall [--agent codex] [--yes]
+  libra-governor adapter <operation> [--json]
   libra-governor agents [--json]
   libra-governor evidence-report consent
   libra-governor evidence-report
@@ -163,6 +165,7 @@ fn main() {
     {
         ["--help"] | ["-h"] | ["help"] => print_help(),
         ["--version"] | ["-V"] | ["version"] => print_version(),
+        ["adapter", ..] => std::process::exit(adapter_cmd::run(&args[1..])),
         ["daemon", "run"] => daemon_cmd::run(),
         ["daemon", "stop"] => std::process::exit(daemon_cmd::stop()),
         ["hook", "user-prompt-submit"] => hook::run(),
