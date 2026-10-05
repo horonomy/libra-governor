@@ -442,8 +442,14 @@ fn quantile_u64(sorted: &[u64], p: f64) -> u64 {
 /// `Estimate` shape asks for that, and building it speculatively would be
 /// exactly the unwarranted complexity this ticket's brief asks to avoid.
 /// Returns `(None, None, None)` when no receipt carries any resource
-/// usage at all (true of every MVP 1.0 receipt today — Claude Code's hook
-/// payloads expose no cost/token data, see the PR description).
+/// usage at all. That used to be true of every receipt, on the stated
+/// premise that Claude Code's hook payloads expose no cost/token data —
+/// a premise HORO-1725 disproved (the `Stop` payload carries
+/// `transcript_path`, and the host records per-turn token counts there).
+/// Receipts written since then carry a measured `Tokens` amount whenever
+/// the host exposed a readable transcript, so an all-`None` return now
+/// means what it says: no receipt in this window has an observed amount,
+/// not that observation is impossible.
 fn resource_quantiles(
     receipts: &[ExecutionReceipt],
 ) -> (

@@ -102,6 +102,7 @@ pub fn normalize(entry: EntryPoint, raw: &str) -> Result<NormalizedEvent, Normal
                 model: payload.model,
                 turn_id: payload.turn_id,
                 agent_id: payload.agent_id,
+                transcript_path: payload.transcript_path,
             })
         }
     }

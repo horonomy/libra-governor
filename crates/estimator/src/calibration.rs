@@ -175,10 +175,11 @@ impl CostCoverage {
     /// value today.
     pub fn unavailable() -> Self {
         CostCoverage::Unavailable {
-            reason: "no locally recorded ExecutionReceipt carries resource_amount usage data \
-                     today (Claude Code's hook payloads expose no cost/token figures — see \
-                     libra-governor-estimator::resource_quantiles docs), so cost-based coverage \
-                     and admission replay have no real basis to compute from yet",
+            reason: "cost coverage is denominated in money, and nothing on this machine holds a \
+                     rate card to price a token count with — converting one would fabricate a \
+                     figure. Receipts do carry measured token usage since HORO-1725, so a \
+                     token-denominated coverage report is now possible in principle, but it \
+                     needs an estimated-vs-actual resource pair this module does not build yet",
         }
     }
 }

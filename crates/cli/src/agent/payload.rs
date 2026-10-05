@@ -8,8 +8,19 @@
 //! might omit is `Option`/`#[serde(default)]`, and nothing here uses
 //! `#[serde(deny_unknown_fields)]`: Codex's extra fields (`turn_id`,
 //! `permission_mode`, `tool_use_id`, `agent_id`, `agent_type`,
-//! `last_assistant_message`, `stop_hook_active`) and Claude's own extras
-//! (`transcript_path`) are ignored, never rejected.
+//! `last_assistant_message`, `stop_hook_active`) and any other host
+//! extras are ignored, never rejected.
+//!
+//! `transcript_path` used to be in that ignored list. It is captured on
+//! the `Stop` payload now (HORO-1725): the host writes per-turn
+//! `input_tokens`/`cache_creation_input_tokens`/
+//! `cache_read_input_tokens`/`output_tokens` into that file, which is the
+//! only source of *measured* resource usage available without a gateway.
+//! Treating it as an irrelevant extra is what left every receipt's
+//! `actual_usage` empty and every task's reservation pinned to the same
+//! policy-target constant. This crate only relays the path — it never
+//! opens the file; see `libra_governor_daemon::usage` for why the read
+//! belongs to the daemon and what it extracts.
 //!
 //! `turn_id`/`agent_id` (HORO-1599) are the two of those extras this
 //! integration now actually captures, for the shared execution identity
@@ -65,6 +76,11 @@ pub struct TurnCompletedPayload {
     pub turn_id: Option<String>,
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// Claude Code's path to this session's transcript. Absent for Codex,
+    /// whose `Stop` payload documents no equivalent — so it stays `None`
+    /// rather than being guessed at, exactly as `model`/`turn_id` do.
+    #[serde(default)]
+    pub transcript_path: Option<PathBuf>,
 }
 
 fn optional_native_call_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>

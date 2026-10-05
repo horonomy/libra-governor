@@ -135,13 +135,14 @@
 use std::time::{Duration, Instant};
 
 use libra_governor_protocol::{
-    BudgetPosture, Confidence, DoctorResult, ReplanState, Request, Response, StatusResult,
-    TaskSummary,
+    BudgetPosture, BudgetSnapshot, Confidence, ConfiguredBudget, DoctorResult, ReplanState,
+    Request, ResourceKind, Response, StatusResult, TaskSummary,
 };
 use serde_json::{json, Value};
 use time::OffsetDateTime;
 
 use crate::client::{self, ClientError};
+use crate::presentation::{self, BudgetDisplay};
 
 /// Version of the cross-product provider contract this module speaks. A
 /// host that does not recognise it refuses the whole document rather than
@@ -215,6 +216,11 @@ const MAX_DURATION_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
 /// Largest count the host's contract accepts. `ReplanState::Replanned`
 /// carries a `u32`, which can exceed it.
 const MAX_COUNT: u32 = 1_000_000_000;
+/// Longest label the host's contract accepts. Mirrored here because the
+/// budget label is the one this module assembles from numbers whose width
+/// it does not control, so it has to be able to ask whether a candidate
+/// fits — see [`budget_label`].
+const MAX_LABEL_CHARS: usize = 48;
 
 /// Why the provider has no live reading to report.
 ///
@@ -553,15 +559,324 @@ fn percent_left(fraction_left: f64) -> Option<u32> {
     Some(((fraction_left * 100.0).floor() as u32).max(1))
 }
 
-/// What is left of the task's resource envelope (HORO-1634).
+/// The share to display, preferring the one the transported *amounts*
+/// imply over the one the posture carries (HORO-1709).
 ///
-/// A share, never an amount, and the axis is a literal in the format string
-/// rather than something assembled from a variable. The host refuses a label
-/// containing a percentage with no word saying what it measures — `62%`
-/// alone reads as used *and* as left, which are opposite answers — and a
-/// refused label costs the whole document, not the one segment. Writing the
-/// axis as part of the template is what makes the rule satisfied by
-/// construction: there is no code path that formats the number without it.
+/// Both come from the same `BudgetSnapshot` in the same ledger
+/// transaction, so they agree in the daemon by construction. They can
+/// still disagree by one ULP *after the wire*: `serde_json`'s default
+/// float parser is approximate — exact `f64` round-tripping lives behind
+/// its `float_roundtrip` feature, which is not enabled — while the
+/// integral amounts round-trip exactly. A share sitting on an integer
+/// boundary can therefore come back one ULP low and render a whole point
+/// lower than the amounts beside it, because [`percent_left`] floors.
+/// Recomputing from the amounts is what makes "percentage and amount
+/// cannot contradict each other" survive the transport as well as the
+/// query.
+///
+/// Falls back to the posture's own share when no snapshot came with it —
+/// a v11 daemon always sends both for a `Remaining` posture, so this is
+/// the path for a future peer that sends only the classification.
+fn share_to_display(fraction_left: f64, amounts: Option<&BudgetSnapshot>) -> f64 {
+    amounts
+        .and_then(BudgetSnapshot::fraction_left)
+        .unwrap_or(fraction_left)
+}
+
+/// The noun the host may print beside a budget count, per resource kind
+/// (HORO-1709).
+///
+/// `None` suppresses amounts entirely, which is the honest answer for a
+/// quota envelope: its amounts *are* percentages, so "38 of 100 quota
+/// percent" restates the share as though it were a second fact.
+///
+/// USD is reported in cents and says so. The host's label allowlist has
+/// no `$`, and the contract's `count`/`total` are integers, so `$12.40`
+/// is not expressible — and inventing a formatter here would put a
+/// currency renderer in a product, which is exactly what the contract
+/// keeps in the host. Cents with the unit named is unambiguous today;
+/// a currency-aware host span is HORO-1719's business.
+///
+/// Nothing here guesses: the kind is the envelope's own, fixed at
+/// admission from the policy's resource target, so a unit is never
+/// inferred from the fact that a number exists.
+fn unit_noun(kind: ResourceKind) -> Option<&'static str> {
+    match kind {
+        ResourceKind::Tokens => Some("tokens"),
+        ResourceKind::Usd => Some("USD cents"),
+        ResourceKind::QuotaPercent => None,
+    }
+}
+
+/// One amount as a contract `count`, or `None` when it cannot be one.
+///
+/// Floored rather than rounded, for the same reason [`percent_left`]
+/// truncates: a budget figure should never over-report what is left.
+/// `None` for a non-finite value, a negative one (the contract has no
+/// signed count, and silently clamping an overrun to `0` would turn a
+/// deficit into a boundary), or one above the host's ceiling — an
+/// envelope larger than a billion units renders as a share with no
+/// amounts rather than as a clamped number that is simply wrong.
+fn count_value(amount: f64) -> Option<u32> {
+    if !amount.is_finite() || amount < 0.0 || amount > f64::from(MAX_COUNT) {
+        return None;
+    }
+    Some(amount.floor() as u32)
+}
+
+/// A run of decimal digits with `,` every three, deterministically and
+/// without consulting a locale — the host formats its own `count`/`total`
+/// span, but `used` and `reserved` have no contract field yet, so those
+/// two reach the user through the label and need a grouping of their own.
+///
+/// Takes the digits as text rather than a number so that the one rule
+/// lives in one place regardless of how wide the figure is: a four-digit
+/// count and a ledger `f64` past four billion are grouped identically,
+/// and an unfamiliar magnitude never silently loses its separators at the
+/// exact width where they matter most.
+fn group_digits(digits: &str) -> String {
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The semantic pressure band for an active task's envelope (HORO-1709's
+/// pressure refinement, rendered by HORO-1719).
+///
+/// The axis is *utilization*, not the displayed number: `38% budget left`
+/// is 62% utilized, which is CAUTION. Classifying the displayed share
+/// instead would paint a two-thirds-spent envelope green, which is the
+/// specific error the refinement names.
+///
+/// `None` for an unobserved or unreadable envelope. Not `safe`: "nothing
+/// has been attributed to this task" is missing attribution, and a
+/// reassuring tone for missing data is the one mapping the ticket
+/// forbids outright.
+fn pressure_band(utilization: Option<f64>) -> Option<&'static str> {
+    let utilization = utilization?;
+    if !utilization.is_finite() {
+        return None;
+    }
+    Some(match utilization {
+        // An overrun and a negative remaining both land here, because
+        // both mean utilization above 1.0.
+        u if u > 1.0 => "critical",
+        u if u > 0.9 => "critical",
+        u if u > 0.7 => "warning",
+        u if u > 0.5 => "caution",
+        // Includes a negative utilization, which cannot happen from a
+        // well-formed snapshot and is not worth a fifth band: "less than
+        // nothing has been spent" is still not pressure.
+        _ => "safe",
+    })
+}
+
+/// A ledger figure as it may appear inside a label, or `None` when it has
+/// no honest rendering there (HORO-1709).
+///
+/// Deliberately not routed through [`count_value`]: that function enforces
+/// the *host's* ceiling on its `count` field, which is a rule about a
+/// number the host will format and has nothing to say about a word in a
+/// sentence. The only ceiling that applies here is the label's own, and
+/// [`budget_label`] checks it on the assembled phrase.
+///
+/// A negative figure is declined rather than rendered. Settled spend and
+/// held capacity cannot be negative in a well-formed snapshot, so one
+/// arriving here is a peer sending something this build does not
+/// understand, and the compact phrase is the wrong place to work out what
+/// it meant.
+fn span_figure(amount: f64) -> Option<String> {
+    (amount.is_finite() && amount >= 0.0).then(|| grouped_f64(amount))
+}
+
+/// The compact budget phrase, at the most detail the preference allows
+/// that still fits the host's label ceiling (HORO-1709).
+///
+/// The percentage is always present and always first, because it is the
+/// one figure that fits in every envelope's worth of digits and the one
+/// the pre-ticket line carried. `used` and `reserved` are appended only
+/// when asked for, and only when they fit — the contract has no field
+/// for either, so the label is the only route, and a label over
+/// [`MAX_LABEL_CHARS`] is refused by the host at the cost of the *whole
+/// document*. Dropping back to a shorter phrase is therefore the only
+/// acceptable failure mode: the preference is a ceiling on detail, never
+/// a promise of it, and the figures that did not fit are still in the
+/// structured fields and in `explain`.
+///
+/// "held" rather than "reserved" for the reserved figure: it is four
+/// characters shorter in a 48-character budget, and "reserved" beside
+/// "used" invites reading the two as a sum, which the ticket forbids.
+fn budget_label(percent: u32, amounts: Option<&BudgetSnapshot>, display: BudgetDisplay) -> String {
+    let base = format!("{percent}% budget left");
+    let (Some(amounts), true) = (
+        amounts,
+        display == BudgetDisplay::UsedRemainingAndTotal || display == BudgetDisplay::Full,
+    ) else {
+        return base;
+    };
+    // A quota envelope's amounts *are* percentages, so "38% left, 42 used"
+    // would put two percentages side by side with only one of them marked
+    // as one. The share is the honest rendering of that envelope and it is
+    // already here.
+    if unit_noun(amounts.kind()).is_none() || !amounts.is_observed() {
+        return base;
+    }
+    let Some(used) = span_figure(amounts.used().as_f64()) else {
+        return base;
+    };
+    let mut candidates = Vec::new();
+    if display == BudgetDisplay::Full {
+        if let Some(held) = span_figure(amounts.reserved().as_f64()) {
+            candidates.push(format!("{percent}% left, {used} used, {held} held"));
+        }
+    }
+    candidates.push(format!("{percent}% left, {used} used"));
+    // Bytes, not chars, because that is what the host measures and these
+    // candidates are pure ASCII — digits, commas, spaces and two English
+    // words — so the two counts are equal and the byte one cannot be the
+    // looser of them.
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.len() <= MAX_LABEL_CHARS)
+        .unwrap_or(base)
+}
+
+/// One structured ledger figure, written only if it is a number at all.
+///
+/// A non-finite amount is omitted rather than serialized: `serde_json`
+/// cannot represent `NaN` or an infinity and would turn it into `null`,
+/// which a reader would have to tell apart from an absent field anyway —
+/// so the absent field is the clearer of the two identical outcomes.
+fn amount_field(segment: &mut Value, key: &str, amount: f64) {
+    if amount.is_finite() {
+        segment[key] = json!(amount);
+    }
+}
+
+/// The structured economic fields the shared renderer will read
+/// (HORO-1709), attached to a segment whatever the wording preference
+/// says.
+///
+/// Emitted unconditionally when the ledger has authoritative figures,
+/// because the preference governs the *compact phrase* and nothing else:
+/// Clear stays as terse as the user asked for while Detail and
+/// HORO-1719's palette still have the whole envelope to work from. The
+/// contract ignores fields it does not know, so these render nothing
+/// today and cost nothing — HORO-1719 is where they acquire a
+/// presentation.
+///
+/// `budget_scope` is on every one of them. Four envelopes can produce a
+/// number here — a task's, a configured default, a host cap and an
+/// organisation's — and the ticket's standing requirement is that they
+/// are never conflated. A figure that cannot say which one it is a
+/// figure of is not economic truth.
+fn budget_amount_fields(segment: &mut Value, amounts: &BudgetSnapshot) {
+    segment["budget_scope"] = json!("active_task");
+    if let Some(unit) = unit_noun(amounts.kind()) {
+        segment["budget_unit"] = json!(unit);
+    }
+    // The ceiling is authoritative even when nothing has drawn against
+    // it, so it is reported either way. The *consumption* figures are
+    // not: an unobserved envelope has no measured spend, and emitting
+    // `0` for it would be the "100% budget left" claim in a new field.
+    //
+    // These are the ledger's own figures, not the host's `count` field, so
+    // [`count_value`]'s ceiling does not apply to them and they are
+    // reported signed and at full width. A figure a renderer declines to
+    // show is a presentation decision; a figure withheld here would be a
+    // missing fact.
+    amount_field(segment, "budget_total", amounts.total().as_f64());
+    segment["budget_observed"] = json!(amounts.is_observed());
+    if !amounts.is_observed() {
+        return;
+    }
+    amount_field(segment, "budget_used", amounts.used().as_f64());
+    amount_field(segment, "budget_reserved", amounts.reserved().as_f64());
+    // Signed on purpose, and the field here most likely to be negative: an
+    // overrun is a real authoritative state and the contract's unsigned
+    // `count` cannot hold it, so this is where it survives.
+    amount_field(segment, "budget_remaining", amounts.remaining().value);
+    if let Some(utilization) = amounts.utilization() {
+        if utilization.is_finite() {
+            segment["budget_pressure_percent"] = json!((utilization * 100.0).floor());
+        }
+    }
+    if let Some(band) = pressure_band(amounts.utilization()) {
+        segment["semantic_state"] = json!(band);
+    }
+}
+
+/// The contract-native amount span: `count`, `total` and the noun that
+/// says what they count (HORO-1709).
+///
+/// These three the host *does* render today, which is why they are the
+/// one part of this gated on the preference. The default is
+/// percentage-only, so a fresh install's Clear line is unchanged by this
+/// ticket; a user who asks for amounts gets them in the host's own
+/// formatting rather than in a span assembled here.
+///
+/// Nothing is emitted for an unobserved envelope. `count` would have to
+/// be the whole ceiling, and "150,000 of 150,000 tokens" is the
+/// measured-full claim HORO-1708 removed, restated as a pair of numbers.
+fn budget_count_fields(segment: &mut Value, amounts: &BudgetSnapshot, display: BudgetDisplay) {
+    if display == BudgetDisplay::Percent || !amounts.is_observed() {
+        return;
+    }
+    let Some(unit) = unit_noun(amounts.kind()) else {
+        return;
+    };
+    let Some(remaining) = count_value(amounts.remaining().value) else {
+        return;
+    };
+    segment["count"] = json!(remaining);
+    segment["count_label"] = json!(unit);
+    if display == BudgetDisplay::Remaining {
+        return;
+    }
+    if let Some(total) = count_value(amounts.total().as_f64()) {
+        segment["total"] = json!(total);
+    }
+}
+
+/// What is left of the task's resource envelope (HORO-1634), optionally
+/// with the amounts behind the share (HORO-1709).
+///
+/// The share is always present and the axis is always a literal in the
+/// format string rather than something assembled from a variable. The host
+/// refuses a label containing a percentage with no word saying what it
+/// measures — `62%` alone reads as used *and* as left, which are opposite
+/// answers — and a refused label costs the whole document, not the one
+/// segment. Writing the axis as part of the template is what makes the rule
+/// satisfied by construction: there is no code path that formats the number
+/// without it.
+///
+/// HORO-1709 adds the figures the share is a share *of*. Three routes, and
+/// which one a figure takes is not a style choice:
+///
+/// - `count`/`total`/`count_label` for remaining and total, because the
+///   contract has fields for them and is explicit that the *host* formats
+///   the numbers. Gated on the user's preference, so a fresh install's line
+///   is byte-identical to the pre-ticket one.
+/// - the label for used and reserved, because the contract has no field for
+///   either and the label is the only surface left. Gated on the preference
+///   too, and dropped when it would not fit.
+/// - `budget_*` structured fields for everything, unconditionally, because
+///   the preference governs the compact phrase and not what Detail,
+///   `explain` and HORO-1719's palette are allowed to know.
+///
+/// The share rendered is recomputed from the amounts when they are present
+/// — see [`share_to_display`] — so the percentage and the numbers beside it
+/// cannot contradict each other even by one ULP of transport error.
+///
+/// `state` deliberately does *not* move with pressure. It is the contract's
+/// own severity field, already load-bearing for Clear's exception
+/// selection, and a two-thirds-spent envelope is not an exception. The
+/// pressure reading rides `semantic_state`, which is HORO-1719's to colour.
 ///
 /// `vital`, except when the envelope is spent. A budget share is the one
 /// reading that qualifies a schedule — `Replans now need approval · 38%
@@ -584,25 +899,36 @@ fn percent_left(fraction_left: f64) -> Option<u32> {
 /// is gone", which is the "100% budget left" claim this variant exists to
 /// stop making. Naming the unknown thing instead is the only phrasing that
 /// cannot be mistaken for the measurement it lacks.
-fn budget_segment(posture: BudgetPosture) -> Value {
+fn budget_segment(
+    posture: BudgetPosture,
+    amounts: Option<&BudgetSnapshot>,
+    display: BudgetDisplay,
+) -> Value {
     let (state, label, reason_code, clear_role) = match posture {
-        BudgetPosture::Remaining { fraction_left } => match percent_left(fraction_left) {
-            Some(percent) => ("neutral", format!("{percent}% budget left"), None, "vital"),
-            // "not usable" rather than "not a number", because
-            // `percent_left` rejects three different malformations and only
-            // one of them is a NaN: a share of exactly zero and a share
-            // above one are both perfectly good numbers that cannot be a
-            // share of a live envelope. A label naming the narrowest cause
-            // would be false in two of the three cases, which is the one
-            // thing a provider whose whole job is reporting state may not
-            // be.
-            None => (
-                "warn",
-                "Budget share not usable".to_string(),
-                Some("budget_share_not_usable"),
-                "vital",
-            ),
-        },
+        BudgetPosture::Remaining { fraction_left } => {
+            match percent_left(share_to_display(fraction_left, amounts)) {
+                Some(percent) => (
+                    "neutral",
+                    budget_label(percent, amounts, display),
+                    None,
+                    "vital",
+                ),
+                // "not usable" rather than "not a number", because
+                // `percent_left` rejects three different malformations and
+                // only one of them is a NaN: a share of exactly zero and a
+                // share above one are both perfectly good numbers that
+                // cannot be a share of a live envelope. A label naming the
+                // narrowest cause would be false in two of the three cases,
+                // which is the one thing a provider whose whole job is
+                // reporting state may not be.
+                None => (
+                    "warn",
+                    "Budget share not usable".to_string(),
+                    Some("budget_share_not_usable"),
+                    "vital",
+                ),
+            }
+        }
         // `warn`, matching the escalation and for the same reason: hooks are
         // advisory-only, so an exhausted envelope means the ledger will
         // refuse the next reservation, not that work has stopped. `critical`
@@ -648,7 +974,61 @@ fn budget_segment(posture: BudgetPosture) -> Value {
     if let Some(reason_code) = reason_code {
         segment["reason_code"] = json!(reason_code);
     }
+    if let Some(amounts) = amounts {
+        budget_amount_fields(&mut segment, amounts);
+        budget_count_fields(&mut segment, amounts, display);
+    }
     segment
+}
+
+/// The envelope a *new* task would be admitted to, shown while nothing is
+/// being governed (HORO-1709's Idle refinement).
+///
+/// Three things make this safe to show and would make the obvious
+/// alternatives unsafe:
+///
+/// - `budget_configured`, not `budget`. The idle line must not carry a
+///   figure that reads as the active task's remaining budget, and the
+///   surest way to guarantee that is for it not to be in that segment.
+/// - `budget_scope: "configured_default"` on the figure itself, so no
+///   downstream renderer can lose track of which of the four envelopes it
+///   is looking at.
+/// - a `count` with no `total`. A configured ceiling is a ceiling, not a
+///   remainder of anything; pairing it with a total would invite "150,000
+///   of 150,000", which is the measured-full claim with no measurement
+///   behind it.
+///
+/// `neutral`, never a pressure band: a ceiling nobody has drawn against
+/// exerts no pressure, and this segment has no consumption figures at all
+/// to compute one from. `supporting` rather than `posture` because the idle
+/// `task` segment already owns Clear's single posture.
+///
+/// Only emitted when the user has asked for amounts. Percentage-only users
+/// get nothing here, which is what makes this genuinely optional rather
+/// than a new line everyone acquires on upgrade.
+fn configured_budget_segment(
+    configured: &ConfiguredBudget,
+    display: BudgetDisplay,
+) -> Option<Value> {
+    if display == BudgetDisplay::Percent {
+        return None;
+    }
+    let ceiling = configured.ceiling;
+    let unit = unit_noun(ceiling.kind())?;
+    let count = count_value(ceiling.as_f64())?;
+    Some(json!({
+        "key": "budget_configured",
+        "state": "neutral",
+        "label": "Budget ceiling for a new task",
+        "count": count,
+        "count_label": unit,
+        "budget_scope": "configured_default",
+        "budget_unit": unit,
+        "budget_total": ceiling.as_f64(),
+        "explain_key": "libra.budget",
+        "order_hint": 26,
+        "clear_role": "supporting",
+    }))
 }
 
 /// The four presets `Policy` exposes: the config token, spelled exactly as
@@ -791,7 +1171,27 @@ fn rfc3339_utc(now: OffsetDateTime) -> String {
 /// shares the task's segment rather than claiming a fifth — see
 /// [`task_segment`]. A document with five segments is refused whole, so
 /// Libra would render as nothing at the moment it had the most to say.
-pub fn reading(status: &StatusResult, doctor: Option<&DoctorResult>, now: OffsetDateTime) -> Value {
+///
+/// That allowance is also why the configured-ceiling segment (HORO-1709) is
+/// an idle-only thing: while a task is governed all four slots are taken,
+/// and the active envelope is the one the user needs. Idle has two of them
+/// free and no active envelope to report, which is exactly when a ceiling
+/// for a *prospective* task is worth a line.
+///
+/// The wording preference is a parameter rather than something read in
+/// here, deliberately. A function that reached for the user's state
+/// directory could not be asserted on without the suite depending on
+/// whatever preference the developer running it happens to have recorded,
+/// and the alternative — a wrapper that reads the file and forwards it —
+/// is a branch no unit test can reach, which is the same gap wearing a
+/// function signature. So the read happens once, at the process edge in
+/// [`run_provider`], beside the socket call and the clock.
+pub fn reading(
+    status: &StatusResult,
+    doctor: Option<&DoctorResult>,
+    now: OffsetDateTime,
+    display: BudgetDisplay,
+) -> Value {
     let mut segments = vec![task_segment(status.current_task.as_ref())];
     if let Some(task) = status.current_task.as_ref() {
         segments.push(estimate_segment(task));
@@ -800,7 +1200,18 @@ pub fn reading(status: &StatusResult, doctor: Option<&DoctorResult>, now: Offset
         // Clear and Detail cannot disagree about it and no second round trip
         // was spent. A task without a budget field yields no segment rather
         // than a guessed one.
-        segments.extend(status.task_budget.map(budget_segment));
+        segments.extend(
+            status.task_budget.map(|posture| {
+                budget_segment(posture, status.task_budget_amounts.as_ref(), display)
+            }),
+        );
+    } else {
+        segments.extend(
+            status
+                .configured_budget
+                .as_ref()
+                .and_then(|configured| configured_budget_segment(configured, display)),
+        );
     }
     segments.extend(doctor.and_then(profile_segment));
 
@@ -858,7 +1269,12 @@ fn probe(deadline: Instant) -> Result<(StatusResult, Option<DoctorResult>), NoRe
 /// can render and `doctor` can act on.
 pub fn run_provider() {
     let payload = match probe(Instant::now() + HOT_PATH_BUDGET) {
-        Ok((status, doctor)) => reading(&status, doctor.as_ref(), OffsetDateTime::now_utc()),
+        Ok((status, doctor)) => reading(
+            &status,
+            doctor.as_ref(),
+            OffsetDateTime::now_utc(),
+            presentation::load().budget_display(),
+        ),
         Err(kind) => no_reading(kind),
     };
     println!("{payload}");
@@ -892,16 +1308,29 @@ fn replan_state_prose(state: &ReplanState) -> String {
 /// field, which the current daemon does not do; it is reported as
 /// unestablished rather than silently omitted, because a missing line reads
 /// as "there is no budget" and that is a claim this function cannot make.
-fn budget_posture_prose(posture: Option<BudgetPosture>) -> String {
+fn budget_posture_prose(
+    posture: Option<BudgetPosture>,
+    amounts: Option<&BudgetSnapshot>,
+) -> String {
     match posture {
-        Some(BudgetPosture::Remaining { fraction_left }) => match percent_left(fraction_left) {
-            Some(percent) => format!(
-                "{percent}% budget left — a share of the task's limit, not an\n\
-                 \x20                  amount; the limit itself and what has been spent are\n\
-                 \x20                  resource figures and stay off every rendering surface"
-            ),
-            None => "not reported — the daemon's share was not a usable number".to_string(),
-        },
+        Some(BudgetPosture::Remaining { fraction_left }) => {
+            match percent_left(share_to_display(fraction_left, amounts)) {
+                // No longer followed by "and the amounts stay off every
+                // surface", because under HORO-1709 they do not: the four
+                // lines below this one are the task's own ledger figures.
+                // What the share still *is* is a share of this task's
+                // envelope and of nothing wider — which is the sentence
+                // worth keeping, because the three other envelopes that
+                // could produce a percentage here are reported separately
+                // or not at all.
+                Some(percent) => format!(
+                    "{percent}% budget left — a share of this task's own limit, not\n\
+                     \x20                  of a configured default, a host cap or an\n\
+                     \x20                  organisation's"
+                ),
+                None => "not reported — the daemon's share was not a usable number".to_string(),
+            }
+        }
         // The one line here that explains an *omission*, so it says what
         // would otherwise be assumed: the share is withheld deliberately,
         // and the envelope being intact is not the same fact as the work
@@ -931,6 +1360,128 @@ fn budget_posture_prose(posture: Option<BudgetPosture>) -> String {
     }
 }
 
+/// A possibly-fractional figure, grouped, for the surfaces that carry a
+/// ledger amount as text rather than as a contract field (HORO-1709): the
+/// compact label, via [`span_figure`], and `explain`.
+///
+/// The contract's `count` is a `u32`, so [`count_value`] can decline a
+/// figure outright. A ledger figure is an `f64` and three things can be
+/// true of it that no
+/// `count` can express — a fraction, a negative, and a magnitude past four
+/// billion — and `explain` has both the room and the obligation to show
+/// all three rather than withhold the figure. Fractions are printed to one
+/// place and only when there is one, so a token count does not acquire a
+/// `.0` it never had.
+///
+/// Past 2^53 an `f64`'s integers are no longer consecutive, so the digits
+/// printed here are the exact value of the number held rather than the
+/// figure anyone intended. That is still the honest rendering of what the
+/// ledger returned, and no envelope anywhere near that width exists; the
+/// alternative — rounding to something tidier — would print a figure the
+/// ledger does not hold.
+fn grouped_f64(value: f64) -> String {
+    if !value.is_finite() {
+        return "not a usable number".to_string();
+    }
+    let sign = if value < 0.0 { "-" } else { "" };
+    let magnitude = value.abs();
+    let whole = magnitude.trunc();
+    let fraction = magnitude - whole;
+    let whole = group_digits(&format!("{whole:.0}"));
+    if fraction < 0.05 {
+        format!("{sign}{whole}")
+    } else {
+        format!("{sign}{whole}.{:.0}", fraction * 10.0)
+    }
+}
+
+/// The task envelope's own figures, one per line, for `explain`
+/// (HORO-1709).
+///
+/// Every line names its unit. A column of bare numbers under a heading
+/// invites the reader to carry the unit across from whichever line
+/// mentioned it, and the one envelope that must never be read that way is
+/// a quota envelope, whose figures are themselves percentages.
+///
+/// The Completion Reserve is reported and said not to be subtracted,
+/// because it is the one figure here that does not fit the arithmetic a
+/// reader will try: `total - used - held` is `remaining`, and the reserve
+/// sits inside that remainder rather than beside it. Required completion
+/// work may draw against it, so a remaining figure that excluded it would
+/// under-report what the task has.
+fn budget_amounts_prose(amounts: &BudgetSnapshot) -> String {
+    let unit = unit_noun(amounts.kind()).unwrap_or("percent of quota");
+    let mut out = format!(
+        "  budget limit     {} {} — this task's envelope, fixed when it was\n\
+         \x20                  admitted and never amended since\n",
+        grouped_f64(amounts.total().as_f64()),
+        unit,
+    );
+    if !amounts.is_observed() {
+        // The envelope is real, so its ceiling is reported. Its
+        // consumption is not measured, so no consumption figure is
+        // printed — not even a zero, which is the "nothing has been spent"
+        // claim this state cannot support.
+        out.push_str(
+            "  budget used      not measured — no reservation has ever been made\n\
+             \x20                  against this envelope, so there is no settled spend\n\
+             \x20                  and no held capacity to report. Zero spend measured\n\
+             \x20                  and no measurement are different facts.\n",
+        );
+        return out;
+    }
+    out.push_str(&format!(
+        "  budget used      {} {} — settled: what finished turns actually cost\n",
+        grouped_f64(amounts.used().as_f64()),
+        unit,
+    ));
+    out.push_str(&format!(
+        "  budget held      {} {} — reserved by active reservations and not yet\n\
+         \x20                  settled. Never added to used: it becomes settled\n\
+         \x20                  spend when the turn finishes, and summing the two\n\
+         \x20                  would count it twice.\n",
+        grouped_f64(amounts.reserved().as_f64()),
+        unit,
+    ));
+    let remaining = amounts.remaining().value;
+    if remaining < 0.0 {
+        out.push_str(&format!(
+            "  budget remaining {} {} — negative: this envelope is overrun, which\n\
+             \x20                  is why it is reported signed rather than floored\n\
+             \x20                  at zero\n",
+            grouped_f64(remaining),
+            unit,
+        ));
+    } else {
+        out.push_str(&format!(
+            "  budget remaining {} {} — limit minus used minus held, which is the\n\
+             \x20                  ledger's own admission formula and not a second\n\
+             \x20                  sum computed for display\n",
+            grouped_f64(remaining),
+            unit,
+        ));
+    }
+    out.push_str(&format!(
+        "  completion res.  {} {} — protected for required completion work. Part\n\
+         \x20                  of the remainder above, not subtracted from it:\n\
+         \x20                  required work may draw against it.\n",
+        grouped_f64(amounts.completion_reserve().as_f64()),
+        unit,
+    ));
+    if let Some(utilization) = amounts.utilization() {
+        if utilization.is_finite() {
+            out.push_str(&format!(
+                "  budget pressure  {}% committed — used plus held, over the limit.\n\
+                 \x20                  This is the axis a risk reading belongs on; it is\n\
+                 \x20                  not the complement of the share above by\n\
+                 \x20                  coincidence, both come from these same figures.\n",
+                (utilization * 100.0).floor(),
+            ));
+        }
+    }
+    out
+}
+
 /// The read-only long form of the same state, for the shared `explain`
 /// surface.
 ///
@@ -942,10 +1493,19 @@ fn budget_posture_prose(posture: Option<BudgetPosture>) -> String {
 /// disagree about what a minute is.
 ///
 /// What it never prints: prompts, task or tool content, the estimator's
-/// free-text `reason`, the resource/cost quantiles, a credential, or a
-/// path. The ids it does print are local, ephemeral and the only handle a
-/// reader has on the work — unlike Fornax's claim and session ids, which
-/// answer no question this surface is asked.
+/// free-text `reason`, the estimator's resource/cost quantiles, a
+/// credential, or a path. The ids it does print are local, ephemeral and
+/// the only handle a reader has on the work — unlike Fornax's claim and
+/// session ids, which answer no question this surface is asked.
+///
+/// It *does* print the task's own budget figures as of HORO-1709 — limit,
+/// settled spend, held capacity, remainder, Completion Reserve and
+/// pressure — which is a deliberate narrowing of what used to be a blanket
+/// "no resource figures" promise. The estimator's quantiles are a
+/// prediction about work nobody has done and stay off every surface; the
+/// ledger's record of this task's envelope is the question the user came
+/// here to have answered, and withholding it was costing them the ability
+/// to tell a nearly-spent envelope from a nearly-untouched one.
 pub fn explain_text(status: &StatusResult, doctor: Option<&DoctorResult>) -> String {
     let mut out = String::from("Libra — the task being governed on this machine (host-wide)\n\n");
 
@@ -998,31 +1558,72 @@ pub fn explain_text(status: &StatusResult, doctor: Option<&DoctorResult>) -> Str
                 "  replan state     {}\n",
                 replan_state_prose(&task.replan_state)
             ));
-            // A share, in both places, and for the same reason the segment
-            // carries one: the hard limit, the settled spend, the active
-            // reservations and the Completion Reserve are all resource
-            // figures, and this surface's closing paragraph promises it does
-            // not print those. "How much room is left" is answerable without
-            // disclosing what the room is measured in.
             out.push_str(&format!(
                 "  budget           {}\n",
-                budget_posture_prose(status.task_budget)
+                budget_posture_prose(status.task_budget, status.task_budget_amounts.as_ref())
             ));
-            if task.replan_state == ReplanState::EscalatedAwaitingApproval {
-                out.push_str(
-                    "\n  This task has used up its automatic-replan budget, so the next\n",
-                );
-                out.push_str(
-                    "  material deviation will not be silently replanned again. Nothing\n",
-                );
-                out.push_str(
-                    "  is blocked and nothing is waiting on an answer from you — Libra's\n",
-                );
-                out.push_str("  hooks are advisory, and the task is still running. What has\n");
-                out.push_str("  changed is that the plan and estimate above will no longer be\n");
-                out.push_str("  corrected automatically, so they are worth re-reading yourself.\n");
+            // The figures behind that share, unconditionally (HORO-1709).
+            //
+            // The wording preference does not reach this surface: it exists
+            // because a statusline has one line, and `explain` is the place
+            // a user comes precisely to be told the whole thing. There is
+            // nothing to abbreviate here and no 48-character ceiling.
+            //
+            // `used` and `held` are separate lines and never added together.
+            // A reservation is capacity committed and not yet spent; it
+            // becomes settled spend when the turn finishes, and a surface
+            // that had presented the sum as "used" would then count it
+            // twice. `remaining` is `total - used - held`, which is the
+            // ledger's own admission formula and not a display-side variant
+            // of it.
+            if let Some(amounts) = status.task_budget_amounts.as_ref() {
+                out.push_str(&budget_amounts_prose(amounts));
             }
         }
+    }
+
+    // The configured default, in both states and labelled as a different
+    // scope in both (HORO-1709).
+    //
+    // Shown beside an active task rather than only while idle, because
+    // this is the surface on which the distinction is *explainable*: the
+    // task's envelope was fixed at admission and the configured default
+    // can be edited mid-task, so the two legitimately differ and a user
+    // comparing them needs to be told which is which rather than left to
+    // guess that the bigger number is the real one.
+    if let Some(configured) = status.configured_budget.as_ref() {
+        let ceiling = configured.ceiling;
+        out.push_str(&format!(
+            "\n  configured limit {} {} — the ceiling a new task would be\n\
+             \x20                  admitted to, from the policy now in force. Not a\n\
+             \x20                  remaining balance, and not the envelope of any task\n\
+             \x20                  already running.\n",
+            grouped_f64(ceiling.as_f64()),
+            unit_noun(ceiling.kind()).unwrap_or("percent of quota"),
+        ));
+    }
+    // And the one envelope with no local source at all. Said out loud
+    // rather than omitted: a reader who has been shown two envelopes will
+    // otherwise assume the absence of a third means there is no cap above
+    // them, which is a claim this machine has no way to make.
+    out.push_str(
+        "  host cap         not established — nothing on this machine records a\n\
+         \x20                  per-principal or organisation ceiling, so none is\n\
+         \x20                  reported. That is an absence of a record, not a\n\
+         \x20                  finding that no such ceiling exists.\n",
+    );
+
+    if status
+        .current_task
+        .as_ref()
+        .is_some_and(|task| task.replan_state == ReplanState::EscalatedAwaitingApproval)
+    {
+        out.push_str("\n  This task has used up its automatic-replan budget, so the next\n");
+        out.push_str("  material deviation will not be silently replanned again. Nothing\n");
+        out.push_str("  is blocked and nothing is waiting on an answer from you — Libra's\n");
+        out.push_str("  hooks are advisory, and the task is still running. What has\n");
+        out.push_str("  changed is that the plan and estimate above will no longer be\n");
+        out.push_str("  corrected automatically, so they are worth re-reading yourself.\n");
     }
 
     out.push('\n');
@@ -1049,8 +1650,18 @@ pub fn explain_text(status: &StatusResult, doctor: Option<&DoctorResult>) -> Str
     }
 
     out.push_str("\n  Not shown here: prompts, task or tool content, the estimator's\n");
-    out.push_str("  free-text reasoning, and resource/cost quantiles. Libra keeps that\n");
-    out.push_str("  material local and off every rendering surface.\n");
+    out.push_str("  free-text reasoning, and its resource/cost quantiles. Libra keeps\n");
+    out.push_str("  that material local and off every rendering surface.\n");
+    // The distinction the previous line is now careful about: the
+    // *estimator's* resource and cost quantiles are a prediction about work
+    // nobody has done, and they stay off. The budget figures above are the
+    // ledger's record of this task's own envelope, which HORO-1709 is
+    // specifically about showing. Both sentences are needed, because a
+    // reader who has just been shown four budget figures and then told
+    // "resource figures are not shown" would reasonably conclude the tool
+    // is lying about one of the two.
+    out.push_str("  The budget figures above are not in that category: they are this\n");
+    out.push_str("  task's own ledger record, not a prediction, and they are local.\n");
     out
 }
 
@@ -1073,7 +1684,10 @@ pub fn run_explain() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libra_governor_domain::{BucketTier, Estimate, PlanId, ResourceAmount, TaskId};
+    use libra_governor_domain::{
+        BucketTier, BudgetSnapshot, Estimate, PlanId, ResourceAmount, ResourceKind, TaskId,
+    };
+    use libra_governor_protocol::ConfiguredBudget;
 
     // ---------------------------------------------------------------- fixtures
 
@@ -1124,6 +1738,8 @@ mod tests {
             // bug shows up as a wrong digit instead of as the right one by
             // luck.
             task_budget: Some(BUDGET_LEFT),
+            task_budget_amounts: Some(BUDGET_LEFT_AMOUNTS),
+            configured_budget: Some(CONFIGURED),
         }
     }
 
@@ -1131,6 +1747,103 @@ mod tests {
     const BUDGET_LEFT: BudgetPosture = BudgetPosture::Remaining {
         fraction_left: 0.38,
     };
+
+    /// The amounts that *produce* [`BUDGET_LEFT`]: a 150,000-token
+    /// envelope with 18,000 settled and 75,000 held, so 57,000 remain and
+    /// `57_000 / 150_000` is exactly `0.38`.
+    ///
+    /// Tokens, not currency, because every envelope a live Libra daemon
+    /// writes is denominated in tokens (HORO-1725/HORO-1727) — a dollar
+    /// fixture here would be testing a shape the product does not
+    /// produce. `budget_fixtures_classify_to_the_posture_they_are_paired_with`
+    /// below pins this against [`BudgetPosture::from_snapshot`] so the
+    /// pair cannot drift into describing two different envelopes.
+    const BUDGET_LEFT_AMOUNTS: BudgetSnapshot = BudgetSnapshot::new(
+        ResourceKind::Tokens,
+        150_000.0,
+        30_000.0,
+        18_000.0,
+        75_000.0,
+        2,
+    );
+
+    /// The daemon's running ceiling — a different scope from the active
+    /// task's envelope, and deliberately a different number from
+    /// [`BUDGET_LEFT_AMOUNTS`]'s ceiling so a test cannot pass by
+    /// accidentally reading one for the other.
+    const CONFIGURED: ConfiguredBudget = ConfiguredBudget {
+        ceiling: ResourceAmount::Tokens(200_000),
+    };
+
+    /// A quota envelope: 100 "percent of quota", 62 of it committed.
+    ///
+    /// Reachable — `ResourceKind::QuotaPercent` is a policy target a
+    /// `config.json` may name — and the one kind whose amounts *are*
+    /// percentages. "62 of 100 quota percent left (38%)" states the share
+    /// twice as though the two were different facts, so this fixture
+    /// exists to pin the decision to show no amount span for it at all.
+    const QUOTA_AMOUNTS: BudgetSnapshot =
+        BudgetSnapshot::new(ResourceKind::QuotaPercent, 100.0, 20.0, 42.0, 20.0, 3);
+
+    /// An overrun: a 150,000-token envelope with 165,000 settled against
+    /// it, so the remainder is `-15,000` and utilization is 110%.
+    ///
+    /// Real, because Libra's hooks are advisory: the ledger refuses the
+    /// *next* reservation, it does not stop a turn already running from
+    /// costing more than it reserved. The contract's `count` is unsigned,
+    /// which is exactly the shape this fixture is here to stop a
+    /// renderer from clamping a deficit into.
+    const OVERRUN_AMOUNTS: BudgetSnapshot =
+        BudgetSnapshot::new(ResourceKind::Tokens, 150_000.0, 30_000.0, 165_000.0, 0.0, 6);
+
+    /// An envelope past the host's billion-unit `count` ceiling, with
+    /// `used` and `reserved` wide enough that the full label cannot fit in
+    /// 48 characters either. Both fallbacks in one fixture, because both
+    /// are triggered by the same cause — a big envelope — and a test that
+    /// only had a small one would exercise neither.
+    const HUGE_AMOUNTS: BudgetSnapshot = BudgetSnapshot::new(
+        ResourceKind::Tokens,
+        4_000_000_000.0,
+        100_000_000.0,
+        1_480_000_000.0,
+        1_000_000_000.0,
+        9,
+    );
+
+    /// The amounts behind a posture, for the fixtures that vary it.
+    ///
+    /// `None` for the two postures that have no snapshot behind them by
+    /// construction: `NotEstablished` means there is no budget row to
+    /// read, `Unreadable` means the read failed. Both are the daemon's
+    /// `(posture, None)` shape, not a snapshot that happens to look
+    /// empty.
+    fn amounts_for(posture: BudgetPosture) -> Option<BudgetSnapshot> {
+        Some(match posture {
+            BudgetPosture::Remaining { .. } => BUDGET_LEFT_AMOUNTS,
+            // An envelope with no reservation row in any state: the
+            // HORO-1708 case.
+            BudgetPosture::Uncommitted => {
+                BudgetSnapshot::new(ResourceKind::Tokens, 150_000.0, 30_000.0, 0.0, 0.0, 0)
+            }
+            BudgetPosture::Exhausted => {
+                BudgetSnapshot::new(ResourceKind::Tokens, 150_000.0, 30_000.0, 150_000.0, 0.0, 4)
+            }
+            BudgetPosture::NotEstablished | BudgetPosture::Unreadable => return None,
+        })
+    }
+
+    /// Sets the budget half of a fixture reply the way the daemon sets
+    /// it: the posture and the amounts together, from one snapshot, never
+    /// one without the other (HORO-1709).
+    ///
+    /// A test that assigned only `task_budget` would be describing a wire
+    /// message the daemon cannot send — and, worse, would quietly stop
+    /// exercising the amounts path while still looking like it covered
+    /// that posture.
+    fn set_budget(status: &mut StatusResult, posture: Option<BudgetPosture>) {
+        status.task_budget_amounts = posture.and_then(amounts_for);
+        status.task_budget = posture;
+    }
 
     /// Every budget shape the daemon can report, plus the absence of the
     /// field.
@@ -1149,12 +1862,50 @@ mod tests {
         ("unreadable", Some(BudgetPosture::Unreadable)),
     ];
 
-    /// The idle shape: no task, and so no share of a budget that was never
-    /// admitted.
+    /// The idle shape: no task, and so no share and no amounts of a
+    /// budget that was never admitted.
+    ///
+    /// `configured_budget` is nonetheless `Some`, because that is what an
+    /// idle daemon really sends (HORO-1709): the ceiling the *next* task
+    /// would get is a fact it knows authoritatively even with nothing
+    /// running. Keeping it populated here is what makes the idle
+    /// assertions below load-bearing — they prove the provider does not
+    /// turn a configured setting into an active-task reading, rather than
+    /// proving it has nothing to turn.
     fn idle() -> StatusResult {
         StatusResult {
             current_task: None,
             task_budget: None,
+            task_budget_amounts: None,
+            configured_budget: Some(CONFIGURED),
+        }
+    }
+
+    /// Fixture-drift guard. Each `(posture, amounts)` pair above must
+    /// describe one envelope: the amounts, classified by the daemon's own
+    /// rule, must come back as the posture they are paired with. Without
+    /// this, a fixture could pair "38% left" with an exhausted snapshot
+    /// and every assertion built on it would be testing a state the
+    /// product cannot reach.
+    #[test]
+    fn budget_fixtures_classify_to_the_posture_they_are_paired_with() {
+        for posture in [
+            BUDGET_LEFT,
+            BudgetPosture::Uncommitted,
+            BudgetPosture::Exhausted,
+        ] {
+            let amounts = amounts_for(posture).expect("these three have amounts behind them");
+            assert_eq!(
+                BudgetPosture::from_snapshot(&amounts),
+                posture,
+                "fixture amounts do not classify to {posture:?}"
+            );
+        }
+        for posture in [BudgetPosture::NotEstablished, BudgetPosture::Unreadable] {
+            assert!(
+                amounts_for(posture).is_none(),
+                "{posture:?} has no snapshot behind it by construction"
+            );
         }
     }
 
@@ -1201,6 +1952,52 @@ mod tests {
         document["segments"].as_array().unwrap()
     }
 
+    /// [`super::reading`] with the wording preference pinned to the
+    /// pre-ticket default, shadowing the real one for the whole test
+    /// module so that the ~thirty tests predating HORO-1709 keep reading
+    /// as three-argument calls about documents rather than about a
+    /// preference none of them is concerned with.
+    ///
+    /// Every test that *is* about the preference names the display it
+    /// means, through [`reading_showing`] or `super::reading` directly.
+    fn reading(status: &StatusResult, doctor: Option<&DoctorResult>, now: OffsetDateTime) -> Value {
+        super::reading(status, doctor, now, BudgetDisplay::Percent)
+    }
+
+    /// The same, at a chosen level of detail.
+    fn reading_showing(
+        status: &StatusResult,
+        doctor: Option<&DoctorResult>,
+        display: BudgetDisplay,
+    ) -> Value {
+        super::reading(status, doctor, now(), display)
+    }
+
+    /// Every display preference, for the properties that must hold however
+    /// the user has asked to be told. The preference changes which fields
+    /// a document carries, so a property proven only at the default is
+    /// proven for one of five documents.
+    const ALL_DISPLAYS: [(&str, BudgetDisplay); 5] = [
+        ("percent", BudgetDisplay::Percent),
+        ("remaining", BudgetDisplay::Remaining),
+        ("remaining+total", BudgetDisplay::RemainingAndTotal),
+        ("used+remaining+total", BudgetDisplay::UsedRemainingAndTotal),
+        ("full", BudgetDisplay::Full),
+    ];
+
+    /// Pins [`ALL_DISPLAYS`] to the enum rather than to a hand-written
+    /// list: a sixth variant must either appear in the sweeps below or
+    /// fail here, never be silently uncovered.
+    #[test]
+    fn the_display_sweep_covers_every_choice_the_cli_accepts() {
+        assert_eq!(ALL_DISPLAYS.len(), BudgetDisplay::CHOICES.len());
+        for ((swept_name, swept), (name, choice)) in ALL_DISPLAYS.iter().zip(BudgetDisplay::CHOICES)
+        {
+            assert_eq!(*swept_name, name);
+            assert_eq!(*swept, choice);
+        }
+    }
+
     /// Every document this provider can emit, for the properties that must
     /// hold in *all* of them rather than in a chosen one.
     fn every_document() -> Vec<(String, Value)> {
@@ -1228,24 +2025,55 @@ mod tests {
             for (doctor_name, doctor) in &doctors {
                 for (estimate_name, p90) in [("with-p90", Some(600u64)), ("no-p90", None)] {
                     for (budget_name, budget) in ALL_BUDGETS {
-                        let mut status = status_with(state);
-                        status.current_task.as_mut().unwrap().remaining_estimate =
-                            estimate_with(p90, p90.is_none(), 7);
-                        status.task_budget = budget;
-                        out.push((
-                            format!(
-                                "reading/{state_name}/{doctor_name}/{estimate_name}/{budget_name}"
-                            ),
-                            reading(&status, doctor.as_ref(), now()),
-                        ));
+                        for (display_name, display) in ALL_DISPLAYS {
+                            let mut status = status_with(state);
+                            status.current_task.as_mut().unwrap().remaining_estimate =
+                                estimate_with(p90, p90.is_none(), 7);
+                            set_budget(&mut status, budget);
+                            out.push((
+                                format!(
+                                    "reading/{state_name}/{doctor_name}/{estimate_name}/\
+                                     {budget_name}/{display_name}"
+                                ),
+                                super::reading(&status, doctor.as_ref(), now(), display),
+                            ));
+                        }
                     }
                 }
             }
         }
-        out.push((
-            "reading/idle".to_string(),
-            reading(&idle(), Some(&doctor_with("balanced", true)), now()),
-        ));
+        // Idle at every display too: the configured-ceiling segment only
+        // exists at some of them, and a host rule it broke would otherwise
+        // be proven against the one shape that omits it.
+        for (display_name, display) in ALL_DISPLAYS {
+            out.push((
+                format!("reading/idle/{display_name}"),
+                super::reading(
+                    &idle(),
+                    Some(&doctor_with("balanced", true)),
+                    now(),
+                    display,
+                ),
+            ));
+        }
+        // And the two envelope shapes HORO-1709 has to render without a
+        // currency: a quota envelope, whose figures are themselves
+        // percentages, and an overrun, whose remainder is negative.
+        for (display_name, display) in ALL_DISPLAYS {
+            for (shape_name, amounts) in [
+                ("quota", QUOTA_AMOUNTS),
+                ("overrun", OVERRUN_AMOUNTS),
+                ("huge", HUGE_AMOUNTS),
+            ] {
+                let mut status = status_with(ReplanState::Stable);
+                status.task_budget = Some(BudgetPosture::from_snapshot(&amounts));
+                status.task_budget_amounts = Some(amounts);
+                out.push((
+                    format!("reading/{shape_name}/{display_name}"),
+                    super::reading(&status, None, now(), display),
+                ));
+            }
+        }
         out
     }
 
@@ -1578,7 +2406,7 @@ mod tests {
 
     fn with_budget(posture: Option<BudgetPosture>) -> Value {
         let mut status = status_with(ReplanState::Stable);
-        status.task_budget = posture;
+        set_budget(&mut status, posture);
         reading(&status, None, now())
     }
 
@@ -1610,9 +2438,20 @@ mod tests {
         // is asserted here. A guard no test executes is a guard nobody has
         // read, and this one's label is the only thing the user would see.
         for fraction in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -0.5, 1.5] {
-            let document = with_budget(Some(BudgetPosture::Remaining {
+            // Deliberately the share-only shape, with no amounts beside
+            // it. A malformed share *next to* a well-formed snapshot is
+            // not this state: under HORO-1709 the snapshot is the
+            // authority and the provider recomputes the share from it, so
+            // pairing the two would be testing which of two contradictory
+            // numbers wins — which is
+            // `authoritative_amounts_outrank_a_transported_share`'s
+            // question, not this one's.
+            let mut status = status_with(ReplanState::Stable);
+            status.task_budget = Some(BudgetPosture::Remaining {
                 fraction_left: fraction,
-            }));
+            });
+            status.task_budget_amounts = None;
+            let document = reading(&status, None, now());
             let budget = segments(&document)
                 .iter()
                 .find(|s| s["key"] == json!("budget"))
@@ -1647,12 +2486,21 @@ mod tests {
         // The axis lives in the format template, so there is no code path
         // that can print the number without it — this proves the claim over
         // every number the template can be handed.
+        //
+        // Share-only, so the sweep's fraction is the one rendered: with
+        // amounts present the snapshot is the authority and all 1001
+        // iterations would render the fixture's 38%, which would sweep
+        // nothing. The amount-bearing labels get their own axis assertion
+        // in `every_amount_label_still_names_what_its_percentage_measures`.
         let mut seen_percent = 0;
         for permille in 0..=1000u32 {
             let fraction = f64::from(permille) / 1000.0;
-            let document = with_budget(Some(BudgetPosture::Remaining {
+            let mut status = status_with(ReplanState::Stable);
+            status.task_budget = Some(BudgetPosture::Remaining {
                 fraction_left: fraction,
-            }));
+            });
+            status.task_budget_amounts = None;
+            let document = reading(&status, None, now());
             let label = budget_label(&document).expect("a budget is always reported");
             if !label.contains('%') {
                 // A fraction outside `0.0..=1.0` (only 0.0 here) is reported
@@ -1777,7 +2625,7 @@ mod tests {
         // The statusline has room only to name the unknown; `explain` is
         // where a user finds out that the omission is deliberate rather
         // than a missing reading.
-        let prose = budget_posture_prose(Some(BudgetPosture::Uncommitted));
+        let prose = budget_posture_prose(Some(BudgetPosture::Uncommitted), None);
         assert!(prose.starts_with("unknown — "), "{prose}");
         assert!(prose.contains("nothing has been"), "{prose}");
         assert!(!prose.contains('%'), "{prose}");
@@ -1785,9 +2633,12 @@ mod tests {
         // read as saying the task has no envelope at all.
         assert_ne!(
             prose,
-            budget_posture_prose(Some(BudgetPosture::NotEstablished))
+            budget_posture_prose(Some(BudgetPosture::NotEstablished), None)
         );
-        assert_ne!(prose, budget_posture_prose(Some(BudgetPosture::Unreadable)));
+        assert_ne!(
+            prose,
+            budget_posture_prose(Some(BudgetPosture::Unreadable), None)
+        );
     }
 
     #[test]
@@ -1841,7 +2692,7 @@ mod tests {
         // absent — and the idle document must not grow a reading for it even
         // if a peer sent one.
         let mut status = idle();
-        status.task_budget = Some(BudgetPosture::Exhausted);
+        set_budget(&mut status, Some(BudgetPosture::Exhausted));
         let document = reading(&status, None, now());
         assert!(budget_label(&document).is_none());
         assert_eq!(segments(&document).len(), 1);
@@ -1856,6 +2707,939 @@ mod tests {
         // timed-out second round trip produces.
         let document = reading(&status_with(ReplanState::Stable), None, now());
         assert_eq!(budget_label(&document).as_deref(), Some("38% budget left"));
+    }
+
+    // ------------------------------------------- HORO-1709: budget amounts
+
+    /// The `budget` segment of a document, or `None`.
+    fn budget_of(document: &Value) -> Option<Value> {
+        segments(document)
+            .iter()
+            .find(|s| s["key"] == json!("budget"))
+            .cloned()
+    }
+
+    /// An active-task document at a chosen display, with chosen amounts.
+    fn with_amounts(amounts: BudgetSnapshot, display: BudgetDisplay) -> Value {
+        let mut status = status_with(ReplanState::Stable);
+        status.task_budget = Some(BudgetPosture::from_snapshot(&amounts));
+        status.task_budget_amounts = Some(amounts);
+        reading_showing(&status, None, display)
+    }
+
+    #[test]
+    fn the_default_display_is_byte_identical_to_the_pre_ticket_line() {
+        // AC 2: existing users are not silently changed during upgrade. The
+        // strongest form of that is not "the label is similar" but "the
+        // whole document is the same bytes", which also catches a
+        // structured field accidentally gated the wrong way.
+        let status = status_with(ReplanState::Stable);
+        let default = reading_showing(&status, None, BudgetDisplay::default());
+        let budget = budget_of(&default).expect("an active task has a budget segment");
+        assert_eq!(budget["label"], json!("38% budget left"));
+        assert!(
+            budget.get("count").is_none() && budget.get("total").is_none(),
+            "the default must add no amount span: {budget}"
+        );
+        assert_eq!(
+            BudgetDisplay::default(),
+            BudgetDisplay::Percent,
+            "if this ever changes, every install's line changes with it"
+        );
+    }
+
+    #[test]
+    fn every_choice_the_cli_offers_changes_the_document_it_governs() {
+        // A preference the renderer quietly ignores is worse than no
+        // preference: the user records a choice, the CLI confirms it, and
+        // nothing happens. So each of the five spellings must reach the
+        // output as a document distinguishable from all four others.
+        let mut status = status_with(ReplanState::Stable);
+        status.task_budget = Some(BudgetPosture::from_snapshot(&BUDGET_LEFT_AMOUNTS));
+        status.task_budget_amounts = Some(BUDGET_LEFT_AMOUNTS);
+        let mut seen = Vec::new();
+        for (name, display) in ALL_DISPLAYS {
+            let document = super::reading(&status, None, now(), display);
+            assert!(
+                !seen.iter().any(|(_, prior)| prior == &document),
+                "{name} renders identically to an earlier choice"
+            );
+            seen.push((name, document));
+        }
+        assert_eq!(seen.len(), BudgetDisplay::CHOICES.len());
+    }
+
+    #[test]
+    fn asking_for_amounts_adds_the_contract_fields_the_host_formats() {
+        // AC 1/13: the amount is rendered in the envelope's own unit,
+        // through the contract's own `count`/`total`/`count_label` rather
+        // than through a span this provider formatted. 57,000 of 150,000
+        // tokens, which is the fixture's arithmetic and not a round number.
+        let document = with_amounts(BUDGET_LEFT_AMOUNTS, BudgetDisplay::RemainingAndTotal);
+        let budget = budget_of(&document).unwrap();
+        assert_eq!(budget["count"], json!(57_000));
+        assert_eq!(budget["total"], json!(150_000));
+        assert_eq!(
+            budget["count_label"],
+            json!("tokens"),
+            "the unit is the envelope's own, never inferred from the number"
+        );
+        assert_eq!(
+            budget["label"],
+            json!("38% budget left"),
+            "the host renders the count span; the label does not duplicate it"
+        );
+    }
+
+    #[test]
+    fn remaining_alone_omits_the_total_rather_than_inventing_one() {
+        let budget =
+            budget_of(&with_amounts(BUDGET_LEFT_AMOUNTS, BudgetDisplay::Remaining)).unwrap();
+        assert_eq!(budget["count"], json!(57_000));
+        assert_eq!(budget["count_label"], json!("tokens"));
+        assert!(
+            budget.get("total").is_none(),
+            "the user asked for the remainder, not the envelope: {budget}"
+        );
+    }
+
+    #[test]
+    fn a_count_always_arrives_with_the_noun_that_says_what_it_counts() {
+        // The contract requires `count_label` whenever `count` is set, and
+        // refuses the document otherwise. Swept over every display and
+        // every segment, because this is a rule about documents rather
+        // than about the budget segment.
+        for (name, document) in every_document() {
+            for segment in segments(&document) {
+                if segment.get("count").is_some() || segment.get("total").is_some() {
+                    assert!(
+                        segment.get("count_label").is_some(),
+                        "{name}: {segment} has a counter with no noun"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn used_and_held_reach_the_label_because_the_contract_has_no_field_for_them() {
+        let full = budget_of(&with_amounts(BUDGET_LEFT_AMOUNTS, BudgetDisplay::Full)).unwrap();
+        assert_eq!(full["label"], json!("38% left, 18,000 used, 75,000 held"));
+        let used_only = budget_of(&with_amounts(
+            BUDGET_LEFT_AMOUNTS,
+            BudgetDisplay::UsedRemainingAndTotal,
+        ))
+        .unwrap();
+        assert_eq!(used_only["label"], json!("38% left, 18,000 used"));
+        assert!(
+            !used_only["label"].as_str().unwrap().contains("held"),
+            "held capacity is only shown at `full`: {used_only}"
+        );
+    }
+
+    #[test]
+    fn held_capacity_is_never_folded_into_settled_spend() {
+        // The ticket is explicit: do not double-count reserved amounts as
+        // settled spend. The fixture's two figures are deliberately
+        // different and their sum is a third distinct number, so a
+        // renderer that added them would print 93,000 and be caught.
+        let amounts = BUDGET_LEFT_AMOUNTS;
+        assert_eq!(amounts.used().as_f64(), 18_000.0);
+        assert_eq!(amounts.reserved().as_f64(), 75_000.0);
+        let budget = budget_of(&with_amounts(amounts, BudgetDisplay::Full)).unwrap();
+        assert_eq!(budget["budget_used"], json!(18_000.0));
+        assert_eq!(budget["budget_reserved"], json!(75_000.0));
+        let label = budget["label"].as_str().unwrap().to_string();
+        assert!(
+            !label.contains("93,000"),
+            "used and held were summed: {label}"
+        );
+        let text = {
+            let mut status = status_with(ReplanState::Stable);
+            status.task_budget = Some(BudgetPosture::from_snapshot(&amounts));
+            status.task_budget_amounts = Some(amounts);
+            explain_text(&status, None)
+        };
+        assert!(!text.contains("93,000"), "explain summed them: {text}");
+    }
+
+    #[test]
+    fn the_structured_breakdown_is_present_whatever_the_wording_preference() {
+        // The preference governs the compact phrase. It must not gate what
+        // Detail, `explain` and HORO-1719's palette are allowed to know,
+        // or a percentage-only user's renderer would have no pressure
+        // reading to colour from.
+        for (name, display) in ALL_DISPLAYS {
+            let budget = budget_of(&with_amounts(BUDGET_LEFT_AMOUNTS, display)).unwrap();
+            assert_eq!(budget["budget_total"], json!(150_000.0), "{name}");
+            assert_eq!(budget["budget_used"], json!(18_000.0), "{name}");
+            assert_eq!(budget["budget_reserved"], json!(75_000.0), "{name}");
+            assert_eq!(budget["budget_remaining"], json!(57_000.0), "{name}");
+            assert_eq!(budget["budget_unit"], json!("tokens"), "{name}");
+            assert_eq!(budget["budget_scope"], json!("active_task"), "{name}");
+            assert_eq!(budget["budget_pressure_percent"], json!(62.0), "{name}");
+            assert_eq!(budget["semantic_state"], json!("caution"), "{name}");
+        }
+    }
+
+    #[test]
+    fn pressure_is_read_off_utilization_and_not_off_the_displayed_share() {
+        // The ticket's own example: `38% left` is 62% *utilized*, which is
+        // CAUTION. A renderer that banded the displayed number would read
+        // 38 as SAFE and paint a two-thirds-spent envelope green.
+        assert_eq!(pressure_band(Some(0.62)), Some("caution"));
+        assert_eq!(
+            pressure_band(Some(0.38)),
+            Some("safe"),
+            "premise: the two axes band differently, so the choice is load-bearing"
+        );
+        // The boundaries, each tested on both sides of the inequality the
+        // ticket wrote: 0..=50 safe, 50<..=70 caution, 70<..=90 warning,
+        // 90<..=100 critical, and above 100 still critical.
+        for (utilization, band) in [
+            (0.0, "safe"),
+            (0.5, "safe"),
+            (0.500_001, "caution"),
+            (0.7, "caution"),
+            (0.700_001, "warning"),
+            (0.9, "warning"),
+            (0.900_001, "critical"),
+            (1.0, "critical"),
+            (1.1, "critical"),
+            (12.0, "critical"),
+        ] {
+            assert_eq!(
+                pressure_band(Some(utilization)),
+                Some(band),
+                "{utilization} banded wrong"
+            );
+        }
+        // Absence of a reading is never reassurance.
+        assert_eq!(pressure_band(None), None);
+        assert_eq!(pressure_band(Some(f64::NAN)), None);
+        assert_eq!(pressure_band(Some(f64::INFINITY)), None);
+    }
+
+    #[test]
+    fn an_unobserved_envelope_gets_a_ceiling_and_no_consumption_figures() {
+        // The HORO-1708 defect, in its new form. `Uncommitted` means no
+        // economic event was ever attributed to this task, so there is a
+        // ceiling but nothing measured against it. A `count` here would
+        // have to be the whole ceiling — "150,000 of 150,000 tokens" — and
+        // a `budget_used: 0` would be the same claim in a structured
+        // field.
+        for (name, display) in ALL_DISPLAYS {
+            let amounts = amounts_for(BudgetPosture::Uncommitted).unwrap();
+            assert!(!amounts.is_observed(), "premise");
+            let budget = budget_of(&with_amounts(amounts, display)).unwrap();
+            assert_eq!(budget["label"], json!("Budget usage unknown"), "{name}");
+            assert!(
+                budget.get("count").is_none() && budget.get("total").is_none(),
+                "{name}: an unmeasured envelope presented a counter: {budget}"
+            );
+            assert_eq!(budget["budget_observed"], json!(false), "{name}");
+            assert_eq!(
+                budget["budget_total"],
+                json!(150_000.0),
+                "{name}: the ceiling is authoritative even unobserved"
+            );
+            for fabricated in [
+                "budget_used",
+                "budget_reserved",
+                "budget_remaining",
+                "budget_pressure_percent",
+                "semantic_state",
+            ] {
+                assert!(
+                    budget.get(fabricated).is_none(),
+                    "{name}: {fabricated} was reported for an unmeasured envelope: {budget}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_spend_measured_is_distinguishable_from_nothing_measured() {
+        // "Zero must be distinguishable from unknown." Two envelopes with
+        // the same arithmetic and different evidence: one has a settled
+        // reservation of nothing, the other has no reservation at all.
+        let measured_zero = BudgetSnapshot::new(ResourceKind::Tokens, 150_000.0, 0.0, 0.0, 0.0, 1);
+        let unmeasured = BudgetSnapshot::new(ResourceKind::Tokens, 150_000.0, 0.0, 0.0, 0.0, 0);
+        assert_eq!(
+            measured_zero.remaining().value,
+            unmeasured.remaining().value
+        );
+
+        let measured = budget_of(&with_amounts(measured_zero, BudgetDisplay::Full)).unwrap();
+        let unknown = budget_of(&with_amounts(unmeasured, BudgetDisplay::Full)).unwrap();
+        assert_ne!(measured["label"], unknown["label"]);
+        assert_eq!(measured["budget_used"], json!(0.0));
+        assert!(unknown.get("budget_used").is_none());
+        assert_eq!(measured["budget_observed"], json!(true));
+        assert_eq!(unknown["budget_observed"], json!(false));
+        assert_eq!(
+            measured["label"],
+            json!("100% left, 0 used, 0 held"),
+            "a measured-empty envelope may say so; an unmeasured one may not"
+        );
+    }
+
+    #[test]
+    fn an_overrun_is_reported_signed_and_never_clamped_into_a_counter() {
+        // The contract's `count` is unsigned, so a deficit cannot ride it.
+        // Clamping to `0` would turn "15,000 over" into "exactly spent",
+        // which is the one state a user most needs told apart.
+        let amounts = OVERRUN_AMOUNTS;
+        assert_eq!(amounts.remaining().value, -15_000.0, "premise");
+        for (name, display) in ALL_DISPLAYS {
+            let budget = budget_of(&with_amounts(amounts, display)).unwrap();
+            assert_eq!(budget["label"], json!("Budget exhausted"), "{name}");
+            assert!(
+                budget.get("count").is_none(),
+                "{name}: a deficit was clamped into a count: {budget}"
+            );
+            assert_eq!(budget["budget_remaining"], json!(-15_000.0), "{name}");
+            assert_eq!(budget["semantic_state"], json!("critical"), "{name}");
+            assert_eq!(budget["budget_pressure_percent"], json!(110.0), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_quota_envelope_shows_no_amount_span_because_its_amounts_are_the_share() {
+        // "62 of 100 quota percent left (38%)" states one fact twice as
+        // though it were two. The share is kept, the span is declined, and
+        // the structured fields still carry the figures for a renderer
+        // that has a better idea.
+        let amounts = QUOTA_AMOUNTS;
+        assert_eq!(amounts.kind(), ResourceKind::QuotaPercent, "premise");
+        assert_eq!(unit_noun(ResourceKind::QuotaPercent), None);
+        for (name, display) in ALL_DISPLAYS {
+            let budget = budget_of(&with_amounts(amounts, display)).unwrap();
+            assert_eq!(budget["label"], json!("38% budget left"), "{name}");
+            assert!(
+                budget.get("count").is_none() && budget.get("count_label").is_none(),
+                "{name}: a quota envelope grew an amount span: {budget}"
+            );
+            assert!(
+                budget.get("budget_unit").is_none(),
+                "{name}: there is no noun for a percentage: {budget}"
+            );
+            assert_eq!(budget["budget_remaining"], json!(38.0), "{name}");
+            assert_eq!(budget["semantic_state"], json!("caution"), "{name}");
+        }
+    }
+
+    #[test]
+    fn usd_is_named_in_cents_rather_than_rendered_as_currency() {
+        // AC 7: USD is never assumed, and never *formatted* either. The
+        // host's label allowlist has no `$`, the contract's counters are
+        // integers, and `ResourceAmount::UsdCents` is cents — so a
+        // currency span is not expressible here and inventing one would
+        // put a currency renderer in a product. No live envelope is
+        // denominated this way today (HORO-1727), which is why the
+        // assertion is about honest naming rather than about a format.
+        assert_eq!(unit_noun(ResourceKind::Usd), Some("USD cents"));
+        let amounts = BudgetSnapshot::new(ResourceKind::Usd, 3_263.0, 600.0, 1_240.0, 783.0, 2);
+        for (name, display) in ALL_DISPLAYS {
+            let budget = budget_of(&with_amounts(amounts, display)).unwrap();
+            let rendered = serde_json::to_string(&budget).unwrap();
+            assert!(!rendered.contains('$'), "{name}: {rendered}");
+            assert_eq!(budget["budget_unit"], json!("USD cents"), "{name}");
+            if display != BudgetDisplay::Percent {
+                assert_eq!(budget["count"], json!(1_240), "{name}");
+                assert_eq!(budget["count_label"], json!("USD cents"), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_resource_kind_is_rendered_as_a_unit_it_was_not_denominated_in() {
+        // "Never assume USD because a number exists." Swept over the whole
+        // enum so a fourth kind cannot inherit tokens' noun by default.
+        for kind in [
+            ResourceKind::Tokens,
+            ResourceKind::Usd,
+            ResourceKind::QuotaPercent,
+        ] {
+            let amounts = BudgetSnapshot::new(kind, 1_000.0, 100.0, 380.0, 0.0, 2);
+            let budget = budget_of(&with_amounts(amounts, BudgetDisplay::Full)).unwrap();
+            let rendered = serde_json::to_string(&budget).unwrap();
+            for (other, noun) in [
+                (ResourceKind::Tokens, "tokens"),
+                (ResourceKind::Usd, "USD cents"),
+            ] {
+                if other == kind {
+                    continue;
+                }
+                assert!(
+                    !rendered.contains(noun),
+                    "{kind:?} was rendered as {noun}: {rendered}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_envelope_past_the_hosts_counter_ceiling_drops_to_a_share() {
+        // A clamped counter is simply a wrong number, and the host refuses
+        // anything over a billion. A share with no span is the honest
+        // answer, and the real figures still ride the structured fields,
+        // which are this provider's own and carry no such ceiling.
+        let amounts = HUGE_AMOUNTS;
+        assert!(amounts.total().as_f64() > f64::from(MAX_COUNT), "premise");
+        let budget = budget_of(&with_amounts(amounts, BudgetDisplay::Full)).unwrap();
+        assert!(
+            budget.get("count").is_none() && budget.get("total").is_none(),
+            "a figure past the ceiling was clamped into a counter: {budget}"
+        );
+        assert_eq!(budget["budget_total"], json!(4_000_000_000.0));
+        assert_eq!(budget["budget_remaining"], json!(1_520_000_000.0));
+        assert_eq!(
+            budget["label"],
+            json!("38% left, 1,480,000,000 used, 1,000,000,000 held")
+        );
+
+        // The ceiling applies per figure rather than to the segment: an
+        // envelope whose remainder fits still reports it, and simply omits
+        // the total it cannot express.
+        let mixed = BudgetSnapshot::new(ResourceKind::Tokens, 2e9, 0.0, 1.5e9, 0.0, 3);
+        let budget = budget_of(&with_amounts(mixed, BudgetDisplay::RemainingAndTotal)).unwrap();
+        assert_eq!(budget["count"], json!(500_000_000));
+        assert_eq!(budget["count_label"], json!("tokens"));
+        assert!(
+            budget.get("total").is_none(),
+            "the inexpressible figure took the expressible one with it: {budget}"
+        );
+    }
+
+    #[test]
+    fn a_label_too_long_for_the_host_falls_back_instead_of_costing_the_document() {
+        // An over-long label is refused by the host at the cost of the
+        // whole provider document, so Libra would render as nothing at
+        // precisely the moment it had the most to report. Every candidate
+        // the ladder can produce is therefore checked against the ceiling,
+        // and the shortest rung always fits.
+        for (name, display) in ALL_DISPLAYS {
+            for amounts in [
+                BUDGET_LEFT_AMOUNTS,
+                HUGE_AMOUNTS,
+                OVERRUN_AMOUNTS,
+                QUOTA_AMOUNTS,
+            ] {
+                let budget = budget_of(&with_amounts(amounts, display)).unwrap();
+                let label = budget["label"].as_str().unwrap();
+                assert!(
+                    label.len() <= MAX_LABEL_CHARS,
+                    "{name}: {label:?} is {} bytes",
+                    label.len()
+                );
+            }
+        }
+
+        // The rungs themselves, taken directly, because the width at which
+        // each one gives way is the whole behaviour. At thirteen digits
+        // apiece the three-figure phrase is exactly as wide as the host
+        // will take.
+        let widest = super::budget_label(38, Some(&HUGE_AMOUNTS), BudgetDisplay::Full);
+        assert_eq!(widest.len(), MAX_LABEL_CHARS, "{widest}");
+
+        // One digit more and the held figure is dropped, not the document.
+        let wider = BudgetSnapshot::new(ResourceKind::Tokens, 4e10, 0.0, 1.48e10, 1e10, 9);
+        assert_eq!(
+            super::budget_label(38, Some(&wider), BudgetDisplay::Full),
+            "38% left, 14,800,000,000 used"
+        );
+
+        // The last rung — the share alone — is a guard rather than a state
+        // any envelope can reach, and that is worth stating with the
+        // arithmetic rather than with a fixture that cannot exist. The
+        // widest figure a `ResourceAmount` can hold is `i64::MAX` cents;
+        // even that beside a three-digit percentage fits the two-figure
+        // phrase, while two of them do not fit the three-figure one.
+        let widest_figure = group_digits(&i64::MAX.to_string());
+        assert_eq!(widest_figure.len(), 25, "{widest_figure}");
+        assert!(
+            format!("100% left, {widest_figure} used").len() <= MAX_LABEL_CHARS,
+            "the two-figure phrase has width to spare at any real magnitude"
+        );
+        assert!(
+            format!("100% left, {widest_figure} used, {widest_figure} held").len()
+                > MAX_LABEL_CHARS,
+            "premise: the three-figure phrase is the one that can overflow"
+        );
+    }
+
+    #[test]
+    fn every_amount_label_still_names_what_its_percentage_measures() {
+        // The axis rule from HORO-1634 survives the new wording: the
+        // shortened "38% left" is still a direction, and `left` is the
+        // word carrying it. Checked across the whole document sweep rather
+        // than on one fixture.
+        for (name, document) in every_document() {
+            let Some(budget) = budget_of(&document) else {
+                continue;
+            };
+            let label = budget["label"].as_str().unwrap();
+            if !label.contains('%') {
+                continue;
+            }
+            assert!(
+                label.contains("left"),
+                "{name}: {label:?} is a percentage with no direction"
+            );
+        }
+    }
+
+    #[test]
+    fn the_percentage_is_recomputed_from_the_amounts_it_sits_beside() {
+        // AC 5, at the transport layer. `serde_json`'s default float
+        // parser is approximate — exact `f64` round-tripping is behind its
+        // `float_roundtrip` feature, which is not enabled — while integral
+        // amounts round-trip exactly. A share sitting on a whole-percent
+        // boundary can therefore come back a hair low and render a point
+        // lower than the amounts beside it, because `percent_left` floors.
+        //
+        // Simulated by handing the provider a share one ULP below a
+        // boundary beside the amounts that produce the boundary exactly.
+        let amounts = BudgetSnapshot::new(ResourceKind::Tokens, 100_000.0, 0.0, 40_000.0, 0.0, 2);
+        assert_eq!(amounts.fraction_left(), Some(0.6), "premise: exactly 60%");
+        let mut status = status_with(ReplanState::Stable);
+        status.task_budget = Some(BudgetPosture::Remaining {
+            fraction_left: f64::from_bits(0.6f64.to_bits() - 1),
+        });
+        status.task_budget_amounts = Some(amounts);
+        assert_eq!(
+            percent_left(f64::from_bits(0.6f64.to_bits() - 1)),
+            Some(59),
+            "premise: the degraded share really does floor a point lower"
+        );
+        let budget = budget_of(&reading(&status, None, now())).unwrap();
+        assert_eq!(
+            budget["label"],
+            json!("60% budget left"),
+            "the share was read off the wire instead of off the amounts"
+        );
+    }
+
+    #[test]
+    fn authoritative_amounts_outrank_a_transported_share() {
+        // The general rule behind the ULP case: when the two disagree, the
+        // amounts win, because they are the figures the share was computed
+        // from and the only ones a user can check. Driven with a share
+        // that is wildly wrong rather than a hair wrong, so the precedence
+        // is unmistakable.
+        let mut status = status_with(ReplanState::Stable);
+        status.task_budget = Some(BudgetPosture::Remaining { fraction_left: 0.9 });
+        status.task_budget_amounts = Some(BUDGET_LEFT_AMOUNTS);
+        let budget = budget_of(&reading(&status, None, now())).unwrap();
+        assert_eq!(budget["label"], json!("38% budget left"));
+        // And the posture's share is still honoured when no amounts came
+        // with it — a peer that sends only the classification is not
+        // thereby reported as having no budget.
+        status.task_budget_amounts = None;
+        let budget = budget_of(&reading(&status, None, now())).unwrap();
+        assert_eq!(budget["label"], json!("90% budget left"));
+    }
+
+    #[test]
+    fn the_percentage_and_the_count_describe_one_instant() {
+        // AC 5 as an arithmetic identity rather than as a pair of fixed
+        // strings: whatever the figures, the displayed share must be the
+        // share the displayed counters imply. Swept over a range of
+        // envelopes so it cannot pass on the fixture's happy numbers.
+        for settled in [0u64, 1, 7, 1_000, 49_999, 75_000, 149_999] {
+            let amounts =
+                BudgetSnapshot::new(ResourceKind::Tokens, 150_000.0, 0.0, settled as f64, 0.0, 2);
+            let budget =
+                budget_of(&with_amounts(amounts, BudgetDisplay::RemainingAndTotal)).unwrap();
+            let Some(label) = budget["label"].as_str() else {
+                continue;
+            };
+            let Some(percent) = label
+                .split('%')
+                .next()
+                .and_then(|head| head.split_whitespace().last())
+                .and_then(|token| token.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let count = budget["count"].as_f64().expect("a counter was asked for");
+            let total = budget["total"].as_f64().expect("a total was asked for");
+            let implied = percent_left(count / total).expect("a usable share");
+            assert_eq!(
+                percent, implied,
+                "{settled} settled: label said {percent}%, counters imply {implied}%"
+            );
+        }
+    }
+
+    // ----------------------------------- HORO-1709: the configured scope
+
+    #[test]
+    fn an_idle_daemon_may_report_the_ceiling_a_new_task_would_get() {
+        let document = reading_showing(&idle(), None, BudgetDisplay::RemainingAndTotal);
+        let configured = segments(&document)
+            .iter()
+            .find(|s| s["key"] == json!("budget_configured"))
+            .expect("an idle daemon knows the ceiling authoritatively")
+            .clone();
+        assert_eq!(configured["count"], json!(200_000));
+        assert_eq!(configured["count_label"], json!("tokens"));
+        assert_eq!(configured["budget_scope"], json!("configured_default"));
+        assert_eq!(configured["state"], json!("neutral"));
+        assert_eq!(
+            configured["clear_role"],
+            json!("supporting"),
+            "the idle task segment already owns Clear's single posture"
+        );
+        assert!(
+            configured.get("total").is_none(),
+            "a ceiling is not a remainder of anything: {configured}"
+        );
+    }
+
+    #[test]
+    fn the_idle_ceiling_is_never_presented_as_remaining_budget() {
+        // The refinement's load-bearing sentence: idle must never present
+        // the configured envelope as active-task remaining budget, and in
+        // particular must not say `100% budget left` because nothing has
+        // consumed anything.
+        for (name, display) in ALL_DISPLAYS {
+            let document = reading_showing(&idle(), None, display);
+            assert!(
+                budget_of(&document).is_none(),
+                "{name}: idle grew a `budget` segment"
+            );
+            for (path, text) in all_strings(&document) {
+                assert!(
+                    !text.contains("budget left"),
+                    "{name}: {path} = {text:?} reads as an active-task remainder"
+                );
+                assert!(!text.contains("100%"), "{name}: {path} = {text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_configured_ceiling_is_optional_and_absent_by_default() {
+        // "Optionally show" means a percentage-only user acquires no new
+        // line on upgrade. The default display is where that is decided.
+        let document = reading_showing(&idle(), None, BudgetDisplay::default());
+        assert_eq!(
+            segments(&document).len(),
+            1,
+            "the default idle document is the pre-ticket one: {document}"
+        );
+    }
+
+    #[test]
+    fn the_configured_ceiling_and_the_task_envelope_stay_separate_scopes() {
+        // The two legitimately differ: the task's envelope was fixed at
+        // admission and the configured default can be edited mid-task. The
+        // fixtures use different numbers so a surface that read one for
+        // the other is caught.
+        assert_ne!(
+            CONFIGURED.ceiling.as_f64(),
+            BUDGET_LEFT_AMOUNTS.total().as_f64(),
+            "premise"
+        );
+        // While a task runs, the four-segment allowance is full and the
+        // active envelope is the one that matters, so the configured
+        // ceiling is not in the document at all — it cannot be mistaken
+        // for the task's.
+        for (name, display) in ALL_DISPLAYS {
+            let document = reading_showing(&status_with(ReplanState::Stable), None, display);
+            assert!(
+                !segments(&document)
+                    .iter()
+                    .any(|s| s["key"] == json!("budget_configured")),
+                "{name}: an active document carried a second envelope"
+            );
+            let rendered = serde_json::to_string(&document).unwrap();
+            assert!(
+                !rendered.contains("200000") && !rendered.contains("200,000"),
+                "{name}: the configured ceiling leaked into an active reading: {rendered}"
+            );
+        }
+        // `explain` has the room to show both, and must label them.
+        let text = explain_text(&status_with(ReplanState::Stable), None);
+        assert!(text.contains("200,000 tokens"), "{text}");
+        assert!(text.contains("150,000 tokens"), "{text}");
+        assert!(text.contains("configured limit"), "{text}");
+        assert!(text.contains("a new task would be"), "{text}");
+    }
+
+    #[test]
+    fn no_segment_is_ever_four_envelopes_at_once() {
+        // "Configured / Default / Host cap / Active task must never be
+        // conflated." Every figure this provider emits therefore carries
+        // the scope it belongs to, and no segment carries two.
+        for (name, document) in every_document() {
+            for segment in segments(&document) {
+                let has_figure = ["budget_total", "budget_remaining", "budget_used"]
+                    .iter()
+                    .any(|field| segment.get(field).is_some());
+                if !has_figure {
+                    continue;
+                }
+                let scope = segment["budget_scope"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{name}: a budget figure with no scope: {segment}"));
+                assert!(
+                    scope == "active_task" || scope == "configured_default",
+                    "{name}: unknown scope {scope:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_host_cap_is_reported_as_unrecorded_rather_than_as_absent_or_unlimited() {
+        // Scope C has no authoritative source on this machine, so nothing
+        // is rendered for it and `explain` says why. The alternative — an
+        // enum variant nothing can construct, or silence — would read as
+        // "there is no cap above you", which this machine cannot know.
+        let text = explain_text(&idle(), None);
+        assert!(text.contains("host cap"), "{text}");
+        assert!(text.contains("not established"), "{text}");
+        assert!(
+            text.contains("absence of a record"),
+            "silence would read as a finding: {text}"
+        );
+        for (name, document) in every_document() {
+            let rendered = serde_json::to_string(&document).unwrap();
+            assert!(
+                !rendered.contains("host_cap") && !rendered.contains("unlimited"),
+                "{name}: {rendered}"
+            );
+        }
+    }
+
+    // ------------------------------ HORO-1709: colour stays HORO-1719's
+
+    #[test]
+    fn the_provider_embeds_no_ansi_and_no_colour_of_its_own() {
+        // The shared renderer owns palette and fallback (HORO-1719). A
+        // provider that embedded an escape would break NO_COLOR, non-TTY
+        // and JSON consumers at once, and the host cannot strip what it
+        // did not add.
+        for (name, document) in every_document() {
+            let rendered = serde_json::to_string(&document).unwrap();
+            assert!(!rendered.contains('\u{1b}'), "{name}");
+            assert!(!rendered.contains("\\u001b"), "{name}");
+            for forbidden in ["[31m", "[32m", "[33m", "[0m", "ansi", "color", "colour"] {
+                assert!(
+                    !rendered.to_lowercase().contains(forbidden),
+                    "{name}: carried {forbidden:?}"
+                );
+            }
+        }
+        let text = explain_text(&status_with(ReplanState::Stable), None);
+        assert!(!text.contains('\u{1b}'), "explain is plain text too");
+    }
+
+    #[test]
+    fn the_text_is_authoritative_without_the_semantic_token() {
+        // Colour is supplemental: every segment that carries a
+        // `semantic_state` must already say the same thing in words, so a
+        // NO_COLOR, non-TTY or screen-reader user loses nothing. Checked
+        // by stripping the token and requiring the label to still
+        // distinguish the band.
+        let bands = [
+            (
+                BudgetSnapshot::new(ResourceKind::Tokens, 100_000.0, 0.0, 10_000.0, 0.0, 2),
+                "safe",
+            ),
+            (BUDGET_LEFT_AMOUNTS, "caution"),
+            (
+                BudgetSnapshot::new(ResourceKind::Tokens, 100_000.0, 0.0, 80_000.0, 0.0, 2),
+                "warning",
+            ),
+            (
+                BudgetSnapshot::new(ResourceKind::Tokens, 100_000.0, 0.0, 95_000.0, 0.0, 2),
+                "critical",
+            ),
+        ];
+        let mut labels = Vec::new();
+        for (amounts, expected) in bands {
+            let budget = budget_of(&with_amounts(amounts, BudgetDisplay::Percent)).unwrap();
+            assert_eq!(budget["semantic_state"], json!(expected));
+            let label = budget["label"].as_str().unwrap().to_string();
+            assert!(
+                label.contains('%'),
+                "the band must be legible without colour: {label}"
+            );
+            labels.push(label);
+        }
+        labels.sort();
+        labels.dedup();
+        assert_eq!(
+            labels.len(),
+            4,
+            "four pressure bands rendered fewer than four distinct phrases: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn the_contract_severity_field_is_not_moved_by_pressure() {
+        // `state` is the host's own severity field and already drives
+        // Clear's exception selection. A two-thirds-spent envelope is not
+        // an exception, and promoting it would displace a real one — which
+        // is why the pressure reading rides `semantic_state` instead.
+        for amounts in [
+            BudgetSnapshot::new(ResourceKind::Tokens, 100_000.0, 0.0, 10_000.0, 0.0, 2),
+            BUDGET_LEFT_AMOUNTS,
+            BudgetSnapshot::new(ResourceKind::Tokens, 100_000.0, 0.0, 95_000.0, 0.0, 2),
+        ] {
+            let budget = budget_of(&with_amounts(amounts, BudgetDisplay::Full)).unwrap();
+            assert_eq!(
+                budget["state"],
+                json!("neutral"),
+                "pressure moved the contract's severity field: {budget}"
+            );
+            assert_eq!(budget["clear_role"], json!("vital"));
+        }
+    }
+
+    // --------------------------------- HORO-1709: explain's full breakdown
+
+    #[test]
+    fn explain_shows_the_whole_envelope_whatever_the_wording_preference() {
+        // The preference exists because a statusline has one line.
+        // `explain` is where a user comes to be told everything, so there
+        // is nothing for it to abbreviate.
+        let mut status = status_with(ReplanState::Stable);
+        status.task_budget = Some(BudgetPosture::from_snapshot(&BUDGET_LEFT_AMOUNTS));
+        status.task_budget_amounts = Some(BUDGET_LEFT_AMOUNTS);
+        let text = explain_text(&status, None);
+        for expected in [
+            "150,000 tokens",
+            "18,000 tokens",
+            "75,000 tokens",
+            "57,000 tokens",
+            "30,000 tokens",
+            "62% committed",
+        ] {
+            assert!(
+                text.contains(expected),
+                "{expected:?} missing from:\n{text}"
+            );
+        }
+        // And the arithmetic a reader will try is explained rather than
+        // left to fail: the Completion Reserve sits inside the remainder.
+        assert!(text.contains("not subtracted from it"), "{text}");
+    }
+
+    #[test]
+    fn explain_declines_to_report_consumption_it_never_measured() {
+        let mut status = status_with(ReplanState::Stable);
+        let amounts = amounts_for(BudgetPosture::Uncommitted).unwrap();
+        status.task_budget = Some(BudgetPosture::Uncommitted);
+        status.task_budget_amounts = Some(amounts);
+        let text = explain_text(&status, None);
+        assert!(
+            text.contains("150,000 tokens"),
+            "the ceiling is real: {text}"
+        );
+        assert!(text.contains("not measured"), "{text}");
+        assert!(
+            text.contains("different facts"),
+            "the distinction must be stated, not implied: {text}"
+        );
+        // Line-wise rather than substring-wise: "150,000 tokens" ends in
+        // "0 tokens", so a naive search for a fabricated zero passes on the
+        // ceiling and proves nothing.
+        for forbidden in [
+            "  budget used      0",
+            "  budget held",
+            "  budget remaining",
+            "  budget pressure",
+        ] {
+            assert!(
+                !text.lines().any(|line| line.starts_with(forbidden)),
+                "{forbidden:?} was reported for an unmeasured envelope:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn explain_reports_an_overrun_as_a_deficit() {
+        let mut status = status_with(ReplanState::Stable);
+        status.task_budget = Some(BudgetPosture::from_snapshot(&OVERRUN_AMOUNTS));
+        status.task_budget_amounts = Some(OVERRUN_AMOUNTS);
+        let text = explain_text(&status, None);
+        assert!(text.contains("-15,000 tokens"), "{text}");
+        assert!(text.contains("overrun"), "{text}");
+        assert!(text.contains("110% committed"), "{text}");
+    }
+
+    #[test]
+    fn explain_still_withholds_the_estimators_predictions() {
+        // The narrowing is deliberate and bounded: the *ledger's* record
+        // of this task's envelope is now shown; the estimator's resource
+        // and cost quantiles are a prediction about work nobody has done
+        // and stay off every surface. The fixture carries both.
+        let status = status_with(ReplanState::Stable);
+        let estimate = &status.current_task.as_ref().unwrap().remaining_estimate;
+        assert!(estimate.resource_p50.is_some(), "premise");
+        let text = explain_text(&status, None);
+        assert!(
+            !text.contains("1234") && !text.contains("1,234"),
+            "an estimator quantile reached explain: {text}"
+        );
+        assert!(text.contains("resource/cost quantiles"), "{text}");
+        assert!(
+            text.contains("not a prediction"),
+            "the two kinds of figure must be told apart: {text}"
+        );
+    }
+
+    #[test]
+    fn grouping_is_deterministic_and_locale_free() {
+        assert_eq!(group_digits("0"), "0");
+        assert_eq!(group_digits("7"), "7");
+        assert_eq!(group_digits("999"), "999");
+        assert_eq!(group_digits("1000"), "1,000");
+        assert_eq!(group_digits("57000"), "57,000");
+        assert_eq!(group_digits("1000000"), "1,000,000");
+        assert_eq!(group_digits("4294967295"), "4,294,967,295");
+        assert_eq!(
+            grouped_f64(14_800_000_000.0),
+            "14,800,000,000",
+            "grouping must not lapse past the width a `u32` can hold"
+        );
+        assert_eq!(grouped_f64(-15_000.0), "-15,000");
+        assert_eq!(grouped_f64(0.0), "0");
+        assert_eq!(
+            grouped_f64(1_500.5),
+            "1,500.5",
+            "a fractional ledger figure keeps its fraction"
+        );
+        assert_eq!(
+            grouped_f64(1_500.0),
+            "1,500",
+            "a whole figure must not acquire a decimal place it never had"
+        );
+        assert_eq!(grouped_f64(f64::NAN), "not a usable number");
+        assert_eq!(grouped_f64(f64::INFINITY), "not a usable number");
+    }
+
+    #[test]
+    fn a_count_is_floored_never_rounded_up() {
+        // Same direction as `percent_left`: a budget figure must not
+        // over-report what is left.
+        assert_eq!(count_value(0.0), Some(0));
+        assert_eq!(count_value(0.9), Some(0));
+        assert_eq!(count_value(57_000.7), Some(57_000));
+        assert_eq!(count_value(f64::from(MAX_COUNT)), Some(MAX_COUNT));
+        assert_eq!(
+            count_value(f64::from(MAX_COUNT) + 1.0),
+            None,
+            "the host refuses this; a clamp would be a wrong number"
+        );
+        assert_eq!(count_value(-1.0), None, "a deficit is not a count");
+        assert_eq!(count_value(f64::NAN), None);
+        assert_eq!(count_value(f64::INFINITY), None);
     }
 
     // -------------------------------------------------------- escalation
@@ -2136,7 +3920,7 @@ mod tests {
         );
 
         let mut exhausted = status_with(ReplanState::Stable);
-        exhausted.task_budget = Some(BudgetPosture::Exhausted);
+        set_budget(&mut exhausted, Some(BudgetPosture::Exhausted));
         let exhausted = reading(&exhausted, None, now());
         assert_eq!(role_of(&exhausted, "budget").as_deref(), Some("exception"));
         assert_eq!(role_of(&exhausted, "task").as_deref(), Some("supporting"));
@@ -2495,15 +4279,15 @@ mod tests {
         // The statusline has room for a label; `explain` has room for the
         // difference, which is the whole reason the posture is four variants.
         let mut spent = status_with(ReplanState::Stable);
-        spent.task_budget = Some(BudgetPosture::Exhausted);
+        set_budget(&mut spent, Some(BudgetPosture::Exhausted));
         let spent = explain_text(&spent, None);
 
         let mut never = status_with(ReplanState::Stable);
-        never.task_budget = Some(BudgetPosture::NotEstablished);
+        set_budget(&mut never, Some(BudgetPosture::NotEstablished));
         let never = explain_text(&never, None);
 
         let mut unreadable = status_with(ReplanState::Stable);
-        unreadable.task_budget = Some(BudgetPosture::Unreadable);
+        set_budget(&mut unreadable, Some(BudgetPosture::Unreadable));
         let unreadable = explain_text(&unreadable, None);
 
         let mut lines: Vec<String> = Vec::new();
@@ -2525,7 +4309,7 @@ mod tests {
         // envelope, because with a task present the daemon always answers
         // and `None` only ever means "nothing was governed".
         let mut absent = status_with(ReplanState::Stable);
-        absent.task_budget = None;
+        set_budget(&mut absent, None);
         let absent = explain_text(&absent, None);
         assert!(absent.contains("admitted without a resource envelope"));
     }

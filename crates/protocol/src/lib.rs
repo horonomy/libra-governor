@@ -29,18 +29,18 @@ pub use host_event::{
 };
 pub use libra_governor_domain::Estimate;
 pub use libra_governor_domain::{
-    BusinessContextSummary, Confidence, CredentialCustody, EnforcementCapabilities,
-    EnforcementTier, ExecutionOutcome, MonetaryEnforcement, NoMonetaryCap, PlanId, PolicyDecision,
-    ResourceAmount, TaskId, UsageAccounting,
+    BudgetSnapshot, BusinessContextSummary, Confidence, CredentialCustody, EnforcementCapabilities,
+    EnforcementTier, ExecutionOutcome, Headroom, MonetaryEnforcement, NoMonetaryCap, PlanId,
+    PolicyDecision, ResourceAmount, ResourceKind, TaskId, UsageAccounting,
 };
 pub use libra_governor_estimator::{
     AdmissionOutcome, AdmissionPolicy, AdmissionStats, CoverageReport, QuantileCoverage, Stratum,
 };
 pub use messages::{
-    AdmissionPolicyReport, BudgetPosture, CalibrationReportResult, DoctorResult, FinalizeOutcome,
-    FinalizeResult, GatewayStatusResult, OutcomeRecordedOutcome, OutcomeRecordedResult,
-    PreflightResult, ReconSummary, ReplanState, Request, RequestEnvelope, Response,
-    ResponseEnvelope, StatusResult, TaskSummary,
+    AdmissionPolicyReport, BudgetPosture, BudgetScope, CalibrationReportResult, ConfiguredBudget,
+    DoctorResult, FinalizeOutcome, FinalizeResult, GatewayStatusResult, OutcomeRecordedOutcome,
+    OutcomeRecordedResult, PreflightResult, ReconSummary, ReplanState, Request, RequestEnvelope,
+    Response, ResponseEnvelope, StatusResult, TaskSummary,
 };
 
 /// The protocol version this build of the crate speaks. Bump on any
@@ -104,4 +104,40 @@ pub use messages::{
 /// long-lived v8 daemon must be restarted after upgrading, which the
 /// statusline provider reports as its own `daemon_protocol_mismatch`
 /// no-reading rather than as "no task".
-pub const PROTOCOL_VERSION: u32 = 9;
+///
+/// Bumped 9 -> 10 for HORO-1725: `Request::Finalize` gained
+/// `transcript_path`, a required field a v9 peer cannot decode. It is
+/// what lets a receipt record *measured* token usage instead of an empty
+/// `actual_usage`, which in turn is what lets
+/// `Estimate::resource_p80` ever be `Some` — before this, every task on
+/// a live store reserved the identical policy-target constant. Same known
+/// limitation as every earlier bump: a long-lived v9 daemon must be
+/// restarted after upgrading.
+///
+/// Bumped 10 -> 11 for HORO-1709: [`messages::StatusResult`] gained
+/// `task_budget_amounts` and `configured_budget`. They are what let a
+/// rendering surface say how much of an envelope is left *in the unit the
+/// envelope is denominated in* rather than only as a share of itself —
+/// and, separately, let an idle daemon report the envelope that would
+/// govern the next task without that being mistaken for an active task's
+/// remaining capacity.
+///
+/// Unlike most bumps above, the shape change here would **not** fail a
+/// decode on its own, and the doc should not claim otherwise: both new
+/// fields are `Option`, and serde defaults a missing `Option` to `None`
+/// rather than erroring. A v11 client handed a v10 `StatusResult` would
+/// deserialize it happily — and then report "no amounts available" about
+/// a daemon whose only defect is being old. That silent downgrade of
+/// *stale* to *unknown* is precisely what this bump exists to prevent:
+/// the envelope's version check rejects the exchange outright, and the
+/// statusline provider renders a `daemon_protocol_mismatch` no-reading
+/// that names the real problem.
+///
+/// (The same correction applies to the 8 -> 9 entry above, which
+/// described `task_budget` — also an `Option` — as a field a v8 client
+/// "would silently fail to deserialize". The bump was right; that
+/// reasoning for it was not.)
+///
+/// Same known limitation as every earlier bump: a long-lived v10 daemon
+/// must be restarted after upgrading.
+pub const PROTOCOL_VERSION: u32 = 11;

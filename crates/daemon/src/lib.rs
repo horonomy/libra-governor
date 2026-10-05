@@ -17,6 +17,7 @@ pub mod paths;
 pub mod pidfile;
 pub mod recon;
 pub mod server;
+pub mod usage;
 
 pub use server::{
     bind_or_detect_running, default_admission_policy, handle_connection, serve, DaemonConfig,

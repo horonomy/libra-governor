@@ -39,7 +39,7 @@ use libra_governor_domain::{
     ExternalApproval, ExternalVerdict, HysteresisOutcome, PersistedPins, PlanId, Policy,
     PolicyPresetInputs, ProgressEvidence, RegimeKey, RegimeProvenance, RemainingEstimate, ReplanId,
     ReplanReason, ReplanRecord, ReplanTriggerKind, ReservationClass, ReservationState,
-    ResourceAmount, Shadow, SpendScope, TaskId, ABSOLUTE_TOOL_CALL_COUNT_FALLBACK,
+    ResourceAmount, ResourceKind, Shadow, SpendScope, TaskId, ABSOLUTE_TOOL_CALL_COUNT_FALLBACK,
     DEFAULT_LOOP_STREAK_THRESHOLD,
 };
 use libra_governor_estimator::{
@@ -56,10 +56,11 @@ use libra_governor_ledger::{
     BusinessContextInsert, LedgerStore, OutcomeAttestationInsert, ReserveOutcome, ReserveRequest,
 };
 use libra_governor_protocol::{
-    wire, AdmissionPolicyReport, BudgetPosture, CalibrationReportResult, DoctorResult,
-    FinalizeOutcome, FinalizeResult, GatewayStatusResult, OutcomeRecordedOutcome,
-    OutcomeRecordedResult, PreflightResult, ReconSummary, ReplanState, Request, RequestEnvelope,
-    Response, ResponseEnvelope, StatusResult, TaskSummary, PROTOCOL_VERSION,
+    wire, AdmissionPolicyReport, BudgetPosture, BudgetSnapshot, CalibrationReportResult,
+    ConfiguredBudget, DoctorResult, FinalizeOutcome, FinalizeResult, GatewayStatusResult,
+    OutcomeRecordedOutcome, OutcomeRecordedResult, PreflightResult, ReconSummary, ReplanState,
+    Request, RequestEnvelope, Response, ResponseEnvelope, StatusResult, TaskSummary,
+    PROTOCOL_VERSION,
 };
 
 use crate::{
@@ -490,12 +491,30 @@ fn dispatch(
                 }
             }
         },
-        Request::Status => Response::Status(Box::new(StatusResult {
-            task_budget: current_task
-                .as_ref()
-                .map(|task| budget_posture(ledger, task.task_id)),
-            current_task: current_task.clone(),
-        })),
+        Request::Status => {
+            // One ledger read for both budget fields (HORO-1709). Splitting
+            // this into a posture read and an amounts read would let the
+            // percentage and the amounts in the same reply describe
+            // different instants.
+            let (task_budget, task_budget_amounts) = match current_task.as_ref() {
+                Some(task) => {
+                    let (posture, amounts) = budget_reading(ledger, task.task_id);
+                    (Some(posture), amounts)
+                }
+                // No current task: a share of a budget that was never
+                // admitted is not zero, it is absent — and so are its
+                // amounts. What the reply still carries is
+                // `configured_budget`, which is a different scope and
+                // labelled as one.
+                None => (None, None),
+            };
+            Response::Status(Box::new(StatusResult {
+                task_budget,
+                task_budget_amounts,
+                configured_budget: configured_budget(config),
+                current_task: current_task.clone(),
+            }))
+        }
         Request::ToolInvoked {
             session_id,
             tool_name,
@@ -512,7 +531,16 @@ fn dispatch(
             session_id,
             model,
             provider,
-        } => match handle_finalize(&session_id, model, provider, ledger, current_task, config) {
+            transcript_path,
+        } => match handle_finalize(
+            &session_id,
+            model,
+            provider,
+            transcript_path.as_deref(),
+            ledger,
+            current_task,
+            config,
+        ) {
             Ok(outcome) => Response::Finalize(outcome),
             Err(e) => {
                 log::append_line(&config.log_path, &format!("finalize error: {e}"));
@@ -650,86 +678,83 @@ fn replan_state_for_summary(
 }
 
 /// What the reservation ledger says about `task_id`'s envelope right now
-/// (HORO-1634), for the `Status` reply.
+/// (HORO-1634), for the `Status` reply: the classification and the amounts
+/// it classifies, together.
 ///
-/// Four indexed local SQLite reads on the connection the daemon already
-/// holds: `available` resolves the budget row and then sums settled and
-/// active reservations, and the `hard_limit` is read from that row again
-/// below. The repeat read is deliberate — collapsing it would mean a new
-/// `LedgerStore` method returning headroom and limit together, and
-/// widening the ledger's public API to save one indexed primary-key
-/// lookup is the wrong trade. No extra *round trip* of any kind, which is
-/// the cost that actually matters here: the figure is computed while
-/// answering a request the statusline provider was already going to make,
-/// which is the only way a budget reading is affordable inside a 200 ms
-/// hot-path probe.
+/// # One read, not four (HORO-1709)
 ///
-/// `RequiredWork` rather than `OptionalWork`, so the figure is the whole
-/// envelope: `hard_limit - settled - active`, with the protected Completion
-/// Reserve left in it. The reserve is earmarked, not spent, and required
-/// completion work may still draw against it, so subtracting it here would
-/// report less room than the task has. The gateway's own authority check
-/// (`gateway_authority::authorize`) takes the narrower `OptionalWork` view
-/// for the opposite and correct reason — it cannot tell whether an HTTP
-/// request is required work, so it takes the weaker claim. These are two
+/// This function used to make four reads — `available` for the headroom,
+/// `reservations_for_task` for whether anything had ever been committed,
+/// `task_budget` for the ceiling — and the doc here used to defend that,
+/// on the ground that a new `LedgerStore` method to collapse them would
+/// be a worse trade than one extra indexed primary-key lookup. That was
+/// a reasonable call while the reply carried a single percentage. It
+/// stops being one the moment the reply carries amounts as well.
+///
+/// Amounts and a percentage are two claims a reader will check against
+/// each other, and separate reads cannot keep them consistent: a
+/// settlement committing between the ceiling read and the sum read
+/// yields a correct ceiling, correct sums, and a line that does not add
+/// up. The cost of the extra lookups was never the real argument; the
+/// snapshot's value is that every figure is a projection of **one**
+/// observation. So `LedgerStore::budget_snapshot` reads all of it inside
+/// one transaction and [`BudgetPosture::from_snapshot`] classifies the
+/// result — which also puts the branch order, the HORO-1708 observation
+/// check and the exhaustion rule in one testable place instead of in a
+/// daemon handler.
+///
+/// No extra *round trip* either way, which remains the cost that matters:
+/// the figure is computed while answering a request the statusline
+/// provider was already going to make, the only way a budget reading is
+/// affordable inside a 200 ms hot-path probe.
+///
+/// # What the figures include
+///
+/// The whole envelope — `hard_limit - settled - active`, with the
+/// protected Completion Reserve left in it. The reserve is earmarked, not
+/// spent, and required completion work may still draw against it, so
+/// subtracting it here would report less room than the task has. This is
+/// the `RequiredWork` view, and the ledger's own test pins it against
+/// `available(task, RequiredWork)`. The gateway's authority check
+/// (`gateway_authority::authorize`) takes the narrower `OptionalWork`
+/// view for the opposite and correct reason — it cannot tell whether an
+/// HTTP request is required work, so it takes the weaker claim. Two
 /// different questions, not a disagreement.
 ///
-/// The order of the branches is load-bearing. Exhaustion is decided on
-/// the headroom alone, before the limit is read, so the share is only ever
-/// computed from a positive numerator. With `value > 0` and
-/// `value = limit - settled - active <= limit`, `limit` is necessarily
-/// positive too — which is why there is no zero-limit guard below rather
-/// than a missing one. It also stays ahead of the `Uncommitted` check: a
-/// zero-limit envelope satisfies both conditions, and "the next
-/// reservation will be refused" is the one of the two a user can act on.
+/// A ledger error becomes [`BudgetPosture::Unreadable`] with no amounts
+/// rather than failing the whole `Status`: a budget that could not be
+/// read must not cost the user the task state that could.
+fn budget_reading(
+    ledger: &LedgerStore,
+    task_id: libra_governor_domain::TaskId,
+) -> (BudgetPosture, Option<BudgetSnapshot>) {
+    match ledger.budget_snapshot(task_id) {
+        Ok(Some(snapshot)) => (BudgetPosture::from_snapshot(&snapshot), Some(snapshot)),
+        // No budget row: there is no envelope to report amounts of, so
+        // the amounts are absent rather than zero.
+        Ok(None) => (BudgetPosture::NotEstablished, None),
+        Err(_) => (BudgetPosture::Unreadable, None),
+    }
+}
+
+/// The ceiling the running policy would give the *next* task admitted
+/// here (HORO-1709) — scope [`libra_governor_protocol::BudgetScope::ConfiguredDefault`].
 ///
-/// The `Uncommitted` branch is the HORO-1708 fix, and it is a check for
-/// *observation*, not for capacity. Every other branch here asks the
-/// ledger how much room there is; this one asks whether anything was ever
-/// put in the room. Without it, a task holding no reservation in any state
-/// has `settled = 0` and `active = 0`, so the canonical share is
-/// `limit / limit = 1.0` and the statusline reads "100% budget left" —
-/// a measured-sounding claim about an envelope no economic event was ever
-/// attributed to. The emptiness is read from the ledger's own
-/// `reservations_for_task` rather than inferred from the share being
-/// exactly `1.0`: the two coincide today, but a float equality standing in
-/// for "nothing happened" would silently start lying the first time a
-/// settlement rounds back to the limit.
+/// Read from the policy the daemon is actually running, not from
+/// `config.json` on disk, because the running value is the one that will
+/// be copied into the next task's budget row. A config edited since
+/// startup is reported by `doctor`'s `running_config_matches_disk` and by
+/// the statusline's `profile` segment; it is not this function's job to
+/// pre-empt either with a figure that is not in force.
 ///
-/// A ledger error becomes [`BudgetPosture::Unreadable`] rather than failing
-/// the whole `Status`: a budget that could not be read must not cost the
-/// user the task state that could.
-fn budget_posture(ledger: &LedgerStore, task_id: libra_governor_domain::TaskId) -> BudgetPosture {
-    let headroom = match ledger.available(task_id, ReservationClass::RequiredWork) {
-        Ok(Some(headroom)) => headroom,
-        Ok(None) => return BudgetPosture::NotEstablished,
-        Err(_) => return BudgetPosture::Unreadable,
-    };
-    if headroom.is_exhausted() {
-        return BudgetPosture::Exhausted;
-    }
-    // Any state counts, including `released` and `expired`. A hold that was
-    // taken and returned is a real draw against the envelope that the
-    // ledger genuinely accounted for, so `hard_limit - settled - active` is
-    // a true statement about that task's room. What this branch rules out is
-    // the envelope nothing ever touched.
-    match ledger.reservations_for_task(task_id) {
-        Ok(reservations) if reservations.is_empty() => return BudgetPosture::Uncommitted,
-        Ok(_) => {}
-        Err(_) => return BudgetPosture::Unreadable,
-    }
-    let limit = match ledger.task_budget(task_id) {
-        // `available` already resolved a budget to compute the headroom
-        // above, so this is the same row read twice rather than a
-        // different outcome being handled — but it is read through the
-        // same fallible API and is not this function's place to unwrap.
-        Ok(Some(budget)) => budget.hard_limit.as_f64(),
-        Ok(None) => return BudgetPosture::NotEstablished,
-        Err(_) => return BudgetPosture::Unreadable,
-    };
-    BudgetPosture::Remaining {
-        fraction_left: headroom.value / limit,
-    }
+/// Always `Some` — a daemon cannot run without a resolved policy — but
+/// returned as an `Option` because the protocol field is one, and because
+/// a future policy shape with no resource bound should degrade to "not
+/// reported" rather than to a fabricated ceiling.
+fn configured_budget(config: &DaemonConfig) -> Option<ConfiguredBudget> {
+    Some(ConfiguredBudget {
+        ceiling: config.policy.resource.hard_ceiling,
+    })
 }
 
 /// Builds the execution regime the daemon can honestly observe right
@@ -1690,6 +1715,7 @@ fn handle_finalize(
     session_id: &str,
     model: Option<String>,
     provider: Option<String>,
+    transcript_path: Option<&str>,
     ledger: &mut LedgerStore,
     current_task: &mut Option<TaskSummary>,
     config: &DaemonConfig,
@@ -1705,24 +1731,98 @@ fn handle_finalize(
     };
 
     let now = time::OffsetDateTime::now_utc();
-    let started_at = ledger.session_started_at(session_id)?.unwrap_or(now);
+    // Anchored to the start of *this plan's lineage*, not to the start of
+    // the session (HORO-1723). `session_tasks.created_at` is written
+    // exactly once per session, so measuring from it made every receipt
+    // report the session's age: successive Stops in one long session each
+    // recorded a larger duration than the last (up to ~169 h observed on
+    // a real store), and all of them became estimator samples. The error
+    // equals the session's age, so it is invisible wherever sessions are
+    // seconds old — which is every test and every CI run.
+    //
+    // Walking the replan lineage rather than taking `plan.created_at`
+    // directly matters because a replan supersedes the in-flight plan
+    // mid-turn; the plan being finalized is then not the one the turn
+    // started with.
+    let started_at = ledger
+        .plan_lineage_started_at(plan_id)?
+        .unwrap_or(plan.created_at);
     let elapsed_secs = (now - started_at).whole_seconds().max(0) as u64;
     let tool_call_count = ledger.tool_call_count_for_session(session_id)?;
+
+    // Measured host usage for the window this receipt covers
+    // (HORO-1725). The window runs from this task's previous receipt to
+    // now, so successive receipts tile the session's spend: each token
+    // the host recorded falls inside exactly one window.
+    //
+    // `started_at` is the obvious alternative and it is not equivalent.
+    // It already excludes earlier turns (HORO-1723 scoped it to the plan
+    // lineage, so it cannot double-count), but it is *later* than the
+    // previous receipt, and the gap between the two is real: a host keeps
+    // writing assistant records after `Stop` fires — a compaction, a
+    // continuation, a subagent finishing — and every token in that gap
+    // would be attributed to no receipt at all. Spend that is silently
+    // dropped biases the estimator low, which is the same class of
+    // dishonesty as inventing one.
+    //
+    // The boundary is inclusive at the lower end, so a record timestamped
+    // to the exact nanosecond of a receipt would be counted by both
+    // windows. Not worth a second comparison path to close: the
+    // alternative is dropping it from both.
+    //
+    // The premise this code used to state — that Claude Code's hook
+    // payloads expose no token data — was wrong, and it was expensive.
+    // The payload carries `transcript_path`, and the host writes the four
+    // per-turn counts into that file. With `actual_usage` left empty,
+    // `resource_quantiles` had nothing to work from, `resource_p80` was
+    // unconditionally `None`, admission fell back to
+    // `policy.resource.target` for every task, and every reservation on a
+    // live store held the identical constant.
+    let usage_window_start = ledger
+        .last_receipt_recorded_at(task_id)?
+        .unwrap_or(started_at);
+    let observation = match transcript_path {
+        Some(path) => crate::usage::observe_transcript_window(
+            std::path::Path::new(path),
+            usage_window_start,
+            crate::usage::DEFAULT_SCAN_CAP_BYTES,
+        ),
+        None => crate::usage::UsageObservation::Unavailable(
+            crate::usage::UsageUnavailable::NoTranscriptPath,
+        ),
+    };
+    // One `Tokens` entry or none — never a second amount of the same
+    // kind, which `resource_quantiles` would treat as an independent
+    // sample and skew its own quantiles with.
+    let actual_usage: Vec<ResourceAmount> = match observation.measured() {
+        Some(measured) => vec![ResourceAmount::Tokens(measured.fresh_tokens())],
+        None => vec![],
+    };
+    log::append_line(
+        &config.log_path,
+        &format!(
+            "task {task_id}: host usage {} for window since {}",
+            observation.reason_label(),
+            usage_window_start
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_else(|_| "unknown".to_string()),
+        ),
+    );
 
     // MVP 1.0 has no automated Completion Contract verification (no
     // test-running integration): outcome is always `Unknown` here,
     // structurally correct per `ExecutionOutcome`'s own docs — a task
     // must never be inferred "done" merely because the session stopped.
-    // Actual resource usage is an honest empty `Vec`, not a zeroed USD
-    // amount: Claude Code's `Stop`/`PostToolUse` hook payloads expose no
-    // token/cost data (see PR description), so nothing here fabricates a
-    // spend figure.
+    // An empty `actual_usage` now means only what it says: no measurement
+    // was available (no transcript, unreadable, or a window too large to
+    // read within the scan cap). It is never a fabricated or zeroed
+    // amount.
     let receipt = ExecutionReceipt::new(
         task_id,
         plan.contract_revision,
         plan_id,
         elapsed_secs,
-        vec![],
+        actual_usage,
         ExecutionOutcome::Unknown,
         now,
     )
@@ -1738,18 +1838,41 @@ fn handle_finalize(
             .unwrap_or(libra_governor_domain::FEATURE_SCHEMA_VERSION),
     )));
 
-    // Settle every reservation still active on this plan (HORO-1141).
-    // `None` as the actual cost: Claude Code's hook payloads expose no
-    // token/cost usage figure (see the comment above on `actual_usage`),
-    // so settlement conservatively falls back to the reserved amount
-    // rather than fabricating one — see `Reservation::usage_known` docs.
+    // Settle every reservation still active on this plan (HORO-1141),
+    // with the measured amount when there is one (HORO-1725).
+    //
+    // `settle(id, Some(amount))` records `usage_known = true`;
+    // `settle(id, None)` falls back to the full reserved amount and
+    // records `usage_known = false`. That flag is the provenance
+    // distinction a downstream consumer needs in order not to mistake a
+    // conservative placeholder for an observation, and it already
+    // existed — what was missing was ever having a real figure to pass.
+    //
+    // Only attributed when the plan has exactly ONE active reservation.
+    // The measurement is a single aggregate for the whole window; with
+    // two or more concurrent envelopes there is no evidence for how to
+    // divide it, and splitting it on a guess would write a precise-looking
+    // number that no observation supports. Those settle conservatively
+    // instead, which is visible as `usage_known = false` rather than
+    // silent.
     let active_reservations: Vec<_> = ledger
         .reservations_for_task(task_id)?
         .into_iter()
         .filter(|r| r.plan_id == Some(plan_id) && r.state == ReservationState::Active)
         .collect();
+    let attributable = if active_reservations.len() == 1 {
+        observation.measured().map(|m| m.fresh_tokens())
+    } else {
+        None
+    };
     for reservation in active_reservations {
-        ledger.settle(reservation.id, None, now)?;
+        // Kind-matched before it is offered: `settle` rejects a mismatch
+        // outright, and a token measurement must not be pushed at a USD
+        // or quota-percent envelope.
+        let actual = attributable
+            .filter(|_| reservation.amount.kind() == ResourceKind::Tokens)
+            .map(ResourceAmount::Tokens);
+        ledger.settle(reservation.id, actual, now)?;
     }
     let reservation_evidence = ledger.reservation_evidence(task_id)?;
     let receipt = receipt.with_reservation_evidence(reservation_evidence);
@@ -2277,6 +2400,7 @@ mod tests {
             "no-such-session",
             None,
             None,
+            None,
             &mut ledger,
             &mut current_task,
             &config,
@@ -2314,6 +2438,9 @@ mod tests {
             "sess-1",
             Some("claude-sonnet-5".to_string()),
             Some("claude-code".to_string()),
+            // No transcript: this test proves the pre-HORO-1725
+            // behavior still holds when a host exposes none.
+            None,
             &mut ledger,
             &mut current_task,
             &config,
@@ -2519,5 +2646,265 @@ mod tests {
             !should_shut_down,
             "an older client protocol must not shut the daemon down"
         );
+    }
+
+    // ------------------------------------------- HORO-1709: Status budget
+
+    fn status_reply(
+        ledger: &mut LedgerStore,
+        current_task: &mut Option<TaskSummary>,
+        config: &DaemonConfig,
+    ) -> Box<StatusResult> {
+        match dispatch(Request::Status, ledger, current_task, config) {
+            Response::Status(result) => result,
+            other => panic!("Status must answer with Status, got {other:?}"),
+        }
+    }
+
+    /// The Idle refinement's central requirement: a daemon with nothing
+    /// running must not present a configured ceiling as an active task's
+    /// remaining capacity, and must not fabricate a percentage in its
+    /// place. So the active-task fields are absent — not zero, not full —
+    /// while the ceiling that *would* govern the next task is reported as
+    /// its own scope.
+    #[test]
+    fn an_idle_status_reports_the_configured_ceiling_and_no_task_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_daemon_config(dir.path());
+        let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
+        let mut current_task = None;
+
+        let result = status_reply(&mut ledger, &mut current_task, &config);
+
+        assert!(result.current_task.is_none());
+        assert!(
+            result.task_budget.is_none(),
+            "no task means no share, not a full one"
+        );
+        assert!(
+            result.task_budget_amounts.is_none(),
+            "no task means no amounts, not zeroes"
+        );
+        assert_eq!(
+            result.configured_budget,
+            Some(ConfiguredBudget {
+                ceiling: config.policy.resource.hard_ceiling
+            }),
+            "the next task's ceiling is a fact an idle daemon knows"
+        );
+    }
+
+    /// The configured ceiling comes from the policy the daemon is
+    /// *running*, which is what the next task will actually get. Pinned
+    /// against a non-default value so the assertion cannot pass by
+    /// matching a constant.
+    #[test]
+    fn the_configured_ceiling_is_the_running_policys_not_a_build_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_daemon_config(dir.path());
+        let default_ceiling = config.policy.resource.hard_ceiling;
+        config.policy.resource.hard_ceiling = ResourceAmount::Tokens(777_000);
+        assert_ne!(default_ceiling, config.policy.resource.hard_ceiling);
+
+        let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
+        let mut current_task = None;
+        let result = status_reply(&mut ledger, &mut current_task, &config);
+
+        assert_eq!(
+            result.configured_budget.unwrap().ceiling,
+            ResourceAmount::Tokens(777_000)
+        );
+    }
+
+    /// HORO-1709 AC 5, end to end through the real dispatch: the share
+    /// and the amounts in one reply must be projections of one
+    /// observation, so reconstructing either from the other is exact.
+    /// Driven through a real preflight so the envelope, its reservation
+    /// and its unit all come from the daemon rather than from a fixture.
+    #[test]
+    fn an_active_status_reports_a_share_and_amounts_that_reconcile() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_daemon_config(dir.path());
+        let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
+        let mut current_task = None;
+
+        let preflight = dispatch(
+            Request::Preflight {
+                task_hint: "add a regression test".to_string(),
+                cwd: dir.path().to_path_buf(),
+                session_id: "sess-h1709".to_string(),
+            },
+            &mut ledger,
+            &mut current_task,
+            &config,
+        );
+        assert!(matches!(preflight, Response::Preflight(_)));
+        assert!(current_task.is_some(), "preflight must bind a current task");
+
+        let result = status_reply(&mut ledger, &mut current_task, &config);
+        let amounts = result
+            .task_budget_amounts
+            .expect("an admitted task has an envelope with amounts");
+
+        // The unit is the envelope's own. Every envelope a live daemon
+        // writes is denominated in tokens (HORO-1725/HORO-1727); nothing
+        // here assumes currency, and this would fail loudly if it did.
+        assert_eq!(amounts.kind(), ResourceKind::Tokens);
+        assert_eq!(amounts.total(), config.policy.resource.hard_ceiling);
+
+        // used + reserved + remaining == total, in one unit, from one read.
+        let reconstructed =
+            amounts.used().as_f64() + amounts.reserved().as_f64() + amounts.remaining().value;
+        assert!(
+            (reconstructed - amounts.total().as_f64()).abs() < 1e-9,
+            "amounts must reconcile to the total: {reconstructed} vs {:?}",
+            amounts.total()
+        );
+
+        // The share and the amounts must be the same observation. This
+        // assertion is what a split read would break: classify the
+        // transported amounts yourself and you must land on the
+        // transported posture, whichever posture that is.
+        assert_eq!(
+            result.task_budget,
+            Some(BudgetPosture::from_snapshot(&amounts)),
+            "the posture and the amounts in one reply must describe one instant"
+        );
+    }
+
+    /// The `Remaining` branch with figures a reader can check: a 150,000
+    /// token envelope with 15,000 settled and 45,000 held leaves 90,000,
+    /// so the reading must be 0.6 *and* those three amounts — a share
+    /// computed one way and amounts fetched another could not both land
+    /// here.
+    #[test]
+    fn a_budget_reading_is_one_set_of_amounts_and_not_a_second_sum() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_daemon_config(dir.path());
+        let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
+        let task_id = TaskId::new();
+        let now = time::OffsetDateTime::now_utc();
+
+        // A zero completion reserve, so the envelope's arithmetic is only
+        // the three figures under test. (The reserve has its own test in
+        // the protocol crate: it must not move the reported share.)
+        let reserve = libra_governor_domain::CompletionReserveEstimate {
+            amount: ResourceAmount::Tokens(0),
+            basis: libra_governor_domain::CompletionReserveBasis::PolicyTarget,
+            fraction: 0.0,
+            required_criteria_count: 0,
+        };
+        ledger
+            .insert_task(
+                &libra_governor_domain::TaskIdentity {
+                    id: task_id,
+                    external_ref: None,
+                },
+                now,
+            )
+            .unwrap();
+        ledger
+            .initialize_task_budget(task_id, &config.policy, &reserve, now)
+            .unwrap();
+        assert_eq!(
+            config.policy.resource.hard_ceiling,
+            ResourceAmount::Tokens(150_000),
+            "this test's figures are a sixth of the default ceiling"
+        );
+
+        let hold = |ledger: &mut LedgerStore, amount, key: &str| {
+            let outcome = ledger
+                .reserve(ReserveRequest {
+                    task_id,
+                    session_id: "sess-h1709-share",
+                    plan_id: None,
+                    class: ReservationClass::RequiredWork,
+                    amount: ResourceAmount::Tokens(amount),
+                    idempotency_key: key,
+                    now,
+                    ttl_secs: 900,
+                })
+                .unwrap();
+            match outcome {
+                ReserveOutcome::Granted(reservation) => reservation,
+                other => panic!("a {amount}-token hold must fit this envelope: {other:?}"),
+            }
+        };
+
+        let spent = hold(&mut ledger, 15_000, "settled");
+        ledger
+            .settle(spent.id, Some(ResourceAmount::Tokens(15_000)), now)
+            .unwrap();
+        hold(&mut ledger, 45_000, "held");
+
+        let (posture, amounts) = budget_reading(&ledger, task_id);
+        let amounts = amounts.expect("an initialized envelope has amounts");
+
+        assert_eq!(amounts.kind(), ResourceKind::Tokens);
+        assert_eq!(amounts.total(), ResourceAmount::Tokens(150_000));
+        assert_eq!(amounts.used(), ResourceAmount::Tokens(15_000));
+        assert_eq!(amounts.reserved(), ResourceAmount::Tokens(45_000));
+        assert_eq!(amounts.remaining().value, 90_000.0);
+        assert_eq!(posture, BudgetPosture::Remaining { fraction_left: 0.6 });
+    }
+
+    /// The scopes must be able to disagree without either being wrong: a
+    /// task's ceiling is fixed at admission for its whole life, so
+    /// editing the running policy afterwards changes what the *next* task
+    /// gets and nothing about this one. A reply that collapsed the two
+    /// would answer "how much is left" with a setting.
+    #[test]
+    fn the_task_envelope_and_the_configured_ceiling_are_separate_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_daemon_config(dir.path());
+        let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
+        let mut current_task = None;
+
+        dispatch(
+            Request::Preflight {
+                task_hint: "add a regression test".to_string(),
+                cwd: dir.path().to_path_buf(),
+                session_id: "sess-h1709-scopes".to_string(),
+            },
+            &mut ledger,
+            &mut current_task,
+            &config,
+        );
+        let admitted_ceiling = status_reply(&mut ledger, &mut current_task, &config)
+            .task_budget_amounts
+            .expect("an admitted task has an envelope")
+            .total();
+
+        // The operator raises the ceiling mid-task.
+        config.policy.resource.hard_ceiling = ResourceAmount::Tokens(900_000);
+        let result = status_reply(&mut ledger, &mut current_task, &config);
+
+        assert_eq!(
+            result
+                .task_budget_amounts
+                .expect("the running task still has its envelope")
+                .total(),
+            admitted_ceiling,
+            "the limit in force at admission is the limit for the life of the task"
+        );
+        assert_eq!(
+            result.configured_budget.unwrap().ceiling,
+            ResourceAmount::Tokens(900_000),
+            "the next task would get the new ceiling"
+        );
+        assert_ne!(admitted_ceiling, ResourceAmount::Tokens(900_000));
+    }
+
+    /// A task with no budget row reports the absence as an absence. Not
+    /// an empty snapshot, which a renderer would read as a measured zero.
+    #[test]
+    fn a_task_without_a_budget_row_has_no_amounts_rather_than_zeroes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_daemon_config(dir.path());
+        let ledger = LedgerStore::open(&config.ledger_path).unwrap();
+
+        let (posture, amounts) = budget_reading(&ledger, TaskId::new());
+        assert_eq!(posture, BudgetPosture::NotEstablished);
+        assert!(amounts.is_none());
     }
 }

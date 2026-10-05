@@ -29,9 +29,9 @@
 //! rather than double-applying the effect.
 
 use libra_governor_domain::{
-    AccountId, CompletionReserveBasis, CompletionReserveEstimate, Headroom, LeaseKind, PlanId,
-    Policy, Reservation, ReservationClass, ReservationEvidence, ReservationId, ReservationState,
-    ResourceAmount, ResourceKind, TaskBudget, TaskId, RESERVATION_SCHEMA_VERSION,
+    AccountId, BudgetSnapshot, CompletionReserveBasis, CompletionReserveEstimate, Headroom,
+    LeaseKind, PlanId, Policy, Reservation, ReservationClass, ReservationEvidence, ReservationId,
+    ReservationState, ResourceAmount, ResourceKind, TaskBudget, TaskId, RESERVATION_SCHEMA_VERSION,
     RESOURCE_ACCOUNT_SCHEMA_VERSION,
 };
 use rusqlite::{OptionalExtension, TransactionBehavior};
@@ -516,6 +516,97 @@ impl LedgerStore {
             kind: budget.resource_kind,
             value,
         }))
+    }
+
+    /// Reads every economic figure about `task_id`'s envelope in one
+    /// transaction (HORO-1709). `Ok(None)` when no budget has been
+    /// initialized for this task.
+    ///
+    /// # Why this exists beside [`Self::available`]
+    ///
+    /// `available` answers one question — how much room is left for a
+    /// given class — and callers that need only that should keep using
+    /// it. A rendering surface needs five figures at once (the ceiling,
+    /// what was spent, what is held, what is left, and whether anything
+    /// was ever committed), and obtaining those from `available` plus
+    /// [`Self::task_budget`] plus [`Self::reservations_for_task`] means
+    /// three independent reads of a database that other threads are
+    /// writing to. Each read is individually correct and the set of them
+    /// can still describe no single instant: a settlement committing
+    /// between the ceiling read and the sum read produces amounts that do
+    /// not add up to the percentage shown beside them.
+    ///
+    /// So this is one transaction with four statements inside it,
+    /// returning a [`BudgetSnapshot`] every display figure is then derived
+    /// from arithmetically.
+    ///
+    /// Deferred rather than `Immediate`, which is the one place this
+    /// method departs from the module's transaction doctrine, and
+    /// deliberately. `Immediate` exists so a read-then-write cannot
+    /// interleave with another writer; nothing here writes. What a
+    /// read-only transaction needs is a stable *snapshot*, and this
+    /// ledger runs in WAL mode, where a read transaction fixes its
+    /// snapshot at the first statement and holds it to `commit`
+    /// regardless of what commits meanwhile — exactly the guarantee the
+    /// four statements need. Taking a write lock instead would let a
+    /// statusline refresh block, or be blocked by, real work: the
+    /// cheapest possible read would contend with the admission path it
+    /// is only describing.
+    ///
+    /// The remaining-capacity formula is **not** restated here. The
+    /// snapshot's own `remaining()` applies `hard_limit - settled -
+    /// active`, which is `available`'s `RequiredWork` arm, and there is
+    /// deliberately no second expression of it anywhere in the workspace
+    /// — a display-side variant of the accounting rule is how a
+    /// statusline starts disagreeing with an admission decision.
+    pub fn budget_snapshot(&self, task_id: TaskId) -> Result<Option<BudgetSnapshot>, LedgerError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let id = task_id.to_string();
+        let budget: Option<(String, f64, f64)> = tx
+            .query_row(
+                "SELECT resource_kind, hard_limit, completion_reserve
+                 FROM task_budgets WHERE task_id = ?1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((kind, hard_limit, completion_reserve)) = budget else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let settled: f64 = tx.query_row(
+            "SELECT COALESCE(SUM(settled_amount), 0.0) FROM reservations
+             WHERE task_id = ?1 AND state = 'settled'",
+            [&id],
+            |row| row.get(0),
+        )?;
+        let active: f64 = tx.query_row(
+            "SELECT COALESCE(SUM(amount), 0.0) FROM reservations
+             WHERE task_id = ?1 AND state = 'active'",
+            [&id],
+            |row| row.get(0),
+        )?;
+        // Every state, not just the two summed above. The question this
+        // answers is "was any economic event ever attributed to this
+        // task", and a reservation that was released or expired is still
+        // an event — it is a draw against the envelope that happened and
+        // then did not cost anything. Counting only `active`/`settled`
+        // would report a task whose only reservation was released as
+        // never observed, which is a different and false fact.
+        let reservation_count: u64 = tx.query_row(
+            "SELECT COUNT(*) FROM reservations WHERE task_id = ?1",
+            [&id],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(Some(BudgetSnapshot::new(
+            kind_from_str(&kind)?,
+            hard_limit,
+            completion_reserve,
+            settled,
+            active,
+            reservation_count,
+        )))
     }
 
     fn settled_and_active(&self, task_id: TaskId) -> Result<(f64, f64), LedgerError> {
@@ -1330,6 +1421,175 @@ mod tests {
             .initialize_task_budget(task_id, &policy, &reserve, now())
             .unwrap();
         task_id
+    }
+
+    // --- budget_snapshot: one read, every display figure (HORO-1709) ---
+
+    /// The contract the statusline depends on: the snapshot's own
+    /// arithmetic must agree with `available`'s, because they are the same
+    /// rule and a second expression of it would be a second source of
+    /// truth.
+    #[test]
+    fn a_snapshot_agrees_with_available_on_the_same_state() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(300),
+                idempotency_key: "key-1",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap();
+
+        let snapshot = store.budget_snapshot(task_id).unwrap().unwrap();
+        let available = store
+            .available(task_id, ReservationClass::RequiredWork)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.remaining().value, available.value);
+        assert_eq!(snapshot.remaining().kind, available.kind);
+        assert_eq!(snapshot.total(), ResourceAmount::Tokens(1_000));
+        assert_eq!(snapshot.reserved(), ResourceAmount::Tokens(300));
+        assert_eq!(snapshot.used(), ResourceAmount::Tokens(0));
+        assert_eq!(snapshot.completion_reserve(), ResourceAmount::Tokens(200));
+    }
+
+    /// Reserved-but-not-settled is its own column, and it is the state a
+    /// live task spends most of its time in. Reporting the hold as spend
+    /// would overstate consumption; omitting it would overstate what is
+    /// still available.
+    #[test]
+    fn a_hold_is_reserved_not_used_and_settling_moves_it_across() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let ReserveOutcome::Granted(reservation) = store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(400),
+                idempotency_key: "key-1",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap()
+        else {
+            panic!("expected Granted");
+        };
+
+        let held = store.budget_snapshot(task_id).unwrap().unwrap();
+        assert_eq!(held.reserved(), ResourceAmount::Tokens(400));
+        assert_eq!(held.used(), ResourceAmount::Tokens(0));
+        assert_eq!(held.remaining().value, 600.0);
+
+        store
+            .settle(reservation.id, Some(ResourceAmount::Tokens(250)), now())
+            .unwrap();
+
+        let settled = store.budget_snapshot(task_id).unwrap().unwrap();
+        assert_eq!(settled.used(), ResourceAmount::Tokens(250));
+        assert_eq!(
+            settled.reserved(),
+            ResourceAmount::Tokens(0),
+            "a settled reservation is no longer a hold — counting it as both \
+             would double-count the same capacity"
+        );
+        assert_eq!(settled.remaining().value, 750.0);
+    }
+
+    /// The HORO-1708 distinction, now carried on the snapshot rather than
+    /// re-derived by the caller: an envelope with no reservation row in any
+    /// state has never been observed, even though its arithmetic is
+    /// perfectly answerable.
+    #[test]
+    fn an_envelope_with_no_reservation_row_reports_itself_unobserved() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+
+        let snapshot = store.budget_snapshot(task_id).unwrap().unwrap();
+        assert!(!snapshot.is_observed());
+        assert_eq!(snapshot.remaining().value, 1_000.0);
+        assert_eq!(snapshot.fraction_left(), Some(1.0));
+    }
+
+    /// A released reservation costs nothing and is still an event. Were
+    /// `is_observed` keyed on the two states that carry an amount, a task
+    /// whose only draw was released would be reported as never measured —
+    /// which is false, and in the direction that withholds a figure the
+    /// ledger actually has.
+    #[test]
+    fn a_released_reservation_still_counts_as_an_observation() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let ReserveOutcome::Granted(reservation) = store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(100),
+                idempotency_key: "key-1",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap()
+        else {
+            panic!("expected Granted");
+        };
+        store.release(reservation.id, now()).unwrap();
+
+        let snapshot = store.budget_snapshot(task_id).unwrap().unwrap();
+        assert!(snapshot.is_observed());
+        assert_eq!(snapshot.used(), ResourceAmount::Tokens(0));
+        assert_eq!(snapshot.reserved(), ResourceAmount::Tokens(0));
+        assert_eq!(snapshot.remaining().value, 1_000.0);
+    }
+
+    /// An overrun must survive the trip to a display surface signed. The
+    /// ledger permits a settlement above the reserved amount (it records
+    /// the truth rather than refusing it), and a snapshot that saturated at
+    /// zero would turn "spent 120% of the envelope" into "spent exactly
+    /// all of it".
+    #[test]
+    fn an_overrun_reaches_the_snapshot_as_negative_remaining() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let ReserveOutcome::Granted(reservation) = store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::RequiredWork,
+                amount: ResourceAmount::Tokens(900),
+                idempotency_key: "key-1",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap()
+        else {
+            panic!("expected Granted");
+        };
+        store
+            .settle(reservation.id, Some(ResourceAmount::Tokens(1_200)), now())
+            .unwrap();
+
+        let snapshot = store.budget_snapshot(task_id).unwrap().unwrap();
+        assert_eq!(snapshot.used(), ResourceAmount::Tokens(1_200));
+        assert_eq!(snapshot.remaining().value, -200.0);
+        assert!(snapshot.remaining().is_exhausted());
+        assert_eq!(snapshot.utilization(), Some(1.2));
+    }
+
+    #[test]
+    fn a_task_with_no_budget_row_has_no_snapshot_rather_than_an_empty_one() {
+        let store = LedgerStore::open_in_memory().unwrap();
+        assert_eq!(store.budget_snapshot(TaskId::new()).unwrap(), None);
     }
 
     // --- Basic reserve/settle/release round trips -------------------
