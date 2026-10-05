@@ -31,8 +31,8 @@ use uuid::Uuid;
 
 use crate::{
     completion_contract::CompletionContract, estimate::Estimate, execution_plan::PlanId,
-    policy::Policy, resource_account::AccountId, resource_amount::ResourceAmount,
-    task_identity::TaskId,
+    policy::Policy, resource_account::AccountId, resource_amount::Headroom,
+    resource_amount::ResourceAmount, task_identity::TaskId,
 };
 
 /// Traceability tag every produced [`Reservation`]/[`TaskBudget`] is
@@ -275,6 +275,171 @@ pub struct TaskBudget {
     pub reservation_schema_version: String,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
+}
+
+/// Every economic figure about one task's envelope, read in one go
+/// (HORO-1709).
+///
+/// # Why one struct rather than four accessors
+///
+/// A rendering surface that shows "38% left" beside "62,000 of 150,000
+/// tokens" is making two claims that a reader will check against each
+/// other, and the only way they cannot disagree is for both to be
+/// projections of a single value. Before this type the daemon's
+/// `budget_posture` made four separate ledger reads to produce one
+/// percentage; adding amounts on the same footing would have meant a
+/// fifth and a sixth, each able to observe a different instant. The
+/// percentage would then be arithmetically correct, the amounts would be
+/// arithmetically correct, and the line would still be wrong.
+///
+/// So the ledger reads this once, inside one transaction
+/// (`LedgerStore::budget_snapshot`), and every figure below is computed
+/// from the fields of the same value. There is deliberately no second
+/// place in this workspace that re-derives remaining capacity for
+/// display.
+///
+/// # What the fields mean
+///
+/// `settled` and `active` are raw `f64` in the envelope's own
+/// [`ResourceKind`] — the shape the ledger stores (`REAL` plus a kind
+/// discriminator) — and are private so no caller can read a bare number
+/// without the unit. The accessors hand back typed amounts.
+///
+/// `reservation_count` is the number of reservation rows in *any* state.
+/// It answers a question about observation rather than capacity: a task
+/// holding no reservation at all has `settled == 0.0` and `active == 0.0`,
+/// so remaining capacity equals the limit exactly — and reporting that as
+/// "all of it is still available" claims a measurement that never
+/// happened (HORO-1708). See [`Self::is_observed`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BudgetSnapshot {
+    kind: crate::resource_amount::ResourceKind,
+    hard_limit: f64,
+    completion_reserve: f64,
+    settled: f64,
+    active: f64,
+    reservation_count: u64,
+}
+
+impl BudgetSnapshot {
+    /// Builds a snapshot from the figures a single ledger transaction
+    /// read. Only the ledger has a legitimate reason to call this; it is
+    /// public because the ledger is a separate crate, not because a
+    /// caller holding four loose numbers should assemble one.
+    pub fn new(
+        kind: crate::resource_amount::ResourceKind,
+        hard_limit: f64,
+        completion_reserve: f64,
+        settled: f64,
+        active: f64,
+        reservation_count: u64,
+    ) -> Self {
+        Self {
+            kind,
+            hard_limit,
+            completion_reserve,
+            settled,
+            active,
+            reservation_count,
+        }
+    }
+
+    /// The unit every figure on this snapshot is measured in. Fixed at
+    /// admission from the policy's own resource kind, so there is exactly
+    /// one unit per envelope and no figure here can be a sum of two.
+    pub fn kind(&self) -> crate::resource_amount::ResourceKind {
+        self.kind
+    }
+
+    /// The task's whole envelope — the ceiling in force for the life of
+    /// the task. `LedgerStore::initialize_task_budget` writes it once and
+    /// never overwrites it, so for a given task this is both the
+    /// *original configured* and the *current effective* ceiling; they
+    /// cannot drift apart. The daemon's configured default can and does
+    /// drift from it, which is a different scope and reported as one.
+    pub fn total(&self) -> ResourceAmount {
+        ResourceAmount::from_kind_f64(self.kind, self.hard_limit)
+    }
+
+    /// What has actually been consumed: the sum of settled reservations.
+    /// Not an estimate and not a projection — a settlement is an
+    /// after-the-fact record of what a finished turn cost.
+    pub fn used(&self) -> ResourceAmount {
+        ResourceAmount::from_kind_f64(self.kind, self.settled)
+    }
+
+    /// Capacity held by reservations that are still active: committed,
+    /// not yet spent. Kept separate from [`Self::used`] on purpose — a
+    /// surface that added the two together and called the result "used"
+    /// would double-count the moment those reservations settle.
+    pub fn reserved(&self) -> ResourceAmount {
+        ResourceAmount::from_kind_f64(self.kind, self.active)
+    }
+
+    /// The protected Completion Reserve, which is earmarked rather than
+    /// spent. Deliberately *not* subtracted from [`Self::remaining`]:
+    /// required completion work may draw against it (see
+    /// [`ReservationClass::RequiredWork`]), so a remaining figure that
+    /// excluded it would under-report what the task has.
+    pub fn completion_reserve(&self) -> ResourceAmount {
+        ResourceAmount::from_kind_f64(self.kind, self.completion_reserve)
+    }
+
+    /// `total - used - reserved`, signed.
+    ///
+    /// A [`Headroom`] rather than a [`ResourceAmount`] because an overrun
+    /// is real and representable only here: `Tokens(u64)` cannot hold a
+    /// negative, and saturating at zero would hide the one condition a
+    /// reader most needs to see. This is the same formula
+    /// `LedgerStore::available` applies for `RequiredWork`, which is the
+    /// point — one accounting rule, not a display-side variant of it.
+    pub fn remaining(&self) -> Headroom {
+        Headroom {
+            kind: self.kind,
+            value: self.hard_limit - self.settled - self.active,
+        }
+    }
+
+    /// `(used + reserved) / total` — the share of the envelope that is
+    /// gone or promised.
+    ///
+    /// This is the axis a pressure/urgency reading belongs on, and it is
+    /// not the complement of a displayed "percent left" by coincidence:
+    /// both are computed here from the same three fields. It may exceed
+    /// `1.0` (an overrun), which callers must preserve rather than clamp
+    /// — an envelope 120% committed is not the same fact as one exactly
+    /// spent.
+    ///
+    /// `None` when the limit is not a positive finite number, because a
+    /// share of nothing is not zero pressure, it is no reading at all.
+    pub fn utilization(&self) -> Option<f64> {
+        if !self.hard_limit.is_finite() || self.hard_limit <= 0.0 {
+            return None;
+        }
+        let value = (self.settled + self.active) / self.hard_limit;
+        value.is_finite().then_some(value)
+    }
+
+    /// The complement of [`Self::utilization`] — the share of the
+    /// envelope that is neither spent nor promised. `None` under exactly
+    /// the same condition, so a surface can never show one of the two
+    /// while the other is withheld.
+    pub fn fraction_left(&self) -> Option<f64> {
+        self.utilization().map(|used| 1.0 - used)
+    }
+
+    /// Whether any economic event has ever been attributed to this task.
+    ///
+    /// `false` means the envelope exists and nothing was ever committed
+    /// against it — reachable in normal operation, because a plan whose
+    /// admission came back `Deny` or `ApprovalRequired` gets no
+    /// reservation by design. The distinction matters because every
+    /// arithmetic figure above is then trivially "all of it available",
+    /// which reads as a measurement and is not one. Absence of
+    /// observation is not observation of fullness.
+    pub fn is_observed(&self) -> bool {
+        self.reservation_count > 0
+    }
 }
 
 /// The result of [`completion_reserve_for`]: the computed amount plus the
@@ -526,5 +691,115 @@ mod tests {
         reservation.settled_amount = Some(ResourceAmount::Tokens(300));
         assert_eq!(reservation.overrun(), None);
         assert_eq!(reservation.refunded(), Some(ResourceAmount::Tokens(200)));
+    }
+}
+
+#[cfg(test)]
+mod budget_snapshot_tests {
+    use super::*;
+    use crate::resource_amount::ResourceKind;
+
+    /// 150,000 limit, 18,000 settled, 70,000 still held.
+    fn partially_spent() -> BudgetSnapshot {
+        BudgetSnapshot::new(
+            ResourceKind::Tokens,
+            150_000.0,
+            30_000.0,
+            18_000.0,
+            70_000.0,
+            2,
+        )
+    }
+
+    #[test]
+    fn every_figure_comes_from_one_value_in_one_unit() {
+        let snapshot = partially_spent();
+        assert_eq!(snapshot.kind(), ResourceKind::Tokens);
+        assert_eq!(snapshot.total(), ResourceAmount::Tokens(150_000));
+        assert_eq!(snapshot.used(), ResourceAmount::Tokens(18_000));
+        assert_eq!(snapshot.reserved(), ResourceAmount::Tokens(70_000));
+        assert_eq!(
+            snapshot.completion_reserve(),
+            ResourceAmount::Tokens(30_000)
+        );
+        assert_eq!(snapshot.remaining().value, 62_000.0);
+        assert_eq!(snapshot.remaining().kind, ResourceKind::Tokens);
+    }
+
+    /// The reconciliation rule the statusline depends on: what is left
+    /// plus what is spent plus what is held is the whole envelope, and the
+    /// reserve is *not* a fourth slice of it — it is earmarked capacity
+    /// that still sits inside `remaining`.
+    #[test]
+    fn used_reserved_and_remaining_reconcile_to_the_total() {
+        let snapshot = partially_spent();
+        let sum =
+            snapshot.used().as_f64() + snapshot.reserved().as_f64() + snapshot.remaining().value;
+        assert_eq!(sum, snapshot.total().as_f64());
+    }
+
+    /// The whole reason pressure is its own accessor. `62,000 of 150,000
+    /// left` is 41% left and 59% *pressure*, and a band table applied to
+    /// the first number would call a nearly-two-thirds-committed envelope
+    /// safe.
+    #[test]
+    fn utilization_is_the_committed_share_not_the_remaining_one() {
+        let snapshot = partially_spent();
+        let utilization = snapshot.utilization().unwrap();
+        let left = snapshot.fraction_left().unwrap();
+        assert!((utilization - 88_000.0 / 150_000.0).abs() < 1e-12);
+        assert!((utilization + left - 1.0).abs() < 1e-12);
+        assert!(
+            utilization > left,
+            "this fixture is only interesting while the two differ"
+        );
+    }
+
+    #[test]
+    fn an_overrun_is_preserved_rather_than_clamped() {
+        let overrun = BudgetSnapshot::new(ResourceKind::Tokens, 100.0, 20.0, 120.0, 0.0, 1);
+        assert_eq!(overrun.remaining().value, -20.0);
+        assert!(overrun.remaining().is_exhausted());
+        assert_eq!(
+            overrun.utilization(),
+            Some(1.2),
+            "120% committed is a different fact from exactly spent"
+        );
+        let left = overrun.fraction_left().unwrap();
+        assert!(
+            left < 0.0 && (left + 0.2).abs() < 1e-12,
+            "a negative share must reach the caller so it can be refused, not rounded to \
+             zero (got {left})"
+        );
+    }
+
+    #[test]
+    fn a_zero_limit_envelope_has_no_share_rather_than_a_zero_one() {
+        let empty = BudgetSnapshot::new(ResourceKind::Tokens, 0.0, 0.0, 0.0, 0.0, 1);
+        assert_eq!(empty.utilization(), None);
+        assert_eq!(empty.fraction_left(), None);
+    }
+
+    #[test]
+    fn an_envelope_nothing_was_committed_against_reports_itself_unobserved() {
+        let untouched = BudgetSnapshot::new(ResourceKind::Tokens, 150_000.0, 30_000.0, 0.0, 0.0, 0);
+        assert!(!untouched.is_observed());
+        assert_eq!(
+            untouched.utilization(),
+            Some(0.0),
+            "the arithmetic is still answerable — it is the *claim* that is not"
+        );
+        assert!(partially_spent().is_observed());
+    }
+
+    #[test]
+    fn amounts_keep_the_envelopes_own_unit() {
+        let usd = BudgetSnapshot::new(ResourceKind::Usd, 5_000.0, 1_000.0, 1_240.0, 0.0, 1);
+        assert_eq!(usd.total(), ResourceAmount::UsdCents(5_000));
+        assert_eq!(usd.used(), ResourceAmount::UsdCents(1_240));
+        assert_eq!(usd.remaining().kind, ResourceKind::Usd);
+        let quota = BudgetSnapshot::new(ResourceKind::QuotaPercent, 100.0, 20.0, 38.0, 0.0, 1);
+        assert_eq!(quota.total(), ResourceAmount::QuotaPercent(100.0));
+        assert_eq!(quota.used(), ResourceAmount::QuotaPercent(38.0));
     }
 }

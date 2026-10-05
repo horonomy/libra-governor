@@ -148,8 +148,8 @@ pub use replay::{
     UnpinnedReason, MIN_REPLAY_SAMPLES, REPLAY_PINS_SCHEMA_VERSION,
 };
 pub use reservation::{
-    completion_reserve_for, CompletionReserveBasis, CompletionReserveEstimate, LeaseKind,
-    Reservation, ReservationClass, ReservationId, ReservationState, TaskBudget,
+    completion_reserve_for, BudgetSnapshot, CompletionReserveBasis, CompletionReserveEstimate,
+    LeaseKind, Reservation, ReservationClass, ReservationId, ReservationState, TaskBudget,
     COMPLETION_RESERVE_BASE_FRACTION, COMPLETION_RESERVE_MAX_FRACTION,
     COMPLETION_RESERVE_PER_REQUIRED_CRITERION, RESERVATION_SCHEMA_VERSION,
 };
