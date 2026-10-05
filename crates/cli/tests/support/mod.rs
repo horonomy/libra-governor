@@ -1,5 +1,6 @@
 //! Process isolation for integration tests that exercise daemon auto-start.
 
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -37,6 +38,18 @@ impl DaemonState {
 
 impl Drop for DaemonState {
     fn drop(&mut self) {
+        // Preserve this fixture's request/startup error before its isolated
+        // state disappears. Successful tests emit no additional output.
+        if std::thread::panicking() {
+            if let Ok(file) = std::fs::File::open(self.path().join("daemon.log")) {
+                let mut log = String::new();
+                let _ = file.take(8192).read_to_string(&mut log);
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "isolated test daemon log (at most 8192 bytes):\n{log}"
+                );
+            }
+        }
         self.stop();
     }
 }
