@@ -6,11 +6,20 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use libra_governor_daemon::host_runtime::contract::{HostContract, ValidatedManifest};
+use libra_governor_daemon::host_runtime::dispatch::{
+    Cancellation, DiagnosticDispatcher, DiagnosticScope, DiagnosticSelection,
+};
 use libra_governor_daemon::host_runtime::state::{AdapterRegistry, RegistrySnapshot};
 use libra_governor_daemon::host_runtime::{RegistryEffect, RegistryFailure};
 use serde_json::{json, Map, Value};
 
-const HELP: &str = "Usage:\n  libra-governor adapter list [--json]\n  libra-governor adapter inspect <id> [--review-code-trust] [--json]\n  libra-governor adapter capabilities <id> [--json]\n  libra-governor adapter status [id] [--json]\n  libra-governor adapter doctor [id] [--json]\n  libra-governor adapter explain <id> [--json]\n  libra-governor adapter register <manifest-path> [--confirm-code-digest <sha256:...>] [--dry-run] [--json]\n  libra-governor adapter unregister <id> [--dry-run] [--json]\n  libra-governor adapter install|uninstall|enable|disable <id> [--json]\n\nRegistry metadata is passive. Code-trust review hashes declared files but does not execute them.";
+const HELP: &str = "Usage:\n  libra-governor adapter list [--json]\n  libra-governor adapter inspect <id> [--review-code-trust] [--json]\n  libra-governor adapter capabilities <id> [--json]\n  libra-governor adapter status [id] [--json]\n  libra-governor adapter doctor [id] [--json]\n  libra-governor adapter doctor <id> --probe [--scope user|project] [--json]\n  libra-governor adapter explain <id> [--json]\n  libra-governor adapter register <manifest-path> [--confirm-code-digest <sha256:...>] [--dry-run] [--json]\n  libra-governor adapter unregister <id> [--dry-run] [--json]\n  libra-governor adapter install|uninstall|enable|disable <id> [--json]\n\nRegistry metadata is passive. Code-trust review hashes declared files but does not execute them. `adapter doctor <id> --probe` executes explicitly trusted external code with ambient authority; the probe itself grants no host capability or native persistent-statusline support.";
+
+#[derive(Clone, Copy, Debug)]
+enum ProbeScope {
+    User,
+    Project,
+}
 
 #[derive(Debug)]
 struct Command {
@@ -21,6 +30,8 @@ struct Command {
     dry_run: bool,
     review: bool,
     confirmation: Option<String>,
+    probe: bool,
+    scope: Option<ProbeScope>,
     unavailable: bool,
 }
 
@@ -68,6 +79,8 @@ fn parse(args: &[String]) -> Result<Command, (&'static str, bool)> {
         dry_run: false,
         review: false,
         confirmation: None,
+        probe: false,
+        scope: None,
         unavailable,
     };
     let mut index = 1;
@@ -125,11 +138,27 @@ fn parse(args: &[String]) -> Result<Command, (&'static str, bool)> {
                 };
                 command.confirmation = Some(value.clone());
             }
-            "--probe" if operation == "doctor" => command.unavailable = true,
+            "--probe" if operation == "doctor" && !command.probe => command.probe = true,
+            "--scope" if operation == "doctor" && command.scope.is_none() => {
+                index += 1;
+                command.scope = match args.get(index).map(String::as_str) {
+                    Some("user") => Some(ProbeScope::User),
+                    Some("project") => Some(ProbeScope::Project),
+                    _ => return Err((operation, args.iter().any(|arg| arg == "--json"))),
+                };
+            }
             // Scope/profile and generic confirmation switches have no meaning for this registry.
             _ => return Err((operation, args.iter().any(|arg| arg == "--json"))),
         }
         index += 1;
+    }
+    if command.scope.is_some() && !command.probe {
+        return Err((operation, command.json));
+    }
+    if command.probe
+        && (operation != "doctor" || command.id.as_deref().is_none_or(|id| !valid_id(id)))
+    {
+        return Err((operation, command.json));
     }
     Ok(command)
 }
@@ -161,6 +190,9 @@ fn execute(command: Command) -> i32 {
         }
     };
     let registry = AdapterRegistry::new(root, contract.clone());
+    if command.probe {
+        return execute_probe(&command, &contract, registry);
+    }
     let result = if command.unavailable {
         Err(RegistryFailure::new("operation", "operation unavailable"))
     } else {
@@ -232,6 +264,119 @@ fn dispatch(
         "register" => register(command, contract, registry),
         "unregister" => unregister(command, registry),
         _ => Err(RegistryFailure::new("operation", "operation unavailable")),
+    }
+}
+
+fn execute_probe(command: &Command, contract: &HostContract, registry: AdapterRegistry) -> i32 {
+    let mut signals = match crate::adapter_probe_signal::ProbeSignals::install() {
+        Ok(signals) => signals,
+        Err(()) => {
+            return emit(
+                contract,
+                command,
+                "refused",
+                "signal_setup_refused",
+                json!({"execution_attempted":false,"filesystem_effect":"unchanged"}),
+                "failed",
+                2,
+            );
+        }
+    };
+    let cancellation: Cancellation = signals.cancellation();
+    let id = command.id.as_deref().unwrap_or("");
+    let selection = DiagnosticSelection {
+        scope: match command.scope.unwrap_or(ProbeScope::User) {
+            ProbeScope::User => DiagnosticScope::User,
+            ProbeScope::Project => DiagnosticScope::Project,
+        },
+        configuration: b"{}".to_vec(),
+    };
+    let result = DiagnosticDispatcher::new(registry, contract.clone()).probe_registered(
+        id,
+        selection,
+        &cancellation,
+    );
+    let execution_attempted = result
+        .as_ref()
+        .map(|_| true)
+        .unwrap_or_else(|failure| failure.execution_attempted);
+
+    // probe_registered owns runner cleanup and returns only after the process
+    // group is settled; restore handlers before emitting a CLI response.
+    match signals.restore() {
+        Ok(true) => {
+            return emit(
+                contract,
+                command,
+                "failed",
+                "probe_cancelled",
+                json!({"execution_attempted":execution_attempted,"filesystem_effect": if execution_attempted {"not_asserted"} else {"unchanged"}}),
+                "failed",
+                2,
+            );
+        }
+        Ok(false) => {}
+        Err(()) => {
+            return emit(
+                contract,
+                command,
+                "failed",
+                "signal_restore_failed",
+                json!({"execution_attempted":execution_attempted,"filesystem_effect":"not_asserted"}),
+                "failed",
+                2,
+            );
+        }
+    }
+
+    match result {
+        Ok(candidate) => emit(
+            contract,
+            command,
+            "partial",
+            "candidate_protocol_validated",
+            json!({
+                "adapter_id": safe(candidate.adapter_id()),
+                "capability_count": candidate.capability_count(),
+                "candidate_protocol": "validated",
+                "native_effect": "unverified",
+                "host_trust": "unknown",
+                "effective_support": "unknown",
+            }),
+            "unverified",
+            0,
+        ),
+        Err(failure) => {
+            let reason = diagnostic_reason(failure.stage, failure.reason);
+            let (outcome, filesystem_effect, status) = if failure.execution_attempted {
+                ("failed", "not_asserted", 2)
+            } else {
+                ("refused", "unchanged", 1)
+            };
+            emit(
+                contract,
+                command,
+                outcome,
+                reason,
+                json!({"execution_attempted":failure.execution_attempted,"filesystem_effect":filesystem_effect}),
+                "failed",
+                status,
+            )
+        }
+    }
+}
+
+fn diagnostic_reason(stage: &str, reason: &str) -> &'static str {
+    match (stage, reason) {
+        ("selection", "unknown adapter") => "unknown_adapter",
+        ("selection", "builtin diagnostics unavailable") => "operation_refused",
+        ("trust", _) => "code_trust_refused",
+        ("registry", _) => "registry_unavailable",
+        ("context", _) => "context_refused",
+        ("configuration", _) => "configuration_refused",
+        ("protocol", _) => "protocol_refused",
+        ("execution", _) => "probe_execution_failed",
+        _ => "probe_refused",
     }
 }
 
@@ -491,6 +636,8 @@ fn emit_early(
         dry_run: false,
         review: false,
         confirmation: None,
+        probe: false,
+        scope: None,
         unavailable: false,
     };
     emit(
@@ -508,6 +655,7 @@ fn validate_sample(contract: &HostContract, command: &Command) -> Result<(), Reg
     let sample = envelope(
         command.operation,
         command.id.as_deref(),
+        response_scope(command),
         "success",
         "",
         json!({}),
@@ -528,6 +676,7 @@ fn emit(
     let value = envelope(
         command.operation,
         command.id.as_deref(),
+        response_scope(command),
         outcome,
         reason,
         body,
@@ -553,6 +702,7 @@ fn emit(
 fn envelope(
     operation: &str,
     id: Option<&str>,
+    scope: Option<&'static str>,
     outcome: &str,
     reason: &str,
     body: Value,
@@ -563,6 +713,9 @@ fn envelope(
     value.insert("operation".into(), json!(operation_for_schema(operation)));
     if let Some(id) = id.filter(|id| valid_id(id)) {
         value.insert("adapter_id".into(), json!(safe(id)));
+    }
+    if let Some(scope) = scope {
+        value.insert("scope".into(), json!(scope));
     }
     value.insert("outcome".into(), json!(outcome));
     value.insert(
@@ -576,6 +729,19 @@ fn envelope(
     value.insert("result".into(), body);
     value.insert("verification_state".into(), json!(verification));
     Value::Object(value)
+}
+
+fn scope_name(scope: ProbeScope) -> &'static str {
+    match scope {
+        ProbeScope::User => "user",
+        ProbeScope::Project => "project",
+    }
+}
+
+fn response_scope(command: &Command) -> Option<&'static str> {
+    command
+        .probe
+        .then(|| scope_name(command.scope.unwrap_or(ProbeScope::User)))
 }
 
 fn print_body(value: &Value, depth: usize) {

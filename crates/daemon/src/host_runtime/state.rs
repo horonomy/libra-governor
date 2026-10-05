@@ -53,7 +53,7 @@ impl AdapterRegistry {
         }
     }
 
-    fn root(&self) -> Result<&Path, RegistryFailure> {
+    pub(super) fn root(&self) -> Result<&Path, RegistryFailure> {
         self.root.as_deref().map_err(Clone::clone)
     }
 

@@ -614,6 +614,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 name = "libra-governor-cli"
 version = "0.0.2"
 dependencies = [
+ "libc",
  "libra-governor-daemon",
  "libra-governor-domain",
  "libra-governor-estimator",
@@ -640,6 +641,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jsonschema",
+ "libc",
  "libra-governor-domain",
  "libra-governor-estimator",
  "libra-governor-extension",
