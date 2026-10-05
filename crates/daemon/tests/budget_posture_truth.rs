@@ -503,6 +503,7 @@ fn a_finished_task_leaves_no_budget_behind_in_idle() {
         session_id: "finished-session".to_string(),
         model: None,
         provider: None,
+        transcript_path: None,
     }) {
         Response::Finalize(_) => {}
         other => panic!("expected a Finalize response, got {other:?}"),

@@ -39,7 +39,7 @@ use libra_governor_domain::{
     ExternalApproval, ExternalVerdict, HysteresisOutcome, PersistedPins, PlanId, Policy,
     PolicyPresetInputs, ProgressEvidence, RegimeKey, RegimeProvenance, RemainingEstimate, ReplanId,
     ReplanReason, ReplanRecord, ReplanTriggerKind, ReservationClass, ReservationState,
-    ResourceAmount, Shadow, SpendScope, TaskId, ABSOLUTE_TOOL_CALL_COUNT_FALLBACK,
+    ResourceAmount, ResourceKind, Shadow, SpendScope, TaskId, ABSOLUTE_TOOL_CALL_COUNT_FALLBACK,
     DEFAULT_LOOP_STREAK_THRESHOLD,
 };
 use libra_governor_estimator::{
@@ -512,7 +512,16 @@ fn dispatch(
             session_id,
             model,
             provider,
-        } => match handle_finalize(&session_id, model, provider, ledger, current_task, config) {
+            transcript_path,
+        } => match handle_finalize(
+            &session_id,
+            model,
+            provider,
+            transcript_path.as_deref(),
+            ledger,
+            current_task,
+            config,
+        ) {
             Ok(outcome) => Response::Finalize(outcome),
             Err(e) => {
                 log::append_line(&config.log_path, &format!("finalize error: {e}"));
@@ -1690,6 +1699,7 @@ fn handle_finalize(
     session_id: &str,
     model: Option<String>,
     provider: Option<String>,
+    transcript_path: Option<&str>,
     ledger: &mut LedgerStore,
     current_task: &mut Option<TaskSummary>,
     config: &DaemonConfig,
@@ -1724,20 +1734,64 @@ fn handle_finalize(
     let elapsed_secs = (now - started_at).whole_seconds().max(0) as u64;
     let tool_call_count = ledger.tool_call_count_for_session(session_id)?;
 
+    // Measured host usage for the window this receipt covers
+    // (HORO-1725). The window starts at the previous receipt on this task
+    // — NOT at the lineage start — because everything before that was
+    // already recorded by that receipt and settled against its own
+    // reservations; re-counting it would inflate every receipt by the sum
+    // of its predecessors.
+    //
+    // The premise this code used to state — that Claude Code's hook
+    // payloads expose no token data — was wrong, and it was expensive.
+    // The payload carries `transcript_path`, and the host writes the four
+    // per-turn counts into that file. With `actual_usage` left empty,
+    // `resource_quantiles` had nothing to work from, `resource_p80` was
+    // unconditionally `None`, admission fell back to
+    // `policy.resource.target` for every task, and every reservation on a
+    // live store held the identical constant.
+    let usage_window_start = ledger
+        .last_receipt_recorded_at(task_id)?
+        .unwrap_or(started_at);
+    let observation = match transcript_path {
+        Some(path) => crate::usage::observe_transcript_window(
+            std::path::Path::new(path),
+            usage_window_start,
+            crate::usage::DEFAULT_SCAN_CAP_BYTES,
+        ),
+        None => crate::usage::UsageObservation::Unavailable(crate::usage::UsageUnavailable::NoTranscriptPath),
+    };
+    // One `Tokens` entry or none — never a second amount of the same
+    // kind, which `resource_quantiles` would treat as an independent
+    // sample and skew its own quantiles with.
+    let actual_usage: Vec<ResourceAmount> = match observation.measured() {
+        Some(measured) => vec![ResourceAmount::Tokens(measured.fresh_tokens())],
+        None => vec![],
+    };
+    log::append_line(
+        &config.log_path,
+        &format!(
+            "task {task_id}: host usage {} for window since {}",
+            observation.reason_label(),
+            usage_window_start
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_else(|_| "unknown".to_string()),
+        ),
+    );
+
     // MVP 1.0 has no automated Completion Contract verification (no
     // test-running integration): outcome is always `Unknown` here,
     // structurally correct per `ExecutionOutcome`'s own docs — a task
     // must never be inferred "done" merely because the session stopped.
-    // Actual resource usage is an honest empty `Vec`, not a zeroed USD
-    // amount: Claude Code's `Stop`/`PostToolUse` hook payloads expose no
-    // token/cost data (see PR description), so nothing here fabricates a
-    // spend figure.
+    // An empty `actual_usage` now means only what it says: no measurement
+    // was available (no transcript, unreadable, or a window too large to
+    // read within the scan cap). It is never a fabricated or zeroed
+    // amount.
     let receipt = ExecutionReceipt::new(
         task_id,
         plan.contract_revision,
         plan_id,
         elapsed_secs,
-        vec![],
+        actual_usage,
         ExecutionOutcome::Unknown,
         now,
     )
@@ -1753,18 +1807,41 @@ fn handle_finalize(
             .unwrap_or(libra_governor_domain::FEATURE_SCHEMA_VERSION),
     )));
 
-    // Settle every reservation still active on this plan (HORO-1141).
-    // `None` as the actual cost: Claude Code's hook payloads expose no
-    // token/cost usage figure (see the comment above on `actual_usage`),
-    // so settlement conservatively falls back to the reserved amount
-    // rather than fabricating one — see `Reservation::usage_known` docs.
+    // Settle every reservation still active on this plan (HORO-1141),
+    // with the measured amount when there is one (HORO-1725).
+    //
+    // `settle(id, Some(amount))` records `usage_known = true`;
+    // `settle(id, None)` falls back to the full reserved amount and
+    // records `usage_known = false`. That flag is the provenance
+    // distinction a downstream consumer needs in order not to mistake a
+    // conservative placeholder for an observation, and it already
+    // existed — what was missing was ever having a real figure to pass.
+    //
+    // Only attributed when the plan has exactly ONE active reservation.
+    // The measurement is a single aggregate for the whole window; with
+    // two or more concurrent envelopes there is no evidence for how to
+    // divide it, and splitting it on a guess would write a precise-looking
+    // number that no observation supports. Those settle conservatively
+    // instead, which is visible as `usage_known = false` rather than
+    // silent.
     let active_reservations: Vec<_> = ledger
         .reservations_for_task(task_id)?
         .into_iter()
         .filter(|r| r.plan_id == Some(plan_id) && r.state == ReservationState::Active)
         .collect();
+    let attributable = if active_reservations.len() == 1 {
+        observation.measured().map(|m| m.fresh_tokens())
+    } else {
+        None
+    };
     for reservation in active_reservations {
-        ledger.settle(reservation.id, None, now)?;
+        // Kind-matched before it is offered: `settle` rejects a mismatch
+        // outright, and a token measurement must not be pushed at a USD
+        // or quota-percent envelope.
+        let actual = attributable
+            .filter(|_| reservation.amount.kind() == ResourceKind::Tokens)
+            .map(ResourceAmount::Tokens);
+        ledger.settle(reservation.id, actual, now)?;
     }
     let reservation_evidence = ledger.reservation_evidence(task_id)?;
     let receipt = receipt.with_reservation_evidence(reservation_evidence);
@@ -2292,6 +2369,7 @@ mod tests {
             "no-such-session",
             None,
             None,
+            None,
             &mut ledger,
             &mut current_task,
             &config,
@@ -2329,6 +2407,9 @@ mod tests {
             "sess-1",
             Some("claude-sonnet-5".to_string()),
             Some("claude-code".to_string()),
+            // No transcript: this test proves the pre-HORO-1725
+            // behavior still holds when a host exposes none.
+            None,
             &mut ledger,
             &mut current_task,
             &config,

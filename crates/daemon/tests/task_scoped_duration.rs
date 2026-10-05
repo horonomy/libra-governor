@@ -216,6 +216,7 @@ impl Harness {
             session_id: session_id.to_string(),
             model: None,
             provider: None,
+            transcript_path: None,
         }) {
             Response::Finalize(FinalizeOutcome::Finalized(result)) => *result,
             other => panic!("expected a Finalized outcome, got {other:?}"),

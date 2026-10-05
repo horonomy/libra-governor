@@ -339,13 +339,14 @@ pub fn run_turn_completed(agent: AgentKind) {
         }
     };
 
-    let (session_id, model, turn_id, agent_id) = match event {
+    let (session_id, model, turn_id, agent_id, transcript_path) = match event {
         NormalizedEvent::TurnCompleted {
             session_id,
             model,
             turn_id,
             agent_id,
-        } => (session_id, model, turn_id, agent_id),
+            transcript_path,
+        } => (session_id, model, turn_id, agent_id, transcript_path),
         NormalizedEvent::RecognizedUnwired { hook_event_name } => {
             log(
                 &log_path,
@@ -406,6 +407,10 @@ pub fn run_turn_completed(agent: AgentKind) {
         session_id,
         model,
         provider: Some(super::label(agent).to_string()),
+        // Relayed verbatim, never opened here (HORO-1725): a lossy
+        // conversion is still a conversion, and this crate has no
+        // business reading the transcript.
+        transcript_path: transcript_path.map(|p| p.to_string_lossy().into_owned()),
     };
 
     match client::roundtrip(&stream, request) {
