@@ -560,13 +560,15 @@ impl LedgerStore {
     /// When this task last had a receipt written, if ever (HORO-1725).
     ///
     /// This is the lower bound of the window a host-usage measurement may
-    /// claim: everything up to the previous receipt was already accounted
-    /// for by that receipt, and by the reservations it settled. Measuring
-    /// from the task's (or plan lineage's) start instead would re-count
-    /// every earlier turn on every subsequent `Stop`, inflating each
-    /// receipt by the sum of all its predecessors — the same shape of
-    /// error HORO-1723 fixed for duration, and the reason the one-snapshot
-    /// accounting invariant exists.
+    /// claim, and the reason successive receipts tile a session's spend
+    /// rather than sampling it. Everything up to the previous receipt was
+    /// already recorded there and settled against its own reservations,
+    /// so the window may not reach back past it; and because this is
+    /// strictly *earlier* than the next turn's
+    /// [`Self::plan_lineage_started_at`], nothing the host recorded
+    /// between the two falls outside every window. Spend attributed to no
+    /// receipt at all biases the estimator low just as surely as a
+    /// fabricated amount biases it high.
     ///
     /// `None` means no receipt yet, in which case the caller's own window
     /// start (the plan lineage's beginning) is already correct.

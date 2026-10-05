@@ -1735,11 +1735,24 @@ fn handle_finalize(
     let tool_call_count = ledger.tool_call_count_for_session(session_id)?;
 
     // Measured host usage for the window this receipt covers
-    // (HORO-1725). The window starts at the previous receipt on this task
-    // — NOT at the lineage start — because everything before that was
-    // already recorded by that receipt and settled against its own
-    // reservations; re-counting it would inflate every receipt by the sum
-    // of its predecessors.
+    // (HORO-1725). The window runs from this task's previous receipt to
+    // now, so successive receipts tile the session's spend: each token
+    // the host recorded falls inside exactly one window.
+    //
+    // `started_at` is the obvious alternative and it is not equivalent.
+    // It already excludes earlier turns (HORO-1723 scoped it to the plan
+    // lineage, so it cannot double-count), but it is *later* than the
+    // previous receipt, and the gap between the two is real: a host keeps
+    // writing assistant records after `Stop` fires — a compaction, a
+    // continuation, a subagent finishing — and every token in that gap
+    // would be attributed to no receipt at all. Spend that is silently
+    // dropped biases the estimator low, which is the same class of
+    // dishonesty as inventing one.
+    //
+    // The boundary is inclusive at the lower end, so a record timestamped
+    // to the exact nanosecond of a receipt would be counted by both
+    // windows. Not worth a second comparison path to close: the
+    // alternative is dropping it from both.
     //
     // The premise this code used to state — that Claude Code's hook
     // payloads expose no token data — was wrong, and it was expensive.
