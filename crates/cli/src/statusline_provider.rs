@@ -1140,9 +1140,10 @@ mod tests {
     /// message rather than calling a function, so a peer that omitted the
     /// field must still produce a truthful document, and the all-documents
     /// properties below have to cover that.
-    const ALL_BUDGETS: [(&str, Option<BudgetPosture>); 5] = [
+    const ALL_BUDGETS: [(&str, Option<BudgetPosture>); 6] = [
         ("absent", None),
         ("remaining", Some(BUDGET_LEFT)),
+        ("uncommitted", Some(BudgetPosture::Uncommitted)),
         ("exhausted", Some(BudgetPosture::Exhausted)),
         ("unestablished", Some(BudgetPosture::NotEstablished)),
         ("unreadable", Some(BudgetPosture::Unreadable)),
@@ -1736,11 +1737,67 @@ mod tests {
     }
 
     #[test]
-    fn the_three_ways_a_budget_can_be_gone_stay_three_facts() {
+    fn an_uncommitted_envelope_is_reported_as_an_unknown_and_never_as_a_full_one() {
+        // HORO-1708. The daemon used to send `Remaining { 1.0 }` here and
+        // this surface faithfully rendered "100% budget left". The label is
+        // asserted against that specific string rather than only against
+        // the absence of a `%`, because "100% budget left" is the exact
+        // output a reverted fix produces and the one a reader of this test
+        // needs to see named.
+        let document = with_budget(Some(BudgetPosture::Uncommitted));
+        let budget = segments(&document)
+            .iter()
+            .find(|s| s["key"] == json!("budget"))
+            .unwrap()
+            .clone();
+        assert_eq!(budget["label"], json!("Budget usage unknown"));
+        assert_ne!(budget["label"], json!("100% budget left"));
+        assert_eq!(budget["state"], json!("unknown"));
+        assert_eq!(
+            budget["reason_code"],
+            json!("no_commitment_against_envelope")
+        );
+        assert_eq!(budget["clear_role"], json!("vital"));
+
+        let label = budget["label"].as_str().unwrap();
+        assert!(!label.contains('%'), "there is no share to report: {label}");
+        // The phrasings that would reintroduce the defect in words rather
+        // than in arithmetic. Each of these reads as "none of it is gone",
+        // which is the claim this posture exists to withhold.
+        for forbidden in ["full", "untouched", "unspent", "intact", "all"] {
+            assert!(
+                !label.to_lowercase().contains(forbidden),
+                "{label:?} implies a measured full envelope via {forbidden:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_uncommitted_explain_prose_says_why_the_share_is_withheld() {
+        // The statusline has room only to name the unknown; `explain` is
+        // where a user finds out that the omission is deliberate rather
+        // than a missing reading.
+        let prose = budget_posture_prose(Some(BudgetPosture::Uncommitted));
+        assert!(prose.starts_with("unknown — "), "{prose}");
+        assert!(prose.contains("nothing has been"), "{prose}");
+        assert!(!prose.contains('%'), "{prose}");
+        // Distinct from the neighbouring absences, so `explain` cannot be
+        // read as saying the task has no envelope at all.
+        assert_ne!(
+            prose,
+            budget_posture_prose(Some(BudgetPosture::NotEstablished))
+        );
+        assert_ne!(prose, budget_posture_prose(Some(BudgetPosture::Unreadable)));
+    }
+
+    #[test]
+    fn the_four_ways_a_share_can_be_missing_stay_four_facts() {
         // Collapsing them loses the one a user could act on: a spent
-        // envelope is not an unadmitted task, and neither is a ledger that
-        // would not read.
+        // envelope is not an unadmitted task, an envelope nothing has drawn
+        // against is neither, and none of the three is a ledger that would
+        // not read.
         let shapes = [
+            BudgetPosture::Uncommitted,
             BudgetPosture::Exhausted,
             BudgetPosture::NotEstablished,
             BudgetPosture::Unreadable,
@@ -1764,11 +1821,11 @@ mod tests {
         let mut unique_labels = labels.clone();
         unique_labels.sort();
         unique_labels.dedup();
-        assert_eq!(unique_labels.len(), 3, "{labels:?}");
+        assert_eq!(unique_labels.len(), 4, "{labels:?}");
         let mut unique_reasons = reasons.clone();
         unique_reasons.sort();
         unique_reasons.dedup();
-        assert_eq!(unique_reasons.len(), 3, "{reasons:?}");
+        assert_eq!(unique_reasons.len(), 4, "{reasons:?}");
     }
 
     #[test]
