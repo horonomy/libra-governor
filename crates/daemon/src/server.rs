@@ -56,10 +56,11 @@ use libra_governor_ledger::{
     BusinessContextInsert, LedgerStore, OutcomeAttestationInsert, ReserveOutcome, ReserveRequest,
 };
 use libra_governor_protocol::{
-    wire, AdmissionPolicyReport, BudgetPosture, CalibrationReportResult, DoctorResult,
-    FinalizeOutcome, FinalizeResult, GatewayStatusResult, OutcomeRecordedOutcome,
-    OutcomeRecordedResult, PreflightResult, ReconSummary, ReplanState, Request, RequestEnvelope,
-    Response, ResponseEnvelope, StatusResult, TaskSummary, PROTOCOL_VERSION,
+    wire, AdmissionPolicyReport, BudgetPosture, BudgetSnapshot, CalibrationReportResult,
+    ConfiguredBudget, DoctorResult, FinalizeOutcome, FinalizeResult, GatewayStatusResult,
+    OutcomeRecordedOutcome, OutcomeRecordedResult, PreflightResult, ReconSummary, ReplanState,
+    Request, RequestEnvelope, Response, ResponseEnvelope, StatusResult, TaskSummary,
+    PROTOCOL_VERSION,
 };
 
 use crate::{
@@ -490,12 +491,30 @@ fn dispatch(
                 }
             }
         },
-        Request::Status => Response::Status(Box::new(StatusResult {
-            task_budget: current_task
-                .as_ref()
-                .map(|task| budget_posture(ledger, task.task_id)),
-            current_task: current_task.clone(),
-        })),
+        Request::Status => {
+            // One ledger read for both budget fields (HORO-1709). Splitting
+            // this into a posture read and an amounts read would let the
+            // percentage and the amounts in the same reply describe
+            // different instants.
+            let (task_budget, task_budget_amounts) = match current_task.as_ref() {
+                Some(task) => {
+                    let (posture, amounts) = budget_reading(ledger, task.task_id);
+                    (Some(posture), amounts)
+                }
+                // No current task: a share of a budget that was never
+                // admitted is not zero, it is absent — and so are its
+                // amounts. What the reply still carries is
+                // `configured_budget`, which is a different scope and
+                // labelled as one.
+                None => (None, None),
+            };
+            Response::Status(Box::new(StatusResult {
+                task_budget,
+                task_budget_amounts,
+                configured_budget: configured_budget(config),
+                current_task: current_task.clone(),
+            }))
+        }
         Request::ToolInvoked {
             session_id,
             tool_name,
@@ -659,86 +678,83 @@ fn replan_state_for_summary(
 }
 
 /// What the reservation ledger says about `task_id`'s envelope right now
-/// (HORO-1634), for the `Status` reply.
+/// (HORO-1634), for the `Status` reply: the classification and the amounts
+/// it classifies, together.
 ///
-/// Four indexed local SQLite reads on the connection the daemon already
-/// holds: `available` resolves the budget row and then sums settled and
-/// active reservations, and the `hard_limit` is read from that row again
-/// below. The repeat read is deliberate — collapsing it would mean a new
-/// `LedgerStore` method returning headroom and limit together, and
-/// widening the ledger's public API to save one indexed primary-key
-/// lookup is the wrong trade. No extra *round trip* of any kind, which is
-/// the cost that actually matters here: the figure is computed while
-/// answering a request the statusline provider was already going to make,
-/// which is the only way a budget reading is affordable inside a 200 ms
-/// hot-path probe.
+/// # One read, not four (HORO-1709)
 ///
-/// `RequiredWork` rather than `OptionalWork`, so the figure is the whole
-/// envelope: `hard_limit - settled - active`, with the protected Completion
-/// Reserve left in it. The reserve is earmarked, not spent, and required
-/// completion work may still draw against it, so subtracting it here would
-/// report less room than the task has. The gateway's own authority check
-/// (`gateway_authority::authorize`) takes the narrower `OptionalWork` view
-/// for the opposite and correct reason — it cannot tell whether an HTTP
-/// request is required work, so it takes the weaker claim. These are two
+/// This function used to make four reads — `available` for the headroom,
+/// `reservations_for_task` for whether anything had ever been committed,
+/// `task_budget` for the ceiling — and the doc here used to defend that,
+/// on the ground that a new `LedgerStore` method to collapse them would
+/// be a worse trade than one extra indexed primary-key lookup. That was
+/// a reasonable call while the reply carried a single percentage. It
+/// stops being one the moment the reply carries amounts as well.
+///
+/// Amounts and a percentage are two claims a reader will check against
+/// each other, and separate reads cannot keep them consistent: a
+/// settlement committing between the ceiling read and the sum read
+/// yields a correct ceiling, correct sums, and a line that does not add
+/// up. The cost of the extra lookups was never the real argument; the
+/// snapshot's value is that every figure is a projection of **one**
+/// observation. So `LedgerStore::budget_snapshot` reads all of it inside
+/// one transaction and [`BudgetPosture::from_snapshot`] classifies the
+/// result — which also puts the branch order, the HORO-1708 observation
+/// check and the exhaustion rule in one testable place instead of in a
+/// daemon handler.
+///
+/// No extra *round trip* either way, which remains the cost that matters:
+/// the figure is computed while answering a request the statusline
+/// provider was already going to make, the only way a budget reading is
+/// affordable inside a 200 ms hot-path probe.
+///
+/// # What the figures include
+///
+/// The whole envelope — `hard_limit - settled - active`, with the
+/// protected Completion Reserve left in it. The reserve is earmarked, not
+/// spent, and required completion work may still draw against it, so
+/// subtracting it here would report less room than the task has. This is
+/// the `RequiredWork` view, and the ledger's own test pins it against
+/// `available(task, RequiredWork)`. The gateway's authority check
+/// (`gateway_authority::authorize`) takes the narrower `OptionalWork`
+/// view for the opposite and correct reason — it cannot tell whether an
+/// HTTP request is required work, so it takes the weaker claim. Two
 /// different questions, not a disagreement.
 ///
-/// The order of the branches is load-bearing. Exhaustion is decided on
-/// the headroom alone, before the limit is read, so the share is only ever
-/// computed from a positive numerator. With `value > 0` and
-/// `value = limit - settled - active <= limit`, `limit` is necessarily
-/// positive too — which is why there is no zero-limit guard below rather
-/// than a missing one. It also stays ahead of the `Uncommitted` check: a
-/// zero-limit envelope satisfies both conditions, and "the next
-/// reservation will be refused" is the one of the two a user can act on.
+/// A ledger error becomes [`BudgetPosture::Unreadable`] with no amounts
+/// rather than failing the whole `Status`: a budget that could not be
+/// read must not cost the user the task state that could.
+fn budget_reading(
+    ledger: &LedgerStore,
+    task_id: libra_governor_domain::TaskId,
+) -> (BudgetPosture, Option<BudgetSnapshot>) {
+    match ledger.budget_snapshot(task_id) {
+        Ok(Some(snapshot)) => (BudgetPosture::from_snapshot(&snapshot), Some(snapshot)),
+        // No budget row: there is no envelope to report amounts of, so
+        // the amounts are absent rather than zero.
+        Ok(None) => (BudgetPosture::NotEstablished, None),
+        Err(_) => (BudgetPosture::Unreadable, None),
+    }
+}
+
+/// The ceiling the running policy would give the *next* task admitted
+/// here (HORO-1709) — scope [`libra_governor_protocol::BudgetScope::ConfiguredDefault`].
 ///
-/// The `Uncommitted` branch is the HORO-1708 fix, and it is a check for
-/// *observation*, not for capacity. Every other branch here asks the
-/// ledger how much room there is; this one asks whether anything was ever
-/// put in the room. Without it, a task holding no reservation in any state
-/// has `settled = 0` and `active = 0`, so the canonical share is
-/// `limit / limit = 1.0` and the statusline reads "100% budget left" —
-/// a measured-sounding claim about an envelope no economic event was ever
-/// attributed to. The emptiness is read from the ledger's own
-/// `reservations_for_task` rather than inferred from the share being
-/// exactly `1.0`: the two coincide today, but a float equality standing in
-/// for "nothing happened" would silently start lying the first time a
-/// settlement rounds back to the limit.
+/// Read from the policy the daemon is actually running, not from
+/// `config.json` on disk, because the running value is the one that will
+/// be copied into the next task's budget row. A config edited since
+/// startup is reported by `doctor`'s `running_config_matches_disk` and by
+/// the statusline's `profile` segment; it is not this function's job to
+/// pre-empt either with a figure that is not in force.
 ///
-/// A ledger error becomes [`BudgetPosture::Unreadable`] rather than failing
-/// the whole `Status`: a budget that could not be read must not cost the
-/// user the task state that could.
-fn budget_posture(ledger: &LedgerStore, task_id: libra_governor_domain::TaskId) -> BudgetPosture {
-    let headroom = match ledger.available(task_id, ReservationClass::RequiredWork) {
-        Ok(Some(headroom)) => headroom,
-        Ok(None) => return BudgetPosture::NotEstablished,
-        Err(_) => return BudgetPosture::Unreadable,
-    };
-    if headroom.is_exhausted() {
-        return BudgetPosture::Exhausted;
-    }
-    // Any state counts, including `released` and `expired`. A hold that was
-    // taken and returned is a real draw against the envelope that the
-    // ledger genuinely accounted for, so `hard_limit - settled - active` is
-    // a true statement about that task's room. What this branch rules out is
-    // the envelope nothing ever touched.
-    match ledger.reservations_for_task(task_id) {
-        Ok(reservations) if reservations.is_empty() => return BudgetPosture::Uncommitted,
-        Ok(_) => {}
-        Err(_) => return BudgetPosture::Unreadable,
-    }
-    let limit = match ledger.task_budget(task_id) {
-        // `available` already resolved a budget to compute the headroom
-        // above, so this is the same row read twice rather than a
-        // different outcome being handled — but it is read through the
-        // same fallible API and is not this function's place to unwrap.
-        Ok(Some(budget)) => budget.hard_limit.as_f64(),
-        Ok(None) => return BudgetPosture::NotEstablished,
-        Err(_) => return BudgetPosture::Unreadable,
-    };
-    BudgetPosture::Remaining {
-        fraction_left: headroom.value / limit,
-    }
+/// Always `Some` — a daemon cannot run without a resolved policy — but
+/// returned as an `Option` because the protocol field is one, and because
+/// a future policy shape with no resource bound should degrade to "not
+/// reported" rather than to a fabricated ceiling.
+fn configured_budget(config: &DaemonConfig) -> Option<ConfiguredBudget> {
+    Some(ConfiguredBudget {
+        ceiling: config.policy.resource.hard_ceiling,
+    })
 }
 
 /// Builds the execution regime the daemon can honestly observe right

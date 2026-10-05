@@ -126,21 +126,28 @@ mod tests {
         }
     }
 
+    /// A `Status` reply carrying no economic figures at all. The budget
+    /// fields are varied explicitly by the tests that care about them
+    /// (see `the_parsed_compatibility_line_is_unaffected_by_the_budget_posture`);
+    /// everything else here is asserting about the task half of the line,
+    /// and a helper keeps that intent legible as the reply grows fields.
+    fn status_for(current_task: Option<TaskSummary>) -> StatusResult {
+        StatusResult {
+            current_task,
+            task_budget: None,
+            task_budget_amounts: None,
+            configured_budget: None,
+        }
+    }
+
     #[test]
     fn format_status_reports_idle_when_no_current_task() {
-        let status = StatusResult {
-            current_task: None,
-            task_budget: None,
-        };
-        assert_eq!(format_status(&status), "libra: idle");
+        assert_eq!(format_status(&status_for(None)), "libra: idle");
     }
 
     #[test]
     fn format_status_renders_a_single_line_with_confidence_and_recon_cost() {
-        let status = StatusResult {
-            current_task: Some(sample_task(ReplanState::Stable)),
-            task_budget: None,
-        };
+        let status = status_for(Some(sample_task(ReplanState::Stable)));
         let line = format_status(&status);
         assert!(line.starts_with("libra: task "));
         assert!(line.contains("medium"));
@@ -158,10 +165,7 @@ mod tests {
         // it here would silently break every pattern downstream.
         // One task value, reused: `sample_task` mints fresh ids per call.
         let task = sample_task(ReplanState::Stable);
-        let baseline = format_status(&StatusResult {
-            current_task: Some(task.clone()),
-            task_budget: None,
-        });
+        let baseline = format_status(&status_for(Some(task.clone())));
         for posture in [
             BudgetPosture::Remaining {
                 fraction_left: 0.38,
@@ -174,28 +178,66 @@ mod tests {
             let line = format_status(&StatusResult {
                 current_task: Some(task.clone()),
                 task_budget: Some(posture),
+                task_budget_amounts: None,
+                configured_budget: None,
             });
             assert_eq!(line, baseline, "{posture:?} changed the legacy line");
             assert!(!line.contains('%'));
         }
     }
 
+    /// HORO-1709 put *amounts* on the same reply, which is a far stronger
+    /// temptation to leak into this line than a bare share was — an
+    /// amount is exactly what a human reading a statusline wants. It
+    /// still must not: this is the legacy text surface a founder wrapper
+    /// greps, and the amounts belong to the structured provider
+    /// document. Asserted against a full snapshot and a configured
+    /// ceiling, not against `None`, so the test would fail if a future
+    /// edit started rendering either.
+    #[test]
+    fn the_parsed_compatibility_line_never_renders_a_budget_amount() {
+        use libra_governor_protocol::{
+            BudgetSnapshot, ConfiguredBudget, ResourceAmount, ResourceKind,
+        };
+
+        let task = sample_task(ReplanState::Stable);
+        let baseline = format_status(&status_for(Some(task.clone())));
+        let line = format_status(&StatusResult {
+            current_task: Some(task),
+            task_budget: Some(BudgetPosture::Remaining {
+                fraction_left: 0.38,
+            }),
+            task_budget_amounts: Some(BudgetSnapshot::new(
+                ResourceKind::Tokens,
+                150_000.0,
+                30_000.0,
+                18_000.0,
+                70_000.0,
+                2,
+            )),
+            configured_budget: Some(ConfiguredBudget {
+                ceiling: ResourceAmount::Tokens(150_000),
+            }),
+        });
+        assert_eq!(line, baseline, "budget amounts changed the legacy line");
+        for leaked in ["150000", "150,000", "62000", "62,000", "token", "$"] {
+            assert!(
+                !line.contains(leaked),
+                "legacy line leaked {leaked:?}: {line}"
+            );
+        }
+    }
+
     #[test]
     fn format_status_reflects_a_replanned_state() {
-        let status = StatusResult {
-            current_task: Some(sample_task(ReplanState::Replanned { count: 2 })),
-            task_budget: None,
-        };
+        let status = status_for(Some(sample_task(ReplanState::Replanned { count: 2 })));
         let line = format_status(&status);
         assert!(line.contains("replanned 2x"));
     }
 
     #[test]
     fn format_status_reflects_escalation() {
-        let status = StatusResult {
-            current_task: Some(sample_task(ReplanState::EscalatedAwaitingApproval)),
-            task_budget: None,
-        };
+        let status = status_for(Some(sample_task(ReplanState::EscalatedAwaitingApproval)));
         let line = format_status(&status);
         assert!(line.contains("escalated"));
         assert!(line.contains("awaiting approval"));

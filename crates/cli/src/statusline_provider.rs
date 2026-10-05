@@ -1073,7 +1073,10 @@ pub fn run_explain() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libra_governor_domain::{BucketTier, Estimate, PlanId, ResourceAmount, TaskId};
+    use libra_governor_domain::{
+        BucketTier, BudgetSnapshot, Estimate, PlanId, ResourceAmount, ResourceKind, TaskId,
+    };
+    use libra_governor_protocol::ConfiguredBudget;
 
     // ---------------------------------------------------------------- fixtures
 
@@ -1124,6 +1127,8 @@ mod tests {
             // bug shows up as a wrong digit instead of as the right one by
             // luck.
             task_budget: Some(BUDGET_LEFT),
+            task_budget_amounts: Some(BUDGET_LEFT_AMOUNTS),
+            configured_budget: Some(CONFIGURED),
         }
     }
 
@@ -1131,6 +1136,68 @@ mod tests {
     const BUDGET_LEFT: BudgetPosture = BudgetPosture::Remaining {
         fraction_left: 0.38,
     };
+
+    /// The amounts that *produce* [`BUDGET_LEFT`]: a 150,000-token
+    /// envelope with 18,000 settled and 75,000 held, so 57,000 remain and
+    /// `57_000 / 150_000` is exactly `0.38`.
+    ///
+    /// Tokens, not currency, because every envelope a live Libra daemon
+    /// writes is denominated in tokens (HORO-1725/HORO-1727) — a dollar
+    /// fixture here would be testing a shape the product does not
+    /// produce. `budget_fixtures_classify_to_the_posture_they_are_paired_with`
+    /// below pins this against [`BudgetPosture::from_snapshot`] so the
+    /// pair cannot drift into describing two different envelopes.
+    const BUDGET_LEFT_AMOUNTS: BudgetSnapshot = BudgetSnapshot::new(
+        ResourceKind::Tokens,
+        150_000.0,
+        30_000.0,
+        18_000.0,
+        75_000.0,
+        2,
+    );
+
+    /// The daemon's running ceiling — a different scope from the active
+    /// task's envelope, and deliberately a different number from
+    /// [`BUDGET_LEFT_AMOUNTS`]'s ceiling so a test cannot pass by
+    /// accidentally reading one for the other.
+    const CONFIGURED: ConfiguredBudget = ConfiguredBudget {
+        ceiling: ResourceAmount::Tokens(200_000),
+    };
+
+    /// The amounts behind a posture, for the fixtures that vary it.
+    ///
+    /// `None` for the two postures that have no snapshot behind them by
+    /// construction: `NotEstablished` means there is no budget row to
+    /// read, `Unreadable` means the read failed. Both are the daemon's
+    /// `(posture, None)` shape, not a snapshot that happens to look
+    /// empty.
+    fn amounts_for(posture: BudgetPosture) -> Option<BudgetSnapshot> {
+        Some(match posture {
+            BudgetPosture::Remaining { .. } => BUDGET_LEFT_AMOUNTS,
+            // An envelope with no reservation row in any state: the
+            // HORO-1708 case.
+            BudgetPosture::Uncommitted => {
+                BudgetSnapshot::new(ResourceKind::Tokens, 150_000.0, 30_000.0, 0.0, 0.0, 0)
+            }
+            BudgetPosture::Exhausted => {
+                BudgetSnapshot::new(ResourceKind::Tokens, 150_000.0, 30_000.0, 150_000.0, 0.0, 4)
+            }
+            BudgetPosture::NotEstablished | BudgetPosture::Unreadable => return None,
+        })
+    }
+
+    /// Sets the budget half of a fixture reply the way the daemon sets
+    /// it: the posture and the amounts together, from one snapshot, never
+    /// one without the other (HORO-1709).
+    ///
+    /// A test that assigned only `task_budget` would be describing a wire
+    /// message the daemon cannot send — and, worse, would quietly stop
+    /// exercising the amounts path while still looking like it covered
+    /// that posture.
+    fn set_budget(status: &mut StatusResult, posture: Option<BudgetPosture>) {
+        status.task_budget_amounts = posture.and_then(amounts_for);
+        status.task_budget = posture;
+    }
 
     /// Every budget shape the daemon can report, plus the absence of the
     /// field.
@@ -1149,12 +1216,50 @@ mod tests {
         ("unreadable", Some(BudgetPosture::Unreadable)),
     ];
 
-    /// The idle shape: no task, and so no share of a budget that was never
-    /// admitted.
+    /// The idle shape: no task, and so no share and no amounts of a
+    /// budget that was never admitted.
+    ///
+    /// `configured_budget` is nonetheless `Some`, because that is what an
+    /// idle daemon really sends (HORO-1709): the ceiling the *next* task
+    /// would get is a fact it knows authoritatively even with nothing
+    /// running. Keeping it populated here is what makes the idle
+    /// assertions below load-bearing — they prove the provider does not
+    /// turn a configured setting into an active-task reading, rather than
+    /// proving it has nothing to turn.
     fn idle() -> StatusResult {
         StatusResult {
             current_task: None,
             task_budget: None,
+            task_budget_amounts: None,
+            configured_budget: Some(CONFIGURED),
+        }
+    }
+
+    /// Fixture-drift guard. Each `(posture, amounts)` pair above must
+    /// describe one envelope: the amounts, classified by the daemon's own
+    /// rule, must come back as the posture they are paired with. Without
+    /// this, a fixture could pair "38% left" with an exhausted snapshot
+    /// and every assertion built on it would be testing a state the
+    /// product cannot reach.
+    #[test]
+    fn budget_fixtures_classify_to_the_posture_they_are_paired_with() {
+        for posture in [
+            BUDGET_LEFT,
+            BudgetPosture::Uncommitted,
+            BudgetPosture::Exhausted,
+        ] {
+            let amounts = amounts_for(posture).expect("these three have amounts behind them");
+            assert_eq!(
+                BudgetPosture::from_snapshot(&amounts),
+                posture,
+                "fixture amounts do not classify to {posture:?}"
+            );
+        }
+        for posture in [BudgetPosture::NotEstablished, BudgetPosture::Unreadable] {
+            assert!(
+                amounts_for(posture).is_none(),
+                "{posture:?} has no snapshot behind it by construction"
+            );
         }
     }
 
@@ -1231,7 +1336,7 @@ mod tests {
                         let mut status = status_with(state);
                         status.current_task.as_mut().unwrap().remaining_estimate =
                             estimate_with(p90, p90.is_none(), 7);
-                        status.task_budget = budget;
+                        set_budget(&mut status, budget);
                         out.push((
                             format!(
                                 "reading/{state_name}/{doctor_name}/{estimate_name}/{budget_name}"
@@ -1578,7 +1683,7 @@ mod tests {
 
     fn with_budget(posture: Option<BudgetPosture>) -> Value {
         let mut status = status_with(ReplanState::Stable);
-        status.task_budget = posture;
+        set_budget(&mut status, posture);
         reading(&status, None, now())
     }
 
@@ -1841,7 +1946,7 @@ mod tests {
         // absent — and the idle document must not grow a reading for it even
         // if a peer sent one.
         let mut status = idle();
-        status.task_budget = Some(BudgetPosture::Exhausted);
+        set_budget(&mut status, Some(BudgetPosture::Exhausted));
         let document = reading(&status, None, now());
         assert!(budget_label(&document).is_none());
         assert_eq!(segments(&document).len(), 1);
@@ -2136,7 +2241,7 @@ mod tests {
         );
 
         let mut exhausted = status_with(ReplanState::Stable);
-        exhausted.task_budget = Some(BudgetPosture::Exhausted);
+        set_budget(&mut exhausted, Some(BudgetPosture::Exhausted));
         let exhausted = reading(&exhausted, None, now());
         assert_eq!(role_of(&exhausted, "budget").as_deref(), Some("exception"));
         assert_eq!(role_of(&exhausted, "task").as_deref(), Some("supporting"));
@@ -2495,15 +2600,15 @@ mod tests {
         // The statusline has room for a label; `explain` has room for the
         // difference, which is the whole reason the posture is four variants.
         let mut spent = status_with(ReplanState::Stable);
-        spent.task_budget = Some(BudgetPosture::Exhausted);
+        set_budget(&mut spent, Some(BudgetPosture::Exhausted));
         let spent = explain_text(&spent, None);
 
         let mut never = status_with(ReplanState::Stable);
-        never.task_budget = Some(BudgetPosture::NotEstablished);
+        set_budget(&mut never, Some(BudgetPosture::NotEstablished));
         let never = explain_text(&never, None);
 
         let mut unreadable = status_with(ReplanState::Stable);
-        unreadable.task_budget = Some(BudgetPosture::Unreadable);
+        set_budget(&mut unreadable, Some(BudgetPosture::Unreadable));
         let unreadable = explain_text(&unreadable, None);
 
         let mut lines: Vec<String> = Vec::new();
@@ -2525,7 +2630,7 @@ mod tests {
         // envelope, because with a task present the daemon always answers
         // and `None` only ever means "nothing was governed".
         let mut absent = status_with(ReplanState::Stable);
-        absent.task_budget = None;
+        set_budget(&mut absent, None);
         let absent = explain_text(&absent, None);
         assert!(absent.contains("admitted without a resource envelope"));
     }
