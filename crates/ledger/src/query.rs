@@ -500,6 +500,63 @@ impl LedgerStore {
             .transpose()
     }
 
+    /// Returns when the work `plan_id` belongs to actually began: the
+    /// `created_at` of the root of its replan lineage, found by walking
+    /// `replaces_plan_id` back to the plan that no other plan replaced.
+    ///
+    /// This is the anchor for a receipt's `actual_duration_secs`
+    /// (HORO-1723). A replan supersedes the in-flight plan mid-turn, so
+    /// the plan being finalized is often *not* the one the turn started
+    /// with; measuring from it would under-report by however long the
+    /// pre-replan work took. Walking to the lineage root measures the
+    /// whole turn.
+    ///
+    /// Deliberately scoped to one lineage rather than to the session: a
+    /// second prompt in the same session produces a fresh plan with
+    /// `replaces_plan_id IS NULL` (only [`crate::LedgerStore`]'s replan
+    /// path sets that column), so each turn anchors to its own start
+    /// instead of accumulating every earlier turn's elapsed time plus
+    /// the operator's idle time between them.
+    ///
+    /// `None` when `plan_id` does not exist. A lineage whose root row is
+    /// missing (a partially pruned store) resolves to the deepest plan
+    /// still present rather than failing, so a damaged history degrades
+    /// to an under-estimate rather than to an error at `Finalize`.
+    pub fn plan_lineage_started_at(
+        &self,
+        plan_id: PlanId,
+    ) -> Result<Option<OffsetDateTime>, LedgerError> {
+        // `depth` orders the walk so the last row is the furthest
+        // ancestor reached. `LIMIT 64` bounds a lineage that is cyclic
+        // through a corrupted `replaces_plan_id`: without it a cycle
+        // would spin forever inside SQLite and wedge the Stop hook.
+        //
+        // Only `QueryReturnedNoRows` becomes `None`. A real SQLite
+        // failure propagates: it would otherwise be indistinguishable
+        // from "unknown plan" and fall back silently to a shorter
+        // duration, which is exactly the class of quiet substitution
+        // HORO-1723 is about.
+        let created_at: Option<String> = match self.conn.query_row(
+            "WITH RECURSIVE lineage(id, created_at, replaces_plan_id, depth) AS (
+                     SELECT id, created_at, replaces_plan_id, 0
+                       FROM plans WHERE id = ?1
+                   UNION ALL
+                     SELECT p.id, p.created_at, p.replaces_plan_id, lineage.depth + 1
+                       FROM plans p
+                       JOIN lineage ON p.id = lineage.replaces_plan_id
+                      WHERE lineage.depth < 64
+                 )
+                 SELECT created_at FROM lineage ORDER BY depth DESC LIMIT 1",
+            [plan_id.0.to_string()],
+            |row| row.get(0),
+        ) {
+            Ok(value) => Some(value),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(err) => return Err(err.into()),
+        };
+        created_at.map(|s| parse_time(&s)).transpose()
+    }
+
     /// Returns every locally recorded [`ExecutionReceipt`], across all
     /// tasks, paired with the [`TaskFeatures`] its originating plan was
     /// estimated against (`None` for a pre-HORO-1130 receipt) — the
