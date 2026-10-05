@@ -645,6 +645,37 @@ fn group_digits(digits: &str) -> String {
     out
 }
 
+/// The semantic pressure band for an active task's envelope (HORO-1709's
+/// pressure refinement, rendered by HORO-1719).
+///
+/// The axis is *utilization*, not the displayed number: `38% budget left`
+/// is 62% utilized, which is CAUTION. Classifying the displayed share
+/// instead would paint a two-thirds-spent envelope green, which is the
+/// specific error the refinement names.
+///
+/// `None` for an unobserved or unreadable envelope. Not `safe`: "nothing
+/// has been attributed to this task" is missing attribution, and a
+/// reassuring tone for missing data is the one mapping the ticket
+/// forbids outright.
+fn pressure_band(utilization: Option<f64>) -> Option<&'static str> {
+    let utilization = utilization?;
+    if !utilization.is_finite() {
+        return None;
+    }
+    Some(match utilization {
+        // An overrun and a negative remaining both land here, because
+        // both mean utilization above 1.0.
+        u if u > 1.0 => "critical",
+        u if u > 0.9 => "critical",
+        u if u > 0.7 => "warning",
+        u if u > 0.5 => "caution",
+        // Includes a negative utilization, which cannot happen from a
+        // well-formed snapshot and is not worth a fifth band: "less than
+        // nothing has been spent" is still not pressure.
+        _ => "safe",
+    })
+}
+
 /// A ledger figure as it may appear inside a label, or `None` when it has
 /// no honest rendering there (HORO-1709).
 ///
@@ -770,6 +801,14 @@ fn budget_amount_fields(segment: &mut Value, amounts: &BudgetSnapshot) {
     // overrun is a real authoritative state and the contract's unsigned
     // `count` cannot hold it, so this is where it survives.
     amount_field(segment, "budget_remaining", amounts.remaining().value);
+    if let Some(utilization) = amounts.utilization() {
+        if utilization.is_finite() {
+            segment["budget_pressure_percent"] = json!((utilization * 100.0).floor());
+        }
+    }
+    if let Some(band) = pressure_band(amounts.utilization()) {
+        segment["semantic_state"] = json!(band);
+    }
 }
 
 /// The contract-native amount span: `count`, `total` and the noun that
@@ -833,6 +872,11 @@ fn budget_count_fields(segment: &mut Value, amounts: &BudgetSnapshot, display: B
 /// The share rendered is recomputed from the amounts when they are present
 /// — see [`share_to_display`] — so the percentage and the numbers beside it
 /// cannot contradict each other even by one ULP of transport error.
+///
+/// `state` deliberately does *not* move with pressure. It is the contract's
+/// own severity field, already load-bearing for Clear's exception
+/// selection, and a two-thirds-spent envelope is not an exception. The
+/// pressure reading rides `semantic_state`, which is HORO-1719's to colour.
 ///
 /// `vital`, except when the envelope is spent. A budget share is the one
 /// reading that qualifies a schedule — `Replans now need approval · 38%
