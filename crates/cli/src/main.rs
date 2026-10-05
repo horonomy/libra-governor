@@ -34,6 +34,10 @@
 //! - `statusline explain` — the read-only long form of the same state, for
 //!   the shared statusline `explain` surface. Says plainly what the daemon
 //!   does *not* hold, and never prints task content.
+//! - `statusline presentation` — records, in Libra's own state directory,
+//!   how much of the budget envelope the compact budget phrase should
+//!   spell out (HORO-1709). Never touches the user's statusline script or
+//!   `~/.claude/settings.json`.
 //! - `calibration report` — real duration-coverage and admission-replay
 //!   calibration evidence over local history (HORO-1132).
 //! - `gateway token` — prints the local capability token Claude Code's
@@ -98,6 +102,7 @@ mod hook_post_tool_use;
 mod hook_stop;
 mod install_cmd;
 mod outcome_cmd;
+mod presentation;
 mod statusline;
 mod statusline_provider;
 mod uninstall_cmd;
@@ -116,6 +121,8 @@ Usage:
   libra-governor statusline
   libra-governor statusline provider
   libra-governor statusline explain
+  libra-governor statusline presentation
+  libra-governor statusline presentation --budget-display percent|remaining|remaining+total|used+remaining+total|full
   libra-governor calibration report
   libra-governor gateway token
   libra-governor gateway status
@@ -167,6 +174,10 @@ fn main() {
         ["statusline"] => statusline::run(),
         ["statusline", "provider"] => statusline_provider::run_provider(),
         ["statusline", "explain"] => statusline_provider::run_explain(),
+        ["statusline", "presentation"] => presentation::run(None),
+        ["statusline", "presentation", "--budget-display", choice] => {
+            presentation::run(Some(choice))
+        }
         ["calibration", "report"] => calibration_cmd::run(),
         ["gateway", "token"] => gateway_cmd::run_token(),
         ["gateway", "status"] => gateway_cmd::run_status(),
