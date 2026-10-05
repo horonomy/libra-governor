@@ -166,6 +166,7 @@ mod tests {
             BudgetPosture::Remaining {
                 fraction_left: 0.38,
             },
+            BudgetPosture::Uncommitted,
             BudgetPosture::Exhausted,
             BudgetPosture::NotEstablished,
             BudgetPosture::Unreadable,

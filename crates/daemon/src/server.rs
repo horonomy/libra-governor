@@ -674,12 +674,27 @@ fn replan_state_for_summary(
 /// request is required work, so it takes the weaker claim. These are two
 /// different questions, not a disagreement.
 ///
-/// The order of the two branches is load-bearing. Exhaustion is decided on
+/// The order of the branches is load-bearing. Exhaustion is decided on
 /// the headroom alone, before the limit is read, so the share is only ever
 /// computed from a positive numerator. With `value > 0` and
 /// `value = limit - settled - active <= limit`, `limit` is necessarily
 /// positive too — which is why there is no zero-limit guard below rather
-/// than a missing one.
+/// than a missing one. It also stays ahead of the `Uncommitted` check: a
+/// zero-limit envelope satisfies both conditions, and "the next
+/// reservation will be refused" is the one of the two a user can act on.
+///
+/// The `Uncommitted` branch is the HORO-1708 fix, and it is a check for
+/// *observation*, not for capacity. Every other branch here asks the
+/// ledger how much room there is; this one asks whether anything was ever
+/// put in the room. Without it, a task holding no reservation in any state
+/// has `settled = 0` and `active = 0`, so the canonical share is
+/// `limit / limit = 1.0` and the statusline reads "100% budget left" —
+/// a measured-sounding claim about an envelope no economic event was ever
+/// attributed to. The emptiness is read from the ledger's own
+/// `reservations_for_task` rather than inferred from the share being
+/// exactly `1.0`: the two coincide today, but a float equality standing in
+/// for "nothing happened" would silently start lying the first time a
+/// settlement rounds back to the limit.
 ///
 /// A ledger error becomes [`BudgetPosture::Unreadable`] rather than failing
 /// the whole `Status`: a budget that could not be read must not cost the
@@ -692,6 +707,16 @@ fn budget_posture(ledger: &LedgerStore, task_id: libra_governor_domain::TaskId) 
     };
     if headroom.is_exhausted() {
         return BudgetPosture::Exhausted;
+    }
+    // Any state counts, including `released` and `expired`. A hold that was
+    // taken and returned is a real draw against the envelope that the
+    // ledger genuinely accounted for, so `hard_limit - settled - active` is
+    // a true statement about that task's room. What this branch rules out is
+    // the envelope nothing ever touched.
+    match ledger.reservations_for_task(task_id) {
+        Ok(reservations) if reservations.is_empty() => return BudgetPosture::Uncommitted,
+        Ok(_) => {}
+        Err(_) => return BudgetPosture::Unreadable,
     }
     let limit = match ledger.task_budget(task_id) {
         // `available` already resolved a budget to compute the headroom
