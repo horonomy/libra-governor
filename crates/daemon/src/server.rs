@@ -1705,7 +1705,22 @@ fn handle_finalize(
     };
 
     let now = time::OffsetDateTime::now_utc();
-    let started_at = ledger.session_started_at(session_id)?.unwrap_or(now);
+    // Anchored to the start of *this plan's lineage*, not to the start of
+    // the session (HORO-1723). `session_tasks.created_at` is written
+    // exactly once per session, so measuring from it made every receipt
+    // report the session's age: successive Stops in one long session each
+    // recorded a larger duration than the last (up to ~169 h observed on
+    // a real store), and all of them became estimator samples. The error
+    // equals the session's age, so it is invisible wherever sessions are
+    // seconds old — which is every test and every CI run.
+    //
+    // Walking the replan lineage rather than taking `plan.created_at`
+    // directly matters because a replan supersedes the in-flight plan
+    // mid-turn; the plan being finalized is then not the one the turn
+    // started with.
+    let started_at = ledger
+        .plan_lineage_started_at(plan_id)?
+        .unwrap_or(plan.created_at);
     let elapsed_secs = (now - started_at).whole_seconds().max(0) as u64;
     let tool_call_count = ledger.tool_call_count_for_session(session_id)?;
 
