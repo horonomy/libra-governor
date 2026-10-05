@@ -23,6 +23,7 @@ jsonschema.workspace = true
 semver.workspace = true
 num-cmp.workspace = true
 rustix.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

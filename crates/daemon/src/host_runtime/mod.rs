@@ -2,6 +2,8 @@
 
 pub mod catalog;
 pub mod contract;
+pub mod dispatch;
+mod exec;
 pub mod identity;
 mod parents;
 pub mod state;

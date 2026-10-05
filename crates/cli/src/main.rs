@@ -84,6 +84,7 @@
 //!   in v0.0.3 rather than rejected as unknown.
 
 mod adapter_cmd;
+mod adapter_probe_signal;
 mod agent;
 mod agents_cmd;
 mod bucket_prose;
