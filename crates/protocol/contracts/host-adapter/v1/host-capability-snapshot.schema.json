@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://horonomy.github.io/contracts/host-adapter/v1/host-capability-snapshot.schema.json",
+  "title": "HostCapabilitySnapshot v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "snapshot_id", "observed_at", "adapter", "host", "context", "lifecycle", "capabilities"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "snapshot_id": {"type": "string", "minLength": 1},
+    "observed_at": {"$ref": "#/$defs/utc"},
+    "adapter": {"type": "object", "additionalProperties": false, "required": ["id", "version", "manifest_digest", "implementation_digest"], "properties": {"id": {"$ref": "#/$defs/adapterId"}, "version": {"type": "string", "minLength": 1}, "manifest_digest": {"$ref": "#/$defs/digest"}, "implementation_digest": {"$ref": "#/$defs/digest"}}},
+    "host": {"type": "object", "additionalProperties": false, "required": ["tool_provider", "version", "version_source"], "properties": {"tool_provider": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,31}$"}, "version": {"type": ["string", "null"]}, "version_source": {"enum": ["native", "host_schema", "runtime_probe", "unknown"]}}},
+    "context": {"type": "object", "additionalProperties": false, "required": ["scope"], "properties": {"scope": {"enum": ["host", "session", "agent", "turn_task", "project_worktree", "unknown"]}, "profile": {"type": "string"}, "project_ref": {"type": "string"}}},
+    "lifecycle": {"type": "object", "additionalProperties": false, "required": ["registered", "installed", "enabled", "adapter_trust", "host_trust"], "properties": {"registered": {"type": "boolean"}, "installed": {"type": "boolean"}, "enabled": {"type": "boolean"}, "adapter_trust": {"enum": ["trusted", "untrusted", "unknown"]}, "host_trust": {"enum": ["trusted", "untrusted", "unknown"]}}},
+    "capabilities": {"type": "array", "items": {"$ref": "#/$defs/capability"}}
+  },
+  "$defs": {
+    "utc": {"type": "string", "format": "date-time", "pattern": "Z$"},
+    "adapterId": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$"},
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "capability": {"type": "object", "additionalProperties": false, "required": ["key", "state", "reason_codes", "limits", "evidence"], "properties": {"key": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$"}, "state": {"enum": ["supported", "limited", "trust-required", "admin-disabled", "unavailable", "unknown"]}, "reason_codes": {"type": "array", "items": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,63}$"}}, "limits": {"type": "object", "properties": {"event_classes": {"type": "array", "items": {"type": "string", "minLength": 1}}, "tool_classes": {"type": "array", "items": {"type": "string", "minLength": 1}}, "execution_mode": {"enum": ["synchronous", "asynchronous", "mixed", "unknown"]}, "failure_behavior": {"enum": ["fail_open", "fail_closed", "skip", "unknown"]}}, "additionalProperties": true}, "evidence": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["kind", "observed_at", "source_ref", "result"], "properties": {"kind": {"enum": ["manifest", "host_schema", "host_version", "runtime_probe", "config_observation", "trust_observation", "admin_observation"]}, "observed_at": {"$ref": "#/$defs/utc"}, "source_ref": {"type": "string", "minLength": 1}, "result": {"type": "string", "minLength": 1}, "digest": {"$ref": "#/$defs/digest"}}}}, "last_success_at": {"$ref": "#/$defs/utc"}}}
+  }
+}

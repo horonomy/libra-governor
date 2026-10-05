@@ -14,6 +14,9 @@
 //! would be over-engineering given the two hosts' verified payload
 //! compatibility.
 
+// Slice A exposes the pure bridge without wiring it into the live CLI path.
+#[allow(dead_code)]
+pub mod canonical;
 pub mod event;
 pub mod identity;
 pub mod normalize;

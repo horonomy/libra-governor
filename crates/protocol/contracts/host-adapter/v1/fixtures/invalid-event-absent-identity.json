@@ -1,0 +1,1 @@
+{"schema_version":1,"event_id":"bad","observed_at":"2026-10-05T00:00:00Z","adapter_id":"codex","adapter_version":"1","source":{"kind":"hook","native_event_name":"PreToolUse"},"capability_snapshot_id":"snap","scope":"unknown","kind":"tool_before","facts":{"tool_name":"shell","operands_availability":"not_provided"},"quality":"literal","field_provenance":{}}
