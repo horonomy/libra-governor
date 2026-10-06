@@ -92,6 +92,21 @@ refuses the adapter namespace. Native verification remains `unverified`, includi
 when local integrity checks pass. This profile does not add a Codex statusline or
 certify native Codex readiness.
 
+## Passive operator inspection
+
+`adapter status`, ordinary `adapter doctor`, and `adapter explain <id>` provide
+passive inspection of registration, recorded code trust and local installation
+state. Their installation facts and metadata share one catalog observation.
+Catalog drift refuses the query; damaged local configuration, package or artifact
+preserves recorded intent with unknown integrity. Pending operations remain
+pending during inspection.
+
+Connected local callbacks do not establish host trust or observed native
+execution. Those dimensions remain `unknown`, and native verification remains
+`unverified`. Selecting an external planner reports its own registration;
+the builtin consumer's installation is not attributed to the planner. These
+commands start no adapter child or daemon and do not reconcile configuration.
+
 ## External planner preview
 
 An explicitly registered and trusted ConfigDriver can propose a preview for an

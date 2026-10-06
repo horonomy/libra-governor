@@ -22,7 +22,7 @@ use super::dispatch::{
     Cancellation, DiagnosticDispatcher, DiagnosticFailure, DiagnosticScope, DiagnosticSelection,
 };
 use super::identity::product_executable_digest;
-use super::state::{AdapterRegistry, LifecycleTransaction};
+use super::state::{AdapterRegistry, LifecycleTransaction, RegistrySnapshot};
 use super::{RegistryEffect, RegistryFailure};
 
 pub const CLAUDE_PROFILE: &str = super::config_bundle::PROFILE_ID;
@@ -45,6 +45,7 @@ enum LifecycleBoundary {
     AfterTargetReplacement,
     BeforeConnectionCompletion,
     BeforePlanReturn,
+    BeforeInspectionReturn,
 }
 
 fn lifecycle_boundary(point: LifecycleBoundary) -> Result<(), RegistryFailure> {
@@ -146,6 +147,32 @@ pub struct LocalInstallationStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
     pub native_verification: &'static str,
+    pub host_trust: &'static str,
+    pub observed_execution: &'static str,
+    pub effective_support: &'static str,
+}
+
+/// One passive product observation. Its metadata owns no descriptors and
+/// cannot authorize execution, configuration mutation or economic effects.
+pub struct PassiveAdapterInspection {
+    snapshot: RegistrySnapshot,
+    installations: Vec<(String, LocalInstallationStatus)>,
+}
+
+impl PassiveAdapterInspection {
+    pub fn snapshot(&self) -> &RegistrySnapshot {
+        &self.snapshot
+    }
+
+    pub fn local_installations<'a>(
+        &'a self,
+        selected: Option<&'a str>,
+    ) -> impl Iterator<Item = &'a LocalInstallationStatus> + 'a {
+        self.installations
+            .iter()
+            .filter(move |(id, _)| selected.is_none_or(|selected| selected == id))
+            .map(|(_, status)| status)
+    }
 }
 
 pub struct ConfigLifecycle {
@@ -593,17 +620,60 @@ impl ConfigLifecycle {
         &self,
         adapter_id: &str,
     ) -> Result<Option<LocalInstallationStatus>, RegistryFailure> {
-        let snapshot = self.registry.read()?;
-        let Some(document) = snapshot.document() else {
-            return Ok(None);
-        };
-        let Some((binding, record)) = document
-            .installations
-            .iter()
-            .find(|(_, record)| record.adapter_id == adapter_id)
-        else {
-            return Ok(None);
-        };
+        Ok(self
+            .inspect_adapters()?
+            .local_installations(Some(adapter_id))
+            .next()
+            .cloned())
+    }
+
+    /// Registration and installation facts share the same original catalog.
+    /// Catalog drift refuses the whole query; local damage preserves recorded
+    /// intent while downgrading only its integrity observation.
+    pub fn inspect_adapters(&self) -> Result<PassiveAdapterInspection, RegistryFailure> {
+        let witness = self.registry.observe_passively()?;
+        let snapshot = witness.snapshot();
+        let mut installations = Vec::new();
+        let mut proofs = Vec::new();
+        if let Some(document) = snapshot.document() {
+            for (binding, record) in &document.installations {
+                let (status, proof) = self.inspect_record(document, binding, record);
+                let index = installations.len();
+                installations.push((record.adapter_id.clone(), status));
+                if let Some((artifact, target)) = proof {
+                    proofs.push((index, record, artifact, target));
+                }
+            }
+        }
+        lifecycle_boundary(LifecycleBoundary::BeforeInspectionReturn)?;
+        witness.check()?;
+        for (index, record, artifact, target) in proofs {
+            let current = verify_package(record, Path::new(&record.binary.path))
+                .and_then(|_| artifact.check())
+                .and_then(|_| target.check());
+            if let Err(failure) = current {
+                let status = &mut installations[index].1;
+                status.integrity = "unknown";
+                status.local_connection = "unknown";
+                status.reason = Some(failure.reason);
+            }
+        }
+        witness.check()?;
+        Ok(PassiveAdapterInspection {
+            snapshot,
+            installations,
+        })
+    }
+
+    fn inspect_record(
+        &self,
+        document: &RegistryDocument,
+        binding: &str,
+        record: &InstallationRecord,
+    ) -> (
+        LocalInstallationStatus,
+        Option<(FileObservation, FileObservation)>,
+    ) {
         let current = (|| {
             if record.context.state_root != locator(self.registry.root()?)? {
                 return Err(fail("installation_context_changed"));
@@ -624,18 +694,15 @@ impl ConfigLifecycle {
                     &callbacks(record, binding),
                 )?;
             }
-            if self.registry.read()?.stamp() != snapshot.stamp() {
-                return Err(fail("registry_changed"));
-            }
             artifact.check()?;
             target.check()?;
-            Ok(())
+            Ok((artifact, target))
         })();
         let reason = current
             .as_ref()
             .err()
             .map(|failure: &RegistryFailure| failure.reason);
-        Ok(Some(LocalInstallationStatus {
+        let status = LocalInstallationStatus {
             profile: CLAUDE_PROFILE,
             installed: record.installed,
             desired_enabled: record.desired_enabled,
@@ -656,7 +723,11 @@ impl ConfigLifecycle {
             reason,
             pending_operation: record.pending.as_ref().map(|pending| pending.operation),
             native_verification: "unverified",
-        }))
+            host_trust: "unknown",
+            observed_execution: "unknown",
+            effective_support: "unknown",
+        };
+        (status, current.ok())
     }
 
     /// Explicit local connection changes. The gate remains closed until actual
@@ -1386,6 +1457,7 @@ fn verify_connected(
 mod tests {
     use super::*;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
 
     thread_local! {
         pub(super) static INTERRUPTION: std::cell::Cell<Option<LifecycleBoundary>> = const { std::cell::Cell::new(None) };
@@ -1531,6 +1603,257 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn passive_inspection_refuses_replaced_original_catalog_before_return() {
+        let (home, lifecycle, selection) = fixture();
+        lifecycle.install("claude_code", &selection, false).unwrap();
+        let catalog = home.path().join("state/host-adapters/registry.json");
+        let original = fs::read(&catalog).unwrap();
+        let replacement = catalog.clone();
+        let retained = home.path().join("retained-catalog");
+        let changed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let marked = changed.clone();
+        ACTION.with(|slot| {
+            *slot.borrow_mut() = Some((
+                LifecycleBoundary::BeforeInspectionReturn,
+                Box::new(move || {
+                    let bytes = fs::read(&replacement).unwrap();
+                    fs::rename(&replacement, retained).unwrap();
+                    fs::write(&replacement, bytes).unwrap();
+                    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+                    marked.set(true);
+                }),
+            ));
+        });
+        let result = lifecycle.inspect_installation("claude_code");
+        assert!(changed.get());
+        assert_eq!(fs::read(&catalog).unwrap(), original);
+        assert!(!selection.target.exists());
+        assert!(result.is_err(), "same-byte catalog replacement was adopted");
+    }
+
+    #[test]
+    fn passive_inspection_refuses_namespace_replacement_and_state_appearance() {
+        for component in ["root", "adapters", "absent"] {
+            let (home, lifecycle, selection) = fixture();
+            if component != "absent" {
+                lifecycle.install("claude_code", &selection, false).unwrap();
+            }
+            let root = home.path().join("state");
+            let source = if component == "adapters" {
+                root.join("host-adapters")
+            } else {
+                root.clone()
+            };
+            let retained = home.path().join("retained-namespace");
+            let catalog = root.join("host-adapters/registry.json");
+            let original = fs::read(&catalog).ok();
+            let replacement_bytes = original.clone();
+            let destination = catalog.clone();
+            let changed = std::rc::Rc::new(std::cell::Cell::new(false));
+            let marked = changed.clone();
+            ACTION.with(|slot| {
+                *slot.borrow_mut() = Some((
+                    LifecycleBoundary::BeforeInspectionReturn,
+                    Box::new(move || {
+                        if replacement_bytes.is_some() {
+                            fs::rename(&source, retained).unwrap();
+                        }
+                        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+                        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+                        fs::set_permissions(
+                            destination.parent().unwrap(),
+                            fs::Permissions::from_mode(0o700),
+                        )
+                        .unwrap();
+                        if let Some(bytes) = replacement_bytes {
+                            fs::write(&destination, bytes).unwrap();
+                            fs::set_permissions(&destination, fs::Permissions::from_mode(0o600))
+                                .unwrap();
+                        }
+                        marked.set(true);
+                    }),
+                ));
+            });
+            let failure = lifecycle
+                .inspect_adapters()
+                .err()
+                .expect("changed namespace must refuse query");
+            assert!(changed.get());
+            assert_eq!(failure.effect, RegistryEffect::NoChange);
+            assert_eq!(fs::read(&catalog).ok(), original);
+            assert!(!selection.target.exists());
+        }
+    }
+
+    #[test]
+    fn passive_inspection_keeps_real_pending_intent_without_reconciliation() {
+        let (home, lifecycle, selection) = fixture();
+        let interruption = Interruption::at(LifecycleBoundary::AfterArtifactCreation);
+        assert!(lifecycle.install("claude_code", &selection, false).is_err());
+        drop(interruption);
+        let catalog = home.path().join("state/host-adapters/registry.json");
+        let before = fs::read(&catalog).unwrap();
+        let (_, record) = installed_record(&lifecycle);
+        let artifact = artifact_path(lifecycle.registry.root().unwrap(), &record);
+        let artifact_before = fs::read(&artifact).unwrap();
+        let inspection = lifecycle.inspect_adapters().unwrap();
+        let status = inspection
+            .local_installations(Some("claude_code"))
+            .next()
+            .unwrap();
+        assert!(!status.installed);
+        assert!(!status.desired_enabled);
+        assert_eq!(status.pending_operation, Some(ConfigIntent::Install));
+        assert_eq!(status.local_connection, "pending");
+        assert_eq!(status.integrity, "unknown");
+        assert_eq!(status.reason, Some("pending_operation"));
+        assert_eq!(status.native_verification, "unverified");
+        assert_eq!(fs::read(&catalog).unwrap(), before);
+        assert_eq!(fs::read(&artifact).unwrap(), artifact_before);
+        assert!(!selection.target.exists());
+    }
+
+    #[test]
+    fn passive_inspection_keeps_enabled_intent_when_local_proofs_change() {
+        for component in [
+            "artifact",
+            "package",
+            "target",
+            "late_target",
+            "late_artifact",
+            "late_package",
+        ] {
+            let (home, lifecycle, selection) = fixture();
+            fs::create_dir_all(selection.target.parent().unwrap()).unwrap();
+            fs::write(&selection.target, b"{\"future\":true}").unwrap();
+            lifecycle.install("claude_code", &selection, false).unwrap();
+            lifecycle
+                .change_connection("claude_code", &selection, ConfigIntent::Enable, false)
+                .unwrap();
+            let (_, record) = installed_record(&lifecycle);
+            let changed = match component {
+                "artifact" | "late_artifact" => {
+                    artifact_path(lifecycle.registry.root().unwrap(), &record)
+                }
+                "package" | "late_package" => selection.binary.clone(),
+                _ => selection.target.clone(),
+            };
+            if component.starts_with("late_") {
+                let destination = changed.clone();
+                ACTION.with(|slot| {
+                    *slot.borrow_mut() = Some((
+                        LifecycleBoundary::BeforeInspectionReturn,
+                        Box::new(move || fs::write(destination, b"{}").unwrap()),
+                    ));
+                });
+            } else {
+                fs::write(&changed, b"{}").unwrap();
+            }
+            let catalog = home.path().join("state/host-adapters/registry.json");
+            let before = fs::read(&catalog).unwrap();
+            let inspection = lifecycle.inspect_adapters().unwrap();
+            let status = inspection
+                .local_installations(Some("claude_code"))
+                .next()
+                .unwrap();
+            assert!(status.installed);
+            assert!(status.desired_enabled);
+            assert_eq!(status.local_connection, "unknown");
+            assert_eq!(status.integrity, "unknown");
+            assert!(status.reason.is_some());
+            assert_eq!(status.host_trust, "unknown");
+            assert_eq!(status.observed_execution, "unknown");
+            assert_eq!(fs::read(&changed).unwrap(), b"{}");
+            assert_eq!(fs::read(&catalog).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn passive_inspection_refuses_a_valid_concurrent_catalog_writer() {
+        let (home, lifecycle, selection) = fixture();
+        lifecycle.install("claude_code", &selection, false).unwrap();
+        let registry =
+            AdapterRegistry::new(home.path().join("state"), HostContract::load().unwrap());
+        let contract = HostContract::load().unwrap();
+        let manifest = contract.validate_manifest(include_bytes!("../../../protocol/contracts/host-adapter/v1/fixtures/valid-manifest-synthetic.json")).unwrap();
+        let id = manifest.value()["adapter_id"].as_str().unwrap().to_owned();
+        let changed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let marked = changed.clone();
+        ACTION.with(|slot| {
+            *slot.borrow_mut() = Some((
+                LifecycleBoundary::BeforeInspectionReturn,
+                Box::new(move || {
+                    registry
+                        .register(manifest, registry.read().unwrap().stamp())
+                        .unwrap();
+                    marked.set(true);
+                }),
+            ));
+        });
+        let failure = lifecycle
+            .inspect_adapters()
+            .err()
+            .expect("query must not mix revisions");
+        assert!(changed.get());
+        assert_eq!(failure.effect, RegistryEffect::NoChange);
+        let current = lifecycle.registry.read().unwrap();
+        assert!(current.document().unwrap().adapters.contains_key(&id));
+        assert_eq!(current.document().unwrap().installations.len(), 1);
+        assert!(!selection.target.exists());
+    }
+
+    #[test]
+    fn passive_inspection_objects_release_all_owned_descriptors() {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "host_runtime::config_lifecycle::tests::isolated_passive_inspection_fd_helper",
+            "--ignored",
+        ]);
+        let mut child = super::super::exec::spawn_test_child(&mut command).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("passive inspection descriptor control exceeded deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[ignore = "invoked by passive inspection descriptor lifecycle control"]
+    fn isolated_passive_inspection_fd_helper() {
+        let (_home, lifecycle, selection) = fixture();
+        lifecycle.install("claude_code", &selection, false).unwrap();
+        let descriptors = || fs::read_dir("/dev/fd").unwrap().count();
+        let before = descriptors();
+        let mut retained = Vec::new();
+        for _ in 0..20 {
+            let inspection = lifecycle.inspect_adapters().unwrap();
+            assert!(inspection.snapshot().document().is_some());
+            assert_eq!(
+                inspection
+                    .local_installations(None)
+                    .next()
+                    .unwrap()
+                    .integrity,
+                "verified"
+            );
+            retained.push(inspection);
+            assert_eq!(descriptors(), before);
+        }
+        assert_eq!(retained.len(), 20);
+        drop(retained);
+        assert_eq!(descriptors(), before);
     }
 
     fn installed_record(lifecycle: &ConfigLifecycle) -> (String, InstallationRecord) {
