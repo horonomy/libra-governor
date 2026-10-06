@@ -415,12 +415,29 @@ fn execute_probe(command: &Command, contract: &HostContract, registry: AdapterRe
                 command,
                 outcome,
                 reason,
-                json!({"execution_attempted":failure.execution_attempted,"filesystem_effect":filesystem_effect}),
+                json!({"execution_attempted":failure.execution_attempted,"filesystem_effect":filesystem_effect,
+                    "execution_failure": execution_failure_category(failure.stage, failure.reason)}),
                 "failed",
                 status,
             )
         }
     }
+}
+
+fn execution_failure_category(stage: &str, reason: &str) -> Option<&'static str> {
+    if stage != "execution" {
+        return None;
+    }
+    Some(match reason {
+        "diagnostic cancelled" => "cancelled",
+        "request deadline exceeded" => "timeout",
+        "request limit exceeded" => "input_limit",
+        "response limit exceeded" => "output_limit",
+        "stderr limit exceeded" => "stderr_limit",
+        "adapter exited unsuccessfully" => "nonzero_exit",
+        "caller signal policy refused" => "signal_context",
+        _ => "owned_execution_failed",
+    })
 }
 
 fn diagnostic_reason(stage: &str, reason: &str) -> &'static str {
@@ -910,4 +927,29 @@ fn valid_id(value: &str) -> bool {
 
 fn builtin_ids() -> [&'static str; 2] {
     ["claude_code", "codex"]
+}
+
+#[cfg(test)]
+mod execution_diagnostic_tests {
+    use super::execution_failure_category;
+
+    #[test]
+    fn projects_only_fixed_execution_categories_without_source_messages() {
+        for (reason, expected) in [
+            ("diagnostic cancelled", "cancelled"),
+            ("request deadline exceeded", "timeout"),
+            ("request limit exceeded", "input_limit"),
+            ("response limit exceeded", "output_limit"),
+            ("stderr limit exceeded", "stderr_limit"),
+            ("adapter exited unsuccessfully", "nonzero_exit"),
+            ("caller signal policy refused", "signal_context"),
+            ("PRIVATE_DRIVER_ERROR_CANARY", "owned_execution_failed"),
+        ] {
+            assert_eq!(
+                execution_failure_category("execution", reason),
+                Some(expected)
+            );
+            assert_eq!(execution_failure_category("protocol", reason), None);
+        }
+    }
 }
