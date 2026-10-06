@@ -416,11 +416,27 @@ fn execute_probe(command: &Command, contract: &HostContract, registry: AdapterRe
                 outcome,
                 reason,
                 json!({"execution_attempted":failure.execution_attempted,"filesystem_effect":filesystem_effect,
-                    "execution_failure": execution_failure_category(failure.stage, failure.reason)}),
+                    "execution_failure": execution_failure_category(failure.stage, failure.reason),
+                    "timeout_phase": timeout_phase(failure.stage, failure.reason)}),
                 "failed",
                 status,
             )
         }
+    }
+}
+
+fn timeout_phase(stage: &str, reason: &str) -> Option<&'static str> {
+    if stage != "execution" {
+        return None;
+    }
+    match reason {
+        "request deadline exceeded (not_owned)" => Some("not_owned"),
+        "request deadline exceeded (owned_awaiting_ready)" => Some("owned_awaiting_ready"),
+        "request deadline exceeded (group_ready_awaiting_exec_status)" => {
+            Some("group_ready_awaiting_exec_status")
+        }
+        "request deadline exceeded (exec_status_closed)" => Some("exec_status_closed"),
+        _ => None,
     }
 }
 
@@ -430,7 +446,11 @@ fn execution_failure_category(stage: &str, reason: &str) -> Option<&'static str>
     }
     Some(match reason {
         "diagnostic cancelled" => "cancelled",
-        "request deadline exceeded" => "timeout",
+        "request deadline exceeded"
+        | "request deadline exceeded (not_owned)"
+        | "request deadline exceeded (owned_awaiting_ready)"
+        | "request deadline exceeded (group_ready_awaiting_exec_status)"
+        | "request deadline exceeded (exec_status_closed)" => "timeout",
         "request limit exceeded" => "input_limit",
         "response limit exceeded" => "output_limit",
         "stderr limit exceeded" => "stderr_limit",
@@ -931,7 +951,37 @@ fn builtin_ids() -> [&'static str; 2] {
 
 #[cfg(test)]
 mod execution_diagnostic_tests {
-    use super::execution_failure_category;
+    use super::{execution_failure_category, timeout_phase};
+
+    #[test]
+    fn timeout_phase_projects_only_qualified_fixed_reasons() {
+        for phase in [
+            "not_owned",
+            "owned_awaiting_ready",
+            "group_ready_awaiting_exec_status",
+            "exec_status_closed",
+        ] {
+            let reason = format!("request deadline exceeded ({phase})");
+            assert_eq!(
+                execution_failure_category("execution", &reason),
+                Some("timeout")
+            );
+            assert_eq!(timeout_phase("execution", &reason), Some(phase));
+            assert_eq!(timeout_phase("protocol", &reason), None);
+        }
+        assert_eq!(
+            timeout_phase("execution", "request deadline exceeded"),
+            None
+        );
+        assert_eq!(
+            timeout_phase("execution", "request deadline exceeded (PRIVATE_CANARY)"),
+            None
+        );
+        assert_eq!(
+            execution_failure_category("execution", "request deadline exceeded (PRIVATE_CANARY)"),
+            Some("owned_execution_failed")
+        );
+    }
 
     #[test]
     fn projects_only_fixed_execution_categories_without_source_messages() {

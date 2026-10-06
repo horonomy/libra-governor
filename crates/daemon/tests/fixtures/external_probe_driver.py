@@ -1,6 +1,8 @@
 
-import json
 import sys
+with open(sys.argv[2] + ".entry", "a", encoding="utf-8") as stream:
+    stream.write("entry\n")
+import json
 import os
 import time
 import hashlib

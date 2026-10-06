@@ -77,6 +77,20 @@ pub(super) enum ExecFailure {
     OwnershipInterference,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TimeoutPhase {
+    NotOwned,
+    OwnedAwaitingReady,
+    GroupReadyAwaitingExecStatus,
+    ExecStatusClosed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ExecDiagnosticFailure {
+    pub kind: ExecFailure,
+    pub timeout_phase: Option<TimeoutPhase>,
+}
+
 /// Only dispatch may construct a launch after matching current recorded trust.
 pub(super) struct VerifiedLaunch {
     pub executable: CString,
@@ -359,6 +373,7 @@ struct Attempt {
     status_length: usize,
     ready: bool,
     failure: Option<ExecFailure>,
+    timeout_phase: Option<TimeoutPhase>,
     term_at: Option<Instant>,
     group_final_signal: bool,
     leader_final_signal: bool,
@@ -399,6 +414,7 @@ impl Attempt {
             status_length: 0,
             ready: false,
             failure: None,
+            timeout_phase: None,
             term_at: None,
             group_final_signal: false,
             leader_final_signal: false,
@@ -413,7 +429,25 @@ impl Attempt {
         }
     }
 
+    fn timeout(&mut self) -> ExecFailure {
+        if self.failure.is_none() && self.timeout_phase.is_none() {
+            self.timeout_phase = Some(if self.pid.is_none() {
+                TimeoutPhase::NotOwned
+            } else if !self.ready {
+                TimeoutPhase::OwnedAwaitingReady
+            } else if self.status.is_some() {
+                TimeoutPhase::GroupReadyAwaitingExecStatus
+            } else {
+                TimeoutPhase::ExecStatusClosed
+            });
+        }
+        ExecFailure::Timeout
+    }
+
     fn fail(&mut self, failure: ExecFailure) {
+        if failure == ExecFailure::Timeout {
+            self.timeout();
+        }
         self.failure.get_or_insert(failure);
     }
 
@@ -691,12 +725,21 @@ fn poll(attempt: &Attempt, write_input: bool, deadline: Instant) -> Result<(), E
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn run(
     launch: VerifiedLaunch,
     request: &[u8],
     cancellation: &Cancellation,
 ) -> Result<Vec<u8>, ExecFailure> {
-    run_owned(launch, request, cancellation, RunControls::default())
+    run_diagnostic(launch, request, cancellation).map_err(|error| error.kind)
+}
+
+pub(super) fn run_diagnostic(
+    launch: VerifiedLaunch,
+    request: &[u8],
+    cancellation: &Cancellation,
+) -> Result<Vec<u8>, ExecDiagnosticFailure> {
+    run_owned_diagnostic(launch, request, cancellation, RunControls::default())
 }
 
 #[cfg(test)]
@@ -706,6 +749,8 @@ type AfterCleanup = Box<dyn FnOnce(&Attempt)>;
 
 #[derive(Default)]
 struct RunControls {
+    #[cfg(test)]
+    expire_before_launch: bool,
     #[cfg(test)]
     before_cleanup: Option<BeforeCleanup>,
     #[cfg(test)]
@@ -751,14 +796,27 @@ fn completion_failure(
     }
 }
 
+#[cfg(test)]
 fn run_owned(
     launch: VerifiedLaunch,
     request: &[u8],
     cancellation: &Cancellation,
-    _controls: RunControls,
+    controls: RunControls,
 ) -> Result<Vec<u8>, ExecFailure> {
+    run_owned_diagnostic(launch, request, cancellation, controls).map_err(|error| error.kind)
+}
+
+fn run_owned_diagnostic(
+    launch: VerifiedLaunch,
+    request: &[u8],
+    cancellation: &Cancellation,
+    _controls: RunControls,
+) -> Result<Vec<u8>, ExecDiagnosticFailure> {
     if request.len() > launch.max_request_bytes.min(MAX_OUTPUT) {
-        return Err(ExecFailure::InputLimit);
+        return Err(ExecDiagnosticFailure {
+            kind: ExecFailure::InputLimit,
+            timeout_phase: None,
+        });
     }
     let mut owner = Attempt::prepared();
     let deadline = Instant::now() + REQUEST_BUDGET;
@@ -767,6 +825,10 @@ fn run_owned(
     // Owner lives outside the unwind boundary; cleanup precedes any resumed
     // panic, so dropping an idle public dispatcher cannot abandon a child.
     let execution = catch_unwind(AssertUnwindSafe(|| {
+        #[cfg(test)]
+        if _controls.expire_before_launch {
+            std::thread::sleep(REQUEST_BUDGET);
+        }
         let environment = [
             CString::new("LANG=C.UTF-8").unwrap(),
             CString::new("LC_ALL=C.UTF-8").unwrap(),
@@ -785,7 +847,7 @@ fn run_owned(
                 return Err(ExecFailure::Cancelled);
             }
             if Instant::now() >= deadline {
-                return Err(ExecFailure::Timeout);
+                return Err(owner.timeout());
             }
             match FORK_PLAN.try_lock() {
                 Ok(lock) => break lock,
@@ -841,7 +903,7 @@ fn run_owned(
             return Err(ExecFailure::Cancelled);
         }
         if Instant::now() >= deadline {
-            return Err(ExecFailure::Timeout);
+            return Err(owner.timeout());
         }
         let mut mask = ParentMask::block()?;
         // SAFETY: child takes only the audited async-signal-safe path above.
@@ -878,7 +940,7 @@ fn run_owned(
                     return Err(if cancellation.cancelled() {
                         ExecFailure::Cancelled
                     } else {
-                        ExecFailure::Timeout
+                        owner.timeout()
                     });
                 }
                 match rustix::io::read(&gate.ready.read, &mut byte) {
@@ -899,7 +961,7 @@ fn run_owned(
                     return Err(ExecFailure::Cancelled);
                 }
                 if Instant::now() >= deadline {
-                    return Err(ExecFailure::Timeout);
+                    return Err(owner.timeout());
                 }
                 rustix::io::write(&gate.resume.write, &[1_u8]).map_err(|_| ExecFailure::Setup)?;
             }
@@ -978,9 +1040,23 @@ fn run_owned(
     }
     match execution {
         Err(panic) => resume_unwind(panic),
-        Ok(Err(failure)) => Err(failure),
+        Ok(Err(failure)) => Err(ExecDiagnosticFailure {
+            kind: failure,
+            timeout_phase: if failure == ExecFailure::Timeout {
+                owner.timeout_phase
+            } else {
+                None
+            },
+        }),
         Ok(Ok(())) => match owner.failure {
-            Some(failure) => Err(failure),
+            Some(failure) => Err(ExecDiagnosticFailure {
+                kind: failure,
+                timeout_phase: if failure == ExecFailure::Timeout {
+                    owner.timeout_phase
+                } else {
+                    None
+                },
+            }),
             None => Ok(std::mem::take(&mut owner.output_bytes)),
         },
     }
@@ -1008,7 +1084,7 @@ mod tests {
     fn exact_input_pressure_is_drained_without_a_write_then_read_deadlock() {
         let directory = tempfile::tempdir().unwrap();
         let request = vec![b'x'; MAX_OUTPUT / 2];
-        let result = run(
+        let result = run_diagnostic(
             launch("/bin/cat", &[], directory.path()),
             &request,
             &Cancellation::default(),
@@ -1149,6 +1225,142 @@ print('no-private-descriptors')
             ),
             Err(ExecFailure::InputLimit)
         );
+    }
+
+    #[test]
+    fn diagnostic_timeout_freezes_parent_observation_before_owned_cleanup() {
+        // Held pre-exec gates retain inherited pipe ends until exit. Keep
+        // these deliberate stalls outside other test-owned runner processes.
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "host_runtime::exec::tests::isolated_timeout_phase_helper",
+            "--ignored",
+        ]);
+        let mut helper = spawn_test_child(&mut command).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(status) = helper.try_wait().unwrap() {
+                assert!(status.success(), "isolated timeout phase controls failed");
+                return;
+            }
+            if Instant::now() >= deadline {
+                helper.kill().unwrap();
+                helper.wait().unwrap();
+                panic!("timeout phase fixture exceeded its bounded deadline");
+            }
+            std::thread::sleep(SLICE);
+        }
+    }
+
+    #[test]
+    #[ignore = "invoked by diagnostic timeout controls in an isolated process"]
+    fn isolated_timeout_phase_helper() {
+        for late in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut gate = ChildGate::new();
+            gate.late = late;
+            let phase = if late {
+                TimeoutPhase::GroupReadyAwaitingExecStatus
+            } else {
+                TimeoutPhase::OwnedAwaitingReady
+            };
+            let observed = Arc::new(std::sync::atomic::AtomicI32::new(0));
+            let published = observed.clone();
+            let result = run_owned_diagnostic(
+                launch(
+                    "/bin/sh",
+                    &["-c", "printf unexpected > exec-marker"],
+                    directory.path(),
+                ),
+                b"withheld",
+                &Cancellation::default(),
+                RunControls {
+                    gate: Some(gate),
+                    hold_gate: true,
+                    on_owned: Some(Box::new(move |pid| {
+                        published.store(pid.as_raw_pid(), Ordering::SeqCst);
+                    })),
+                    before_cleanup: Some(Box::new(move |owner| {
+                        assert_eq!(owner.timeout_phase, Some(phase));
+                    })),
+                    after_cleanup: Some(Box::new(move |owner| {
+                        assert!(owner.reaped);
+                        assert!(owner.pid.is_none());
+                        assert_eq!(owner.timeout_phase, Some(phase));
+                    })),
+                    ..RunControls::default()
+                },
+            );
+            assert_eq!(
+                result,
+                Err(ExecDiagnosticFailure {
+                    kind: ExecFailure::Timeout,
+                    timeout_phase: Some(phase)
+                })
+            );
+            assert!(!directory.path().join("exec-marker").exists());
+            verify_absent(Pid::from_raw(observed.load(Ordering::SeqCst)).unwrap());
+        }
+        let directory = tempfile::tempdir().unwrap();
+        for (expire, phase) in [
+            (true, TimeoutPhase::NotOwned),
+            (false, TimeoutPhase::ExecStatusClosed),
+        ] {
+            let observed = Arc::new(std::sync::atomic::AtomicI32::new(0));
+            let published = observed.clone();
+            let result = run_owned_diagnostic(
+                launch(
+                    "/bin/sh",
+                    &["-c", "cat >/dev/null; sleep 3"],
+                    directory.path(),
+                ),
+                b"{}",
+                &Cancellation::default(),
+                RunControls {
+                    expire_before_launch: expire,
+                    on_owned: Some(Box::new(move |pid| {
+                        published.store(pid.as_raw_pid(), Ordering::SeqCst);
+                    })),
+                    after_cleanup: Some(Box::new(move |owner| {
+                        assert!(owner.pid.is_none());
+                        assert_eq!(owner.timeout_phase, Some(phase));
+                        if !expire {
+                            assert!(owner.reaped);
+                        }
+                    })),
+                    ..RunControls::default()
+                },
+            );
+            assert_eq!(
+                result,
+                Err(ExecDiagnosticFailure {
+                    kind: ExecFailure::Timeout,
+                    timeout_phase: Some(phase)
+                })
+            );
+            if expire {
+                assert_eq!(observed.load(Ordering::SeqCst), 0);
+            } else {
+                verify_absent(Pid::from_raw(observed.load(Ordering::SeqCst)).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn timeout_observation_never_replaces_first_failure_or_later_progress() {
+        let mut owner = Attempt::prepared();
+        owner.fail(ExecFailure::NonzeroExit);
+        owner.fail(ExecFailure::Timeout);
+        assert_eq!(owner.failure, Some(ExecFailure::NonzeroExit));
+        assert_eq!(owner.timeout_phase, None);
+        let mut owner = Attempt::prepared();
+        owner.fail(ExecFailure::Timeout);
+        owner.ready = true;
+        owner.fail(ExecFailure::Cancelled);
+        owner.finish();
+        assert_eq!(owner.failure, Some(ExecFailure::Timeout));
+        assert_eq!(owner.timeout_phase, Some(TimeoutPhase::NotOwned));
     }
 
     #[test]
@@ -1455,6 +1667,7 @@ print('no-private-descriptors')
                 b"withheld",
                 &cancellation,
                 RunControls {
+                    expire_before_launch: false,
                     gate: Some(gate),
                     hold_gate: true,
                     on_owned: Some(Box::new(move |child| {

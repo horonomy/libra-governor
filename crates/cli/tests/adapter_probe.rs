@@ -139,6 +139,8 @@ fn output_context(output: &Output) -> String {
 }
 
 fn fixture_counts(fixture: &Fixture) -> String {
+    let entry = fs::read_to_string(format!("{}.entry", fixture.operation_log.display()))
+        .map(|text| text.lines().count());
     let starts = fs::read_to_string(format!("{}.starts", fixture.operation_log.display()))
         .map(|text| text.lines().count());
     let operations = fs::read_to_string(&fixture.operation_log).map(|text| {
@@ -147,7 +149,9 @@ fn fixture_counts(fixture: &Fixture) -> String {
             text.lines().filter(|line| *line == "probe").count(),
         )
     });
-    format!("recorded_starts={starts:?} handshake_probe_counts={operations:?}")
+    format!(
+        "script_entry={entry:?} recorded_starts={starts:?} handshake_probe_counts={operations:?}"
+    )
 }
 
 fn review_and_confirm(fixture: &Fixture) -> String {
@@ -197,6 +201,13 @@ fn operation_log(fixture: &Fixture) -> Vec<String> {
         .lines()
         .count();
     assert_eq!(starts, operations.len(), "fixture start/request mismatch");
+    let entry = fs::read_to_string(format!("{}.entry", fixture.operation_log.display()))
+        .unwrap_or_default();
+    assert_eq!(
+        entry.lines().count(),
+        starts,
+        "fixture entry/start mismatch"
+    );
     operations
 }
 
@@ -508,6 +519,11 @@ fn trusted_execution_failures_have_fixed_categories_without_candidate_output() {
         );
         assert_eq!(result["result"]["execution_attempted"], true);
         assert_eq!(result["result"]["filesystem_effect"], "not_asserted");
+        if category == "timeout" {
+            assert_eq!(result["result"]["timeout_phase"], "exec_status_closed");
+        } else {
+            assert!(result["result"]["timeout_phase"].is_null());
+        }
         assert_eq!(operation_log(&fixture), ["handshake"]);
         assert_eq!(fs::read(&fixture.registry).unwrap(), before);
         assert!(!String::from_utf8_lossy(&probe.stdout).contains(SOURCE_CANARY));
