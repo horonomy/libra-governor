@@ -174,6 +174,63 @@ mod tests {
     }
 
     #[test]
+    fn session_start_sources_are_recognized_as_unwired() {
+        for source in ["startup", "resume", "clear", "compact", "fork"] {
+            let json = format!(
+                r#"{{"session_id":"fixture-session","hook_event_name":"SessionStart","source":"{source}"}}"#
+            );
+            let event = normalize(EntryPoint::PromptSubmit, &json).unwrap();
+            assert_eq!(
+                event,
+                NormalizedEvent::RecognizedUnwired {
+                    hook_event_name: "SessionStart".to_string()
+                },
+                "source {source} must not imply identity lifecycle behavior"
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_fields_do_not_turn_unwired_hooks_into_identity_events() {
+        for hook_event_name in ["SubagentStart", "SubagentStop"] {
+            let json = format!(
+                r#"{{"session_id":"fixture-parent-session","hook_event_name":"{hook_event_name}","agent_id":"fixture-agent","turn_id":"fixture-turn","agent_type":"worker"}}"#
+            );
+            let event = normalize(EntryPoint::PromptSubmit, &json).unwrap();
+            assert_eq!(
+                event,
+                NormalizedEvent::RecognizedUnwired {
+                    hook_event_name: hook_event_name.to_string()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn every_known_unwired_lifecycle_name_stays_unwired() {
+        for hook_event_name in [
+            "SessionStart",
+            "SessionEnd",
+            "SubagentStart",
+            "SubagentStop",
+            "Interrupt",
+            "PreCompact",
+            "PostCompact",
+        ] {
+            let json = format!(
+                r#"{{"session_id":"fixture-session","hook_event_name":"{hook_event_name}"}}"#
+            );
+            let event = normalize(EntryPoint::PromptSubmit, &json).unwrap();
+            assert_eq!(
+                event,
+                NormalizedEvent::RecognizedUnwired {
+                    hook_event_name: hook_event_name.to_string()
+                }
+            );
+        }
+    }
+
+    #[test]
     fn a_genuinely_unknown_event_name_is_unrecognized_not_an_error() {
         let json = r#"{"session_id": "s", "cwd": "/repo", "hook_event_name": "SomeFutureEvent"}"#;
         let event = normalize(EntryPoint::PromptSubmit, json).unwrap();
