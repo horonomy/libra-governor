@@ -92,6 +92,32 @@ refuses the adapter namespace. Native verification remains `unverified`, includi
 when local integrity checks pass. This profile does not add a Codex statusline or
 certify native Codex readiness.
 
+## External planner preview
+
+An explicitly registered and trusted ConfigDriver can propose a preview for an
+existing installed `libra.claude-hooks.v1` consumer:
+
+```sh
+libra-governor adapter plan <registered-planner-id> --profile libra.claude-hooks.v1 --intent enable --dry-run --json
+libra-governor adapter plan <registered-planner-id> --profile libra.claude-hooks.v1 --intent enable --json
+```
+
+The runtime ID selects the external planner; the installation still belongs to
+the builtin consumer. Dry-run performs local preflight with no child or writes
+and reports `external_plan_required`. Ordinary planning executes trusted code
+with ambient authority through handshake and `plan_config`. The product validates
+the returned plan against its shipped profile and renders a preview without
+applying it. Output identifies the profile, consumer, three slot actions and
+whether a configuration change would be required; it exposes no commands or
+configuration paths. Observed code, catalog, package, artifact or target drift
+refuses the preview and is preserved.
+
+`enable`, `disable` and `uninstall` are accepted preview intents; install, project
+scope and other profiles are unavailable here. There is no apply token or saved
+plan input. Native verification remains `unverified`; a validated preview grants
+no activation or task attribution. Builtin disable/uninstall never requires the
+external planner to remain registered or trusted.
+
 ## What ships
 
 - `libra-governor hook user-prompt-submit` — a `UserPromptSubmit` hook

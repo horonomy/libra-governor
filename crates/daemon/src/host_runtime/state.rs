@@ -30,6 +30,35 @@ struct ObservedRegistry {
     namespace: Namespace,
 }
 
+/// One preview retains its original namespace and file proof across children.
+/// Public snapshots remain FD-free and cannot become execution authority.
+pub(super) struct PassiveRegistryObservation<'a> {
+    registry: &'a AdapterRegistry,
+    original: ObservedRegistry,
+}
+
+impl PassiveRegistryObservation<'_> {
+    pub(super) fn snapshot(&self) -> RegistrySnapshot {
+        RegistrySnapshot {
+            document: self.original.document.clone(),
+            stamp: self.original.stamp.clone(),
+        }
+    }
+
+    pub(super) fn check(&self) -> Result<(), RegistryFailure> {
+        let path = self.registry.root()?.join("host-adapters/registry.json");
+        self.original.namespace.check()?;
+        verify_file_revision(&path, self.original.file_identity.as_ref())?;
+        let current = self.registry.read_observed()?;
+        if current.stamp != self.original.stamp {
+            return Err(RegistryFailure::new("registry", "registry_changed"));
+        }
+        storage_boundary(CommitBoundary::AfterPassivePreviewRead)?;
+        self.original.namespace.check()?;
+        verify_file_revision(&path, self.original.file_identity.as_ref())
+    }
+}
+
 impl RegistrySnapshot {
     pub fn document(&self) -> Option<&RegistryDocument> {
         self.document.as_ref()
@@ -218,6 +247,17 @@ impl AdapterRegistry {
             document: observed.document,
             stamp: observed.stamp,
         })
+    }
+
+    pub(super) fn observe_passively(
+        &self,
+    ) -> Result<PassiveRegistryObservation<'_>, RegistryFailure> {
+        let witness = PassiveRegistryObservation {
+            registry: self,
+            original: self.read_observed()?,
+        };
+        witness.check()?;
+        Ok(witness)
     }
 
     fn read_observed(&self) -> Result<ObservedRegistry, RegistryFailure> {
@@ -1100,6 +1140,7 @@ impl Drop for OwnedTemporary {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CommitBoundary {
+    AfterPassivePreviewRead,
     BeforeLegacyRootCreation,
     AfterLegacyRootCreation,
     AfterLifecycleCommit,
@@ -1126,6 +1167,144 @@ fn storage_boundary(point: CommitBoundary) -> Result<(), RegistryFailure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn passive_preview_witness_refuses_same_bytes_file_or_namespace_replacement() {
+        for component in ["catalog", "adapters", "root"] {
+            let home = tempfile::tempdir().unwrap();
+            let root = home.path().join("state");
+            let contract = HostContract::load().unwrap();
+            let registry = AdapterRegistry::new(root.clone(), contract.clone());
+            registry
+                .register(
+                    fixture(&contract, "first"),
+                    registry.read().unwrap().stamp(),
+                )
+                .unwrap();
+            let witness = registry.observe_passively().unwrap();
+            witness.check().unwrap();
+            let catalog = root.join("host-adapters/registry.json");
+            let original = fs::read(&catalog).unwrap();
+            let source = match component {
+                "catalog" => catalog.clone(),
+                "adapters" => root.join("host-adapters"),
+                _ => root.clone(),
+            };
+            fs::rename(&source, home.path().join("retained-original")).unwrap();
+            if component != "catalog" {
+                fs::create_dir_all(root.join("host-adapters")).unwrap();
+                for directory in [&root, &root.join("host-adapters")] {
+                    fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+                }
+            }
+            fs::write(&catalog, &original).unwrap();
+            fs::set_permissions(&catalog, fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(registry.read().unwrap().stamp(), witness.snapshot().stamp());
+            assert!(witness.check().is_err(), "replaced {component} was adopted");
+            assert_eq!(fs::read(&catalog).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn passive_preview_witness_never_creates_missing_state_and_rejects_later_creation() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("state");
+        let registry = AdapterRegistry::new(root.clone(), HostContract::load().unwrap());
+        let witness = registry.observe_passively().unwrap();
+        witness.check().unwrap();
+        assert!(!root.exists());
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(witness.check().is_err());
+        assert!(root.read_dir().unwrap().next().is_none());
+    }
+
+    #[test]
+    fn passive_preview_witness_checks_original_file_after_fresh_read() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("state");
+        let contract = HostContract::load().unwrap();
+        let registry = AdapterRegistry::new(root.clone(), contract.clone());
+        registry
+            .register(
+                fixture(&contract, "first"),
+                registry.read().unwrap().stamp(),
+            )
+            .unwrap();
+        let witness = registry.observe_passively().unwrap();
+        let catalog = root.join("host-adapters/registry.json");
+        let original = fs::read(&catalog).unwrap();
+        let replacement = catalog.clone();
+        let retained = home.path().join("retained-original");
+        ACTION.with(|action| {
+            *action.borrow_mut() = Some((
+                CommitBoundary::AfterPassivePreviewRead,
+                Box::new(move || {
+                    let bytes = fs::read(&replacement).unwrap();
+                    fs::rename(&replacement, retained).unwrap();
+                    fs::write(&replacement, bytes).unwrap();
+                    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+                }),
+            ))
+        });
+        assert!(witness.check().is_err());
+        assert_eq!(registry.read().unwrap().stamp(), witness.snapshot().stamp());
+        assert_eq!(fs::read(&catalog).unwrap(), original);
+    }
+
+    #[test]
+    fn passive_preview_witness_releases_descriptors_without_retaining_them_in_snapshot() {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "host_runtime::state::tests::isolated_passive_witness_fd_helper",
+            "--ignored",
+        ]);
+        let mut helper = super::super::exec::spawn_test_child(&mut command).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if let Some(status) = helper.try_wait().unwrap() {
+                assert!(status.success());
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                helper.kill().unwrap();
+                helper.wait().unwrap();
+                panic!("passive witness fixture exceeded deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[ignore = "invoked by passive witness descriptor lifecycle control"]
+    fn isolated_passive_witness_fd_helper() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("state");
+        let contract = HostContract::load().unwrap();
+        let registry = AdapterRegistry::new(root, contract.clone());
+        registry
+            .register(
+                fixture(&contract, "first"),
+                registry.read().unwrap().stamp(),
+            )
+            .unwrap();
+        let descriptors = || fs::read_dir("/dev/fd").unwrap().count();
+        let before = descriptors();
+        for _ in 0..20 {
+            let witness = registry.observe_passively().unwrap();
+            let snapshot = witness.snapshot();
+            let held = descriptors();
+            assert!(held > before);
+            for _ in 0..3 {
+                witness.check().unwrap();
+                assert_eq!(descriptors(), held);
+            }
+            drop(witness);
+            assert!(snapshot.document().is_some());
+            assert_eq!(descriptors(), before);
+        }
+    }
+
     #[test]
     fn lifecycle_refresh_refuses_identical_byte_directory_and_file_replacement() {
         for initially_absent in [false, true] {
