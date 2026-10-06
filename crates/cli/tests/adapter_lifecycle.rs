@@ -75,14 +75,23 @@ fn profile_args(
 }
 
 fn run_profile(temp: &Path, home: &Path, state: &Path, args: &[String]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_libra-governor"))
+    let output = Command::new(env!("CARGO_BIN_EXE_libra-governor"))
         .args(args)
         .env_clear()
         .env("HOME", home)
         .env("LIBRA_GOVERNOR_STATE_DIR", state)
         .current_dir(temp)
         .output()
-        .unwrap()
+        .unwrap();
+    if !output.status.success() {
+        eprintln!(
+            "profile fixture product bytes: {}",
+            fs::metadata(env!("CARGO_BIN_EXE_libra-governor"))
+                .unwrap()
+                .len()
+        );
+    }
+    output
 }
 
 fn assert_closed_gate_with_blocking_stdin(

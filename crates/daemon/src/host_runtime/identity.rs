@@ -19,6 +19,9 @@ use super::RegistryFailure;
 const MAX_FILES: usize = 128;
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+// The product debug executable can exceed an external adapter file budget.
+// This separate single-file bound grants no additional external code authority.
+const MAX_PRODUCT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_LINKS: usize = 40;
 const CHUNK_BYTES: usize = 64 * 1024;
 const HEADER_BYTES: usize = 256;
@@ -247,7 +250,10 @@ fn measure(raw: &Value, total: &mut u64) -> Result<Measured, RegistryFailure> {
             .as_str()
             .ok_or_else(|| fail("identity_unavailable"))?,
     )?;
-    let measured = read_code_bytes(&literal, *total)?;
+    let remaining = MAX_TOTAL_BYTES
+        .checked_sub(*total)
+        .ok_or_else(|| fail("identity_limit"))?;
+    let measured = read_code_bytes(&literal, MAX_FILE_BYTES.min(remaining))?;
     if raw["digest"].as_str() != Some(measured.digest.as_str()) {
         return Err(fail("identity_digest_mismatch"));
     }
@@ -271,9 +277,9 @@ struct CodeBytes {
     size: u64,
 }
 
-fn read_code_bytes(literal: &Path, total: u64) -> Result<CodeBytes, RegistryFailure> {
+fn read_code_bytes(literal: &Path, max_bytes: u64) -> Result<CodeBytes, RegistryFailure> {
     let mut resolved = resolve(literal)?;
-    if resolved.size > MAX_FILE_BYTES || total + resolved.size > MAX_TOTAL_BYTES {
+    if resolved.size > max_bytes {
         return Err(fail("identity_limit"));
     }
     let mut digest = Sha256::new();
@@ -289,7 +295,7 @@ fn read_code_bytes(literal: &Path, total: u64) -> Result<CodeBytes, RegistryFail
             break;
         }
         size += count as u64;
-        if size > MAX_FILE_BYTES || total + size > MAX_TOTAL_BYTES {
+        if size > max_bytes {
             return Err(fail("identity_limit"));
         }
         let keep = (HEADER_BYTES - header.len()).min(count);
@@ -316,7 +322,7 @@ pub(super) fn product_executable_digest(path: &Path) -> Result<String, RegistryF
         path.to_str()
             .ok_or_else(|| fail("unsupported_invocation"))?,
     )?;
-    let measured = read_code_bytes(&literal, 0)?;
+    let measured = read_code_bytes(&literal, MAX_PRODUCT_BYTES)?;
     if !measured.resolved.executable {
         return Err(fail("identity_not_executable"));
     }
@@ -571,6 +577,56 @@ mod observation_tests {
             unchanged(&code, &observed).unwrap_err().reason,
             "identity_drift"
         );
+    }
+
+    #[test]
+    fn product_budget_hashes_beyond_external_file_limit_without_expanding_external_trust() {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("product");
+        let mut file = File::create(&path).unwrap();
+        file.set_len(MAX_FILE_BYTES + 1).unwrap();
+        file.seek(SeekFrom::Start(MAX_FILE_BYTES)).unwrap();
+        file.write_all(&[0x7f]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let measured = product_executable_digest(&path).unwrap();
+        let mut expected = Sha256::new();
+        let chunk = [0_u8; CHUNK_BYTES];
+        for _ in 0..MAX_FILE_BYTES / CHUNK_BYTES as u64 {
+            expected.update(chunk);
+        }
+        expected.update([0x7f_u8]);
+        assert_eq!(measured, digest_string(&expected.finalize()));
+        let raw = json!({"path":path,"kind":"entrypoint","digest":measured});
+        let mut used = 0;
+        assert_eq!(
+            measure(&raw, &mut used).err().unwrap().reason,
+            "identity_limit"
+        );
+        assert_eq!(used, 0);
+        file.set_len(MAX_PRODUCT_BYTES + 1).unwrap();
+        assert_eq!(
+            product_executable_digest(&path).unwrap_err().reason,
+            "identity_limit"
+        );
+    }
+
+    #[test]
+    fn external_remaining_budget_accepts_exact_bytes_and_refuses_overflow() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("dependency");
+        std::fs::write(&path, b"one").unwrap();
+        let raw = json!({"path":path,"kind":"dependency","digest":digest_string(&Sha256::digest(b"one"))});
+        let mut used = MAX_TOTAL_BYTES - 3;
+        assert_eq!(measure(&raw, &mut used).unwrap().digest, raw["digest"]);
+        assert_eq!(used, MAX_TOTAL_BYTES);
+        let mut invalid = MAX_TOTAL_BYTES + 1;
+        assert_eq!(
+            measure(&raw, &mut invalid).err().unwrap().reason,
+            "identity_limit"
+        );
+        assert_eq!(invalid, MAX_TOTAL_BYTES + 1);
     }
 
     #[test]
