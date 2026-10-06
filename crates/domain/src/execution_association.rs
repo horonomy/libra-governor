@@ -71,11 +71,15 @@ impl ExecutionPosition {
         .map_err(|_| AssociationUnavailable::Unsupported)?;
         object.remove("observed_at");
         object.remove("event_id");
+        // Persistent bytes must not depend on dependency map-order features.
+        object.sort_keys();
         let exact =
             serde_json::to_string(&wire).map_err(|_| AssociationUnavailable::Unsupported)?;
-        wire.as_object_mut()
-            .ok_or(AssociationUnavailable::Unsupported)?
-            .remove("turn_id");
+        let object = wire
+            .as_object_mut()
+            .ok_or(AssociationUnavailable::Unsupported)?;
+        object.remove("turn_id");
+        object.sort_keys();
         let context =
             serde_json::to_string(&wire).map_err(|_| AssociationUnavailable::Unsupported)?;
         Ok(Self {
@@ -87,5 +91,37 @@ impl ExecutionPosition {
                 .to_owned(),
             exact,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ExecutionIdentityBuilder;
+
+    #[test]
+    fn durable_position_keeps_the_same_encoding_across_json_map_features() {
+        let identity = ExecutionIdentityBuilder::new("host", "codex")
+            .provider_session_id("session")
+            .agent_id("agent")
+            .turn_id("turn")
+            .tool_instance_id("instance")
+            .child_lineage("parent")
+            .session_lineage_id("lineage")
+            .repo_id("repo")
+            .worktree_id("worktree")
+            .build_at(time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap())
+            .unwrap();
+        let position = ExecutionPosition::from_identity(&identity).unwrap();
+        assert_eq!(position.lane, r#"["host","codex","session","agent"]"#);
+        assert_eq!(position.turn, "turn");
+        assert_eq!(
+            position.exact,
+            r#"{"agent_id":"agent","envelope_version":1,"host_id":"host","lineage_status":"child","parent_agent_id":"parent","provider_session_id":"session","repo_id":"repo","session_lineage_id":"lineage","tool_instance_id":"instance","tool_provider":"codex","turn_id":"turn","worktree_id":"worktree"}"#
+        );
+        assert_eq!(
+            position.context,
+            r#"{"agent_id":"agent","envelope_version":1,"host_id":"host","lineage_status":"child","parent_agent_id":"parent","provider_session_id":"session","repo_id":"repo","session_lineage_id":"lineage","tool_instance_id":"instance","tool_provider":"codex","worktree_id":"worktree"}"#
+        );
     }
 }

@@ -72,6 +72,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace
+      - name: execution owner position encoding with alternate JSON map ordering
+        run: cargo test -p libra-governor-domain --features serde_json/preserve_order durable_position_keeps_the_same_encoding_across_json_map_features
       - name: fresh install and first preflight (Ubuntu)
         if: matrix.os == 'ubuntu-latest'
         run: |

@@ -41,6 +41,8 @@ repo and worktree, are exact immutable lane facts. Any presence/value drift retu
 ambiguous even for a new turn with the correct predecessor; it cannot create a
 second economic lane or rewrite unknown lineage. Each immutable turn stores the
 full v1 identity, excluding only observation/event values from position equality.
+Persisted position objects sort keys explicitly, so enabling a dependency JSON
+map-order feature cannot change association keys across builds or restarts.
 Rich identity never falls back to a current/latest host or session result.
 
 - `Prompt { task_hint, cwd, supersedes_turn }` creates/reuses the lane's TaskId and creates a plan;
