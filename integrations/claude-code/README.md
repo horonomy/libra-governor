@@ -33,6 +33,65 @@ for how this fits the overall hooks/daemon responsibility boundary.
 > It's a manual, opt-in-gated, local-only export you run yourself — not
 > telemetry, no network call, nothing automatic.
 
+## Explicit installed callback lifecycle
+
+The user-scoped `libra.claude-hooks.v1` profile manages the three advisory
+callbacks separately from the legacy `install` command:
+
+```sh
+libra-governor adapter install claude_code --profile libra.claude-hooks.v1 --scope user
+libra-governor adapter enable claude_code --profile libra.claude-hooks.v1 --scope user
+libra-governor adapter status claude_code --json
+libra-governor adapter doctor claude_code --json
+libra-governor adapter disable claude_code --profile libra.claude-hooks.v1 --scope user
+libra-governor adapter uninstall claude_code --profile libra.claude-hooks.v1 --scope user
+```
+
+`install` creates and verifies a private immutable callback artifact with its gate
+disabled; it writes no host callbacks. `enable` connects the three exact callbacks
+after checking the artifact, current binary and target configuration. `disable`
+closes admission before removing positively owned references. `uninstall`
+requires disabled state and removes only that installation's references and
+artifact, preserving registration, ledger, unrelated configuration and other
+products. All four mutators accept `--json` and `--dry-run`; previews report
+current state and planned artifact/callback changes without writing or executing
+an adapter. Project scope and other profiles are currently unsupported.
+
+The target follows the existing `LIBRA_GOVERNOR_CLAUDE_DIR`/home-directory
+convention; the state root follows `LIBRA_GOVERNOR_STATE_DIR`. Their captured
+locators, installation identity, validator and binary digest must still match.
+After a binary upgrade, activation refuses stale identity; disable/uninstall can
+still clean up the stored exact references without executing the old binary.
+The [request](../../crates/daemon/resources/config-profiles/libra.claude-hooks.v1/request.schema.json) and
+[plan](../../crates/daemon/resources/config-profiles/libra.claude-hooks.v1/plan.schema.json) schemas belong to
+the compiled product profile; no adapter supplies commands or filesystem paths.
+
+Unknown settings values, foreign hook members, statusLine, model/provider,
+MCP and plugin settings survive lifecycle changes. Modified, moved, duplicate or
+partial owned callbacks are conflicts. A failure before completion leaves a pending operation
+with a closed gate. Drift observed after a completion commit is reported as
+unconfirmed; recorded intent remains intact, current integrity is unknown, and
+the callback refuses the changed artifact or references. Retry the same command to reconcile a proven before/after
+state; ambiguous user edits remain pending. An enable retry proven to have made
+no target change reports `operation_not_applied` and does not replay activation.
+No stale whole-file backup is restored.
+
+The installed gate exits before stdin or legacy effects when missing, disabled
+or pending. Enabled admission holds the existing reservation only for integrity
+checks, then releases it before input/consumer work. A callback admitted before
+disable may finish afterward. Installed input is limited to 1 MiB before entering
+the shared legacy handler; this local byte limit is not a native-host timeout or
+capability claim. These handlers retain their existing session-level advisory
+semantics; they do not establish canonical execution/task attribution.
+
+Legacy callbacks are independent: a disabled installed profile does not disable
+legacy commands. Activation refuses conflicting legacy/orphan callbacks rather
+than adopting or deleting them. Legacy install refuses a canonical installation;
+legacy removal preserves canonical references, and its existing state-purge guard
+refuses the adapter namespace. Native verification remains `unverified`, including
+when local integrity checks pass. This profile does not add a Codex statusline or
+certify native Codex readiness.
+
 ## What ships
 
 - `libra-governor hook user-prompt-submit` — a `UserPromptSubmit` hook

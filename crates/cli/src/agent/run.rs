@@ -126,7 +126,14 @@ pub fn run_prompt_submit(agent: AgentKind) {
         return;
     };
 
-    let event = match normalize(EntryPoint::PromptSubmit, &raw) {
+    run_prompt_submit_with_input(agent, &raw);
+}
+
+/// The installed callback uses the same consumer after its bounded input gate.
+pub(crate) fn run_prompt_submit_with_input(agent: AgentKind, raw: &str) {
+    let log_path = libra_governor_daemon::paths::log_path();
+
+    let event = match normalize(EntryPoint::PromptSubmit, raw) {
         Ok(event) => event,
         Err(NormalizeError::Malformed(e)) => {
             log(&log_path, agent, &format!("malformed hook payload: {e}"));
@@ -238,7 +245,14 @@ pub fn run_tool_completed(agent: AgentKind) {
         return;
     };
 
-    let event = match normalize(EntryPoint::ToolCompleted, &raw) {
+    run_tool_completed_with_input(agent, &raw);
+}
+
+/// The installed callback uses the same consumer after its bounded input gate.
+pub(crate) fn run_tool_completed_with_input(agent: AgentKind, raw: &str) {
+    let log_path = libra_governor_daemon::paths::log_path();
+
+    let event = match normalize(EntryPoint::ToolCompleted, raw) {
         Ok(event) => event,
         Err(NormalizeError::Malformed(e)) => {
             log(
@@ -328,7 +342,14 @@ pub fn run_turn_completed(agent: AgentKind) {
         return;
     };
 
-    let event = match normalize(EntryPoint::TurnCompleted, &raw) {
+    run_turn_completed_with_input(agent, &raw);
+}
+
+/// The installed callback uses the same consumer after its bounded input gate.
+pub(crate) fn run_turn_completed_with_input(agent: AgentKind, raw: &str) {
+    let log_path = libra_governor_daemon::paths::log_path();
+
+    let event = match normalize(EntryPoint::TurnCompleted, raw) {
         Ok(event) => event,
         Err(NormalizeError::Malformed(e)) => {
             log(

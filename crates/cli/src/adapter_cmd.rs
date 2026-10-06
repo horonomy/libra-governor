@@ -5,6 +5,8 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+use libra_governor_daemon::host_runtime::config_lifecycle::{ConfigLifecycle, LocalInstallation};
+use libra_governor_daemon::host_runtime::config_profile::ConfigIntent;
 use libra_governor_daemon::host_runtime::contract::{HostContract, ValidatedManifest};
 use libra_governor_daemon::host_runtime::dispatch::{
     Cancellation, DiagnosticDispatcher, DiagnosticScope, DiagnosticSelection,
@@ -13,7 +15,7 @@ use libra_governor_daemon::host_runtime::state::{AdapterRegistry, RegistrySnapsh
 use libra_governor_daemon::host_runtime::{RegistryEffect, RegistryFailure};
 use serde_json::{json, Map, Value};
 
-const HELP: &str = "Usage:\n  libra-governor adapter list [--json]\n  libra-governor adapter inspect <id> [--review-code-trust] [--json]\n  libra-governor adapter capabilities <id> [--json]\n  libra-governor adapter status [id] [--json]\n  libra-governor adapter doctor [id] [--json]\n  libra-governor adapter doctor <id> --probe [--scope user|project] [--json]\n  libra-governor adapter explain <id> [--json]\n  libra-governor adapter register <manifest-path> [--confirm-code-digest <sha256:...>] [--dry-run] [--json]\n  libra-governor adapter unregister <id> [--dry-run] [--json]\n  libra-governor adapter install|uninstall|enable|disable <id> [--json]\n\nRegistry metadata is passive. Code-trust review hashes declared files but does not execute them. `adapter doctor <id> --probe` executes explicitly trusted external code with ambient authority; the probe itself grants no host capability or native persistent-statusline support.";
+const HELP: &str = "Usage:\n  libra-governor adapter list [--json]\n  libra-governor adapter inspect <id> [--review-code-trust] [--json]\n  libra-governor adapter capabilities <id> [--json]\n  libra-governor adapter status [id] [--json]\n  libra-governor adapter doctor [id] [--json]\n  libra-governor adapter doctor <id> --probe [--scope user|project] [--json]\n  libra-governor adapter explain <id> [--json]\n  libra-governor adapter register <manifest-path> [--confirm-code-digest <sha256:...>] [--dry-run] [--json]\n  libra-governor adapter unregister <id> [--dry-run] [--json]\n  libra-governor adapter install|uninstall|enable|disable <id> --profile <name> [--scope user|project] [--dry-run] [--json]\n\nRegistry metadata is passive. Code-trust review hashes declared files but does not execute them. `adapter doctor <id> --probe` executes explicitly trusted external code with ambient authority; the probe itself grants no host capability or native persistent-statusline support.";
 
 #[derive(Clone, Copy, Debug)]
 enum ProbeScope {
@@ -32,6 +34,7 @@ struct Command {
     confirmation: Option<String>,
     probe: bool,
     scope: Option<ProbeScope>,
+    profile: Option<String>,
     unavailable: bool,
 }
 
@@ -81,6 +84,7 @@ fn parse(args: &[String]) -> Result<Command, (&'static str, bool)> {
         confirmation: None,
         probe: false,
         scope: None,
+        profile: None,
         unavailable,
     };
     let mut index = 1;
@@ -123,7 +127,10 @@ fn parse(args: &[String]) -> Result<Command, (&'static str, bool)> {
     while index < args.len() {
         match args[index].as_str() {
             "--json" if !command.json => command.json = true,
-            "--dry-run" if !command.dry_run && matches!(operation, "register" | "unregister") => {
+            "--dry-run"
+                if !command.dry_run
+                    && (matches!(operation, "register" | "unregister") || unavailable) =>
+            {
                 command.dry_run = true
             }
             "--review-code-trust" if !command.review && operation == "inspect" => {
@@ -139,7 +146,7 @@ fn parse(args: &[String]) -> Result<Command, (&'static str, bool)> {
                 command.confirmation = Some(value.clone());
             }
             "--probe" if operation == "doctor" && !command.probe => command.probe = true,
-            "--scope" if operation == "doctor" && command.scope.is_none() => {
+            "--scope" if (operation == "doctor" || unavailable) && command.scope.is_none() => {
                 index += 1;
                 command.scope = match args.get(index).map(String::as_str) {
                     Some("user") => Some(ProbeScope::User),
@@ -147,12 +154,21 @@ fn parse(args: &[String]) -> Result<Command, (&'static str, bool)> {
                     _ => return Err((operation, args.iter().any(|arg| arg == "--json"))),
                 };
             }
-            // Scope/profile and generic confirmation switches have no meaning for this registry.
+            "--profile" if unavailable && command.profile.is_none() => {
+                index += 1;
+                let Some(value) = args
+                    .get(index)
+                    .filter(|value| !value.starts_with('-') && value.len() <= 128)
+                else {
+                    return Err((operation, args.iter().any(|arg| arg == "--json")));
+                };
+                command.profile = Some(value.clone());
+            }
             _ => return Err((operation, args.iter().any(|arg| arg == "--json"))),
         }
         index += 1;
     }
-    if command.scope.is_some() && !command.probe {
+    if command.scope.is_some() && !command.probe && !unavailable {
         return Err((operation, command.json));
     }
     if command.probe
@@ -189,14 +205,20 @@ fn execute(command: Command) -> i32 {
             );
         }
     };
-    let registry = AdapterRegistry::new(root, contract.clone());
+    let registry = AdapterRegistry::new(root.clone(), contract.clone());
     if command.probe {
         return execute_probe(&command, &contract, registry);
     }
-    let result = if command.unavailable {
+    let result = if matches!(
+        command.operation,
+        "install" | "enable" | "disable" | "uninstall"
+    ) && command.profile.is_some()
+    {
+        execute_install(&command, root, &contract)
+    } else if command.unavailable {
         Err(RegistryFailure::new("operation", "operation unavailable"))
     } else {
-        dispatch(&command, &contract, &registry)
+        dispatch(&command, &contract, &registry, &root)
     };
     match result {
         Ok((outcome, reason, body, verification, status)) => emit(
@@ -215,8 +237,8 @@ fn execute(command: Command) -> i32 {
                 &command,
                 outcome,
                 reason,
-                json!({"effect": effect_name(failure.effect), "effect_scope":"registry_and_trust",
-                    "filesystem_effect": if !command.dry_run && matches!(command.operation,"register"|"unregister") {"not_asserted"} else {"unchanged"}}),
+                json!({"effect": effect_name(failure.effect), "effect_scope": if command.profile.is_some() {"installation_and_configuration"} else {"registry_and_trust"},
+                    "filesystem_effect": if !command.dry_run && (matches!(command.operation,"register"|"unregister") || command.profile.is_some()) {"not_asserted"} else {"unchanged"}}),
                 verification,
                 status,
             )
@@ -227,10 +249,38 @@ fn execute(command: Command) -> i32 {
 type DispatchResult =
     Result<(&'static str, &'static str, Value, &'static str, i32), RegistryFailure>;
 
+fn execute_install(command: &Command, root: PathBuf, contract: &HostContract) -> DispatchResult {
+    let selection = LocalInstallation {
+        scope: scope_name(command.scope.unwrap_or(ProbeScope::User)).into(),
+        profile: command.profile.clone().unwrap(),
+        target: crate::claude_settings::settings_path()
+            .map_err(|_| RegistryFailure::new("lifecycle", "configuration_locator_unavailable"))?,
+        binary: std::env::current_exe()
+            .map_err(|_| RegistryFailure::new("lifecycle", "consumer_unavailable"))?,
+    };
+    let result = ConfigLifecycle::new(root, contract.clone()).change_connection(
+        command.id.as_deref().unwrap_or(""),
+        &selection,
+        match command.operation {
+            "install" => ConfigIntent::Install,
+            "enable" => ConfigIntent::Enable,
+            "disable" => ConfigIntent::Disable,
+            "uninstall" => ConfigIntent::Uninstall,
+            _ => unreachable!(),
+        },
+        command.dry_run,
+    )?;
+    let mut body = serde_json::to_value(result)
+        .map_err(|_| RegistryFailure::new("lifecycle", "result_unavailable"))?;
+    body["dry_run"] = json!(command.dry_run);
+    Ok(("success", "", body, "unverified", 0))
+}
+
 fn dispatch(
     command: &Command,
     contract: &HostContract,
     registry: &AdapterRegistry,
+    root: &Path,
 ) -> DispatchResult {
     match command.operation {
         "list" | "status" | "doctor" => {
@@ -240,7 +290,14 @@ fn dispatch(
                     return Err(RegistryFailure::new("registry", "unknown adapter"));
                 }
             }
-            let body = render_list(&snapshot, command.id.as_deref());
+            let mut body = render_list(&snapshot, command.id.as_deref());
+            if matches!(command.operation, "status" | "doctor")
+                && command.id.as_deref().is_none_or(|id| id == "claude_code")
+            {
+                let local = ConfigLifecycle::new(root.to_owned(), contract.clone())
+                    .inspect_installation("claude_code")?;
+                body["local_installations"] = json!(local.into_iter().collect::<Vec<_>>());
+            }
             Ok(("success", "", body, "unverified", 0))
         }
         "inspect" | "capabilities" | "explain" => {
@@ -358,12 +415,49 @@ fn execute_probe(command: &Command, contract: &HostContract, registry: AdapterRe
                 command,
                 outcome,
                 reason,
-                json!({"execution_attempted":failure.execution_attempted,"filesystem_effect":filesystem_effect}),
+                json!({"execution_attempted":failure.execution_attempted,"filesystem_effect":filesystem_effect,
+                    "execution_failure": execution_failure_category(failure.stage, failure.reason),
+                    "timeout_phase": timeout_phase(failure.stage, failure.reason)}),
                 "failed",
                 status,
             )
         }
     }
+}
+
+fn timeout_phase(stage: &str, reason: &str) -> Option<&'static str> {
+    if stage != "execution" {
+        return None;
+    }
+    match reason {
+        "request deadline exceeded (not_owned)" => Some("not_owned"),
+        "request deadline exceeded (owned_awaiting_ready)" => Some("owned_awaiting_ready"),
+        "request deadline exceeded (group_ready_awaiting_exec_status)" => {
+            Some("group_ready_awaiting_exec_status")
+        }
+        "request deadline exceeded (exec_status_closed)" => Some("exec_status_closed"),
+        _ => None,
+    }
+}
+
+fn execution_failure_category(stage: &str, reason: &str) -> Option<&'static str> {
+    if stage != "execution" {
+        return None;
+    }
+    Some(match reason {
+        "diagnostic cancelled" => "cancelled",
+        "request deadline exceeded"
+        | "request deadline exceeded (not_owned)"
+        | "request deadline exceeded (owned_awaiting_ready)"
+        | "request deadline exceeded (group_ready_awaiting_exec_status)"
+        | "request deadline exceeded (exec_status_closed)" => "timeout",
+        "request limit exceeded" => "input_limit",
+        "response limit exceeded" => "output_limit",
+        "stderr limit exceeded" => "stderr_limit",
+        "adapter exited unsuccessfully" => "nonzero_exit",
+        "caller signal policy refused" => "signal_context",
+        _ => "owned_execution_failed",
+    })
 }
 
 fn diagnostic_reason(stage: &str, reason: &str) -> &'static str {
@@ -639,6 +733,7 @@ fn emit_early(
         probe: false,
         scope: None,
         unavailable: false,
+        profile: None,
     };
     emit(
         &contract,
@@ -739,8 +834,7 @@ fn scope_name(scope: ProbeScope) -> &'static str {
 }
 
 fn response_scope(command: &Command) -> Option<&'static str> {
-    command
-        .probe
+    (command.probe || command.profile.is_some())
         .then(|| scope_name(command.scope.unwrap_or(ProbeScope::User)))
 }
 
@@ -797,6 +891,10 @@ fn failure_output(failure: &RegistryFailure) -> (&'static str, &'static str, &'s
     }
     let reason = match (failure.stage, failure.reason) {
         ("operation", _) => "operation_unavailable",
+        ("lifecycle", "pending_operation") => "pending_operation",
+        ("lifecycle", "disable_required") => "disable_required",
+        ("lifecycle", "unsupported_installation_profile") => "unsupported_profile",
+        ("lifecycle", "consumer_identity_changed") => "consumer_identity_changed",
         ("resource_integrity", _) => "resource_integrity",
         ("manifest", _) => "invalid_manifest",
         ("identity", "identity_limit") => "identity_limit",
@@ -849,4 +947,59 @@ fn valid_id(value: &str) -> bool {
 
 fn builtin_ids() -> [&'static str; 2] {
     ["claude_code", "codex"]
+}
+
+#[cfg(test)]
+mod execution_diagnostic_tests {
+    use super::{execution_failure_category, timeout_phase};
+
+    #[test]
+    fn timeout_phase_projects_only_qualified_fixed_reasons() {
+        for phase in [
+            "not_owned",
+            "owned_awaiting_ready",
+            "group_ready_awaiting_exec_status",
+            "exec_status_closed",
+        ] {
+            let reason = format!("request deadline exceeded ({phase})");
+            assert_eq!(
+                execution_failure_category("execution", &reason),
+                Some("timeout")
+            );
+            assert_eq!(timeout_phase("execution", &reason), Some(phase));
+            assert_eq!(timeout_phase("protocol", &reason), None);
+        }
+        assert_eq!(
+            timeout_phase("execution", "request deadline exceeded"),
+            None
+        );
+        assert_eq!(
+            timeout_phase("execution", "request deadline exceeded (PRIVATE_CANARY)"),
+            None
+        );
+        assert_eq!(
+            execution_failure_category("execution", "request deadline exceeded (PRIVATE_CANARY)"),
+            Some("owned_execution_failed")
+        );
+    }
+
+    #[test]
+    fn projects_only_fixed_execution_categories_without_source_messages() {
+        for (reason, expected) in [
+            ("diagnostic cancelled", "cancelled"),
+            ("request deadline exceeded", "timeout"),
+            ("request limit exceeded", "input_limit"),
+            ("response limit exceeded", "output_limit"),
+            ("stderr limit exceeded", "stderr_limit"),
+            ("adapter exited unsuccessfully", "nonzero_exit"),
+            ("caller signal policy refused", "signal_context"),
+            ("PRIVATE_DRIVER_ERROR_CANARY", "owned_execution_failed"),
+        ] {
+            assert_eq!(
+                execution_failure_category("execution", reason),
+                Some(expected)
+            );
+            assert_eq!(execution_failure_category("protocol", reason), None);
+        }
+    }
 }

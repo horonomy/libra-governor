@@ -1,6 +1,12 @@
 //! Passive adapter metadata and explicit local-code trust, separate from host admission.
 
 pub mod catalog;
+mod config_bundle;
+mod config_io;
+pub mod config_lifecycle;
+pub mod config_profile;
+mod config_record;
+mod config_settings;
 pub mod contract;
 pub mod dispatch;
 mod exec;

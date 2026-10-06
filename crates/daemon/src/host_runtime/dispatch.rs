@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use super::catalog::RegistryRecord;
 use super::contract::{HostContract, ValidatedManifest};
-use super::exec::{self, ExecFailure, VerifiedLaunch};
+use super::exec::{self, ExecFailure, TimeoutPhase, VerifiedLaunch};
 use super::identity::measure_identity;
 use super::state::AdapterRegistry;
 
@@ -432,7 +432,7 @@ impl DiagnosticDispatcher {
         let max_request_bytes = request_limit(&context.manifest)?;
         // Recheck after request/FD preparation, immediately before admission.
         self.recheck(context)?;
-        let response = exec::run(
+        let response = exec::run_diagnostic(
             VerifiedLaunch {
                 executable,
                 arguments,
@@ -444,9 +444,21 @@ impl DiagnosticDispatcher {
         )
         .map_err(|error| DiagnosticFailure {
             stage: "execution",
-            reason: match error {
+            reason: match error.kind {
                 ExecFailure::Cancelled => "diagnostic cancelled",
-                ExecFailure::Timeout => "request deadline exceeded",
+                ExecFailure::Timeout => match error.timeout_phase {
+                    Some(TimeoutPhase::NotOwned) => "request deadline exceeded (not_owned)",
+                    Some(TimeoutPhase::OwnedAwaitingReady) => {
+                        "request deadline exceeded (owned_awaiting_ready)"
+                    }
+                    Some(TimeoutPhase::GroupReadyAwaitingExecStatus) => {
+                        "request deadline exceeded (group_ready_awaiting_exec_status)"
+                    }
+                    Some(TimeoutPhase::ExecStatusClosed) => {
+                        "request deadline exceeded (exec_status_closed)"
+                    }
+                    None => "request deadline exceeded",
+                },
                 ExecFailure::InputLimit => "request limit exceeded",
                 ExecFailure::OutputLimit => "response limit exceeded",
                 ExecFailure::ErrorLimit => "stderr limit exceeded",

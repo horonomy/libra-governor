@@ -158,16 +158,26 @@ pub fn derive_lock_path(config_path: &Path) -> std::io::Result<PathBuf> {
 /// `EAGAIN` are retried per the schedule. Any other error is not
 /// retried and fails immediately as [`LockFailure::Error`].
 pub fn acquire(config_path: &Path) -> Result<WriteLockGuard, LockFailure> {
-    acquire_with_policy(config_path, false)
+    acquire_with_policy(config_path, false, true)
 }
 
 /// Acquire the same sidecar lock with owner-private namespace checks.
 /// Refuses unsafe existing entries without repairing or replacing them.
 pub fn acquire_private(config_path: &Path) -> Result<WriteLockGuard, LockFailure> {
-    acquire_with_policy(config_path, true)
+    acquire_with_policy(config_path, true, true)
 }
 
-fn acquire_with_policy(config_path: &Path, private: bool) -> Result<WriteLockGuard, LockFailure> {
+/// Callback admission observes an existing reservation; it never initializes
+/// one after an absent-file observation or a concurrent unlink.
+pub(crate) fn acquire_existing_private(config_path: &Path) -> Result<WriteLockGuard, LockFailure> {
+    acquire_with_policy(config_path, true, false)
+}
+
+fn acquire_with_policy(
+    config_path: &Path,
+    private: bool,
+    create: bool,
+) -> Result<WriteLockGuard, LockFailure> {
     let lock_path = derive_lock_path(config_path).map_err(|e| LockFailure::Error {
         errno: e.raw_os_error(),
         message: format!("could not canonicalize the lock sidecar's parent directory: {e}"),
@@ -182,7 +192,7 @@ fn acquire_with_policy(config_path: &Path, private: bool) -> Result<WriteLockGua
     };
     let mut options = OpenOptions::new();
     options
-        .create(true)
+        .create(create)
         .truncate(false)
         .read(true)
         .write(true)
@@ -259,6 +269,44 @@ fn private_error() -> LockFailure {
     LockFailure::Error {
         errno: None,
         message: "unsafe or unavailable private lock namespace".into(),
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    #[test]
+    fn existing_private_admission_never_creates_a_missing_reservation() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("state");
+        let sidecar = derive_lock_path(&target).unwrap();
+        assert!(acquire_existing_private(&target).is_err());
+        assert!(!sidecar.exists());
+        let owner = acquire_private(&target).unwrap();
+        owner.verify().unwrap();
+        drop(owner);
+        let before = std::fs::symlink_metadata(&sidecar).unwrap();
+        let admission = acquire_existing_private(&target).unwrap();
+        admission.verify().unwrap();
+        drop(admission);
+        let after = std::fs::symlink_metadata(&sidecar).unwrap();
+        assert_eq!(
+            (before.dev(), before.ino(), before.mode(), before.len()),
+            (after.dev(), after.ino(), after.mode(), after.len())
+        );
+    }
+
+    #[test]
+    fn unlinked_reservation_refuses_admission_without_recreating_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("state");
+        let sidecar = derive_lock_path(&target).unwrap();
+        let owner = acquire_private(&target).unwrap();
+        std::fs::remove_file(&sidecar).unwrap();
+        assert!(owner.verify().is_err());
+        assert!(acquire_existing_private(&target).is_err());
+        assert!(!sidecar.exists());
     }
 }
 

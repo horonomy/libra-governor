@@ -7,11 +7,14 @@ use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use super::config_record::InstallationRecord;
 use super::contract::{HostContract, ValidatedManifest, MAX_MANIFEST_BYTES};
 use super::RegistryFailure;
 
 const MAX_REGISTRY_BYTES: usize = 8 * 1024 * 1024;
-const MAX_REGISTRY_DEPTH: usize = 8;
+// The closed v2 pending target contains nested ownership projections. V1's
+// records remain flat; both versions retain the same byte/node bounds.
+const MAX_REGISTRY_DEPTH: usize = 12;
 const MAX_REGISTRY_NODES: usize = 8192;
 const MAX_RECORDS: usize = 128;
 const MAX_COUNTER: u64 = 9_007_199_254_740_991;
@@ -28,9 +31,11 @@ const _: () = {
 
 #[derive(Clone, Debug)]
 pub struct RegistryDocument {
+    pub(super) schema_version: u32,
     pub(super) registry_id: String,
     pub(super) revision: u64,
     pub(super) adapters: BTreeMap<String, RegistryRecord>,
+    pub(super) installations: BTreeMap<String, InstallationRecord>,
 }
 
 #[derive(Clone, Debug)]
@@ -52,12 +57,23 @@ pub struct CodeTrust {
 impl RegistryDocument {
     pub fn parse(raw: &[u8], contract: &HostContract) -> Result<Self, RegistryFailure> {
         let value = parse_json(raw)?;
-        exact_keys(
-            &value,
-            &["schema_version", "registry_id", "revision", "adapters"],
-        )?;
-        if integer(&value["schema_version"], "schema version")? != 1 {
-            return Err(fail("registry", "unsupported schema version"));
+        let schema_version = integer(&value["schema_version"], "schema version")?;
+        match schema_version {
+            1 => exact_keys(
+                &value,
+                &["schema_version", "registry_id", "revision", "adapters"],
+            )?,
+            2 => exact_keys(
+                &value,
+                &[
+                    "schema_version",
+                    "registry_id",
+                    "revision",
+                    "adapters",
+                    "installations",
+                ],
+            )?,
+            _ => return Err(fail("registry", "unsupported schema version")),
         }
         let registry_id = string(&value["registry_id"], "registry id")?.to_owned();
         if !is_lower_hex(&registry_id, 32) {
@@ -131,10 +147,32 @@ impl RegistryDocument {
                 },
             );
         }
+        let installations = if schema_version == 2 {
+            let records = value["installations"]
+                .as_object()
+                .ok_or_else(|| fail("registry", "invalid installations map"))?;
+            // This version's only installed consumer has exactly one logical
+            // builtin/profile/user binding, including uncompleted intents.
+            if records.len() > 1 {
+                return Err(fail("registry", "installation conflict"));
+            }
+            let mut installations = BTreeMap::new();
+            for (binding, value) in records {
+                let record: InstallationRecord = serde_json::from_value(value.clone())
+                    .map_err(|_| fail("registry", "invalid installation record"))?;
+                record.validate(&registry_id, binding, revision)?;
+                installations.insert(binding.clone(), record);
+            }
+            installations
+        } else {
+            BTreeMap::new()
+        };
         Ok(Self {
+            schema_version: schema_version as u32,
             registry_id,
             revision,
             adapters,
+            installations,
         })
     }
 
@@ -162,7 +200,13 @@ impl RegistryDocument {
                 "trust": trust,
             }));
         }
-        let value = serde_json::json!({"schema_version":1,"registry_id":self.registry_id,"revision":self.revision,"adapters":adapters});
+        let mut value = serde_json::json!({"schema_version":self.schema_version,"registry_id":self.registry_id,"revision":self.revision,"adapters":adapters});
+        if self.schema_version == 2 {
+            value["installations"] = serde_json::to_value(&self.installations)
+                .map_err(|_| fail("registry", "serialization failed"))?;
+        } else if !self.installations.is_empty() {
+            return Err(fail("registry", "installation requires lifecycle schema"));
+        }
         let bytes =
             serde_json::to_vec(&value).map_err(|_| fail("registry", "serialization failed"))?;
         if bytes.len() > MAX_REGISTRY_BYTES {
@@ -340,6 +384,42 @@ fn fail(stage: &'static str, reason: &'static str) -> RegistryFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_v2_roundtrip_preserves_pending_install_without_activating_it() {
+        use super::super::config_record::{InstallationContext, ProductBinary};
+        let contract = HostContract::load().unwrap();
+        let registry_id = "a".repeat(32);
+        let context = InstallationContext {
+            scope: "user".into(),
+            state_root: "/tmp/state".into(),
+            target_path: "/tmp/home/.claude/settings.json".into(),
+        };
+        let binary = ProductBinary {
+            path: "/tmp/libra-governor".into(),
+            sha256: super::super::config_bundle::sha256(b"product"),
+        };
+        let (binding, record) =
+            InstallationRecord::prepare_install(&registry_id, 1, context.clone(), binary.clone())
+                .unwrap();
+        let mut document = RegistryDocument {
+            schema_version: 2,
+            registry_id: registry_id.clone(),
+            revision: 1,
+            adapters: BTreeMap::new(),
+            installations: BTreeMap::from([(binding.clone(), record)]),
+        };
+        let bytes = document.encode(&contract).unwrap();
+        let decoded = RegistryDocument::parse(&bytes, &contract).unwrap();
+        assert!(!decoded.installations[&binding].installed);
+        assert!(!decoded.installations[&binding].desired_enabled);
+        assert!(decoded.installations[&binding].pending.is_some());
+        assert!(decoded.encode(&contract).unwrap() == bytes);
+        let (second, record) =
+            InstallationRecord::prepare_install(&registry_id, 1, context, binary).unwrap();
+        document.installations.insert(second, record);
+        assert!(document.encode(&contract).is_err());
+    }
 
     #[test]
     fn counters_reject_fraction_and_overflow() {

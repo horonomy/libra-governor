@@ -138,6 +138,22 @@ fn output_context(output: &Output) -> String {
     )
 }
 
+fn fixture_counts(fixture: &Fixture) -> String {
+    let entry = fs::read_to_string(format!("{}.entry", fixture.operation_log.display()))
+        .map(|text| text.lines().count());
+    let starts = fs::read_to_string(format!("{}.starts", fixture.operation_log.display()))
+        .map(|text| text.lines().count());
+    let operations = fs::read_to_string(&fixture.operation_log).map(|text| {
+        (
+            text.lines().filter(|line| *line == "handshake").count(),
+            text.lines().filter(|line| *line == "probe").count(),
+        )
+    });
+    format!(
+        "script_entry={entry:?} recorded_starts={starts:?} handshake_probe_counts={operations:?}"
+    )
+}
+
 fn review_and_confirm(fixture: &Fixture) -> String {
     let manifest = fixture.manifest.to_str().unwrap();
     let review = adapter_cli(
@@ -185,6 +201,13 @@ fn operation_log(fixture: &Fixture) -> Vec<String> {
         .lines()
         .count();
     assert_eq!(starts, operations.len(), "fixture start/request mismatch");
+    let entry = fs::read_to_string(format!("{}.entry", fixture.operation_log.display()))
+        .unwrap_or_default();
+    assert_eq!(
+        entry.lines().count(),
+        starts,
+        "fixture entry/start mismatch"
+    );
     operations
 }
 
@@ -230,7 +253,12 @@ fn probe_is_passive_until_real_cli_trust_then_reports_only_conservative_summary(
             "doctor", ADAPTER_ID, "--probe", "--scope", "project", "--json",
         ],
     );
-    assert!(probe.status.success(), "{}", output_context(&probe));
+    assert!(
+        probe.status.success(),
+        "{} {}",
+        fixture_counts(&fixture),
+        output_context(&probe)
+    );
     let result = json(&probe);
     assert_eq!(result["operation"], "doctor");
     assert_eq!(result["outcome"], "partial");
@@ -341,7 +369,12 @@ fn trusted_text_probe_does_not_render_candidate_evidence_or_paths() {
     enroll_and_confirm(&fixture);
     let before = fs::read(&fixture.registry).unwrap();
     let probe = adapter_cli(&fixture, &["doctor", ADAPTER_ID, "--probe"]);
-    assert!(probe.status.success(), "{}", output_context(&probe));
+    assert!(
+        probe.status.success(),
+        "{} {}",
+        fixture_counts(&fixture),
+        output_context(&probe)
+    );
     let stdout = String::from_utf8_lossy(&probe.stdout);
     let stderr = String::from_utf8_lossy(&probe.stderr);
     assert!(stdout.contains("partial"));
@@ -462,4 +495,38 @@ fn cli_sigint_cancels_probe_and_waits_for_fixture_process_group_cleanup() {
     assert_eq!(stdout["result"]["filesystem_effect"], "not_asserted");
     assert_eq!(fs::read(&stderr_path).unwrap(), b"");
     assert_eq!(operation_log(&fixture), ["handshake"]);
+}
+
+#[test]
+fn trusted_execution_failures_have_fixed_categories_without_candidate_output() {
+    for (mode, category) in [
+        ("nonzero_exit", "nonzero_exit"),
+        ("wait_for_signal", "timeout"),
+    ] {
+        let fixture = fixture(mode);
+        enroll_and_confirm(&fixture);
+        let before = fs::read(&fixture.registry).unwrap();
+        let probe = adapter_cli(&fixture, &["doctor", ADAPTER_ID, "--probe", "--json"]);
+        assert!(!probe.status.success());
+        let result = json(&probe);
+        assert_eq!(result["reasons"][0], "probe_execution_failed");
+        assert_eq!(
+            result["result"]["execution_failure"],
+            category,
+            "{} {}",
+            fixture_counts(&fixture),
+            output_context(&probe)
+        );
+        assert_eq!(result["result"]["execution_attempted"], true);
+        assert_eq!(result["result"]["filesystem_effect"], "not_asserted");
+        if category == "timeout" {
+            assert_eq!(result["result"]["timeout_phase"], "exec_status_closed");
+        } else {
+            assert!(result["result"]["timeout_phase"].is_null());
+        }
+        assert_eq!(operation_log(&fixture), ["handshake"]);
+        assert_eq!(fs::read(&fixture.registry).unwrap(), before);
+        assert!(!String::from_utf8_lossy(&probe.stdout).contains(SOURCE_CANARY));
+        assert!(!String::from_utf8_lossy(&probe.stderr).contains(SOURCE_CANARY));
+    }
 }
