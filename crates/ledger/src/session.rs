@@ -11,6 +11,7 @@
 use libra_governor_domain::{
     CompletionContract, PlanId, ReplanHysteresisState, TaskId, TaskIdentity,
 };
+use rusqlite::OptionalExtension;
 use time::format_description::well_known::Rfc3339;
 
 use crate::{store::LedgerStore, LedgerError};
@@ -53,7 +54,7 @@ impl LedgerStore {
                 [session_id],
                 |row| row.get(0),
             )
-            .ok();
+            .optional()?;
         task_id
             .map(|s| {
                 uuid::Uuid::parse_str(&s)
@@ -77,7 +78,7 @@ impl LedgerStore {
                 [&task_id_str],
                 |row| row.get(0),
             )
-            .ok()
+            .optional()?
             .flatten();
 
         let Some(revision) = revision else {

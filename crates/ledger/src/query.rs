@@ -4,6 +4,7 @@ use libra_governor_domain::{
     RegimeProvenance, ReplanId, ReplanReason, ReplanRecord, ResourceAmount, TaskFeatures, TaskId,
     TaskIdentity,
 };
+use rusqlite::OptionalExtension;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -490,7 +491,7 @@ impl LedgerStore {
                 [session_id],
                 |row| row.get(0),
             )
-            .ok();
+            .optional()?;
         plan_id
             .map(|s| {
                 Uuid::parse_str(&s)

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 /// A request envelope: a required, non-defaulted protocol version plus
 /// the request payload. See crate docs on why the version is required.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequestEnvelope {
     pub protocol_version: u32,
     pub request: Request,
@@ -31,8 +32,11 @@ pub struct ResponseEnvelope {
 
 /// One request a client may send the daemon.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    ExecutionOwner {
+        event: Box<crate::ExecutionOwnerRequest>,
+    },
     /// Ask the daemon to run bounded reconnaissance against `cwd` for the
     /// given prompt hint and return a preflight result (draft Completion
     /// Contract + reconnaissance summary), creating or reusing the task
@@ -215,6 +219,8 @@ pub struct PreflightResult {
 /// The result of a `Status` request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatusResult {
+    /// Legacy Status is the last observed host task, never a current-session lookup.
+    pub scope: StatusScope,
     pub current_task: Option<TaskSummary>,
     /// What the reservation ledger says about `current_task`'s resource
     /// envelope (HORO-1634), computed while answering *this* request
@@ -280,6 +286,12 @@ pub struct StatusResult {
     /// nonetheless never present it as consumption: see
     /// [`BudgetScope::ConfiguredDefault`].
     pub configured_budget: Option<ConfiguredBudget>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusScope {
+    HostLatestObservation,
 }
 
 /// Which envelope an economic figure is a figure *of* (HORO-1709).
@@ -807,6 +819,7 @@ pub enum OutcomeRecordedOutcome {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
+    ExecutionOwner(Box<crate::ExecutionOwnerOutcome>),
     Preflight(Box<PreflightResult>),
     Status(Box<StatusResult>),
     Finalize(FinalizeOutcome),
@@ -1248,6 +1261,7 @@ mod tests {
         let envelope = ResponseEnvelope {
             protocol_version: PROTOCOL_VERSION,
             response: Response::Status(Box::new(StatusResult {
+                scope: crate::StatusScope::HostLatestObservation,
                 current_task: None,
                 task_budget: Some(BudgetPosture::from_snapshot(&half_spent)),
                 task_budget_amounts: Some(half_spent),
@@ -1323,21 +1337,14 @@ mod tests {
         assert_eq!(amounts.remaining().value, 62_000.0);
     }
 
-    /// Pins what the shape alone does *not* protect, so nobody relies on
-    /// it. A v10 `StatusResult` decodes cleanly into a v11 one: both new
-    /// fields are `Option`, and serde defaults a missing `Option` to
-    /// `None`. The result is indistinguishable from a daemon that has a
-    /// task with no budget row — stale silently read as unknown.
-    ///
-    /// That is why [`PROTOCOL_VERSION`] was bumped and why the envelope
-    /// carries a required, non-defaulted version: the version check is
-    /// the whole protection here, not the field shape. Deleting the bump
-    /// on the grounds that "it deserializes fine" would reintroduce the
-    /// silent downgrade.
+    /// Optional budget fields still default to None within the current
+    /// scoped status shape. The required envelope version rejects omitted
+    /// versions before a daemon can reinterpret that absence.
     #[test]
     fn a_missing_budget_field_decodes_to_none_so_the_version_gate_is_the_protection() {
-        let v10_shaped = r#"{"current_task":null,"task_budget":null}"#;
-        let decoded: StatusResult = serde_json::from_str(v10_shaped)
+        let older_budget_shape =
+            r#"{"scope":"host_latest_observation","current_task":null,"task_budget":null}"#;
+        let decoded: StatusResult = serde_json::from_str(older_budget_shape)
             .expect("an Option field absent from the payload is not a decode error");
         assert_eq!(decoded.task_budget_amounts, None);
         assert_eq!(decoded.configured_budget, None);
@@ -1371,6 +1378,7 @@ mod tests {
     #[test]
     fn an_idle_status_carries_a_configured_ceiling_and_no_task_amounts() {
         let idle = StatusResult {
+            scope: crate::StatusScope::HostLatestObservation,
             current_task: None,
             task_budget: None,
             task_budget_amounts: None,

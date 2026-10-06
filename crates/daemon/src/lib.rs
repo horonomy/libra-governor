@@ -9,6 +9,7 @@
 
 pub mod config_file;
 pub mod contract;
+mod execution_owner;
 pub mod extension_authority;
 pub mod features;
 pub mod gateway_authority;

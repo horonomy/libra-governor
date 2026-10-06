@@ -133,6 +133,7 @@ mod tests {
     /// and a helper keeps that intent legible as the reply grows fields.
     fn status_for(current_task: Option<TaskSummary>) -> StatusResult {
         StatusResult {
+            scope: libra_governor_protocol::StatusScope::HostLatestObservation,
             current_task,
             task_budget: None,
             task_budget_amounts: None,
@@ -176,6 +177,7 @@ mod tests {
             BudgetPosture::Unreadable,
         ] {
             let line = format_status(&StatusResult {
+                scope: libra_governor_protocol::StatusScope::HostLatestObservation,
                 current_task: Some(task.clone()),
                 task_budget: Some(posture),
                 task_budget_amounts: None,
@@ -203,6 +205,7 @@ mod tests {
         let task = sample_task(ReplanState::Stable);
         let baseline = format_status(&status_for(Some(task.clone())));
         let line = format_status(&StatusResult {
+            scope: libra_governor_protocol::StatusScope::HostLatestObservation,
             current_task: Some(task),
             task_budget: Some(BudgetPosture::Remaining {
                 fraction_left: 0.38,

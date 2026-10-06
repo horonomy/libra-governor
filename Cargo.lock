@@ -744,6 +744,7 @@ version = "0.0.2"
 dependencies = [
  "libra-governor-domain",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
@@ -761,6 +762,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+ "time",
 ]
 
 [[package]]
