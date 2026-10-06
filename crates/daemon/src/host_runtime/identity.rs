@@ -247,8 +247,33 @@ fn measure(raw: &Value, total: &mut u64) -> Result<Measured, RegistryFailure> {
             .as_str()
             .ok_or_else(|| fail("identity_unavailable"))?,
     )?;
-    let mut resolved = resolve(&literal)?;
-    if resolved.size > MAX_FILE_BYTES || *total + resolved.size > MAX_TOTAL_BYTES {
+    let measured = read_code_bytes(&literal, *total)?;
+    if raw["digest"].as_str() != Some(measured.digest.as_str()) {
+        return Err(fail("identity_digest_mismatch"));
+    }
+    *total += measured.size;
+    Ok(Measured {
+        literal,
+        resolved: measured.resolved,
+        kind: raw["kind"]
+            .as_str()
+            .ok_or_else(|| fail("identity_unavailable"))?
+            .to_owned(),
+        digest: measured.digest,
+        header: measured.header,
+    })
+}
+
+struct CodeBytes {
+    resolved: Resolved,
+    digest: String,
+    header: Vec<u8>,
+    size: u64,
+}
+
+fn read_code_bytes(literal: &Path, total: u64) -> Result<CodeBytes, RegistryFailure> {
+    let mut resolved = resolve(literal)?;
+    if resolved.size > MAX_FILE_BYTES || total + resolved.size > MAX_TOTAL_BYTES {
         return Err(fail("identity_limit"));
     }
     let mut digest = Sha256::new();
@@ -264,7 +289,7 @@ fn measure(raw: &Value, total: &mut u64) -> Result<Measured, RegistryFailure> {
             break;
         }
         size += count as u64;
-        if size > MAX_FILE_BYTES || *total + size > MAX_TOTAL_BYTES {
+        if size > MAX_FILE_BYTES || total + size > MAX_TOTAL_BYTES {
             return Err(fail("identity_limit"));
         }
         let keep = (HEADER_BYTES - header.len()).min(count);
@@ -274,22 +299,28 @@ fn measure(raw: &Value, total: &mut u64) -> Result<Measured, RegistryFailure> {
     if size != resolved.size {
         return Err(fail("identity_drift"));
     }
-    unchanged(&literal, &resolved)?;
+    unchanged(literal, &resolved)?;
     let digest = digest_string(&digest.finalize());
-    if raw["digest"].as_str() != Some(digest.as_str()) {
-        return Err(fail("identity_digest_mismatch"));
-    }
-    *total += size;
-    Ok(Measured {
-        literal,
+    Ok(CodeBytes {
         resolved,
-        kind: raw["kind"]
-            .as_str()
-            .ok_or_else(|| fail("identity_unavailable"))?
-            .to_owned(),
         digest,
         header,
+        size,
     })
+}
+
+/// The lifecycle coordinator measures its actual packaged executable without
+/// impersonating an externally registered adapter or granting code trust.
+pub(super) fn product_executable_digest(path: &Path) -> Result<String, RegistryFailure> {
+    let literal = absolute(
+        path.to_str()
+            .ok_or_else(|| fail("unsupported_invocation"))?,
+    )?;
+    let measured = read_code_bytes(&literal, 0)?;
+    if !measured.resolved.executable {
+        return Err(fail("identity_not_executable"));
+    }
+    Ok(measured.digest)
 }
 
 fn python(name: &str) -> bool {

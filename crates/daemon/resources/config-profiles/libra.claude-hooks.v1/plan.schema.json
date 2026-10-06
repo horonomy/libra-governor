@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "binding_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "installation_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "target_revision": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "changes": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "slot": {
+            "enum": [
+              "prompt_submit",
+              "tool_completed",
+              "turn_completed"
+            ]
+          },
+          "action": {
+            "enum": [
+              "add",
+              "preserve",
+              "remove"
+            ]
+          },
+          "callback_ref": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "expected_owned_digest": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "placement": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "event": {
+                "enum": [
+                  "UserPromptSubmit",
+                  "PostToolUse",
+                  "Stop"
+                ]
+              },
+              "matcher": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "event",
+              "matcher"
+            ]
+          }
+        },
+        "required": [
+          "slot",
+          "action",
+          "callback_ref",
+          "expected_owned_digest",
+          "placement"
+        ]
+      }
+    }
+  },
+  "required": [
+    "schema_version",
+    "binding_id",
+    "installation_id",
+    "changes"
+  ]
+}

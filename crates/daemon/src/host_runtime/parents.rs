@@ -321,6 +321,41 @@ impl ParentObservation {
         !self.missing.is_empty()
     }
 
+    /// Unlike ancestor preparation, this owned leaf must not adopt EEXIST.
+    pub(super) fn create_child_exclusive(
+        &self,
+        name: &std::ffi::OsStr,
+    ) -> Result<(PreparedParent, Arc<File>), RegistryFailure> {
+        self.check()?;
+        if self.needs_preparation()
+            || Path::new(name).components().count() != 1
+            || !matches!(
+                Path::new(name).components().next(),
+                Some(Component::Normal(_))
+            )
+        {
+            return Err(failure("invalid_state_root"));
+        }
+        mkdirat(self.anchor.as_ref(), name, Mode::RWXU)
+            .map_err(|_| failure("state_namespace_changed"))?;
+        let result = (|| {
+            self.check()?;
+            let stat = statat(self.anchor.as_ref(), name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|_| failure("state_parent_changed"))?;
+            if stat.st_mode & 0o077 != 0 {
+                return Err(failure("unsafe_state_root"));
+            }
+            let (opened, edge) = directory_edge(self.anchor.clone(), name.to_owned(), &stat, true)?;
+            let proof = PreparedParent {
+                original: self.clone(),
+                edges: vec![edge],
+            };
+            proof.check()?;
+            Ok((proof, opened))
+        })();
+        result.map_err(|failure| RegistryFailure::unconfirmed(failure.stage, failure.reason))
+    }
+
     pub(super) fn prepare(&self) -> Result<PreparedParent, RegistryFailure> {
         // Missing components can now exist because another initial registrant
         // prepared them. Existing anchor observations may never be refreshed.

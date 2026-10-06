@@ -110,7 +110,34 @@ fn uninstall_claude_settings() -> bool {
             return false;
         }
     };
-    match claude_settings::remove(&settings_path) {
+    let guarded = (|| {
+        let root = libra_governor_daemon::paths::state_dir().map_err(|_| {
+            libra_governor_daemon::host_runtime::RegistryFailure::new(
+                "lifecycle",
+                "state_unavailable",
+            )
+        })?;
+        let contract = libra_governor_daemon::host_runtime::contract::HostContract::load()?;
+        libra_governor_daemon::host_runtime::config_lifecycle::ConfigLifecycle::new(root, contract)
+            .run_legacy_claude(&settings_path, false, |_| {
+                claude_settings::remove(&settings_path)
+            })
+    })();
+    let removed = match guarded {
+        Ok(Some(result)) => result,
+        Ok(None) => {
+            println!(
+                "libra-governor uninstall: {} does not exist — nothing to remove",
+                settings_path.display()
+            );
+            return true;
+        }
+        Err(error) => {
+            eprintln!("libra-governor uninstall: legacy configuration refused: {error}");
+            return false;
+        }
+    };
+    match removed {
         Ok(removed) if removed.file_absent => {
             println!(
                 "libra-governor uninstall: {} does not exist — nothing to remove",

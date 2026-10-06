@@ -23,6 +23,14 @@ const SLICE: Duration = Duration::from_millis(5);
 // claim is made about foreign callers retaining non-CLOEXEC descriptors.
 static FORK_PLAN: Mutex<()> = Mutex::new(());
 
+#[cfg(test)]
+pub(super) fn spawn_test_child(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::Child> {
+    let _plan = FORK_PLAN.lock().unwrap();
+    command.spawn()
+}
+
 #[derive(Clone, Default)]
 pub struct Cancellation {
     local: Arc<AtomicBool>,

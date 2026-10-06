@@ -44,7 +44,162 @@ pub struct AdapterRegistry {
     contract: HostContract,
 }
 
+/// Lifecycle commits reuse the existing outside-root reservation. It remains
+/// held across intent, target mutation, readback and metadata completion.
+pub(super) struct LifecycleTransaction<'a> {
+    registry: &'a AdapterRegistry,
+    guard: crate::write_lock::WriteLockGuard,
+    observed: ObservedRegistry,
+    changed: bool,
+    created_legacy_root: Option<super::parents::PreparedParent>,
+}
+
+impl LifecycleTransaction<'_> {
+    pub(super) fn document(&self) -> Option<&RegistryDocument> {
+        self.observed.document.as_ref()
+    }
+
+    pub(super) fn root(&self) -> Result<&Path, RegistryFailure> {
+        self.registry.root()
+    }
+
+    pub(super) fn verify(&self) -> Result<(), RegistryFailure> {
+        if let Some(proof) = &self.created_legacy_root {
+            proof.check().map_err(|failure| self.qualify(failure))?;
+        }
+        self.registry
+            .verify_no_change(
+                &self.observed.stamp,
+                &self.guard,
+                self.observed.file_identity.as_ref(),
+                &self.observed.namespace,
+            )
+            .map_err(|failure| self.qualify(failure))
+    }
+
+    pub(super) fn qualify(&self, mut failure: RegistryFailure) -> RegistryFailure {
+        if self.changed {
+            failure.effect = RegistryEffect::EffectUnconfirmed;
+        }
+        failure
+    }
+
+    pub(super) fn note_configuration_change(&mut self) {
+        self.changed = true;
+    }
+
+    pub(super) fn prepare_legacy_marker_root(&mut self) -> Result<(), RegistryFailure> {
+        self.verify()?;
+        let root = self.registry.root()?.to_owned();
+        let entry = self
+            .observed
+            .namespace
+            .entries
+            .iter()
+            .position(|(path, _, _)| path == &root)
+            .ok_or_else(|| refusal("registry", "state namespace changed"))?;
+        if self.observed.namespace.entries[entry].1.is_some() {
+            return Ok(());
+        }
+        storage_boundary(CommitBoundary::BeforeLegacyRootCreation)?;
+        let (proof, held) = self.observed.namespace.parent.create_child_exclusive(
+            root.file_name()
+                .ok_or_else(|| refusal("registry", "invalid state root"))?,
+        )?;
+        self.changed = true;
+        let owned = held
+            .metadata()
+            .map_err(|_| self.qualify(refusal("registry", "state unavailable")))?;
+        self.observed.namespace.entries[entry].1 = Some(owned);
+        self.created_legacy_root = Some(proof);
+        storage_boundary(CommitBoundary::AfterLegacyRootCreation)
+            .map_err(|failure| self.qualify(failure))?;
+        self.verify()
+    }
+
+    pub(super) fn commit(&mut self, document: &RegistryDocument) -> Result<(), RegistryFailure> {
+        let expected = RegistryStamp(Some((
+            document.registry_id.clone(),
+            document.revision,
+            digest(&document.encode(&self.registry.contract)?),
+        )));
+        let observed = self
+            .registry
+            .commit_observed(
+                document,
+                &self.observed.stamp,
+                &self.guard,
+                self.observed.file_identity.as_ref(),
+                &self.observed.namespace,
+            )
+            .map_err(|failure| self.qualify(failure))?;
+        self.changed = true;
+        storage_boundary(CommitBoundary::AfterLifecycleCommit)
+            .map_err(|failure| self.qualify(failure))?;
+        observed
+            .namespace
+            .check()
+            .map_err(|failure| self.qualify(failure))?;
+        verify_file_revision(
+            &self.registry.root()?.join("host-adapters/registry.json"),
+            observed.file_identity.as_ref(),
+        )
+        .map_err(|failure| self.qualify(failure))?;
+        if observed.stamp != expected {
+            return Err(RegistryFailure::unconfirmed(
+                "registry",
+                "committed registry changed",
+            ));
+        }
+        self.observed = observed;
+        self.verify()
+    }
+}
+
 impl AdapterRegistry {
+    pub(super) fn begin_lifecycle(
+        &self,
+        expected: &RegistryStamp,
+        prepare_missing: bool,
+    ) -> Result<LifecycleTransaction<'_>, RegistryFailure> {
+        let (guard, observed) = self.begin(expected, prepare_missing)?;
+        Ok(LifecycleTransaction {
+            registry: self,
+            guard,
+            observed,
+            changed: false,
+            created_legacy_root: None,
+        })
+    }
+
+    pub(super) fn begin_admission(
+        &self,
+        expected: &RegistryStamp,
+    ) -> Result<LifecycleTransaction<'_>, RegistryFailure> {
+        let (guard, observed) = self.begin_with_creation(expected, false, false, false)?;
+        Ok(LifecycleTransaction {
+            registry: self,
+            guard,
+            observed,
+            changed: false,
+            created_legacy_root: None,
+        })
+    }
+
+    pub(super) fn begin_legacy(
+        &self,
+        expected: &RegistryStamp,
+        prepare_parent: bool,
+    ) -> Result<LifecycleTransaction<'_>, RegistryFailure> {
+        let (guard, observed) = self.begin_with_creation(expected, prepare_parent, true, true)?;
+        Ok(LifecycleTransaction {
+            registry: self,
+            guard,
+            observed,
+            changed: false,
+            created_legacy_root: None,
+        })
+    }
     /// Construction neither creates directories nor reads host configuration.
     pub fn new(state_root: PathBuf, contract: HostContract) -> Self {
         Self {
@@ -325,11 +480,21 @@ impl AdapterRegistry {
         expected: &RegistryStamp,
         prepare_missing: bool,
     ) -> Result<(crate::write_lock::WriteLockGuard, ObservedRegistry), RegistryFailure> {
+        self.begin_with_creation(expected, prepare_missing, true, false)
+    }
+
+    fn begin_with_creation(
+        &self,
+        expected: &RegistryStamp,
+        prepare_missing: bool,
+        create_reservation: bool,
+        allow_absent_catalog: bool,
+    ) -> Result<(crate::write_lock::WriteLockGuard, ObservedRegistry), RegistryFailure> {
         let initial = self.read_observed()?;
         if &initial.stamp != expected {
             return Err(refusal("registry", "registry changed"));
         }
-        if initial.document.is_none() && !prepare_missing {
+        if initial.document.is_none() && !prepare_missing && !allow_absent_catalog {
             return Err(refusal("registry", "unknown adapter"));
         }
         storage_boundary(CommitBoundary::BeforePreparation)?;
@@ -355,8 +520,12 @@ impl AdapterRegistry {
         if target.parent() != Some(observed_parent) {
             return Err(refusal("registry", "state namespace changed"));
         }
-        let guard = crate::write_lock::acquire_private(&target)
-            .map_err(|_| refusal("write_lock", "registry lock unavailable"))?;
+        let acquisition = if create_reservation {
+            crate::write_lock::acquire_private(&target)
+        } else {
+            crate::write_lock::acquire_existing_private(&target)
+        };
+        let guard = acquisition.map_err(|_| refusal("write_lock", "registry lock unavailable"))?;
         guard
             .verify()
             .map_err(|_| refusal("registry", "state reservation changed"))?;
@@ -426,6 +595,18 @@ impl AdapterRegistry {
         original_file: Option<&Metadata>,
         original_namespace: &Namespace,
     ) -> Result<RegistryEffect, RegistryFailure> {
+        self.commit_observed(document, expected, guard, original_file, original_namespace)?;
+        Ok(RegistryEffect::AppliedVerified)
+    }
+
+    fn commit_observed(
+        &self,
+        document: &RegistryDocument,
+        expected: &RegistryStamp,
+        guard: &crate::write_lock::WriteLockGuard,
+        original_file: Option<&Metadata>,
+        original_namespace: &Namespace,
+    ) -> Result<ObservedRegistry, RegistryFailure> {
         self.verify_reservation(guard)?;
         original_namespace.check()?;
         verify_file_revision(
@@ -490,19 +671,35 @@ impl AdapterRegistry {
                 .map_err(|_| refusal("registry", "directory synchronization failed"))?;
             namespace.check()?;
             storage_boundary(CommitBoundary::Readback)?;
-            let (observed, _) =
+            let (observed, identity) =
                 read_private(&path)?.ok_or_else(|| refusal("registry", "readback unavailable"))?;
             if observed != raw {
                 return Err(refusal("registry", "readback changed"));
             }
-            RegistryDocument::parse(&observed, &self.contract)?;
+            let parsed = RegistryDocument::parse(&observed, &self.contract)?;
+            let held = file
+                .metadata()
+                .map_err(|_| refusal("registry", "readback unavailable"))?;
+            if !safe_file(&held) || !unchanged(&held, &identity) {
+                return Err(refusal("registry", "readback file changed"));
+            }
             namespace.check()?;
-            Ok(())
+            self.verify_reservation(guard)?;
+            verify_file_revision(&path, Some(&identity))?;
+            Ok(ObservedRegistry {
+                stamp: RegistryStamp(Some((
+                    parsed.registry_id.clone(),
+                    parsed.revision,
+                    digest(&observed),
+                ))),
+                document: Some(parsed),
+                file_identity: Some(identity),
+                namespace,
+            })
         })();
         verified.map_err(|_: RegistryFailure| {
             RegistryFailure::unconfirmed("registry", "registry effect unconfirmed")
-        })?;
-        Ok(RegistryEffect::AppliedVerified)
+        })
     }
 }
 
@@ -540,9 +737,11 @@ fn registration_candidate(
     manifest: super::contract::ValidatedManifest,
 ) -> Result<RegistryDocument, RegistryFailure> {
     let mut document = document.unwrap_or_else(|| RegistryDocument {
+        schema_version: 1,
         registry_id: uuid::Uuid::new_v4().simple().to_string(),
         revision: 0,
         adapters: std::collections::BTreeMap::new(),
+        installations: std::collections::BTreeMap::new(),
     });
     if document.adapters.contains_key(manifest.adapter_id()) {
         return Err(refusal("registry", "adapter already registered"));
@@ -901,6 +1100,9 @@ impl Drop for OwnedTemporary {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CommitBoundary {
+    BeforeLegacyRootCreation,
+    AfterLegacyRootCreation,
+    AfterLifecycleCommit,
     BeforeLegacyLock,
     BeforePreparation,
     BeforeNoChange,
@@ -924,6 +1126,244 @@ fn storage_boundary(point: CommitBoundary) -> Result<(), RegistryFailure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lifecycle_refresh_refuses_identical_byte_directory_and_file_replacement() {
+        for initially_absent in [false, true] {
+            for component in ["root", "adapters", "catalog"] {
+                let home = tempfile::tempdir().unwrap();
+                let root = home.path().join("state");
+                let contract = HostContract::load().unwrap();
+                let registry = AdapterRegistry::new(root.clone(), contract.clone());
+                if !initially_absent {
+                    registry
+                        .register(
+                            fixture(&contract, "first"),
+                            registry.read().unwrap().stamp(),
+                        )
+                        .unwrap();
+                }
+                let snapshot = registry.read().unwrap();
+                let candidate = registration_candidate(
+                    snapshot.document().cloned(),
+                    fixture(&contract, "next"),
+                )
+                .unwrap();
+                let expected = candidate.encode(&contract).unwrap();
+                let changed_root = root.clone();
+                let moved = home.path().join("retained-original");
+                let retained = moved.clone();
+                ACTION.with(|pending| {
+                    *pending.borrow_mut() = Some((
+                        CommitBoundary::AfterLifecycleCommit,
+                        Box::new(move || {
+                            let catalog = changed_root.join("host-adapters/registry.json");
+                            let raw = fs::read(&catalog).unwrap();
+                            let source = match component {
+                                "root" => changed_root.clone(),
+                                "adapters" => changed_root.join("host-adapters"),
+                                _ => catalog.clone(),
+                            };
+                            fs::rename(&source, &moved).unwrap();
+                            if component == "root" {
+                                fs::create_dir(&changed_root).unwrap();
+                                fs::set_permissions(
+                                    &changed_root,
+                                    fs::Permissions::from_mode(0o700),
+                                )
+                                .unwrap();
+                            }
+                            if component != "catalog" {
+                                fs::create_dir(changed_root.join("host-adapters")).unwrap();
+                                fs::set_permissions(
+                                    changed_root.join("host-adapters"),
+                                    fs::Permissions::from_mode(0o700),
+                                )
+                                .unwrap();
+                            }
+                            fs::write(&catalog, raw).unwrap();
+                            fs::set_permissions(&catalog, fs::Permissions::from_mode(0o600))
+                                .unwrap();
+                            fs::write(changed_root.join("foreign"), b"retain replacement").unwrap();
+                        }),
+                    ))
+                });
+                let mut transaction = registry.begin_lifecycle(snapshot.stamp(), true).unwrap();
+                assert_eq!(
+                    transaction.commit(&candidate).unwrap_err().effect,
+                    RegistryEffect::EffectUnconfirmed
+                );
+                assert_eq!(
+                    fs::read(root.join("host-adapters/registry.json")).unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    fs::read(root.join("foreign")).unwrap(),
+                    b"retain replacement"
+                );
+                assert!(retained.exists());
+                assert!(transaction.commit(&candidate).is_err());
+                assert_eq!(
+                    fs::read(root.join("host-adapters/registry.json")).unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_wrapper_qualifies_target_drift_after_owned_root_creation() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("state");
+        let target = home.path().join("settings.json");
+        fs::write(&target, b"{}").unwrap();
+        let changed = target.clone();
+        ACTION.with(|pending| {
+            *pending.borrow_mut() = Some((
+                CommitBoundary::AfterLegacyRootCreation,
+                Box::new(move || fs::write(changed, b"{\"foreign\":true}").unwrap()),
+            ))
+        });
+        let lifecycle = super::super::config_lifecycle::ConfigLifecycle::new(
+            root.clone(),
+            HostContract::load().unwrap(),
+        );
+        let called = std::cell::Cell::new(false);
+        let failure = lifecycle
+            .run_legacy_claude(&target, true, |_| {
+                called.set(true);
+            })
+            .unwrap_err();
+        assert_eq!(failure.effect, RegistryEffect::EffectUnconfirmed);
+        assert!(!called.get());
+        assert!(root.is_dir());
+        assert_eq!(fs::read(&target).unwrap(), b"{\"foreign\":true}");
+        assert!(!root.join("install.json").exists());
+        assert!(!root.join("host-adapters").exists());
+    }
+
+    #[test]
+    fn legacy_root_preparation_advances_only_its_owned_leaf_and_retains_creation_proof() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("state");
+        let registry = AdapterRegistry::new(root.clone(), HostContract::load().unwrap());
+        let snapshot = registry.read().unwrap();
+        let mut transaction = registry.begin_legacy(snapshot.stamp(), true).unwrap();
+        transaction.prepare_legacy_marker_root().unwrap();
+        assert_eq!(fs::metadata(&root).unwrap().mode() & 0o777, 0o700);
+        fs::write(root.join("install.json"), b"owned legacy marker").unwrap();
+        transaction.verify().unwrap();
+        assert!(!root.join("host-adapters").exists());
+        assert_eq!(*registry.read().unwrap().stamp(), *snapshot.stamp());
+        let moved = home.path().join("moved");
+        fs::rename(&root, &moved).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("foreign"), b"keep").unwrap();
+        assert!(transaction.verify().is_err());
+        assert_eq!(fs::read(root.join("foreign")).unwrap(), b"keep");
+        assert_eq!(
+            fs::read(moved.join("install.json")).unwrap(),
+            b"owned legacy marker"
+        );
+    }
+
+    #[test]
+    fn raced_legacy_root_appearance_is_not_adopted_or_deleted() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("state");
+        let registry = AdapterRegistry::new(root.clone(), HostContract::load().unwrap());
+        let snapshot = registry.read().unwrap();
+        let mut transaction = registry.begin_legacy(snapshot.stamp(), true).unwrap();
+        let appeared = root.clone();
+        ACTION.with(|pending| {
+            *pending.borrow_mut() = Some((
+                CommitBoundary::BeforeLegacyRootCreation,
+                Box::new(move || {
+                    fs::create_dir(&appeared).unwrap();
+                    fs::write(appeared.join("foreign"), b"keep").unwrap();
+                }),
+            ))
+        });
+        assert!(transaction.prepare_legacy_marker_root().is_err());
+        assert_eq!(fs::read(root.join("foreign")).unwrap(), b"keep");
+        assert!(!root.join("install.json").exists());
+        assert!(!root.join("host-adapters").exists());
+        assert!(transaction.verify().is_err());
+    }
+
+    #[test]
+    fn legacy_root_preparation_preserves_existing_mode_and_refuses_later_catalog_appearance() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("state");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let registry = AdapterRegistry::new(root.clone(), HostContract::load().unwrap());
+        let snapshot = registry.read().unwrap();
+        let mut transaction = registry.begin_legacy(snapshot.stamp(), true).unwrap();
+        transaction.prepare_legacy_marker_root().unwrap();
+        assert_eq!(fs::metadata(&root).unwrap().mode() & 0o777, 0o755);
+        fs::create_dir(root.join("host-adapters")).unwrap();
+        fs::set_permissions(
+            root.join("host-adapters"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::write(root.join("host-adapters/foreign"), b"keep").unwrap();
+        assert!(transaction.verify().is_err());
+        assert_eq!(
+            fs::read(root.join("host-adapters/foreign")).unwrap(),
+            b"keep"
+        );
+    }
+
+    #[test]
+    fn lifecycle_refresh_refuses_valid_replacement_instead_of_adopting_it() {
+        for increment_revision in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("state");
+            let contract = HostContract::load().unwrap();
+            let registry = AdapterRegistry::new(root.clone(), contract.clone());
+            registry
+                .register(
+                    fixture(&contract, "first"),
+                    registry.read().unwrap().stamp(),
+                )
+                .unwrap();
+            let snapshot = registry.read().unwrap();
+            let mut candidate = snapshot.document().unwrap().clone();
+            candidate.revision += 1;
+            let mut replaced = candidate.clone();
+            if increment_revision {
+                replaced.revision += 1;
+            }
+            replaced.adapters.insert(
+                "foreign".into(),
+                super::super::catalog::RegistryRecord {
+                    manifest: fixture(&contract, "foreign"),
+                    registration_revision: replaced.revision,
+                    trust_revision: 0,
+                    trust: None,
+                },
+            );
+            let replacement = replaced.encode(&contract).unwrap();
+            let path = root.join("host-adapters/registry.json");
+            let later_path = path.clone();
+            let later_bytes = replacement.clone();
+            ACTION.with(|pending| {
+                *pending.borrow_mut() = Some((
+                    CommitBoundary::AfterLifecycleCommit,
+                    Box::new(move || fs::write(later_path, later_bytes).unwrap()),
+                ))
+            });
+            let mut transaction = registry.begin_lifecycle(snapshot.stamp(), false).unwrap();
+            assert_eq!(
+                transaction.commit(&candidate).unwrap_err().effect,
+                RegistryEffect::EffectUnconfirmed
+            );
+            assert_eq!(fs::read(&path).unwrap(), replacement);
+            assert!(transaction.commit(&candidate).is_err());
+            assert_eq!(fs::read(&path).unwrap(), replacement);
+        }
+    }
     use std::cell::{Cell, RefCell};
     use std::os::unix::fs::PermissionsExt;
     thread_local! { static FAILURE: Cell<Option<CommitBoundary>> = const { Cell::new(None) }; }
@@ -1390,9 +1830,11 @@ mod tests {
         let contract = HostContract::load().unwrap();
         let registry = AdapterRegistry::new(root.clone(), contract.clone());
         let mut document = RegistryDocument {
+            schema_version: 1,
             registry_id: "a".repeat(32),
             revision: 64,
             adapters: std::collections::BTreeMap::new(),
+            installations: std::collections::BTreeMap::new(),
         };
         for index in 0..64 {
             let id = format!("adapter_{index:04}");

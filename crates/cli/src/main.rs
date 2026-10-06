@@ -84,6 +84,7 @@
 //!   in v0.0.3 rather than rejected as unknown.
 
 mod adapter_cmd;
+mod adapter_hook;
 mod adapter_probe_signal;
 mod agent;
 mod agents_cmd;
@@ -167,6 +168,7 @@ fn main() {
         ["--help"] | ["-h"] | ["help"] => print_help(),
         ["--version"] | ["-V"] | ["version"] => print_version(),
         ["adapter", ..] => std::process::exit(adapter_cmd::run(&args[1..])),
+        ["adapter-hook", ..] => std::process::exit(adapter_hook::run(&args[1..])),
         ["daemon", "run"] => daemon_cmd::run(),
         ["daemon", "stop"] => std::process::exit(daemon_cmd::stop()),
         ["hook", "user-prompt-submit"] => hook::run(),

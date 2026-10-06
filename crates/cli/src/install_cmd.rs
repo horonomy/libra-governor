@@ -47,7 +47,32 @@ pub fn run() {
         }
     };
 
-    match claude_settings::apply(&settings_path, &binary) {
+    let guarded = (|| {
+        let root = libra_governor_daemon::paths::state_dir().map_err(|_| {
+            libra_governor_daemon::host_runtime::RegistryFailure::new(
+                "lifecycle",
+                "state_unavailable",
+            )
+        })?;
+        let contract = libra_governor_daemon::host_runtime::contract::HostContract::load()?;
+        libra_governor_daemon::host_runtime::config_lifecycle::ConfigLifecycle::new(root, contract)
+            .run_legacy_claude(&settings_path, true, |root| {
+                let applied = claude_settings::apply(&settings_path, &binary);
+                if applied.is_ok() {
+                    write_install_marker_at(&binary, root);
+                }
+                applied
+            })
+    })();
+    let applied = match guarded {
+        Ok(Some(result)) => result,
+        Ok(None) => unreachable!("legacy activation always executes or refuses"),
+        Err(error) => {
+            eprintln!("libra-governor install: legacy configuration refused: {error}");
+            std::process::exit(1);
+        }
+    };
+    match applied {
         Ok(applied) => {
             println!(
                 "libra-governor install: wired into {}",
@@ -63,7 +88,6 @@ pub fn run() {
             if let Some(backup) = &applied.backup_path {
                 println!("  backup written:   {}", backup.display());
             }
-            write_install_marker(&binary);
             println!();
             if applied.statusline_conflict {
                 println!(
@@ -147,6 +171,10 @@ fn write_install_marker(binary: &std::path::Path) {
             return;
         }
     };
+    write_install_marker_at(binary, &state_dir);
+}
+
+fn write_install_marker_at(binary: &std::path::Path, state_dir: &std::path::Path) {
     // Best-effort (HORO-1380 S4b): `None` if hashing fails, written as
     // `null`. Not read back by `doctor`'s stale-runtime check, which
     // always hashes the binary at `binary_path` fresh at diagnostic time
