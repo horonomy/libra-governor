@@ -12,6 +12,7 @@ pub mod contract;
 pub mod extension_authority;
 pub mod features;
 pub mod gateway_authority;
+pub mod host_binding;
 pub mod host_runtime;
 pub mod log;
 pub mod paths;

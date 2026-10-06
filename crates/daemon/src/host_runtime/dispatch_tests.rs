@@ -147,3 +147,89 @@ fn public_probe_final_cancellation_after_candidate_copy_refuses_return() {
         grant_before
     );
 }
+
+#[test]
+fn public_normalize_final_cancellation_after_binding_refuses_entire_batch() {
+    assert_normalize_final_refusal(false);
+}
+
+#[test]
+fn public_normalize_final_expiry_after_binding_refuses_entire_batch() {
+    assert_normalize_final_refusal(true);
+}
+
+fn assert_normalize_final_refusal(expire: bool) {
+    let temp = TempDir::new().unwrap();
+    let contract = HostContract::load().unwrap();
+    let (registry, log, registry_file) = registered_fixture(&temp, &contract);
+    let registry_before = fs::read(&registry_file).unwrap();
+    let grant_before = registry.read().unwrap().document().unwrap().adapters()
+        ["external_probe_fixture"]
+        .trust()
+        .unwrap()
+        .confirmation_digest()
+        .to_owned();
+    let cancellation = Cancellation::default();
+    let hook_called = Rc::new(Cell::new(false));
+    let hook_observation = Rc::clone(&hook_called);
+    let cancellation_from_hook = cancellation.clone();
+    let mut dispatcher = DiagnosticDispatcher::new(
+        AdapterRegistry::new(temp.path().join("state"), contract.clone()),
+        contract,
+    );
+    dispatcher.after_copy = Some(Box::new(move || {
+        hook_observation.set(true);
+        if !expire {
+            cancellation_from_hook.cancel();
+        }
+    }));
+    dispatcher.expire_after_copy = expire;
+    let result = dispatcher.normalize_registered(
+        "external_probe_fixture",
+        DiagnosticSelection {
+            scope: DiagnosticScope::User,
+            configuration: b"{}".to_vec(),
+        },
+        NativeNormalizationInput {
+            host_id: "diagnostic-host".into(),
+            observed_at: "2026-10-06T00:00:00Z".into(),
+            source: serde_json::from_value(json!({
+                "kind":"hook", "native_event_name":"SyntheticAfter"
+            }))
+            .unwrap(),
+            native_payload: b"{}".to_vec(),
+        },
+        &cancellation,
+    );
+    let failure = match result {
+        Ok(_) => panic!("final cancellation must prevent returning any bound candidates"),
+        Err(failure) => failure,
+    };
+    assert!(
+        hook_called.get(),
+        "normalization reached final batch mapping"
+    );
+    assert_eq!(failure.stage, if expire { "context" } else { "execution" });
+    assert_eq!(
+        failure.reason,
+        if expire {
+            "diagnostic context expired"
+        } else {
+            "diagnostic cancelled"
+        }
+    );
+    assert!(failure.execution_attempted);
+    assert_eq!(operation_log(&log), ["handshake", "probe", "normalize"]);
+    assert_eq!(
+        operation_log(&PathBuf::from(format!("{}.starts", log.display()))),
+        ["start", "start", "start"]
+    );
+    assert_eq!(fs::read(&registry_file).unwrap(), registry_before);
+    assert_eq!(
+        registry.read().unwrap().document().unwrap().adapters()["external_probe_fixture"]
+            .trust()
+            .unwrap()
+            .confirmation_digest(),
+        grant_before
+    );
+}

@@ -3,10 +3,9 @@
 //! This is pure local normalization. The returned context is transient product
 //! input; it is never added to canonical lifecycle facts or persisted here.
 
-use std::path::PathBuf;
-
 mod binding;
 pub use binding::HostBindingOutcome;
+use libra_governor_daemon::host_binding::LibraNativeContext;
 use libra_governor_domain::AgentKind;
 use libra_governor_protocol::{
     validate_host_event, validate_host_json, HostBindingFailure, HostBindingReason,
@@ -31,15 +30,6 @@ pub struct BuiltinHostContext {
     pub host_version: Option<String>,
     pub scope: HostEventScope,
     pub snapshot: ValidatedHostCapabilitySnapshot,
-}
-
-/// Product-local context correlated to one native input; never part of the
-/// shared canonical lifecycle schema.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum LibraNativeContext {
-    PromptAdmission { task_hint: String, cwd: PathBuf },
-    Completion { model: Option<String> },
-    None,
 }
 
 #[derive(Debug, Clone)]
