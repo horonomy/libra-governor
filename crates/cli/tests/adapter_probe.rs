@@ -230,11 +230,7 @@ fn probe_is_passive_until_real_cli_trust_then_reports_only_conservative_summary(
             "doctor", ADAPTER_ID, "--probe", "--scope", "project", "--json",
         ],
     );
-    assert!(
-        probe.status.success(),
-        "{}",
-        String::from_utf8_lossy(&probe.stderr)
-    );
+    assert!(probe.status.success(), "{}", output_context(&probe));
     let result = json(&probe);
     assert_eq!(result["operation"], "doctor");
     assert_eq!(result["outcome"], "partial");
@@ -345,11 +341,7 @@ fn trusted_text_probe_does_not_render_candidate_evidence_or_paths() {
     enroll_and_confirm(&fixture);
     let before = fs::read(&fixture.registry).unwrap();
     let probe = adapter_cli(&fixture, &["doctor", ADAPTER_ID, "--probe"]);
-    assert!(
-        probe.status.success(),
-        "{}",
-        String::from_utf8_lossy(&probe.stderr)
-    );
+    assert!(probe.status.success(), "{}", output_context(&probe));
     let stdout = String::from_utf8_lossy(&probe.stdout);
     let stderr = String::from_utf8_lossy(&probe.stderr);
     assert!(stdout.contains("partial"));
@@ -397,7 +389,28 @@ fn cli_sigint_cancels_probe_and_waits_for_fixture_process_group_cleanup() {
     }
     if !marker_path.exists() {
         stop_direct_cli(&mut child);
-        panic!("fixture did not start its bounded handshake process");
+        let stdout = fs::read(&stdout_path).unwrap_or_default();
+        let stderr = fs::read(&stderr_path).unwrap_or_default();
+        let starts = fs::read_to_string(format!("{}.starts", fixture.operation_log.display()))
+            .unwrap_or_default()
+            .lines()
+            .count();
+        // Failure diagnostics must not invoke the normal log-correlation
+        // assertions: a started process may not have parsed its request yet.
+        let operations = fs::read_to_string(&fixture.operation_log).unwrap_or_default();
+        let handshakes = operations
+            .lines()
+            .filter(|line| *line == "handshake")
+            .count();
+        let probes = operations.lines().filter(|line| *line == "probe").count();
+        panic!(
+            "fixture did not announce its handshake PID: recorded_starts={starts} handshakes={handshakes} probes={probes} {}",
+            output_context(&Output {
+                status: child.wait().unwrap(),
+                stdout,
+                stderr,
+            })
+        );
     }
     let fixture_pid_raw = match fs::read_to_string(&marker_path)
         .ok()
