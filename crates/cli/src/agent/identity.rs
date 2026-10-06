@@ -13,8 +13,8 @@
 //! module docs) — "agent_id known, parent_agent_id unavailable" is
 //! preserved exactly rather than guessed.
 
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::Path;
 
 use libra_governor_domain::{
@@ -28,29 +28,84 @@ const HOST_ID_FILE_NAME: &str = "host_id";
 /// one on first use. Never derived from any machine fingerprint.
 pub fn resolve_host_id(state_dir: &Path) -> io::Result<String> {
     let path = state_dir.join(HOST_ID_FILE_NAME);
-    if let Ok(existing) = fs::read_to_string(&path) {
-        let trimmed = existing.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
-        }
+    if let Some(existing) = read_host_id(&path)? {
+        return Ok(existing);
     }
 
-    let host_id = uuid::Uuid::new_v4().to_string();
     fs::create_dir_all(state_dir)?;
-    fs::write(&path, &host_id)?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    // Publish only after the complete, private file has been written. A
+    // hard link makes creation atomic and refuses to replace a concurrent
+    // winner, unlike writing directly to `host_id`.
+    let (temporary_path, mut temporary_file) = create_host_id_temporary(state_dir)?;
+    let _temporary_file = RemoveFileOnDrop(temporary_path.clone());
+    let host_id = uuid::Uuid::new_v4().to_string();
+    temporary_file.write_all(host_id.as_bytes())?;
+    temporary_file.sync_all()?;
+    drop(temporary_file);
+
+    match fs::hard_link(&temporary_path, &path) {
+        Ok(()) => Ok(host_id),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => read_host_id(&path)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "host_id disappeared while another process was publishing it",
+                )
+            }),
+        Err(error) => Err(error),
     }
-
-    Ok(host_id)
 }
 
-/// Builds the [`ExecutionIdentity`] for one hook event. `agent_id` and
-/// `turn_id` are whatever the normalized event carried (Codex-only
-/// today, see `agent::payload`); lineage is always `Unknown`.
+fn read_host_id(path: &Path) -> io::Result<Option<String>> {
+    let existing = match fs::read_to_string(path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let trimmed = existing.trim();
+    if trimmed.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "existing host_id file is empty",
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+fn create_host_id_temporary(state_dir: &Path) -> io::Result<(std::path::PathBuf, fs::File)> {
+    for _ in 0..10 {
+        let path = state_dir.join(format!(".{HOST_ID_FILE_NAME}.{}.tmp", uuid::Uuid::new_v4()));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique temporary host_id file",
+    ))
+}
+
+struct RemoveFileOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveFileOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Builds the [`ExecutionIdentity`] for one hook event. Optional host
+/// IDs are preserved exactly as supplied (see `agent::payload`);
+/// lineage is always `Unknown`.
 pub fn capture(
     host_id: &str,
     agent: AgentKind,
@@ -84,6 +139,49 @@ mod tests {
         let second = resolve_host_id(dir.path()).unwrap();
         assert_eq!(first, second);
         assert!(!first.is_empty());
+    }
+
+    #[test]
+    fn concurrent_first_resolution_returns_the_atomically_persisted_id() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().to_path_buf();
+        let barrier = Arc::new(Barrier::new(24));
+        let callers: Vec<_> = (0..24)
+            .map(|_| {
+                let state_dir = state_dir.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    resolve_host_id(&state_dir).unwrap()
+                })
+            })
+            .collect();
+
+        let ids: Vec<_> = callers
+            .into_iter()
+            .map(|caller| caller.join().unwrap())
+            .collect();
+        let persisted = fs::read_to_string(state_dir.join(HOST_ID_FILE_NAME)).unwrap();
+        assert!(ids.iter().all(|id| id == &persisted));
+        assert_eq!(
+            fs::read_dir(&state_dir).unwrap().count(),
+            1,
+            "only the published host_id file should remain"
+        );
+    }
+
+    #[test]
+    fn resolve_host_id_does_not_replace_an_invalid_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(HOST_ID_FILE_NAME);
+        fs::write(&path, "  \n").unwrap();
+
+        let error = resolve_host_id(dir.path()).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read_to_string(path).unwrap(), "  \n");
     }
 
     #[test]

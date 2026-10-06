@@ -18,18 +18,17 @@ pub enum NormalizedEvent {
         session_id: String,
         cwd: PathBuf,
         prompt: String,
-        /// Codex-only today — see `agent::payload`'s module docs
-        /// (HORO-1599).
+        /// Codex documents this on turn-scoped hooks; absent where the
+        /// host does not supply it (see `agent::payload`).
         turn_id: Option<String>,
-        /// Codex-only today — see `agent::payload`'s module docs
-        /// (HORO-1599).
+        /// Optional in subagent contexts for both documented hosts.
         agent_id: Option<String>,
     },
     /// `PostToolUse`.
     ToolCompleted {
         session_id: String,
         tool_name: String,
-        /// Native call ID where the host exposes one (Codex `tool_use_id`).
+        /// Native call ID where the host exposes one (`tool_use_id`).
         native_call_id: Option<String>,
         turn_id: Option<String>,
         agent_id: Option<String>,
@@ -40,8 +39,8 @@ pub enum NormalizedEvent {
         model: Option<String>,
         turn_id: Option<String>,
         agent_id: Option<String>,
-        /// Claude-Code-only today — the host's own transcript for this
-        /// session, relayed to the daemon so a receipt can record
+        /// The host's own transcript for this session, relayed to the
+        /// daemon so a receipt can record
         /// measured token usage (HORO-1725). Never opened by this crate.
         transcript_path: Option<PathBuf>,
     },
