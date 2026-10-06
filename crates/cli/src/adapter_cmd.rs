@@ -9,13 +9,13 @@ use libra_governor_daemon::host_runtime::config_lifecycle::{ConfigLifecycle, Loc
 use libra_governor_daemon::host_runtime::config_profile::ConfigIntent;
 use libra_governor_daemon::host_runtime::contract::{HostContract, ValidatedManifest};
 use libra_governor_daemon::host_runtime::dispatch::{
-    Cancellation, DiagnosticDispatcher, DiagnosticScope, DiagnosticSelection,
+    Cancellation, DiagnosticDispatcher, DiagnosticFailure, DiagnosticScope, DiagnosticSelection,
 };
 use libra_governor_daemon::host_runtime::state::{AdapterRegistry, RegistrySnapshot};
 use libra_governor_daemon::host_runtime::{RegistryEffect, RegistryFailure};
 use serde_json::{json, Map, Value};
 
-const HELP: &str = "Usage:\n  libra-governor adapter list [--json]\n  libra-governor adapter inspect <id> [--review-code-trust] [--json]\n  libra-governor adapter capabilities <id> [--json]\n  libra-governor adapter status [id] [--json]\n  libra-governor adapter doctor [id] [--json]\n  libra-governor adapter doctor <id> --probe [--scope user|project] [--json]\n  libra-governor adapter explain <id> [--json]\n  libra-governor adapter register <manifest-path> [--confirm-code-digest <sha256:...>] [--dry-run] [--json]\n  libra-governor adapter unregister <id> [--dry-run] [--json]\n  libra-governor adapter install|uninstall|enable|disable <id> --profile <name> [--scope user|project] [--dry-run] [--json]\n\nRegistry metadata is passive. Code-trust review hashes declared files but does not execute them. `adapter doctor <id> --probe` executes explicitly trusted external code with ambient authority; the probe itself grants no host capability or native persistent-statusline support.";
+const HELP: &str = "Usage:\n  libra-governor adapter list [--json]\n  libra-governor adapter inspect <id> [--review-code-trust] [--json]\n  libra-governor adapter capabilities <id> [--json]\n  libra-governor adapter status [id] [--json]\n  libra-governor adapter doctor [id] [--json]\n  libra-governor adapter doctor <id> --probe [--scope user|project] [--json]\n  libra-governor adapter explain <id> [--json]\n  libra-governor adapter register <manifest-path> [--confirm-code-digest <sha256:...>] [--dry-run] [--json]\n  libra-governor adapter unregister <id> [--dry-run] [--json]\n  libra-governor adapter install|uninstall|enable|disable <id> --profile <name> [--scope user|project] [--dry-run] [--json]\n\nExplicit `adapter plan <registered-planner-id> --profile libra.claude-hooks.v1 --intent enable|disable|uninstall [--scope user] [--dry-run] [--json]` previews an existing builtin installation with no product apply. Ordinary planning executes trusted code with ambient authority; dry-run starts no child.\n\nRegistry metadata is passive. Code-trust review hashes declared files but does not execute them. `adapter doctor <id> --probe` executes explicitly trusted external code with ambient authority; the probe itself grants no host capability or native persistent-statusline support.";
 
 #[derive(Clone, Copy, Debug)]
 enum ProbeScope {
@@ -35,6 +35,7 @@ struct Command {
     probe: bool,
     scope: Option<ProbeScope>,
     profile: Option<String>,
+    intent: Option<ConfigIntent>,
     unavailable: bool,
 }
 
@@ -71,6 +72,7 @@ fn parse(args: &[String]) -> Result<Command, (&'static str, bool)> {
         "uninstall" => "uninstall",
         "enable" => "enable",
         "disable" => "disable",
+        "plan" => "plan",
         _ => return Err(("list", args.iter().any(|arg| arg == "--json"))),
     };
     let unavailable = matches!(operation, "install" | "uninstall" | "enable" | "disable");
@@ -85,6 +87,7 @@ fn parse(args: &[String]) -> Result<Command, (&'static str, bool)> {
         probe: false,
         scope: None,
         profile: None,
+        intent: None,
         unavailable,
     };
     let mut index = 1;
@@ -114,7 +117,7 @@ fn parse(args: &[String]) -> Result<Command, (&'static str, bool)> {
         if unavailable
             || matches!(
                 operation,
-                "unregister" | "inspect" | "capabilities" | "explain"
+                "unregister" | "inspect" | "capabilities" | "explain" | "plan"
             )
         {
             command.id = Some(value.clone());
@@ -129,7 +132,7 @@ fn parse(args: &[String]) -> Result<Command, (&'static str, bool)> {
             "--json" if !command.json => command.json = true,
             "--dry-run"
                 if !command.dry_run
-                    && (matches!(operation, "register" | "unregister") || unavailable) =>
+                    && (matches!(operation, "register" | "unregister" | "plan") || unavailable) =>
             {
                 command.dry_run = true
             }
@@ -146,7 +149,10 @@ fn parse(args: &[String]) -> Result<Command, (&'static str, bool)> {
                 command.confirmation = Some(value.clone());
             }
             "--probe" if operation == "doctor" && !command.probe => command.probe = true,
-            "--scope" if (operation == "doctor" || unavailable) && command.scope.is_none() => {
+            "--scope"
+                if (matches!(operation, "doctor" | "plan") || unavailable)
+                    && command.scope.is_none() =>
+            {
                 index += 1;
                 command.scope = match args.get(index).map(String::as_str) {
                     Some("user") => Some(ProbeScope::User),
@@ -154,7 +160,7 @@ fn parse(args: &[String]) -> Result<Command, (&'static str, bool)> {
                     _ => return Err((operation, args.iter().any(|arg| arg == "--json"))),
                 };
             }
-            "--profile" if unavailable && command.profile.is_none() => {
+            "--profile" if (unavailable || operation == "plan") && command.profile.is_none() => {
                 index += 1;
                 let Some(value) = args
                     .get(index)
@@ -164,15 +170,31 @@ fn parse(args: &[String]) -> Result<Command, (&'static str, bool)> {
                 };
                 command.profile = Some(value.clone());
             }
+            "--intent" if operation == "plan" && command.intent.is_none() => {
+                index += 1;
+                command.intent = match args.get(index).map(String::as_str) {
+                    Some("enable") => Some(ConfigIntent::Enable),
+                    Some("disable") => Some(ConfigIntent::Disable),
+                    Some("uninstall") => Some(ConfigIntent::Uninstall),
+                    _ => return Err((operation, args.iter().any(|arg| arg == "--json"))),
+                };
+            }
             _ => return Err((operation, args.iter().any(|arg| arg == "--json"))),
         }
         index += 1;
     }
-    if command.scope.is_some() && !command.probe && !unavailable {
+    if command.scope.is_some() && !command.probe && !unavailable && operation != "plan" {
         return Err((operation, command.json));
     }
     if command.probe
         && (operation != "doctor" || command.id.as_deref().is_none_or(|id| !valid_id(id)))
+    {
+        return Err((operation, command.json));
+    }
+    if operation == "plan"
+        && (command.intent.is_none()
+            || command.profile.is_none()
+            || command.id.as_deref().is_none_or(|id| !valid_id(id)))
     {
         return Err((operation, command.json));
     }
@@ -208,6 +230,9 @@ fn execute(command: Command) -> i32 {
     let registry = AdapterRegistry::new(root.clone(), contract.clone());
     if command.probe {
         return execute_probe(&command, &contract, registry);
+    }
+    if command.operation == "plan" {
+        return execute_plan(&command, &contract, root);
     }
     let result = if matches!(
         command.operation,
@@ -420,6 +445,116 @@ fn execute_probe(command: &Command, contract: &HostContract, registry: AdapterRe
                     "timeout_phase": timeout_phase(failure.stage, failure.reason)}),
                 "failed",
                 status,
+            )
+        }
+    }
+}
+
+fn execute_plan(command: &Command, contract: &HostContract, root: PathBuf) -> i32 {
+    let mut signals = match crate::adapter_probe_signal::ProbeSignals::install() {
+        Ok(signals) => signals,
+        Err(()) => {
+            return emit(
+                contract,
+                command,
+                "refused",
+                "signal_setup_refused",
+                json!({"execution_attempted":false,"filesystem_effect":"unchanged"}),
+                "failed",
+                2,
+            )
+        }
+    };
+    let cancellation = signals.cancellation();
+    let mut result = (|| {
+        let selection = LocalInstallation {
+            scope: scope_name(command.scope.unwrap_or(ProbeScope::User)).into(),
+            profile: command.profile.clone().unwrap(),
+            target: crate::claude_settings::settings_path().map_err(|_| DiagnosticFailure {
+                stage: "profile",
+                reason: "configuration_locator_unavailable",
+                execution_attempted: false,
+            })?,
+            binary: std::env::current_exe().map_err(|_| DiagnosticFailure {
+                stage: "profile",
+                reason: "consumer_unavailable",
+                execution_attempted: false,
+            })?,
+        };
+        ConfigLifecycle::new(root, contract.clone()).preview_registered_plan(
+            command.id.as_deref().unwrap(),
+            &selection,
+            command.intent.unwrap(),
+            command.dry_run,
+            &cancellation,
+        )
+    })();
+    let attempted = result
+        .as_ref()
+        .map(|preview| preview.execution_attempted)
+        .unwrap_or_else(|failure| failure.execution_attempted);
+    match signals.restore() {
+        Ok(true) => {
+            result = Err(DiagnosticFailure {
+                stage: "execution",
+                reason: "diagnostic cancelled",
+                execution_attempted: attempted,
+            })
+        }
+        Ok(false) => {}
+        Err(()) => {
+            return emit(
+                contract,
+                command,
+                "failed",
+                "signal_restore_failed",
+                json!({"execution_attempted":attempted,"filesystem_effect":if attempted {"not_asserted"} else {"unchanged"}}),
+                "failed",
+                2,
+            )
+        }
+    }
+    match result {
+        Ok(preview) => {
+            let reason = if command.dry_run {
+                "external_plan_required"
+            } else {
+                "plan_validated"
+            };
+            emit(
+                contract,
+                command,
+                "partial",
+                reason,
+                serde_json::to_value(preview).unwrap(),
+                "unverified",
+                0,
+            )
+        }
+        Err(failure) => {
+            let reason = match failure.stage {
+                "execution" => "plan_execution_failed",
+                "profile" => "plan_profile_refused",
+                "selection" if failure.reason == "unknown adapter" => "unknown_adapter",
+                _ => match diagnostic_reason(failure.stage, failure.reason) {
+                    "probe_refused" => "plan_refused",
+                    reason => reason,
+                },
+            };
+            emit(
+                contract,
+                command,
+                if failure.execution_attempted {
+                    "failed"
+                } else {
+                    "refused"
+                },
+                reason,
+                json!({"execution_attempted":failure.execution_attempted,"filesystem_effect":if failure.execution_attempted {"not_asserted"} else {"unchanged"},
+                    "configuration_effect":"not_applied","apply_available":false,
+                    "execution_failure":execution_failure_category(failure.stage,failure.reason),"timeout_phase":timeout_phase(failure.stage,failure.reason)}),
+                "failed",
+                if failure.execution_attempted { 2 } else { 1 },
             )
         }
     }
@@ -734,6 +869,7 @@ fn emit_early(
         scope: None,
         unavailable: false,
         profile: None,
+        intent: None,
     };
     emit(
         &contract,
@@ -934,6 +1070,7 @@ fn operation_for_schema(operation: &str) -> &'static str {
         "status" => "status",
         "doctor" => "doctor",
         "explain" => "explain",
+        "plan" => "plan",
         _ => "list",
     }
 }

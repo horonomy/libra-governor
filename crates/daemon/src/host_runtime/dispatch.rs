@@ -153,6 +153,12 @@ struct Context {
     expires: Instant,
 }
 
+pub(super) struct PreparedConfigPlan {
+    context: Context,
+    handshake: Value,
+    request: Value,
+}
+
 struct WorkingDirectory {
     locator: PathBuf,
     canonical: PathBuf,
@@ -484,20 +490,140 @@ impl DiagnosticDispatcher {
             .map_err(|_| mark_attempted(fail("protocol", "response correlation refused")))
     }
 
+    fn accept_handshake(
+        &self,
+        context: &Context,
+        request: Value,
+        cancellation: &Cancellation,
+    ) -> Result<(), DiagnosticFailure> {
+        let hello = self.invoke(context, request, cancellation)?;
+        if hello.get("error").is_some() || hello["selected_version"].as_f64() != Some(1.0) {
+            return Err(attempted(fail("protocol", "handshake refused")));
+        }
+        Ok(())
+    }
+
+    pub(super) fn prepare_config_plan(
+        &self,
+        id: &str,
+        selection: DiagnosticSelection,
+        provider: &str,
+        profile: &str,
+        validator_ref: Value,
+        request: Value,
+    ) -> Result<PreparedConfigPlan, DiagnosticFailure> {
+        if !matches!(selection.scope, DiagnosticScope::User) {
+            return Err(fail("selection", "planning scope refused"));
+        }
+        let mut context = self.prepare(id, selection)?;
+        if context.provider != provider
+            || !context.manifest.value()["roles"]
+                .as_array()
+                .is_some_and(|roles| roles.iter().any(|role| role == "ConfigDriver"))
+        {
+            return Err(fail("selection", "planning role or provider refused"));
+        }
+        context.wire_context = json!({"scope":"host","profile":profile});
+        let handshake = json!({"protocol":"horonom.host-adapter", "offered_versions":[1], "request_id":Uuid::new_v4().to_string(), "operation":"handshake"});
+        let request = json!({"protocol":"horonom.host-adapter","protocol_version":1,"host_contract_version":1,"request_id":Uuid::new_v4().to_string(),"operation":"plan_config","input":{"product_id":"libra-governor","validator_ref":validator_ref,"context":context.wire_context,"request":request},"configuration":context.configuration});
+        let limit = request_limit(&context.manifest)?;
+        // Both requests are entirely known before execution. Refuse oversized
+        // planning input before even the handshake may run.
+        for value in [&handshake, &request] {
+            let bytes = serde_json::to_vec(value)
+                .map_err(|_| fail("protocol", "request encoding failed"))?;
+            if bytes.len() > limit {
+                return Err(fail("execution", "request limit exceeded"));
+            }
+            self.contract
+                .validate_request(&bytes)
+                .map_err(|_| fail("protocol", "request refused"))?;
+        }
+        self.recheck(&context)?;
+        Ok(PreparedConfigPlan {
+            context,
+            handshake,
+            request,
+        })
+    }
+
+    pub(super) fn check_config_plan(
+        &self,
+        prepared: &PreparedConfigPlan,
+        cancellation: &Cancellation,
+    ) -> Result<(), DiagnosticFailure> {
+        self.finish_config_plan(prepared, cancellation)?;
+        self.recheck(&prepared.context)
+    }
+
+    pub(super) fn finish_config_plan(
+        &self,
+        prepared: &PreparedConfigPlan,
+        cancellation: &Cancellation,
+    ) -> Result<(), DiagnosticFailure> {
+        if cancellation.cancelled() {
+            return Err(fail("execution", "diagnostic cancelled"));
+        }
+        if Instant::now() >= prepared.context.expires {
+            return Err(fail("context", "diagnostic context expired"));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn expire_config_plan_for_test(
+        &self,
+        mut prepared: PreparedConfigPlan,
+    ) -> PreparedConfigPlan {
+        prepared.context.expires = Instant::now().min(prepared.context.expires);
+        prepared
+    }
+
+    pub(super) fn plan_config_registered(
+        &self,
+        prepared: &PreparedConfigPlan,
+        cancellation: &Cancellation,
+        check_local: impl Fn() -> Result<(), DiagnosticFailure>,
+    ) -> Result<Value, DiagnosticFailure> {
+        self.check_config_plan(prepared, cancellation)?;
+        check_local()?;
+        self.accept_handshake(&prepared.context, prepared.handshake.clone(), cancellation)?;
+        check_local().map_err(attempted)?;
+        self.check_config_plan(prepared, cancellation)
+            .map_err(attempted)?;
+        check_local().map_err(attempted)?;
+        let response = self
+            .invoke(&prepared.context, prepared.request.clone(), cancellation)
+            .map_err(attempted)?;
+        let result = &response["result"];
+        let reference = &prepared.request["input"]["validator_ref"];
+        if response.get("error").is_some()
+            || result["product_id"] != prepared.request["input"]["product_id"]
+            || result["validator_ref"]["id"] != reference["id"]
+            || result["validator_ref"]["digest"] != reference["digest"]
+            || result["validator_ref"]["version"].as_f64() != reference["version"].as_f64()
+        {
+            return Err(attempted(fail(
+                "profile",
+                "planner result identity refused",
+            )));
+        }
+        check_local().map_err(attempted)?;
+        self.check_config_plan(prepared, cancellation)
+            .map_err(attempted)?;
+        check_local().map_err(attempted)?;
+        self.finish_config_plan(prepared, cancellation)
+            .map_err(attempted)?;
+        Ok(result["plan"].clone())
+    }
+
     fn probe_candidate(
         &self,
         context: &Context,
         cancellation: &Cancellation,
     ) -> Result<Value, DiagnosticFailure> {
         let handshake = json!({"protocol":"horonom.host-adapter", "offered_versions":[1], "request_id":Uuid::new_v4().to_string(), "operation":"handshake"});
-        let hello = self.invoke(context, handshake, cancellation)?;
-        if hello.get("error").is_some() || hello["selected_version"].as_f64() != Some(1.0) {
-            return Err(DiagnosticFailure {
-                stage: "protocol",
-                reason: "handshake refused",
-                execution_attempted: true,
-            });
-        }
+        self.accept_handshake(context, handshake, cancellation)?;
         let request = json!({"protocol":"horonom.host-adapter", "protocol_version":1, "host_contract_version":1, "request_id":Uuid::new_v4().to_string(), "operation":"probe", "input":{"context":context.wire_context}, "configuration":context.configuration});
         let response = self
             .invoke(context, request, cancellation)

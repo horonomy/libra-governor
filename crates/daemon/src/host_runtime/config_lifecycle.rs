@@ -18,6 +18,9 @@ use super::config_record::{
 };
 use super::config_settings::{self, CallbackPresence, OwnedCallback};
 use super::contract::HostContract;
+use super::dispatch::{
+    Cancellation, DiagnosticDispatcher, DiagnosticFailure, DiagnosticScope, DiagnosticSelection,
+};
 use super::identity::product_executable_digest;
 use super::state::{AdapterRegistry, LifecycleTransaction};
 use super::{RegistryEffect, RegistryFailure};
@@ -41,6 +44,7 @@ enum LifecycleBoundary {
     AfterConnectionIntent,
     AfterTargetReplacement,
     BeforeConnectionCompletion,
+    BeforePlanReturn,
 }
 
 fn lifecycle_boundary(point: LifecycleBoundary) -> Result<(), RegistryFailure> {
@@ -149,6 +153,36 @@ pub struct ConfigLifecycle {
     contract: HostContract,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct ConfigPlanSlotPreview {
+    pub slot: ConfigSlot,
+    pub action: SlotAction,
+}
+
+/// A redacted observation, never an apply token or installation authority.
+#[derive(Clone, Debug, Serialize)]
+pub struct ConfigPlanPreview {
+    pub profile: &'static str,
+    pub consumer_adapter_id: &'static str,
+    pub planned_intent: ConfigIntent,
+    pub plan_validation: &'static str,
+    pub configuration_effect: &'static str,
+    pub configuration_change_required: Option<bool>,
+    pub apply_available: bool,
+    pub execution_attempted: bool,
+    pub filesystem_effect: &'static str,
+    pub native_verification: &'static str,
+    pub slots: Vec<ConfigPlanSlotPreview>,
+}
+
+fn preview_failure(failure: RegistryFailure) -> DiagnosticFailure {
+    DiagnosticFailure {
+        stage: "profile",
+        reason: failure.reason,
+        execution_attempted: false,
+    }
+}
+
 impl ConfigLifecycle {
     /// Construction is passive and does not initialize any state or lock.
     pub fn new(state_root: PathBuf, contract: HostContract) -> Self {
@@ -156,6 +190,166 @@ impl ConfigLifecycle {
             registry: AdapterRegistry::new(state_root, contract.clone()),
             contract,
         }
+    }
+
+    /// Execute an explicitly trusted planner only for a validated preview of
+    /// the existing consumer. Trusted code retains ambient authority.
+    pub fn preview_registered_plan(
+        &self,
+        planner_id: &str,
+        selection: &LocalInstallation,
+        intent: ConfigIntent,
+        dry_run: bool,
+        cancellation: &Cancellation,
+    ) -> Result<ConfigPlanPreview, DiagnosticFailure> {
+        let local = || -> Result<_, RegistryFailure> {
+            if intent == ConfigIntent::Install {
+                return Err(fail("unsupported_planning_intent"));
+            }
+            let context = self.context("claude_code", selection)?;
+            let witness = self.registry.observe_passively()?;
+            let snapshot = witness.snapshot();
+            let document = snapshot
+                .document()
+                .ok_or_else(|| fail("installation_unavailable"))?;
+            let (binding, record) = document
+                .installations
+                .iter()
+                .next()
+                .ok_or_else(|| fail("installation_unavailable"))?;
+            if !record.installed || record.context != context {
+                return Err(fail("installation_context_changed"));
+            }
+            if record.pending.is_some() {
+                return Err(fail("pending_operation"));
+            }
+            if intent == ConfigIntent::Uninstall && record.desired_enabled {
+                return Err(fail("disable_required"));
+            }
+            verify_package(record, &selection.binary)?;
+            let artifact = verify_artifact(document, binding, record)?;
+            let target = FileObservation::capture(&selection.target, false)?;
+            let owned = observe_owned(binding, record, &target)?;
+            if owned != record.desired_enabled {
+                return Err(fail("connection_changed"));
+            }
+            let request = connection_request(document, binding, record, intent, &target, owned)?;
+            let value = super::config_bundle::validate_request_value(&request)?;
+            Ok((witness, snapshot, artifact, target, request, value))
+        };
+        let (witness, snapshot, artifact, target, request, request_value) =
+            local().map_err(preview_failure)?;
+        let document = snapshot.document().unwrap();
+        let (binding, record) = document.installations.iter().next().unwrap();
+        let check = || -> Result<(), DiagnosticFailure> {
+            (|| {
+                witness.check()?;
+                verify_package(record, &selection.binary)?;
+                artifact.check()?;
+                target.check()?;
+                witness.check()?;
+                artifact.check()?;
+                target.check()
+            })()
+            .map_err(preview_failure)
+        };
+        let dispatcher = DiagnosticDispatcher::new(
+            AdapterRegistry::new(
+                self.registry.root().map_err(preview_failure)?.to_path_buf(),
+                self.contract.clone(),
+            ),
+            self.contract.clone(),
+        );
+        let prepared = dispatcher.prepare_config_plan(
+            planner_id,
+            DiagnosticSelection {
+                scope: DiagnosticScope::User,
+                configuration: b"{}".to_vec(),
+            },
+            "claude_code",
+            CLAUDE_PROFILE,
+            serde_json::to_value(super::config_bundle::validator_ref())
+                .map_err(|_| preview_failure(fail("validator_ref_encoding_refused")))?,
+            request_value,
+        )?;
+        dispatcher.check_config_plan(&prepared, cancellation)?;
+        check()?;
+        if dry_run {
+            let preview = ConfigPlanPreview {
+                profile: CLAUDE_PROFILE,
+                consumer_adapter_id: "claude_code",
+                planned_intent: intent,
+                plan_validation: "external_plan_required",
+                configuration_effect: "not_applied",
+                configuration_change_required: None,
+                apply_available: false,
+                execution_attempted: false,
+                filesystem_effect: "unchanged",
+                native_verification: "unverified",
+                slots: Vec::new(),
+            };
+            lifecycle_boundary(LifecycleBoundary::BeforePlanReturn).map_err(preview_failure)?;
+            #[cfg(test)]
+            let prepared = if tests::EXPIRE_PLAN.with(|flag| flag.get()) {
+                dispatcher.expire_config_plan_for_test(prepared)
+            } else {
+                prepared
+            };
+            dispatcher.finish_config_plan(&prepared, cancellation)?;
+            return Ok(preview);
+        }
+        let candidate = dispatcher.plan_config_registered(&prepared, cancellation, check)?;
+        let attempted = |mut error: DiagnosticFailure| {
+            error.execution_attempted = true;
+            error
+        };
+        let plan = super::config_bundle::validate_external_plan(&request, &candidate)
+            .map_err(preview_failure)
+            .map_err(attempted)?;
+        // Consume the returned, independently validated plan through the same
+        // renderer as builtin mutations, without invoking its writer.
+        let rendered = render_connection_plan(binding, record, intent, &target, &plan)
+            .map_err(preview_failure)
+            .map_err(attempted)?;
+        let configuration_change_required = rendered.raw.as_deref() != target.raw();
+        let slots = plan
+            .changes()
+            .iter()
+            .map(|change| ConfigPlanSlotPreview {
+                slot: change.slot,
+                action: change.action,
+            })
+            .collect();
+        dispatcher
+            .check_config_plan(&prepared, cancellation)
+            .map_err(attempted)?;
+        check().map_err(attempted)?;
+        let preview = ConfigPlanPreview {
+            profile: CLAUDE_PROFILE,
+            consumer_adapter_id: "claude_code",
+            planned_intent: intent,
+            plan_validation: "validated",
+            configuration_effect: "not_applied",
+            configuration_change_required: Some(configuration_change_required),
+            apply_available: false,
+            execution_attempted: true,
+            filesystem_effect: "not_asserted",
+            native_verification: "unverified",
+            slots,
+        };
+        lifecycle_boundary(LifecycleBoundary::BeforePlanReturn)
+            .map_err(preview_failure)
+            .map_err(attempted)?;
+        #[cfg(test)]
+        let prepared = if tests::EXPIRE_PLAN.with(|flag| flag.get()) {
+            dispatcher.expire_config_plan_for_test(prepared)
+        } else {
+            prepared
+        };
+        dispatcher
+            .finish_config_plan(&prepared, cancellation)
+            .map_err(attempted)?;
+        Ok(preview)
     }
 
     fn context(
@@ -886,6 +1080,19 @@ fn connection_bytes(
     target: &FileObservation,
     owned: bool,
 ) -> Result<PlannedConnection, RegistryFailure> {
+    let request = connection_request(document, binding, record, intent, target, owned)?;
+    let plan = config_profile::build_plan(&request)?;
+    render_connection_plan(binding, record, intent, target, &plan)
+}
+
+fn connection_request(
+    document: &RegistryDocument,
+    binding: &str,
+    record: &InstallationRecord,
+    intent: ConfigIntent,
+    target: &FileObservation,
+    owned: bool,
+) -> Result<ProfileRequest, RegistryFailure> {
     if intent == ConfigIntent::Enable {
         config_settings::ensure_activation_compatible(
             &target.document()?,
@@ -924,7 +1131,17 @@ fn connection_bytes(
             })
             .collect(),
     };
-    let plan = config_profile::build_plan(&request)?;
+    config_profile::build_plan(&request)?;
+    Ok(request)
+}
+
+fn render_connection_plan(
+    binding: &str,
+    record: &InstallationRecord,
+    intent: ConfigIntent,
+    target: &FileObservation,
+    plan: &config_profile::ValidatedConnectionPlan,
+) -> Result<PlannedConnection, RegistryFailure> {
     let old = target.document()?;
     let adds = plan.changes().iter().any(|c| c.action == SlotAction::Add);
     let removes = plan
@@ -1172,6 +1389,7 @@ mod tests {
 
     thread_local! {
         pub(super) static INTERRUPTION: std::cell::Cell<Option<LifecycleBoundary>> = const { std::cell::Cell::new(None) };
+        pub(super) static EXPIRE_PLAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     type BoundaryAction = (LifecycleBoundary, Box<dyn FnOnce()>);
@@ -1216,6 +1434,103 @@ mod tests {
         let lifecycle =
             ConfigLifecycle::new(home.path().join("state"), HostContract::load().unwrap());
         (home, lifecycle, selection)
+    }
+
+    #[test]
+    fn registered_plan_final_boundary_cancellation_and_expiry_prevent_return() {
+        for dry_run in [true, false] {
+            for expire in [true, false] {
+                let (home, lifecycle, selection) = fixture();
+                lifecycle.install("claude_code", &selection, false).unwrap();
+                let script = home.path().join("planner.py");
+                let log = home.path().join("operations.log");
+                let registry_file = home.path().join("state/host-adapters/registry.json");
+                fs::write(
+                    &script,
+                    include_str!("../../tests/fixtures/external_config_driver.py"),
+                )
+                .unwrap();
+                let mut manifest: serde_json::Value = serde_json::from_str(include_str!("../../../protocol/contracts/host-adapter/v1/fixtures/valid-manifest-synthetic.json")).unwrap();
+                manifest["adapter_id"] = serde_json::json!("terminal_plan_fixture");
+                manifest["roles"] = serde_json::json!(["ConfigDriver"]);
+                manifest["host_version_constraints"][0]["provider"] =
+                    serde_json::json!("claude_code");
+                manifest["launch"] = serde_json::json!({"executable":"/usr/bin/python3","argv":[script,registry_file,log,"normal"]});
+                manifest["runtime_files"] = serde_json::json!([
+                    {"path":"/usr/bin/python3","kind":"entrypoint","digest":super::super::config_bundle::sha256(&fs::read("/usr/bin/python3").unwrap())},
+                    {"path":script,"kind":"entrypoint","digest":super::super::config_bundle::sha256(&fs::read(&script).unwrap())}
+                ]);
+                let manifest = lifecycle
+                    .contract
+                    .validate_manifest(&serde_json::to_vec(&manifest).unwrap())
+                    .unwrap();
+                lifecycle
+                    .registry
+                    .register(manifest, lifecycle.registry.read().unwrap().stamp())
+                    .unwrap();
+                let review = lifecycle
+                    .registry
+                    .review_trust("terminal_plan_fixture")
+                    .unwrap();
+                lifecycle
+                    .registry
+                    .confirm_trust(
+                        "terminal_plan_fixture",
+                        review.manifest_digest(),
+                        review.confirmation_digest(),
+                        lifecycle.registry.read().unwrap().stamp(),
+                    )
+                    .unwrap();
+                let before = fs::read(&registry_file).unwrap();
+                let cancellation = Cancellation::default();
+                let stopped = cancellation.clone();
+                let called = std::rc::Rc::new(std::cell::Cell::new(false));
+                let published = called.clone();
+                ACTION.with(|action| {
+                    *action.borrow_mut() = Some((
+                        LifecycleBoundary::BeforePlanReturn,
+                        Box::new(move || {
+                            published.set(true);
+                            if expire {
+                                EXPIRE_PLAN.with(|flag| flag.set(true));
+                            } else {
+                                stopped.cancel();
+                            }
+                        }),
+                    ))
+                });
+                let result = lifecycle.preview_registered_plan(
+                    "terminal_plan_fixture",
+                    &selection,
+                    ConfigIntent::Enable,
+                    dry_run,
+                    &cancellation,
+                );
+                EXPIRE_PLAN.with(|flag| flag.set(false));
+                let failure = result.unwrap_err();
+                assert!(called.get());
+                assert_eq!(failure.stage, if expire { "context" } else { "execution" });
+                assert_eq!(
+                    failure.reason,
+                    if expire {
+                        "diagnostic context expired"
+                    } else {
+                        "diagnostic cancelled"
+                    }
+                );
+                assert_eq!(failure.execution_attempted, !dry_run);
+                assert_eq!(fs::read(&registry_file).unwrap(), before);
+                assert!(!selection.target.exists());
+                if dry_run {
+                    assert!(!log.exists());
+                } else {
+                    assert_eq!(
+                        fs::read_to_string(&log).unwrap(),
+                        "handshake\nplan_config\n"
+                    );
+                }
+            }
+        }
     }
 
     fn installed_record(lifecycle: &ConfigLifecycle) -> (String, InstallationRecord) {
