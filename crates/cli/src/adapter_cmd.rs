@@ -308,24 +308,57 @@ fn dispatch(
     root: &Path,
 ) -> DispatchResult {
     match command.operation {
-        "list" | "status" | "doctor" => {
+        "status" | "doctor" | "explain" => {
+            let inspection =
+                ConfigLifecycle::new(root.to_owned(), contract.clone()).inspect_adapters()?;
+            let snapshot = inspection.snapshot();
+            let selected = command.id.as_deref();
+            if selected.is_some_and(|id| describe(snapshot, id).is_none()) {
+                return Err(RegistryFailure::new("registry", "unknown adapter"));
+            }
+            let local = inspection.local_installations(selected).collect::<Vec<_>>();
+            let mut body = if command.operation == "explain" {
+                let mut value = describe(snapshot, selected.unwrap_or("")).unwrap();
+                let summary = match local.first() {
+                    Some(status) if status.pending_operation.is_some() => {
+                        "installation pending; local integrity and native execution unverified"
+                    }
+                    Some(status) if status.integrity != "verified" => {
+                        "recorded installation intent; local integrity unknown; native execution unverified"
+                    }
+                    Some(status) if status.desired_enabled => {
+                        "local callbacks connected; host trust and native execution unknown"
+                    }
+                    Some(_) => {
+                        "installation disabled; local callbacks disconnected; native execution unverified"
+                    }
+                    None => {
+                        "adapter metadata; not installed locally; native execution unverified"
+                    }
+                };
+                value["summary"] = json!(summary);
+                value
+            } else {
+                render_list(snapshot, selected)
+            };
+            body["local_installations"] = json!(local);
+            body["host_trust"] = json!("unknown");
+            body["observed_execution"] = json!("unknown");
+            body["effective_support"] = json!("unknown");
+            body["native_verification"] = json!("unverified");
+            Ok(("success", "", body, "unverified", 0))
+        }
+        "list" => {
             let snapshot = registry.read()?;
             if let Some(id) = command.id.as_deref() {
                 if describe(&snapshot, id).is_none() {
                     return Err(RegistryFailure::new("registry", "unknown adapter"));
                 }
             }
-            let mut body = render_list(&snapshot, command.id.as_deref());
-            if matches!(command.operation, "status" | "doctor")
-                && command.id.as_deref().is_none_or(|id| id == "claude_code")
-            {
-                let local = ConfigLifecycle::new(root.to_owned(), contract.clone())
-                    .inspect_installation("claude_code")?;
-                body["local_installations"] = json!(local.into_iter().collect::<Vec<_>>());
-            }
+            let body = render_list(&snapshot, command.id.as_deref());
             Ok(("success", "", body, "unverified", 0))
         }
-        "inspect" | "capabilities" | "explain" => {
+        "inspect" | "capabilities" => {
             let snapshot = registry.read()?;
             let id = command.id.as_deref().unwrap_or("");
             if command.operation == "inspect" && command.review {
@@ -336,8 +369,6 @@ fn dispatch(
             };
             let body = if command.operation == "capabilities" {
                 json!({"adapter_id": safe(id), "capabilities": value["capabilities"], "effective_support": "unknown"})
-            } else if command.operation == "explain" {
-                json!({"adapter_id": id, "summary": "passive adapter metadata only", "native_lifecycle": "unavailable", "effective_support": "unknown"})
             } else {
                 value
             };
@@ -739,7 +770,7 @@ fn render_list(snapshot: &RegistrySnapshot, selected: Option<&str>) -> Value {
         .into_iter()
         .filter(|id| selected.is_none_or(|selected| selected == *id))
         .map(|id| {
-            json!({"adapter_id":id,"origin":"builtin","registered":false,"adapter_version":"metadata-only","roles":[],"capabilities":[],"effective_support":"unknown"})
+            json!({"adapter_id":id,"origin":"builtin","registered":false,"adapter_version":"metadata-only","roles":[],"capabilities":[],"effective_support":"unknown","code_trust":"not_applicable","host_trust":"unknown","observed_execution":"unknown"})
         })
         .collect::<Vec<_>>();
     if let Some(document) = snapshot.document() {
@@ -759,7 +790,7 @@ fn render_list(snapshot: &RegistrySnapshot, selected: Option<&str>) -> Value {
 fn describe(snapshot: &RegistrySnapshot, id: &str) -> Option<Value> {
     if builtin_ids().contains(&id) {
         return Some(
-            json!({"adapter_id":id,"origin":"builtin","registered":false,"adapter_version":"metadata-only","roles":[],"capabilities":[],"effective_support":"unknown","native_lifecycle":"unavailable","code_trust":"not_applicable"}),
+            json!({"adapter_id":id,"origin":"builtin","registered":false,"adapter_version":"metadata-only","roles":[],"capabilities":[],"effective_support":"unknown","native_lifecycle":"unavailable","code_trust":"not_applicable","host_trust":"unknown","observed_execution":"unknown"}),
         );
     }
     let document = snapshot.document()?;
@@ -789,7 +820,8 @@ fn manifest_summary(id: &str, manifest: &ValidatedManifest, trusted: bool) -> Va
         "capabilities": capabilities.into_iter().filter_map(|v| v.as_str().map(safe)).collect::<Vec<_>>(),
         "code_trust": if trusted { "recorded" } else { "not_reviewed" },
         "effective_support": "unknown",
-        "native_lifecycle": "unavailable"
+        "native_lifecycle": "unavailable",
+        "host_trust":"unknown","observed_execution":"unknown"
     })
 }
 
