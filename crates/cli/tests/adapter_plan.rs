@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
@@ -326,8 +328,62 @@ fn plan(fixture: &Fixture, id: &str, intent: &str, dry_run: bool) -> Output {
     adapter_cli(fixture, &args)
 }
 
+// Failed execution must stay distinguishable from a candidate that actually
+// reached its discriminating response. Never print raw child or CLI payloads.
+fn plan_failure_context(fixture: &Fixture, output: &Output) -> Value {
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+    let allowed = |value: &Value, choices: &[&str]| {
+        value
+            .as_str()
+            .filter(|value| choices.contains(value))
+            .unwrap_or("other_or_unavailable")
+            .to_owned()
+    };
+    let marker = |suffix: &str| {
+        let path = PathBuf::from(format!("{}{suffix}", fixture.operation_log.display()));
+        match fs::File::open(path) {
+            Ok(file) => {
+                let mut text = String::new();
+                match file.take(4097).read_to_string(&mut text) {
+                    Ok(_) if text.len() <= 4096 => {
+                        let lines = text.lines().collect::<Vec<_>>();
+                        json!({"state":"present","count":lines.len(),
+                            "handshake":lines.iter().filter(|line| **line == "handshake").count(),
+                            "plan_config":lines.iter().filter(|line| **line == "plan_config").count(),
+                            "other":lines.iter().filter(|line| !matches!(**line,"handshake"|"plan_config"|"entry"|"start")).count()})
+                    }
+                    _ => json!({"state":"unreadable_or_oversized"}),
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                json!({"state":"missing","count":0})
+            }
+            Err(_) => json!({"state":"unreadable"}),
+        }
+    };
+    json!({
+        "exit_code":output.status.code(),
+        "signal":output.status.signal(),
+        "stdout_bytes":output.stdout.len(),"stderr_bytes":output.stderr.len(),
+        "envelope_decoded":envelope.is_object(),
+        "outcome":allowed(&envelope["outcome"], &["success","partial","failed","refused"]),
+        "reason":allowed(&envelope["reasons"][0],
+            &["plan_validated","plan_execution_failed","plan_profile_refused","unknown_adapter","plan_refused","registry_unavailable","context_refused","configuration_refused","code_trust_refused","protocol_refused"]),
+        "execution_attempted":envelope["result"]["execution_attempted"].as_bool(),
+        "execution_failure":allowed(&envelope["result"]["execution_failure"],
+            &["timeout","cancelled","input_limit","output_limit","stderr_limit","nonzero_exit","signal_context","owned_execution_failed"]),
+        "timeout_phase":allowed(&envelope["result"]["timeout_phase"],
+            &["not_owned","owned_awaiting_ready","group_ready_awaiting_exec_status","exec_status_closed"]),
+        "entry":marker(".entry"),"start":marker(".starts"),"operation":marker("")
+    })
+}
+
 fn assert_valid_preview(fixture: &Fixture, output: &Output, intent: &str, actions: &[&str]) {
-    assert!(output.status.success(), "validated preview did not succeed");
+    assert!(
+        output.status.success(),
+        "validated preview did not succeed: intent={intent} context={}",
+        plan_failure_context(fixture, output)
+    );
     assert_private_output(fixture, output);
     let envelope = json(output);
     assert_eq!(envelope["operation"], "plan");
@@ -364,14 +420,47 @@ fn assert_valid_preview(fixture: &Fixture, output: &Output, intent: &str, action
     assert_eq!(found, expected);
 }
 
+#[test]
+fn failure_context_redacts_unknown_and_malformed_payloads() {
+    let fixture = make_fixture();
+    for payload in [
+        PRIVATE_CANARY.as_bytes().to_vec(),
+        serde_json::to_vec(&json!({"outcome":PRIVATE_CANARY,
+            "reasons":[PRIVATE_CANARY],"result":{"execution_attempted":true,
+                "execution_failure":PRIVATE_CANARY,"timeout_phase":PRIVATE_CANARY}}))
+        .unwrap(),
+    ] {
+        let output = Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: payload,
+            stderr: PRIVATE_CANARY.as_bytes().to_vec(),
+        };
+        let context = plan_failure_context(&fixture, &output);
+        let text = context.to_string();
+        assert!(!text.contains(PRIVATE_CANARY));
+        assert!(!text.contains(&path_string(&fixture.root)));
+        assert_eq!(context["exit_code"], 1);
+        assert_eq!(context["entry"]["state"], "missing");
+        assert_eq!(context["execution_failure"], "other_or_unavailable");
+        assert_eq!(context["stdout_bytes"], output.stdout.len());
+        assert_eq!(context["stderr_bytes"], output.stderr.len());
+    }
+}
+
 fn assert_attempted_refusal(fixture: &Fixture, output: &Output) {
     assert!(
         !output.status.success(),
-        "invalid external plan unexpectedly succeeded"
+        "invalid external plan unexpectedly succeeded: context={}",
+        plan_failure_context(fixture, output)
     );
     assert_private_output(fixture, output);
     let envelope = json(output);
-    assert_eq!(envelope["result"]["execution_attempted"], true);
+    assert_eq!(
+        envelope["result"]["execution_attempted"],
+        true,
+        "context={}",
+        plan_failure_context(fixture, output)
+    );
     assert_eq!(envelope["result"]["filesystem_effect"], "not_asserted");
     assert_eq!(envelope["verification_state"], "failed");
 }
@@ -603,12 +692,18 @@ fn profile_schema_accepts_mathematical_integer_float_but_rejects_bool_and_bad_ve
         let id = format!("external_config_invalid_version_{index}");
         register_external(&fixture, &id, mode, true);
         let before = inventory(&fixture.root, &fixture.operation_log);
+        let prior_operations = operations(&fixture).len();
         let output = plan(&fixture, &id, "enable", false);
         assert_attempted_refusal(&fixture, &output);
         let expected = operations(&fixture);
+        let delta = expected
+            .get(prior_operations..)
+            .map(|items| items.iter().map(String::as_str).collect::<Vec<_>>());
         assert_eq!(
-            &expected[expected.len() - 2..],
-            &["handshake", "plan_config"]
+            delta.as_deref(),
+            Some(["handshake", "plan_config"].as_slice()),
+            "mode={mode} context={}",
+            plan_failure_context(&fixture, &output)
         );
         assert_eq!(inventory(&fixture.root, &fixture.operation_log), before);
     }
@@ -644,7 +739,12 @@ fn independently_invalid_driver_plans_are_refused_after_correlated_two_call_exch
         let output = plan(&fixture, &id, "enable", false);
         assert_attempted_refusal(&fixture, &output);
         let recorded = operations(&fixture);
-        assert_eq!(recorded.len(), prior_operations.len() + 2);
+        assert_eq!(
+            recorded.len(),
+            prior_operations.len() + 2,
+            "mode={mode} context={}",
+            plan_failure_context(&fixture, &output)
+        );
         assert_eq!(
             &recorded[prior_operations.len()..],
             &["handshake", "plan_config"]
@@ -669,6 +769,7 @@ fn handshake_and_runner_failures_remain_redacted_and_preserve_local_files() {
         let id = format!("external_config_runner_failure_{index}");
         register_external(&fixture, &id, mode, true);
         let before = inventory(&fixture.root, &fixture.operation_log);
+        let prior_operations = operations(&fixture).len();
         let output = plan(&fixture, &id, "enable", false);
         assert!(
             !output.status.success(),
@@ -676,9 +777,30 @@ fn handshake_and_runner_failures_remain_redacted_and_preserve_local_files() {
         );
         assert_private_output(&fixture, &output);
         let recorded = operations(&fixture);
-        assert_eq!(&recorded[recorded.len() - expected.len()..], expected);
+        let delta = recorded
+            .get(prior_operations..)
+            .map(|items| items.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(
+            delta.as_deref(),
+            Some(expected.as_slice()),
+            "mode={mode} context={}",
+            plan_failure_context(&fixture, &output)
+        );
         if expected.len() == 2 {
             assert_attempted_refusal(&fixture, &output);
+            let expected_category = match mode {
+                "timeout" => "timeout",
+                "nonzero" => "nonzero_exit",
+                "stdout_flood" => "output_limit",
+                "stderr_flood" => "stderr_limit",
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                json(&output)["result"]["execution_failure"],
+                expected_category,
+                "mode={mode} context={}",
+                plan_failure_context(&fixture, &output)
+            );
         }
         assert_eq!(inventory(&fixture.root, &fixture.operation_log), before);
     }
