@@ -160,3 +160,7 @@ pub use resource_account::{
 pub use resource_amount::{Headroom, ResourceAmount, ResourceKind};
 pub use task_features::{BucketTier, BuildTopology, TaskFeatures, FEATURE_SCHEMA_VERSION};
 pub use task_identity::{ExternalRef, TaskId, TaskIdentity};
+pub mod execution_association;
+pub use execution_association::{
+    AssociationUnavailable, ExecutionPosition, ExecutionTarget, EXECUTION_ASSOCIATION_VERSION,
+};

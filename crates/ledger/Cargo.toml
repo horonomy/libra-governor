@@ -13,6 +13,7 @@ uuid.workspace = true
 time.workspace = true
 thiserror.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

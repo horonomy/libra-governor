@@ -239,6 +239,11 @@ fn extension_runtime(config: &DaemonConfig) -> &ExtensionRuntime {
         .get_or_init(|| build_extension_runtime(config))
 }
 
+// Secret-command validation must happen outside the owner effect transaction.
+pub(crate) fn prepare_execution_extensions(config: &DaemonConfig) {
+    let _ = extension_runtime(config);
+}
+
 /// The default admission [`Policy`] every task's budget is initialized
 /// from when no per-task policy override exists yet (no such override
 /// surface exists as of HORO-1141 — every task uses this one policy).
@@ -454,7 +459,32 @@ fn dispatch(
     current_task: &mut Option<TaskSummary>,
     config: &DaemonConfig,
 ) -> Response {
+    // Reserved internal routing keys must not be reachable through legacy
+    // native-session mutation requests.
+    let legacy_session = match &request {
+        Request::Preflight { session_id, .. }
+        | Request::ToolInvoked { session_id, .. }
+        | Request::Finalize { session_id, .. } => Some(session_id.as_str()),
+        _ => None,
+    };
+    if legacy_session.is_some_and(|id| id.starts_with("execution-owner-v1:")) {
+        return Response::Error {
+            message: "reserved execution owner scope requires owner protocol".to_owned(),
+        };
+    }
     match request {
+        Request::ExecutionOwner { event } => {
+            match crate::execution_owner::handle(&event, ledger, config) {
+                Ok(outcome) => Response::ExecutionOwner(Box::new(outcome)),
+                Err(e) => {
+                    log::append_line(&config.log_path, &format!("execution owner error: {e}"));
+                    Response::Error {
+                        message: "execution owner storage error; retry the exact native replay key to confirm effect"
+                            .to_owned(),
+                    }
+                }
+            }
+        }
         Request::Preflight {
             task_hint,
             cwd,
@@ -509,6 +539,7 @@ fn dispatch(
                 None => (None, None),
             };
             Response::Status(Box::new(StatusResult {
+                scope: libra_governor_protocol::StatusScope::HostLatestObservation,
                 task_budget,
                 task_budget_amounts,
                 configured_budget: configured_budget(config),
@@ -791,14 +822,20 @@ fn handle_preflight(
     ledger: &mut LedgerStore,
     config: &DaemonConfig,
 ) -> Result<PreflightResult, DaemonError> {
-    let now = time::OffsetDateTime::now_utc();
-
-    // Opportunistic reconciliation (HORO-1141): a long-lived daemon does
-    // this once at startup (see `serve`) too, but re-running it here
-    // means a reservation left dangling by a crashed subagent gets
-    // reclaimed before the very next preflight needs its capacity, not
-    // only after the next daemon restart.
     reconcile_stale_reservations(ledger, config);
+    let recon = recon::run_recon(cwd, task_hint, &config.recon_budget);
+    handle_preflight_prepared(task_hint, cwd, session_id, recon, ledger, config)
+}
+
+pub(crate) fn handle_preflight_prepared(
+    task_hint: &str,
+    cwd: &std::path::Path,
+    session_id: &str,
+    recon: recon::ReconOutput,
+    ledger: &mut LedgerStore,
+    config: &DaemonConfig,
+) -> Result<PreflightResult, DaemonError> {
+    let now = time::OffsetDateTime::now_utc();
 
     let task_id = ledger.resolve_or_create_task_for_session(session_id, now)?;
     let previous_contract = ledger.latest_contract(task_id)?;
@@ -810,7 +847,6 @@ fn handle_preflight(
     // (HORO-1141).
     let previous_plan_id = ledger.in_flight_plan_for_session(session_id)?;
 
-    let recon = recon::run_recon(cwd, task_hint, &config.recon_budget);
     let contract = contract::draft_contract(previous_contract.as_ref(), &recon);
     ledger.insert_contract(task_id, &contract, now)?;
 
@@ -1318,7 +1354,7 @@ fn enqueue_admission_and_approval_events(
 /// this function runs entirely server-side against local SQLite state,
 /// so it does not touch the deliberate PostToolUse latency contract
 /// documented on `libra-governor-cli`'s `hook_post_tool_use` module.
-fn handle_tool_invoked(
+pub(crate) fn handle_tool_invoked(
     session_id: &str,
     tool_name: &str,
     ledger: &mut LedgerStore,
@@ -1711,7 +1747,7 @@ fn handle_tool_invoked(
 /// verification — see crate docs), and persists it. A safe no-op
 /// (`FinalizeOutcome::NoActiveTask`) when `session_id` has no task bound
 /// to it at all (e.g. `Stop` fired with no preceding `Preflight`).
-fn handle_finalize(
+pub(crate) fn handle_finalize(
     session_id: &str,
     model: Option<String>,
     provider: Option<String>,

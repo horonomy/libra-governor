@@ -1138,11 +1138,11 @@ fn enabled_stop_callback_sends_legacy_finalize_to_the_configured_local_socket() 
         std::io::BufReader::new(stream.try_clone().unwrap())
             .read_line(&mut request_line)
             .unwrap();
-        stream
-            .write_all(
-                b"{\"protocol_version\":11,\"response\":{\"kind\":\"finalize\",\"state\":\"no_active_task\"}}\n",
-            )
-            .unwrap();
+        let response = serde_json::json!({
+            "protocol_version": libra_governor_protocol::PROTOCOL_VERSION,
+            "response": { "kind": "finalize", "state": "no_active_task" },
+        });
+        writeln!(stream, "{response}").unwrap();
         serde_json::from_str::<Value>(&request_line).unwrap()
     });
 
@@ -1159,7 +1159,10 @@ fn enabled_stop_callback_sends_legacy_finalize_to_the_configured_local_socket() 
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
-    assert_eq!(envelope["protocol_version"], 11);
+    assert_eq!(
+        envelope["protocol_version"],
+        libra_governor_protocol::PROTOCOL_VERSION
+    );
     let request = &envelope["request"];
     assert_eq!(request.as_object().unwrap().len(), 5);
     assert_eq!(request["kind"], "finalize");

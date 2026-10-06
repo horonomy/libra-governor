@@ -1,3 +1,4 @@
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::path::Path;
 
 use rusqlite::Connection;
@@ -14,6 +15,50 @@ pub struct LedgerStore {
 }
 
 impl LedgerStore {
+    /// Runs `operation` inside one immediate transaction.
+    ///
+    /// Ledger mutations invoked by the callback use savepoints, so their
+    /// normal standalone transaction guarantees remain intact while their
+    /// writes participate in this all-or-nothing boundary.
+    pub fn with_immediate_transaction<T, E>(
+        &mut self,
+        operation: impl FnOnce(&mut LedgerStore) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<LedgerError>,
+    {
+        if !self.conn.is_autocommit() {
+            return Err(LedgerError::Sqlite(rusqlite::Error::InvalidQuery).into());
+        }
+
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(LedgerError::from)
+            .map_err(E::from)?;
+
+        match catch_unwind(AssertUnwindSafe(|| operation(self))) {
+            Ok(Ok(value)) => match self.conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(value),
+                Err(error) => {
+                    if self.conn.execute_batch("ROLLBACK").is_err() {
+                        return Err(LedgerError::TransactionUnconfirmed.into());
+                    }
+                    Err(LedgerError::from(error).into())
+                }
+            },
+            Ok(Err(error)) => {
+                if self.conn.execute_batch("ROLLBACK").is_err() {
+                    return Err(LedgerError::TransactionUnconfirmed.into());
+                }
+                Err(error)
+            }
+            Err(payload) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                resume_unwind(payload)
+            }
+        }
+    }
+
     /// Opens (creating if necessary) the SQLite database at `path`,
     /// applies any pending migrations, and returns a ready-to-use store.
     ///
@@ -124,7 +169,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
     }
 
     #[test]

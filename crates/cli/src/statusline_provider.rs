@@ -45,7 +45,7 @@
 //!    (ADR-0001), and `server.rs`'s `EscalateApprovalNeeded` arm logs, sets
 //!    the state, and returns `Ok(())`; work proceeds. "Awaiting approval"
 //!    invites the reader to go and approve something that does not exist.
-//!    So this provider says `Replans now need approval`: future tense, about
+//!    So this provider says `Latest host replans need approval`: future tense, about
 //!    a rule rather than a queue, naming the decision a user could make
 //!    without implying one is pending.
 //!
@@ -399,7 +399,7 @@ pub fn no_reading(kind: NoReading) -> Value {
 /// legacy line's `stable` said the same thing at more length.
 ///
 /// The escalated state is the one case where the label is not the task.
-/// `Replans now need approval` replaces the id because the host accepts
+/// `Latest host replans need approval` replaces the id because the host accepts
 /// four segments per provider and refuses the fifth, so this segment and
 /// the escalation cannot both exist beside the estimate, the budget and a
 /// policy-drift warning — and when they compete for one label slot the
@@ -423,7 +423,7 @@ fn task_segment(task: Option<&TaskSummary>) -> Value {
         return json!({
             "key": "task",
             "state": "neutral",
-            "label": "No task being governed",
+            "label": "No host task selected",
             "explain_key": "libra.task",
             "order_hint": 10,
             "clear_role": "posture",
@@ -439,7 +439,7 @@ fn task_segment(task: Option<&TaskSummary>) -> Value {
         return json!({
             "key": "task",
             "state": "warn",
-            "label": "Replans now need approval",
+            "label": "Latest host replans need approval",
             "reason_code": "next_replan_needs_human_approval",
             "explain_key": "libra.escalation",
             "order_hint": 10,
@@ -449,7 +449,7 @@ fn task_segment(task: Option<&TaskSummary>) -> Value {
     let mut segment = json!({
         "key": "task",
         "state": "neutral",
-        "label": format!("Task {}", crate::statusline::short_task_id(&task.task_id.to_string())),
+        "label": format!("Latest host task {}", crate::statusline::short_task_id(&task.task_id.to_string())),
         "explain_key": "libra.task",
         "order_hint": 10,
         "clear_role": "supporting",
@@ -502,7 +502,7 @@ fn estimate_segment(task: &TaskSummary) -> Value {
         return json!({
             "key": "estimate",
             "state": "unknown",
-            "label": "Remaining work not estimated",
+            "label": "Latest host work not estimated",
             "reason_code": if estimate.cold_start {
                 "no_local_history_yet"
             } else {
@@ -516,7 +516,7 @@ fn estimate_segment(task: &TaskSummary) -> Value {
     json!({
         "key": "estimate",
         "state": "neutral",
-        "label": "Remaining work",
+        "label": "Latest host work",
         "duration_seconds": p90.min(MAX_DURATION_SECONDS),
         "duration_label": "P90",
         "confidence": confidence_token(task.confidence),
@@ -879,7 +879,7 @@ fn budget_count_fields(segment: &mut Value, amounts: &BudgetSnapshot, display: B
 /// pressure reading rides `semantic_state`, which is HORO-1719's to colour.
 ///
 /// `vital`, except when the envelope is spent. A budget share is the one
-/// reading that qualifies a schedule — `Replans now need approval · 38%
+/// reading that qualifies a schedule — `Latest host replans need approval · 38%
 /// budget left` says what the decision costs, which a bare approval cannot
 /// — and the host only pairs a declared vital with an exception, never an
 /// inferred one. Exhaustion is the exception: a limit that has been reached
@@ -1732,6 +1732,7 @@ mod tests {
 
     fn status_with(replan_state: ReplanState) -> StatusResult {
         StatusResult {
+            scope: libra_governor_protocol::StatusScope::HostLatestObservation,
             current_task: Some(task(replan_state)),
             // The ordinary active shape: an envelope with room left in it.
             // 0.38 rather than a round fraction so a truncation or rounding
@@ -1874,6 +1875,7 @@ mod tests {
     /// proving it has nothing to turn.
     fn idle() -> StatusResult {
         StatusResult {
+            scope: libra_governor_protocol::StatusScope::HostLatestObservation,
             current_task: None,
             task_budget: None,
             task_budget_amounts: None,
@@ -2250,7 +2252,10 @@ mod tests {
             json!("neutral"),
             "`ok` would assert the work is going well, which Libra has not measured"
         );
-        assert!(task["label"].as_str().unwrap().starts_with("Task "));
+        assert!(task["label"]
+            .as_str()
+            .unwrap()
+            .starts_with("Latest host task "));
     }
 
     #[test]
@@ -2260,7 +2265,7 @@ mod tests {
         assert_eq!(segments(&document).len(), 1);
         assert_eq!(
             segments(&document)[0]["label"],
-            json!("No task being governed")
+            json!("No host task selected")
         );
         assert_eq!(segments(&document)[0]["state"], json!("neutral"));
     }
@@ -2311,7 +2316,7 @@ mod tests {
         assert_eq!(estimate["key"], json!("estimate"));
         assert_eq!(estimate["duration_seconds"], json!(600));
         assert_eq!(estimate["duration_label"], json!("P90"));
-        assert_eq!(estimate["label"], json!("Remaining work"));
+        assert_eq!(estimate["label"], json!("Latest host work"));
         for (path, text) in all_strings(document.get("segments").unwrap()) {
             assert!(
                 !text.contains("10m") && !text.contains("600s"),
@@ -3665,7 +3670,10 @@ mod tests {
             .expect("the state must be visible at all");
 
         assert_eq!(escalation["state"], json!("warn"));
-        assert_eq!(escalation["label"], json!("Replans now need approval"));
+        assert_eq!(
+            escalation["label"],
+            json!("Latest host replans need approval")
+        );
         assert_eq!(
             escalation["reason_code"],
             json!("next_replan_needs_human_approval"),
@@ -3695,11 +3703,11 @@ mod tests {
                 .unwrap()
                 .to_string()
         };
-        assert!(labels(ReplanState::Stable).starts_with("Task "));
-        assert!(labels(ReplanState::Replanned { count: 3 }).starts_with("Task "));
+        assert!(labels(ReplanState::Stable).starts_with("Latest host task "));
+        assert!(labels(ReplanState::Replanned { count: 3 }).starts_with("Latest host task "));
         assert_eq!(
             labels(ReplanState::EscalatedAwaitingApproval),
-            "Replans now need approval"
+            "Latest host replans need approval"
         );
     }
 
@@ -3915,7 +3923,7 @@ mod tests {
             role_of(&escalated, "budget").as_deref(),
             Some("vital"),
             "the host pairs an exception only with a *declared* vital, which \
-             is how `Replans now need approval . 38% budget left` gets to say \
+             is how `Latest host replans need approval . 38% budget left` gets to say \
              what the decision costs"
         );
 
@@ -3951,7 +3959,7 @@ mod tests {
         status.current_task.as_mut().unwrap().remaining_estimate = estimate_with(None, true, 0);
         let document = reading(&status, None, now());
         let estimate = &segments(&document)[1];
-        assert_eq!(estimate["label"], json!("Remaining work not estimated"));
+        assert_eq!(estimate["label"], json!("Latest host work not estimated"));
         assert_eq!(estimate["clear_role"], json!("posture"));
 
         let estimated = reading(&status_with(ReplanState::Stable), None, now());
@@ -4151,7 +4159,7 @@ mod tests {
         // Guarding the guard: a check that never fires proves nothing about
         // the documents it passed.
         assert!(looks_high_entropy("sk-live-AbCd1234EfGh5678IjKl"));
-        assert!(!looks_high_entropy("Replans now need approval"));
+        assert!(!looks_high_entropy("Latest host replans need approval"));
         assert!(
             !looks_high_entropy("Task 3f2a1b9c"),
             "a short lowercase-hex id must stay renderable"

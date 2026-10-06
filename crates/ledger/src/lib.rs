@@ -24,6 +24,8 @@
 //! guarantee this rests on.
 
 mod economic_truth;
+mod execution_owner;
+pub use execution_owner::ExecutionLookup;
 mod extension;
 mod gateway;
 mod migrations;
@@ -32,6 +34,7 @@ mod reservation;
 mod resource_account;
 mod session;
 mod store;
+mod transaction;
 mod write;
 
 pub use extension::{
@@ -55,6 +58,10 @@ pub use write::DOGFOOD_PROFILE_ENV_VAR;
 /// Errors returned by the ledger crate.
 #[derive(Debug, thiserror::Error)]
 pub enum LedgerError {
+    #[error("transaction state unconfirmed; retry durable replay lookup")]
+    TransactionUnconfirmed,
+    #[error("inconsistent execution association")]
+    InvalidExecutionAssociation,
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     /// A filesystem operation on the ledger's own files failed — as of

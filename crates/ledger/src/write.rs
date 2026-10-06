@@ -5,7 +5,7 @@ use libra_governor_domain::{
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
-use crate::{store::LedgerStore, LedgerError};
+use crate::{store::LedgerStore, transaction::begin, LedgerError};
 
 fn rfc3339(t: time::OffsetDateTime) -> Result<String, LedgerError> {
     t.format(&Rfc3339)
@@ -70,7 +70,7 @@ impl LedgerStore {
         created_at: time::OffsetDateTime,
     ) -> Result<(), LedgerError> {
         let created_at = rfc3339(created_at)?;
-        let tx = self.conn.transaction()?;
+        let tx = begin(&mut self.conn, rusqlite::TransactionBehavior::Deferred)?;
         tx.execute(
             "INSERT INTO contracts (task_id, revision, created_at) VALUES (?1, ?2, ?3)",
             rusqlite::params![task_id.to_string(), contract.revision, created_at],
@@ -108,7 +108,7 @@ impl LedgerStore {
             LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
         })?;
 
-        let tx = self.conn.transaction()?;
+        let tx = begin(&mut self.conn, rusqlite::TransactionBehavior::Deferred)?;
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO events (id, task_id, occurred_at, payload_json)
              VALUES (?1, ?2, ?3, ?4)",

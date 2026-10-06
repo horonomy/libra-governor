@@ -38,7 +38,7 @@ use rusqlite::{OptionalExtension, TransactionBehavior};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use crate::{store::LedgerStore, LedgerError};
+use crate::{store::LedgerStore, transaction::begin, LedgerError};
 
 fn rfc3339(t: OffsetDateTime) -> Result<String, LedgerError> {
     t.format(&Rfc3339)
@@ -390,9 +390,7 @@ impl LedgerStore {
         })?;
         let now_str = rfc3339(now)?;
 
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT INTO task_budgets (
                 task_id, resource_kind, hard_limit, initial_completion_reserve,
@@ -560,9 +558,17 @@ impl LedgerStore {
     /// — a display-side variant of the accounting rule is how a
     /// statusline starts disagreeing with an admission decision.
     pub fn budget_snapshot(&self, task_id: TaskId) -> Result<Option<BudgetSnapshot>, LedgerError> {
-        let tx = self.conn.unchecked_transaction()?;
+        // Reuse an enclosing transaction's snapshot when called from an
+        // owner transaction. Standalone callers still get a dedicated
+        // read transaction spanning all four statements.
+        let tx = if self.conn.is_autocommit() {
+            Some(self.conn.unchecked_transaction()?)
+        } else {
+            None
+        };
+        let conn: &rusqlite::Connection = tx.as_ref().map_or(&self.conn, |tx| tx);
         let id = task_id.to_string();
-        let budget: Option<(String, f64, f64)> = tx
+        let budget: Option<(String, f64, f64)> = conn
             .query_row(
                 "SELECT resource_kind, hard_limit, completion_reserve
                  FROM task_budgets WHERE task_id = ?1",
@@ -571,16 +577,18 @@ impl LedgerStore {
             )
             .optional()?;
         let Some((kind, hard_limit, completion_reserve)) = budget else {
-            tx.commit()?;
+            if let Some(tx) = tx {
+                tx.commit()?;
+            }
             return Ok(None);
         };
-        let settled: f64 = tx.query_row(
+        let settled: f64 = conn.query_row(
             "SELECT COALESCE(SUM(settled_amount), 0.0) FROM reservations
              WHERE task_id = ?1 AND state = 'settled'",
             [&id],
             |row| row.get(0),
         )?;
-        let active: f64 = tx.query_row(
+        let active: f64 = conn.query_row(
             "SELECT COALESCE(SUM(amount), 0.0) FROM reservations
              WHERE task_id = ?1 AND state = 'active'",
             [&id],
@@ -593,12 +601,14 @@ impl LedgerStore {
         // then did not cost anything. Counting only `active`/`settled`
         // would report a task whose only reservation was released as
         // never observed, which is a different and false fact.
-        let reservation_count: u64 = tx.query_row(
+        let reservation_count: u64 = conn.query_row(
             "SELECT COUNT(*) FROM reservations WHERE task_id = ?1",
             [&id],
             |row| row.get(0),
         )?;
-        tx.commit()?;
+        if let Some(tx) = tx {
+            tx.commit()?;
+        }
         Ok(Some(BudgetSnapshot::new(
             kind_from_str(&kind)?,
             hard_limit,
@@ -631,9 +641,7 @@ impl LedgerStore {
     /// on its own. See module docs for the transaction/idempotency
     /// guarantees.
     pub fn reserve(&mut self, req: ReserveRequest<'_>) -> Result<ReserveOutcome, LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
 
         let existing: Option<ReservationRow> = tx
             .query_row(
@@ -795,7 +803,7 @@ impl LedgerStore {
     }
 
     fn get_reservation_tx(
-        tx: &rusqlite::Transaction<'_>,
+        tx: &rusqlite::Connection,
         id: ReservationId,
     ) -> Result<Option<Reservation>, LedgerError> {
         let row: Option<ReservationRow> = tx
@@ -843,9 +851,7 @@ impl LedgerStore {
             }
         }
 
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
         let Some(reservation) = Self::get_reservation_tx(&tx, id)? else {
             tx.commit()?;
             return Ok(SettleOutcome::NotFound);
@@ -946,9 +952,7 @@ impl LedgerStore {
         id: ReservationId,
         now: OffsetDateTime,
     ) -> Result<ReleaseOutcome, LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
         let Some(reservation) = Self::get_reservation_tx(&tx, id)? else {
             tx.commit()?;
             return Ok(ReleaseOutcome::NotFound);
@@ -997,9 +1001,7 @@ impl LedgerStore {
         plan_id: PlanId,
         now: OffsetDateTime,
     ) -> Result<Vec<Reservation>, LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
         let ids: Vec<String> = {
             let mut stmt = tx.prepare(
                 "SELECT id FROM reservations WHERE task_id = ?1 AND plan_id = ?2 AND state = 'active'",
@@ -1052,9 +1054,7 @@ impl LedgerStore {
         now: OffsetDateTime,
     ) -> Result<Vec<Reservation>, LedgerError> {
         let now_str = rfc3339(now)?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
         let ids: Vec<String> = {
             let mut stmt = tx.prepare(
                 "SELECT id FROM reservations WHERE state = 'active' AND expires_at <= ?1",
@@ -1134,9 +1134,7 @@ impl LedgerStore {
         basis: CompletionReserveBasis,
         now: OffsetDateTime,
     ) -> Result<AdjustOutcome, LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
         let budget_row: Option<BudgetRow> = tx
             .query_row(
                 "SELECT resource_kind, hard_limit, initial_completion_reserve, completion_reserve,

@@ -18,7 +18,12 @@
 //! [`Response::Error`]) rather than silently misinterpret a message shape
 //! it does not actually understand.
 
+pub mod execution_owner;
 pub mod host_event;
+pub use execution_owner::{
+    ExecutionEffect, ExecutionOperation, ExecutionOwnerOutcome, ExecutionOwnerRequest,
+    NativeExecutionContext,
+};
 mod messages;
 pub mod wire;
 
@@ -40,7 +45,7 @@ pub use messages::{
     AdmissionPolicyReport, BudgetPosture, BudgetScope, CalibrationReportResult, ConfiguredBudget,
     DoctorResult, FinalizeOutcome, FinalizeResult, GatewayStatusResult, OutcomeRecordedOutcome,
     OutcomeRecordedResult, PreflightResult, ReconSummary, ReplanState, Request, RequestEnvelope,
-    Response, ResponseEnvelope, StatusResult, TaskSummary,
+    Response, ResponseEnvelope, StatusResult, StatusScope, TaskSummary,
 };
 
 /// The protocol version this build of the crate speaks. Bump on any
@@ -140,4 +145,9 @@ pub use messages::{
 ///
 /// Same known limitation as every earlier bump: a long-lived v10 daemon
 /// must be restarted after upgrading.
-pub const PROTOCOL_VERSION: u32 = 11;
+///
+/// Bumped 11 -> 12 for the identity-v1 owner request and typed association
+/// results. Status now requires an explicit host-latest scope, and unknown
+/// request dimensions fail decoding rather than silently narrowing identity.
+/// A long-lived v11 daemon must be restarted before owner traffic.
+pub const PROTOCOL_VERSION: u32 = 12;
