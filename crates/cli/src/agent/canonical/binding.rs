@@ -1,138 +1,59 @@
-//! Pure interpretation of validated host observations for Libra.
-//!
-//! Candidates retain the complete canonical event and transient native context.
-//! They are not daemon requests, resolved tasks, or authorization to perform effects.
-
-use std::path::PathBuf;
+//! Concrete built-in native-name correlation around Libra's shared pure binder.
 
 use super::{LibraNativeContext, NormalizedHostInput};
-
-use libra_governor_domain::LineageStatus;
 use libra_governor_protocol::{
     HostBindingFailure, HostBindingReason, HostBindingStage, HostEventKind, HostEventScope,
-    ValidatedHostEvent,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecordOnlyReason {
-    MissingNativeContext,
-    MissingAttributionIdentity,
-    UnknownScope,
-    UnsupportedLifecycle,
-    UnsupportedToolBoundary,
-    UnsupportedUsage,
-}
+#[cfg(test)]
+use libra_governor_protocol::ValidatedHostEvent;
 
-#[derive(Debug, Clone)]
-pub enum BindingCandidate {
-    Preflight {
-        event: ValidatedHostEvent,
-        task_hint: String,
-        cwd: PathBuf,
-    },
-    CompletedTool {
-        event: ValidatedHostEvent,
-    },
-    TurnCompletion {
-        event: ValidatedHostEvent,
-        model: Option<String>,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub enum HostBindingOutcome {
-    Candidate(BindingCandidate),
-    RecordOnly {
-        event: ValidatedHostEvent,
-        reason: RecordOnlyReason,
-    },
-    Rejected(HostBindingFailure),
-}
+pub use libra_governor_daemon::host_binding::HostBindingOutcome;
+#[cfg(test)]
+pub use libra_governor_daemon::host_binding::{BindingCandidate, RecordOnlyReason};
 
 pub(super) fn bind(input: NormalizedHostInput) -> HostBindingOutcome {
     let NormalizedHostInput {
         event,
         native_context,
     } = input;
+    // Preserve the old reducer's precedence: an unknown scope remains
+    // record-only before any native-name mismatch is considered.
     if event.scope() == HostEventScope::Unknown {
-        return record(event, RecordOnlyReason::UnknownScope);
+        return libra_governor_daemon::host_binding::bind(event, native_context);
     }
-    match event.kind() {
-        HostEventKind::Lifecycle => {
-            match event.facts().get("event_type").and_then(|v| v.as_str()) {
-                Some("turn_start") => match native_context {
-                    LibraNativeContext::PromptAdmission { task_hint, cwd } => {
-                        if event.source().native_event_name != "UserPromptSubmit" {
-                            return rejected(HostBindingReason::ContextMismatch);
-                        }
-                        if task_hint.is_empty() || cwd.as_os_str().is_empty() {
-                            return record(event, RecordOnlyReason::MissingNativeContext);
-                        }
-                        if let Some(reason) = attribution_gap(&event) {
-                            return record(event, reason);
-                        }
-                        HostBindingOutcome::Candidate(BindingCandidate::Preflight {
-                            event,
-                            task_hint,
-                            cwd,
-                        })
-                    }
-                    LibraNativeContext::None | LibraNativeContext::Completion { .. } => {
-                        record(event, RecordOnlyReason::MissingNativeContext)
-                    }
-                },
-                Some("turn_end") => match native_context {
-                    LibraNativeContext::Completion { model } => {
-                        if event.source().native_event_name != "Stop" {
-                            return rejected(HostBindingReason::ContextMismatch);
-                        }
-                        if let Some(reason) = attribution_gap(&event) {
-                            return record(event, reason);
-                        }
-                        HostBindingOutcome::Candidate(BindingCandidate::TurnCompletion {
-                            event,
-                            model,
-                        })
-                    }
-                    LibraNativeContext::None | LibraNativeContext::PromptAdmission { .. } => {
-                        record(event, RecordOnlyReason::MissingNativeContext)
-                    }
-                },
-                _ => record(event, RecordOnlyReason::UnsupportedLifecycle),
-            }
-        }
-        HostEventKind::ToolAfter => {
-            if event.source().native_event_name != "PostToolUse"
-                || !matches!(native_context, LibraNativeContext::None)
+
+    if event.kind() == HostEventKind::Lifecycle {
+        match (
+            event
+                .facts()
+                .get("event_type")
+                .and_then(|value| value.as_str()),
+            &native_context,
+        ) {
+            (Some("turn_start"), LibraNativeContext::PromptAdmission { .. })
+                if event.source().native_event_name != "UserPromptSubmit" =>
             {
                 return rejected(HostBindingReason::ContextMismatch);
             }
-            if let Some(reason) = attribution_gap(&event) {
-                return record(event, reason);
+            (Some("turn_end"), LibraNativeContext::Completion { .. })
+                if event.source().native_event_name != "Stop" =>
+            {
+                return rejected(HostBindingReason::ContextMismatch);
             }
-            HostBindingOutcome::Candidate(BindingCandidate::CompletedTool { event })
+            _ => {}
         }
-        HostEventKind::ToolBefore | HostEventKind::ToolFailure => {
-            record(event, RecordOnlyReason::UnsupportedToolBoundary)
-        }
-        HostEventKind::Usage => record(event, RecordOnlyReason::UnsupportedUsage),
     }
-}
 
-fn attribution_gap(event: &ValidatedHostEvent) -> Option<RecordOnlyReason> {
-    let identity = event.identity();
-    if identity.lineage_status() != LineageStatus::Root
-        || identity.provider_session_id().is_none_or(str::is_empty)
-        || identity.agent_id().is_none_or(str::is_empty)
-        || identity.turn_id().is_none_or(str::is_empty)
+    // The concrete built-in wrapper requires its actual PostToolUse name.
+    // Generic external providers reach the daemon binder without this rule.
+    if event.kind() == HostEventKind::ToolAfter
+        && (event.source().native_event_name != "PostToolUse"
+            || !matches!(&native_context, LibraNativeContext::None))
     {
-        return Some(RecordOnlyReason::MissingAttributionIdentity);
+        return rejected(HostBindingReason::ContextMismatch);
     }
-    None
-}
-
-fn record(event: ValidatedHostEvent, reason: RecordOnlyReason) -> HostBindingOutcome {
-    HostBindingOutcome::RecordOnly { event, reason }
+    libra_governor_daemon::host_binding::bind(event, native_context)
 }
 
 fn rejected(reason: HostBindingReason) -> HostBindingOutcome {
@@ -146,6 +67,205 @@ fn rejected(reason: HostBindingReason) -> HostBindingOutcome {
 mod tests {
     use super::*;
     use libra_governor_protocol::validate_host_event;
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    const OBSERVED_AT: &str = "2026-10-05T00:00:00.000Z";
+
+    fn event(
+        kind: &str,
+        facts: serde_json::Value,
+        lineage: &str,
+        scope: &str,
+        native_event_name: &str,
+    ) -> ValidatedHostEvent {
+        let mut identity = json!({
+            "envelope_version": 1,
+            "observed_at": OBSERVED_AT,
+            "host_id": "host-local",
+            "tool_provider": "codex",
+            "provider_session_id": "session-native",
+            "agent_id": "agent-native",
+            "turn_id": "turn-native",
+            "lineage_status": lineage
+        });
+        if lineage == "child" {
+            identity["parent_agent_id"] = json!("parent-native");
+        }
+        let value = json!({
+            "schema_version": 1,
+            "event_id": "observation-1",
+            "observed_at": OBSERVED_AT,
+            "adapter_id": "codex",
+            "adapter_version": "1.0.0",
+            "source": {"kind":"hook", "native_event_name":native_event_name},
+            "capability_snapshot_id": "snapshot-1",
+            "identity": identity,
+            "scope": scope,
+            "kind": kind,
+            "facts": facts,
+            "quality": "reconstructed",
+            "field_provenance": {}
+        });
+        validate_host_event(value.to_string().as_bytes()).unwrap()
+    }
+
+    fn prompt_context() -> LibraNativeContext {
+        LibraNativeContext::PromptAdmission {
+            task_hint: "fix defect".into(),
+            cwd: PathBuf::from("/repo"),
+        }
+    }
+
+    #[test]
+    fn unknown_scope_precedes_native_correlation_and_attribution() {
+        let event = event(
+            "tool_after",
+            json!({"tool_name":"Edit"}),
+            "unknown",
+            "unknown",
+            "wrong.native.name",
+        );
+        assert!(matches!(
+            bind(NormalizedHostInput {
+                event,
+                native_context: LibraNativeContext::Completion { model: None },
+            }),
+            HostBindingOutcome::RecordOnly {
+                reason: RecordOnlyReason::UnknownScope,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn prompt_and_stop_name_checks_apply_only_with_matching_native_context() {
+        let wrong_prompt = event(
+            "lifecycle",
+            json!({"event_type":"turn_start"}),
+            "root",
+            "turn_task",
+            "other.prompt.name",
+        );
+        assert!(matches!(
+            bind(NormalizedHostInput {
+                event: wrong_prompt,
+                native_context: prompt_context(),
+            }),
+            HostBindingOutcome::Rejected(HostBindingFailure {
+                reason: HostBindingReason::ContextMismatch,
+                ..
+            })
+        ));
+
+        let no_prompt_context = event(
+            "lifecycle",
+            json!({"event_type":"turn_start"}),
+            "root",
+            "turn_task",
+            "other.prompt.name",
+        );
+        assert!(matches!(
+            bind(NormalizedHostInput {
+                event: no_prompt_context,
+                native_context: LibraNativeContext::None,
+            }),
+            HostBindingOutcome::RecordOnly {
+                reason: RecordOnlyReason::MissingNativeContext,
+                ..
+            }
+        ));
+
+        let wrong_stop = event(
+            "lifecycle",
+            json!({"event_type":"turn_end"}),
+            "root",
+            "turn_task",
+            "other.stop.name",
+        );
+        assert!(matches!(
+            bind(NormalizedHostInput {
+                event: wrong_stop,
+                native_context: LibraNativeContext::Completion {
+                    model: Some("observed-model".into()),
+                },
+            }),
+            HostBindingOutcome::Rejected(HostBindingFailure {
+                reason: HostBindingReason::ContextMismatch,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn post_tool_name_and_context_mismatch_precede_attribution() {
+        let wrong_name = event(
+            "tool_after",
+            json!({"tool_name":"Edit"}),
+            "child",
+            "turn_task",
+            "other.tool.name",
+        );
+        assert!(matches!(
+            bind(NormalizedHostInput {
+                event: wrong_name,
+                native_context: LibraNativeContext::None,
+            }),
+            HostBindingOutcome::Rejected(HostBindingFailure {
+                reason: HostBindingReason::ContextMismatch,
+                ..
+            })
+        ));
+
+        let wrong_context = event(
+            "tool_after",
+            json!({"tool_name":"Edit"}),
+            "child",
+            "turn_task",
+            "PostToolUse",
+        );
+        assert!(matches!(
+            bind(NormalizedHostInput {
+                event: wrong_context,
+                native_context: prompt_context(),
+            }),
+            HostBindingOutcome::Rejected(HostBindingFailure {
+                reason: HostBindingReason::ContextMismatch,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn unrelated_event_branches_keep_their_existing_record_only_reasons() {
+        let before = event(
+            "tool_before",
+            json!({"tool_name":"Edit"}),
+            "root",
+            "turn_task",
+            "unrelated.native.event",
+        );
+        assert!(matches!(
+            bind(NormalizedHostInput {
+                event: before,
+                native_context: LibraNativeContext::None,
+            }),
+            HostBindingOutcome::RecordOnly {
+                reason: RecordOnlyReason::UnsupportedToolBoundary,
+                ..
+            }
+        ));
+    }
+}
+
+// Keep the original canonical reducer coverage beside its compatibility
+// wrapper. These assertions continue to protect native behavior after the pure
+// mapping moved to the daemon library.
+#[cfg(test)]
+mod legacy_tests {
+    use super::*;
+    use libra_governor_protocol::validate_host_event;
+    use std::path::PathBuf;
 
     const OBSERVED_AT: &str = "2026-10-05T00:00:00.000Z";
 
@@ -188,7 +308,6 @@ mod tests {
         validate_host_event(value.to_string().as_bytes()).unwrap()
     }
 
-    // Synthetic root-lineage fixtures exercise pure projection only.
     fn synthetic_bind(
         event: ValidatedHostEvent,
         native_context: LibraNativeContext,
@@ -219,6 +338,32 @@ mod tests {
             }) => {
                 assert_eq!(task_hint, "fix defect");
                 assert_eq!(cwd, PathBuf::from("/repo"));
+                assert_eq!(
+                    event.identity().provider_session_id(),
+                    Some("session-native")
+                );
+                assert_eq!(event.identity().agent_id(), Some("agent-native"));
+                assert_eq!(event.identity().turn_id(), Some("turn-native"));
+            }
+            other => panic!("unexpected binding result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn completion_candidate_preserves_model_and_full_root_identity() {
+        let event = event(
+            "lifecycle",
+            serde_json::json!({"event_type": "turn_end"}),
+            "root",
+        );
+        match synthetic_bind(
+            event,
+            LibraNativeContext::Completion {
+                model: Some("observed-model".into()),
+            },
+        ) {
+            HostBindingOutcome::Candidate(BindingCandidate::TurnCompletion { event, model }) => {
+                assert_eq!(model.as_deref(), Some("observed-model"));
                 assert_eq!(
                     event.identity().provider_session_id(),
                     Some("session-native")

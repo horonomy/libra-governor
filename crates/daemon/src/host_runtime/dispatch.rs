@@ -7,6 +7,11 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use crate::host_binding::{self, HostBindingOutcome, LibraNativeContext};
+use libra_governor_domain::ExecutionIdentity;
+use libra_governor_protocol::host_event::{
+    validate_host_event, HostEventSource, ValidatedHostEvent,
+};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -28,6 +33,38 @@ pub struct DiagnosticSelection {
     pub scope: DiagnosticScope,
     /// Bounded JSON validated against the registered configuration profile.
     pub configuration: Vec<u8>,
+}
+
+/// Explicit diagnostic assertions, not authenticated host identity. No reader
+/// or initializer obtains identity on the caller's behalf.
+pub struct NativeNormalizationInput {
+    pub host_id: String,
+    pub observed_at: String,
+    pub source: HostEventSource,
+    pub native_payload: Vec<u8>,
+}
+
+/// Validated adapter claims and pure binding candidates; never an admission
+/// receipt, reusable host context or authorization to perform product effects.
+pub struct CandidateNormalization {
+    adapter_id: String,
+    events: Vec<ValidatedHostEvent>,
+    bindings: Vec<HostBindingOutcome>,
+}
+
+impl CandidateNormalization {
+    pub fn adapter_id(&self) -> &str {
+        &self.adapter_id
+    }
+    pub fn events(&self) -> &[ValidatedHostEvent] {
+        &self.events
+    }
+    pub fn bindings(&self) -> &[HostBindingOutcome] {
+        &self.bindings
+    }
+    pub fn verification_state(&self) -> &'static str {
+        "unverified"
+    }
 }
 
 /// Fixed local diagnostics never retain driver errors, payloads or paths.
@@ -94,11 +131,15 @@ impl CandidateProbe {
 /// stable, and must not let a foreign reaper consume these owned children.
 /// Unsupported observed signal policy is refused before fork; this library
 /// does not synchronize foreign process-global policy changes.
+/// Portable pipe setup also requires callers to exclude concurrent foreign
+/// process launches; its private fork lock coordinates only owned runners.
 pub struct DiagnosticDispatcher {
     registry: AdapterRegistry,
     contract: HostContract,
     #[cfg(test)]
     after_copy: Option<Box<dyn FnOnce()>>,
+    #[cfg(test)]
+    expire_after_copy: bool,
 }
 
 struct Context {
@@ -125,6 +166,19 @@ fn fail(stage: &'static str, reason: &'static str) -> DiagnosticFailure {
         reason,
         execution_attempted: false,
     }
+}
+
+fn attempted(mut failure: DiagnosticFailure) -> DiagnosticFailure {
+    failure.execution_attempted = true;
+    failure
+}
+
+fn request_limit(manifest: &ValidatedManifest) -> Result<usize, DiagnosticFailure> {
+    manifest.value()["input_limits"]["max_bytes"]
+        .as_f64()
+        .filter(|limit| (1.0..=1_048_576.0).contains(limit) && limit.fract() == 0.0)
+        .map(|limit| limit as usize)
+        .ok_or_else(|| fail("selection", "input limit refused"))
 }
 
 impl WorkingDirectory {
@@ -190,6 +244,8 @@ impl DiagnosticDispatcher {
             contract,
             #[cfg(test)]
             after_copy: None,
+            #[cfg(test)]
+            expire_after_copy: false,
         }
     }
 
@@ -373,13 +429,7 @@ impl DiagnosticDispatcher {
             .file
             .try_clone()
             .map_err(|_| fail("context", "working directory unavailable"))?;
-        let max_request_bytes = context.manifest.value()["input_limits"]["max_bytes"]
-            .as_f64()
-            // The validated integer range is at most 2^20: every accepted
-            // value has an exact f64/usize representation, including 1024.0.
-            .filter(|limit| (1.0..=1_048_576.0).contains(limit) && limit.fract() == 0.0)
-            .map(|limit| limit as usize)
-            .ok_or_else(|| fail("selection", "input limit refused"))?;
+        let max_request_bytes = request_limit(&context.manifest)?;
         // Recheck after request/FD preparation, immediately before admission.
         self.recheck(context)?;
         let response = exec::run(
@@ -422,18 +472,13 @@ impl DiagnosticDispatcher {
             .map_err(|_| mark_attempted(fail("protocol", "response correlation refused")))
     }
 
-    pub fn probe_registered(
-        &mut self,
-        id: &str,
-        selection: DiagnosticSelection,
+    fn probe_candidate(
+        &self,
+        context: &Context,
         cancellation: &Cancellation,
-    ) -> Result<CandidateProbe, DiagnosticFailure> {
-        if cancellation.cancelled() {
-            return Err(fail("execution", "diagnostic cancelled"));
-        }
-        let context = self.prepare(id, selection)?;
+    ) -> Result<Value, DiagnosticFailure> {
         let handshake = json!({"protocol":"horonom.host-adapter", "offered_versions":[1], "request_id":Uuid::new_v4().to_string(), "operation":"handshake"});
-        let hello = self.invoke(&context, handshake, cancellation)?;
+        let hello = self.invoke(context, handshake, cancellation)?;
         if hello.get("error").is_some() || hello["selected_version"].as_f64() != Some(1.0) {
             return Err(DiagnosticFailure {
                 stage: "protocol",
@@ -443,7 +488,7 @@ impl DiagnosticDispatcher {
         }
         let request = json!({"protocol":"horonom.host-adapter", "protocol_version":1, "host_contract_version":1, "request_id":Uuid::new_v4().to_string(), "operation":"probe", "input":{"context":context.wire_context}, "configuration":context.configuration});
         let response = self
-            .invoke(&context, request, cancellation)
+            .invoke(context, request, cancellation)
             .map_err(|mut error| {
                 error.execution_attempted = true;
                 error
@@ -461,13 +506,156 @@ impl DiagnosticDispatcher {
                 execution_attempted: true,
             });
         }
-        self.recheck(&context).map_err(|mut error| {
+        self.recheck(context).map_err(|mut error| {
             error.execution_attempted = true;
             error
         })?;
+        Ok(candidate.clone())
+    }
+
+    /// Normalize explicit diagnostic input into an all-or-nothing batch of
+    /// unverified adapter claims and pure Libra binding candidates. There is
+    /// no native context override or product effect path.
+    pub fn normalize_registered(
+        &mut self,
+        id: &str,
+        selection: DiagnosticSelection,
+        input: NativeNormalizationInput,
+        cancellation: &Cancellation,
+    ) -> Result<CandidateNormalization, DiagnosticFailure> {
+        if cancellation.cancelled() {
+            return Err(fail("execution", "diagnostic cancelled"));
+        }
+        let source = &input.source;
+        let lengths = [
+            input.host_id.len(),
+            input.observed_at.len(),
+            input.native_payload.len(),
+            source.native_event_name.len(),
+            source.native_schema_ref.as_ref().map_or(0, String::len),
+            source.native_event_id.as_ref().map_or(0, String::len),
+            source.replay_key.as_ref().map_or(0, String::len),
+        ];
+        if lengths.into_iter().fold(0_usize, usize::saturating_add) > 1_048_576 {
+            return Err(fail("input", "normalization input refused"));
+        }
+        let source = serde_json::to_value(source)
+            .map_err(|_| fail("input", "normalization input refused"))?;
+        let observation = self
+            .contract
+            .validate_normalization_observation(
+                &input.native_payload,
+                &input.host_id,
+                &input.observed_at,
+                source.clone(),
+            )
+            .map_err(|_| fail("input", "normalization input refused"))?;
+        let context = self.prepare(id, selection)?;
+        // Reuse the owning identity timestamp parser only as a private
+        // comparison intermediate; this is not an observed identity.
+        let identity: ExecutionIdentity = serde_json::from_value(json!({
+            "envelope_version":1, "host_id":input.host_id, "observed_at":input.observed_at,
+            "tool_provider":context.provider, "lineage_status":"unknown"
+        }))
+        .map_err(|_| fail("input", "normalization input refused"))?;
+        let mut request = json!({"protocol":"horonom.host-adapter", "protocol_version":1,
+            "host_contract_version":1, "request_id":Uuid::new_v4().to_string(), "operation":"normalize",
+            "input":observation, "configuration":context.configuration});
+        // The snapshot is not known yet. Check the complete known lower
+        // bound, then check the actual request after the fresh probe.
+        let lower = serde_json::to_vec(&request)
+            .map_err(|_| fail("input", "normalization request refused"))?;
+        let limit = request_limit(&context.manifest)?;
+        if lower.len() > limit || self.contract.check_protocol_bounds(&lower).is_err() {
+            return Err(fail("input", "normalization request refused"));
+        }
+        let snapshot = self.probe_candidate(&context, cancellation)?;
+        request["input"]["capability_snapshot"] = snapshot.clone();
+        let raw = serde_json::to_vec(&request)
+            .map_err(|_| attempted(fail("input", "normalization request refused")))?;
+        if raw.len() > limit || self.contract.validate_request(&raw).is_err() {
+            return Err(attempted(fail("input", "normalization request refused")));
+        }
+        let response = self
+            .invoke(&context, request, cancellation)
+            .map_err(attempted)?;
+        if response.get("error").is_some() {
+            return Err(attempted(fail("protocol", "normalization refused")));
+        }
+        let returned = response["result"]["events"]
+            .as_array()
+            .ok_or_else(|| attempted(fail("protocol", "normalization refused")))?;
+        let mut events = Vec::with_capacity(returned.len());
+        for value in returned {
+            let raw = serde_json::to_vec(value)
+                .map_err(|_| attempted(fail("protocol", "normalization refused")))?;
+            let event = validate_host_event(&raw)
+                .map_err(|_| attempted(fail("protocol", "normalization refused")))?;
+            if event.identity().host_id() != input.host_id
+                || event.identity().tool_provider() != context.provider
+                || event.identity().observed_at() != identity.observed_at()
+                || event.adapter_id() != context.manifest.adapter_id()
+                || Some(event.adapter_version()) != snapshot["adapter"]["version"].as_str()
+                || Some(event.capability_snapshot_id()) != snapshot["snapshot_id"].as_str()
+                || event.host_version() != snapshot["host"]["version"].as_str()
+                || serde_json::to_value(event.source()).ok().as_ref() != Some(&source)
+                || serde_json::to_value(event.scope()).ok().as_ref()
+                    != Some(&context.wire_context["scope"])
+            {
+                return Err(attempted(fail(
+                    "protocol",
+                    "normalized event correlation refused",
+                )));
+            }
+            events.push(event);
+        }
+        let bindings = events
+            .iter()
+            .cloned()
+            .map(|event| host_binding::bind(event, LibraNativeContext::None))
+            .collect();
+        self.recheck(&context).map_err(attempted)?;
+        let result = CandidateNormalization {
+            adapter_id: id.to_owned(),
+            events,
+            bindings,
+        };
+        #[cfg(test)]
+        if let Some(after_copy) = self.after_copy.take() {
+            after_copy();
+        }
+        if cancellation.cancelled() {
+            return Err(attempted(fail("execution", "diagnostic cancelled")));
+        }
+        let expires = context.expires;
+        // Shorten only the final test deadline after genuine child execution;
+        // no public context or execution authority can be fabricated here.
+        #[cfg(test)]
+        let expires = if self.expire_after_copy {
+            Instant::now().min(expires)
+        } else {
+            expires
+        };
+        if Instant::now() >= expires {
+            return Err(attempted(fail("context", "diagnostic context expired")));
+        }
+        Ok(result)
+    }
+
+    pub fn probe_registered(
+        &mut self,
+        id: &str,
+        selection: DiagnosticSelection,
+        cancellation: &Cancellation,
+    ) -> Result<CandidateProbe, DiagnosticFailure> {
+        if cancellation.cancelled() {
+            return Err(fail("execution", "diagnostic cancelled"));
+        }
+        let context = self.prepare(id, selection)?;
+        let candidate = self.probe_candidate(&context, cancellation)?;
         let result = CandidateProbe {
             adapter_id: id.to_owned(),
-            candidate: candidate.clone(),
+            candidate,
         };
         #[cfg(test)]
         if let Some(after_copy) = self.after_copy.take() {

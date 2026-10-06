@@ -1396,14 +1396,19 @@ print('no-private-descriptors')
     fn pre_exec_deadline_and_late_setup_cancellation_withhold_execution() {
         // A deliberately stalled pre-exec child retains inherited CLOEXEC
         // pipe ends until exec/exit. Isolate it from other test-owned runners.
-        let mut helper = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "host_runtime::exec::tests::isolated_pre_exec_deadline_helper",
-                "--ignored",
-            ])
-            .spawn()
-            .unwrap();
+        let launched = {
+            // Cooperate with portable pipe preparation; retain no raw pipe
+            // originals in this longer-lived helper across exec.
+            let _plan = FORK_PLAN.lock().unwrap();
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "host_runtime::exec::tests::isolated_pre_exec_deadline_helper",
+                    "--ignored",
+                ])
+                .spawn()
+        };
+        let mut helper = launched.unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             if let Some(status) = helper.try_wait().unwrap() {
@@ -1486,14 +1491,19 @@ print('no-private-descriptors')
 
     #[test]
     fn leader_group_drift_controls_run_in_an_isolated_process() {
-        let mut helper = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "host_runtime::exec::tests::isolated_leader_group_drift_helper",
-                "--ignored",
-            ])
-            .spawn()
-            .unwrap();
+        let launched = {
+            // Cooperate with portable pipe preparation; retain no raw pipe
+            // originals in this longer-lived helper across exec.
+            let _plan = FORK_PLAN.lock().unwrap();
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "host_runtime::exec::tests::isolated_leader_group_drift_helper",
+                    "--ignored",
+                ])
+                .spawn()
+        };
+        let mut helper = launched.unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             if let Some(status) = helper.try_wait().unwrap() {
@@ -1596,14 +1606,19 @@ time.sleep(5)
 
     #[test]
     fn signal_policy_controls_run_in_an_isolated_test_process() {
-        let mut helper = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "host_runtime::exec::tests::isolated_signal_policy_helper",
-                "--ignored",
-            ])
-            .spawn()
-            .unwrap();
+        let launched = {
+            // Cooperate with portable pipe preparation; retain no raw pipe
+            // originals in this longer-lived helper across exec.
+            let _plan = FORK_PLAN.lock().unwrap();
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "host_runtime::exec::tests::isolated_signal_policy_helper",
+                    "--ignored",
+                ])
+                .spawn()
+        };
+        let mut helper = launched.unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             if let Some(status) = helper.try_wait().unwrap() {

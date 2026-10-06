@@ -65,6 +65,7 @@ pub struct HostContract {
     response: SchemaValidator,
     probe_result: SchemaValidator,
     normalize_result: SchemaValidator,
+    normalize_observation: SchemaValidator,
     encode_control_result: SchemaValidator,
     plan_config_result: SchemaValidator,
     cli: SchemaValidator,
@@ -189,6 +190,25 @@ impl HostContract {
             schema["$ref"] = Value::String(format!("#/$defs/results/{name}"));
             schema
         };
+        // Caller observations cannot supply the runtime-owned snapshot. This
+        // private projection retains the pinned definition and its references
+        // without registering a modified canonical resource identity.
+        let mut observation_schema = parsed[3].clone();
+        let object = observation_schema
+            .as_object_mut()
+            .expect("bundled schema object");
+        object.remove("$id");
+        object.remove("oneOf");
+        observation_schema["$ref"] = Value::String("#/$defs/inputs/normalize".into());
+        let definition = &mut observation_schema["$defs"]["inputs"]["normalize"];
+        definition["required"]
+            .as_array_mut()
+            .expect("pinned required fields")
+            .retain(|field| field != "capability_snapshot");
+        definition["properties"]
+            .as_object_mut()
+            .expect("pinned properties")
+            .remove("capability_snapshot");
         Ok(Self {
             events: compile(&parsed[0])?,
             snapshots: compile(&parsed[1])?,
@@ -197,10 +217,47 @@ impl HostContract {
             response: compile(&response_schema)?,
             probe_result: compile(&result_schema("probe"))?,
             normalize_result: compile(&result_schema("normalize"))?,
+            normalize_observation: compile(&observation_schema)?,
             encode_control_result: compile(&result_schema("encode_control"))?,
             plan_config_result: compile(&result_schema("plan_config"))?,
             cli: compile(&parsed[4])?,
         })
+    }
+
+    pub(super) fn validate_normalization_observation(
+        &self,
+        native_payload: &[u8],
+        host_id: &str,
+        observed_at: &str,
+        source: Value,
+    ) -> Result<Value, RegistryFailure> {
+        let native = parse(
+            native_payload,
+            MAX_PROTOCOL_BYTES,
+            MAX_PROTOCOL_DEPTH,
+            MAX_PROTOCOL_NODES,
+        )?;
+        let input = serde_json::json!({"native_payload":native, "host_id":host_id, "observed_at":observed_at, "source":source});
+        let raw =
+            serde_json::to_vec(&input).map_err(|_| fail("protocol", "invalid observation"))?;
+        let bounded = parse(
+            &raw,
+            MAX_PROTOCOL_BYTES,
+            MAX_PROTOCOL_DEPTH,
+            MAX_PROTOCOL_NODES,
+        )?;
+        validate(&self.normalize_observation, &bounded, "protocol")?;
+        Ok(bounded)
+    }
+
+    pub(super) fn check_protocol_bounds(&self, raw: &[u8]) -> Result<(), RegistryFailure> {
+        parse(
+            raw,
+            MAX_PROTOCOL_BYTES,
+            MAX_PROTOCOL_DEPTH,
+            MAX_PROTOCOL_NODES,
+        )
+        .map(|_| ())
     }
 
     pub fn validate_manifest(&self, raw: &[u8]) -> Result<ValidatedManifest, RegistryFailure> {
