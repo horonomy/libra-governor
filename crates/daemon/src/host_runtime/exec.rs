@@ -14,6 +14,7 @@ use rustix::process::{self, Pid, Signal, WaitId, WaitIdOptions, WaitOptions};
 const MAX_OUTPUT: usize = 1_048_576;
 const MAX_ERROR: usize = 16_384;
 const CHUNK: usize = 65_536;
+const FORK_PLAN_BUDGET: Duration = Duration::from_secs(60);
 const REQUEST_BUDGET: Duration = Duration::from_secs(2);
 const CLEANUP_BUDGET: Duration = Duration::from_secs(1);
 const TERM_GRACE: Duration = Duration::from_millis(150);
@@ -819,16 +820,12 @@ fn run_owned_diagnostic(
         });
     }
     let mut owner = Attempt::prepared();
-    let deadline = Instant::now() + REQUEST_BUDGET;
+    let preparation_deadline = Instant::now() + FORK_PLAN_BUDGET;
     #[cfg(test)]
     let mut held_gate = None;
     // Owner lives outside the unwind boundary; cleanup precedes any resumed
     // panic, so dropping an idle public dispatcher cannot abandon a child.
     let execution = catch_unwind(AssertUnwindSafe(|| {
-        #[cfg(test)]
-        if _controls.expire_before_launch {
-            std::thread::sleep(REQUEST_BUDGET);
-        }
         let environment = [
             CString::new("LANG=C.UTF-8").unwrap(),
             CString::new("LC_ALL=C.UTF-8").unwrap(),
@@ -846,7 +843,7 @@ fn run_owned_diagnostic(
             if cancellation.cancelled() {
                 return Err(ExecFailure::Cancelled);
             }
-            if Instant::now() >= deadline {
+            if Instant::now() >= preparation_deadline {
                 return Err(owner.timeout());
             }
             match FORK_PLAN.try_lock() {
@@ -858,6 +855,14 @@ fn run_owned_diagnostic(
         let directory = directory_source(&launch.directory)?;
         let plan = Plan::new()?;
         let signals = signal_plan()?;
+        // Serializing our own portable fork preparation must not consume the
+        // adapter's request budget. Under parallel callers that made a healthy,
+        // ready adapter time out before it was ever admitted to run.
+        let deadline = Instant::now() + REQUEST_BUDGET;
+        #[cfg(test)]
+        if _controls.expire_before_launch {
+            std::thread::sleep(REQUEST_BUDGET);
+        }
         // SAFETY: all-zero signal structures are initialized by sigemptyset
         // before the child can read them; disposition is explicitly SIG_DFL.
         let mut default_signal: libc::sigaction = unsafe { std::mem::zeroed() };

@@ -83,8 +83,8 @@ if operation == "handshake":
     reply(base)
 elif operation == "plan_config":
     if mode in ("timeout", "timeout_plan"):
-        # Finite like the other installed fixture: a harness error cannot leave
-        # a forever-running candidate process.
+        # Finite beyond the production request budget: a harness error cannot
+        # leave a forever-running candidate process.
         time.sleep(5)
     if mode in ("nonzero", "nonzero_plan"):
         raise SystemExit(7)
