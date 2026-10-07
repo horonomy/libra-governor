@@ -622,6 +622,10 @@ fn execution_failure_category(stage: &str, reason: &str) -> Option<&'static str>
         "stderr limit exceeded" => "stderr_limit",
         "adapter exited unsuccessfully" => "nonzero_exit",
         "caller signal policy refused" => "signal_context",
+        "owned execution setup failed" => "setup",
+        "owned execution exec failed" => "exec",
+        "owned execution io failed" => "io",
+        "owned execution ownership interference" => "ownership_interference",
         _ => "owned_execution_failed",
     })
 }
@@ -1162,6 +1166,13 @@ mod execution_diagnostic_tests {
             ("stderr limit exceeded", "stderr_limit"),
             ("adapter exited unsuccessfully", "nonzero_exit"),
             ("caller signal policy refused", "signal_context"),
+            ("owned execution setup failed", "setup"),
+            ("owned execution exec failed", "exec"),
+            ("owned execution io failed", "io"),
+            (
+                "owned execution ownership interference",
+                "ownership_interference",
+            ),
             ("PRIVATE_DRIVER_ERROR_CANARY", "owned_execution_failed"),
         ] {
             assert_eq!(

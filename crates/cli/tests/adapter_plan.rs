@@ -371,7 +371,7 @@ fn plan_failure_context(fixture: &Fixture, output: &Output) -> Value {
             &["plan_validated","plan_execution_failed","plan_profile_refused","unknown_adapter","plan_refused","registry_unavailable","context_refused","configuration_refused","code_trust_refused","protocol_refused"]),
         "execution_attempted":envelope["result"]["execution_attempted"].as_bool(),
         "execution_failure":allowed(&envelope["result"]["execution_failure"],
-            &["timeout","cancelled","input_limit","output_limit","stderr_limit","nonzero_exit","signal_context","owned_execution_failed"]),
+            &["timeout","cancelled","input_limit","output_limit","stderr_limit","nonzero_exit","signal_context","setup","exec","io","ownership_interference","owned_execution_failed"]),
         "timeout_phase":allowed(&envelope["result"]["timeout_phase"],
             &["not_owned","owned_awaiting_ready","group_ready_awaiting_exec_status","exec_status_closed"]),
         "entry":marker(".entry"),"start":marker(".starts"),"operation":marker("")
