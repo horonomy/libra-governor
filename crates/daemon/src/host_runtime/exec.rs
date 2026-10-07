@@ -914,6 +914,12 @@ fn run_owned_diagnostic(
         }
         let mut mask = ParentMask::block()?;
         let pid = loop {
+            if cancellation.cancelled() {
+                return Err(ExecFailure::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(owner.timeout());
+            }
             #[cfg(test)]
             let simulated_eagain = _controls.fail_fork_with_eagain > 0;
             #[cfg(test)]
@@ -942,8 +948,11 @@ fn run_owned_diagnostic(
             let error = std::io::Error::last_os_error()
                 .raw_os_error()
                 .unwrap_or_default();
-            if error != libc::EAGAIN || Instant::now() >= preparation_deadline {
+            if error != libc::EAGAIN {
                 return Err(ExecFailure::Setup);
+            }
+            if Instant::now() >= deadline {
+                return Err(owner.timeout());
             }
             mask.restore()?;
             std::thread::sleep(SLICE);
@@ -1287,6 +1296,31 @@ print('no-private-descriptors')
             },
         );
         assert_eq!(result, Ok(b"ok".to_vec()));
+    }
+
+    #[test]
+    fn fork_retry_exhausts_the_request_deadline_without_starting_a_child() {
+        let directory = tempfile::tempdir().unwrap();
+        let result = run_owned_diagnostic(
+            launch(
+                "/bin/sh",
+                &["-c", "printf should-not-run"],
+                directory.path(),
+            ),
+            b"{}",
+            &Cancellation::default(),
+            RunControls {
+                fail_fork_with_eagain: usize::MAX,
+                ..RunControls::default()
+            },
+        );
+        assert_eq!(
+            result,
+            Err(ExecDiagnosticFailure {
+                kind: ExecFailure::Timeout,
+                timeout_phase: Some(TimeoutPhase::NotOwned),
+            })
+        );
     }
 
     #[test]
