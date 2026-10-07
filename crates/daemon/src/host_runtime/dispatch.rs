@@ -438,7 +438,7 @@ impl DiagnosticDispatcher {
         let max_request_bytes = request_limit(&context.manifest)?;
         // Recheck after request/FD preparation, immediately before admission.
         self.recheck(context)?;
-        let response = exec::run_diagnostic(
+        let response = match exec::run_diagnostic(
             VerifiedLaunch {
                 executable,
                 arguments,
@@ -447,36 +447,47 @@ impl DiagnosticDispatcher {
             },
             &raw,
             cancellation,
-        )
-        .map_err(|error| DiagnosticFailure {
-            stage: "execution",
-            reason: match error.kind {
-                ExecFailure::Cancelled => "diagnostic cancelled",
-                ExecFailure::Timeout => match error.timeout_phase {
-                    Some(TimeoutPhase::NotOwned) => "request deadline exceeded (not_owned)",
-                    Some(TimeoutPhase::OwnedAwaitingReady) => {
-                        "request deadline exceeded (owned_awaiting_ready)"
-                    }
-                    Some(TimeoutPhase::GroupReadyAwaitingExecStatus) => {
-                        "request deadline exceeded (group_ready_awaiting_exec_status)"
-                    }
-                    Some(TimeoutPhase::ExecStatusClosed) => {
-                        "request deadline exceeded (exec_status_closed)"
-                    }
-                    None => "request deadline exceeded",
-                },
-                ExecFailure::InputLimit => "request limit exceeded",
-                ExecFailure::OutputLimit => "response limit exceeded",
-                ExecFailure::ErrorLimit => "stderr limit exceeded",
-                ExecFailure::NonzeroExit => "adapter exited unsuccessfully",
-                ExecFailure::SignalContext => "caller signal policy refused",
-                ExecFailure::Setup
-                | ExecFailure::Exec
-                | ExecFailure::Io
-                | ExecFailure::OwnershipInterference => "owned execution failed",
-            },
-            execution_attempted: true,
-        })?;
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                // Context/trust drift is the stronger boundary: if the adapter
+                // changed it while running, report that fact rather than the
+                // transport symptom that happened to be observed first.
+                self.recheck(context).map_err(|mut drift| {
+                    drift.execution_attempted = true;
+                    drift
+                })?;
+                return Err(DiagnosticFailure {
+                    stage: "execution",
+                    reason: match error.kind {
+                        ExecFailure::Cancelled => "diagnostic cancelled",
+                        ExecFailure::Timeout => match error.timeout_phase {
+                            Some(TimeoutPhase::NotOwned) => "request deadline exceeded (not_owned)",
+                            Some(TimeoutPhase::OwnedAwaitingReady) => {
+                                "request deadline exceeded (owned_awaiting_ready)"
+                            }
+                            Some(TimeoutPhase::GroupReadyAwaitingExecStatus) => {
+                                "request deadline exceeded (group_ready_awaiting_exec_status)"
+                            }
+                            Some(TimeoutPhase::ExecStatusClosed) => {
+                                "request deadline exceeded (exec_status_closed)"
+                            }
+                            None => "request deadline exceeded",
+                        },
+                        ExecFailure::InputLimit => "request limit exceeded",
+                        ExecFailure::OutputLimit => "response limit exceeded",
+                        ExecFailure::ErrorLimit => "stderr limit exceeded",
+                        ExecFailure::NonzeroExit => "adapter exited unsuccessfully",
+                        ExecFailure::SignalContext => "caller signal policy refused",
+                        ExecFailure::Setup
+                        | ExecFailure::Exec
+                        | ExecFailure::Io
+                        | ExecFailure::OwnershipInterference => "owned execution failed",
+                    },
+                    execution_attempted: true,
+                });
+            }
+        };
         let mark_attempted = |mut failure: DiagnosticFailure| {
             failure.execution_attempted = true;
             failure

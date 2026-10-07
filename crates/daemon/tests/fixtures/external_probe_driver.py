@@ -19,8 +19,8 @@ if mode == "wait_for_signal":
     with open(operation_log + ".pid", "w", encoding="utf-8") as stream:
         stream.write(str(os.getpid()))
     # Inert finite fixture: even a failed CLI signal route cannot leave an
-    # indefinitely running adapter. Production request budget is two seconds.
-    time.sleep(5)
+    # indefinitely running adapter. It outlives the four-second request budget.
+    time.sleep(7)
 
 if mode == "invalid_json":
     sys.stdout.write("{")

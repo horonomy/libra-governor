@@ -849,7 +849,7 @@ impl ConfigLifecycle {
                     .target
                     .as_ref()
                     .ok_or_else(|| fail("pending_operation"))?;
-                if observed.fingerprint() == delta.after && owned == !delta.owned_after.is_empty() {
+                if observed.fingerprint() == delta.after && owned != delta.owned_after.is_empty() {
                     let target = if observed.parent_missing() && intent != ConfigIntent::Enable {
                         TargetAccess::Observed(Box::new(observed))
                     } else {
@@ -1285,7 +1285,7 @@ fn complete_connection(
         .as_ref()
         .ok_or_else(|| fail("pending_operation"))?;
     if target.observation().fingerprint() != delta.after
-        || observe_owned(binding, record, target.observation())? != !delta.owned_after.is_empty()
+        || observe_owned(binding, record, target.observation())? == delta.owned_after.is_empty()
     {
         return Err(fail("pending_target_conflict"));
     }

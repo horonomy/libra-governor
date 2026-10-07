@@ -460,9 +460,9 @@ impl HostContract {
             };
             validate(result_validator, result, "protocol")?;
             if operation == "normalize"
-                && !result["events"]
+                && result["events"]
                     .as_array()
-                    .is_some_and(|events| !events.is_empty())
+                    .is_none_or(|events| events.is_empty())
             {
                 return Err(fail("protocol", "operation result mismatch"));
             }
