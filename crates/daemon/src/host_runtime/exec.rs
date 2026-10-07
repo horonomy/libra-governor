@@ -14,8 +14,8 @@ use rustix::process::{self, Pid, Signal, WaitId, WaitIdOptions, WaitOptions};
 const MAX_OUTPUT: usize = 1_048_576;
 const MAX_ERROR: usize = 16_384;
 const CHUNK: usize = 65_536;
-const FORK_PLAN_BUDGET: Duration = Duration::from_secs(60);
-const REQUEST_BUDGET: Duration = Duration::from_secs(2);
+const FORK_PLAN_WAIT_BUDGET: Duration = Duration::from_secs(60);
+const REQUEST_BUDGET: Duration = Duration::from_secs(4);
 const CLEANUP_BUDGET: Duration = Duration::from_secs(1);
 const TERM_GRACE: Duration = Duration::from_millis(150);
 const SLICE: Duration = Duration::from_millis(5);
@@ -820,7 +820,7 @@ fn run_owned_diagnostic(
         });
     }
     let mut owner = Attempt::prepared();
-    let preparation_deadline = Instant::now() + FORK_PLAN_BUDGET;
+    let preparation_deadline = Instant::now() + FORK_PLAN_WAIT_BUDGET;
     #[cfg(test)]
     let mut held_gate = None;
     // Owner lives outside the unwind boundary; cleanup precedes any resumed
@@ -855,9 +855,9 @@ fn run_owned_diagnostic(
         let directory = directory_source(&launch.directory)?;
         let plan = Plan::new()?;
         let signals = signal_plan()?;
-        // Serializing our own portable fork preparation must not consume the
-        // adapter's request budget. Under parallel callers that made a healthy,
-        // ready adapter time out before it was ever admitted to run.
+        // Waiting for our own launch mutex must not consume the adapter's
+        // request budget. Under parallel callers that made a healthy, ready
+        // adapter time out before it was ever admitted to run.
         let deadline = Instant::now() + REQUEST_BUDGET;
         #[cfg(test)]
         if _controls.expire_before_launch {
@@ -1232,6 +1232,8 @@ print('no-private-descriptors')
         );
     }
 
+    const ISOLATED_WATCHDOG: Duration = Duration::from_secs(30);
+
     #[test]
     fn diagnostic_timeout_freezes_parent_observation_before_owned_cleanup() {
         // Held pre-exec gates retain inherited pipe ends until exit. Keep
@@ -1243,7 +1245,7 @@ print('no-private-descriptors')
             "--ignored",
         ]);
         let mut helper = spawn_test_child(&mut command).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + ISOLATED_WATCHDOG;
         loop {
             if let Some(status) = helper.try_wait().unwrap() {
                 assert!(status.success(), "isolated timeout phase controls failed");
@@ -1317,7 +1319,7 @@ print('no-private-descriptors')
             let result = run_owned_diagnostic(
                 launch(
                     "/bin/sh",
-                    &["-c", "cat >/dev/null; sleep 3"],
+                    &["-c", "cat >/dev/null; sleep 6"],
                     directory.path(),
                 ),
                 b"{}",
@@ -1634,7 +1636,7 @@ print('no-private-descriptors')
                 .spawn()
         };
         let mut helper = launched.unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + ISOLATED_WATCHDOG;
         loop {
             if let Some(status) = helper.try_wait().unwrap() {
                 assert!(
@@ -1730,7 +1732,7 @@ print('no-private-descriptors')
                 .spawn()
         };
         let mut helper = launched.unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + ISOLATED_WATCHDOG;
         loop {
             if let Some(status) = helper.try_wait().unwrap() {
                 assert!(status.success(), "isolated group drift control failed");
@@ -1845,7 +1847,7 @@ time.sleep(5)
                 .spawn()
         };
         let mut helper = launched.unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + ISOLATED_WATCHDOG;
         loop {
             if let Some(status) = helper.try_wait().unwrap() {
                 assert!(status.success(), "isolated signal controls failed");
