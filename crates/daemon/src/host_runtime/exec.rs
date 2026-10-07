@@ -753,6 +753,8 @@ struct RunControls {
     #[cfg(test)]
     expire_before_launch: bool,
     #[cfg(test)]
+    fail_fork_with_eagain: usize,
+    #[cfg(test)]
     before_cleanup: Option<BeforeCleanup>,
     #[cfg(test)]
     after_cleanup: Option<AfterCleanup>,
@@ -811,7 +813,7 @@ fn run_owned_diagnostic(
     launch: VerifiedLaunch,
     request: &[u8],
     cancellation: &Cancellation,
-    _controls: RunControls,
+    mut _controls: RunControls,
 ) -> Result<Vec<u8>, ExecDiagnosticFailure> {
     if request.len() > launch.max_request_bytes.min(MAX_OUTPUT) {
         return Err(ExecDiagnosticFailure {
@@ -911,11 +913,45 @@ fn run_owned_diagnostic(
             return Err(owner.timeout());
         }
         let mut mask = ParentMask::block()?;
-        // SAFETY: child takes only the audited async-signal-safe path above.
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            return Err(ExecFailure::Setup);
-        }
+        let pid = loop {
+            #[cfg(test)]
+            let simulated_eagain = _controls.fail_fork_with_eagain > 0;
+            #[cfg(test)]
+            let pid = if simulated_eagain {
+                _controls.fail_fork_with_eagain -= 1;
+                -1
+            } else {
+                // SAFETY: child takes only the audited async-signal-safe path above.
+                unsafe { libc::fork() }
+            };
+            #[cfg(not(test))]
+            // SAFETY: child takes only the audited async-signal-safe path above.
+            let pid = unsafe { libc::fork() };
+            if pid >= 0 {
+                break pid;
+            }
+            #[cfg(test)]
+            let error = if simulated_eagain {
+                libc::EAGAIN
+            } else {
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or_default()
+            };
+            #[cfg(not(test))]
+            let error = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or_default();
+            if error != libc::EAGAIN || Instant::now() >= preparation_deadline {
+                return Err(ExecFailure::Setup);
+            }
+            mask.restore()?;
+            std::thread::sleep(SLICE);
+            if cancellation.cancelled() {
+                return Err(ExecFailure::Cancelled);
+            }
+            mask = ParentMask::block()?;
+        };
         if pid == 0 {
             unsafe { child(&raw) };
         }
@@ -1233,6 +1269,25 @@ print('no-private-descriptors')
     }
 
     const ISOLATED_WATCHDOG: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn transient_fork_admission_retries_without_spending_the_request_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let result = run_owned_diagnostic(
+            launch(
+                "/bin/sh",
+                &["-c", "cat >/dev/null; printf ok"],
+                directory.path(),
+            ),
+            b"{}",
+            &Cancellation::default(),
+            RunControls {
+                fail_fork_with_eagain: 1,
+                ..RunControls::default()
+            },
+        );
+        assert_eq!(result, Ok(b"ok".to_vec()));
+    }
 
     #[test]
     fn diagnostic_timeout_freezes_parent_observation_before_owned_cleanup() {
@@ -1699,6 +1754,7 @@ print('no-private-descriptors')
                             })
                         );
                     })),
+                    ..RunControls::default()
                 },
             );
             assert_eq!(
