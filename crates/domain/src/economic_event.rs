@@ -323,7 +323,11 @@ impl EconomicEvent {
 /// [`crate::ExecutionIdentity`]'s own `observed_at` wire format exactly
 /// (`YYYY-MM-DDTHH:MM:SS.fffZ`) so both timestamps round-trip through the
 /// same JSON shape.
-mod occurred_at_wire {
+///
+/// `pub(crate)` (rather than private) so [`crate::quota_window`] reuses
+/// this exact wire format for its own UTC timestamps instead of
+/// reimplementing millisecond-truncated RFC3339 formatting a second time.
+pub(crate) mod occurred_at_wire {
     use serde::{Deserialize, Deserializer, Serializer};
     use time::format_description::well_known::Rfc3339;
     use time::OffsetDateTime;
