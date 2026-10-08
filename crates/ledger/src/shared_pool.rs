@@ -75,6 +75,13 @@ fn invalid() -> LedgerError {
     LedgerError::Sqlite(rusqlite::Error::InvalidQuery)
 }
 
+/// A generous-but-finite bound on a reservation's `ttl_secs`, mirroring
+/// `quota_window::MAX_SLIDING_LENGTH_SECS`'s own 100-year precedent — no
+/// realistic operator-configured TTL approaches this, so clamping to it
+/// means the expiry-instant arithmetic in [`LedgerStore::reserve_shared`]
+/// never needs an "expires immediately" fallback for an oversized TTL.
+const MAX_TTL_SECS: u64 = 100 * 365 * 24 * 3600;
+
 /// SQLite's `INTEGER` column is a signed 64-bit value; every amount this
 /// module persists originates as a caller-supplied `u64`. A bare `as i64`
 /// cast silently wraps a value above `i64::MAX` into a negative number —
@@ -346,11 +353,80 @@ impl LedgerStore {
     /// inside the caller's own transaction so it observes the same
     /// instant as the settled/active sums.
     #[allow(clippy::type_complexity)]
+    /// Sums only `settled` reservations whose own `settled_at` is at or
+    /// before `observed_at` — i.e. Libra-side activity the snapshot
+    /// could structurally already include, because it existed before
+    /// the provider observed its own `used` figure. A `settled` row
+    /// that postdates the snapshot can never be part of what the
+    /// snapshot measured, and `active` holds are never subtracted here
+    /// at all (see [`Self::external_overhang_tx`]'s own docs for why).
+    fn settled_before_tx(
+        tx: &rusqlite::Connection,
+        pool_id: &PoolId,
+        observed_at: OffsetDateTime,
+    ) -> Result<u64, LedgerError> {
+        // Comparing RFC3339 strings with a SQL `<=` is a real
+        // parser-differential bug, not a theoretical one: the `time`
+        // crate's Rfc3339 formatter omits the fractional-second
+        // component entirely when it is zero, so two timestamps sharing
+        // the same whole second but differing in fractional precision
+        // ("...T00:00:01Z" vs "...T00:00:01.500Z") do not sort the same
+        // lexically as they do chronologically — "01." (0x2E) sorts
+        // before "01Z" (0x5A) byte-for-byte, inverting a comparison that
+        // should go the other way. Parsing every candidate row's own
+        // timestamp and comparing as `OffsetDateTime` values sidesteps
+        // the representation entirely, at the cost of pulling
+        // (typically few) rows into Rust instead of summing in SQL.
+        let mut stmt = tx.prepare(
+            "SELECT settled_amount, settled_at FROM shared_pool_reservations
+             WHERE pool_id = ?1 AND state = 'settled'",
+        )?;
+        let rows = stmt.query_map([&pool_id.0], |row| {
+            let settled_amount: Option<i64> = row.get(0)?;
+            let settled_at: Option<String> = row.get(1)?;
+            Ok((settled_amount, settled_at))
+        })?;
+        let mut total: u64 = 0;
+        for row in rows {
+            let (settled_amount, settled_at) = row?;
+            let (Some(settled_amount), Some(settled_at)) = (settled_amount, settled_at) else {
+                continue;
+            };
+            if parse_time(&settled_at)? <= observed_at {
+                total = total.saturating_add(settled_amount.max(0) as u64);
+            }
+        }
+        Ok(total)
+    }
+
+    /// Computes how much of a provider snapshot's `used` figure is
+    /// genuinely *external* — activity Libra has no record of at all —
+    /// as opposed to activity Libra already knows about and must not
+    /// double-count as spend.
+    ///
+    /// Two independent-review findings (HORO-1779) shaped this
+    /// function's current arithmetic, both confirmed by a real
+    /// oversubscription reproduction and empirically verified by a
+    /// reverted source patch before being accepted as correct:
+    ///
+    /// - `active` is **never** subtracted here. A still-`active` hold is
+    ///   Libra's own *reserved* capacity, not evidence the provider's
+    ///   `used` figure already reflects it — subtracting it let a
+    ///   snapshot's overhang silently zero out the moment Libra's own
+    ///   active sum caught up to the snapshot's `used` value, even
+    ///   though the real external activity the snapshot measured was
+    ///   never retracted (a 10-unit pool could be driven to 14 real
+    ///   units held this way).
+    /// - Only `settled` rows whose `settled_at` is at or before the
+    ///   snapshot's own `observed_at` are subtracted — a settlement that
+    ///   happened *after* the snapshot was observed cannot possibly be
+    ///   part of what the snapshot measured, so including it in the
+    ///   subtraction masks real overhang the same way the `active` bug
+    ///   did, just via the settled path instead.
+    #[allow(clippy::type_complexity)]
     fn external_overhang_tx(
         tx: &rusqlite::Connection,
         pool_id: &PoolId,
-        settled: u64,
-        active: u64,
         now: OffsetDateTime,
     ) -> Result<u64, LedgerError> {
         let row: Option<(String, Option<String>, i64, Option<i64>, Option<i64>)> = tx
@@ -369,7 +445,7 @@ impl LedgerStore {
                 },
             )
             .optional()?;
-        let Some((_observed_at, valid_until, disclosed, used_value, _declared_limit)) = row else {
+        let Some((observed_at, valid_until, disclosed, used_value, _declared_limit)) = row else {
             return Ok(0);
         };
         // A stale snapshot (past its own declared `valid_until`) is
@@ -393,8 +469,9 @@ impl LedgerStore {
             return Ok(0);
         };
         let used_value = used_value.max(0) as u64;
-        let libra_known = settled.saturating_add(active);
-        Ok(used_value.saturating_sub(libra_known))
+        let observed_at = parse_time(&observed_at)?;
+        let settled_before = Self::settled_before_tx(tx, pool_id, observed_at)?;
+        Ok(used_value.saturating_sub(settled_before))
     }
 
     /// Computes [`PoolAdmission`] for `pool_id` as of `now`, inside the
@@ -409,8 +486,7 @@ impl LedgerStore {
             return Ok(None);
         };
         let (settled, active) = Self::settled_and_active_tx(&self.conn, pool_id)?;
-        let external_overhang =
-            Self::external_overhang_tx(&self.conn, pool_id, settled, active, now)?;
+        let external_overhang = Self::external_overhang_tx(&self.conn, pool_id, now)?;
         Ok(Some(PoolAdmission {
             capacity: pool.capacity,
             settled,
@@ -486,8 +562,7 @@ impl LedgerStore {
         }
 
         let (settled, active) = Self::settled_and_active_tx(&tx, req.pool_id)?;
-        let external_overhang =
-            Self::external_overhang_tx(&tx, req.pool_id, settled, active, req.now)?;
+        let external_overhang = Self::external_overhang_tx(&tx, req.pool_id, req.now)?;
         let admission = PoolAdmission {
             capacity: pool.capacity,
             settled,
@@ -509,15 +584,23 @@ impl LedgerStore {
         // `ttl_secs` above `i64::MAX`) and panic (`OffsetDateTime`
         // arithmetic panics outside its representable range) — the same
         // bug class flagged for proactive avoidance in all new code here.
-        // Saturating the seconds value and using `checked_add` reports a
-        // conservative "expires immediately" fallback instead of either
-        // failure mode; an operator-configured TTL is never realistically
-        // this large, so the fallback path exists only as a safety net.
-        let ttl_seconds = i64::try_from(req.ttl_secs).unwrap_or(i64::MAX);
+        //
+        // An earlier version of this code fell back to `req.now` (i.e.
+        // "expires immediately") on overflow. An independent Verify pass
+        // (HORO-1779) found this was the opposite of a safe fallback: a
+        // caller requesting an effectively-unlimited TTL (a realistic
+        // sentinel for a long-running session) had its hold swept as
+        // stale on the very next sweep, and its capacity re-granted to a
+        // second caller — a genuine phantom-free-allowance bug, not a
+        // conservative one. Clamping `ttl_secs` to a generous-but-finite
+        // bound (mirroring `quota_window::MAX_SLIDING_LENGTH_SECS`'s own
+        // 100-year precedent) instead means `checked_add` below can never
+        // actually need a fallback branch.
+        let ttl_seconds = i64::try_from(req.ttl_secs.min(MAX_TTL_SECS)).unwrap_or(i64::MAX);
         let expires_at = req
             .now
             .checked_add(time::Duration::seconds(ttl_seconds))
-            .unwrap_or(req.now);
+            .ok_or_else(invalid)?;
         let amount_i64 = checked_i64(req.amount)?;
         tx.execute(
             "INSERT INTO shared_pool_reservations (
@@ -707,12 +790,27 @@ impl LedgerStore {
     ) -> Result<Vec<SharedPoolReservation>, LedgerError> {
         let now_str = rfc3339(now)?;
         let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
+        // Parsed-timestamp comparison, not a SQL `<=` on the RFC3339
+        // text — the same parser-differential risk fixed in
+        // `settled_before_tx` applies here too: `now` can carry
+        // fractional seconds (e.g. a real `OffsetDateTime::now_utc()`
+        // call) that a lexical string comparison against `expires_at`
+        // would not order chronologically in every case.
         let ids: Vec<String> = {
             let mut stmt = tx.prepare(
-                "SELECT id FROM shared_pool_reservations WHERE state = 'active' AND expires_at <= ?1",
+                "SELECT id, expires_at FROM shared_pool_reservations WHERE state = 'active'",
             )?;
-            let rows = stmt.query_map([&now_str], |row| row.get::<_, String>(0))?;
-            rows.collect::<Result<_, _>>()?
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut ids = Vec::new();
+            for row in rows {
+                let (id, expires_at) = row?;
+                if parse_time(&expires_at)? <= now {
+                    ids.push(id);
+                }
+            }
+            ids
         };
 
         let mut expired = Vec::with_capacity(ids.len());
