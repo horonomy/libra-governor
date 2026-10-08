@@ -288,6 +288,20 @@ fn check_window(
     injected.value = injected
         .value
         .saturating_add(continuity_addition(window, mode));
+    // Continuity is spare per-window headroom, not a reservation the
+    // task actually needs to fit — it must never be able to make an
+    // otherwise-feasible need (already clamped below this window's own
+    // limit by `compute_task_need`) permanently infeasible here. Clamp
+    // the continuity-inflated injected amount back down to this
+    // window's own `limit - 1` (round 4 fixed the cross-window
+    // inconsistency; this clamp is what keeps that fix from
+    // reintroducing round 3's permanent-lockout bug under a nonzero
+    // continuity reserve stacked with backoff).
+    if let Some(limit) = limit_or_capacity(window) {
+        if limit > 0 {
+            injected.value = injected.value.min(limit - 1);
+        }
+    }
 
     let synthetic_id = ReservationId(synthetic_uuid(window.id().0, SYNTHETIC_NEED_TAG));
     let synthetic_hold = OutstandingHold::projected(synthetic_id, injected);
@@ -932,5 +946,50 @@ mod tests {
             }
             other => panic!("expected the sliding window to be limiting, got {other:?}"),
         }
+    }
+
+    /// Regression test for a real bug an independent review found: round
+    /// 4's `compute_task_need` clamps the recorded need to one tick
+    /// below a window's limit, but `check_window` then added the
+    /// Sustain continuity reserve *on top* of that already-clamped
+    /// figure before injecting it — so a clamped-but-still-large need
+    /// plus a nonzero continuity addition could exceed the window's
+    /// limit outright, with no pending hold to ever settle and produce
+    /// a relief instant: `Relief::AfterOutstandingHoldsSettle` with
+    /// nothing pending resolves to `Unavailable(NoProjectedRelief)`,
+    /// which never retries — reintroducing round 3's permanent-lockout
+    /// bug under the specific combination of continuity + backoff this
+    /// fixture exercises. An empty window must always admit a feasible
+    /// candidate immediately, continuity or not.
+    #[test]
+    fn continuity_addition_never_pushes_an_empty_window_into_permanent_lockout() {
+        let id = QuotaWindowId::new();
+        let window = sliding_window(id, 1000, 21_600);
+        let estimate = estimate_with_tokens_p90(300);
+        let input = WindowInput {
+            window: &window,
+            usage: &[],
+            pending: &[],
+            snapshots: &[],
+        };
+        let result = earliest_safe_admit(
+            &[input],
+            &estimate,
+            &policy(),
+            None,
+            None,
+            ForecastMode::Sustain {
+                continuity_reserve_bp: 1000,
+            },
+            400,
+            100,
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        assert_eq!(
+            result,
+            super::super::NextAdmit::Now,
+            "an empty window must admit a feasible candidate immediately, \
+             regardless of continuity reserve stacked with backoff"
+        );
     }
 }
