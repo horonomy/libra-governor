@@ -732,6 +732,19 @@ impl OutstandingHold {
     pub fn amount(&self) -> &QuotaAmount {
         &self.amount
     }
+
+    /// Builds a synthetic, never-persisted hold for a candidate or
+    /// in-flight simulated task (`libra_governor_domain::pacing`'s
+    /// earliest-safe-admit forecast). `id` must be a synthetic id —
+    /// never a real [`ReservationId`] that could collide with a ledger
+    /// row — callers are responsible for keeping the synthetic id space
+    /// disjoint from `Uuid::new_v4()`'s range (see `pacing`'s id
+    /// scheme). `pub(crate)`: this is an internal seam for the pacing
+    /// simulator, not a public way to fabricate holds outside this
+    /// crate.
+    pub(crate) fn projected(id: ReservationId, amount: QuotaAmount) -> Self {
+        Self { id, amount }
+    }
 }
 
 /// A provider-declared gauge reading. [`Self::Undisclosed`] is a real,

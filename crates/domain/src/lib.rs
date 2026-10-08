@@ -51,6 +51,7 @@ mod execution_plan;
 mod execution_receipt;
 mod external_approval;
 mod outcome_attestation;
+pub mod pacing;
 mod policy;
 mod progressive;
 mod quota_window;
