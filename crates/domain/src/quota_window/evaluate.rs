@@ -176,7 +176,14 @@ fn prepare(
         .into_iter()
         .filter(|h| h.amount().unit == *window.unit())
         .collect();
-    let outstanding: u64 = holds.iter().map(|h| h.amount().value).sum();
+    // Saturating, not `.sum()`: a plain u64 sum wraps on overflow in a
+    // release build (overflow checks are debug-only), which would
+    // silently under-report outstanding capacity and fail OPEN — the
+    // opposite of what a quota governor must do. Saturating at u64::MAX
+    // fails closed instead (remaining goes very negative => Blocking).
+    let outstanding: u64 = holds
+        .iter()
+        .fold(0u64, |acc, h| acc.saturating_add(h.amount().value));
 
     PreparedEvidence { usage, outstanding }
 }
@@ -255,7 +262,10 @@ fn evaluate_period(
         .iter()
         .filter(|u| u.occurred_at() >= start && u.occurred_at() < end)
         .collect();
-    let settled: u64 = in_period.iter().map(|u| u.amount().value).sum();
+    // Saturating, not `.sum()` — see the comment on `outstanding` above.
+    let settled: u64 = in_period
+        .iter()
+        .fold(0u64, |acc, u| acc.saturating_add(u.amount().value));
     let remaining = remaining_i64(limit, settled, prepared.outstanding);
     let blocking_now = remaining <= 0;
 
@@ -300,7 +310,10 @@ fn evaluate_sliding(
         .iter()
         .filter(|u| u.occurred_at() > window_start && u.occurred_at() <= now)
         .collect();
-    let settled: u64 = in_window.iter().map(|u| u.amount().value).sum();
+    // Saturating, not `.sum()` — see the comment on `outstanding` above.
+    let settled: u64 = in_window
+        .iter()
+        .fold(0u64, |acc, u| acc.saturating_add(u.amount().value));
     let remaining = remaining_i64(limit, settled, prepared.outstanding);
     let blocking_now = remaining <= 0;
 

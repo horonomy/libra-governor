@@ -785,6 +785,67 @@ fn from_economic_event_only_maps_additive_spend_facts() {
 // --- Fixture 20: dedup --------------------------------------------------
 
 #[test]
+fn settled_sum_saturates_instead_of_wrapping_on_u64_overflow() {
+    // A plain `.sum()` wraps on overflow in a release build (overflow
+    // checks are debug-only) — that would silently under-report
+    // `settled` and fail OPEN. Saturating must instead fail closed: the
+    // window stays Blocking rather than wrapping to a small number.
+    let w = window(
+        QuotaUnit::Tokens,
+        WindowKind::Sliding {
+            length_secs: 60,
+            limit: 100,
+        },
+    );
+    let now = datetime!(2026-10-08 12:00:00 UTC);
+    let near_max = usage(now, u64::MAX - 10);
+    let also_large = usage(now, 1_000);
+    let evidence = QuotaEvidence {
+        usage: &[near_max, also_large],
+        holds: &[],
+        snapshots: &[],
+    };
+    let eval = w.evaluate(&evidence, now);
+    let WindowState::Period(p) = eval.state else {
+        panic!("expected Period state")
+    };
+    assert_eq!(p.settled, u64::MAX, "must saturate, not wrap, on overflow");
+    assert_eq!(eval.blocking, BlockingStatus::Blocking);
+}
+
+#[test]
+fn outstanding_sum_saturates_instead_of_wrapping_on_u64_overflow() {
+    let w = window(
+        QuotaUnit::Tokens,
+        WindowKind::Sliding {
+            length_secs: 60,
+            limit: 100,
+        },
+    );
+    let now = datetime!(2026-10-08 12:00:00 UTC);
+    let hold_a =
+        OutstandingHold::from_reservation(&fixture_reservation(u64::MAX - 10, ResState::Active))
+            .unwrap();
+    let hold_b =
+        OutstandingHold::from_reservation(&fixture_reservation(1_000, ResState::Active)).unwrap();
+    let evidence = QuotaEvidence {
+        usage: &[],
+        holds: &[hold_a, hold_b],
+        snapshots: &[],
+    };
+    let eval = w.evaluate(&evidence, now);
+    let WindowState::Period(p) = eval.state else {
+        panic!("expected Period state")
+    };
+    assert_eq!(
+        p.outstanding,
+        u64::MAX,
+        "must saturate, not wrap, on overflow"
+    );
+    assert_eq!(eval.blocking, BlockingStatus::Blocking);
+}
+
+#[test]
 fn duplicated_usage_id_counts_once() {
     let id = EconomicEventId::new();
     let now = datetime!(2026-10-08 12:00:00 UTC);
