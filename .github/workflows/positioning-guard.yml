@@ -1,0 +1,74 @@
+# Semantic positioning guard (HORO-1740): catches identity narrowing to
+# "an agentic coding tool"/"Claude Code and Codex" (the HORO-1737
+# regression) across README, PRODUCT.md and the CLI --help banner.
+# Standalone, additive — does not touch ci.yml, codeql.yml,
+# phase0-ci.yml or providers-ci.yml.
+name: Positioning guard
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - README.md
+      - PRODUCT.md
+      - crates/cli/src/main.rs
+      - .github/workflows/positioning-guard.yml
+  push:
+    branches: [main]
+    paths:
+      - README.md
+      - PRODUCT.md
+      - crates/cli/src/main.rs
+      - .github/workflows/positioning-guard.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: positioning-guard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-identity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout libra-governor
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: product
+
+      - name: Checkout horonomy/.github (positioning registry)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: horonomy/.github
+          ref: e03d9bd8c421514efef5167feb2e77698624f7bf
+          sparse-checkout: |
+            scripts
+            metadata/positioning
+          sparse-checkout-cone-mode: false
+          path: guard
+
+      - name: Check README identity paragraph
+        run: |
+          python3 guard/scripts/check_positioning.py text \
+            --product libra-governor --surface identity \
+            --record guard/metadata/positioning/libra-governor.yaml \
+            --file product/README.md \
+            --from '# Libra Governor' --to 'See [`PRODUCT.md`]'
+
+      - name: Check PRODUCT.md "What Libra is" section
+        run: |
+          python3 guard/scripts/check_positioning.py text \
+            --product libra-governor --surface identity \
+            --record guard/metadata/positioning/libra-governor.yaml \
+            --file product/PRODUCT.md \
+            --from '## What Libra is' --to 'one.'
+
+      - name: Check CLI --help banner
+        run: |
+          python3 guard/scripts/check_positioning.py text \
+            --product libra-governor --surface identity \
+            --record guard/metadata/positioning/libra-governor.yaml \
+            --file product/crates/cli/src/main.rs \
+            --from 'local-first execution governor' --to '{USAGE}'
