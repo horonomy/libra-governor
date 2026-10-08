@@ -11,31 +11,42 @@
 # the binary it just built to report on itself.
 #
 # Usage: run from the root of a clone of this repository:
-#   ./scripts/install.sh
+#   ./scripts/install.sh [--hooks-only]
 set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: scripts/install.sh [--help]
+Usage: scripts/install.sh [--hooks-only] [--help]
 
 Builds and installs the libra-governor binary from this repository
-clone (via `cargo install --path crates/cli --locked`), wires it into
-Claude Code's ~/.claude/settings.json, and runs a diagnostic to confirm
-the result.
+clone (via `cargo install --path crates/cli --locked`), wires its Claude
+Code hooks into Claude Code's ~/.claude/settings.json, and runs a
+diagnostic to confirm the result. By default, also installs Libra's
+legacy statusline when the slot is free; --hooks-only leaves statusLine
+exactly as configured, including leaving it absent. Set
+LIBRA_GOVERNOR_CLAUDE_DIR to select a different Claude Code settings
+directory for a scoped install or testing.
 
 Requires: a Rust toolchain (cargo, rustc) already installed. See
 https://rustup.rs if you do not have one.
 
 Never runs as root, never uses sudo, and only ever writes to
 $CARGO_HOME/bin (cargo's own default install location),
-$HOME/.claude/settings.json (Claude Code's own settings file), and this
-tool's own state directory (see crates/daemon/src/paths.rs).
+$LIBRA_GOVERNOR_CLAUDE_DIR/settings.json when set (otherwise
+$HOME/.claude/settings.json), and this tool's own state directory (see
+crates/daemon/src/paths.rs).
 EOF
 }
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     usage
     exit 0
+fi
+
+if [[ "$#" -gt 1 || ( "${1:-}" != "" && "${1:-}" != "--hooks-only" ) ]]; then
+    echo "error: unknown argument(s): $*" >&2
+    usage >&2
+    exit 2
 fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -67,8 +78,13 @@ fi
 echo "Installed: $bin_path"
 echo
 
-echo "Wiring Claude Code integration (~/.claude/settings.json) ..."
-"$bin_path" install
+settings_dir="${LIBRA_GOVERNOR_CLAUDE_DIR:-$HOME/.claude}"
+echo "Wiring Claude Code integration ($settings_dir/settings.json) ..."
+if [[ "${1:-}" == "--hooks-only" ]]; then
+    "$bin_path" install --hooks-only
+else
+    "$bin_path" install
+fi
 echo
 
 echo "Running diagnostics ..."
@@ -80,7 +96,11 @@ set -e
 echo
 echo "Install complete. Next steps:"
 echo "  1. Restart Claude Code (or open a new session) so it picks up the settings change."
-echo "  2. Submit any prompt — the statusline should update within a couple of seconds."
+if [[ "${1:-}" == "--hooks-only" ]]; then
+    echo "  2. Submit any prompt to exercise the hooks; statusLine was left unchanged."
+else
+    echo "  2. Submit any prompt — the statusline should update within a couple of seconds."
+fi
 echo "  3. Run 'libra-governor doctor' any time to check on things."
 echo "  4. See README.md and integrations/claude-code/README.md for policy presets,"
 echo "     the optional enforcement gateway, and troubleshooting."

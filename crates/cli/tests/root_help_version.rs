@@ -27,6 +27,10 @@ fn help_flag_exits_zero_and_prints_usage() {
             "{flag} output should contain a Usage section: {stdout}"
         );
         assert!(
+            stdout.contains("--hooks-only"),
+            "help should document hooks-only install: {stdout}"
+        );
+        assert!(
             stdout.contains("doctor"),
             "{flag} output should list real subcommands: {stdout}"
         );

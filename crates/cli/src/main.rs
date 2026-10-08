@@ -50,10 +50,10 @@
 //!   statusline wiring, gateway configuration and capability tier, and
 //!   `config.json` validity (HORO-1150). Never spawns the daemon, never
 //!   prints a secret.
-//! - `install [--agent codex]` — wires this binary's hooks (and, for
-//!   Claude Code, statusline) into `~/.claude/settings.json` or
+//! - `install [--hooks-only] [--agent codex]` — wires this binary's hooks (and,
+//!   for Claude Code by default, statusline) into `~/.claude/settings.json` or
 //!   `~/.codex/hooks.json`, preserving every other key (HORO-1150,
-//!   `--agent codex` in HORO-1157).
+//!   `--agent codex` in HORO-1157, `--hooks-only` in HORO-1743).
 //! - `uninstall [--agent codex] [--yes]` — removes exactly what `install`
 //!   added, plus (with confirmation) the state directory and, if this
 //!   tool installed it, the daemon binary (HORO-1150, `--agent codex` in
@@ -130,7 +130,8 @@ Usage:
   libra-governor gateway token
   libra-governor gateway status
   libra-governor doctor [--json]
-  libra-governor install [--agent codex]
+  libra-governor install [--hooks-only]
+  libra-governor install --agent codex
   libra-governor uninstall [--agent codex] [--yes]
   libra-governor adapter <operation> [--json]
   libra-governor agents [--json]
@@ -190,6 +191,7 @@ fn main() {
         ["doctor"] => doctor_cmd::run(false),
         ["doctor", "--json"] => doctor_cmd::run(true),
         ["install"] => install_cmd::run(),
+        ["install", "--hooks-only"] => install_cmd::run_hooks_only(),
         ["install", "--agent", "codex"] => install_cmd::run_codex(),
         ["uninstall"] => uninstall_cmd::run(false),
         ["uninstall", "--yes"] => uninstall_cmd::run(true),

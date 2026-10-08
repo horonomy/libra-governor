@@ -240,8 +240,12 @@ crates/cli --locked && libra-governor install`) from the repository root
 — see the root [`README.md`](../../README.md#install), which does
 exactly the settings.json edit below for you, safely (see
 [`README.md#uninstall`](../../README.md#uninstall) for the guarantees).
-The manual steps below are what that command automates, for anyone who
-wants to see or do it by hand.
+To install only Libra's three hooks without changing `statusLine`, use
+`./scripts/install.sh --hooks-only` or `libra-governor install --hooks-only`.
+That mode preserves `statusLine` exactly as it is, whether it is absent,
+foreign, or an unrecognized JSON value. The manual steps below describe
+the default install, which also adds Libra's legacy statusline only when
+the slot is free.
 
 Build the binary and put it on your `PATH` (or reference it by absolute
 path in the settings below):

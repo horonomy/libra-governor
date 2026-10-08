@@ -257,7 +257,18 @@ impl Sandbox {
     }
 
     fn run(&self, args: &[&str]) -> (std::process::Output, Duration) {
+        self.run_with_home(args, None)
+    }
+
+    fn run_with_home(
+        &self,
+        args: &[&str],
+        home: Option<&std::path::Path>,
+    ) -> (std::process::Output, Duration) {
         let mut cmd = Command::new(&self.bin_path);
+        if let Some(home) = home {
+            cmd.env("HOME", home);
+        }
         cmd.args(args)
             .env("LIBRA_GOVERNOR_STATE_DIR", &self.state_dir)
             .env("LIBRA_GOVERNOR_CLAUDE_DIR", &self.claude_dir)
@@ -367,6 +378,123 @@ fn install_doctor_uninstall_doctor_lifecycle() {
     assert!(
         stdout_again.to_lowercase().contains("not installed"),
         "doctor after uninstall must report not-installed again: {stdout_again}"
+    );
+}
+
+#[test]
+fn install_hooks_only_preserves_statusline_writes_marker_and_passes_doctor() {
+    let sandbox = Sandbox::new();
+    let settings_path = sandbox.claude_dir.join("settings.json");
+    let foreign_statusline = serde_json::json!({
+        "type": "command",
+        "command": "/usr/local/bin/foreign-statusline",
+        "owner": "someone-else"
+    });
+    let seed = serde_json::json!({
+        "statusLine": foreign_statusline,
+        "unknownFutureSetting": { "keep": true }
+    });
+    std::fs::write(&settings_path, serde_json::to_vec_pretty(&seed).unwrap()).unwrap();
+
+    let (install_output, _) = sandbox.run(&["install", "--hooks-only"]);
+    let (doctor_output, _) = sandbox.run(&["doctor"]);
+    assert_profile_hooks_only_result(
+        &sandbox,
+        install_output,
+        doctor_output,
+        &settings_path,
+        Some(&seed),
+        None,
+    );
+}
+
+#[test]
+fn install_hooks_only_leaves_absent_profile_statusline_absent_and_global_sentinel_untouched() {
+    let sandbox = Sandbox::new();
+    let settings_path = sandbox.claude_dir.join("settings.json");
+    let global_settings_path = sandbox._claude_parent.path().join(".claude/settings.json");
+    std::fs::create_dir_all(global_settings_path.parent().unwrap()).unwrap();
+    let global_sentinel =
+        br#"{"statusLine":{"type":"command","command":"/usr/local/bin/global-sentinel"}}"#;
+    std::fs::write(&global_settings_path, global_sentinel).unwrap();
+
+    let (install_output, _) = sandbox.run_with_home(
+        &["install", "--hooks-only"],
+        Some(sandbox._claude_parent.path()),
+    );
+    let (doctor_output, _) =
+        sandbox.run_with_home(&["doctor"], Some(sandbox._claude_parent.path()));
+    assert_profile_hooks_only_result(
+        &sandbox,
+        install_output,
+        doctor_output,
+        &settings_path,
+        None,
+        Some((&global_settings_path, global_sentinel)),
+    );
+}
+
+fn assert_profile_hooks_only_result(
+    sandbox: &Sandbox,
+    install_output: std::process::Output,
+    doctor_output: std::process::Output,
+    settings_path: &std::path::Path,
+    expected_settings: Option<&serde_json::Value>,
+    global_sentinel: Option<(&std::path::Path, &[u8])>,
+) {
+    assert!(
+        install_output.status.success(),
+        "hooks-only install failed: {}",
+        String::from_utf8_lossy(&install_output.stderr)
+    );
+    let installed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(settings_path).unwrap()).unwrap();
+    if let Some(expected) = expected_settings {
+        assert_eq!(installed["statusLine"], expected["statusLine"]);
+        assert_eq!(
+            installed["unknownFutureSetting"],
+            expected["unknownFutureSetting"]
+        );
+    } else {
+        assert!(
+            installed.get("statusLine").is_none(),
+            "hooks-only install must not create a profile statusLine: {installed}"
+        );
+    }
+    for subcommand in ["hook user-prompt-submit", "hook post-tool-use", "hook stop"] {
+        assert!(
+            std::fs::read_to_string(settings_path)
+                .unwrap()
+                .contains(subcommand),
+            "expected Libra hook {subcommand} in settings"
+        );
+    }
+    assert!(!installed.to_string().contains("/libra-governor statusline"));
+    if let Some((path, original_bytes)) = global_sentinel {
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            original_bytes,
+            "profile-scoped install must leave the global settings sentinel untouched"
+        );
+    }
+
+    let marker: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(sandbox.state_dir.join("install.json")).unwrap())
+            .unwrap();
+    assert_eq!(marker["installed_by"], "libra-governor");
+    assert_eq!(
+        marker["binary_path"],
+        sandbox.bin_path.display().to_string()
+    );
+    assert!(
+        doctor_output.status.success(),
+        "doctor after hooks-only install failed: {}",
+        String::from_utf8_lossy(&doctor_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&doctor_output.stdout).contains("hooks wired"),
+        "{}",
+        String::from_utf8_lossy(&doctor_output.stdout)
     );
 }
 

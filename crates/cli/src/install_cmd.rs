@@ -31,6 +31,15 @@ use crate::{claude_settings, codex_hooks_file};
 pub const INSTALL_MARKER_FILE_NAME: &str = "install.json";
 
 pub fn run() {
+    run_claude(true);
+}
+
+/// Installs just the Claude Code hooks, without touching `statusLine`.
+pub fn run_hooks_only() {
+    run_claude(false);
+}
+
+fn run_claude(install_statusline: bool) {
     let binary = match std::env::current_exe() {
         Ok(path) => path,
         Err(e) => {
@@ -57,7 +66,11 @@ pub fn run() {
         let contract = libra_governor_daemon::host_runtime::contract::HostContract::load()?;
         libra_governor_daemon::host_runtime::config_lifecycle::ConfigLifecycle::new(root, contract)
             .run_legacy_claude(&settings_path, true, |root| {
-                let applied = claude_settings::apply(&settings_path, &binary);
+                let applied = if install_statusline {
+                    claude_settings::apply(&settings_path, &binary)
+                } else {
+                    claude_settings::apply_hooks_only(&settings_path, &binary)
+                };
                 if applied.is_ok() {
                     write_install_marker_at(&binary, root);
                 }
@@ -79,7 +92,11 @@ pub fn run() {
                 settings_path.display()
             );
             println!("  hooks added:      {}", applied.hooks_added);
-            println!("  statusline added: {}", applied.statusline_added);
+            if install_statusline {
+                println!("  statusline added: {}", applied.statusline_added);
+            } else {
+                println!("  statusLine:       left unchanged");
+            }
             if applied.statusline_conflict {
                 println!(
                     "  statusline:       left untouched — a non-Governor statusLine is already configured"
