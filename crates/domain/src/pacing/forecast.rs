@@ -142,6 +142,23 @@ pub fn earliest_safe_admit(
         return super::NextAdmit::Unavailable(UnavailableReason::BelowMinConfidence);
     }
 
+    // Computed once for the whole candidate — see `compute_task_need`'s
+    // own docs for why this must be a single figure, not one recomputed
+    // (and potentially clamped differently) inside each window's check.
+    let all_windows: Vec<&QuotaWindow> = windows.iter().map(|w| w.window).collect();
+    let need = match compute_task_need(
+        &all_windows,
+        need_estimate,
+        contract,
+        estimate_for_reserve,
+        policy,
+        backoff_numerator,
+        backoff_denominator,
+    ) {
+        Ok(need) => need,
+        Err(reason) => return super::NextAdmit::Unavailable(reason),
+    };
+
     let mut t = start_at;
     let mut limiting_from_last_round: Option<QuotaWindowId> = None;
 
@@ -149,21 +166,7 @@ pub fn earliest_safe_admit(
         let mut latest_relief: Option<(OffsetDateTime, QuotaWindowId)> = None;
 
         for input in windows {
-            let need = match window_need(
-                input.window,
-                need_estimate,
-                contract,
-                estimate_for_reserve,
-                policy,
-                mode,
-                backoff_numerator,
-                backoff_denominator,
-            ) {
-                Ok(need) => need,
-                Err(reason) => return super::NextAdmit::Unavailable(reason),
-            };
-
-            match check_window(input, need.as_ref(), t) {
+            match check_window(input, need.as_ref(), mode, t) {
                 WindowOutcome::Admit => {}
                 WindowOutcome::BlockedAt(relief_at) => {
                     if relief_at <= t {
@@ -233,7 +236,8 @@ fn extract_relief(state: &WindowState) -> Relief {
 
 fn check_window(
     input: &WindowInput<'_>,
-    need: Option<&WindowNeed>,
+    need: Option<&QuotaAmount>,
+    mode: ForecastMode,
     t: OffsetDateTime,
 ) -> WindowOutcome {
     let window = input.window;
@@ -268,28 +272,25 @@ fn check_window(
     let Some(need) = need else {
         return WindowOutcome::Unavailable(UnavailableReason::NoEstimateInWindowUnit(window.id()));
     };
-    if need.unscaled.unit != *window.unit() {
+    if need.unit != *window.unit() {
+        // `compute_task_need` computed this figure against a different
+        // window's unit (or this window simply isn't one the task's
+        // estimate has a figure for at all) — the feasibility/clamping
+        // it already did is against *other* windows, not this one, so
+        // this window's own constraint is honestly unknown.
         return WindowOutcome::Unavailable(UnavailableReason::NoEstimateInWindowUnit(window.id()));
     }
-    if let Some(limit) = limit_or_capacity(window) {
-        // The *unscaled* need (independent of any backoff ratio) is the
-        // honest feasibility check: this window could truly never admit
-        // this task regardless of pacing. `>=`, not `>` — `remaining <=
-        // 0` blocks at a need exactly equal to the limit, so an equal
-        // need can never actually be admitted either (see
-        // `evaluate_sliding`/`evaluate_period`'s own `blocking_now`
-        // test). The backoff-*scaled* need is deliberately never checked
-        // here — see `window_need`'s own docs for why backoff must only
-        // throttle, never permanently lock a principal out.
-        if need.unscaled.value >= limit {
-            return WindowOutcome::Unavailable(UnavailableReason::NeedExceedsWindowLimit(
-                window.id(),
-            ));
-        }
-    }
+
+    // Sustain's continuity reserve is injected here, per window, on top
+    // of the one task-level need — see `compute_task_need`'s docs for
+    // why it is never folded into the recorded figure itself.
+    let mut injected = need.clone();
+    injected.value = injected
+        .value
+        .saturating_add(continuity_addition(window, mode));
 
     let synthetic_id = ReservationId(synthetic_uuid(window.id().0, SYNTHETIC_NEED_TAG));
-    let synthetic_hold = OutstandingHold::projected(synthetic_id, need.scaled.clone());
+    let synthetic_hold = OutstandingHold::projected(synthetic_id, injected);
     let mut holds: Vec<OutstandingHold> = pending_holds;
     holds.push(synthetic_hold);
     let mut usage: Vec<QuotaUsage> = input.usage.to_vec();
@@ -343,109 +344,118 @@ fn resource_kind_for_unit(unit: &QuotaUnit) -> Option<ResourceKind> {
     }
 }
 
-/// Computes this window's need for the candidate task: the frozen
-/// estimate's p90 remaining-resource quantile in the window's own unit,
-/// floored at [`completion_reserve_for`]'s figure when that figure's
-/// resource kind matches, inflated by the Sustain continuity reserve
-/// (`continuity_reserve_bp × limit`, window-limit-based, never estimate-
-/// based) and by the integer backoff ratio. Returns `Ok(None)` only for
-/// a Gauge window (no quantity applies there — see module docs);
-/// returns `Err` for every honest reason this figure cannot be computed
-/// at all.
-/// The two forms of a window's need this module cares about:
-/// `unscaled` (base estimate, floored at the completion reserve, plus
-/// Sustain's continuity addition) is the figure a feasibility check
-/// (`NeedExceedsWindowLimit`) must use — it is independent of any
-/// principal's backoff. `scaled` additionally applies the integer
-/// backoff ratio, and is what actually gets injected as the candidate's
-/// synthetic hold. Keeping them distinct is what lets backoff genuinely
-/// throttle (clamp) a principal's new starts without ever being able to
-/// permanently lock them out: see [`check_window`]'s use of both.
-pub(crate) struct WindowNeed {
-    pub unscaled: QuotaAmount,
-    pub scaled: QuotaAmount,
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn window_need(
-    window: &QuotaWindow,
+/// Computes **one** recorded need for the candidate task — not a
+/// separate figure per window. A prior version of this module computed
+/// need independently inside each window's own check, which let a
+/// window with a smaller limit or a larger Sustain continuity addition
+/// clamp or inflate the figure differently than another window sharing
+/// the same unit; `recorded_hold` then recorded whichever window's
+/// figure happened to be largest, which could be *more* than what some
+/// other window had actually verified safe — AC2's "fits all enforceable
+/// hard windows" requires one number that is simultaneously true for
+/// every one of them, not a per-window figure reconciled after the fact.
+///
+/// The frozen estimate's p90 remaining-resource quantile (in the shared
+/// unit every matching, non-Gauge window uses) is floored at
+/// [`completion_reserve_for`]'s figure, then scaled by the integer
+/// backoff ratio, then clamped to one tick below the *smallest* limit
+/// among every matching window — the largest amount any of them could
+/// ever admit. The feasibility check (`NeedExceedsWindowLimit`) runs
+/// against the *unscaled* figure against that same smallest limit:
+/// backoff must only throttle (via the clamp), never permanently lock a
+/// principal out by making an inflated need "infeasible" forever.
+///
+/// Sustain's continuity reserve (`continuity_reserve_bp × limit`) is
+/// deliberately **not** part of this recorded figure — it is spare
+/// per-window admission headroom, not an amount the task actually
+/// reserves or ever settles as usage. [`check_window`] adds it only to
+/// what gets injected into *that* window's own evaluation.
+pub(crate) fn compute_task_need(
+    windows: &[&QuotaWindow],
     estimate: &RemainingWorkEstimate,
     contract: Option<&CompletionContract>,
     estimate_for_reserve: Option<&Estimate>,
     policy: &Policy,
-    mode: ForecastMode,
     backoff_numerator: u64,
     backoff_denominator: u64,
-) -> Result<Option<WindowNeed>, UnavailableReason> {
-    if is_gauge(window) {
-        return Ok(None);
-    }
-
-    let Some(kind) = resource_kind_for_unit(window.unit()) else {
-        return Err(UnavailableReason::NoEstimateInWindowUnit(window.id()));
-    };
-
-    let base = match &estimate.resource {
-        RemainingResource::Quantiles {
-            kind: est_kind,
-            p90,
-            ..
-        } => {
-            if *est_kind != kind {
-                return Err(UnavailableReason::NoEstimateInWindowUnit(window.id()));
-            }
-            *p90
-        }
+) -> Result<Option<QuotaAmount>, UnavailableReason> {
+    let (kind, base) = match &estimate.resource {
+        RemainingResource::Quantiles { kind, p90, .. } => (*kind, *p90),
         RemainingResource::Insufficient { .. } | RemainingResource::Unavailable { .. } => {
             return Err(UnavailableReason::EstimateInsufficient);
         }
     };
 
-    let mut need = resource_amount_to_quota_amount(base, window.unit())
-        .ok_or(UnavailableReason::NoEstimateInWindowUnit(window.id()))?;
+    let matching: Vec<&&QuotaWindow> = windows
+        .iter()
+        .filter(|w| !is_gauge(w) && resource_kind_for_unit(w.unit()) == Some(kind))
+        .collect();
+    let Some(first) = matching.first() else {
+        // No non-Gauge window in this unit at all — nothing to compute
+        // a feasibility figure against. Each window's own `check_window`
+        // call still independently reports `NoEstimateInWindowUnit` for
+        // itself when its unit doesn't match.
+        return Ok(None);
+    };
+    let unit = first.unit().clone();
+
+    let mut need = resource_amount_to_quota_amount(base, &unit)
+        .ok_or_else(|| UnavailableReason::NoEstimateInWindowUnit(first.id()))?;
 
     if let Some(contract) = contract {
         let reserve = completion_reserve_for(contract, estimate_for_reserve, policy);
         if reserve.amount.kind() == kind {
-            if let Some(floor) = resource_amount_to_quota_amount(reserve.amount, window.unit()) {
+            if let Some(floor) = resource_amount_to_quota_amount(reserve.amount, &unit) {
                 need.value = need.value.max(floor.value);
             }
         }
     }
 
-    if let ForecastMode::Sustain {
-        continuity_reserve_bp,
-    } = mode
-    {
-        if let Some(limit) = limit_or_capacity(window) {
-            let addition = (limit as u128)
-                .saturating_mul(continuity_reserve_bp as u128)
-                .saturating_div(10_000);
-            need.value = need
-                .value
-                .saturating_add(u64::try_from(addition).unwrap_or(u64::MAX));
+    let smallest_limit = matching
+        .iter()
+        .filter_map(|w| limit_or_capacity(w).map(|limit| (limit, w.id())))
+        .min_by_key(|(limit, _)| *limit);
+
+    if let Some((limit, limiting_window)) = smallest_limit {
+        // `>=`, not `>`: `remaining <= 0` blocks at a need exactly equal
+        // to the limit (see `evaluate_sliding`/`evaluate_period`), so an
+        // equal need can never actually be admitted either.
+        if need.value >= limit {
+            return Err(UnavailableReason::NeedExceedsWindowLimit(limiting_window));
         }
     }
-
-    let unscaled = need.clone();
 
     let scaled_raw = (need.value as u128)
         .saturating_mul(backoff_numerator.max(1) as u128)
         .saturating_div(backoff_denominator.max(1) as u128);
-    let mut scaled = need;
-    scaled.value = u64::try_from(scaled_raw).unwrap_or(u64::MAX);
-    // Backoff throttles; it must never be able to permanently lock a
-    // principal out. Clamp the scaled need to the largest amount this
-    // window could ever admit (`limit - 1`, since `remaining <= 0`
-    // blocks at exactly the limit) rather than letting an inflated need
-    // alone make `NeedExceedsWindowLimit` fire forever.
-    if let Some(limit) = limit_or_capacity(window) {
+    need.value = u64::try_from(scaled_raw).unwrap_or(u64::MAX);
+
+    if let Some((limit, _)) = smallest_limit {
         if limit > 0 {
-            scaled.value = scaled.value.min(limit - 1);
+            need.value = need.value.min(limit - 1);
         }
     }
 
-    Ok(Some(WindowNeed { unscaled, scaled }))
+    Ok(Some(need))
+}
+
+/// The Sustain continuity-reserve addition for one window — see
+/// [`compute_task_need`]'s docs for why this is computed per-window and
+/// kept out of the single recorded need.
+fn continuity_addition(window: &QuotaWindow, mode: ForecastMode) -> u64 {
+    let ForecastMode::Sustain {
+        continuity_reserve_bp,
+    } = mode
+    else {
+        return 0;
+    };
+    let Some(limit) = limit_or_capacity(window) else {
+        return 0;
+    };
+    let addition = (limit as u128)
+        .saturating_mul(continuity_reserve_bp as u128)
+        .saturating_div(10_000);
+    u64::try_from(addition).unwrap_or(u64::MAX)
 }
 
 fn resource_amount_to_quota_amount(
@@ -809,6 +819,118 @@ mod tests {
                 );
             }
             other => panic!("expected At(+6h) limited by the sliding window, got {other:?}"),
+        }
+    }
+
+    /// Regression test for a real bug an independent review found: the
+    /// need used to check each window — and the figure ultimately
+    /// recorded as the Start's hold — used to be computed independently
+    /// *per window*, so a Sustain continuity reserve (window-limit-
+    /// scaled, different for a 1000-limit sliding window vs. a
+    /// 1200-limit weekly one) could make one window's check pass with a
+    /// different injected amount than another's, and `recorded_hold`
+    /// would then record whichever was largest — a figure that was
+    /// never actually checked, consistently, against every window.
+    /// `compute_task_need` is now computed once for the whole candidate,
+    /// with continuity applied only as a per-window addition at
+    /// injection time, never folded into the recorded figure.
+    #[test]
+    fn ac2_one_recorded_need_consistently_checked_against_every_window() {
+        let sliding_id = QuotaWindowId::new();
+        let sliding = sliding_window(sliding_id, 1000, 21_600);
+        let weekly_id = QuotaWindowId::new();
+        let utc = crate::quota_window::IanaTimeZone::new("UTC").unwrap();
+        let weekly = QuotaWindow::validated(
+            weekly_id,
+            QuotaScope {
+                subject: QuotaSubject::Principal(PrincipalId("p".to_string())),
+                source: EntitlementSource::OperatorConfigured,
+                confidence: Confidence::High,
+                observed_at: OffsetDateTime::UNIX_EPOCH,
+                valid_until: None,
+            },
+            QuotaUnit::Tokens,
+            WindowKind::FixedAligned {
+                period: crate::quota_window::AlignedPeriod::Week {
+                    starts_on: crate::quota_window::ResetWeekday::Monday,
+                    at: crate::quota_window::WallClockTime::new(0, 0).unwrap(),
+                },
+                time_zone: utc,
+                limit: 1200,
+            },
+        )
+        .unwrap();
+
+        let t0 = time::macros::datetime!(2024-01-01 00:00:00 UTC);
+        let estimate = estimate_with_tokens_p90(100);
+
+        // The one figure `compute_task_need` would record — confirmed
+        // identical regardless of which window's limit or continuity
+        // addition one might otherwise have been tempted to key it off.
+        let all_windows = vec![&sliding, &weekly];
+        let recorded = compute_task_need(&all_windows, &estimate, None, None, &policy(), 1, 1)
+            .unwrap()
+            .expect("both windows share a unit the estimate has a figure for");
+        assert_eq!(
+            recorded.value, 100,
+            "no continuity addition belongs in the recorded figure"
+        );
+
+        // 850 tokens of existing usage: tight enough that the sliding
+        // window (1000 limit, continuity addition 100) blocks, while
+        // the weekly window (1200 limit, continuity addition 120) does
+        // not — demonstrating the two windows' *different* per-window
+        // continuity additions never leak into what's recorded, only
+        // into what's injected at check time.
+        let usage: Vec<QuotaUsage> = (0..1)
+            .map(|_| {
+                QuotaUsage::new(
+                    crate::EconomicEventId(uuid::Uuid::new_v4()),
+                    t0,
+                    QuotaAmount::new(QuotaUnit::Tokens, 850),
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let windows = vec![
+            WindowInput {
+                window: &sliding,
+                usage: &usage,
+                pending: &[],
+                snapshots: &[],
+            },
+            WindowInput {
+                window: &weekly,
+                usage: &usage,
+                pending: &[],
+                snapshots: &[],
+            },
+        ];
+
+        let result = earliest_safe_admit(
+            &windows,
+            &estimate,
+            &policy(),
+            None,
+            None,
+            ForecastMode::Sustain {
+                continuity_reserve_bp: 1000,
+            },
+            1,
+            1,
+            t0,
+        );
+        match result {
+            super::super::NextAdmit::At { limiting, .. } => {
+                assert_eq!(
+                    limiting, sliding_id,
+                    "the sliding window's own (smaller) continuity addition is what \
+                     blocks here — the weekly window's own larger addition never \
+                     affects the recorded need, only its own injected check"
+                );
+            }
+            other => panic!("expected the sliding window to be limiting, got {other:?}"),
         }
     }
 }

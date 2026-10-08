@@ -49,16 +49,15 @@ struct ActiveTask {
     principal: String,
     hold: QuotaAmount,
     /// The floor settlement falls back to when no `Spend` was ever
-    /// reported — deliberately *not* `hold.value`: `hold` is the full
-    /// admission-time reservation, which for SUSTAIN includes the
-    /// continuity-reserve margin (`continuity_reserve_bp × limit`,
-    /// window-limit-scaled, not task-need-scaled). Settling at the full
-    /// `hold` would record that per-window admission margin as if it
-    /// were real spend, inflating this task's contribution to every
-    /// window's cumulative-usage history. `settlement_floor` is the same
-    /// need computed with the continuity term forced off (still
-    /// including the completion-reserve floor — the ledger's own
-    /// settle-at-full-reservation convention — and backoff scaling).
+    /// reported — deliberately *not* `hold.value`: `hold` may be
+    /// backoff-inflated (a principal currently throttled by an earlier
+    /// overrun). Settling at the full inflated `hold` would record that
+    /// throttling margin as if it were real spend the task never
+    /// actually made, inflating its contribution to every window's
+    /// cumulative-usage history. `settlement_floor` is the same need
+    /// computed with the backoff ratio forced to 100 (still including
+    /// the completion-reserve floor — the ledger's own settle-at-full-
+    /// reservation convention).
     settlement_floor: u64,
     #[allow(dead_code)]
     started_at: OffsetDateTime,
@@ -302,19 +301,13 @@ fn try_admit(
 
         match resolved_at {
             Some(instant) if instant <= now => {
-                let hold = recorded_hold(&task.estimate, scenario, policy, mode, backoff);
-                // Burst (no continuity-reserve addition) so the
-                // settlement floor is the task's own need, never
-                // inflated by SUSTAIN's window-limit-scaled admission
-                // margin — see `ActiveTask::settlement_floor`'s docs.
-                let settlement_floor = recorded_hold(
-                    &task.estimate,
-                    scenario,
-                    policy,
-                    ForecastMode::Burst,
-                    backoff,
-                )
-                .value;
+                let hold = recorded_hold(&task.estimate, scenario, policy, backoff);
+                // Backoff ratio forced to 100 (no inflation): a
+                // throttled task that never reports a `Spend` must
+                // settle at its own real need, never at a backoff-
+                // inflated figure that was never actually spent — see
+                // `ActiveTask::settlement_floor`'s docs.
+                let settlement_floor = recorded_hold(&task.estimate, scenario, policy, 100).value;
                 start_task(
                     &mut working,
                     task.id,
@@ -436,29 +429,21 @@ fn recorded_hold(
     estimate: &crate::progressive::RemainingWorkEstimate,
     scenario: &Scenario<'_>,
     policy: &Policy,
-    mode: ForecastMode,
     backoff: u64,
 ) -> QuotaAmount {
-    let mut best: Option<QuotaAmount> = None;
-    for window in scenario.windows {
-        if let Ok(Some(need)) = super::forecast::window_need(
-            window,
-            estimate,
-            scenario.contract,
-            None,
-            policy,
-            mode,
-            backoff,
-            100,
-        ) {
-            let need = need.scaled;
-            best = Some(match best {
-                Some(b) if b.value >= need.value => b,
-                _ => need,
-            });
-        }
-    }
-    best.unwrap_or_else(|| QuotaAmount::new(crate::quota_window::QuotaUnit::Tokens, 0))
+    let windows: Vec<&QuotaWindow> = scenario.windows.iter().collect();
+    super::forecast::compute_task_need(
+        &windows,
+        estimate,
+        scenario.contract,
+        None,
+        policy,
+        backoff,
+        100,
+    )
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| QuotaAmount::new(crate::quota_window::QuotaUnit::Tokens, 0))
 }
 
 fn start_task(
