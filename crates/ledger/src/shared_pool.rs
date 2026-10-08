@@ -1170,6 +1170,96 @@ mod tests {
     }
 
     #[test]
+    fn existing_task_reservation_path_is_unaffected_by_shared_pool_presence() {
+        // AC4: the single flat-account v0.0.3 path (task_budgets +
+        // reservations) must behave IDENTICALLY whether or not a shared
+        // pool exists in the same store. This drives both code paths
+        // against one `LedgerStore` and asserts the task-level outcome
+        // matches what `crate::reservation`'s own unit tests already
+        // establish in isolation — proving the two table sets (separate
+        // per migration 0016's own docs) do not interact.
+        use crate::reservation::test_support::{fixed_reserve, thousand_token_policy};
+        use libra_governor_domain::{
+            CompletionContract, CompletionCriterion, ReservationClass, ResourceAmount, TaskId,
+            TaskIdentity,
+        };
+
+        let mut store = LedgerStore::open_in_memory().unwrap();
+
+        // Shared-pool activity happening in the same store/connection.
+        store
+            .ensure_pool(&pool_id(), &QuotaUnit::Tokens, 10, now())
+            .unwrap();
+        reserve(&mut store, "pool-session", 10, "pool-key");
+
+        // Ordinary task reservation path, untouched by the above.
+        let task_id = TaskId::new();
+        store
+            .insert_task(
+                &TaskIdentity {
+                    id: task_id,
+                    external_ref: None,
+                },
+                now(),
+            )
+            .unwrap();
+        store
+            .insert_contract(
+                task_id,
+                &CompletionContract::first(vec![CompletionCriterion::required("done")]),
+                now(),
+            )
+            .unwrap();
+        store
+            .initialize_task_budget(
+                task_id,
+                &thousand_token_policy(),
+                &fixed_reserve(200),
+                now(),
+            )
+            .unwrap();
+
+        let outcome = store
+            .reserve(crate::ReserveRequest {
+                task_id,
+                session_id: "task-session",
+                plan_id: None,
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(300),
+                idempotency_key: "task-key",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap();
+        let crate::ReserveOutcome::Granted(reservation) = outcome else {
+            panic!("expected Granted");
+        };
+        // Matches exactly what `crate::reservation`'s own tests expect
+        // for this fixture (800 optional headroom, 300 requested, 0
+        // drawn from the 200-token reserve): the shared pool's existence
+        // and its own 10/10 fully-consumed capacity have no bearing on
+        // this task's arithmetic.
+        assert_eq!(reservation.amount, ResourceAmount::Tokens(300));
+        assert_eq!(reservation.drawn_from_reserve, ResourceAmount::Tokens(0));
+
+        let snapshot = store.budget_snapshot(task_id).unwrap().unwrap();
+        assert_eq!(snapshot.reserved(), ResourceAmount::Tokens(300));
+        assert_eq!(snapshot.completion_reserve(), ResourceAmount::Tokens(200));
+
+        store
+            .settle(reservation.id, Some(ResourceAmount::Tokens(250)), now())
+            .unwrap();
+        let snapshot = store.budget_snapshot(task_id).unwrap().unwrap();
+        assert_eq!(snapshot.used(), ResourceAmount::Tokens(250));
+        assert_eq!(snapshot.reserved(), ResourceAmount::Tokens(0));
+
+        // And the shared pool's own accounting is likewise untouched by
+        // the task-level activity above: still exactly fully consumed.
+        let admission = store.pool_admission(&pool_id(), now()).unwrap().unwrap();
+        assert_eq!(admission.remaining(), 0);
+    }
+
+    #[test]
     fn concurrent_reservations_never_collectively_exceed_capacity_at_exact_limit() {
         // AC1: at the last remaining 10 units, concurrent sessions cannot
         // collectively reserve more than 10 units. Real threads, real
