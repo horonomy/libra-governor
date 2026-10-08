@@ -402,6 +402,15 @@ mod tests {
     /// so_concurrent_holds_genuinely_stack` (in `step.rs`) now guards —
     /// an invariant over `simulate`'s own output, not a test that reuses
     /// the code under test to check itself.
+    ///
+    /// Updated for HORO-1781's fast-follow fix: a hold no longer settles
+    /// on an estimated completion instant (`PendingHold::completes_at` is
+    /// gone) — only a real `TaskCompleted` event ever moves it from
+    /// outstanding to settled usage. Tasks 0..=8 (the nine that fit in
+    /// the first pass, 9*100 = 900 < 1000) are given a real completion at
+    /// `t0+60`; the oracle below applies that settlement the same way
+    /// `step` does — before checking any Start proposal in the same
+    /// tick, never after.
     #[test]
     fn ac2_every_start_independently_verified_not_blocking() {
         let many: Vec<SimTask> = (0..11).map(|i| task(i, 100, 60)).collect();
@@ -416,49 +425,75 @@ mod tests {
                 max_fanout: 20,
             },
         };
-        let events = vec![PacingEvent::ModeChanged {
-            at: OffsetDateTime::UNIX_EPOCH,
-            seq: 0,
-        }];
+        let t0 = OffsetDateTime::UNIX_EPOCH;
+        let mut events = vec![PacingEvent::ModeChanged { at: t0, seq: 0 }];
+        for i in 0..9u32 {
+            events.push(PacingEvent::TaskCompleted {
+                at: t0 + time::Duration::seconds(60),
+                seq: u64::from(i) + 1,
+                task: SimTaskId(i),
+            });
+        }
         let (_, trace) = simulate(&events, &policy(), &scenario);
 
-        // Independently-tracked (amount, completes_at) pairs, keyed by a
-        // fresh v4 id per start (never derived the way `step`'s internal
-        // machinery derives its own ids) — the point is that a bug in
-        // `step`'s derivation must not be able to hide from this check.
-        // Before `completes_at`, a pair counts as an outstanding hold;
-        // from `completes_at` on it is folded into usage instead —
-        // independently reconstructing the same split `forecast`'s
-        // `split_pending_as_of` makes, not by calling it.
-        let mut independent_pending: Vec<(QuotaAmount, OffsetDateTime)> = Vec::new();
+        // Independently-tracked outstanding holds (keyed by task, not by
+        // a fresh id per start — a real completion must be able to find
+        // and remove exactly the right one) and settled usage records
+        // (fresh v4 id per record, never derived the way `step`'s
+        // internal machinery derives its own ids) — the point is that a
+        // bug in `step`'s own derivation must not be able to hide from
+        // this check.
+        let mut independent_pending: std::collections::BTreeMap<SimTaskId, QuotaAmount> =
+            std::collections::BTreeMap::new();
+        let mut independent_settled: Vec<crate::quota_window::QuotaUsage> = Vec::new();
         let mut started_any = false;
+        let mut total_starts = 0usize;
+        let mut nine_and_ten_starts: Vec<OffsetDateTime> = Vec::new();
+
         for (tick, proposals) in &trace {
             let at = match tick {
                 Tick::Event(e) => e.at(),
                 Tick::Timer(t) => *t,
             };
-            for p in proposals {
-                if let Proposal::Start { hold, .. } = p {
-                    started_any = true;
-                    let mut evidence_holds = Vec::new();
-                    let mut evidence_usage = Vec::new();
-                    for (amount, completes_at) in &independent_pending {
-                        let id = crate::reservation::ReservationId(uuid::Uuid::new_v4());
-                        if *completes_at <= at {
-                            if let Ok(usage) = crate::quota_window::QuotaUsage::new(
-                                crate::EconomicEventId(id.0),
-                                *completes_at,
-                                amount.clone(),
-                            ) {
-                                evidence_usage.push(usage);
-                            }
-                        } else {
-                            evidence_holds.push(crate::quota_window::OutstandingHold::projected(
-                                id,
-                                amount.clone(),
-                            ));
-                        }
+
+            // Mirror `step`'s own ordering: the triggering event (here, a
+            // completion) is applied before admission is attempted, so a
+            // completion and the Start(s) it frees up can land in the
+            // very same tick.
+            if let Tick::Event(PacingEvent::TaskCompleted {
+                task, at: done_at, ..
+            }) = tick
+            {
+                if let Some(amount) = independent_pending.remove(task) {
+                    let id = crate::reservation::ReservationId(uuid::Uuid::new_v4());
+                    if let Ok(usage) = crate::quota_window::QuotaUsage::new(
+                        crate::EconomicEventId(id.0),
+                        *done_at,
+                        amount,
+                    ) {
+                        independent_settled.push(usage);
                     }
+                }
+            }
+
+            for p in proposals {
+                if let Proposal::Start { task, hold, .. } = p {
+                    started_any = true;
+                    total_starts += 1;
+                    if *task == SimTaskId(9) || *task == SimTaskId(10) {
+                        nine_and_ten_starts.push(at);
+                    }
+
+                    let mut evidence_holds: Vec<crate::quota_window::OutstandingHold> =
+                        independent_pending
+                            .values()
+                            .map(|amount| {
+                                crate::quota_window::OutstandingHold::projected(
+                                    crate::reservation::ReservationId(uuid::Uuid::new_v4()),
+                                    amount.clone(),
+                                )
+                            })
+                            .collect();
                     // The candidate task's own hold must also be in the
                     // evidence being checked — omitting it would only
                     // ever catch the original bug one task late (e.g.
@@ -471,7 +506,7 @@ mod tests {
                         hold.clone(),
                     ));
                     let evidence = crate::quota_window::QuotaEvidence {
-                        usage: &evidence_usage,
+                        usage: &independent_settled,
                         holds: &evidence_holds,
                         snapshots: &[],
                     };
@@ -482,7 +517,7 @@ mod tests {
                         "a Start proposal must independently verify as NotBlocking \
                          against every other hold already active at that instant"
                     );
-                    independent_pending.push((hold.clone(), at + time::Duration::seconds(60)));
+                    independent_pending.insert(*task, hold.clone());
                 }
             }
         }
@@ -494,11 +529,25 @@ mod tests {
         // checks only the *first* pass, where exactly 9 of 11 fit), this
         // test lets `simulate` run the derived timer forward across
         // relief hops with no end condition, so eventually all 11 tasks
-        // start once the sliding window ages enough usage out — the
-        // invariant actually being checked is that every single one of
-        // those 11 starts, whenever it happens, independently verifies
-        // as `NotBlocking`.
-        assert_eq!(independent_pending.len(), 11);
+        // start once the sliding window ages enough real settled usage
+        // out — the invariant actually being checked is that every
+        // single one of those 11 starts, whenever it happens,
+        // independently verifies as `NotBlocking`.
+        assert_eq!(total_starts, 11, "all 11 tasks must eventually start");
+        assert_eq!(
+            nine_and_ten_starts.len(),
+            2,
+            "tasks 9 and 10 must both eventually start"
+        );
+        let expected_age_out = t0 + time::Duration::seconds(60 + 21_600);
+        for started_at in nine_and_ten_starts {
+            assert_eq!(
+                started_at, expected_age_out,
+                "tasks 9 and 10 must both be admitted exactly when the first nine tasks' \
+                 real settled usage (recorded at their actual t0+60 completion) ages out of \
+                 the 6h sliding window — never on any estimate-based schedule"
+            );
+        }
     }
 
     /// AC5's control-run half: "backoff reduces new commitments" — never
