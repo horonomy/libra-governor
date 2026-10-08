@@ -35,6 +35,8 @@
 
 pub mod forecast;
 pub mod ready;
+pub mod simulate;
+pub mod step;
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -45,7 +47,27 @@ use uuid::Uuid;
 use crate::business_context::Priority;
 use crate::economic_attribution::PrincipalId;
 use crate::progressive::RemainingWorkEstimate;
-use crate::quota_window::{IndeterminateReason, QuotaWindowId};
+use crate::quota_window::{IndeterminateReason, QuotaWindowId, WorkingHours};
+
+/// A caller's pacing preference for a [`Scenario`](step::Scenario). Carries
+/// only scheduling knobs — never a [`crate::Policy`] or
+/// [`crate::CompletionContract`] by value, both of which every consumer
+/// (forecast, step) takes by reference instead, so a preference can never
+/// smuggle in a second, divergent copy of either.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum PacingPreference {
+    Sustain {
+        horizon_secs: u64,
+        working_hours: Option<WorkingHours>,
+        continuity_reserve_bp: u16,
+    },
+    Burst {
+        #[serde(with = "crate::economic_event::occurred_at_wire")]
+        target_end: OffsetDateTime,
+        max_fanout: u16,
+    },
+}
 
 /// Traceability tag every persisted pacing artifact is tagged with,
 /// following this crate's existing `*_SCHEMA_VERSION` convention.

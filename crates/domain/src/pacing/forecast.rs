@@ -369,21 +369,20 @@ fn resource_amount_to_quota_amount(
     }
 }
 
+/// Shared test fixtures reused by sibling pacing modules' own test
+/// suites (`step`'s tests need a valid [`Policy`] too, and duplicating
+/// this builder would risk the two fixtures silently drifting apart).
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::completion_contract::{CompletionContract, CompletionCriterion};
-    use crate::pacing::tests::test_estimate;
+pub(crate) mod tests_support {
     use crate::policy::AutonomyBoundary;
-    use crate::progressive::RemainingResource;
-    use crate::quota_window::{EntitlementSource, QuotaScope, QuotaSubject, QuotaWindowId};
-    use crate::{economic_attribution::PrincipalId, Confidence};
+    use crate::resource_amount::ResourceAmount;
+    use crate::{CompletionContract, CompletionCriterion, Confidence, Policy};
 
     fn quality_floor() -> CompletionContract {
         CompletionContract::first(vec![CompletionCriterion::required("tests pass")])
     }
 
-    fn policy() -> Policy {
+    pub(crate) fn policy() -> Policy {
         Policy::validated(
             "test",
             crate::policy::ResourceBound {
@@ -406,11 +405,21 @@ mod tests {
         .unwrap()
     }
 
-    fn policy_requiring_medium_confidence() -> Policy {
+    pub(crate) fn policy_requiring_medium_confidence() -> Policy {
         let mut p = policy();
         p.min_confidence = Confidence::Medium;
         p
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pacing::tests::test_estimate;
+    use crate::progressive::RemainingResource;
+    use crate::quota_window::{EntitlementSource, QuotaScope, QuotaSubject, QuotaWindowId};
+    use crate::{economic_attribution::PrincipalId, Confidence};
+    use tests_support::{policy, policy_requiring_medium_confidence};
 
     fn sliding_window(id: QuotaWindowId, limit: u64, length_secs: u64) -> QuotaWindow {
         QuotaWindow::validated(
