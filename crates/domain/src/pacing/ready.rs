@@ -6,7 +6,7 @@
 //! answers *in what order* ready tasks are offered to the forecast/step
 //! logic — never whether to admit one, which stays `forecast`'s job.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 use super::{SimTask, SimTaskId, TaskSet};
 use crate::business_context::Priority;
@@ -29,7 +29,7 @@ fn priority_rank(p: Priority) -> u8 {
 /// the same tie-break order named in HORO-1765's acceptance criteria.
 /// `None` deadlines sort after any `Some` deadline (an undated task never
 /// jumps ahead of one with a known deadline).
-pub fn ready_order<'a>(tasks: &'a TaskSet, completed: &HashSet<SimTaskId>) -> Vec<&'a SimTask> {
+pub fn ready_order<'a>(tasks: &'a TaskSet, completed: &BTreeSet<SimTaskId>) -> Vec<&'a SimTask> {
     let mut ready: Vec<&SimTask> = tasks
         .tasks()
         .iter()
@@ -79,7 +79,7 @@ mod tests {
             task(4, Priority::Normal, None),
         ])
         .unwrap();
-        let ready = ready_order(&set, &HashSet::new());
+        let ready = ready_order(&set, &BTreeSet::new());
         let ids: Vec<u32> = ready.iter().map(|t| t.id.0).collect();
         assert_eq!(ids, vec![2, 1, 3, 4]);
     }
@@ -105,13 +105,13 @@ mod tests {
             },
         ])
         .unwrap();
-        let none_done = ready_order(&set, &HashSet::new());
+        let none_done = ready_order(&set, &BTreeSet::new());
         assert_eq!(
             none_done.iter().map(|t| t.id.0).collect::<Vec<_>>(),
             vec![1]
         );
 
-        let mut completed = HashSet::new();
+        let mut completed = BTreeSet::new();
         completed.insert(SimTaskId(1));
         let after_first = ready_order(&set, &completed);
         assert_eq!(

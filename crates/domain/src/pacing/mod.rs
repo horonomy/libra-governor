@@ -35,6 +35,8 @@
 
 pub mod forecast;
 pub mod ready;
+pub mod simulate;
+pub mod step;
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -45,7 +47,27 @@ use uuid::Uuid;
 use crate::business_context::Priority;
 use crate::economic_attribution::PrincipalId;
 use crate::progressive::RemainingWorkEstimate;
-use crate::quota_window::{IndeterminateReason, QuotaWindowId};
+use crate::quota_window::{IndeterminateReason, QuotaWindowId, WorkingHours};
+
+/// A caller's pacing preference for a [`Scenario`](step::Scenario). Carries
+/// only scheduling knobs — never a [`crate::Policy`] or
+/// [`crate::CompletionContract`] by value, both of which every consumer
+/// (forecast, step) takes by reference instead, so a preference can never
+/// smuggle in a second, divergent copy of either.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum PacingPreference {
+    Sustain {
+        horizon_secs: u64,
+        working_hours: Option<WorkingHours>,
+        continuity_reserve_bp: u16,
+    },
+    Burst {
+        #[serde(with = "crate::economic_event::occurred_at_wire")]
+        target_end: OffsetDateTime,
+        max_fanout: u16,
+    },
+}
 
 /// Traceability tag every persisted pacing artifact is tagged with,
 /// following this crate's existing `*_SCHEMA_VERSION` convention.
@@ -324,7 +346,29 @@ pub enum NextAdmit {
         at: OffsetDateTime,
         limiting: QuotaWindowId,
     },
+    /// The delay is not caused by any quota window at all — SUSTAIN's
+    /// own spacing formula or working-hours constraint pushed the admit
+    /// instant later than `forecast::earliest_safe_admit` itself
+    /// required. Kept distinct from `At` (which always names a real
+    /// limiting window) so an explain surface never attributes a
+    /// scheduling-policy delay to a window that was not actually
+    /// blocking — a prior version of `step::try_admit` used a
+    /// placeholder window id here (or, with no windows at all, a fresh
+    /// random one, which AC4's determinism requirement forbids).
+    Paced {
+        #[serde(with = "crate::economic_event::occurred_at_wire")]
+        at: OffsetDateTime,
+        cause: PacingCause,
+    },
     Unavailable(UnavailableReason),
+}
+
+/// Which non-window constraint produced a [`NextAdmit::Paced`] instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PacingCause {
+    Spacing,
+    WorkingHours,
 }
 
 /// One proposal the pacing state machine emits for a probe/step.

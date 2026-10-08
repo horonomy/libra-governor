@@ -153,3 +153,139 @@ pub(super) fn fixed_aligned_bounds(
         }
     }
 }
+
+/// A daily working-hours window in one timezone, applied every day
+/// (no per-weekday exclusion — see `pacing::PacingPreference::Sustain`'s
+/// own docs for why that is an accepted MVP scope limit, not an
+/// oversight). `start` must be strictly before `end` on the same
+/// calendar day — an overnight-spanning window (e.g. 22:00-06:00) is not
+/// supported; validated at construction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkingHours {
+    time_zone: IanaTimeZone,
+    start: WallClockTime,
+    end: WallClockTime,
+}
+
+use serde::{Deserialize, Serialize};
+
+/// Error constructing a [`WorkingHours`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum WorkingHoursError {
+    #[error("working-hours start ({start_hour:02}:{start_minute:02}) must be strictly before end ({end_hour:02}:{end_minute:02})")]
+    StartNotBeforeEnd {
+        start_hour: u8,
+        start_minute: u8,
+        end_hour: u8,
+        end_minute: u8,
+    },
+}
+
+impl WorkingHours {
+    pub fn new(
+        time_zone: IanaTimeZone,
+        start: WallClockTime,
+        end: WallClockTime,
+    ) -> Result<Self, WorkingHoursError> {
+        if (start.hour(), start.minute()) >= (end.hour(), end.minute()) {
+            return Err(WorkingHoursError::StartNotBeforeEnd {
+                start_hour: start.hour(),
+                start_minute: start.minute(),
+                end_hour: end.hour(),
+                end_minute: end.minute(),
+            });
+        }
+        Ok(Self {
+            time_zone,
+            start,
+            end,
+        })
+    }
+}
+
+/// The earliest instant `>= now` that falls inside `hours`' daily
+/// window — `now` itself when it is already inside, otherwise that same
+/// (or next) calendar day's `start`, stepping entirely by calendar
+/// date/time in `hours`' own timezone (never by adding a fixed number of
+/// seconds — the same DST discipline [`fixed_aligned_bounds`] follows).
+pub(crate) fn next_working_instant(now: OffsetDateTime, hours: &WorkingHours) -> OffsetDateTime {
+    let z = zone(&hours.time_zone);
+    let now_ts = to_jiff_timestamp(now);
+    let now_zoned = now_ts.to_zoned(z.clone());
+    let mut date = now_zoned.date();
+
+    let today_start = candidate_instant(date, hours.start, &z);
+    let today_end = candidate_instant(date, hours.end, &z);
+    if now_ts >= today_start.timestamp() && now_ts < today_end.timestamp() {
+        return now;
+    }
+    if now_ts < today_start.timestamp() {
+        return from_jiff_timestamp(today_start.timestamp());
+    }
+    date = date
+        .tomorrow()
+        .expect("stepping forward one calendar day cannot fail for a real Date");
+    let next_start = candidate_instant(date, hours.start, &z);
+    from_jiff_timestamp(next_start.timestamp())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::macros::datetime;
+
+    fn utc_9_to_17() -> WorkingHours {
+        WorkingHours::new(
+            IanaTimeZone::new("UTC").unwrap(),
+            WallClockTime::new(9, 0).unwrap(),
+            WallClockTime::new(17, 0).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn before_start_pushes_to_that_days_start() {
+        let now = datetime!(2024-01-01 06:00:00 UTC);
+        let result = next_working_instant(now, &utc_9_to_17());
+        assert_eq!(result, datetime!(2024-01-01 09:00:00 UTC));
+    }
+
+    #[test]
+    fn inside_the_window_returns_now_unchanged() {
+        let now = datetime!(2024-01-01 12:30:00 UTC);
+        let result = next_working_instant(now, &utc_9_to_17());
+        assert_eq!(result, now);
+    }
+
+    #[test]
+    fn at_the_boundary_start_counts_as_inside() {
+        let now = datetime!(2024-01-01 09:00:00 UTC);
+        let result = next_working_instant(now, &utc_9_to_17());
+        assert_eq!(result, now);
+    }
+
+    #[test]
+    fn at_the_boundary_end_counts_as_outside() {
+        let now = datetime!(2024-01-01 17:00:00 UTC);
+        let result = next_working_instant(now, &utc_9_to_17());
+        assert_eq!(result, datetime!(2024-01-02 09:00:00 UTC));
+    }
+
+    #[test]
+    fn after_end_pushes_to_the_next_days_start() {
+        let now = datetime!(2024-01-01 20:00:00 UTC);
+        let result = next_working_instant(now, &utc_9_to_17());
+        assert_eq!(result, datetime!(2024-01-02 09:00:00 UTC));
+    }
+
+    #[test]
+    fn working_hours_construction_rejects_start_not_before_end() {
+        let tz = IanaTimeZone::new("UTC").unwrap();
+        let err = WorkingHours::new(
+            tz,
+            WallClockTime::new(17, 0).unwrap(),
+            WallClockTime::new(9, 0).unwrap(),
+        );
+        assert!(err.is_err());
+    }
+}
