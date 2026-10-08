@@ -86,6 +86,22 @@ pub enum FixtureError {
         found: String,
         expected: &'static str,
     },
+    #[error(
+        "fixture file {path} reading unit {got:?} does not match the target window's unit {expected:?}"
+    )]
+    UnknownUnit {
+        path: String,
+        expected: libra_governor_domain::QuotaUnit,
+        got: libra_governor_domain::QuotaUnit,
+    },
+    #[error(
+        "fixture file {path} is stale: observed {age_secs}s ago, exceeding the window's max staleness of {max_staleness_secs}s"
+    )]
+    Stale {
+        path: String,
+        age_secs: u64,
+        max_staleness_secs: u64,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,6 +187,21 @@ pub fn import_fixture(
             source,
         })?;
 
+    // Unit mismatch — mirrors `response.rs::ingest_body`'s own check.
+    // The window's evaluator (`evaluate_gauge`) would eventually report
+    // this as `SnapshotUnitMismatch`, but this acquisition boundary
+    // refuses the reading outright rather than letting a wrong-unit
+    // reading ever reach the evidence a decision is evaluated against.
+    if let GaugeReading::Used { used, .. } = &fixture.reading {
+        if used.unit != *window.unit() {
+            return Err(FixtureError::UnknownUnit {
+                path: path_display,
+                expected: window.unit().clone(),
+                got: used.unit.clone(),
+            });
+        }
+    }
+
     let snapshot = ProviderSnapshot::validated(
         window_id,
         observed_at,
@@ -196,9 +227,35 @@ pub fn import_fixture(
         trust_owner: fixture.provenance.trust_owner,
     };
 
-    Ok(AcquiredReading::validated(
-        window, snapshot, provenance, now,
-    )?)
+    let reading = AcquiredReading::validated(window, snapshot, provenance, now)?;
+
+    // Staleness — mirrors `response.rs::ingest_body`'s own check. Unlike
+    // that function, this one has no `SourceState::Degraded` channel to
+    // return a still-usable-but-flagged reading through, and a fixture
+    // file is operator-authored test/demo data, not a live provider
+    // response arriving on its own schedule — so a stale fixture is
+    // refused outright rather than silently admitted as fresh.
+    let max_staleness_secs = match window.kind() {
+        libra_governor_domain::WindowKind::OpaqueProviderSnapshot { max_staleness_secs } => {
+            *max_staleness_secs
+        }
+        // A non-gauge window kind has no staleness concept; `validated`
+        // above already refused this reading with a precise
+        // `WindowKindMismatch` if the kinds didn't match.
+        _ => return Ok(reading),
+    };
+    let age_secs = (now - reading.snapshot().observed_at())
+        .whole_seconds()
+        .max(0) as u64;
+    if age_secs > max_staleness_secs {
+        return Err(FixtureError::Stale {
+            path: path_display,
+            age_secs,
+            max_staleness_secs,
+        });
+    }
+
+    Ok(reading)
 }
 
 #[cfg(test)]
@@ -379,5 +436,89 @@ mod tests {
         let path = std::path::PathBuf::from("/does/not/exist/fixture.json");
         let err = import_fixture(&path, &window, datetime!(2026-10-08 01:00:00 UTC)).unwrap_err();
         assert!(matches!(err, FixtureError::Read { .. }));
+    }
+
+    /// Regression test for a real bug an independent Verify pass (Jira
+    /// HORO-1780) found: `import_fixture` never checked staleness, even
+    /// though `response.rs::ingest_body`'s simulated-HTTP path does — the
+    /// only buildable/delivered acquisition path in this crate silently
+    /// admitted a reading an hour stale against a 300s max.
+    #[test]
+    fn rejects_a_stale_fixture() {
+        let window = QuotaWindow::validated(
+            QuotaWindowId::new(),
+            QuotaScope {
+                subject: QuotaSubject::SharedPool(PoolId("acme".to_string())),
+                source: EntitlementSource::ProviderDeclared,
+                confidence: Confidence::Medium,
+                observed_at: datetime!(2026-10-08 00:00:00 UTC),
+                valid_until: None,
+            },
+            QuotaUnit::Percent,
+            WindowKind::OpaqueProviderSnapshot {
+                max_staleness_secs: 300,
+            },
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let body = serde_json::json!({
+            "schema_version": "quota-window-v1",
+            "window_id": window.id(),
+            "observed_at": "2026-10-08T00:00:00Z",
+            "reading": { "state": "used", "used": { "unit": { "unit": "percent" }, "value": 2500 }, "limit": null },
+            "confidence": "medium",
+            "provenance": {
+                "capability": "fixture:acme-quota-v1",
+                "documented_at": "docs/quota-source-fixture.md",
+                "subject": { "kind": "shared_pool", "id": "acme" },
+                "trust_owner": "platform-team"
+            }
+        });
+        let path = write_fixture(&dir, &body);
+        // Observed at 00:00:00, "now" is 01:00:00 — 3600s stale against a 300s max.
+        let err = import_fixture(&path, &window, datetime!(2026-10-08 01:00:00 UTC)).unwrap_err();
+        match err {
+            FixtureError::Stale {
+                age_secs,
+                max_staleness_secs,
+                ..
+            } => {
+                assert_eq!(age_secs, 3600);
+                assert_eq!(max_staleness_secs, 300);
+            }
+            other => panic!("expected FixtureError::Stale, got {other:?}"),
+        }
+    }
+
+    /// Regression test for the second half of the same Verify finding:
+    /// a `tokens`-unit reading against a `Percent`-unit window was
+    /// silently admitted, because the unit check also lived only in
+    /// `ingest_body`.
+    #[test]
+    fn rejects_a_unit_mismatched_fixture() {
+        let window = gauge_window(); // QuotaUnit::Percent
+        let dir = tempfile::tempdir().unwrap();
+        let body = serde_json::json!({
+            "schema_version": "quota-window-v1",
+            "window_id": window.id(),
+            "observed_at": "2026-10-08T00:30:00Z",
+            "reading": { "state": "used", "used": { "unit": { "unit": "tokens" }, "value": 2500 }, "limit": null },
+            "confidence": "medium",
+            "provenance": {
+                "capability": "fixture:acme-quota-v1",
+                "documented_at": "docs/quota-source-fixture.md",
+                "subject": { "kind": "shared_pool", "id": "acme" },
+                "trust_owner": "platform-team"
+            }
+        });
+        let path = write_fixture(&dir, &body);
+        let err = import_fixture(&path, &window, datetime!(2026-10-08 01:00:00 UTC)).unwrap_err();
+        match err {
+            FixtureError::UnknownUnit { expected, got, .. } => {
+                assert_eq!(expected, QuotaUnit::Percent);
+                assert_eq!(got, QuotaUnit::Tokens);
+            }
+            other => panic!("expected FixtureError::UnknownUnit, got {other:?}"),
+        }
     }
 }
