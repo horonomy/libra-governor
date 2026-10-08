@@ -60,6 +60,7 @@ mod replay;
 mod reservation;
 mod resource_account;
 mod resource_amount;
+mod shared_pool;
 mod task_features;
 mod task_identity;
 
@@ -168,6 +169,10 @@ pub use resource_account::{
     EnforcementScope, ResourceAccount, RESOURCE_ACCOUNT_SCHEMA_VERSION,
 };
 pub use resource_amount::{Headroom, ResourceAmount, ResourceKind};
+pub use shared_pool::{
+    PoolAdmission, PoolProviderSnapshot, QuotaPool, SharedPoolReservation, SharedPoolReservationId,
+    SHARED_POOL_RESERVATION_SCHEMA_VERSION,
+};
 pub use task_features::{BucketTier, BuildTopology, TaskFeatures, FEATURE_SCHEMA_VERSION};
 pub use task_identity::{ExternalRef, TaskId, TaskIdentity};
 pub mod execution_association;
