@@ -22,16 +22,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use time::OffsetDateTime;
 
-use crate::quota_window::{
-    next_working_instant, OutstandingHold, QuotaAmount, QuotaEvidence, QuotaWindow,
-};
+use crate::quota_window::{next_working_instant, QuotaAmount, QuotaUsage, QuotaWindow};
 use crate::reservation::ReservationId;
-use crate::{CompletionContract, Policy};
+use crate::resource_amount::ResourceAmount;
+use crate::{CompletionContract, EconomicEventId, Policy};
 
-use super::forecast::{earliest_safe_admit, ForecastMode, WindowInput};
-use super::{
-    synthetic_uuid, NextAdmit, PacingEvent, PacingPreference, Proposal, SimTaskId, TaskSet,
-};
+use super::forecast::{earliest_safe_admit, ForecastMode, PendingHold, WindowInput};
+use super::{NextAdmit, PacingEvent, PacingPreference, Proposal, SimTaskId, TaskSet};
 
 /// Maximum integer backoff ratio (expressed as `x100`, i.e. 400 == 4x) a
 /// principal's overrun may inflate new-start needs to (AC5).
@@ -71,6 +68,23 @@ pub struct PacerState {
     /// slot — the instant the active task is projected to complete.
     last_start: Option<OffsetDateTime>,
     pending_timer: Option<OffsetDateTime>,
+    /// Every completed task's settled usage, append-only — this is what
+    /// lets a window's *cumulative* spend (not just its currently
+    /// concurrent holds) constrain later admits (AC2: "including
+    /// simultaneous in-flight work" is about concurrency; this is its
+    /// cumulative-spend counterpart, the actual "sustainable pacing"
+    /// mechanism). Flat (not per-window): `QuotaWindow::evaluate`
+    /// already filters by unit internally, so every window simply reads
+    /// the same log.
+    usage_log: Vec<QuotaUsage>,
+    /// The largest `Spend` amount reported so far for each still-active
+    /// task, in that task's hold's own unit (a `Spend` in a different
+    /// unit than the hold is ignored for settlement purposes — this
+    /// MVP's `ActiveTask` tracks one hold in one unit per task; see
+    /// module docs). Consulted at `TaskCompleted` so a task's settled
+    /// usage is the larger of its reservation and its reported actual
+    /// spend, never silently the reservation alone.
+    spend_so_far: BTreeMap<SimTaskId, u64>,
 }
 
 impl PacerState {
@@ -91,28 +105,40 @@ impl PacerState {
     }
 }
 
-fn window_evidence<'a>(
-    window: &'a QuotaWindow,
-    state: &PacerState,
-    holds_buf: &'a mut Vec<OutstandingHold>,
-) -> (QuotaEvidence<'a>, Vec<OffsetDateTime>) {
-    let mut completions = Vec::new();
-    for active in state.active.values() {
-        if active.hold.unit == *window.unit() {
-            let id = ReservationId(synthetic_uuid(window.id().0, ACTIVE_HOLD_TAG));
-            holds_buf.push(OutstandingHold::projected(id, active.hold.clone()));
-            completions.push(active.projected_complete_at);
-        }
+/// Derives a [`ReservationId`] unique per `(window, task)` pair — a
+/// single-tag [`synthetic_uuid`] is only unique per window, which a
+/// prior self-review pass in this module found collapses every
+/// in-flight task's hold on the same window into one (silently
+/// understating how constrained the window really is). Mixes the task's
+/// own id into a different byte range than [`synthetic_uuid`] touches,
+/// so this derivation and the candidate-need derivation in `forecast`
+/// can never collide with each other either.
+fn pending_hold_id(
+    window_id: crate::quota_window::QuotaWindowId,
+    task: SimTaskId,
+) -> ReservationId {
+    let mut bytes = *window_id.0.as_bytes();
+    bytes[0] ^= ACTIVE_HOLD_TAG;
+    let task_bytes = task.0.to_be_bytes();
+    for (i, b) in task_bytes.iter().enumerate() {
+        bytes[4 + i] ^= *b;
     }
-    completions.sort();
-    (
-        QuotaEvidence {
-            usage: &[],
-            holds: holds_buf,
-            snapshots: &[],
-        },
-        completions,
-    )
+    ReservationId(uuid::Uuid::from_bytes(bytes))
+}
+
+/// Builds this window's [`PendingHold`] list from every currently active
+/// task whose hold shares the window's unit.
+fn pending_for_window(window: &QuotaWindow, state: &PacerState) -> Vec<PendingHold> {
+    state
+        .active
+        .iter()
+        .filter(|(_, a)| a.hold.unit == *window.unit())
+        .map(|(task_id, a)| PendingHold {
+            id: pending_hold_id(window.id(), *task_id),
+            amount: a.hold.clone(),
+            completes_at: a.projected_complete_at,
+        })
+        .collect()
 }
 
 const ACTIVE_HOLD_TAG: u8 = 0x5A;
@@ -136,12 +162,24 @@ fn try_admit(
         PacingPreference::Sustain { .. } => 1,
     };
 
+    // Tasks this pass has already decided not to start (backoff-skipped,
+    // held for a future instant, or refused outright) — excluded from
+    // candidacy so a later, lower-priority ready task still gets a
+    // chance in the same pass. A principal's backoff therefore only ever
+    // delays *that* principal's new starts, never every other ready
+    // task's (a bug an earlier version of this loop had: `break` on the
+    // first backing-off candidate stopped the whole pass).
+    let mut skip: BTreeSet<SimTaskId> = BTreeSet::new();
+    let mut earliest_pending_timer: Option<OffsetDateTime> = None;
+
     loop {
         if working.active.len() as u32 >= fanout_cap {
             break;
         }
         let ready = super::ready::ready_order(scenario.tasks, &working.completed);
-        let candidate = ready.iter().find(|t| !working.active.contains_key(&t.id));
+        let candidate = ready
+            .iter()
+            .find(|t| !working.active.contains_key(&t.id) && !skip.contains(&t.id));
         let Some(task) = candidate else {
             break;
         };
@@ -149,7 +187,9 @@ fn try_admit(
         // SUSTAIN: a backing-off principal's fanout is capped at 1 even
         // when the scenario's own concurrency allows more (AC5) — for
         // SUSTAIN this is already implied by `fanout_cap == 1`, so the
-        // check only matters for BURST.
+        // check only matters for BURST. Skipping (not breaking) means a
+        // different, non-backing-off principal's ready task can still
+        // start in this same pass.
         let backoff = working.backoff_for(&task.principal.0);
         if backoff > 100
             && working
@@ -157,7 +197,8 @@ fn try_admit(
                 .values()
                 .any(|a| a.principal == task.principal.0)
         {
-            break;
+            skip.insert(task.id);
+            continue;
         }
 
         let mut earliest_at = now;
@@ -170,7 +211,7 @@ fn try_admit(
         }
         if let Some(last) = working.last_start {
             if let PacingPreference::Sustain { .. } = &scenario.preference {
-                if let Some(spacing) = sustain_spacing(scenario, &working, now) {
+                if let Some(spacing) = sustain_spacing(scenario, approximate_need(&task.estimate)) {
                     let next_allowed = last.saturating_add(time::Duration::seconds(
                         i64::try_from(spacing).unwrap_or(i64::MAX),
                     ));
@@ -191,25 +232,22 @@ fn try_admit(
             PacingPreference::Burst { .. } => ForecastMode::Burst,
         };
 
-        let mut window_inputs_holds: Vec<Vec<OutstandingHold>> =
-            vec![Vec::new(); scenario.windows.len()];
-        let mut window_inputs = Vec::with_capacity(scenario.windows.len());
-        let mut completions_per_window = Vec::with_capacity(scenario.windows.len());
-        for (window, holds_buf) in scenario.windows.iter().zip(window_inputs_holds.iter_mut()) {
-            let (_, completions) = window_evidence(window, &working, holds_buf);
-            completions_per_window.push(completions);
-        }
-        for (i, window) in scenario.windows.iter().enumerate() {
-            window_inputs.push(WindowInput {
+        let pending_per_window: Vec<Vec<PendingHold>> = scenario
+            .windows
+            .iter()
+            .map(|w| pending_for_window(w, &working))
+            .collect();
+        let window_inputs: Vec<WindowInput<'_>> = scenario
+            .windows
+            .iter()
+            .zip(pending_per_window.iter())
+            .map(|(window, pending)| WindowInput {
                 window,
-                evidence: QuotaEvidence {
-                    usage: &[],
-                    holds: &window_inputs_holds[i],
-                    snapshots: &[],
-                },
-                hold_completions: &completions_per_window[i],
-            });
-        }
+                usage: &working.usage_log,
+                pending,
+                snapshots: &[],
+            })
+            .collect();
 
         let admit = earliest_safe_admit(
             &window_inputs,
@@ -225,56 +263,53 @@ fn try_admit(
 
         match admit {
             NextAdmit::Now => {
+                let hold = recorded_hold(&task.estimate, scenario, policy, mode, backoff);
                 start_task(
                     &mut working,
                     task.id,
                     task.principal.0.clone(),
                     &task.estimate,
+                    hold.clone(),
                     now,
                 );
                 proposals.push(Proposal::Start {
                     task: task.id,
                     at: now,
-                    hold: representative_hold(&working, task.id),
+                    hold,
                     limiting: None,
                 });
             }
             NextAdmit::At { at, limiting } if at <= now => {
+                let hold = recorded_hold(&task.estimate, scenario, policy, mode, backoff);
                 start_task(
                     &mut working,
                     task.id,
                     task.principal.0.clone(),
                     &task.estimate,
+                    hold.clone(),
                     now,
                 );
                 proposals.push(Proposal::Start {
                     task: task.id,
                     at: now,
-                    hold: representative_hold(&working, task.id),
+                    hold,
                     limiting: Some(limiting),
                 });
             }
             NextAdmit::At { at, .. } => {
-                working.pending_timer = Some(earlier_timer(working.pending_timer, at));
+                earliest_pending_timer = Some(earlier_timer(earliest_pending_timer, at));
                 proposals.push(Proposal::Hold { next: admit });
-                break;
+                skip.insert(task.id);
             }
             NextAdmit::Unavailable(_) => {
                 proposals.push(Proposal::Hold { next: admit });
-                break;
+                skip.insert(task.id);
             }
         }
     }
 
+    working.pending_timer = earliest_pending_timer;
     (working, proposals)
-}
-
-fn representative_hold(state: &PacerState, task: SimTaskId) -> QuotaAmount {
-    state
-        .active
-        .get(&task)
-        .map(|a| a.hold.clone())
-        .unwrap_or(QuotaAmount::new(crate::quota_window::QuotaUnit::Tokens, 0))
 }
 
 fn earlier_timer(current: Option<OffsetDateTime>, candidate: OffsetDateTime) -> OffsetDateTime {
@@ -289,28 +324,36 @@ fn earlier_timer(current: Option<OffsetDateTime>, candidate: OffsetDateTime) -> 
 /// design. Returns `None` when no window yields a usable rate (e.g. an
 /// empty window set) — SUSTAIN then relies solely on `earliest_safe_admit`
 /// for pacing.
-fn sustain_spacing(
-    scenario: &Scenario<'_>,
-    _state: &PacerState,
-    _now: OffsetDateTime,
-) -> Option<u64> {
+/// `ceil(need * secs / rate)` for the tightest (largest-spacing) window
+/// — the ticket's own spacing formula, not `secs / rate` (which ignores
+/// the task's actual need and under-spaces badly for a large task
+/// against a high-rate window).
+fn sustain_spacing(scenario: &Scenario<'_>, need: u64) -> Option<u64> {
     let mut tightest: Option<u64> = None;
     for window in scenario.windows {
         let rate_per_sec = match window.kind() {
             crate::quota_window::WindowKind::Sliding { length_secs, limit } if *length_secs > 0 => {
                 Some((*limit, *length_secs))
             }
-            crate::quota_window::WindowKind::FixedAligned { limit, .. } => Some((*limit, 1)),
             crate::quota_window::WindowKind::RefillBucket {
                 refill_amount,
                 refill_period_secs,
                 ..
             } if *refill_period_secs > 0 => Some((*refill_amount, *refill_period_secs)),
+            // A FixedAligned window's "rate" depends on how much of the
+            // current period remains, which this spacing heuristic
+            // (deliberately simple — real admission safety always comes
+            // from `earliest_safe_admit`, never from this spacing
+            // number alone) does not attempt to model; skipped here.
             _ => None,
         };
-        if let Some((amount, secs)) = rate_per_sec {
-            if amount > 0 {
-                let candidate_spacing = secs.saturating_div(amount.max(1));
+        if let Some((rate, secs)) = rate_per_sec {
+            if rate > 0 {
+                let numerator = (need as u128).saturating_mul(secs as u128);
+                let candidate_spacing = numerator
+                    .saturating_add(rate as u128 - 1)
+                    .saturating_div(rate as u128);
+                let candidate_spacing = u64::try_from(candidate_spacing).unwrap_or(u64::MAX);
                 tightest =
                     Some(tightest.map_or(candidate_spacing, |t: u64| t.max(candidate_spacing)));
             }
@@ -319,27 +362,71 @@ fn sustain_spacing(
     tightest
 }
 
+/// The task's p90 remaining-resource magnitude, ignoring unit — used
+/// only as `sustain_spacing`'s `need` input (a scheduling heuristic);
+/// the actual per-window, per-unit need (and admission safety) is always
+/// `earliest_safe_admit`'s job, never this function's.
+fn approximate_need(estimate: &crate::progressive::RemainingWorkEstimate) -> u64 {
+    match &estimate.resource {
+        crate::progressive::RemainingResource::Quantiles { p90, .. } => match p90 {
+            ResourceAmount::UsdCents(c) => u64::try_from(*c).unwrap_or(0),
+            ResourceAmount::Tokens(t) => *t,
+            ResourceAmount::QuotaPercent(p) => p.max(0.0) as u64,
+        },
+        _ => 0,
+    }
+}
+
+/// Recomputes the same need [`earliest_safe_admit`] already verified
+/// safe for every window sharing the task's resource unit, and records
+/// the **largest** of them as the recorded hold — never the raw,
+/// un-floored p90 estimate. A self-review pass found this exact
+/// mismatch: recording the raw estimate while admission actually keyed
+/// its decision off a contract-floored/backoff-scaled need meant the
+/// recorded reservation could understate what was really required,
+/// undermining the whole point of checking it in the first place. Since
+/// different windows sharing a unit can want different needs (the
+/// continuity-reserve addition is window-limit-scaled), the max across
+/// all of them is the only value guaranteed to still satisfy every one.
+fn recorded_hold(
+    estimate: &crate::progressive::RemainingWorkEstimate,
+    scenario: &Scenario<'_>,
+    policy: &Policy,
+    mode: ForecastMode,
+    backoff: u64,
+) -> QuotaAmount {
+    let mut best: Option<QuotaAmount> = None;
+    for window in scenario.windows {
+        if let Ok(Some(need)) = super::forecast::window_need(
+            window,
+            estimate,
+            scenario.contract,
+            None,
+            policy,
+            mode,
+            backoff,
+            100,
+        ) {
+            best = Some(match best {
+                Some(b) if b.value >= need.value => b,
+                _ => need,
+            });
+        }
+    }
+    best.unwrap_or_else(|| QuotaAmount::new(crate::quota_window::QuotaUnit::Tokens, 0))
+}
+
 fn start_task(
     state: &mut PacerState,
     id: SimTaskId,
     principal: String,
     estimate: &crate::progressive::RemainingWorkEstimate,
+    hold: QuotaAmount,
     at: OffsetDateTime,
 ) {
-    let (hold, duration_secs) = match &estimate.resource {
-        crate::progressive::RemainingResource::Quantiles { p90, .. } => {
-            let hold = QuotaAmount::try_from(*p90)
-                .unwrap_or(QuotaAmount::new(crate::quota_window::QuotaUnit::Tokens, 0));
-            let duration = match estimate.duration {
-                crate::progressive::RemainingDuration::Quantiles { p90_secs, .. } => p90_secs,
-                crate::progressive::RemainingDuration::Insufficient { .. } => 0,
-            };
-            (hold, duration)
-        }
-        _ => (
-            QuotaAmount::new(crate::quota_window::QuotaUnit::Tokens, 0),
-            0,
-        ),
+    let duration_secs = match estimate.duration {
+        crate::progressive::RemainingDuration::Quantiles { p90_secs, .. } => p90_secs,
+        crate::progressive::RemainingDuration::Insufficient { .. } => 0,
     };
     let projected_complete_at = at.saturating_add(time::Duration::seconds(
         i64::try_from(duration_secs).unwrap_or(i64::MAX),
@@ -376,12 +463,26 @@ pub fn step(
                 next.completed.insert(*task);
                 let within_estimate = *at <= active.projected_complete_at;
                 if within_estimate {
-                    next.backoff_x100.insert(active.principal, 100);
+                    next.backoff_x100.insert(active.principal.clone(), 100);
+                }
+                let spend = next.spend_so_far.remove(task);
+                let settled_value = spend.unwrap_or(0).max(active.hold.value);
+                let settled_id = EconomicEventId(pending_hold_settlement_uuid(*task, *at));
+                if let Ok(usage) = QuotaUsage::new(
+                    settled_id,
+                    *at,
+                    QuotaAmount::new(active.hold.unit, settled_value),
+                ) {
+                    next.usage_log.push(usage);
                 }
             }
         }
         PacingEvent::Spend { task, amount, .. } => {
             if let Some(active) = next.active.get(task) {
+                if active.hold.unit == amount.unit {
+                    let entry = next.spend_so_far.entry(*task).or_insert(0);
+                    *entry = (*entry).max(amount.value);
+                }
                 if active.hold.unit == amount.unit && amount.value > active.hold.value {
                     let ratio =
                         ceil_div(amount.value, active.hold.value.max(1)).saturating_mul(100);
@@ -407,6 +508,31 @@ pub fn step(
 
     let (admitted_state, proposals) = try_admit(&next, event.at(), policy, scenario);
     (admitted_state, proposals)
+}
+
+/// A fixed, arbitrary namespace for [`pending_hold_settlement_uuid`] —
+/// never regenerated, the same discipline
+/// `economic_event::EconomicEventId::deterministic`'s own namespace
+/// constant follows.
+const SETTLEMENT_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes([
+    0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81, 0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0x09,
+]);
+
+/// Derives a settlement record's id from the namespace above, the task
+/// id, and the completion instant — unique per `(task, at)` pair without
+/// `Uuid::from_u128(small_int)`'s collision risk (see this module's
+/// other synthetic-id derivations for the same concern).
+fn pending_hold_settlement_uuid(task: SimTaskId, at: OffsetDateTime) -> uuid::Uuid {
+    let mut bytes = *SETTLEMENT_NAMESPACE.as_bytes();
+    let task_bytes = task.0.to_be_bytes();
+    for (i, b) in task_bytes.iter().enumerate() {
+        bytes[i] ^= *b;
+    }
+    let at_bytes = at.unix_timestamp_nanos().to_be_bytes();
+    for (i, b) in at_bytes.iter().enumerate() {
+        bytes[(4 + i) % 16] ^= *b;
+    }
+    uuid::Uuid::from_bytes(bytes)
 }
 
 fn ceil_div(a: u64, b: u64) -> u64 {
@@ -507,6 +633,43 @@ mod tests {
             .count();
         assert_eq!(starts, 2);
         assert_eq!(new_state.active.len(), 2);
+    }
+
+    /// Regression test for a real bug a self-review pass found in this
+    /// module: deriving each in-flight task's hold id from the window
+    /// alone (ignoring the task) made every active task's hold on a
+    /// given window collapse to the same id, which
+    /// `quota_window::dedup_holds_by_id` then silently deduplicated to
+    /// one — understating how constrained the window really was. With
+    /// 11 ready tasks at 100 tokens each against a 1000-token sliding
+    /// limit and no fanout cap, exactly 9 fit (9*100 = 900, a 10th would
+    /// push outstanding to 1000 and `remaining <= 0` blocks); the bug
+    /// this guards against would have let all 11 start.
+    #[test]
+    fn distinct_tasks_get_distinct_hold_ids_so_concurrent_holds_genuinely_stack() {
+        let many: Vec<SimTask> = (0..11).map(|i| task_with_tokens(i, 100, 60)).collect();
+        let tasks = TaskSet::validated(many).unwrap();
+        let w = window(1000, 21_600);
+        let scenario = Scenario {
+            tasks: &tasks,
+            windows: std::slice::from_ref(&w),
+            contract: None,
+            preference: PacingPreference::Burst {
+                target_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+                max_fanout: 20,
+            },
+        };
+        let state = PacerState::default();
+        let event = PacingEvent::ModeChanged {
+            at: OffsetDateTime::UNIX_EPOCH,
+            seq: 0,
+        };
+        let (new_state, _proposals) = step(&state, &event, &policy(), &scenario);
+        assert_eq!(
+            new_state.active_count(),
+            9,
+            "exactly 9 of 11 tasks at 100 tokens must fit under a 1000-token sliding limit"
+        );
     }
 
     #[test]

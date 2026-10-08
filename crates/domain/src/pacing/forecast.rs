@@ -33,33 +33,74 @@
 use time::OffsetDateTime;
 
 use crate::quota_window::{
-    BlockingStatus, OutstandingHold, QuotaAmount, QuotaEvidence, QuotaUnit, QuotaWindow,
-    QuotaWindowId, Relief, WindowKind, WindowState,
+    BlockingStatus, OutstandingHold, ProviderSnapshot, QuotaAmount, QuotaEvidence, QuotaUnit,
+    QuotaUsage, QuotaWindow, QuotaWindowId, Relief, WindowKind, WindowState,
 };
 use crate::reservation::{completion_reserve_for, ReservationId};
 use crate::resource_amount::{ResourceAmount, ResourceKind};
-use crate::{CompletionContract, Estimate, Policy};
+use crate::{CompletionContract, EconomicEventId, Estimate, Policy};
 
 use super::{synthetic_uuid, UnavailableReason, MAX_PROBE_STEPS};
 use crate::progressive::{RemainingResource, RemainingWorkEstimate};
 
-/// One quota window's evidence, plus the information needed to resolve
-/// [`Relief::AfterOutstandingHoldsSettle`] into a concrete next-probe
-/// instant.
+/// A task's hold against one window, not yet known to have settled.
+/// `id` must be unique per *task* (not just per window) — the caller
+/// (`pacing::step`) is responsible for deriving it so two different
+/// tasks' holds on the same window never collide (a prior self-review
+/// pass in this module found exactly that bug: deriving a hold's id from
+/// the window alone made every in-flight task's hold collapse to one,
+/// which `quota_window::dedup_holds_by_id` then silently deduplicated —
+/// the window looked far less constrained than it really was).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingHold {
+    pub id: ReservationId,
+    pub amount: QuotaAmount,
+    /// The instant this hold is projected to settle into ordinary usage.
+    /// Before this instant the forecast treats it as an outstanding
+    /// hold (reduces headroom, never counted twice); from this instant
+    /// on it is folded into `usage` instead — the mechanism that lets a
+    /// sliding/fixed window's *cumulative* spend, not just its
+    /// currently-concurrent holds, actually constrain admission (AC2:
+    /// "including simultaneous in-flight work").
+    pub completes_at: OffsetDateTime,
+}
+
+/// One quota window's evidence: already-settled usage, in-flight holds
+/// not yet known to have settled ([`PendingHold`]), and any provider
+/// snapshots (for a Gauge window). Already scoped to this window (unit-
+/// filtered, caller-selected) the same way [`QuotaWindow::evaluate`]
+/// expects.
 pub struct WindowInput<'a> {
     pub window: &'a QuotaWindow,
-    /// Evidence for this window **excluding** the candidate task's own
-    /// synthetic need — [`earliest_safe_admit`] injects that itself at
-    /// each probe step. Already scoped to this window (unit-filtered,
-    /// caller-selected) the same way [`QuotaWindow::evaluate`] expects.
-    pub evidence: QuotaEvidence<'a>,
-    /// Ascending, caller-supplied instants at which an existing
-    /// outstanding hold already present in `evidence.holds` is projected
-    /// to settle into usage. Only consulted when this window's relief is
-    /// `AfterOutstandingHoldsSettle`; need not be sorted strictly (this
-    /// module sorts defensively), but must include every such instant or
-    /// [`UnavailableReason::NoProjectedRelief`] may fire spuriously.
-    pub hold_completions: &'a [OffsetDateTime],
+    pub usage: &'a [QuotaUsage],
+    pub pending: &'a [PendingHold],
+    pub snapshots: &'a [ProviderSnapshot],
+}
+
+/// Splits `pending` as of probe time `t`: holds not yet settled stay
+/// outstanding; holds whose `completes_at <= t` become ordinary usage
+/// records dated at their completion instant. Returns owned `Vec`s
+/// because [`QuotaWindow::evaluate`] borrows its evidence by reference
+/// and this module has nowhere else to stash them for the duration of
+/// one `check_window` call.
+fn split_pending_as_of(
+    pending: &[PendingHold],
+    t: OffsetDateTime,
+) -> (Vec<OutstandingHold>, Vec<QuotaUsage>) {
+    let mut holds = Vec::new();
+    let mut settled = Vec::new();
+    for p in pending {
+        if p.completes_at <= t {
+            if let Ok(usage) =
+                QuotaUsage::new(EconomicEventId(p.id.0), p.completes_at, p.amount.clone())
+            {
+                settled.push(usage);
+            }
+        } else {
+            holds.push(OutstandingHold::projected(p.id, p.amount.clone()));
+        }
+    }
+    (holds, settled)
 }
 
 /// The caller-chosen pacing mode this probe is being run under. Only the
@@ -196,6 +237,7 @@ fn check_window(
     t: OffsetDateTime,
 ) -> WindowOutcome {
     let window = input.window;
+    let (pending_holds, settled_from_pending) = split_pending_as_of(input.pending, t);
 
     if is_gauge(window) {
         // See module docs: a Gauge window has no quantity to inject a
@@ -203,7 +245,12 @@ fn check_window(
         // answer. A Gauge can therefore never report `BlockedAt` here —
         // only `Admit` or `Unavailable`, which keeps the caller's loop
         // from waiting on a window that structurally cannot resolve.
-        let eval = window.evaluate(&input.evidence, t);
+        let evidence = QuotaEvidence {
+            usage: input.usage,
+            holds: &[],
+            snapshots: input.snapshots,
+        };
+        let eval = window.evaluate(&evidence, t);
         return match eval.blocking {
             BlockingStatus::NotBlocking => WindowOutcome::Admit,
             BlockingStatus::Indeterminate(reason) => WindowOutcome::Unavailable(
@@ -234,12 +281,14 @@ fn check_window(
 
     let synthetic_id = ReservationId(synthetic_uuid(window.id().0, SYNTHETIC_NEED_TAG));
     let synthetic_hold = OutstandingHold::projected(synthetic_id, need.clone());
-    let mut holds: Vec<OutstandingHold> = input.evidence.holds.to_vec();
+    let mut holds: Vec<OutstandingHold> = pending_holds;
     holds.push(synthetic_hold);
+    let mut usage: Vec<QuotaUsage> = input.usage.to_vec();
+    usage.extend(settled_from_pending);
     let evidence = QuotaEvidence {
-        usage: input.evidence.usage,
+        usage: &usage,
         holds: &holds,
-        snapshots: input.evidence.snapshots,
+        snapshots: input.snapshots,
     };
     let eval = window.evaluate(&evidence, t);
     match eval.blocking {
@@ -250,8 +299,14 @@ fn check_window(
         BlockingStatus::Blocking => match extract_relief(&eval.state) {
             Relief::At(x) => WindowOutcome::BlockedAt(x),
             Relief::AfterOutstandingHoldsSettle => {
-                match input.hold_completions.iter().filter(|c| **c > t).min() {
-                    Some(next) => WindowOutcome::BlockedAt(*next),
+                match input
+                    .pending
+                    .iter()
+                    .map(|p| p.completes_at)
+                    .filter(|c| *c > t)
+                    .min()
+                {
+                    Some(next) => WindowOutcome::BlockedAt(next),
                     None => WindowOutcome::Unavailable(UnavailableReason::NoProjectedRelief(
                         window.id(),
                     )),
@@ -289,7 +344,7 @@ fn resource_kind_for_unit(unit: &QuotaUnit) -> Option<ResourceKind> {
 /// returns `Err` for every honest reason this figure cannot be computed
 /// at all.
 #[allow(clippy::too_many_arguments)]
-fn window_need(
+pub(crate) fn window_need(
     window: &QuotaWindow,
     estimate: &RemainingWorkEstimate,
     contract: Option<&CompletionContract>,
@@ -458,12 +513,9 @@ mod tests {
         let estimate = estimate_with_tokens_p90(100);
         let input = WindowInput {
             window: &window,
-            evidence: QuotaEvidence {
-                usage: &[],
-                holds: &[],
-                snapshots: &[],
-            },
-            hold_completions: &[],
+            usage: &[],
+            pending: &[],
+            snapshots: &[],
         };
         let result = earliest_safe_admit(
             &[input],
@@ -504,12 +556,9 @@ mod tests {
         let estimate = estimate_with_tokens_p90(100);
         let input = WindowInput {
             window: &window,
-            evidence: QuotaEvidence {
-                usage: &[],
-                holds: &[],
-                snapshots: &[],
-            },
-            hold_completions: &[],
+            usage: &[],
+            pending: &[],
+            snapshots: &[],
         };
         let result = earliest_safe_admit(
             &[input],
@@ -535,12 +584,9 @@ mod tests {
         let estimate = estimate_with_tokens_p90(100);
         let input = WindowInput {
             window: &window,
-            evidence: QuotaEvidence {
-                usage: &[],
-                holds: &[],
-                snapshots: &[],
-            },
-            hold_completions: &[],
+            usage: &[],
+            pending: &[],
+            snapshots: &[],
         };
         let result = earliest_safe_admit(
             &[input],
@@ -569,12 +615,9 @@ mod tests {
         assert!(p.min_confidence > Confidence::Low);
         let input = WindowInput {
             window: &window,
-            evidence: QuotaEvidence {
-                usage: &[],
-                holds: &[],
-                snapshots: &[],
-            },
-            hold_completions: &[],
+            usage: &[],
+            pending: &[],
+            snapshots: &[],
         };
         let result = earliest_safe_admit(
             &[input],
@@ -607,12 +650,9 @@ mod tests {
         .unwrap()];
         let input = WindowInput {
             window: &window,
-            evidence: QuotaEvidence {
-                usage: &usage,
-                holds: &[],
-                snapshots: &[],
-            },
-            hold_completions: &[],
+            usage: &usage,
+            pending: &[],
+            snapshots: &[],
         };
         let result = earliest_safe_admit(
             &[input],
@@ -631,6 +671,108 @@ mod tests {
                 assert_eq!(limiting, id);
             }
             other => panic!("expected At, got {other:?}"),
+        }
+    }
+
+    /// AC1, the ticket's own fixture: "In sliding six-hour + fixed
+    /// weekly case burst correctly forecasts post-reset six-hour
+    /// starvation." Nine tasks' worth of usage (900 tokens) lands at
+    /// `t0` (a Monday 00:00 UTC, so the weekly window's period boundary
+    /// is unambiguous); the 10th candidate's 100-token need pushes the
+    /// 6h sliding window (limit 1000) to exactly its limit, while the
+    /// weekly window (limit 1200) still has 200 tokens of headroom at
+    /// `t0` and even 6h later — so the 10th task must wait exactly 6h,
+    /// and the *sliding* window (not the weekly one) is correctly named
+    /// as the limiting constraint, never the other way round.
+    #[test]
+    fn ac1_burst_forecasts_post_reset_six_hour_starvation() {
+        let sliding_id = QuotaWindowId::new();
+        let sliding = sliding_window(sliding_id, 1000, 21_600);
+
+        let weekly_id = QuotaWindowId::new();
+        let utc = crate::quota_window::IanaTimeZone::new("UTC").expect("UTC is a known IANA zone");
+        let weekly = QuotaWindow::validated(
+            weekly_id,
+            QuotaScope {
+                subject: QuotaSubject::Principal(PrincipalId("p".to_string())),
+                source: EntitlementSource::OperatorConfigured,
+                confidence: Confidence::High,
+                observed_at: OffsetDateTime::UNIX_EPOCH,
+                valid_until: None,
+            },
+            QuotaUnit::Tokens,
+            WindowKind::FixedAligned {
+                period: crate::quota_window::AlignedPeriod::Week {
+                    starts_on: crate::quota_window::ResetWeekday::Monday,
+                    at: crate::quota_window::WallClockTime::new(0, 0).unwrap(),
+                },
+                time_zone: utc,
+                limit: 1200,
+            },
+        )
+        .unwrap();
+
+        // 2024-01-01 is a Monday — t0 sits exactly at the weekly
+        // window's own reset boundary, so "post-reset" is literal here.
+        let t0 = time::macros::datetime!(2024-01-01 00:00:00 UTC);
+        let estimate = estimate_with_tokens_p90(100);
+
+        // Nine tasks' usage, already settled at t0 (burst started all
+        // nine at once and they are modeled as immediately-counted spend
+        // for this fixture — see module docs on `PendingHold` for why a
+        // settled-before-now pending hold becomes ordinary usage).
+        let usage: Vec<QuotaUsage> = (0..9)
+            .map(|_| {
+                QuotaUsage::new(
+                    crate::EconomicEventId(uuid::Uuid::new_v4()),
+                    t0,
+                    QuotaAmount::new(QuotaUnit::Tokens, 100),
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let windows = vec![
+            WindowInput {
+                window: &sliding,
+                usage: &usage,
+                pending: &[],
+                snapshots: &[],
+            },
+            WindowInput {
+                window: &weekly,
+                usage: &usage,
+                pending: &[],
+                snapshots: &[],
+            },
+        ];
+
+        let result = earliest_safe_admit(
+            &windows,
+            &estimate,
+            &policy(),
+            None,
+            None,
+            ForecastMode::Burst,
+            1,
+            1,
+            t0,
+        );
+
+        match result {
+            super::super::NextAdmit::At { at, limiting } => {
+                assert_eq!(
+                    at,
+                    t0 + time::Duration::seconds(21_600),
+                    "the 10th task must wait exactly 6h for the sliding window to clear"
+                );
+                assert_eq!(
+                    limiting, sliding_id,
+                    "the sliding window, not the weekly one, must be named as limiting — \
+                     the weekly window still has 200 tokens of headroom at t0"
+                );
+            }
+            other => panic!("expected At(+6h) limited by the sliding window, got {other:?}"),
         }
     }
 }

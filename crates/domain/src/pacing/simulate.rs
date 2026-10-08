@@ -117,8 +117,8 @@ mod tests {
     use crate::pacing::{PacingPreference, SimTask, SimTaskId, TaskSet};
     use crate::progressive::{RemainingDuration, RemainingResource};
     use crate::quota_window::{
-        EntitlementSource, QuotaScope, QuotaSubject, QuotaUnit, QuotaWindow, QuotaWindowId,
-        WindowKind,
+        EntitlementSource, QuotaAmount, QuotaScope, QuotaSubject, QuotaUnit, QuotaWindow,
+        QuotaWindowId, WindowKind,
     };
     use crate::resource_amount::{ResourceAmount, ResourceKind};
     use crate::Confidence;
@@ -320,5 +320,172 @@ mod tests {
         // both — `step` takes `&Policy` by reference from the caller in
         // both branches, never a mode-specific copy.
         assert_eq!(shared_policy.name, "test");
+    }
+
+    /// AC3, non-tautological half: with an actual `CompletionContract`
+    /// supplied, both modes apply the *same* completion-reserve floor to
+    /// the hold they admit a task at — demonstrating the contract is
+    /// genuinely consulted identically by both, not merely that the two
+    /// `Scenario`s happen to hold the same Rust reference.
+    #[test]
+    fn ac3_completion_reserve_floor_is_identical_across_modes() {
+        use crate::completion_contract::{CompletionContract, CompletionCriterion};
+        use crate::reservation::completion_reserve_for;
+
+        let contract = CompletionContract::first(vec![
+            CompletionCriterion::required("tests pass"),
+            CompletionCriterion::required("docs updated"),
+        ]);
+        let shared_policy = policy();
+        let reserve = completion_reserve_for(&contract, None, &shared_policy);
+
+        let tasks = TaskSet::validated(vec![task(1, 10, 60)]).unwrap();
+        let w = window(1_000_000, 21_600);
+        let events = vec![PacingEvent::ModeChanged {
+            at: OffsetDateTime::UNIX_EPOCH,
+            seq: 0,
+        }];
+
+        let burst_scenario = Scenario {
+            tasks: &tasks,
+            windows: std::slice::from_ref(&w),
+            contract: Some(&contract),
+            preference: PacingPreference::Burst {
+                target_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(6),
+                max_fanout: 1,
+            },
+        };
+        let sustain_scenario = Scenario {
+            tasks: &tasks,
+            windows: std::slice::from_ref(&w),
+            contract: Some(&contract),
+            preference: PacingPreference::Sustain {
+                horizon_secs: 21_600,
+                working_hours: None,
+                continuity_reserve_bp: 0,
+            },
+        };
+
+        let (_, burst_trace) = simulate(&events, &shared_policy, &burst_scenario);
+        let (_, sustain_trace) = simulate(&events, &shared_policy, &sustain_scenario);
+
+        let burst_hold = first_start_hold(&burst_trace).expect("burst must admit the one task");
+        let sustain_hold =
+            first_start_hold(&sustain_trace).expect("sustain must admit the one task");
+
+        assert!(
+            burst_hold.value >= reserve.amount.as_f64() as u64,
+            "burst's admitted hold must respect the completion reserve floor"
+        );
+        assert_eq!(
+            burst_hold.value, sustain_hold.value,
+            "the same contract/policy must floor both modes' hold identically"
+        );
+    }
+
+    fn first_start_hold(trace: &[(Tick<'_>, Vec<Proposal>)]) -> Option<QuotaAmount> {
+        trace.iter().find_map(|(_, proposals)| {
+            proposals.iter().find_map(|p| match p {
+                Proposal::Start { hold, .. } => Some(hold.clone()),
+                _ => None,
+            })
+        })
+    }
+
+    /// AC2, independent of `step`'s own internal pending-hold machinery:
+    /// rebuilds every in-flight hold at each `Start` proposal's instant
+    /// from the trace alone (distinct ids, not reusing
+    /// `pending_hold_id`), calls `QuotaWindow::evaluate` directly, and
+    /// asserts `NotBlocking`. This is the check that would have caught
+    /// the hold-id-collision bug `distinct_tasks_get_distinct_hold_ids_
+    /// so_concurrent_holds_genuinely_stack` (in `step.rs`) now guards —
+    /// an invariant over `simulate`'s own output, not a test that reuses
+    /// the code under test to check itself.
+    #[test]
+    fn ac2_every_start_independently_verified_not_blocking() {
+        let many: Vec<SimTask> = (0..11).map(|i| task(i, 100, 60)).collect();
+        let tasks = TaskSet::validated(many).unwrap();
+        let w = window(1000, 21_600);
+        let scenario = Scenario {
+            tasks: &tasks,
+            windows: std::slice::from_ref(&w),
+            contract: None,
+            preference: PacingPreference::Burst {
+                target_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+                max_fanout: 20,
+            },
+        };
+        let events = vec![PacingEvent::ModeChanged {
+            at: OffsetDateTime::UNIX_EPOCH,
+            seq: 0,
+        }];
+        let (_, trace) = simulate(&events, &policy(), &scenario);
+
+        // Independently-tracked (amount, completes_at) pairs, keyed by a
+        // fresh v4 id per start (never derived the way `step`'s internal
+        // machinery derives its own ids) — the point is that a bug in
+        // `step`'s derivation must not be able to hide from this check.
+        // Before `completes_at`, a pair counts as an outstanding hold;
+        // from `completes_at` on it is folded into usage instead —
+        // independently reconstructing the same split `forecast`'s
+        // `split_pending_as_of` makes, not by calling it.
+        let mut independent_pending: Vec<(QuotaAmount, OffsetDateTime)> = Vec::new();
+        let mut started_any = false;
+        for (tick, proposals) in &trace {
+            let at = match tick {
+                Tick::Event(e) => e.at(),
+                Tick::Timer(t) => *t,
+            };
+            for p in proposals {
+                if let Proposal::Start { hold, .. } = p {
+                    started_any = true;
+                    let mut evidence_holds = Vec::new();
+                    let mut evidence_usage = Vec::new();
+                    for (amount, completes_at) in &independent_pending {
+                        let id = crate::reservation::ReservationId(uuid::Uuid::new_v4());
+                        if *completes_at <= at {
+                            if let Ok(usage) = crate::quota_window::QuotaUsage::new(
+                                crate::EconomicEventId(id.0),
+                                *completes_at,
+                                amount.clone(),
+                            ) {
+                                evidence_usage.push(usage);
+                            }
+                        } else {
+                            evidence_holds.push(crate::quota_window::OutstandingHold::projected(
+                                id,
+                                amount.clone(),
+                            ));
+                        }
+                    }
+                    let evidence = crate::quota_window::QuotaEvidence {
+                        usage: &evidence_usage,
+                        holds: &evidence_holds,
+                        snapshots: &[],
+                    };
+                    let eval = w.evaluate(&evidence, at);
+                    assert_eq!(
+                        eval.blocking,
+                        crate::quota_window::BlockingStatus::NotBlocking,
+                        "a Start proposal must independently verify as NotBlocking \
+                         against every other hold already active at that instant"
+                    );
+                    independent_pending.push((hold.clone(), at + time::Duration::seconds(60)));
+                }
+            }
+        }
+        assert!(
+            started_any,
+            "scenario must have produced at least one Start to check"
+        );
+        // Unlike the single-step regression test in `step.rs` (which
+        // checks only the *first* pass, where exactly 9 of 11 fit), this
+        // test lets `simulate` run the derived timer forward across
+        // relief hops with no end condition, so eventually all 11 tasks
+        // start once the sliding window ages enough usage out — the
+        // invariant actually being checked is that every single one of
+        // those 11 starts, whenever it happens, independently verifies
+        // as `NotBlocking`.
+        assert_eq!(independent_pending.len(), 11);
     }
 }
