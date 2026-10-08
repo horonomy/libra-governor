@@ -966,7 +966,9 @@ fn run_owned_diagnostic(
         }
         // Publish ownership before any fallible allocation or callback.
         owner.pid = Pid::from_raw(pid);
-        owner.group = process::setpgid(owner.pid, owner.pid).is_ok();
+        // The child alone creates its group before publishing readiness.
+        // Concurrent parent/child setpgid calls can fail with EPERM on Darwin;
+        // cleanup probes getpgid until readiness confirms group ownership.
         let Plan {
             stdin,
             stdout,
@@ -1280,6 +1282,32 @@ print('no-private-descriptors')
     const ISOLATED_WATCHDOG: Duration = Duration::from_secs(30);
 
     #[test]
+    fn child_alone_establishes_its_group_before_execution() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent_group = process::getpgrp();
+        let result = run_owned_diagnostic(
+            launch("/bin/cat", &[], directory.path()),
+            b"owned-request",
+            &Cancellation::default(),
+            RunControls {
+                gate: Some(ChildGate::new()),
+                on_owned: Some(Box::new(move |pid| {
+                    assert_eq!(process::getpgid(Some(pid)), Ok(parent_group));
+                    assert_ne!(pid, parent_group);
+                })),
+                after_cleanup: Some(Box::new(|owner| {
+                    assert!(owner.ready);
+                    assert!(owner.group);
+                    assert!(owner.reaped);
+                    assert!(owner.pid.is_none());
+                })),
+                ..RunControls::default()
+            },
+        );
+        assert_eq!(result, Ok(b"owned-request".to_vec()));
+    }
+
+    #[test]
     fn transient_fork_admission_retries_without_spending_the_request_budget() {
         let directory = tempfile::tempdir().unwrap();
         let result = run_owned_diagnostic(
@@ -1378,9 +1406,11 @@ print('no-private-descriptors')
                         published.store(pid.as_raw_pid(), Ordering::SeqCst);
                     })),
                     before_cleanup: Some(Box::new(move |owner| {
+                        assert_eq!(owner.group, late);
                         assert_eq!(owner.timeout_phase, Some(phase));
                     })),
                     after_cleanup: Some(Box::new(move |owner| {
+                        assert_eq!(owner.group, late);
                         assert!(owner.reaped);
                         assert!(owner.pid.is_none());
                         assert_eq!(owner.timeout_phase, Some(phase));

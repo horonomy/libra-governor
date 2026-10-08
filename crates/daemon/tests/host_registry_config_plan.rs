@@ -177,7 +177,8 @@ fn real_planner_drift_invalidates_preview_without_restoring_changed_state() {
             assert_eq!(
                 fs::read_to_string(&fixture.log).unwrap(),
                 expected,
-                "{phase}/{component}"
+                "{phase}/{component}: {}",
+                failure.reason
             );
             match component {
                 "target_bytes" => assert_eq!(

@@ -540,7 +540,14 @@ fn returned_event_correlation_is_all_or_nothing_across_identity_and_snapshot_fie
         let fixture = make_fixture(mode, None, true, true);
         let state_before = state_inventory(&fixture._temp.path().join("state"));
         let failure = expect_failure(fixture.normalize(ADAPTER_ID, input(), DiagnosticScope::User));
-        assert_eq!(failure.stage, "protocol", "{mode}");
+        assert_eq!(
+            failure.stage,
+            "protocol",
+            "{mode}: {}; starts={}; operations={}",
+            failure.reason,
+            start_lines(&fixture.log).len(),
+            lines(&fixture.log).len()
+        );
         assert_eq!(
             failure.reason, "normalized event correlation refused",
             "{mode}"
@@ -664,7 +671,14 @@ fn code_trust_registration_and_user_cwd_drift_discard_batches_before_or_after_no
         let fixture = make_fixture(mode, None, true, true);
         let before = fs::read(&fixture.registry_file).unwrap();
         let failure = expect_failure(fixture.normalize(ADAPTER_ID, input(), DiagnosticScope::User));
-        assert_eq!(failure.stage, stage, "{mode}");
+        assert_eq!(
+            failure.stage,
+            stage,
+            "{mode}: {}; starts={}; operations={}",
+            failure.reason,
+            start_lines(&fixture.log).len(),
+            lines(&fixture.log).len()
+        );
         assert_eq!(failure.reason, reason, "{mode}");
         assert!(failure.execution_attempted, "{mode}");
         assert_eq!(lines(&fixture.log), operations, "{mode}");
