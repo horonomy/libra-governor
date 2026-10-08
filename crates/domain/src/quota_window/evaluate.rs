@@ -432,7 +432,15 @@ fn evaluate_bucket(
                 .saturating_sub(1)
                 / refill_amount as i128;
             let ms_needed_i64 = ms_needed.clamp(0, i64::MAX as i128) as i64;
-            Relief::At(now + time::Duration::milliseconds(ms_needed_i64))
+            // `now + Duration` panics if the result is out of
+            // OffsetDateTime's representable range — reachable here with
+            // a legitimate (capacity, refill_amount) pair that implies
+            // an astronomically distant refill instant (e.g. a huge
+            // capacity refilling at 1 unit per century). Report the
+            // honest answer, `Unknown`, rather than crash or guess.
+            now.checked_add(time::Duration::milliseconds(ms_needed_i64))
+                .map(Relief::At)
+                .unwrap_or(Relief::Unknown)
         }
     };
 

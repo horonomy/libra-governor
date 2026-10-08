@@ -609,6 +609,31 @@ fn percent_unit_is_refused_on_a_non_gauge_window() {
 }
 
 #[test]
+fn an_unreasonably_long_sliding_window_is_refused_not_trusted_into_a_panic() {
+    // length_secs feeds `now ± Duration::seconds(length_secs as i64)` in
+    // evaluate(); OffsetDateTime arithmetic panics on overflow, so this
+    // must be refused at construction rather than trusted at evaluation
+    // time.
+    let err = QuotaWindow::validated(
+        QuotaWindowId::new(),
+        scope_at(datetime!(2026-01-01 0:00:00 UTC)),
+        QuotaUnit::Tokens,
+        WindowKind::Sliding {
+            length_secs: u64::MAX,
+            limit: 100,
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        QuotaWindowError::FieldOutOfRange {
+            field: "length_secs",
+            ..
+        }
+    ));
+}
+
+#[test]
 fn distinct_opaque_credit_namespaces_are_distinct_units() {
     let a = QuotaUnit::OpaqueCredit(CreditNamespace::new("acme-credits").unwrap());
     let b = QuotaUnit::OpaqueCredit(CreditNamespace::new("other-credits").unwrap());
@@ -976,6 +1001,30 @@ fn refill_bucket_relief_is_deficit_divided_by_rate() {
         b.relief,
         Relief::At(now + time::Duration::milliseconds(100))
     );
+}
+
+#[test]
+fn refill_bucket_relief_reports_unknown_rather_than_panicking_when_astronomically_far() {
+    // A huge outstanding hold against a bucket refilling at a tiny rate
+    // implies a relief instant far beyond OffsetDateTime's representable
+    // range. `now + Duration` panics on overflow; this must report the
+    // honest `Unknown` instead.
+    let anchor = datetime!(2026-10-08 12:00:00 UTC);
+    let w = bucket_window(u64::MAX, 1, 1, anchor, 0);
+    let huge_hold =
+        OutstandingHold::from_reservation(&fixture_reservation(u64::MAX - 1, ResState::Active))
+            .unwrap();
+    let evidence = QuotaEvidence {
+        usage: &[],
+        holds: &[huge_hold],
+        snapshots: &[],
+    };
+    let eval = w.evaluate(&evidence, anchor);
+    assert_eq!(eval.blocking, BlockingStatus::Blocking);
+    let WindowState::Bucket(b) = eval.state else {
+        panic!("expected Bucket state")
+    };
+    assert_eq!(b.relief, Relief::Unknown);
 }
 
 #[test]

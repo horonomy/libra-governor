@@ -431,7 +431,21 @@ pub enum QuotaWindowError {
     GaugeMissingLimit,
     #[error("a Percent gauge reading must not declare a separate limit")]
     GaugeUnexpectedLimit,
+    #[error("{field} ({value}) exceeds the maximum representable window length ({max})")]
+    FieldOutOfRange {
+        field: &'static str,
+        value: u64,
+        max: u64,
+    },
 }
+
+/// The maximum a [`WindowKind::Sliding`]'s `length_secs` may be: 100
+/// years in seconds. No real quota window is anywhere near this long;
+/// the bound exists purely so `now ± Duration::seconds(length_secs)`
+/// can never panic in [`evaluate`] — `OffsetDateTime` arithmetic panics
+/// on overflow, and `length_secs` is caller-supplied, so it must be
+/// refused at construction rather than trusted at evaluation time.
+const MAX_SLIDING_LENGTH_SECS: u64 = 100 * 365 * 24 * 3600;
 
 /// Normalizes a UTC timestamp to whole milliseconds, matching
 /// [`occurred_at_wire`]'s own truncation — so a sub-millisecond
@@ -544,6 +558,13 @@ impl QuotaWindow {
                 if length_secs == 0 {
                     return Err(QuotaWindowError::ZeroField {
                         field: "length_secs",
+                    });
+                }
+                if length_secs > MAX_SLIDING_LENGTH_SECS {
+                    return Err(QuotaWindowError::FieldOutOfRange {
+                        field: "length_secs",
+                        value: length_secs,
+                        max: MAX_SLIDING_LENGTH_SECS,
                     });
                 }
                 WindowKind::Sliding { length_secs, limit }
