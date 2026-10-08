@@ -58,7 +58,12 @@ wires this binary's hooks and statusline into
 `~/.claude/settings.json` (via `libra-governor install` — see
 "Uninstall" below for exactly what that touches), and finishes by
 running `libra-governor doctor` so you see real, current state rather
-than an installer's own claim of success.
+than an installer's own claim of success. If you want the three hooks
+without changing Claude Code's statusline setting, use
+`./scripts/install.sh --hooks-only` or, after installing the binary,
+`libra-governor install --hooks-only`. This mode preserves `statusLine`
+exactly as found, including leaving it absent; default install behavior is
+unchanged.
 
 Equivalent manual steps, if you would rather not run the script:
 

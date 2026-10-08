@@ -357,16 +357,26 @@ pub struct Applied {
 }
 
 /// Adds this integration's `UserPromptSubmit`/`PostToolUse`/`Stop` hooks
-/// and `statusLine`, pointing at `binary`, to `path`. Idempotent: an
-/// already-present Governor-owned entry is not duplicated. Never touches
+/// and, when requested, `statusLine`, pointing at `binary`, to `path`. Idempotent:
+/// an already-present Governor-owned entry is not duplicated. Never touches
 /// any other key. `binary` should be an absolute path (a relative path
 /// in `settings.json` would only work when Claude Code happens to be
 /// launched from the right working directory).
 pub fn apply(path: &Path, binary: &Path) -> Result<Applied, SettingsError> {
-    with_write_lock(path, || apply_locked(path, binary))
+    with_write_lock(path, || apply_locked(path, binary, true))
 }
 
-fn apply_locked(path: &Path, binary: &Path) -> Result<Applied, SettingsError> {
+/// Adds only this integration's three hooks, leaving `statusLine` untouched
+/// whether it is absent, foreign, or has an unrecognized shape.
+pub fn apply_hooks_only(path: &Path, binary: &Path) -> Result<Applied, SettingsError> {
+    with_write_lock(path, || apply_locked(path, binary, false))
+}
+
+fn apply_locked(
+    path: &Path,
+    binary: &Path,
+    install_statusline: bool,
+) -> Result<Applied, SettingsError> {
     let (existing, digest) = read_object(path)?;
     let mut root = existing.unwrap_or_default();
     let binary = binary.display().to_string();
@@ -410,27 +420,30 @@ fn apply_locked(path: &Path, binary: &Path) -> Result<Applied, SettingsError> {
         }
     }
 
-    let statusline_command = format!("{binary} statusline");
-    let existing_statusline_command = root
-        .get("statusLine")
-        .and_then(|v| v.get("command"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let statusline_already_ours =
-        existing_statusline_command.as_deref() == Some(statusline_command.as_str());
-    // A foreign `statusLine` (any value not already ours) is left
-    // untouched — overwriting it would silently destroy a user's own
-    // statusline integration, which is exactly the kind of "conflicting
-    // config overwritten blindly" this module exists to avoid. Only an
-    // absent or already-ours `statusLine` is written.
-    let statusline_conflict = existing_statusline_command.is_some() && !statusline_already_ours;
-    let statusline_added = !statusline_already_ours && !statusline_conflict;
-    if statusline_added {
-        root.insert(
-            "statusLine".to_string(),
-            serde_json::json!({ "type": "command", "command": statusline_command }),
-        );
-    }
+    let (statusline_added, statusline_conflict) = if install_statusline {
+        let statusline_command = format!("{binary} statusline");
+        let existing_statusline_command = root
+            .get("statusLine")
+            .and_then(|v| v.get("command"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let statusline_already_ours =
+            existing_statusline_command.as_deref() == Some(statusline_command.as_str());
+        // A foreign `statusLine` (any value not already ours) is left
+        // untouched — overwriting it would silently destroy a user's own
+        // statusline integration. Only an absent or already-ours `statusLine` is written.
+        let statusline_conflict = existing_statusline_command.is_some() && !statusline_already_ours;
+        let statusline_added = !statusline_already_ours && !statusline_conflict;
+        if statusline_added {
+            root.insert(
+                "statusLine".to_string(),
+                serde_json::json!({ "type": "command", "command": statusline_command }),
+            );
+        }
+        (statusline_added, statusline_conflict)
+    } else {
+        (false, false)
+    };
 
     let backup_path = write_object_atomically(path, &root, digest)?;
     Ok(Applied {
@@ -746,6 +759,81 @@ mod tests {
             bytes_after, original_bytes,
             "a refused apply must leave the file byte-for-byte unchanged"
         );
+    }
+
+    #[test]
+    fn apply_hooks_only_leaves_an_absent_statusline_absent_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        let applied = apply_hooks_only(&path, &binary()).unwrap();
+        assert_eq!(applied.hooks_added, 3);
+        assert!(!applied.statusline_added);
+        assert!(!applied.statusline_conflict);
+
+        let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(value.get("statusLine").is_none());
+        assert_eq!(inspect(&path).hooks_wired, [true, true, true]);
+
+        let second = apply_hooks_only(&path, &binary()).unwrap();
+        assert_eq!(second.hooks_added, 0);
+        assert!(!second.statusline_added);
+    }
+
+    #[test]
+    fn apply_hooks_only_preserves_existing_statusline_metadata_and_unknown_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let seed = serde_json::json!({
+            "statusLine": { "type": "command", "command": "/usr/local/bin/foreign", "custom": true },
+            "futureSetting": { "kept": [1, 2, 3] },
+            "hooks": { "PostToolUse": [{ "matcher": "Read", "hooks": [
+                { "type": "command", "command": "/usr/local/bin/foreign-hook" }
+            ] }] }
+        });
+        std::fs::write(&path, serde_json::to_vec(&seed).unwrap()).unwrap();
+
+        let applied = apply_hooks_only(&path, &binary()).unwrap();
+        assert_eq!(applied.hooks_added, 3);
+        assert!(!applied.statusline_added);
+        assert!(!applied.statusline_conflict);
+
+        let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["statusLine"], seed["statusLine"]);
+        assert_eq!(value["futureSetting"], seed["futureSetting"]);
+        assert_eq!(
+            value["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+            "/usr/local/bin/foreign-hook"
+        );
+
+        apply_hooks_only(&path, &binary()).unwrap();
+        let after: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after["statusLine"], seed["statusLine"]);
+        assert_eq!(
+            after["hooks"]["UserPromptSubmit"].as_array().unwrap().len(),
+            1,
+            "rerunning must not duplicate Libra hooks"
+        );
+    }
+
+    #[test]
+    fn apply_hooks_only_preserves_malformed_statusline_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let malformed = serde_json::json!(["unexpected", { "future": true }]);
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({ "statusLine": malformed })).unwrap(),
+        )
+        .unwrap();
+
+        let applied = apply_hooks_only(&path, &binary()).unwrap();
+        assert_eq!(applied.hooks_added, 3);
+        assert!(!applied.statusline_added);
+        assert!(!applied.statusline_conflict);
+
+        let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["statusLine"], malformed);
     }
 
     #[test]

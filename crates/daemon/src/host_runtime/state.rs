@@ -1167,6 +1167,36 @@ fn storage_boundary(point: CommitBoundary) -> Result<(), RegistryFailure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absent_namespace_witness_refuses_completed_first_registration() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("state");
+        let namespace = Namespace::capture(&root).unwrap();
+        let contract = HostContract::load().unwrap();
+        let registry = AdapterRegistry::new(root, contract.clone());
+        let absent = registry.read().unwrap();
+        registry
+            .register(fixture(&contract, "winner"), absent.stamp())
+            .unwrap();
+        let before = registry.read().unwrap();
+
+        let failure = namespace.check().unwrap_err();
+        assert_eq!(failure.stage, "registry");
+        assert_eq!(failure.reason, "state namespace changed");
+        assert_eq!(failure.effect, RegistryEffect::NoChange);
+        let after = registry.read().unwrap();
+        assert_eq!(after.stamp(), before.stamp());
+        assert_eq!(after.document.as_ref().unwrap().revision, 1);
+        assert_eq!(after.document.as_ref().unwrap().adapters.len(), 1);
+        assert!(after
+            .document
+            .as_ref()
+            .unwrap()
+            .adapters
+            .contains_key("winner"));
+    }
+
     #[test]
     fn passive_preview_witness_refuses_same_bytes_file_or_namespace_replacement() {
         for component in ["catalog", "adapters", "root"] {

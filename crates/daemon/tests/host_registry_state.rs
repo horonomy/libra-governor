@@ -553,10 +553,14 @@ fn concurrent_first_registration_with_a_shared_absent_stamp_keeps_one_record() {
         .find_map(|result| result.as_ref().err())
         .unwrap();
     assert_eq!(stale.stage, "registry");
-    assert!(matches!(
-        stale.reason,
-        "registry changed" | "state_parent_changed"
-    ));
+    assert!(
+        matches!(
+            stale.reason,
+            "registry changed" | "state_parent_changed" | "state namespace changed"
+        ),
+        "unexpected first-registration refusal: {}",
+        stale.reason
+    );
     assert_eq!(stale.effect, RegistryEffect::NoChange);
     let final_registry = AdapterRegistry::new(root.clone(), contract().clone());
     let final_snapshot = final_registry.read().unwrap();

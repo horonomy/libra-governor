@@ -122,6 +122,9 @@ where they were.
 `libra-governor` itself never writes a shared-host registration. Its `install`
 still wires only its own hooks and, if the slot is free, its own legacy
 statusline; registering a provider is the host's job and the host's alone.
+Use `libra-governor install --hooks-only` when you want its hooks without any
+change to `statusLine`; that mode preserves the value exactly as found, or
+leaves it absent.
 
 ## Migrating from an external wrapper
 
