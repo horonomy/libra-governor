@@ -149,7 +149,7 @@ Run `libra-governor doctor` for a read-only health/config snapshot.";
 
 fn print_help() {
     println!(
-        "libra-governor {} — local-first execution governor for Claude Code and Codex\n\n{USAGE}",
+        "libra-governor {} — local-first execution governor for agentic work (Claude Code and Codex today)\n\n{USAGE}",
         env!("CARGO_PKG_VERSION")
     );
 }
