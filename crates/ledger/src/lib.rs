@@ -33,6 +33,7 @@ mod query;
 mod reservation;
 mod resource_account;
 mod session;
+mod shared_pool;
 mod store;
 mod transaction;
 mod write;
@@ -51,6 +52,10 @@ pub use reservation::{
 pub use resource_account::{
     AccountError, EnsureAccountOutcome, GrantSubleaseOutcome, GrantSubleaseRequest,
     RecordedShadowDecision,
+};
+pub use shared_pool::{
+    SharedPoolReleaseOutcome, SharedPoolReserveOutcome, SharedPoolReserveRequest,
+    SharedPoolSettleOutcome,
 };
 pub use store::LedgerStore;
 pub use write::DOGFOOD_PROFILE_ENV_VAR;
@@ -87,4 +92,13 @@ pub enum LedgerError {
     /// credit (HORO-1141 "malicious/invalid agent event" failure case).
     #[error("a negative resource amount is not a valid settlement")]
     NegativeSettlement,
+    /// A shared-pool reserve/ingest amount's
+    /// [`libra_governor_domain::QuotaUnit`] does not match the pool's own
+    /// declared unit (HORO-1763) — the shared-pool analogue of
+    /// [`Self::ResourceKindMismatch`].
+    #[error("quota unit {actual:?} does not match pool unit {expected:?}")]
+    QuotaUnitMismatch {
+        expected: libra_governor_domain::QuotaUnit,
+        actual: libra_governor_domain::QuotaUnit,
+    },
 }
