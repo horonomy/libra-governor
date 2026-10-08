@@ -233,7 +233,7 @@ fn extract_relief(state: &WindowState) -> Relief {
 
 fn check_window(
     input: &WindowInput<'_>,
-    need: Option<&QuotaAmount>,
+    need: Option<&WindowNeed>,
     t: OffsetDateTime,
 ) -> WindowOutcome {
     let window = input.window;
@@ -268,11 +268,20 @@ fn check_window(
     let Some(need) = need else {
         return WindowOutcome::Unavailable(UnavailableReason::NoEstimateInWindowUnit(window.id()));
     };
-    if need.unit != *window.unit() {
+    if need.unscaled.unit != *window.unit() {
         return WindowOutcome::Unavailable(UnavailableReason::NoEstimateInWindowUnit(window.id()));
     }
     if let Some(limit) = limit_or_capacity(window) {
-        if need.value > limit {
+        // The *unscaled* need (independent of any backoff ratio) is the
+        // honest feasibility check: this window could truly never admit
+        // this task regardless of pacing. `>=`, not `>` — `remaining <=
+        // 0` blocks at a need exactly equal to the limit, so an equal
+        // need can never actually be admitted either (see
+        // `evaluate_sliding`/`evaluate_period`'s own `blocking_now`
+        // test). The backoff-*scaled* need is deliberately never checked
+        // here — see `window_need`'s own docs for why backoff must only
+        // throttle, never permanently lock a principal out.
+        if need.unscaled.value >= limit {
             return WindowOutcome::Unavailable(UnavailableReason::NeedExceedsWindowLimit(
                 window.id(),
             ));
@@ -280,7 +289,7 @@ fn check_window(
     }
 
     let synthetic_id = ReservationId(synthetic_uuid(window.id().0, SYNTHETIC_NEED_TAG));
-    let synthetic_hold = OutstandingHold::projected(synthetic_id, need.clone());
+    let synthetic_hold = OutstandingHold::projected(synthetic_id, need.scaled.clone());
     let mut holds: Vec<OutstandingHold> = pending_holds;
     holds.push(synthetic_hold);
     let mut usage: Vec<QuotaUsage> = input.usage.to_vec();
@@ -343,6 +352,20 @@ fn resource_kind_for_unit(unit: &QuotaUnit) -> Option<ResourceKind> {
 /// a Gauge window (no quantity applies there — see module docs);
 /// returns `Err` for every honest reason this figure cannot be computed
 /// at all.
+/// The two forms of a window's need this module cares about:
+/// `unscaled` (base estimate, floored at the completion reserve, plus
+/// Sustain's continuity addition) is the figure a feasibility check
+/// (`NeedExceedsWindowLimit`) must use — it is independent of any
+/// principal's backoff. `scaled` additionally applies the integer
+/// backoff ratio, and is what actually gets injected as the candidate's
+/// synthetic hold. Keeping them distinct is what lets backoff genuinely
+/// throttle (clamp) a principal's new starts without ever being able to
+/// permanently lock them out: see [`check_window`]'s use of both.
+pub(crate) struct WindowNeed {
+    pub unscaled: QuotaAmount,
+    pub scaled: QuotaAmount,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn window_need(
     window: &QuotaWindow,
@@ -353,7 +376,7 @@ pub(crate) fn window_need(
     mode: ForecastMode,
     backoff_numerator: u64,
     backoff_denominator: u64,
-) -> Result<Option<QuotaAmount>, UnavailableReason> {
+) -> Result<Option<WindowNeed>, UnavailableReason> {
     if is_gauge(window) {
         return Ok(None);
     }
@@ -404,12 +427,25 @@ pub(crate) fn window_need(
         }
     }
 
-    let scaled = (need.value as u128)
+    let unscaled = need.clone();
+
+    let scaled_raw = (need.value as u128)
         .saturating_mul(backoff_numerator.max(1) as u128)
         .saturating_div(backoff_denominator.max(1) as u128);
-    need.value = u64::try_from(scaled).unwrap_or(u64::MAX);
+    let mut scaled = need;
+    scaled.value = u64::try_from(scaled_raw).unwrap_or(u64::MAX);
+    // Backoff throttles; it must never be able to permanently lock a
+    // principal out. Clamp the scaled need to the largest amount this
+    // window could ever admit (`limit - 1`, since `remaining <= 0`
+    // blocks at exactly the limit) rather than letting an inflated need
+    // alone make `NeedExceedsWindowLimit` fire forever.
+    if let Some(limit) = limit_or_capacity(window) {
+        if limit > 0 {
+            scaled.value = scaled.value.min(limit - 1);
+        }
+    }
 
-    Ok(Some(need))
+    Ok(Some(WindowNeed { unscaled, scaled }))
 }
 
 fn resource_amount_to_quota_amount(

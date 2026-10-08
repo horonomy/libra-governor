@@ -66,6 +66,20 @@ reservation state. None of that is decided yet.
    for "plan a deterministic schedule for one scenario", and a richer,
    ledger-integrated, multi-principal scheduler is exactly the kind of
    live-wiring decision HORO-1727 is responsible for making.
+6. **`try_admit` skips a blocked or backing-off ready task and keeps
+   trying lower-priority ones in the same pass, rather than stopping the
+   whole pass** — a deliberate backfill choice, not an oversight. The
+   alternative (stop at the first task that can't start) would let one
+   principal's backoff, or one task's window conflict, starve every
+   other ready task in the scenario, which is worse than admitting a
+   lower-priority task out of strict order. The trade-off: a
+   higher-priority, currently-blocked task can be passed over by a
+   lower-priority one that happens to fit, and in SUSTAIN this also
+   means a backfilled task updates `last_start`, which pushes the
+   head-of-line task's own spacing window back further. This is
+   accepted for the same reason as the headline choice: a schedule that
+   makes some progress on lower-priority work is better than one that
+   makes no progress at all while waiting on the head of the line.
 
 ## Consequences
 

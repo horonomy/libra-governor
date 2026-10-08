@@ -228,3 +228,64 @@ pub(crate) fn next_working_instant(now: OffsetDateTime, hours: &WorkingHours) ->
     let next_start = candidate_instant(date, hours.start, &z);
     from_jiff_timestamp(next_start.timestamp())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::macros::datetime;
+
+    fn utc_9_to_17() -> WorkingHours {
+        WorkingHours::new(
+            IanaTimeZone::new("UTC").unwrap(),
+            WallClockTime::new(9, 0).unwrap(),
+            WallClockTime::new(17, 0).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn before_start_pushes_to_that_days_start() {
+        let now = datetime!(2024-01-01 06:00:00 UTC);
+        let result = next_working_instant(now, &utc_9_to_17());
+        assert_eq!(result, datetime!(2024-01-01 09:00:00 UTC));
+    }
+
+    #[test]
+    fn inside_the_window_returns_now_unchanged() {
+        let now = datetime!(2024-01-01 12:30:00 UTC);
+        let result = next_working_instant(now, &utc_9_to_17());
+        assert_eq!(result, now);
+    }
+
+    #[test]
+    fn at_the_boundary_start_counts_as_inside() {
+        let now = datetime!(2024-01-01 09:00:00 UTC);
+        let result = next_working_instant(now, &utc_9_to_17());
+        assert_eq!(result, now);
+    }
+
+    #[test]
+    fn at_the_boundary_end_counts_as_outside() {
+        let now = datetime!(2024-01-01 17:00:00 UTC);
+        let result = next_working_instant(now, &utc_9_to_17());
+        assert_eq!(result, datetime!(2024-01-02 09:00:00 UTC));
+    }
+
+    #[test]
+    fn after_end_pushes_to_the_next_days_start() {
+        let now = datetime!(2024-01-01 20:00:00 UTC);
+        let result = next_working_instant(now, &utc_9_to_17());
+        assert_eq!(result, datetime!(2024-01-02 09:00:00 UTC));
+    }
+
+    #[test]
+    fn working_hours_construction_rejects_start_not_before_end() {
+        let tz = IanaTimeZone::new("UTC").unwrap();
+        let err = WorkingHours::new(
+            tz,
+            WallClockTime::new(17, 0).unwrap(),
+            WallClockTime::new(9, 0).unwrap(),
+        );
+        assert!(err.is_err());
+    }
+}

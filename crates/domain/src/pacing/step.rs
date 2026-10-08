@@ -214,12 +214,20 @@ fn try_admit(
         }
 
         let mut earliest_at = now;
+        // Tracks *why* `earliest_at` moved past `now`, if it did, so a
+        // held task's `NextAdmit::Paced` names the real cause instead of
+        // a placeholder window.
+        let mut pacing_cause: Option<super::PacingCause> = None;
         if let PacingPreference::Sustain {
             working_hours: Some(hours),
             ..
         } = &scenario.preference
         {
-            earliest_at = next_working_instant(earliest_at, hours);
+            let after_hours = next_working_instant(earliest_at, hours);
+            if after_hours > earliest_at {
+                earliest_at = after_hours;
+                pacing_cause = Some(super::PacingCause::WorkingHours);
+            }
         }
         if let Some(last) = working.last_start {
             if let PacingPreference::Sustain { .. } = &scenario.preference {
@@ -229,6 +237,7 @@ fn try_admit(
                     ));
                     if next_allowed > earliest_at {
                         earliest_at = next_allowed;
+                        pacing_cause = Some(super::PacingCause::Spacing);
                     }
                 }
             }
@@ -287,7 +296,7 @@ fn try_admit(
         };
         let resolved_at = match admit {
             NextAdmit::Now => Some(earliest_at),
-            NextAdmit::At { at, .. } => Some(at),
+            NextAdmit::At { at, .. } | NextAdmit::Paced { at, .. } => Some(at),
             NextAdmit::Unavailable(_) => None,
         };
 
@@ -325,17 +334,15 @@ fn try_admit(
             Some(instant) => {
                 earliest_pending_timer = Some(earlier_timer(earliest_pending_timer, instant));
                 // When the delay came from spacing/working-hours alone
-                // (forecast itself said `Now`, i.e. no window was
-                // blocking), there is no limiting window to name — fall
-                // back to the first scenario window so `Proposal::Hold`
-                // still carries a concrete instant a caller can wake on.
-                // `NextAdmit` has no "spacing" cause of its own yet; see
-                // this PR's known limitations.
+                // (forecast itself said `Now`, i.e. no window was ever
+                // blocking), report `Paced` with the real cause rather
+                // than attributing the delay to a window that was never
+                // actually constraining — see `NextAdmit::Paced`'s docs.
                 let next = match admit {
-                    NextAdmit::At { .. } => admit,
-                    _ => NextAdmit::At {
-                        at: instant,
-                        limiting: scenario.windows.first().map(|w| w.id()).unwrap_or_default(),
+                    NextAdmit::At { .. } | NextAdmit::Paced { .. } => admit,
+                    _ => match pacing_cause {
+                        Some(cause) => NextAdmit::Paced { at: instant, cause },
+                        None => admit,
                     },
                 };
                 proposals.push(Proposal::Hold { next });
@@ -444,6 +451,7 @@ fn recorded_hold(
             backoff,
             100,
         ) {
+            let need = need.scaled;
             best = Some(match best {
                 Some(b) if b.value >= need.value => b,
                 _ => need,
@@ -500,11 +508,20 @@ pub fn step(
         PacingEvent::TaskCompleted { task, at, .. } => {
             if let Some(active) = next.active.remove(task) {
                 next.completed.insert(*task);
-                let within_estimate = *at <= active.projected_complete_at;
-                if within_estimate {
+                let spend = next.spend_so_far.remove(task);
+                // Reset on *cost*, not duration: a task that ran long
+                // but stayed within its reserved hold never overran
+                // anything a backoff should be punishing, and — the
+                // real bug an independent review found — a task that
+                // spent 4x its hold but happened to finish on time must
+                // not have that reset wipe its principal's backoff
+                // before it ever reaches a later task. The duration
+                // comparison alone (this function's first version) let
+                // exactly that happen.
+                let within_reservation = spend.unwrap_or(0) <= active.hold.value;
+                if within_reservation {
                     next.backoff_x100.insert(active.principal.clone(), 100);
                 }
-                let spend = next.spend_so_far.remove(task);
                 let settled_value = spend.unwrap_or(0).max(active.settlement_floor);
                 let settled_id = EconomicEventId(pending_hold_settlement_uuid(*task));
                 if let Ok(usage) = QuotaUsage::new(

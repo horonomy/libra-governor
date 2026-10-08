@@ -501,29 +501,34 @@ mod tests {
         assert_eq!(independent_pending.len(), 11);
     }
 
-    /// AC5's control-run half: "backoff reduces new commitments." Task A
-    /// (principal `p`) overruns its hold (`Spend` of 400 against a
-    /// 100-token hold — a 4x ratio, hitting `MAX_BACKOFF_RATIO_X100`)
-    /// and completes late (after its own estimated duration, so
-    /// `TaskCompleted`'s on-time reset never fires). Task B, same
-    /// principal, becomes ready only once task A completes (it depends
-    /// on it) — comparing a run with the overrun `Spend` event against
-    /// an otherwise-identical control run without it isolates backoff's
-    /// effect from everything else in the scenario.
+    /// AC5's control-run half: "backoff reduces new commitments" — never
+    /// a permanent lockout, and never affecting an unrelated principal.
+    /// Principal `p` runs task A then task B (B depends on A); principal
+    /// `q` runs task C then task D (D depends on C), entirely
+    /// independently. A overruns its hold (`Spend` 400 against a
+    /// 100-token hold, a 4x ratio) and completes *on time* — this run
+    /// deliberately does not rely on a late completion to keep backoff
+    /// alive, since `TaskCompleted`'s reset is keyed on cost (spend vs.
+    /// hold), not duration. C never overruns.
+    ///
+    /// Window limit arithmetic (sliding, Tokens): once A and C settle,
+    /// usage is 100+100=200 in the control run, but 400+100=500 in the
+    /// overrun run (A's real overspend genuinely consumed more of the
+    /// shared window — that asymmetry is correct, not a test artifact).
+    /// With limit=700: D's *uninflated* need (100) admits in both runs
+    /// (200+100=300 and 500+100=600, both < 700); B's need is 100 in
+    /// control (200+100=300, admits) but backoff-inflated to 400 in the
+    /// overrun run (500+400=900 > 700, blocks) — isolating exactly
+    /// backoff's effect on B, independent of q's task D.
     #[test]
     fn ac5_backoff_delays_later_starts_for_the_overrunning_principal() {
-        let w = window(250, 21_600);
+        let w = window(700, 21_600);
         let build_tasks = || {
             TaskSet::validated(vec![
-                task(1, 100, 60),
-                SimTask {
-                    id: SimTaskId(2),
-                    principal: PrincipalId("p".to_string()),
-                    depends_on: vec![SimTaskId(1)],
-                    priority: Priority::Normal,
-                    deadline: None,
-                    estimate: task(2, 100, 60).estimate,
-                },
+                task_for(1, "p", vec![], 100, 60),
+                task_for(2, "p", vec![SimTaskId(1)], 100, 60),
+                task_for(3, "q", vec![], 100, 60),
+                task_for(4, "q", vec![SimTaskId(3)], 100, 60),
             ])
             .unwrap()
         };
@@ -534,16 +539,12 @@ mod tests {
                 contract: None,
                 preference: PacingPreference::Burst {
                     target_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(12),
-                    max_fanout: 2,
+                    max_fanout: 4,
                 },
             }
         }
         let t0 = OffsetDateTime::UNIX_EPOCH;
-        // Task A completes at t0+120 — later than its own 60s estimate,
-        // so `TaskCompleted`'s "reset backoff if within estimate" branch
-        // never fires and the overrun's backoff survives to task B's
-        // admission check.
-        let complete_at = t0 + time::Duration::seconds(120);
+        let complete_at = t0 + time::Duration::seconds(60);
 
         let control_tasks = build_tasks();
         let control_events = vec![
@@ -552,6 +553,11 @@ mod tests {
                 at: complete_at,
                 seq: 1,
                 task: SimTaskId(1),
+            },
+            PacingEvent::TaskCompleted {
+                at: complete_at,
+                seq: 2,
+                task: SimTaskId(3),
             },
         ];
         let (_, control_trace) = simulate(
@@ -574,6 +580,11 @@ mod tests {
                 seq: 2,
                 task: SimTaskId(1),
             },
+            PacingEvent::TaskCompleted {
+                at: complete_at,
+                seq: 3,
+                task: SimTaskId(3),
+            },
         ];
         let (_, overrun_trace) = simulate(
             &overrun_events,
@@ -581,30 +592,66 @@ mod tests {
             &scenario_for(&overrun_tasks, &w),
         );
 
-        let task_b_start = |trace: &[(Tick<'_>, Vec<Proposal>)]| {
+        let start_of = |trace: &[(Tick<'_>, Vec<Proposal>)], id: u32| {
             trace.iter().find_map(|(_, proposals)| {
                 proposals.iter().find_map(|p| match p {
-                    Proposal::Start { task, at, .. } if *task == SimTaskId(2) => Some(*at),
+                    Proposal::Start { task, at, .. } if *task == SimTaskId(id) => Some(*at),
                     _ => None,
                 })
             })
         };
 
-        let control_start = task_b_start(&control_trace)
-            .expect("control run must admit task B promptly once task A completes");
-        // Task B never starts in the overrun run within this short event
-        // list: its inflated (4x) need alone exceeds the 250-token
-        // window limit outright, so admission stays an honest
-        // `Unavailable(NeedExceedsWindowLimit)`, not a crash or a
-        // silent "admit anyway". Fewer commitments, exactly as AC5
-        // requires — the strongest possible form of "delayed".
+        let control_b = start_of(&control_trace, 2).expect("control run must admit task B");
+        let overrun_b = start_of(&overrun_trace, 2)
+            .expect("task B must still eventually start — backoff throttles, never bans");
         assert!(
-            task_b_start(&overrun_trace).is_none(),
-            "the overrunning principal's next task must not start in this run at all"
+            overrun_b > control_b,
+            "the overrunning principal's task B must start strictly later \
+             with the overrun than without it (control: {control_b:?}, overrun: {overrun_b:?})"
         );
+
+        let control_d = start_of(&control_trace, 4).expect("control run must admit task D");
+        let overrun_d = start_of(&overrun_trace, 4)
+            .expect("task D (principal q, unaffected by p's overrun) must start");
         assert_eq!(
-            control_start, complete_at,
-            "without an overrun, task B starts the moment task A completes"
+            control_d, overrun_d,
+            "principal q's task D must be unaffected by principal p's overrun — \
+             this also exercises try_admit's skip-not-break fix: D must not wait \
+             behind a blocked B in the same principal-independent pass"
         );
+        assert_eq!(control_d, complete_at);
+    }
+
+    fn task_for(
+        id: u32,
+        principal: &str,
+        depends_on: Vec<SimTaskId>,
+        tokens: u64,
+        duration_secs: u64,
+    ) -> SimTask {
+        let mut e = test_estimate();
+        e.confidence = Confidence::High;
+        e.resource = RemainingResource::Quantiles {
+            kind: ResourceKind::Tokens,
+            p50: ResourceAmount::Tokens(tokens),
+            p80: ResourceAmount::Tokens(tokens),
+            p90: ResourceAmount::Tokens(tokens),
+            conditional_n: 20,
+            weakest_truth: crate::economic_event::TruthStrength::Metered,
+        };
+        e.duration = RemainingDuration::Quantiles {
+            p50_secs: duration_secs,
+            p80_secs: duration_secs,
+            p90_secs: duration_secs,
+            conditional_n: 20,
+        };
+        SimTask {
+            id: SimTaskId(id),
+            principal: PrincipalId(principal.to_string()),
+            depends_on,
+            priority: Priority::Normal,
+            deadline: None,
+            estimate: e,
+        }
     }
 }
