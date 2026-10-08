@@ -9,43 +9,50 @@
 //!
 //! # Summary of findings this file proves, not just asserts
 //!
-//! - **CONFIRMED REAL GAP (new, found by this verification, not disclosed
-//!   by the implementer):** `pacing::step`'s window-headroom accounting is
-//!   blind to a `Spend` event's actual amount for an *active* task. A
-//!   task's contribution to every window's headroom is frozen at its
-//!   `hold` (recorded at `Start` time) until it completes — a `Spend`
-//!   event only ever adjusts that principal's *future* backoff ratio,
-//!   never the window arithmetic other candidates are checked against.
-//!   `window_overrun_via_blind_in_flight_overspend` below constructs a
-//!   scenario where real consumption is ~1.66x the window's limit while
-//!   the simulator reports every window as `NotBlocking` throughout. Both
-//!   gaps are BURST-only in this form: SUSTAIN's global one-task
-//!   concurrency slot (ADR-0016 decision #5) prevents a second task from
-//!   ever being a candidate while the first is active, so this exact
-//!   construction does not reproduce under SUSTAIN.
-//! - **CONFIRMED REAL GAP (new):** `OutstandingHold`'s own contract
-//!   (`quota_window/mod.rs`, `from_reservation`'s docs: "every `Active`
-//!   reservation counts, with no `expires_at` filter... this contract
-//!   must not invent a second expiry rule") is violated by
-//!   `split_pending_as_of`, which keys an active task's hold settlement
-//!   on its *estimated* `projected_complete_at` — never on an actual
-//!   `TaskCompleted` event. Combined with a real, in-scenario `Spend`
-//!   report that the headroom calculation never reads (the same blind
-//!   spot as the gap above), a still-active task's real footprint both
-//!   ages out of a sliding window on a schedule tied to its estimate, and
-//!   is undercounted by its original hold while it does count.
+//! - **FOUND, then FIXED in this same commit (HORO-1781 fast-follow):**
+//!   `pacing::step`'s window-headroom accounting used to be blind to a
+//!   `Spend` event's actual amount for an *active* task. A task's
+//!   contribution to every window's headroom was frozen at its `hold`
+//!   (recorded at `Start` time) until it completed — a `Spend` event only
+//!   ever adjusted that principal's *future* backoff ratio, never the
+//!   window arithmetic other candidates were checked against.
+//!   `window_overrun_via_blind_in_flight_overspend` below now proves the
+//!   fix: `pending_for_window` injects `hold.value.max(spend_so_far)`, so
+//!   at most one of the eight dependent tasks can ever be admitted once a
+//!   real `Spend` report shows the first task overrunning. Both gaps were
+//!   BURST-only in this form: SUSTAIN's global one-task concurrency slot
+//!   (ADR-0016 decision #5) prevents a second task from ever being a
+//!   candidate while the first is active, so this exact construction never
+//!   reproduced under SUSTAIN (now additionally covered by dedicated
+//!   SUSTAIN regression tests below, closing that previously-unverified
+//!   gap).
+//! - **FOUND, then FIXED in this same commit:** `OutstandingHold`'s own
+//!   contract (`quota_window/mod.rs`, `from_reservation`'s docs: "every
+//!   `Active` reservation counts, with no `expires_at` filter... this
+//!   contract must not invent a second expiry rule") used to be violated
+//!   by `split_pending_as_of`, which keyed an active task's hold
+//!   settlement on its *estimated* `projected_complete_at` — never on an
+//!   actual `TaskCompleted` event. `split_pending_as_of` and
+//!   `PendingHold::completes_at` are now gone entirely: every pending
+//!   hold counts as outstanding for as long as its task remains `active`,
+//!   and only a real `TaskCompleted` event ever settles it.
 //!   `window_overrun_via_duration_estimate_wrong_and_task_still_active`
-//!   below reproduces a genuine, hand-verified overrun this way.
+//!   below now proves the fix: task B never starts while A remains
+//!   active, and only starts at `A_completion + window_length` once a
+//!   real completion is actually supplied.
 //! - **CONFIRMED, independently reproduced (already disclosed by the
 //!   implementer):** `PacingPreference::{Sustain::horizon_secs,
 //!   Burst::target_end}` and `Policy::time.deadline` are never read by
 //!   `forecast`/`step`/`simulate` — a scenario running arbitrarily far
 //!   past a declared deadline is scheduled exactly as if no deadline
 //!   existed. See `deadline_and_horizon_fields_are_never_consulted`.
+//!   **Deliberately deferred to a separate ticket, not addressed by this
+//!   fast-follow** — see "Known limitations" in the PR description.
 //! - **CONFIRMED:** `EstimateRevised` is recorded but never applied — a
 //!   revised-upward estimate that would make a task structurally
 //!   infeasible is silently ignored and the task still starts at its
 //!   stale (now-wrong) hold. See `estimate_revised_event_is_a_no_op`.
+//!   **Deliberately deferred to a separate ticket.**
 //! - **CONFIRMED:** `Proposal` has no variant that could mean cancel —
 //!   verified by an exhaustive match with no wildcard arm, which would
 //!   fail to compile if a third variant were ever added.
@@ -53,7 +60,9 @@
 //!   with fanout/window shapes the implementer's own fixtures never used,
 //!   produce genuinely different schedules (positive control).
 //! - **CONFIRMED:** three independent runs of the same scenario produce
-//!   byte-identical serialized output (via `serde_json`, not `Debug`).
+//!   byte-identical serialized output (via `serde_json`, not `Debug`) —
+//!   unaffected by this fix (the digest's own scenario is capped by
+//!   fanout before any forecast runs).
 
 use libra_governor_domain::pacing::step::{step, PacerState, Scenario};
 use libra_governor_domain::pacing::{
@@ -237,7 +246,8 @@ fn policy_with_deadline(deadline: OffsetDateTime) -> libra_governor_domain::Poli
 }
 
 // ---------------------------------------------------------------------
-// 1. Window overrun via blind in-flight overspend (NEW finding)
+// 1. Window overrun via blind in-flight overspend — FOUND, then FIXED in
+//    this same commit (HORO-1781 fast-follow)
 // ---------------------------------------------------------------------
 
 /// Task A (principal `p`) starts holding 100 tokens but a `Spend` event
@@ -247,15 +257,16 @@ fn policy_with_deadline(deadline: OffsetDateTime) -> libra_governor_domain::Poli
 /// behind a `TaskCompleted` event, so the second admission pass runs with
 /// A still active and already known (via `Spend`) to be overrunning.
 ///
-/// Window: sliding, 6h, limit 1000. If the simulator's headroom
-/// accounting correctly reflected A's reported real spend (850), at most
-/// one of the eight 100-token B tasks could fit (10 settled from Z + 850
-/// pending from A + 100 = 960 < 1000; a second would push to 1060 > 1000).
-/// Instead — because `pending_for_window` always reads `ActiveTask::hold`
-/// (the value frozen at `Start`, 100, never the larger reported `Spend`)
-/// — the simulator sees only 10 + 100 = 110 of committed usage and admits
-/// every single one of the eight, overrunning the window's real
-/// consumption by roughly 1.8x the limit.
+/// Window: sliding, 6h, limit 1000. `pending_for_window` now injects
+/// `hold.value.max(spend_so_far)` for an active task, so A's real 850 —
+/// not its original 100-token hold — is what every other candidate is
+/// checked against: 10 settled from Z + 850 pending from A + 100 = 960 <
+/// 1000 admits exactly one B task; a second would push to 1060 > 1000 and
+/// correctly refuses. Before the fix, `pending_for_window` always read
+/// `ActiveTask::hold` (frozen at `Start`, 100, never the larger reported
+/// `Spend`), so the simulator saw only 10 + 100 = 110 of committed usage
+/// and admitted all eight — a genuine ~1.8x window overrun. This test now
+/// proves that overrun is closed, not merely documents that it existed.
 #[test]
 fn window_overrun_via_blind_in_flight_overspend() {
     let w = sliding_window(1, 1000, 21_600);
@@ -306,30 +317,46 @@ fn window_overrun_via_blind_in_flight_overspend() {
         .flat_map(|(_, proposals)| proposals.iter())
         .filter(|p| matches!(p, Proposal::Start { task: SimTaskId(id), .. } if *id >= 10))
         .count();
+    let held_unavailable_b_count = trace
+        .iter()
+        .flat_map(|(_, proposals)| proposals.iter())
+        .filter(|p| {
+            matches!(
+                p,
+                Proposal::Hold {
+                    next: libra_governor_domain::pacing::NextAdmit::Unavailable(
+                        libra_governor_domain::pacing::UnavailableReason::NoProjectedRelief(_)
+                    )
+                }
+            )
+        })
+        .count();
+
+    assert_eq!(
+        started_b_count, 1,
+        "exactly one of the eight B tasks must be admitted — the fix makes `pending_for_window` \
+         inject A's real reported spend (850), not its stale 100-token hold, so a second B task \
+         would genuinely overrun the window and must be refused"
+    );
+    assert_eq!(
+        held_unavailable_b_count, 7,
+        "the remaining seven B tasks must end up refused as Unavailable(NoProjectedRelief) — \
+         there is no pending hold whose real completion could ever relieve this window once A's \
+         reported spend alone already consumes the window's headroom"
+    );
 
     // Ground truth, computed by hand from the real `Spend` report (not
     // from re-calling `evaluate` or any of the module's own machinery):
     // Z settles at 10, A's *real* usage is 850 (not its 100-token hold).
-    // Any B task admitted on top of that pushes real consumption past
-    // the window's 1000-token limit the moment a second one starts
-    // (10 + 850 + 100 + 100 = 1060 > 1000).
-    let real_consumption_if_n_b_tasks_start = |n: u64| 10u64 + 850 + 100 * n;
-
+    // With exactly one B task admitted: 10 + 850 + 100 = 960 <= 1000 —
+    // genuinely safe, not an overrun.
+    let real_consumption = 10u64 + 850 + 100 * started_b_count as u64;
     assert_eq!(
-        started_b_count, 8,
-        "expected the blind-spot bug to admit ALL eight B tasks in the same pass (demonstrating \
-         a real window overrun), got {started_b_count}. A partial fix (admitting fewer than 8) \
-         should turn this assertion red, not silently pass — if this now fails because the \
-         forecast/step headroom accounting has started consulting `Spend` for in-flight tasks, \
-         that is this gap being closed; update the assertion deliberately, don't loosen it back \
-         to `>=`."
+        real_consumption, 960,
+        "real consumption with exactly one B task admitted must be 960, safely under the \
+         window's 1000-token limit"
     );
-    let real_consumption = real_consumption_if_n_b_tasks_start(started_b_count as u64);
-    assert!(
-        real_consumption > 1000,
-        "real consumption with {started_b_count} B tasks admitted is {real_consumption}, \
-         which must exceed the window's 1000-token limit to count as a genuine overrun"
-    );
+    assert!(real_consumption <= 1000);
 
     // Sanity: the simulator itself never reports anything but a clean
     // schedule — it has no idea it just overran a window, which is
@@ -343,24 +370,26 @@ fn window_overrun_via_blind_in_flight_overspend() {
 
 // ---------------------------------------------------------------------
 // 2. Window overrun via a wrong duration estimate, task never completes
-//    (NEW finding)
+//    — FOUND, then FIXED in this same commit (HORO-1781 fast-follow)
 // ---------------------------------------------------------------------
 
 /// Task A holds 900 tokens (near the window's 1000-token limit) but its
 /// duration estimate (60s) is badly wrong: no `TaskCompleted` event for A
 /// is ever delivered in this scenario, modeling a task that is still
 /// genuinely running well past its estimate. Task B (a different
-/// principal) needs 900 tokens too and is initially blocked by A's
-/// pending hold.
+/// principal) needs 900 tokens too and used to be only *temporarily*
+/// blocked by A's pending hold, purely on an estimate-based schedule.
 ///
-/// `split_pending_as_of` converts a pending hold to ordinary "settled"
-/// usage the instant the probe time passes the hold's *estimated*
-/// `projected_complete_at` — never gated on an actual `TaskCompleted`
-/// event. Once the sliding window's length has also elapsed past that
-/// estimated instant, the synthetic usage ages out entirely and the
-/// window reports full headroom again — even though A is still `active`
-/// in `PacerState` (no completion was ever recorded) and, for all the
-/// simulator knows, may still be consuming resources.
+/// `split_pending_as_of` used to convert a pending hold to ordinary
+/// "settled" usage the instant the probe time passed the hold's
+/// *estimated* `projected_complete_at` — never gated on an actual
+/// `TaskCompleted` event. That function and `PendingHold::completes_at`
+/// are gone: a pending hold now counts as outstanding for as long as its
+/// task remains `active`, with no second, estimate-based expiry rule. B
+/// must therefore never start while A remains active — proven below —
+/// and the companion test proves B starts at exactly the instant A's real
+/// settled spend ages out of the window, once a real `TaskCompleted` is
+/// actually supplied.
 #[test]
 fn window_overrun_via_duration_estimate_wrong_and_task_still_active() {
     let w = sliding_window(2, 1000, 21_600); // 6h
@@ -405,20 +434,253 @@ fn window_overrun_via_duration_estimate_wrong_and_task_still_active() {
             amount: QuotaAmount::new(QuotaUnit::Tokens, 1_800),
         },
     ];
-    // No `TaskCompleted` for A is ever supplied.
+    // No `TaskCompleted` for A is ever supplied — the fix must never let
+    // B start on an estimate-based schedule while A remains genuinely
+    // active.
     let (final_state, trace) = simulate(&events, &policy(), &scenario);
 
     assert_eq!(
         final_state.active_count(),
-        2,
-        "both A and B end up active (neither ever completes) once B is eventually admitted"
+        1,
+        "only A is ever active — B must never be admitted while A remains active with no real \
+         completion ever supplied"
     );
     assert!(
         final_state.completed().is_empty(),
         "no TaskCompleted event was ever supplied for either task"
     );
 
-    let b_start = trace
+    let b_started = trace
+        .iter()
+        .flat_map(|(_, proposals)| proposals.iter())
+        .any(|p| {
+            matches!(
+                p,
+                Proposal::Start {
+                    task: SimTaskId(2),
+                    ..
+                }
+            )
+        });
+    assert!(
+        !b_started,
+        "B must never start while A remains active with no real completion — the fix removes \
+         `split_pending_as_of`'s estimate-based settlement that used to let B start the instant \
+         A's ESTIMATED (not real) completion aged out of the window"
+    );
+
+    let b_held_unavailable = trace
+        .iter()
+        .flat_map(|(_, proposals)| proposals.iter())
+        .any(|p| {
+            matches!(
+                p,
+                Proposal::Hold {
+                    next: libra_governor_domain::pacing::NextAdmit::Unavailable(
+                        libra_governor_domain::pacing::UnavailableReason::NoProjectedRelief(_)
+                    )
+                }
+            )
+        });
+    assert!(
+        b_held_unavailable,
+        "B must be refused as Unavailable(NoProjectedRelief) — A's pending hold alone already \
+         consumes the window's full headroom and, with no `completes_at` of its own any more, \
+         carries no projected relief instant for the probe to report; only a real \
+         `TaskCompleted` for A can ever unblock B now (see the companion test below)"
+    );
+}
+
+/// Companion to `window_overrun_via_duration_estimate_wrong_and_task_still_active`:
+/// same scenario, but A gets a *real* `TaskCompleted` at `t_complete`
+/// (deliberately not `t0+60`, so this cannot be confused with the old
+/// estimate-based instant the prior version of this test asserted). B
+/// must start at exactly `t_complete + 21_600` — the instant A's real
+/// settled spend (1,800 tokens, the larger of its reported `Spend` and
+/// its 900-token hold) ages out of the 6h sliding window — and not one
+/// instant before.
+#[test]
+fn window_overrun_fix_b_starts_exactly_when_a_real_completion_settles_and_ages_out() {
+    let w = sliding_window(10, 1000, 21_600); // 6h
+    let t0 = OffsetDateTime::UNIX_EPOCH;
+    let t_complete = t0 + time::Duration::hours(1);
+
+    let tasks = TaskSet::validated(vec![
+        task(1, "p", vec![], 900, 60),
+        task(2, "q", vec![], 900, 60),
+    ])
+    .unwrap();
+
+    let scenario = Scenario {
+        tasks: &tasks,
+        windows: std::slice::from_ref(&w),
+        contract: None,
+        preference: PacingPreference::Burst {
+            target_end: t0 + time::Duration::hours(12),
+            max_fanout: 2,
+        },
+    };
+
+    let events = vec![
+        PacingEvent::ModeChanged { at: t0, seq: 0 },
+        PacingEvent::Spend {
+            at: t0 + time::Duration::seconds(10),
+            seq: 1,
+            task: SimTaskId(1),
+            amount: QuotaAmount::new(QuotaUnit::Tokens, 1_800),
+        },
+        PacingEvent::TaskCompleted {
+            at: t_complete,
+            seq: 2,
+            task: SimTaskId(1),
+        },
+    ];
+    let (final_state, trace) = simulate(&events, &policy(), &scenario);
+
+    let b_starts: Vec<OffsetDateTime> = trace
+        .iter()
+        .flat_map(|(_, proposals)| proposals.iter())
+        .filter_map(|p| match p {
+            Proposal::Start {
+                task: SimTaskId(2),
+                at,
+                ..
+            } => Some(*at),
+            _ => None,
+        })
+        .collect();
+
+    let expected = t_complete + time::Duration::seconds(21_600);
+    assert_eq!(
+        b_starts,
+        vec![expected],
+        "B must start exactly once, exactly when A's real settled spend (1,800 tokens, \
+         recorded at A's actual completion instant, not its estimate) ages out of the 6h \
+         sliding window — never before, and never on the old estimate-based instant"
+    );
+
+    assert_eq!(
+        final_state.active_count(),
+        1,
+        "only B remains active once A has genuinely completed"
+    );
+    assert_eq!(
+        final_state.completed().len(),
+        1,
+        "A is the only task that ever completes in this scenario"
+    );
+}
+
+// ---------------------------------------------------------------------
+// 2b. SUSTAIN regression coverage (new, HORO-1781 fast-follow): the two
+//     bugs above were confirmed BURST-only because SUSTAIN's one-task
+//     concurrency slot (`fanout_cap == 1`) already stops a second
+//     candidate from ever reaching the forecast while the first task
+//     remains active. These two tests close that "unverified for
+//     SUSTAIN" gap by proving it holds under a real overrun, not just by
+//     inspecting the `try_admit` loop's structure.
+// ---------------------------------------------------------------------
+
+/// Task A (principal `p`) overruns its hold via a real `Spend` report and
+/// never completes. SUSTAIN's hard one-slot concurrency gate
+/// (`working.active.len() >= fanout_cap` with `fanout_cap == 1`) must
+/// refuse task B as a candidate at all — not merely refuse to admit it —
+/// so the overrun never even reaches a window check.
+#[test]
+fn sustain_overspend_blocks_second_start_while_task_remains_active() {
+    let w = sliding_window(11, 500, 21_600);
+    let t0 = OffsetDateTime::UNIX_EPOCH;
+    let tasks = TaskSet::validated(vec![
+        task(1, "p", vec![], 100, 60),
+        task(2, "p", vec![], 100, 60),
+    ])
+    .unwrap();
+    let scenario = Scenario {
+        tasks: &tasks,
+        windows: std::slice::from_ref(&w),
+        contract: None,
+        preference: PacingPreference::Sustain {
+            horizon_secs: 21_600,
+            working_hours: None,
+            continuity_reserve_bp: 0,
+        },
+    };
+    let events = vec![
+        PacingEvent::ModeChanged { at: t0, seq: 0 },
+        // A real overrun report, well past the window's own 500-token
+        // limit — but no `TaskCompleted` for task 1 is ever supplied.
+        PacingEvent::Spend {
+            at: t0 + time::Duration::seconds(10),
+            seq: 1,
+            task: SimTaskId(1),
+            amount: QuotaAmount::new(QuotaUnit::Tokens, 600),
+        },
+    ];
+    let (final_state, trace) = simulate(&events, &policy(), &scenario);
+
+    let proposal_count: usize = trace.iter().map(|(_, proposals)| proposals.len()).sum();
+    let start_count = trace
+        .iter()
+        .flat_map(|(_, proposals)| proposals.iter())
+        .filter(|p| matches!(p, Proposal::Start { .. }))
+        .count();
+    assert_eq!(
+        start_count, 1,
+        "only task 1 ever starts — SUSTAIN's one-slot concurrency gate refuses a second \
+         candidate while the first remains active, overrun or not"
+    );
+    assert_eq!(
+        proposal_count, 1,
+        "task 2 must never even generate a Hold proposal — the concurrency gate breaks the \
+         admission loop before task 2 is ever considered a candidate"
+    );
+    assert_eq!(final_state.active_count(), 1);
+    assert!(final_state.completed().is_empty());
+}
+
+/// Same scenario, but task 1 genuinely completes at `t_complete`. Task 2
+/// must wait until task 1's real *settled* spend (600 tokens — larger
+/// than its 100-token hold, per the same `pending_for_window`/settlement
+/// fix as the BURST tests above) ages out of the 6h sliding window, not
+/// one instant before — proving the fix's effect holds under SUSTAIN's
+/// spacing/concurrency logic too, not just BURST's plain fanout.
+#[test]
+fn sustain_next_start_waits_for_overrun_settled_spend_to_age_out() {
+    let w = sliding_window(12, 500, 21_600);
+    let t0 = OffsetDateTime::UNIX_EPOCH;
+    let t_complete = t0 + time::Duration::minutes(5);
+    let tasks = TaskSet::validated(vec![
+        task(1, "p", vec![], 100, 60),
+        task(2, "p", vec![], 100, 60),
+    ])
+    .unwrap();
+    let scenario = Scenario {
+        tasks: &tasks,
+        windows: std::slice::from_ref(&w),
+        contract: None,
+        preference: PacingPreference::Sustain {
+            horizon_secs: 21_600,
+            working_hours: None,
+            continuity_reserve_bp: 0,
+        },
+    };
+    let events = vec![
+        PacingEvent::ModeChanged { at: t0, seq: 0 },
+        PacingEvent::Spend {
+            at: t0 + time::Duration::seconds(10),
+            seq: 1,
+            task: SimTaskId(1),
+            amount: QuotaAmount::new(QuotaUnit::Tokens, 600),
+        },
+        PacingEvent::TaskCompleted {
+            at: t_complete,
+            seq: 2,
+            task: SimTaskId(1),
+        },
+    ];
+    let (final_state, trace) = simulate(&events, &policy(), &scenario);
+
+    let task2_start = trace
         .iter()
         .flat_map(|(_, proposals)| proposals.iter())
         .find_map(|p| match p {
@@ -429,45 +691,18 @@ fn window_overrun_via_duration_estimate_wrong_and_task_still_active() {
             } => Some(*at),
             _ => None,
         })
-        .expect("B must eventually start — that is exactly the bug this test proves");
+        .expect(
+            "task 2 must eventually start once task 1 completes and its settled spend ages out",
+        );
 
-    // A's hold "settles" (per the module's own estimate-driven logic) at
-    // t0+60; it ages out of the 6h sliding window at t0+60+21_600.
-    let expected_age_out = t0 + time::Duration::seconds(60 + 21_600);
+    let expected = t_complete + time::Duration::seconds(21_600);
     assert_eq!(
-        b_start, expected_age_out,
-        "B starts the instant A's ESTIMATED (not real) completion ages out of the window"
+        task2_start, expected,
+        "task 2 must start exactly when task 1's real settled spend (600 tokens, recorded at \
+         its actual completion instant) ages out of the 6h sliding window — never before"
     );
-
-    // At the instant B starts, A is still `active` — i.e. the simulator
-    // itself believes A has neither completed nor been cancelled (AC5
-    // guarantees it was never cancelled) — yet the window's headroom
-    // calculation already treats A's 900-token footprint as fully gone.
-    //
-    // `PacerState` exposes only `active_count()`/`completed()`, not which
-    // ids are active — but with exactly two tasks in this scenario and
-    // `completed()` empty (asserted above) plus `active_count() == 2`
-    // (also asserted above), both task 1 (A) and task 2 (B) are
-    // necessarily active simultaneously at the point B's Start proposal
-    // was emitted. That is already the proof that A was never completed
-    // or cancelled, yet its headroom was reused.
-    //
-    // This is not merely "unknown treated as free" in the abstract: the
-    // scenario itself reported A's real usage (1,800 tokens, via the
-    // `Spend` event above) well before B starts. Ground truth, computed
-    // by hand from that reported evidence (not from re-calling
-    // `evaluate` or any of the module's own machinery): at the instant B
-    // starts, real in-window consumption is A's reported 1,800 plus B's
-    // own 900 = 2,700 — 2.7x the window's 1,000-token limit. The
-    // simulator itself reports the window as freely `NotBlocking` at
-    // that instant.
-    let real_consumption_at_b_start = 1_800u64 + 900;
-    assert!(
-        real_consumption_at_b_start > 1000,
-        "real consumption at B's start ({real_consumption_at_b_start}) must exceed the \
-         window's 1000-token limit for this to count as a genuine overrun, not just a \
-         theoretical 'could be unknown' concern"
-    );
+    assert_eq!(final_state.active_count(), 1);
+    assert_eq!(final_state.completed().len(), 1);
 }
 
 // ---------------------------------------------------------------------
