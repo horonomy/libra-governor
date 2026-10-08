@@ -979,6 +979,30 @@ fn refill_bucket_relief_is_deficit_divided_by_rate() {
 }
 
 #[test]
+fn refill_bucket_with_outstanding_above_i64_max_stays_blocking_not_wraps_positive() {
+    // A direct `outstanding as i64` cast wraps negative above
+    // i64::MAX, which would turn `level - (negative)` into a huge
+    // *positive* remaining — exactly the fail-open this test guards
+    // against. Going through i128 throughout must saturate instead.
+    let anchor = datetime!(2026-10-08 12:00:00 UTC);
+    let w = bucket_window(100, 1, 1, anchor, 100);
+    let huge_hold =
+        OutstandingHold::from_reservation(&fixture_reservation(u64::MAX, ResState::Active))
+            .unwrap();
+    let evidence = QuotaEvidence {
+        usage: &[],
+        holds: &[huge_hold],
+        snapshots: &[],
+    };
+    let eval = w.evaluate(&evidence, anchor);
+    assert_eq!(eval.blocking, BlockingStatus::Blocking);
+    let WindowState::Bucket(b) = eval.state else {
+        panic!("expected Bucket state")
+    };
+    assert!(b.remaining < 0, "remaining must not wrap positive: {b:?}");
+}
+
+#[test]
 fn refill_bucket_ignores_usage_before_the_anchor() {
     let anchor = datetime!(2026-10-08 12:00:00 UTC);
     let w = bucket_window(100, 1, 1_000_000, anchor, 100);

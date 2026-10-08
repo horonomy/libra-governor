@@ -378,37 +378,61 @@ fn evaluate_bucket(
 
     // All arithmetic at millisecond resolution in i128, matching the
     // design: level_scaled = level * period_ms, so refill-per-ms stays
-    // an exact integer ratio.
-    let period_ms: i128 = refill_period_secs as i128 * 1000;
-    let capacity_scaled: i128 = capacity as i128 * period_ms;
-    let mut level_scaled: i128 = level_at_anchor as i128 * period_ms;
+    // an exact integer ratio. Every operation below is saturating:
+    // `capacity`/`refill_period_secs` are operator-configured u64s, and
+    // an unguarded multiply/add can overflow even i128's wide range for
+    // extreme (if unrealistic) configured values. A silent wraparound
+    // here is exactly the fail-open case this type exists to prevent —
+    // saturating at i128::MAX keeps the bucket's capacity/level
+    // legitimately huge rather than wrapping to something small or
+    // negative that would falsely clear a block.
+    let period_ms: i128 = (refill_period_secs as i128).saturating_mul(1000);
+    let capacity_scaled: i128 = (capacity as i128).saturating_mul(period_ms);
+    let mut level_scaled: i128 = (level_at_anchor as i128).saturating_mul(period_ms);
     let mut cursor = anchored_at;
 
     for usage in &in_range {
         let delta_ms = (usage.occurred_at() - cursor).whole_milliseconds();
-        level_scaled = (level_scaled + refill_amount as i128 * delta_ms).min(capacity_scaled);
-        level_scaled -= usage.amount().value as i128 * period_ms;
+        level_scaled = level_scaled
+            .saturating_add((refill_amount as i128).saturating_mul(delta_ms))
+            .min(capacity_scaled);
+        level_scaled =
+            level_scaled.saturating_sub((usage.amount().value as i128).saturating_mul(period_ms));
         cursor = usage.occurred_at();
     }
     let tail_ms = (now - cursor).whole_milliseconds();
-    level_scaled = (level_scaled + refill_amount as i128 * tail_ms).min(capacity_scaled);
+    level_scaled = level_scaled
+        .saturating_add((refill_amount as i128).saturating_mul(tail_ms))
+        .min(capacity_scaled);
 
     let level = level_scaled.div_euclid(period_ms);
     let level_i64 = level.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
-    let remaining = level_i64 - prepared.outstanding as i64;
+    // `outstanding` is a u64 and always fits in i128 without truncation
+    // (unlike a direct cast to i64, which would wrap negative above
+    // i64::MAX and silently turn a huge outstanding hold into a huge
+    // *positive* remaining — the fail-open this saturating path avoids).
+    let remaining_128 = level.saturating_sub(prepared.outstanding as i128);
+    let remaining = remaining_128.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
     let blocking_now = remaining <= 0;
 
-    let relief = if prepared.outstanding as i128 + 1 > capacity as i128 {
+    let relief = if (prepared.outstanding as i128).saturating_add(1) > capacity as i128 {
         Relief::AfterOutstandingHoldsSettle
     } else if !blocking_now {
         Relief::NotBlocking
     } else {
-        let deficit_scaled = (prepared.outstanding as i128 + 1) * period_ms - level_scaled;
+        let deficit_scaled = (prepared.outstanding as i128)
+            .saturating_add(1)
+            .saturating_mul(period_ms)
+            .saturating_sub(level_scaled);
         if deficit_scaled <= 0 {
             Relief::NotBlocking
         } else {
-            let ms_needed = (deficit_scaled + refill_amount as i128 - 1) / refill_amount as i128;
-            Relief::At(now + time::Duration::milliseconds(ms_needed as i64))
+            let ms_needed = deficit_scaled
+                .saturating_add(refill_amount as i128)
+                .saturating_sub(1)
+                / refill_amount as i128;
+            let ms_needed_i64 = ms_needed.clamp(0, i64::MAX as i128) as i64;
+            Relief::At(now + time::Duration::milliseconds(ms_needed_i64))
         }
     };
 
