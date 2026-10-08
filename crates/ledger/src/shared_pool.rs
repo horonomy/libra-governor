@@ -365,14 +365,38 @@ impl LedgerStore {
         pool_id: &PoolId,
         observed_at: OffsetDateTime,
     ) -> Result<u64, LedgerError> {
-        let observed_at_text = observed_at.format(&Rfc3339).map_err(|_| invalid())?;
-        let settled: i64 = tx.query_row(
-            "SELECT COALESCE(SUM(settled_amount), 0) FROM shared_pool_reservations
-             WHERE pool_id = ?1 AND state = 'settled' AND settled_at <= ?2",
-            rusqlite::params![pool_id.0, observed_at_text],
-            |row| row.get(0),
+        // Comparing RFC3339 strings with a SQL `<=` is a real
+        // parser-differential bug, not a theoretical one: the `time`
+        // crate's Rfc3339 formatter omits the fractional-second
+        // component entirely when it is zero, so two timestamps sharing
+        // the same whole second but differing in fractional precision
+        // ("...T00:00:01Z" vs "...T00:00:01.500Z") do not sort the same
+        // lexically as they do chronologically — "01." (0x2E) sorts
+        // before "01Z" (0x5A) byte-for-byte, inverting a comparison that
+        // should go the other way. Parsing every candidate row's own
+        // timestamp and comparing as `OffsetDateTime` values sidesteps
+        // the representation entirely, at the cost of pulling
+        // (typically few) rows into Rust instead of summing in SQL.
+        let mut stmt = tx.prepare(
+            "SELECT settled_amount, settled_at FROM shared_pool_reservations
+             WHERE pool_id = ?1 AND state = 'settled'",
         )?;
-        Ok(settled.max(0) as u64)
+        let rows = stmt.query_map([&pool_id.0], |row| {
+            let settled_amount: Option<i64> = row.get(0)?;
+            let settled_at: Option<String> = row.get(1)?;
+            Ok((settled_amount, settled_at))
+        })?;
+        let mut total: u64 = 0;
+        for row in rows {
+            let (settled_amount, settled_at) = row?;
+            let (Some(settled_amount), Some(settled_at)) = (settled_amount, settled_at) else {
+                continue;
+            };
+            if parse_time(&settled_at)? <= observed_at {
+                total = total.saturating_add(settled_amount.max(0) as u64);
+            }
+        }
+        Ok(total)
     }
 
     /// Computes how much of a provider snapshot's `used` figure is
@@ -766,12 +790,27 @@ impl LedgerStore {
     ) -> Result<Vec<SharedPoolReservation>, LedgerError> {
         let now_str = rfc3339(now)?;
         let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
+        // Parsed-timestamp comparison, not a SQL `<=` on the RFC3339
+        // text — the same parser-differential risk fixed in
+        // `settled_before_tx` applies here too: `now` can carry
+        // fractional seconds (e.g. a real `OffsetDateTime::now_utc()`
+        // call) that a lexical string comparison against `expires_at`
+        // would not order chronologically in every case.
         let ids: Vec<String> = {
             let mut stmt = tx.prepare(
-                "SELECT id FROM shared_pool_reservations WHERE state = 'active' AND expires_at <= ?1",
+                "SELECT id, expires_at FROM shared_pool_reservations WHERE state = 'active'",
             )?;
-            let rows = stmt.query_map([&now_str], |row| row.get::<_, String>(0))?;
-            rows.collect::<Result<_, _>>()?
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut ids = Vec::new();
+            for row in rows {
+                let (id, expires_at) = row?;
+                if parse_time(&expires_at)? <= now {
+                    ids.push(id);
+                }
+            }
+            ids
         };
 
         let mut expired = Vec::with_capacity(ids.len());

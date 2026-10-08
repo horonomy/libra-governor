@@ -615,6 +615,83 @@ fn time_correlated_overhang_would_correctly_refuse_the_oversubscribed_request() 
 /// much of what the snapshot reported (the provider's billed figure and
 /// Libra's own settlement can, over time, come to describe the same
 /// spend). Passes today, and must keep passing under the verified
+/// Regression test for a real bug a background security review found in
+/// the time-correlated fix itself: comparing RFC3339 timestamp strings
+/// with SQL `<=` is a parser-differential bug, not a theoretical one.
+/// The `time` crate's Rfc3339 formatter omits the fractional-second
+/// component entirely when it is zero, so two timestamps sharing the
+/// same whole second but differing in fractional precision do not sort
+/// the same lexically as they do chronologically: `"...:01.500Z"` sorts
+/// BEFORE `"...:01Z"` as a byte string (`.` is 0x2E, `Z` is 0x5A), even
+/// though 1.5s is chronologically AFTER 1.0s. A settlement recorded at
+/// `observed_at + 500ms` must never be treated as predating a snapshot
+/// observed at an exact whole second — if it is, the exact same
+/// quota-bypass this file's other tests target reopens through a
+/// different mechanism. Construction: snapshot observed at `t0+1s`
+/// (whole second, no fraction); a reservation settles at `t0+1.5s`
+/// (chronologically AFTER the snapshot, so must NOT reduce its
+/// overhang) — under the buggy lexical comparison this settlement was
+/// wrongly treated as predating the snapshot, artificially zeroing
+/// overhang and permitting oversubscription.
+#[test]
+fn settlement_with_fractional_seconds_is_never_lexically_misordered_against_a_whole_second_snapshot(
+) {
+    let mut store = LedgerStore::open_in_memory().unwrap();
+    store
+        .ensure_pool(&pool_id(), &QuotaUnit::Tokens, 10, now())
+        .unwrap();
+    let t0 = now();
+    let observed_at = t0 + time::Duration::seconds(1); // whole second, no fraction
+    let settled_at = t0 + time::Duration::milliseconds(1500); // t0+1.5s: AFTER observed_at
+
+    store
+        .ingest_pool_provider_snapshot(
+            &pool_id(),
+            observed_at,
+            Some(observed_at + time::Duration::seconds(3600)),
+            &GaugeReading::Used {
+                used: QuotaAmount::new(QuotaUnit::Tokens, 4),
+                limit: Some(10),
+            },
+            Confidence::High,
+            observed_at,
+        )
+        .unwrap();
+
+    // Reserve 4 units at t0 (before the snapshot), then settle it at
+    // t0+1.5s — strictly after the snapshot's own observed_at (t0+1s).
+    let r = store
+        .reserve_shared(req(&pool_id(), &principal(1), "s1", 4, "k1", t0, 900))
+        .unwrap();
+    let SharedPoolReserveOutcome::Granted(r) = r else {
+        panic!("expected Granted");
+    };
+    store.settle_shared(r.id, Some(4), settled_at).unwrap();
+
+    let admission = store
+        .pool_admission(&pool_id(), settled_at + time::Duration::seconds(1))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        admission.external_overhang, 4,
+        "a settlement recorded AFTER the snapshot's observed_at must never reduce its \
+         overhang, regardless of fractional-second formatting — got overhang={} \
+         (a lexical string-comparison bug would wrongly zero this)",
+        admission.external_overhang
+    );
+    assert_eq!(
+        admission.remaining(),
+        2,
+        "true remaining is 10 - 4(settled) - 4(external, never retracted) = 2"
+    );
+}
+
+/// Non-`#[ignore]`d companion: the case where subtracting settled spend
+/// from a snapshot's overhang IS the correct behavior — a settlement
+/// recorded AFTER the snapshot's `observed_at` legitimately retires that
+/// much of what the snapshot reported (the provider's billed figure and
+/// Libra's own settlement can, over time, come to describe the same
+/// spend). Passes today, and must keep passing under the verified
 /// time-correlated fix direction above.
 #[test]
 fn snapshot_overhang_correctly_zeroes_once_later_settlement_matches_it() {
