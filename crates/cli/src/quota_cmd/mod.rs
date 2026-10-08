@@ -12,8 +12,9 @@
 //! `crates/domain/src/pacing/mod.rs`'s own module docs and
 //! `docs/adr/0016-sustain-burst-pacing.md`). Its only inputs are the
 //! `--replay` fixture file and `--as-of`; see `tests/quota_explain.rs`'s
-//! `no_daemon_or_state_dir_access` test, which asserts this with an
-//! actual file-hash/emptiness comparison rather than "didn't crash".
+//! `ac4_quota_explain_never_touches_home_or_state_dir` test, which
+//! asserts this with an actual file-hash/emptiness comparison rather
+//! than "didn't crash".
 //!
 //! The scope is deliberately one level above `libra_governor_domain::pacing`:
 //! this module owns every output type and every honesty rule about what
