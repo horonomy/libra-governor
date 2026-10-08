@@ -612,7 +612,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libra-governor-cli"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "libc",
  "libra-governor-daemon",
@@ -634,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "libra-governor-daemon"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "bytes",
  "http-body-util",
@@ -664,7 +664,7 @@ dependencies = [
 
 [[package]]
 name = "libra-governor-domain"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -676,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "libra-governor-estimator"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "libra-governor-domain",
  "libra-governor-ledger",
@@ -687,7 +687,7 @@ dependencies = [
 
 [[package]]
 name = "libra-governor-evidence-adapter"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "libra-governor-domain",
  "libra-governor-ledger",
@@ -701,7 +701,7 @@ dependencies = [
 
 [[package]]
 name = "libra-governor-extension"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "bytes",
  "hmac",
@@ -721,7 +721,7 @@ dependencies = [
 
 [[package]]
 name = "libra-governor-gateway"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "bytes",
  "http-body-util",
@@ -740,7 +740,7 @@ dependencies = [
 
 [[package]]
 name = "libra-governor-ledger"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "libra-governor-domain",
  "rusqlite",
@@ -754,7 +754,7 @@ dependencies = [
 
 [[package]]
 name = "libra-governor-protocol"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "libra-governor-domain",
  "libra-governor-estimator",
