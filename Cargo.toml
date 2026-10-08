@@ -42,6 +42,13 @@ sha2 = "0.11"
 # it is not enabled by the transitive graph.
 rustix = { version = "1", features = ["fs", "process"] }
 
+# IANA timezone-aware calendar arithmetic for quota-window reset boundaries
+# (ADR-0015). `time` 0.3 has no timezone database support; jiff's bundled
+# tzdb is used explicitly (never the global/host tzdb) so the same window
+# definition evaluates identically on every machine regardless of what
+# system timezone data (if any) is installed there.
+jiff = { version = "0.2.37", default-features = false, features = ["std", "tzdb-bundle-always"] }
+
 # Daemon cold start hashes its executable before accepting requests. Keep
 # this CPU-bound dependency optimized in debug/test builds as well.
 [profile.dev.package.sha2]
