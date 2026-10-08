@@ -20,6 +20,8 @@
 //! a value may and may not claim (see `view.rs`'s own docs) — it never
 //! passes a domain enum straight through to JSON/text.
 
+#[cfg(test)]
+mod fixtures_gen;
 mod input;
 mod render;
 mod view;

@@ -91,3 +91,10 @@ fn gateway_status_help_does_not_query_the_daemon() {
 fn daemon_stop_help_does_not_signal_any_process() {
     assert_help_suffix_is_side_effect_free(&["daemon", "stop"]);
 }
+
+/// HORO-1767: `quota explain --help` must never open a `--replay` file,
+/// touch the daemon's state dir, or connect to its socket.
+#[test]
+fn quota_explain_help_does_not_read_any_replay_file_or_touch_state() {
+    assert_help_suffix_is_side_effect_free(&["quota", "explain"]);
+}
