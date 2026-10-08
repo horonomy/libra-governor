@@ -497,6 +497,57 @@ fn undisclosed_reading_is_not_zero_and_missing_snapshot_is_indeterminate() {
     );
 }
 
+/// Regression (HORO-1764 self-review): `reading_rank`'s tie-break used to
+/// compute `used.value + 1`, which panics in debug and wraps to `0` in
+/// release for `used.value == u64::MAX` — silently losing the tie-break
+/// against `GaugeReading::Undisclosed` for the single most extreme (if
+/// unrealistic) "used" reading possible. Two snapshots at the exact same
+/// `observed_at` — one `Undisclosed`, one `Used` at `u64::MAX` — must
+/// evaluate without panicking, and the `Used` reading must win the tie.
+#[test]
+fn gauge_tie_break_does_not_panic_or_lose_to_undisclosed_at_u64_max() {
+    let w = gauge_window(QuotaUnit::Tokens, 3600);
+    let now = datetime!(2026-10-08 10:00:00 UTC);
+
+    let undisclosed = ProviderSnapshot::validated(
+        w.id(),
+        now,
+        None,
+        None,
+        GaugeReading::Undisclosed,
+        Confidence::Low,
+    )
+    .unwrap();
+    let maxed_used = ProviderSnapshot::validated(
+        w.id(),
+        now,
+        None,
+        None,
+        GaugeReading::Used {
+            used: QuotaAmount::new(QuotaUnit::Tokens, u64::MAX),
+            limit: Some(1_000),
+        },
+        Confidence::Low,
+    )
+    .unwrap();
+    let evidence = QuotaEvidence {
+        usage: &[],
+        holds: &[],
+        snapshots: &[undisclosed, maxed_used],
+    };
+    let eval = w.evaluate(&evidence, now);
+    let WindowState::Gauge(g) = &eval.state else {
+        panic!("expected a Gauge state");
+    };
+    assert!(
+        matches!(
+            g.latest.as_ref().unwrap().reading(),
+            GaugeReading::Used { .. }
+        ),
+        "the maximal Used reading must win the tie-break, not lose to Undisclosed"
+    );
+}
+
 #[test]
 fn future_snapshot_is_ignored() {
     let w = gauge_window(QuotaUnit::Percent, 3600);

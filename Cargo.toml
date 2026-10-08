@@ -10,6 +10,7 @@ members = [
     "crates/gateway",
     "crates/extension",
     "crates/evidence-adapter",
+    "crates/quota-source",
 ]
 exclude = ["experiments/phase0", "experiments/mvp1_validation/fixtures/rust-crate"]
 

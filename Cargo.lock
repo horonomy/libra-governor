@@ -703,6 +703,7 @@ dependencies = [
  "libra-governor-gateway",
  "libra-governor-ledger",
  "libra-governor-protocol",
+ "libra-governor-quota-source",
  "rustix",
  "serde",
  "serde_json",
@@ -843,6 +844,18 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "thiserror",
+ "time",
+]
+
+[[package]]
+name = "libra-governor-quota-source"
+version = "0.0.3"
+dependencies = [
+ "libra-governor-domain",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror",
  "time",
 ]
