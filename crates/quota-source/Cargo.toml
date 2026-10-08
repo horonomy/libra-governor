@@ -1,0 +1,18 @@
+[package]
+name = "libra-governor-quota-source"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Libra Governor: versioned quota-source contract (HORO-1764) — a QuotaSource trait producing HORO-1762 ProviderSnapshot readings with provenance, freshness/trust-conflict resolution, and a fixture-backed importer. No live network adapter: a real adapter requires an explicit, separately-configured endpoint+consent authorization that does not exist in this build."
+
+[dependencies]
+libra-governor-domain = { path = "../domain" }
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+time = { workspace = true, features = ["macros"] }
