@@ -2,9 +2,10 @@
 
 > Never start work you are unlikely to afford to finish.
 
-Libra is a local **Governor**: a data-plane daemon that sits between an
-agentic coding tool (Claude Code today) and the LLM provider it talks
-to. It estimates the cost and time-to-complete of a task *before*
+Libra is a local **Governor**: a data-plane daemon that sits between
+agentic work and the LLM provider it talks to (an agentic coding tool —
+Claude Code today — is the current integration). It estimates the cost
+and time-to-complete of a task *before*
 admitting it, tracks spend against that estimate as the task runs, and
 makes replanning a deliberate, auditable decision rather than an implicit
 one. See [`PRODUCT.md`](PRODUCT.md) for the full product North Star and

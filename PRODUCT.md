@@ -15,9 +15,10 @@ out of scope for Libra.
 
 ## What Libra is
 
-Libra is a local **Governor** — a data-plane daemon that sits between an
-agentic coding tool (Claude Code, Codex, etc.) and the LLM provider it
-talks to. It estimates the cost and time-to-complete of a task *before*
+Libra is a local **Governor** — a data-plane daemon that sits between
+agentic work and the LLM provider it talks to (currently integrated with
+agentic coding tools — Claude Code, Codex, etc.). It estimates the cost
+and time-to-complete of a task *before*
 admitting it, tracks spend against that estimate as the task runs, and
 makes replanning a deliberate, auditable decision rather than an implicit
 one.
