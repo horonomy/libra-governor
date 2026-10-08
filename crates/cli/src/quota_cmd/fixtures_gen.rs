@@ -332,3 +332,83 @@ fn generate_gauge_fixture() {
     });
     write_fixture("gauge.json", value);
 }
+
+/// Security-regression fixture: a task's `principal` and the policy's
+/// `name` — both caller-controlled free text with no character
+/// restriction anywhere in the domain layer — carry an attempted
+/// terminal-escape injection: a raw ESC byte opening an OSC title-spoof
+/// sequence, a CSI clear-screen sequence, a BEL, and an embedded
+/// newline attempting to forge a fake additional `[SIM]`-prefixed
+/// output line. `render::sanitize_for_terminal` must neutralize all of
+/// this in text-mode stdout.
+#[test]
+#[ignore]
+fn generate_malicious_principal_fixture() {
+    let window_id = QuotaWindowId(fixed_uuid(5));
+    let window = QuotaWindow::validated(
+        window_id,
+        QuotaScope {
+            subject: QuotaSubject::Principal(PrincipalId(
+                "evil\u{1b}]0;pwned\u{7}\u{1b}[2Jinjected\n[SIM] fake line".to_string(),
+            )),
+            source: EntitlementSource::OperatorConfigured,
+            confidence: Confidence::High,
+            observed_at: T0,
+            valid_until: None,
+        },
+        QuotaUnit::Tokens,
+        WindowKind::Sliding {
+            length_secs: 21_600,
+            limit: 5_005,
+        },
+    )
+    .unwrap();
+
+    let task = SimTask {
+        id: SimTaskId(1),
+        principal: PrincipalId(
+            "evil\u{1b}]0;pwned\u{7}\u{1b}[2Jinjected\n[SIM] fake line".to_string(),
+        ),
+        depends_on: vec![],
+        priority: libra_governor_domain::Priority::Normal,
+        deadline: None,
+        estimate: estimate(111, 300, Confidence::High),
+    };
+
+    let events = vec![PacingEvent::ModeChanged { at: T0, seq: 0 }];
+    let preference = PacingPreference::Burst {
+        target_end: T0 + time::Duration::hours(6),
+        max_fanout: 5,
+    };
+
+    let value = json!({
+        "schema_version": "quota-explain-input-v1",
+        "policy": {
+            "policy_schema_version": "policy-v1",
+            "name": "evil\u{1b}[2Jpolicy",
+            "resource": {
+                "mode": "elastic",
+                "target": {"kind": "tokens", "amount": 100_000},
+                "elastic_ceiling": {"kind": "tokens", "amount": 200_000},
+                "hard_ceiling": {"kind": "tokens", "amount": 300_000},
+            },
+            "time": {
+                "mode": "elastic",
+                "target_secs": 3_600,
+                "elastic_ceiling_secs": 7_200,
+                "hard_ceiling_secs": 10_800,
+                "deadline": null,
+            },
+            "quality_floor": quality_floor(),
+            "min_confidence": "low",
+            "autonomy": "ask_on_approval",
+        },
+        "preference": preference,
+        "contract": null,
+        "tasks": [task],
+        "windows": [window],
+        "snapshots": [],
+        "events": events,
+    });
+    write_fixture("malicious_principal.json", value);
+}

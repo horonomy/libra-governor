@@ -316,3 +316,101 @@ fn ac5c_same_input_twice_is_byte_identical() {
     let text_b = run_text("idle_task.json", "1970-01-01T00:00:00Z", "80");
     assert_eq!(text_a, text_b);
 }
+
+/// Security regression: `malicious_principal.json` carries a task
+/// principal (and, separately, a policy name) containing a raw ESC
+/// byte opening an OSC title-spoof sequence, a CSI clear-screen
+/// sequence, a BEL, and an embedded newline attempting to forge a fake
+/// additional `[SIM]`-prefixed output line. None of this may reach
+/// stdout raw in text mode — `render::sanitize_for_terminal` must strip
+/// every control byte from the fully composed line before it is
+/// written. JSON mode is checked too, confirming empirically (not just
+/// assumed) that `serde_json`'s own escaping already keeps a raw
+/// control byte out of that output as well.
+#[test]
+fn malicious_principal_is_neutralized_in_text_output_and_absent_in_json_bytes() {
+    let path = fixture("malicious_principal.json");
+
+    for width in ["40", "80", "120"] {
+        let output = Command::new(bin())
+            .args([
+                "quota",
+                "explain",
+                "--replay",
+                &path,
+                "--as-of",
+                "1970-01-01T00:00:00Z",
+                "--width",
+                width,
+            ])
+            .output()
+            .expect("spawn quota explain");
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Check the raw bytes, not just a lossy UTF-8 string: an ESC or
+        // BEL byte is itself valid single-byte UTF-8, so a lossy
+        // re-encoding could never hide one even if it wanted to — this
+        // is the strongest form of the check, not a weaker one.
+        assert!(
+            !output.stdout.contains(&0x1b),
+            "ESC byte leaked into text stdout at width {width}"
+        );
+        assert!(
+            !output.stdout.contains(&0x07),
+            "BEL byte leaked into text stdout at width {width}"
+        );
+        assert!(
+            !output.stdout.contains(&0x0d),
+            "CR byte leaked into text stdout at width {width}"
+        );
+
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !text.lines().any(|l| l == "[SIM] fake line"),
+            "a forged [SIM]-prefixed line was injected via an embedded \
+             newline at width {width}: {text:?}"
+        );
+        assert!(
+            !text.contains("]0;pwned"),
+            "an OSC title-spoof sequence's body leaked through at width {width}: {text:?}"
+        );
+    }
+
+    // JSON mode: `serde_json` already escapes every control byte as a
+    // textual `\u00XX` sequence, so the raw bytes on stdout must never
+    // contain the literal ESC/BEL byte either — verified empirically,
+    // not assumed.
+    let output = Command::new(bin())
+        .args([
+            "quota",
+            "explain",
+            "--replay",
+            &path,
+            "--as-of",
+            "1970-01-01T00:00:00Z",
+            "--json",
+        ])
+        .output()
+        .expect("spawn quota explain --json");
+    assert!(output.status.success());
+    assert!(
+        !output.stdout.contains(&0x1b),
+        "ESC byte present raw in JSON-mode stdout"
+    );
+    assert!(
+        !output.stdout.contains(&0x07),
+        "BEL byte present raw in JSON-mode stdout"
+    );
+    let v: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("quota explain --json output is valid JSON");
+    // The value itself is still faithfully preserved (escaped, not
+    // dropped) in JSON mode — this surface's job is to neutralize a
+    // terminal injection, never to silently discard legitimate
+    // caller-supplied text.
+    let principal = v["tasks"][0]["principal"].as_str().unwrap();
+    assert!(principal.contains('\u{1b}'));
+}

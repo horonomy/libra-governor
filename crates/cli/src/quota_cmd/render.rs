@@ -76,9 +76,38 @@ fn with_optional_suffix(required: &str, suffix: &str, width: usize) -> String {
     format!("{required} {}", ellipsize(suffix, budget))
 }
 
+/// Strips every C0 control byte (0x00-0x1F) and DEL (0x7F) from `s` —
+/// applied to every line's fully composed text immediately before it is
+/// written, as a single choke point rather than at each individual
+/// field. This surface renders caller-supplied free text straight from
+/// a `--replay` fixture (a task's principal, a policy's name, ...) with
+/// no character restriction of its own; without this, a crafted fixture
+/// could inject a terminal escape sequence (ESC, CSI, OSC — cursor
+/// movement, a screen clear, an OSC title spoof) or a bare `\n`/`\r`
+/// that forges a fake additional `[SIM]`-prefixed line into this
+/// process's stdout. Stripping (never just escaping) is deliberate: a
+/// partial sequence surviving width-based ellipsizing (e.g. the `2J` in
+/// a clear-screen sequence with its leading ESC cut off) is still
+/// rendered harmless once every control byte, including an ESC
+/// anywhere else on the line, is gone — the dangerous part of any such
+/// sequence is always a control byte, never the printable bytes around
+/// it. JSON output is unaffected by this function (and does not need
+/// it): `serde_json` already escapes every control byte, including ESC,
+/// as a textual `\u00XX` sequence, so a raw control byte never reaches
+/// JSON-mode stdout either.
+fn sanitize_for_terminal(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            let code = *c as u32;
+            !(code < 0x20 || code == 0x7F)
+        })
+        .collect()
+}
+
 fn push_line(out: &mut String, width: usize, required: &str, suffix: &str) {
     let body = with_optional_suffix(required, suffix, width);
-    let _ = writeln!(out, "[SIM] {body}");
+    let safe_body = sanitize_for_terminal(&body);
+    let _ = writeln!(out, "[SIM] {safe_body}");
 }
 
 /// First 8 characters of an id/label — short enough that `scope id`
