@@ -479,10 +479,12 @@ impl DiagnosticDispatcher {
                         ExecFailure::ErrorLimit => "stderr limit exceeded",
                         ExecFailure::NonzeroExit => "adapter exited unsuccessfully",
                         ExecFailure::SignalContext => "caller signal policy refused",
-                        ExecFailure::Setup
-                        | ExecFailure::Exec
-                        | ExecFailure::Io
-                        | ExecFailure::OwnershipInterference => "owned execution failed",
+                        ExecFailure::Setup => "owned execution setup failed",
+                        ExecFailure::Exec => "owned execution exec failed",
+                        ExecFailure::Io => "owned execution io failed",
+                        ExecFailure::OwnershipInterference => {
+                            "owned execution ownership interference"
+                        }
                     },
                     execution_attempted: true,
                 });
