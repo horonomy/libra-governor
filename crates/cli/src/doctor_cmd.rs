@@ -117,7 +117,25 @@ fn collect_findings(daemon_present: bool) -> Vec<Finding> {
 
     findings.push(claude_settings_finding());
     findings.push(codex_hooks_finding());
+    findings.push(quota_source_mode_finding());
     findings
+}
+
+/// HORO-1764: reports which `libra-governor-quota-source` mode is active.
+/// Additive only — no `DoctorResult`/protocol/daemon change, since this
+/// ticket stays out of HORO-1763's daemon/ledger lane. Always `Ok` in
+/// this build: there is no live adapter to fail to reach, so the honest
+/// severity is informational, not an error or even a warning — this is
+/// documented scope, not a broken thing to fix.
+fn quota_source_mode_finding() -> Finding {
+    Finding {
+        id: "quota_source_mode",
+        severity: Severity::Ok,
+        message: format!(
+            "quota-source mode: {}",
+            libra_governor_quota_source::describe_active_mode()
+        ),
+    }
 }
 
 /// HORO-1380 S4b: the running daemon's `exe_sha256` (from its pidfile)

@@ -19,6 +19,7 @@ libra-governor-evidence-adapter = { path = "../evidence-adapter" }
 libra-governor-gateway = { path = "../gateway" }
 libra-governor-ledger = { path = "../ledger" }
 libra-governor-protocol = { path = "../protocol" }
+libra-governor-quota-source = { path = "../quota-source" }
 rustix.workspace = true
 libc.workspace = true
 serde.workspace = true
