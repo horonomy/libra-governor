@@ -118,7 +118,24 @@ fn collect_findings(daemon_present: bool) -> Vec<Finding> {
     findings.push(claude_settings_finding());
     findings.push(codex_hooks_finding());
     findings.push(quota_source_mode_finding());
+    findings.push(pacing_authority_finding());
     findings
+}
+
+/// HORO-1767: names `quota explain --replay`'s actual authority honestly
+/// — a *simulated* advisory forecast only, never live enforcement.
+/// Always `Ok` severity (never `Warn`/`Error`, which would change
+/// `doctor`'s exit code — AC4 forbids that): this is documented,
+/// intentional scope, not a broken or missing thing to fix. See
+/// `crates/cli/src/quota_cmd/mod.rs`'s own module docs and HORO-1727.
+fn pacing_authority_finding() -> Finding {
+    Finding {
+        id: "pacing_authority",
+        severity: Severity::Ok,
+        message: "pacing: simulated only (quota explain --replay); no live enforcement \
+                  authority (HORO-1727)"
+            .to_string(),
+    }
 }
 
 /// HORO-1764: reports which `libra-governor-quota-source` mode is active.
