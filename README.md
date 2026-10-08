@@ -1,4 +1,4 @@
-# Libra Governor — Developer Preview
+# Libra Governor
 
 > Never start work you are unlikely to afford to finish.
 
@@ -10,11 +10,39 @@ makes replanning a deliberate, auditable decision rather than an implicit
 one. See [`PRODUCT.md`](PRODUCT.md) for the full product North Star and
 [`ARCHITECTURE.md`](ARCHITECTURE.md) for how the pieces fit together.
 
-This is the **v0.0.2 Developer Preview**: everything from v0.0.1 (the
-validated MVP 3 local flow — HORO-1137 Policy presets, HORO-1139 runtime
-replanning, HORO-1141 Completion Reserve, HORO-1144 the optional
-enforcement gateway — plus installation/diagnostics/documentation,
-HORO-1150), plus:
+This is the **v0.0.3 release**: everything from v0.0.2 (the v0.0.1 MVP 3
+local flow, Codex support, local extension points — see below) plus the
+Agent Execution Economics work (HORO-1666–1673, HORO-1689): hierarchical
+resource accounting, a progressive remaining-cost estimator with shadow
+runtime decisions, counterfactual policy replay, and economic-truth
+reconstruction (`libra-governor economics explain`).
+
+### Capability status (v0.0.3) — what is production-evidenced and what is not
+
+The founder's v0.0.3 GO verdict is **narrowed to the evidence that actually
+exists.** Full record: [`docs/adr/0014-v0-0-3-go-scope-and-exclusions.md`](docs/adr/0014-v0-0-3-go-scope-and-exclusions.md).
+
+**Production-evidenced** (real DogFood evidence, not just synthetic tests —
+see `experiments/v003_1689_dogfood/README.md`):
+- Duration estimation (the progressive/bucketed estimator, `libra-governor
+  calibration report`).
+- Admission (preflight cost/time estimation and admission-replay policies).
+- Flat / single-tenant resource accounts — the only account shape any real
+  installation has ever produced.
+
+**Implemented and tested, but explicitly not yet production-evidenced — do
+not rely on these for production decisions:**
+- The shadow-decision / early-warning mechanism (proactive Stop/Degrade
+  proposals). Real-usage measurement has twice (synthetic and real
+  DogFood) produced zero classifiable samples against the pre-registered
+  floors. Tracked: HORO-1693.
+- Multi-level / multi-tenant hierarchical custody accounting
+  (organization → principal → session → agent). No real installation has
+  ever created a non-flat account; the code path has no production caller.
+  Intentionally kept research/latent — see HORO-1694. Not wired further
+  without a real multi-level product requirement.
+
+### Also in this release (carried from v0.0.2)
 
 - **Codex support** (HORO-1157/1167) — Claude Code and Codex share the
   same Governor core through a stable Agent Adapter contract; capability
@@ -383,6 +411,9 @@ Run `libra-governor doctor` afterward to confirm — it will report
 
 ## Known limitations
 
+- **Shadow-decision/early-warning and multi-level custody accounting are
+  not production-evidenced.** See "Capability status" above and
+  [`docs/adr/0014-v0-0-3-go-scope-and-exclusions.md`](docs/adr/0014-v0-0-3-go-scope-and-exclusions.md).
 - **Developer Preview, not a general release.** No published binaries
   exist yet (see "Install" above); `cargo install` from a local clone is
   the real install path.
