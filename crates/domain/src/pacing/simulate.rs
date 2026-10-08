@@ -313,13 +313,14 @@ mod tests {
         let (burst_state, _) = simulate(&events, &shared_policy, &burst_scenario);
         let (sustain_state, _) = simulate(&events, &shared_policy, &sustain_scenario);
 
-        // Different schedules …
+        // Different schedules under the one shared `Policy` — the
+        // non-tautological half (the same contract/policy is actually
+        // *consulted* identically, not merely referenced by both
+        // `Scenario`s) is `ac3_completion_reserve_floor_is_identical_
+        // across_modes` below.
         assert_eq!(burst_state.active_count(), 2);
         assert_eq!(sustain_state.active_count(), 1);
-        // … but the same policy name/min_confidence was consulted by
-        // both — `step` takes `&Policy` by reference from the caller in
-        // both branches, never a mode-specific copy.
-        assert_eq!(shared_policy.name, "test");
+        let _ = &shared_policy;
     }
 
     /// AC3, non-tautological half: with an actual `CompletionContract`
@@ -458,6 +459,17 @@ mod tests {
                             ));
                         }
                     }
+                    // The candidate task's own hold must also be in the
+                    // evidence being checked — omitting it would only
+                    // ever catch the original bug one task late (e.g.
+                    // with 9 already in flight, a wrongly-admitted 10th
+                    // would still read back as `NotBlocking` if its own
+                    // hold weren't counted).
+                    let this_id = crate::reservation::ReservationId(uuid::Uuid::new_v4());
+                    evidence_holds.push(crate::quota_window::OutstandingHold::projected(
+                        this_id,
+                        hold.clone(),
+                    ));
                     let evidence = crate::quota_window::QuotaEvidence {
                         usage: &evidence_usage,
                         holds: &evidence_holds,
@@ -487,5 +499,112 @@ mod tests {
         // those 11 starts, whenever it happens, independently verifies
         // as `NotBlocking`.
         assert_eq!(independent_pending.len(), 11);
+    }
+
+    /// AC5's control-run half: "backoff reduces new commitments." Task A
+    /// (principal `p`) overruns its hold (`Spend` of 400 against a
+    /// 100-token hold — a 4x ratio, hitting `MAX_BACKOFF_RATIO_X100`)
+    /// and completes late (after its own estimated duration, so
+    /// `TaskCompleted`'s on-time reset never fires). Task B, same
+    /// principal, becomes ready only once task A completes (it depends
+    /// on it) — comparing a run with the overrun `Spend` event against
+    /// an otherwise-identical control run without it isolates backoff's
+    /// effect from everything else in the scenario.
+    #[test]
+    fn ac5_backoff_delays_later_starts_for_the_overrunning_principal() {
+        let w = window(250, 21_600);
+        let build_tasks = || {
+            TaskSet::validated(vec![
+                task(1, 100, 60),
+                SimTask {
+                    id: SimTaskId(2),
+                    principal: PrincipalId("p".to_string()),
+                    depends_on: vec![SimTaskId(1)],
+                    priority: Priority::Normal,
+                    deadline: None,
+                    estimate: task(2, 100, 60).estimate,
+                },
+            ])
+            .unwrap()
+        };
+        fn scenario_for<'a>(tasks: &'a TaskSet, w: &'a QuotaWindow) -> Scenario<'a> {
+            Scenario {
+                tasks,
+                windows: std::slice::from_ref(w),
+                contract: None,
+                preference: PacingPreference::Burst {
+                    target_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(12),
+                    max_fanout: 2,
+                },
+            }
+        }
+        let t0 = OffsetDateTime::UNIX_EPOCH;
+        // Task A completes at t0+120 — later than its own 60s estimate,
+        // so `TaskCompleted`'s "reset backoff if within estimate" branch
+        // never fires and the overrun's backoff survives to task B's
+        // admission check.
+        let complete_at = t0 + time::Duration::seconds(120);
+
+        let control_tasks = build_tasks();
+        let control_events = vec![
+            PacingEvent::ModeChanged { at: t0, seq: 0 },
+            PacingEvent::TaskCompleted {
+                at: complete_at,
+                seq: 1,
+                task: SimTaskId(1),
+            },
+        ];
+        let (_, control_trace) = simulate(
+            &control_events,
+            &policy(),
+            &scenario_for(&control_tasks, &w),
+        );
+
+        let overrun_tasks = build_tasks();
+        let overrun_events = vec![
+            PacingEvent::ModeChanged { at: t0, seq: 0 },
+            PacingEvent::Spend {
+                at: t0 + time::Duration::seconds(10),
+                seq: 1,
+                task: SimTaskId(1),
+                amount: QuotaAmount::new(QuotaUnit::Tokens, 400),
+            },
+            PacingEvent::TaskCompleted {
+                at: complete_at,
+                seq: 2,
+                task: SimTaskId(1),
+            },
+        ];
+        let (_, overrun_trace) = simulate(
+            &overrun_events,
+            &policy(),
+            &scenario_for(&overrun_tasks, &w),
+        );
+
+        let task_b_start = |trace: &[(Tick<'_>, Vec<Proposal>)]| {
+            trace.iter().find_map(|(_, proposals)| {
+                proposals.iter().find_map(|p| match p {
+                    Proposal::Start { task, at, .. } if *task == SimTaskId(2) => Some(*at),
+                    _ => None,
+                })
+            })
+        };
+
+        let control_start = task_b_start(&control_trace)
+            .expect("control run must admit task B promptly once task A completes");
+        // Task B never starts in the overrun run within this short event
+        // list: its inflated (4x) need alone exceeds the 250-token
+        // window limit outright, so admission stays an honest
+        // `Unavailable(NeedExceedsWindowLimit)`, not a crash or a
+        // silent "admit anyway". Fewer commitments, exactly as AC5
+        // requires — the strongest possible form of "delayed".
+        assert!(
+            task_b_start(&overrun_trace).is_none(),
+            "the overrunning principal's next task must not start in this run at all"
+        );
+        assert_eq!(
+            control_start, complete_at,
+            "without an overrun, task B starts the moment task A completes"
+        );
     }
 }

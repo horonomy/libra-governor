@@ -48,6 +48,18 @@ pub struct Scenario<'a> {
 struct ActiveTask {
     principal: String,
     hold: QuotaAmount,
+    /// The floor settlement falls back to when no `Spend` was ever
+    /// reported — deliberately *not* `hold.value`: `hold` is the full
+    /// admission-time reservation, which for SUSTAIN includes the
+    /// continuity-reserve margin (`continuity_reserve_bp × limit`,
+    /// window-limit-scaled, not task-need-scaled). Settling at the full
+    /// `hold` would record that per-window admission margin as if it
+    /// were real spend, inflating this task's contribution to every
+    /// window's cumulative-usage history. `settlement_floor` is the same
+    /// need computed with the continuity term forced off (still
+    /// including the completion-reserve floor — the ledger's own
+    /// settle-at-full-reservation convention — and backoff scaling).
+    settlement_floor: u64,
     #[allow(dead_code)]
     started_at: OffsetDateTime,
     projected_complete_at: OffsetDateTime,
@@ -261,47 +273,75 @@ fn try_admit(
             earliest_at,
         );
 
-        match admit {
-            NextAdmit::Now => {
+        // `admit` was computed with `start_at: earliest_at`, so
+        // `NextAdmit::Now` means "safe at `earliest_at`", not "safe at
+        // the real event time `now`" — these differ whenever SUSTAIN's
+        // spacing or working-hours constraint pushed `earliest_at` into
+        // the future. A prior version of this loop conflated the two
+        // and started every SUSTAIN task at `now`, silently skipping
+        // spacing/working-hours entirely. Resolve the actual admit
+        // instant first, then compare *that* against `now`.
+        let resolved_limiting = match &admit {
+            NextAdmit::At { limiting, .. } => Some(*limiting),
+            _ => None,
+        };
+        let resolved_at = match admit {
+            NextAdmit::Now => Some(earliest_at),
+            NextAdmit::At { at, .. } => Some(at),
+            NextAdmit::Unavailable(_) => None,
+        };
+
+        match resolved_at {
+            Some(instant) if instant <= now => {
                 let hold = recorded_hold(&task.estimate, scenario, policy, mode, backoff);
+                // Burst (no continuity-reserve addition) so the
+                // settlement floor is the task's own need, never
+                // inflated by SUSTAIN's window-limit-scaled admission
+                // margin — see `ActiveTask::settlement_floor`'s docs.
+                let settlement_floor = recorded_hold(
+                    &task.estimate,
+                    scenario,
+                    policy,
+                    ForecastMode::Burst,
+                    backoff,
+                )
+                .value;
                 start_task(
                     &mut working,
                     task.id,
                     task.principal.0.clone(),
                     &task.estimate,
                     hold.clone(),
+                    settlement_floor,
                     now,
                 );
                 proposals.push(Proposal::Start {
                     task: task.id,
                     at: now,
                     hold,
-                    limiting: None,
+                    limiting: resolved_limiting,
                 });
             }
-            NextAdmit::At { at, limiting } if at <= now => {
-                let hold = recorded_hold(&task.estimate, scenario, policy, mode, backoff);
-                start_task(
-                    &mut working,
-                    task.id,
-                    task.principal.0.clone(),
-                    &task.estimate,
-                    hold.clone(),
-                    now,
-                );
-                proposals.push(Proposal::Start {
-                    task: task.id,
-                    at: now,
-                    hold,
-                    limiting: Some(limiting),
-                });
-            }
-            NextAdmit::At { at, .. } => {
-                earliest_pending_timer = Some(earlier_timer(earliest_pending_timer, at));
-                proposals.push(Proposal::Hold { next: admit });
+            Some(instant) => {
+                earliest_pending_timer = Some(earlier_timer(earliest_pending_timer, instant));
+                // When the delay came from spacing/working-hours alone
+                // (forecast itself said `Now`, i.e. no window was
+                // blocking), there is no limiting window to name — fall
+                // back to the first scenario window so `Proposal::Hold`
+                // still carries a concrete instant a caller can wake on.
+                // `NextAdmit` has no "spacing" cause of its own yet; see
+                // this PR's known limitations.
+                let next = match admit {
+                    NextAdmit::At { .. } => admit,
+                    _ => NextAdmit::At {
+                        at: instant,
+                        limiting: scenario.windows.first().map(|w| w.id()).unwrap_or_default(),
+                    },
+                };
+                proposals.push(Proposal::Hold { next });
                 skip.insert(task.id);
             }
-            NextAdmit::Unavailable(_) => {
+            None => {
                 proposals.push(Proposal::Hold { next: admit });
                 skip.insert(task.id);
             }
@@ -319,15 +359,12 @@ fn earlier_timer(current: Option<OffsetDateTime>, candidate: OffsetDateTime) -> 
     }
 }
 
-/// The tightest window's integer rate, used only to space successive
-/// SUSTAIN starts (`ceil(need * secs / amount)`), per the ticket's
-/// design. Returns `None` when no window yields a usable rate (e.g. an
-/// empty window set) — SUSTAIN then relies solely on `earliest_safe_admit`
-/// for pacing.
 /// `ceil(need * secs / rate)` for the tightest (largest-spacing) window
 /// — the ticket's own spacing formula, not `secs / rate` (which ignores
 /// the task's actual need and under-spaces badly for a large task
-/// against a high-rate window).
+/// against a high-rate window). Returns `None` when no window yields a
+/// usable rate (e.g. an empty window set) — SUSTAIN then relies solely
+/// on `earliest_safe_admit` for pacing.
 fn sustain_spacing(scenario: &Scenario<'_>, need: u64) -> Option<u64> {
     let mut tightest: Option<u64> = None;
     for window in scenario.windows {
@@ -422,6 +459,7 @@ fn start_task(
     principal: String,
     estimate: &crate::progressive::RemainingWorkEstimate,
     hold: QuotaAmount,
+    settlement_floor: u64,
     at: OffsetDateTime,
 ) {
     let duration_secs = match estimate.duration {
@@ -436,6 +474,7 @@ fn start_task(
         ActiveTask {
             principal,
             hold,
+            settlement_floor,
             started_at: at,
             projected_complete_at,
         },
@@ -466,8 +505,8 @@ pub fn step(
                     next.backoff_x100.insert(active.principal.clone(), 100);
                 }
                 let spend = next.spend_so_far.remove(task);
-                let settled_value = spend.unwrap_or(0).max(active.hold.value);
-                let settled_id = EconomicEventId(pending_hold_settlement_uuid(*task, *at));
+                let settled_value = spend.unwrap_or(0).max(active.settlement_floor);
+                let settled_id = EconomicEventId(pending_hold_settlement_uuid(*task));
                 if let Ok(usage) = QuotaUsage::new(
                     settled_id,
                     *at,
@@ -518,19 +557,20 @@ const SETTLEMENT_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes([
     0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81, 0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0x09,
 ]);
 
-/// Derives a settlement record's id from the namespace above, the task
-/// id, and the completion instant — unique per `(task, at)` pair without
-/// `Uuid::from_u128(small_int)`'s collision risk (see this module's
-/// other synthetic-id derivations for the same concern).
-fn pending_hold_settlement_uuid(task: SimTaskId, at: OffsetDateTime) -> uuid::Uuid {
+/// Derives a settlement record's id from the namespace above and the
+/// task id alone — deliberately *not* also mixing in the completion
+/// instant: a `SimTaskId` is removed from `active` the moment it
+/// completes and `ready_order` excludes every completed task forever
+/// (see `TaskSet`/`ready`), so a given task settles at most once per
+/// scenario, which makes the task id alone already unique. Mixing in a
+/// second field via a wrapping `% 16` byte range (an earlier version of
+/// this function did) only reintroduces a collision opportunity between
+/// two different `(task, at)` pairs for no benefit.
+fn pending_hold_settlement_uuid(task: SimTaskId) -> uuid::Uuid {
     let mut bytes = *SETTLEMENT_NAMESPACE.as_bytes();
     let task_bytes = task.0.to_be_bytes();
     for (i, b) in task_bytes.iter().enumerate() {
         bytes[i] ^= *b;
-    }
-    let at_bytes = at.unix_timestamp_nanos().to_be_bytes();
-    for (i, b) in at_bytes.iter().enumerate() {
-        bytes[(4 + i) % 16] ^= *b;
     }
     uuid::Uuid::from_bytes(bytes)
 }
@@ -727,6 +767,63 @@ mod tests {
                 .copied()
                 .unwrap_or(100)
                 > 100
+        );
+    }
+
+    /// Regression test for a real bug an independent review found: the
+    /// admission loop compared `NextAdmit::Now` against the real event
+    /// time `now` instead of against `earliest_at` (the spacing/working-
+    /// hours floor actually passed to `earliest_safe_admit` as its
+    /// `start_at`), so a SUSTAIN task that completed early let the
+    /// *next* task start immediately too — silently skipping spacing
+    /// entirely. need=100, 6h sliding limit=1000 gives spacing =
+    /// ceil(100 * 21600 / 1000) = 2160s. Task 1 starts at t0; it
+    /// completes at t0+60 (well inside its own estimate, so no
+    /// backoff); task 2 must still wait until t0+2160, not start at
+    /// t0+60 just because a concurrency slot freed up.
+    #[test]
+    fn sustain_spacing_is_enforced_even_when_a_slot_frees_up_early() {
+        let tasks = TaskSet::validated(vec![
+            task_with_tokens(1, 100, 60),
+            task_with_tokens(2, 100, 60),
+        ])
+        .unwrap();
+        let w = window(1000, 21_600);
+        let scenario = Scenario {
+            tasks: &tasks,
+            windows: std::slice::from_ref(&w),
+            contract: None,
+            preference: PacingPreference::Sustain {
+                horizon_secs: 21_600,
+                working_hours: None,
+                continuity_reserve_bp: 0,
+            },
+        };
+        let t0 = OffsetDateTime::UNIX_EPOCH;
+        let events = vec![
+            PacingEvent::ModeChanged { at: t0, seq: 0 },
+            PacingEvent::TaskCompleted {
+                at: t0 + time::Duration::seconds(60),
+                seq: 1,
+                task: SimTaskId(1),
+            },
+        ];
+        let (_, trace) = crate::pacing::simulate::simulate(&events, &policy(), &scenario);
+
+        let task2_start_at = trace
+            .iter()
+            .flat_map(|(_, proposals)| proposals.iter())
+            .find_map(|p| match p {
+                Proposal::Start { task, at, .. } if *task == SimTaskId(2) => Some(*at),
+                _ => None,
+            })
+            .expect("task 2 must eventually start");
+
+        assert_eq!(
+            task2_start_at,
+            t0 + time::Duration::seconds(2160),
+            "task 2 must wait the full spacing interval from task 1's start, \
+             not start the instant task 1 completes and frees a slot"
         );
     }
 }
