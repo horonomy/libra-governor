@@ -19,15 +19,30 @@
 -- `libra_governor_ledger::shared_pool::ensure_pool`).
 --
 -- `shared_pool_reservations` mirrors `reservations`'s shape exactly where
--- the concepts coincide (state lifecycle, idempotency-key uniqueness
--- scoped to the owning id, `expires_at` for crash/restart reconciliation)
--- and drops what does not apply to a flat pool (class, drawn_from_reserve,
--- plan_id, account_id/lease_kind). `amount`/`settled_amount` are INTEGER,
--- not REAL: a quota pool's unit (tokens, requests, opaque provider
--- credit's base integer, USD cents) is always a whole-number base
--- integer in this contract (see `QuotaAmount.value: u64`), so summing as
--- INTEGER avoids the floating-point accumulation drift the task ledger's
--- REAL amounts accept at a much smaller historical scale.
+-- the concepts coincide (state lifecycle, `expires_at` for crash/restart
+-- reconciliation) and drops what does not apply to a flat pool (class,
+-- drawn_from_reserve, plan_id, account_id/lease_kind). `amount`/
+-- `settled_amount` are INTEGER, not REAL: a quota pool's unit (tokens,
+-- requests, opaque provider credit's base integer, USD cents) is always a
+-- whole-number base integer in this contract (see `QuotaAmount.value:
+-- u64`), so summing as INTEGER avoids the floating-point accumulation
+-- drift the task ledger's REAL amounts accept at a much smaller
+-- historical scale. `settled_amount >= 0` is enforced the same way
+-- `amount >= 0` already is -- a caller-supplied actual-usage figure is
+-- rejected by the ledger layer before it ever reaches this column (see
+-- `checked_i64`), and the CHECK is a second, independent backstop against
+-- a negative value ever being written at all.
+--
+-- Idempotency-key uniqueness is scoped to `(pool_id, principal_id,
+-- idempotency_key)`, NOT `(pool_id, idempotency_key)` alone: a shared
+-- pool is reserved by MANY principals, and an idempotency key is a
+-- caller-chosen string with no global-uniqueness guarantee across
+-- actors. Scoping only to the pool would let one principal's replay
+-- lookup collide with a different principal's row -- returning someone
+-- else's reservation (its principal_id, session_id, amount) to a caller
+-- who never created it, rather than creating or finding that caller's
+-- own idempotent row. Scoping to the principal as well makes that
+-- collision structurally impossible rather than merely unlikely.
 --
 -- `shared_pool_provider_snapshots` holds only the LATEST ingested gauge
 -- reading per pool (`pool_id` is its own primary key, upserted on
@@ -60,7 +75,7 @@ CREATE TABLE IF NOT EXISTS shared_pool_reservations (
     session_id TEXT NOT NULL,
     amount INTEGER NOT NULL CHECK (amount >= 0),
     state TEXT NOT NULL CHECK (state IN ('active', 'settled', 'released', 'expired')),
-    settled_amount INTEGER,
+    settled_amount INTEGER CHECK (settled_amount IS NULL OR settled_amount >= 0),
     usage_known INTEGER,
     idempotency_key TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -71,9 +86,11 @@ CREATE TABLE IF NOT EXISTS shared_pool_reservations (
 );
 
 -- Idempotent reserve retries collide here rather than creating a second
--- hold.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_shared_pool_reservations_pool_idempotency
-    ON shared_pool_reservations (pool_id, idempotency_key);
+-- hold -- scoped to the principal as well as the pool (see module docs
+-- above) so a key collision across two different actors can never merge
+-- their requests.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_shared_pool_reservations_pool_principal_idempotency
+    ON shared_pool_reservations (pool_id, principal_id, idempotency_key);
 -- Serves the admission sub-selects (SUM over active/settled per pool).
 CREATE INDEX IF NOT EXISTS idx_shared_pool_reservations_pool_state
     ON shared_pool_reservations (pool_id, state);

@@ -17,7 +17,12 @@
 //!
 //! # Idempotency
 //!
-//! `reserve` is idempotent on `(pool_id, idempotency_key)`.
+//! `reserve` is idempotent on `(pool_id, principal_id, idempotency_key)`
+//! — the principal is part of the scope, not just the pool, because an
+//! idempotency key is a caller-chosen string with no uniqueness guarantee
+//! across the many different principals that may share one pool; scoping
+//! only to the pool would let one principal's replay lookup collide with
+//! a different principal's row.
 //! `settle`/`release` are idempotent on `id` and its current state via a
 //! conditional `UPDATE ... WHERE state = ?` with a zero-rows-affected
 //! fallback — the same race-safe primitive `crate::reservation` uses,
@@ -68,6 +73,19 @@ fn parse_time(s: &str) -> Result<OffsetDateTime, LedgerError> {
 
 fn invalid() -> LedgerError {
     LedgerError::Sqlite(rusqlite::Error::InvalidQuery)
+}
+
+/// SQLite's `INTEGER` column is a signed 64-bit value; every amount this
+/// module persists originates as a caller-supplied `u64`. A bare `as i64`
+/// cast silently wraps a value above `i64::MAX` into a negative number —
+/// exactly the truncation-bug class this ticket's own review discipline
+/// calls out (a negative stored "capacity" or "amount" would corrupt
+/// every subsequent admission comparison into failing open). Rejected
+/// outright via `try_from` rather than saturated: a caller-supplied
+/// amount this large is never legitimate input, so there is no sensible
+/// value to clamp to — only a request to refuse.
+fn checked_i64(value: u64) -> Result<i64, LedgerError> {
+    i64::try_from(value).map_err(|_| invalid())
 }
 
 fn unit_to_json(unit: &QuotaUnit) -> Result<String, LedgerError> {
@@ -248,6 +266,7 @@ impl LedgerStore {
     ) -> Result<QuotaPool, LedgerError> {
         let unit_json = unit_to_json(unit)?;
         let now_str = rfc3339(now)?;
+        let capacity_i64 = checked_i64(capacity)?;
         let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT INTO quota_pools (pool_id, unit_json, capacity, schema_version, created_at, updated_at)
@@ -256,7 +275,7 @@ impl LedgerStore {
             rusqlite::params![
                 pool_id.0,
                 unit_json,
-                capacity as i64,
+                capacity_i64,
                 SHARED_POOL_RESERVATION_SCHEMA_VERSION,
                 now_str,
             ],
@@ -409,13 +428,23 @@ impl LedgerStore {
     ) -> Result<SharedPoolReserveOutcome, LedgerError> {
         let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
 
+        // Scoped to (pool_id, principal_id, idempotency_key) — an
+        // idempotency key is a caller-chosen string with no uniqueness
+        // guarantee across different principals sharing the same pool.
+        // Matching on (pool_id, idempotency_key) alone would let one
+        // principal's lookup collide with a different principal's row,
+        // handing back someone else's reservation (its principal_id,
+        // session_id, amount) as if it were this caller's own idempotent
+        // replay. See migration 0016's own docs for the same discipline
+        // applied to the unique index this query relies on.
         let existing: Option<ReservationRow> = tx
             .query_row(
                 &format!(
                     "SELECT {RESERVATION_COLUMNS}
-                     FROM shared_pool_reservations WHERE pool_id = ?1 AND idempotency_key = ?2"
+                     FROM shared_pool_reservations
+                     WHERE pool_id = ?1 AND principal_id = ?2 AND idempotency_key = ?3"
                 ),
-                rusqlite::params![req.pool_id.0, req.idempotency_key],
+                rusqlite::params![req.pool_id.0, req.principal_id.0, req.idempotency_key],
                 read_reservation_row,
             )
             .optional()?;
@@ -475,7 +504,21 @@ impl LedgerStore {
         }
 
         let id = SharedPoolReservationId::new();
-        let expires_at = req.now + time::Duration::seconds(req.ttl_secs as i64);
+        // `ttl_secs` is caller-supplied; a bare `Duration::seconds(ttl_secs
+        // as i64)` followed by `now + duration` can both truncate (a
+        // `ttl_secs` above `i64::MAX`) and panic (`OffsetDateTime`
+        // arithmetic panics outside its representable range) — the same
+        // bug class flagged for proactive avoidance in all new code here.
+        // Saturating the seconds value and using `checked_add` reports a
+        // conservative "expires immediately" fallback instead of either
+        // failure mode; an operator-configured TTL is never realistically
+        // this large, so the fallback path exists only as a safety net.
+        let ttl_seconds = i64::try_from(req.ttl_secs).unwrap_or(i64::MAX);
+        let expires_at = req
+            .now
+            .checked_add(time::Duration::seconds(ttl_seconds))
+            .unwrap_or(req.now);
+        let amount_i64 = checked_i64(req.amount)?;
         tx.execute(
             "INSERT INTO shared_pool_reservations (
                 id, pool_id, principal_id, session_id, amount, state, settled_amount,
@@ -487,7 +530,7 @@ impl LedgerStore {
                 req.pool_id.0,
                 req.principal_id.0,
                 req.session_id,
-                req.amount as i64,
+                amount_i64,
                 req.idempotency_key,
                 rfc3339(req.now)?,
                 rfc3339(expires_at)?,
@@ -576,6 +619,7 @@ impl LedgerStore {
         }
 
         let settled_value = actual.unwrap_or(reservation.amount);
+        let settled_value_i64 = checked_i64(settled_value)?;
         let usage_known = actual.is_some();
 
         let expected_prior_state = if late_after_expiry {
@@ -588,7 +632,7 @@ impl LedgerStore {
                                                   usage_known = ?2, settled_at = ?3
              WHERE id = ?4 AND state = ?5",
             rusqlite::params![
-                settled_value as i64,
+                settled_value_i64,
                 usage_known,
                 rfc3339(now)?,
                 id.0.to_string(),
@@ -705,9 +749,11 @@ impl LedgerStore {
     ) -> Result<(), LedgerError> {
         let (disclosed, used_value, declared_limit) = match reading {
             GaugeReading::Undisclosed => (false, None, None),
-            GaugeReading::Used { used, limit } => {
-                (true, Some(used.value as i64), limit.map(|l| l as i64))
-            }
+            GaugeReading::Used { used, limit } => (
+                true,
+                Some(checked_i64(used.value)?),
+                limit.map(checked_i64).transpose()?,
+            ),
         };
         let confidence_str = serde_json::to_string(&confidence).map_err(|e| {
             LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
@@ -828,6 +874,83 @@ mod tests {
             other => {
                 panic!("expected Granted (5 consumed, 5 requested, 10 capacity), got {other:?}")
             }
+        }
+    }
+
+    #[test]
+    fn cross_principal_idempotency_key_reuse_is_not_merged() {
+        // A different principal reusing the exact same idempotency_key
+        // against the same pool must get its OWN reservation, never the
+        // first principal's — scoping idempotency to (pool_id,
+        // principal_id, idempotency_key) rather than (pool_id,
+        // idempotency_key) is what this test guards against regressing.
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        store
+            .ensure_pool(&pool_id(), &QuotaUnit::Tokens, 10, now())
+            .unwrap();
+
+        let from_principal_1 = store
+            .reserve_shared(SharedPoolReserveRequest {
+                pool_id: &pool_id(),
+                principal_id: &principal(1),
+                session_id: "s1",
+                amount: 3,
+                unit: &QuotaUnit::Tokens,
+                idempotency_key: "shared-key",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap();
+        let from_principal_2 = store
+            .reserve_shared(SharedPoolReserveRequest {
+                pool_id: &pool_id(),
+                principal_id: &principal(2),
+                session_id: "s2",
+                amount: 4,
+                unit: &QuotaUnit::Tokens,
+                idempotency_key: "shared-key",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap();
+
+        let (SharedPoolReserveOutcome::Granted(a), SharedPoolReserveOutcome::Granted(b)) =
+            (from_principal_1, from_principal_2)
+        else {
+            panic!("expected both principals to be independently Granted");
+        };
+        assert_ne!(
+            a.id, b.id,
+            "two different principals sharing an idempotency key must never collapse to one row"
+        );
+        assert_eq!(a.principal_id, principal(1));
+        assert_eq!(b.principal_id, principal(2));
+        assert_eq!(a.amount, 3);
+        assert_eq!(b.amount, 4);
+
+        // Both amounts are actually held against the pool (3 + 4 = 7),
+        // not just one of them — proving the second call did not read
+        // back the first principal's row as its own.
+        let admission = store.pool_admission(&pool_id(), now()).unwrap().unwrap();
+        assert_eq!(admission.active, 7);
+
+        // Each principal's OWN replay of their own key is still a true
+        // idempotent no-op.
+        let replay_1 = store
+            .reserve_shared(SharedPoolReserveRequest {
+                pool_id: &pool_id(),
+                principal_id: &principal(1),
+                session_id: "s1",
+                amount: 3,
+                unit: &QuotaUnit::Tokens,
+                idempotency_key: "shared-key",
+                now: now(),
+                ttl_secs: 900,
+            })
+            .unwrap();
+        match replay_1 {
+            SharedPoolReserveOutcome::AlreadyGranted(r) => assert_eq!(r.id, a.id),
+            other => panic!("expected AlreadyGranted for principal 1's own replay, got {other:?}"),
         }
     }
 
@@ -1155,6 +1278,105 @@ mod tests {
             outcome,
             Err(LedgerError::QuotaUnitMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn capacity_above_i64_max_is_rejected_not_wrapped() {
+        // A bare `capacity as i64` would silently wrap a value above
+        // `i64::MAX` into a negative number — fail-open territory (a
+        // negative stored capacity would make every subsequent admission
+        // check nonsensical in the attacker's favor). `ensure_pool` must
+        // reject it outright instead.
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let outcome = store.ensure_pool(&pool_id(), &QuotaUnit::Tokens, u64::MAX, now());
+        assert!(
+            outcome.is_err(),
+            "expected capacity overflow to be rejected, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn reserve_amount_above_i64_max_is_rejected_not_wrapped() {
+        // `admission.admits()` uses i128 arithmetic, so an absurd request
+        // against a (bounded) pool capacity is already caught as
+        // `Insufficient` before the i64 cast guard is ever reached — a
+        // request this large can never be legitimately granted in the
+        // first place, since `ensure_pool` itself rejects a capacity
+        // above `i64::MAX` (see `capacity_above_i64_max_is_rejected_not_wrapped`),
+        // which bounds every admissible amount well under `i64::MAX` too.
+        // Either way, the outcome here must be a rejection, never a
+        // silent grant of a wrapped negative amount.
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        store
+            .ensure_pool(&pool_id(), &QuotaUnit::Tokens, 10, now())
+            .unwrap();
+        let outcome = store
+            .reserve_shared(SharedPoolReserveRequest {
+                pool_id: &pool_id(),
+                principal_id: &principal(1),
+                session_id: "s1",
+                amount: u64::MAX,
+                unit: &QuotaUnit::Tokens,
+                idempotency_key: "k1",
+                now: now(),
+                ttl_secs: 60,
+            })
+            .unwrap();
+        assert!(
+            matches!(outcome, SharedPoolReserveOutcome::Insufficient { .. }),
+            "expected Insufficient, got {outcome:?}"
+        );
+        // And critically: the rejected request must not have been
+        // admitted/written — capacity stays fully available.
+        let admission = store.pool_admission(&pool_id(), now()).unwrap().unwrap();
+        assert_eq!(admission.active, 0);
+    }
+
+    #[test]
+    fn settle_actual_above_i64_max_is_rejected_not_wrapped() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        store
+            .ensure_pool(&pool_id(), &QuotaUnit::Tokens, 10, now())
+            .unwrap();
+        let SharedPoolReserveOutcome::Granted(reservation) = reserve(&mut store, "s1", 5, "k1")
+        else {
+            panic!("expected Granted");
+        };
+        let outcome = store.settle_shared(reservation.id, Some(u64::MAX), now());
+        assert!(
+            outcome.is_err(),
+            "expected settlement overflow to be rejected, got {outcome:?}"
+        );
+        // The reservation must remain untouched (still Active, not
+        // corrupted by a half-applied settlement) after the rejection.
+        let still_active = store
+            .get_shared_reservation(reservation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_active.state, ReservationState::Active);
+    }
+
+    #[test]
+    fn ingested_snapshot_values_above_i64_max_are_rejected_not_wrapped() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        store
+            .ensure_pool(&pool_id(), &QuotaUnit::Tokens, 10, now())
+            .unwrap();
+        let outcome = store.ingest_pool_provider_snapshot(
+            &pool_id(),
+            now(),
+            None,
+            &GaugeReading::Used {
+                used: libra_governor_domain::QuotaAmount::new(QuotaUnit::Tokens, u64::MAX),
+                limit: Some(10),
+            },
+            Confidence::High,
+            now(),
+        );
+        assert!(
+            outcome.is_err(),
+            "expected used-value overflow to be rejected, got {outcome:?}"
+        );
     }
 
     #[test]
