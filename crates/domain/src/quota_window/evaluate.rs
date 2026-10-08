@@ -564,6 +564,12 @@ fn evaluate_gauge(
 fn reading_rank(reading: &GaugeReading) -> u64 {
     match reading {
         GaugeReading::Undisclosed => 0,
-        GaugeReading::Used { used, .. } => used.value + 1,
+        // Saturating, not `+ 1`: a `used.value == u64::MAX` reading
+        // (caller-supplied, not range-checked anywhere upstream) would
+        // otherwise panic in debug or wrap to 0 in release — making a
+        // maximal "used" reading lose the tie-break against
+        // `Undisclosed`, which fails open exactly where this tie-break
+        // exists to be conservative (HORO-1764 self-review).
+        GaugeReading::Used { used, .. } => used.value.saturating_add(1),
     }
 }
