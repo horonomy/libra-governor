@@ -136,7 +136,7 @@ pub use quota_window::{
     PeriodState, PoolId, ProviderAccount, ProviderSnapshot, QuotaAmount, QuotaEvidence, QuotaScope,
     QuotaSubject, QuotaUnit, QuotaUsage, QuotaWindow, QuotaWindowError, QuotaWindowId, Relief,
     ResetWeekday, StaleReason, WallClockTime, WindowEvaluation, WindowKind, WindowState,
-    QUOTA_WINDOW_SCHEMA_VERSION,
+    WorkingHours, WorkingHoursError, QUOTA_WINDOW_SCHEMA_VERSION,
 };
 pub use regime::{
     CacheClass, DimensionUnavailable, DimensionValue, RegimeBasis, RegimeComparison,
