@@ -53,6 +53,7 @@ mod external_approval;
 mod outcome_attestation;
 mod policy;
 mod progressive;
+mod quota_window;
 mod regime;
 mod replan;
 mod replay;
@@ -125,6 +126,15 @@ pub use progressive::{
     RuntimeDecision, RuntimeDecisionProposal, Shadow, ShadowDecisionSummary, SpendScope,
     SpendSoFar, StopReason, MIN_CONDITIONAL_SAMPLES, REMAINING_WORK_SCHEMA_VERSION,
     RUNTIME_DECISION_SCHEMA_VERSION,
+};
+pub use quota_window::{
+    decode_provider_snapshot, decode_quota_window, AlignedPeriod, BlockingStatus, BucketState,
+    CreditNamespace, DecodedProviderSnapshot, DecodedQuotaWindow, EntitlementSource,
+    GaugeFreshness, GaugeReading, GaugeState, IanaTimeZone, IndeterminateReason, OutstandingHold,
+    PeriodState, PoolId, ProviderAccount, ProviderSnapshot, QuotaAmount, QuotaEvidence, QuotaScope,
+    QuotaSubject, QuotaUnit, QuotaUsage, QuotaWindow, QuotaWindowError, QuotaWindowId, Relief,
+    ResetWeekday, StaleReason, WallClockTime, WindowEvaluation, WindowKind, WindowState,
+    QUOTA_WINDOW_SCHEMA_VERSION,
 };
 pub use regime::{
     CacheClass, DimensionUnavailable, DimensionValue, RegimeBasis, RegimeComparison,
