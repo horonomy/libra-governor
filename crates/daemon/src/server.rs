@@ -1030,9 +1030,11 @@ pub(crate) fn handle_preflight_prepared(
     // comment on the `RequiredWork` formula), matching this call site's
     // pre-HORO-1727 behavior exactly whenever `granted` is zero — which
     // is every task today.
-    let snapshot = ledger
-        .budget_snapshot(task_id)?
-        .expect("task_budgets row was written by initialize_task_budget above");
+    let snapshot = ledger.budget_snapshot(task_id)?.ok_or_else(|| {
+        DaemonError::Ledger(libra_governor_ledger::LedgerError::TaskNotFound(
+            task_id.to_string(),
+        ))
+    })?;
     let committed = snapshot.used().as_f64() + snapshot.reserved().as_f64();
     let granted = snapshot.granted();
     let projected =
