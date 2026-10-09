@@ -106,6 +106,7 @@ mod hook_stop;
 mod install_cmd;
 mod outcome_cmd;
 mod presentation;
+mod quota_cmd;
 mod statusline;
 mod statusline_provider;
 mod uninstall_cmd;
@@ -140,6 +141,7 @@ Usage:
   libra-governor dogfood-evidence export
   libra-governor outcome record
   libra-governor economics explain --task|--session|--account|--principal|--organization <value> [--json]
+  libra-governor quota explain --replay <path> [--as-of <rfc3339>] [--json] [--width <n>]
 
 Global options:
   -h, --help     Print this help and exit
@@ -203,6 +205,7 @@ fn main() {
         ["evidence-report"] => evidence_report_cmd::run(),
         ["dogfood-evidence", "export"] => dogfood_evidence_cmd::run(),
         ["outcome", "record"] => outcome_cmd::run(),
+        ["quota", "explain", ..] => std::process::exit(quota_cmd::run(&args[2..])),
         ["economics", "explain", sel, value]
             if matches!(
                 *sel,

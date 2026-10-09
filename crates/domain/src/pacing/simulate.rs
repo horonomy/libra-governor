@@ -38,11 +38,39 @@ pub enum Tick<'a> {
 /// strictly before the next real event (or after the last one). Returns the
 /// final [`PacerState`] plus the full, ordered trace of `(Tick, Vec<Proposal>)`
 /// pairs — the replayable record AC4's determinism test compares byte-for-byte.
+///
+/// Thin wrapper over [`simulate_until`] with no upper bound — see that
+/// function's docs for the general form (added for HORO-1767's `quota
+/// explain --as-of` replay, which must never process an event/timer past
+/// the caller's chosen instant).
 pub fn simulate<'a>(
     events: &'a [PacingEvent],
     policy: &Policy,
     scenario: &Scenario<'_>,
 ) -> (PacerState, Vec<(Tick<'a>, Vec<Proposal>)>) {
+    let (state, trace, _tick_budget_exhausted) = simulate_until(events, policy, scenario, None);
+    (state, trace)
+}
+
+/// Runs every event in `events` through [`step`] exactly as [`simulate`]
+/// does, but never processes an event or synthesized timer tick whose
+/// instant is strictly later than `until` (when `Some`) — the instant
+/// itself is still processed. `until: None` behaves identically to the
+/// unbounded form.
+///
+/// The third return value is `true` iff the loop stopped because
+/// [`MAX_TIMER_TICKS`] was exhausted before every due instant up to
+/// `until` was processed — a caller (HORO-1767's `quota explain`) must
+/// treat that as "the forecast could not be resolved", never silently
+/// report whatever partial state happened to result, since a resolved
+/// `pending_timer` in that case is an artifact of the budget running out,
+/// not a genuine answer.
+pub fn simulate_until<'a>(
+    events: &'a [PacingEvent],
+    policy: &Policy,
+    scenario: &Scenario<'_>,
+    until: Option<OffsetDateTime>,
+) -> (PacerState, Vec<(Tick<'a>, Vec<Proposal>)>, bool) {
     let mut order: Vec<&PacingEvent> = events.iter().collect();
     order.sort_by(|a, b| a.at().cmp(&b.at()).then(a.seq().cmp(&b.seq())));
 
@@ -50,6 +78,7 @@ pub fn simulate<'a>(
     let mut trace = Vec::with_capacity(order.len());
     let mut cursor = 0usize;
     let mut ticks = 0usize;
+    let mut tick_budget_exhausted = false;
 
     loop {
         let next_event = order.get(cursor).copied();
@@ -68,6 +97,16 @@ pub fn simulate<'a>(
             }
         };
 
+        let due_at = match due_now {
+            Due::Event(ev) => ev.at(),
+            Due::Timer(t) => t,
+        };
+        if let Some(until) = until {
+            if due_at > until {
+                break;
+            }
+        }
+
         match due_now {
             Due::Event(ev) => {
                 cursor += 1;
@@ -78,6 +117,7 @@ pub fn simulate<'a>(
             Due::Timer(at) => {
                 ticks += 1;
                 if ticks > MAX_TIMER_TICKS {
+                    tick_budget_exhausted = true;
                     break;
                 }
                 // A tick carries no event payload of its own — model it
@@ -99,7 +139,7 @@ pub fn simulate<'a>(
         }
     }
 
-    (state, trace)
+    (state, trace, tick_budget_exhausted)
 }
 
 enum Due<'a> {
@@ -702,5 +742,85 @@ mod tests {
             deadline: None,
             estimate: e,
         }
+    }
+
+    /// Domain-level regression for HORO-1767: `simulate_until(.., None)`
+    /// must be byte-identical to `simulate`'s own output — the refactor
+    /// that introduced `simulate_until` must be behavior-preserving, not
+    /// just "equivalent in the cases this PR happens to exercise".
+    #[test]
+    fn simulate_until_with_no_bound_matches_simulate() {
+        let tasks = TaskSet::validated(vec![task(1, 100, 60), task(2, 100, 60)]).unwrap();
+        let w = window(1000, 21_600);
+        let scenario = Scenario {
+            tasks: &tasks,
+            windows: std::slice::from_ref(&w),
+            contract: None,
+            preference: PacingPreference::Sustain {
+                horizon_secs: 21_600,
+                working_hours: None,
+                continuity_reserve_bp: 0,
+            },
+        };
+        let t0 = OffsetDateTime::UNIX_EPOCH;
+        let events = vec![
+            PacingEvent::ModeChanged { at: t0, seq: 0 },
+            PacingEvent::TaskCompleted {
+                at: t0 + time::Duration::seconds(60),
+                seq: 1,
+                task: SimTaskId(1),
+            },
+        ];
+        let (state_a, trace_a) = simulate(&events, &policy(), &scenario);
+        let (state_b, trace_b, exhausted) = simulate_until(&events, &policy(), &scenario, None);
+        assert!(!exhausted);
+        assert_eq!(format!("{state_a:?}"), format!("{state_b:?}"));
+        assert_eq!(format!("{trace_a:?}"), format!("{trace_b:?}"));
+    }
+
+    /// `simulate_until` must never process an event or a synthesized
+    /// timer tick whose instant is strictly later than `until` — task 2's
+    /// spacing-gated start (t0+2160s, per `sustain_spacing_is_enforced_
+    /// even_when_a_slot_frees_up_early` in `step.rs`) must not appear in
+    /// the trace when `until` is set to a cutoff before it.
+    #[test]
+    fn simulate_until_never_processes_past_the_cutoff() {
+        let tasks = TaskSet::validated(vec![task(1, 100, 60), task(2, 100, 60)]).unwrap();
+        let w = window(1000, 21_600);
+        let scenario = Scenario {
+            tasks: &tasks,
+            windows: std::slice::from_ref(&w),
+            contract: None,
+            preference: PacingPreference::Sustain {
+                horizon_secs: 21_600,
+                working_hours: None,
+                continuity_reserve_bp: 0,
+            },
+        };
+        let t0 = OffsetDateTime::UNIX_EPOCH;
+        let events = vec![
+            PacingEvent::ModeChanged { at: t0, seq: 0 },
+            PacingEvent::TaskCompleted {
+                at: t0 + time::Duration::seconds(60),
+                seq: 1,
+                task: SimTaskId(1),
+            },
+        ];
+        let cutoff = t0 + time::Duration::seconds(300);
+        let (state, trace, exhausted) = simulate_until(&events, &policy(), &scenario, Some(cutoff));
+        assert!(!exhausted);
+        for (tick, _) in &trace {
+            let at = match tick {
+                Tick::Event(e) => e.at(),
+                Tick::Timer(t) => *t,
+            };
+            assert!(at <= cutoff, "tick at {at:?} exceeds cutoff {cutoff:?}");
+        }
+        assert!(
+            state.pending_timer().map(|t| t > cutoff).unwrap_or(false)
+                || state.pending_timer().is_none(),
+            "task 2's spacing-gated start must still be pending past the cutoff, \
+             never silently resolved"
+        );
     }
 }

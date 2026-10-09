@@ -37,6 +37,7 @@ pub mod forecast;
 pub mod ready;
 pub mod simulate;
 pub mod step;
+pub mod view;
 
 use std::collections::{BTreeSet, HashMap};
 

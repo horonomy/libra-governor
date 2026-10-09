@@ -117,6 +117,41 @@ impl PacerState {
     fn backoff_for(&self, principal: &str) -> u64 {
         *self.backoff_x100.get(principal).unwrap_or(&100)
     }
+
+    /// `pub(super)`: every currently active task's own hold, keyed by
+    /// task id — reused by `pacing::view::task_actuals` (HORO-1767) so
+    /// that module never needs `ActiveTask` itself exposed outside this
+    /// file.
+    pub(super) fn active_holds(&self) -> impl Iterator<Item = (SimTaskId, &QuotaAmount)> {
+        self.active.iter().map(|(id, a)| (*id, &a.hold))
+    }
+
+    /// `pub(super)`: the largest reported `Spend` for a still-active task,
+    /// in its hold's own unit — see [`ActiveTask`]'s own docs on why this
+    /// is never summed. Reused by `pacing::view::task_actuals`.
+    pub(super) fn spend_so_far_for(&self, task: SimTaskId) -> Option<u64> {
+        self.spend_so_far.get(&task).copied()
+    }
+
+    /// `pub(super)`: this task's settled usage record, if it has
+    /// completed — looked up by the same deterministic id `step` itself
+    /// derives at settlement (see [`pending_hold_settlement_uuid`]), not
+    /// by scanning for a task-id field the record doesn't carry. Reused
+    /// by `pacing::view::task_actuals`.
+    pub(super) fn settled_usage_for(&self, task: SimTaskId) -> Option<&QuotaAmount> {
+        let id = EconomicEventId(pending_hold_settlement_uuid(task));
+        self.usage_log
+            .iter()
+            .find(|u| u.id() == id)
+            .map(|u| u.amount())
+    }
+
+    /// `pub(super)`: the full settled-usage log — reused by
+    /// `pacing::view::evaluate_at` (HORO-1767) to build
+    /// `QuotaEvidence::usage`. Never exposed outside `pacing`.
+    pub(super) fn usage_log(&self) -> &[QuotaUsage] {
+        &self.usage_log
+    }
 }
 
 /// Derives a [`ReservationId`] unique per `(window, task)` pair — a
@@ -148,8 +183,9 @@ fn pending_hold_id(
 /// already tracked and already read at `TaskCompleted`, but this function
 /// used to ignore it entirely, leaving every other candidate's admission
 /// check blind to a task that was already known, in-scenario, to be
-/// overrunning its hold).
-fn pending_for_window(window: &QuotaWindow, state: &PacerState) -> Vec<PendingHold> {
+/// overrunning its hold). `pub(super)`: also reused by
+/// `pacing::view::evaluate_at` (HORO-1767) — never outside `pacing`.
+pub(super) fn pending_for_window(window: &QuotaWindow, state: &PacerState) -> Vec<PendingHold> {
     state
         .active
         .iter()
