@@ -27,11 +27,16 @@
 //! `pub(crate)` [`crate::quota_window::OutstandingHold::projected`] seam)
 //! and reads the same `blocking`/`relief` answer back, rather than
 //! re-implementing sliding/fixed/bucket arithmetic a second time.
-//! Likewise, a task's remaining need is read from the *frozen*
+//! Likewise, a task's remaining need is read from a
 //! [`crate::progressive::RemainingWorkEstimate`] a caller already
 //! computed — the same way `crate::replay` consumes it — never from
 //! `libra_governor_estimator::remaining_bucketed` directly, which would
-//! pull a future-data-leaking estimator dependency into this crate.
+//! pull a future-data-leaking estimator dependency into this crate. That
+//! estimate is frozen on [`SimTask::estimate`] itself (never mutated in
+//! place), but is no longer the only source `step::try_admit` reads: an
+//! `EstimateRevised` event (HORO-1792, AC3) can supersede it for a still-
+//! unstarted candidate — see [`step::PacerState`]'s `revised_estimates`
+//! field.
 
 pub mod forecast;
 pub mod ready;
@@ -121,9 +126,13 @@ pub struct SimTask {
     /// never a `Policy::time.deadline` substitute and never consulted by
     /// [`forecast::earliest_safe_admit`] itself.
     pub deadline: Option<OffsetDateTime>,
-    /// The frozen remaining-work estimate this task's need is derived
-    /// from. Never recomputed or re-conditioned inside this module — see
-    /// module docs.
+    /// This task's remaining-work estimate as of `Scenario` construction.
+    /// Never mutated in place and never recomputed or re-conditioned
+    /// inside this module — but no longer the final word on this task's
+    /// need while it is still unstarted: an `EstimateRevised` event
+    /// (HORO-1792, AC3) can supersede it for admission purposes via
+    /// `step::PacerState`'s `revised_estimates`, without ever touching
+    /// this field itself. See module docs.
     pub estimate: RemainingWorkEstimate,
 }
 

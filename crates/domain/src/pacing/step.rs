@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use time::OffsetDateTime;
 
+use crate::progressive::RemainingWorkEstimate;
 use crate::quota_window::{next_working_instant, QuotaAmount, QuotaUsage, QuotaWindow};
 use crate::reservation::ReservationId;
 use crate::resource_amount::ResourceAmount;
@@ -99,6 +100,15 @@ pub struct PacerState {
     /// usage is the larger of its reservation and its reported actual
     /// spend, never silently the reservation alone.
     spend_so_far: BTreeMap<SimTaskId, u64>,
+    /// The latest `EstimateRevised` estimate for a task that is neither
+    /// active nor completed, keyed by task id (HORO-1792, AC3). Only
+    /// ever consulted by `try_admit` when resolving a *new* admission
+    /// candidate's need — an active task's hold, settlement floor, and
+    /// settled usage are never touched by a revision (see `step`'s own
+    /// `EstimateRevised` match arm). Events process in `(at, seq)` order
+    /// already (see `simulate::simulate_until`), so the latest revision
+    /// for a task simply overwrites the previous one here.
+    revised_estimates: BTreeMap<SimTaskId, RemainingWorkEstimate>,
 }
 
 impl PacerState {
@@ -289,6 +299,17 @@ fn try_admit(
         let Some(task) = candidate else {
             break;
         };
+        // AC3 (HORO-1792): resolve the live estimate once per candidate
+        // — a still-pending `EstimateRevised` revision for this task if
+        // one exists, the task's own frozen estimate otherwise — and use
+        // *this* everywhere below that used to read `task.estimate`
+        // directly. A revision only ever affects a new admission
+        // candidate like this one; an active task's hold/settlement are
+        // untouched (see `step`'s own `EstimateRevised` match arm).
+        let est = working
+            .revised_estimates
+            .get(&task.id)
+            .unwrap_or(&task.estimate);
 
         // SUSTAIN: a backing-off principal's fanout is capped at 1 even
         // when the scenario's own concurrency allows more (AC5) — for
@@ -325,7 +346,7 @@ fn try_admit(
         }
         if let Some(last) = working.last_start {
             if let PacingPreference::Sustain { .. } = &scenario.preference {
-                if let Some(spacing) = sustain_spacing(scenario, approximate_need(&task.estimate)) {
+                if let Some(spacing) = sustain_spacing(scenario, approximate_need(est)) {
                     let next_allowed = last.saturating_add(time::Duration::seconds(
                         i64::try_from(spacing).unwrap_or(i64::MAX),
                     ));
@@ -383,7 +404,7 @@ fn try_admit(
 
         let admit = earliest_safe_admit(
             &window_inputs,
-            &task.estimate,
+            est,
             policy,
             scenario.contract,
             None,
@@ -429,13 +450,13 @@ fn try_admit(
 
         match resolved_at {
             Some(instant) if instant <= now => {
-                let hold = recorded_hold(&task.estimate, scenario, policy, backoff);
+                let hold = recorded_hold(est, scenario, policy, backoff);
                 // Backoff ratio forced to 100 (no inflation): a
                 // throttled task that never reports a `Spend` must
                 // settle at its own real need, never at a backoff-
                 // inflated figure that was never actually spent — see
                 // `ActiveTask::settlement_floor`'s docs.
-                let settlement_floor = recorded_hold(&task.estimate, scenario, policy, 100).value;
+                let settlement_floor = recorded_hold(est, scenario, policy, 100).value;
                 start_task(
                     &mut working,
                     task.id,
@@ -655,13 +676,28 @@ pub fn step(
                 // *new* starts (via `try_admit`) see the inflated ratio.
             }
         }
-        PacingEvent::EstimateRevised { .. }
-        | PacingEvent::ModeChanged { .. }
-        | PacingEvent::SnapshotIngested { .. } => {
+        PacingEvent::EstimateRevised { task, estimate, .. } => {
+            // AC3 (HORO-1792): a revision applies only to a task that
+            // still has a new-admission decision ahead of it — neither
+            // currently active (its hold/settlement floor are already
+            // fixed; see `ActiveTask`'s own docs) nor already completed
+            // (nothing left to revise). An unknown task id, or one in
+            // either of those states, is a no-op; this is intentionally
+            // silent rather than an error, matching how every other
+            // event here tolerates being replayed against a state that
+            // has already moved past it.
+            if scenario.tasks.get(*task).is_some()
+                && !next.active.contains_key(task)
+                && !next.completed.contains(task)
+            {
+                next.revised_estimates.insert(*task, (**estimate).clone());
+            }
+        }
+        PacingEvent::ModeChanged { .. } | PacingEvent::SnapshotIngested { .. } => {
             // Recorded for replay completeness; this MVP scenario has no
-            // external evidence store for an estimate/snapshot update to
-            // flow into (see module docs) — a live consumer wiring real
-            // evidence is exactly HORO-1727's follow-up scope.
+            // external evidence store for a snapshot update to flow into
+            // (see module docs) — a live consumer wiring real evidence
+            // is exactly HORO-1727's follow-up scope.
         }
     }
 

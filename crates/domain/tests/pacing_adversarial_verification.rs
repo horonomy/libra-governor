@@ -716,16 +716,15 @@ fn sustain_next_start_waits_for_overrun_settled_spend_to_age_out() {
 }
 
 // ---------------------------------------------------------------------
-// 3. `EstimateRevised` is recorded but never applied
+// 3. `EstimateRevised` now applies to the live, not-yet-admitted
+//    estimate (HORO-1792, AC3 — fixes the gap this test used to confirm)
 // ---------------------------------------------------------------------
 
 /// A task is revised to a p90 far above the window's own limit before it
-/// is ever admitted. If `EstimateRevised` actually fed back into the
-/// ready task's own estimate, the next admission attempt would refuse
-/// with `NeedExceedsWindowLimit`. Because the event only updates replay
-/// bookkeeping (see `step`'s own `match` arm, a no-op for this variant),
-/// the task instead starts at its original (now stale and wrong) 100-
-/// token need.
+/// is ever admitted. The revision now feeds back into the candidate's
+/// own need, so the next admission attempt correctly refuses with
+/// `NeedExceedsWindowLimit` instead of starting at a stale, now-wrong
+/// 100-token need.
 #[test]
 fn estimate_revised_event_is_a_no_op() {
     let w = sliding_window(3, 1000, 21_600);
@@ -756,6 +755,56 @@ fn estimate_revised_event_is_a_no_op() {
     ];
     let (_, trace) = simulate(&events, &policy(), &scenario);
 
+    let proposals: Vec<&Proposal> = trace.iter().flat_map(|(_, p)| p.iter()).collect();
+    assert!(
+        !proposals
+            .iter()
+            .any(|p| matches!(p, Proposal::Start { .. })),
+        "the revised (5000-token, over-limit) estimate must now refuse admission, never start"
+    );
+    assert!(
+        proposals.iter().any(|p| matches!(
+            p,
+            Proposal::Hold {
+                next: NextAdmit::Unavailable(UnavailableReason::NeedExceedsWindowLimit(_))
+            }
+        )),
+        "the refusal must be NeedExceedsWindowLimit, driven by the revised 5000-token need"
+    );
+}
+
+/// A revision that *lowers or raises* a still-feasible need is recorded
+/// on the recorded hold itself, not just used to decide admit/refuse —
+/// proving `recorded_hold` (not just `earliest_safe_admit`) reads the
+/// revision. 100 -> 300 tokens, still comfortably under the window's
+/// 1000-token limit.
+#[test]
+fn estimate_revision_is_reflected_in_the_recorded_hold() {
+    let w = sliding_window(11, 1000, 21_600);
+    let t0 = OffsetDateTime::UNIX_EPOCH;
+    let tasks = TaskSet::validated(vec![task(1, "p", vec![], 100, 60)]).unwrap();
+    let scenario = Scenario {
+        tasks: &tasks,
+        windows: std::slice::from_ref(&w),
+        contract: None,
+        preference: PacingPreference::Burst {
+            target_end: t0 + time::Duration::hours(1),
+            max_fanout: 1,
+        },
+    };
+
+    let revised = estimate_tokens(300, 60);
+    let events = vec![
+        PacingEvent::EstimateRevised {
+            at: t0,
+            seq: 0,
+            task: SimTaskId(1),
+            estimate: Box::new(revised),
+        },
+        PacingEvent::ModeChanged { at: t0, seq: 1 },
+    ];
+    let (_, trace) = simulate(&events, &policy(), &scenario);
+
     let start = trace
         .iter()
         .flat_map(|(_, proposals)| proposals.iter())
@@ -763,11 +812,79 @@ fn estimate_revised_event_is_a_no_op() {
             Proposal::Start { hold, .. } => Some(hold.clone()),
             _ => None,
         })
-        .expect("task 1 must still start — EstimateRevised never refuses or re-checks it");
+        .expect("task 1 must still start — 300 tokens is well under the 1000-token limit");
     assert_eq!(
-        start.value, 100,
-        "the revised (5000-token, over-limit) estimate never reaches the admission check — \
-         the task starts at its original, now-stale 100-token need"
+        start.value, 300,
+        "the recorded hold must reflect the revised 300-token need, not the original 100"
+    );
+}
+
+/// A revision that arrives while its task is already active (in flight)
+/// is ignored for settlement purposes — the task settles at its
+/// ORIGINAL need, never the revision. A revision only ever affects a
+/// *new* admission candidate (AC3's own scope boundary).
+///
+/// Verified indirectly through admission, not through any `pub(crate)`
+/// internal accessor (this file's own discipline — see module docs):
+/// window limit 1000; task 1 needs 100 and settles at t0+60. Task 2
+/// (depends on task 1) needs 800 — comfortably fits (100 + 800 = 900 <
+/// 1000) only if task 1's settled usage is really 100. If the in-flight
+/// revision to 9000 had leaked into settlement instead, task 2 would be
+/// refused with `NeedExceedsWindowLimit` or blocked waiting on relief
+/// that never comes within this scenario's events.
+#[test]
+fn estimate_revision_of_an_active_task_is_ignored_at_settlement() {
+    let w = sliding_window(12, 1000, 21_600);
+    let t0 = OffsetDateTime::UNIX_EPOCH;
+    let tasks = TaskSet::validated(vec![
+        task(1, "p", vec![], 100, 60),
+        task(2, "p", vec![1], 800, 60),
+    ])
+    .unwrap();
+    let scenario = Scenario {
+        tasks: &tasks,
+        windows: std::slice::from_ref(&w),
+        contract: None,
+        preference: PacingPreference::Burst {
+            target_end: t0 + time::Duration::hours(2),
+            max_fanout: 1,
+        },
+    };
+
+    let events = vec![
+        PacingEvent::ModeChanged { at: t0, seq: 0 },
+        // Task 1 is now active (started at t0 with a 100-token hold).
+        // This revision must be ignored for settlement.
+        PacingEvent::EstimateRevised {
+            at: t0 + time::Duration::seconds(10),
+            seq: 1,
+            task: SimTaskId(1),
+            estimate: Box::new(estimate_tokens(9000, 60)),
+        },
+        PacingEvent::TaskCompleted {
+            at: t0 + time::Duration::seconds(60),
+            seq: 2,
+            task: SimTaskId(1),
+        },
+    ];
+    let (_, trace) = simulate(&events, &policy(), &scenario);
+
+    let task2_start = trace
+        .iter()
+        .flat_map(|(_, proposals)| proposals.iter())
+        .find_map(|p| match p {
+            Proposal::Start {
+                task: SimTaskId(2),
+                at,
+                ..
+            } => Some(*at),
+            _ => None,
+        });
+    assert_eq!(
+        task2_start,
+        Some(t0 + time::Duration::seconds(60)),
+        "task 2 must start the instant task 1 completes — proving task 1 settled at its \
+         ORIGINAL 100-token need, not the 9000-token revision it received while active"
     );
 }
 
