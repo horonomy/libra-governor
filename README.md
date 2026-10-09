@@ -11,6 +11,8 @@ makes replanning a deliberate, auditable decision rather than an implicit
 one. See [`PRODUCT.md`](PRODUCT.md) for the full product North Star and
 [`ARCHITECTURE.md`](ARCHITECTURE.md) for how the pieces fit together.
 
+**Product page and hosted docs:** [libra.horonom.com](https://libra.horonom.com) ([docs](https://libra.horonom.com/docs/)) — Developer Preview.
+
 This is the **v0.0.3 release**: everything from v0.0.2 (the v0.0.1 MVP 3
 local flow, Codex support, local extension points — see below) plus the
 Agent Execution Economics work (HORO-1666–1673, HORO-1689): hierarchical
