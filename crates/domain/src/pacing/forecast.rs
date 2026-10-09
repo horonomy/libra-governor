@@ -154,8 +154,14 @@ pub fn earliest_safe_admit(
                         // `relief_is_strictly_future` test below) — this
                         // branch exists only so a future regression in
                         // that invariant fails a probe loop honestly
-                        // instead of spinning forever.
-                        return super::NextAdmit::Unavailable(UnavailableReason::BeyondHorizon);
+                        // instead of spinning forever. `NonAdvancingRelief`
+                        // (HORO-1792): this used to be `BeyondHorizon`,
+                        // which was repurposed for the real SUSTAIN horizon
+                        // refusal in `step::try_admit` — see that variant's
+                        // docs.
+                        return super::NextAdmit::Unavailable(
+                            UnavailableReason::NonAdvancingRelief(input.window.id()),
+                        );
                     }
                     match latest_relief {
                         Some((at, _)) if at >= relief_at => {}

@@ -1,5 +1,5 @@
 //! Independent adversarial verification of `libra_governor_domain::pacing`
-//! (HORO-1765 / HORO-1781).
+//! (HORO-1765 / HORO-1781 / HORO-1792).
 //!
 //! Written by an independent verifier, not the implementer. Every fixture
 //! here is rebuilt from scratch against the crate's *public* API only
@@ -40,19 +40,29 @@
 //!   below now proves the fix: task B never starts while A remains
 //!   active, and only starts at `A_completion + window_length` once a
 //!   real completion is actually supplied.
-//! - **CONFIRMED, independently reproduced (already disclosed by the
-//!   implementer):** `PacingPreference::{Sustain::horizon_secs,
-//!   Burst::target_end}` and `Policy::time.deadline` are never read by
+//! - **FOUND (confirmed independently, already disclosed by the
+//!   implementer at HORO-1765 time), then FIXED in HORO-1792:**
+//!   `PacingPreference::{Sustain::horizon_secs, Burst::target_end}` and
+//!   `Policy::time.deadline` used to never be read by
 //!   `forecast`/`step`/`simulate` — a scenario running arbitrarily far
-//!   past a declared deadline is scheduled exactly as if no deadline
-//!   existed. See `deadline_and_horizon_fields_are_never_consulted`.
-//!   **Deliberately deferred to a separate ticket, not addressed by this
-//!   fast-follow** — see "Known limitations" in the PR description.
+//!   past a declared deadline was scheduled exactly as if no deadline
+//!   existed. `step::try_admit` now calls a new `cutoff_refusal` helper
+//!   before and after the forecast, refusing with `PastDeadline`/
+//!   `PastTargetEnd`/`BeyondHorizon` once the resolved admit instant is
+//!   strictly past the relevant cutoff. See
+//!   `policy_deadline_alone_refuses_past_the_cutoff`,
+//!   `target_end_alone_refuses_past_the_cutoff`,
+//!   `sustain_with_a_policy_deadline_reports_past_deadline`,
+//!   `exactly_at_cutoff_is_allowed_to_start`,
+//!   `sustain_horizon_never_refuses_a_task_admittable_now`, and the
+//!   `sustain_horizon_refuses_past_the_horizon`/
+//!   `sustain_horizon_admits_exactly_at_the_horizon` pair below.
 //! - **CONFIRMED:** `EstimateRevised` is recorded but never applied — a
 //!   revised-upward estimate that would make a task structurally
 //!   infeasible is silently ignored and the task still starts at its
 //!   stale (now-wrong) hold. See `estimate_revised_event_is_a_no_op`.
-//!   **Deliberately deferred to a separate ticket.**
+//!   **Deliberately deferred to a separate ticket (HORO-1792 fixes this
+//!   too — see that test's updated assertions).**
 //! - **CONFIRMED:** `Proposal` has no variant that could mean cancel —
 //!   verified by an exhaustive match with no wildcard arm, which would
 //!   fail to compile if a third variant were ever added.
@@ -66,7 +76,8 @@
 
 use libra_governor_domain::pacing::step::{step, PacerState, Scenario};
 use libra_governor_domain::pacing::{
-    simulate::simulate, PacingEvent, PacingPreference, Proposal, SimTask, SimTaskId, TaskSet,
+    simulate::simulate, NextAdmit, PacingEvent, PacingPreference, Proposal, SimTask, SimTaskId,
+    TaskSet, UnavailableReason,
 };
 use libra_governor_domain::{
     AlignedPeriod, AutonomyBoundary, BucketTier, CompletionContract, CompletionCriterion,
@@ -219,8 +230,7 @@ fn policy() -> libra_governor_domain::Policy {
 }
 
 /// A policy with an explicit deadline well in the future of `t0`, used by
-/// `deadline_and_horizon_fields_are_never_consulted` to prove the
-/// deadline is never actually enforced once a scenario runs past it.
+/// the deadline/target_end/horizon enforcement tests below (HORO-1792).
 fn policy_with_deadline(deadline: OffsetDateTime) -> libra_governor_domain::Policy {
     libra_governor_domain::Policy::validated_at(
         "verifier-deadline",
@@ -310,7 +320,7 @@ fn window_overrun_via_blind_in_flight_overspend() {
         },
     ];
 
-    let (final_state, trace) = simulate(&events, &policy(), &scenario);
+    let (final_state, trace, _) = simulate(&events, &policy(), &scenario);
 
     let started_b_count = trace
         .iter()
@@ -437,7 +447,7 @@ fn window_overrun_via_duration_estimate_wrong_and_task_still_active() {
     // No `TaskCompleted` for A is ever supplied — the fix must never let
     // B start on an estimate-based schedule while A remains genuinely
     // active.
-    let (final_state, trace) = simulate(&events, &policy(), &scenario);
+    let (final_state, trace, _) = simulate(&events, &policy(), &scenario);
 
     assert_eq!(
         final_state.active_count(),
@@ -535,7 +545,7 @@ fn window_overrun_fix_b_starts_exactly_when_a_real_completion_settles_and_ages_o
             task: SimTaskId(1),
         },
     ];
-    let (final_state, trace) = simulate(&events, &policy(), &scenario);
+    let (final_state, trace, _) = simulate(&events, &policy(), &scenario);
 
     let b_starts: Vec<OffsetDateTime> = trace
         .iter()
@@ -616,7 +626,7 @@ fn sustain_overspend_blocks_second_start_while_task_remains_active() {
             amount: QuotaAmount::new(QuotaUnit::Tokens, 600),
         },
     ];
-    let (final_state, trace) = simulate(&events, &policy(), &scenario);
+    let (final_state, trace, _) = simulate(&events, &policy(), &scenario);
 
     let proposal_count: usize = trace.iter().map(|(_, proposals)| proposals.len()).sum();
     let start_count = trace
@@ -678,7 +688,7 @@ fn sustain_next_start_waits_for_overrun_settled_spend_to_age_out() {
             task: SimTaskId(1),
         },
     ];
-    let (final_state, trace) = simulate(&events, &policy(), &scenario);
+    let (final_state, trace, _) = simulate(&events, &policy(), &scenario);
 
     let task2_start = trace
         .iter()
@@ -706,16 +716,15 @@ fn sustain_next_start_waits_for_overrun_settled_spend_to_age_out() {
 }
 
 // ---------------------------------------------------------------------
-// 3. `EstimateRevised` is recorded but never applied
+// 3. `EstimateRevised` now applies to the live, not-yet-admitted
+//    estimate (HORO-1792, AC3 — fixes the gap this test used to confirm)
 // ---------------------------------------------------------------------
 
 /// A task is revised to a p90 far above the window's own limit before it
-/// is ever admitted. If `EstimateRevised` actually fed back into the
-/// ready task's own estimate, the next admission attempt would refuse
-/// with `NeedExceedsWindowLimit`. Because the event only updates replay
-/// bookkeeping (see `step`'s own `match` arm, a no-op for this variant),
-/// the task instead starts at its original (now stale and wrong) 100-
-/// token need.
+/// is ever admitted. The revision now feeds back into the candidate's
+/// own need, so the next admission attempt correctly refuses with
+/// `NeedExceedsWindowLimit` instead of starting at a stale, now-wrong
+/// 100-token need.
 #[test]
 fn estimate_revised_event_is_a_no_op() {
     let w = sliding_window(3, 1000, 21_600);
@@ -744,7 +753,57 @@ fn estimate_revised_event_is_a_no_op() {
         },
         PacingEvent::ModeChanged { at: t0, seq: 1 },
     ];
-    let (_, trace) = simulate(&events, &policy(), &scenario);
+    let (_, trace, _) = simulate(&events, &policy(), &scenario);
+
+    let proposals: Vec<&Proposal> = trace.iter().flat_map(|(_, p)| p.iter()).collect();
+    assert!(
+        !proposals
+            .iter()
+            .any(|p| matches!(p, Proposal::Start { .. })),
+        "the revised (5000-token, over-limit) estimate must now refuse admission, never start"
+    );
+    assert!(
+        proposals.iter().any(|p| matches!(
+            p,
+            Proposal::Hold {
+                next: NextAdmit::Unavailable(UnavailableReason::NeedExceedsWindowLimit(_))
+            }
+        )),
+        "the refusal must be NeedExceedsWindowLimit, driven by the revised 5000-token need"
+    );
+}
+
+/// A revision that *lowers or raises* a still-feasible need is recorded
+/// on the recorded hold itself, not just used to decide admit/refuse —
+/// proving `recorded_hold` (not just `earliest_safe_admit`) reads the
+/// revision. 100 -> 300 tokens, still comfortably under the window's
+/// 1000-token limit.
+#[test]
+fn estimate_revision_is_reflected_in_the_recorded_hold() {
+    let w = sliding_window(11, 1000, 21_600);
+    let t0 = OffsetDateTime::UNIX_EPOCH;
+    let tasks = TaskSet::validated(vec![task(1, "p", vec![], 100, 60)]).unwrap();
+    let scenario = Scenario {
+        tasks: &tasks,
+        windows: std::slice::from_ref(&w),
+        contract: None,
+        preference: PacingPreference::Burst {
+            target_end: t0 + time::Duration::hours(1),
+            max_fanout: 1,
+        },
+    };
+
+    let revised = estimate_tokens(300, 60);
+    let events = vec![
+        PacingEvent::EstimateRevised {
+            at: t0,
+            seq: 0,
+            task: SimTaskId(1),
+            estimate: Box::new(revised),
+        },
+        PacingEvent::ModeChanged { at: t0, seq: 1 },
+    ];
+    let (_, trace, _) = simulate(&events, &policy(), &scenario);
 
     let start = trace
         .iter()
@@ -753,37 +812,105 @@ fn estimate_revised_event_is_a_no_op() {
             Proposal::Start { hold, .. } => Some(hold.clone()),
             _ => None,
         })
-        .expect("task 1 must still start — EstimateRevised never refuses or re-checks it");
+        .expect("task 1 must still start — 300 tokens is well under the 1000-token limit");
     assert_eq!(
-        start.value, 100,
-        "the revised (5000-token, over-limit) estimate never reaches the admission check — \
-         the task starts at its original, now-stale 100-token need"
+        start.value, 300,
+        "the recorded hold must reflect the revised 300-token need, not the original 100"
+    );
+}
+
+/// A revision that arrives while its task is already active (in flight)
+/// is ignored for settlement purposes — the task settles at its
+/// ORIGINAL need, never the revision. A revision only ever affects a
+/// *new* admission candidate (AC3's own scope boundary).
+///
+/// Verified indirectly through admission, not through any `pub(crate)`
+/// internal accessor (this file's own discipline — see module docs):
+/// window limit 1000; task 1 needs 100 and settles at t0+60. Task 2
+/// (depends on task 1) needs 800 — comfortably fits (100 + 800 = 900 <
+/// 1000) only if task 1's settled usage is really 100. If the in-flight
+/// revision to 9000 had leaked into settlement instead, task 2 would be
+/// refused with `NeedExceedsWindowLimit` or blocked waiting on relief
+/// that never comes within this scenario's events.
+#[test]
+fn estimate_revision_of_an_active_task_is_ignored_at_settlement() {
+    let w = sliding_window(12, 1000, 21_600);
+    let t0 = OffsetDateTime::UNIX_EPOCH;
+    let tasks = TaskSet::validated(vec![
+        task(1, "p", vec![], 100, 60),
+        task(2, "p", vec![1], 800, 60),
+    ])
+    .unwrap();
+    let scenario = Scenario {
+        tasks: &tasks,
+        windows: std::slice::from_ref(&w),
+        contract: None,
+        preference: PacingPreference::Burst {
+            target_end: t0 + time::Duration::hours(2),
+            max_fanout: 1,
+        },
+    };
+
+    let events = vec![
+        PacingEvent::ModeChanged { at: t0, seq: 0 },
+        // Task 1 is now active (started at t0 with a 100-token hold).
+        // This revision must be ignored for settlement.
+        PacingEvent::EstimateRevised {
+            at: t0 + time::Duration::seconds(10),
+            seq: 1,
+            task: SimTaskId(1),
+            estimate: Box::new(estimate_tokens(9000, 60)),
+        },
+        PacingEvent::TaskCompleted {
+            at: t0 + time::Duration::seconds(60),
+            seq: 2,
+            task: SimTaskId(1),
+        },
+    ];
+    let (_, trace, _) = simulate(&events, &policy(), &scenario);
+
+    let task2_start = trace
+        .iter()
+        .flat_map(|(_, proposals)| proposals.iter())
+        .find_map(|p| match p {
+            Proposal::Start {
+                task: SimTaskId(2),
+                at,
+                ..
+            } => Some(*at),
+            _ => None,
+        });
+    assert_eq!(
+        task2_start,
+        Some(t0 + time::Duration::seconds(60)),
+        "task 2 must start the instant task 1 completes — proving task 1 settled at its \
+         ORIGINAL 100-token need, not the 9000-token revision it received while active"
     );
 }
 
 // ---------------------------------------------------------------------
-// 4. Deadline/target_end/horizon_secs fields are structurally inert
-//    (independently reproduced; already disclosed by the implementer as
-//    a known gap)
+// 4. Deadline/target_end/horizon_secs enforcement (HORO-1792 fast-follow
+//    closing the gap this file previously only confirmed-and-deferred)
 // ---------------------------------------------------------------------
 
+/// A candidate whose resolved admit instant is strictly past
+/// `Policy::time.deadline` is refused with `PastDeadline`, never
+/// started — `target_end` is set far enough away that it cannot be the
+/// cause, isolating the policy deadline as the one active cutoff.
 #[test]
-fn deadline_target_end_and_sustain_horizon_are_never_consulted() {
+fn policy_deadline_alone_refuses_past_the_cutoff() {
     let w = sliding_window(4, 1_000_000, 60); // generous, never actually blocks
     let t0 = OffsetDateTime::UNIX_EPOCH;
-    // Deadline is 1 hour after t0; the task is scheduled far beyond it.
     let deadline = t0 + time::Duration::hours(1);
     let p = policy_with_deadline(deadline);
 
     let tasks = TaskSet::validated(vec![task(1, "p", vec![], 10, 60)]).unwrap();
-    let scenario_burst = Scenario {
+    let scenario = Scenario {
         tasks: &tasks,
         windows: std::slice::from_ref(&w),
         contract: None,
-        // BURST's own deadline-shaped field, `target_end`, set to the
-        // same past-relative instant — also never consulted.
         preference: PacingPreference::Burst {
-            target_end: deadline,
+            target_end: deadline + time::Duration::hours(100),
             max_fanout: 1,
         },
     };
@@ -792,48 +919,316 @@ fn deadline_target_end_and_sustain_horizon_are_never_consulted() {
         at: far_past_deadline,
         seq: 0,
     }];
-    let (_, trace) = simulate(&events, &p, &scenario_burst);
+    let (_, trace, _) = simulate(&events, &p, &scenario);
+
+    let proposals: Vec<&Proposal> = trace.iter().flat_map(|(_, p)| p.iter()).collect();
+    assert!(
+        !proposals
+            .iter()
+            .any(|p| matches!(p, Proposal::Start { .. })),
+        "a candidate 9h past Policy::time.deadline must never start"
+    );
+    assert!(
+        proposals.iter().any(|p| matches!(
+            p,
+            Proposal::Hold {
+                next: NextAdmit::Unavailable(UnavailableReason::PastDeadline)
+            }
+        )),
+        "the refusal must name PastDeadline, not some other reason"
+    );
+}
+
+/// `Burst::target_end` alone (no policy deadline set) refuses with
+/// `PastTargetEnd`.
+#[test]
+fn target_end_alone_refuses_past_the_cutoff() {
+    let w = sliding_window(5, 1_000_000, 60);
+    let t0 = OffsetDateTime::UNIX_EPOCH;
+    let target_end = t0 + time::Duration::hours(1);
+
+    let tasks = TaskSet::validated(vec![task(1, "p", vec![], 10, 60)]).unwrap();
+    let scenario = Scenario {
+        tasks: &tasks,
+        windows: std::slice::from_ref(&w),
+        contract: None,
+        preference: PacingPreference::Burst {
+            target_end,
+            max_fanout: 1,
+        },
+    };
+    let far_past_target_end = target_end + time::Duration::hours(10);
+    let events = vec![PacingEvent::ModeChanged {
+        at: far_past_target_end,
+        seq: 0,
+    }];
+    let (_, trace, _) = simulate(&events, &policy(), &scenario);
+
+    let proposals: Vec<&Proposal> = trace.iter().flat_map(|(_, p)| p.iter()).collect();
+    assert!(
+        !proposals
+            .iter()
+            .any(|p| matches!(p, Proposal::Start { .. })),
+        "a candidate 9h past Burst::target_end must never start"
+    );
+    assert!(
+        proposals.iter().any(|p| matches!(
+            p,
+            Proposal::Hold {
+                next: NextAdmit::Unavailable(UnavailableReason::PastTargetEnd)
+            }
+        )),
+        "the refusal must name PastTargetEnd, not some other reason"
+    );
+}
+
+/// A policy deadline applies under SUSTAIN too (AC1: "applies in both
+/// SUSTAIN and BURST"), and takes priority over `BeyondHorizon` when
+/// both cutoffs are exceeded.
+#[test]
+fn sustain_with_a_policy_deadline_reports_past_deadline() {
+    let w = sliding_window(6, 1_000_000, 60);
+    let t0 = OffsetDateTime::UNIX_EPOCH;
+    let deadline = t0 + time::Duration::hours(1);
+    let p = policy_with_deadline(deadline);
+
+    let tasks = TaskSet::validated(vec![task(1, "p", vec![], 10, 60)]).unwrap();
+    let scenario = Scenario {
+        tasks: &tasks,
+        windows: std::slice::from_ref(&w),
+        contract: None,
+        preference: PacingPreference::Sustain {
+            horizon_secs: 60, // also exceeded — PastDeadline must still win
+            working_hours: None,
+            continuity_reserve_bp: 0,
+        },
+    };
+    let far_past_deadline = deadline + time::Duration::hours(10);
+    let events = vec![PacingEvent::ModeChanged {
+        at: far_past_deadline,
+        seq: 0,
+    }];
+    let (_, trace, _) = simulate(&events, &p, &scenario);
+
+    let proposals: Vec<&Proposal> = trace.iter().flat_map(|(_, p)| p.iter()).collect();
+    assert!(
+        !proposals
+            .iter()
+            .any(|p| matches!(p, Proposal::Start { .. })),
+        "a SUSTAIN candidate 9h past Policy::time.deadline must never start"
+    );
+    assert!(
+        proposals.iter().any(|p| matches!(
+            p,
+            Proposal::Hold {
+                next: NextAdmit::Unavailable(UnavailableReason::PastDeadline)
+            }
+        )),
+        "PastDeadline must take priority over BeyondHorizon when both cutoffs are exceeded"
+    );
+}
+
+/// Boundary: a candidate whose resolved admit instant lands exactly AT
+/// the policy deadline is allowed to start — only strictly-past refuses.
+#[test]
+fn exactly_at_cutoff_is_allowed_to_start() {
+    let w = sliding_window(7, 1_000_000, 60);
+    let t0 = OffsetDateTime::UNIX_EPOCH;
+    let deadline = t0 + time::Duration::hours(1);
+    let p = policy_with_deadline(deadline);
+
+    let tasks = TaskSet::validated(vec![task(1, "p", vec![], 10, 60)]).unwrap();
+    let scenario = Scenario {
+        tasks: &tasks,
+        windows: std::slice::from_ref(&w),
+        contract: None,
+        preference: PacingPreference::Burst {
+            target_end: deadline + time::Duration::hours(100),
+            max_fanout: 1,
+        },
+    };
+    // The event itself lands exactly on the deadline — BURST's
+    // `earliest_at` is just `now`, so the resolved admit instant is
+    // exactly `deadline`.
+    let events = vec![PacingEvent::ModeChanged {
+        at: deadline,
+        seq: 0,
+    }];
+    let (_, trace, _) = simulate(&events, &p, &scenario);
+
     let started = trace
         .iter()
         .flat_map(|(_, proposals)| proposals.iter())
         .any(|p| matches!(p, Proposal::Start { .. }));
     assert!(
         started,
-        "the task starts 9 hours past both Policy::time.deadline and Burst::target_end — \
-         neither field is ever consulted by forecast/step/simulate. This is the already- \
-         disclosed, confirmed-independently gap bearing on AC1/AC2's framing of \"no hard- \
-         window overrun\": there is no hard window at all tied to a deadline."
+        "a candidate landing exactly at the deadline must start — only strictly-past refuses"
     );
+}
 
-    // SUSTAIN's own horizon-shaped field, `horizon_secs`, exercised
-    // separately (a fresh scenario — SUSTAIN's spacing formula reads
-    // real time differently than BURST's fanout cap, so this is not a
-    // redundant re-run of the BURST case above).
-    let tasks2 = TaskSet::validated(vec![task(2, "p", vec![], 10, 60)]).unwrap();
-    let scenario_sustain = Scenario {
-        tasks: &tasks2,
+/// Positive control (SUSTAIN horizon): a task immediately admittable at
+/// the current decision instant is never refused by `BeyondHorizon`,
+/// however large the declared `horizon_secs` claim looks relative to
+/// scenario-start — the horizon is anchored to `now` (the current step's
+/// time), not to any fixed scenario-start instant.
+#[test]
+fn sustain_horizon_never_refuses_a_task_admittable_now() {
+    let w = sliding_window(8, 1_000_000, 60);
+    let t0 = OffsetDateTime::UNIX_EPOCH;
+
+    let tasks = TaskSet::validated(vec![task(1, "p", vec![], 10, 60)]).unwrap();
+    let scenario = Scenario {
+        tasks: &tasks,
         windows: std::slice::from_ref(&w),
         contract: None,
         preference: PacingPreference::Sustain {
-            horizon_secs: 3600, // claims a 1h horizon
+            horizon_secs: 3600, // 1h, measured from `now` below — not from t0
             working_hours: None,
             continuity_reserve_bp: 0,
         },
     };
-    let events2 = vec![PacingEvent::ModeChanged {
-        at: t0 + time::Duration::hours(50), // 49h past the declared 1h horizon
+    // The one real event lands 50h after t0 — far past any horizon
+    // anchored to scenario-start, but `now` for this decision IS that
+    // instant, so a task admittable immediately is never refused.
+    let events = vec![PacingEvent::ModeChanged {
+        at: t0 + time::Duration::hours(50),
         seq: 0,
     }];
-    let (_, trace2) = simulate(&events2, &policy(), &scenario_sustain);
-    let started2 = trace2
+    let (_, trace, _) = simulate(&events, &policy(), &scenario);
+    let started = trace
         .iter()
         .flat_map(|(_, proposals)| proposals.iter())
         .any(|p| matches!(p, Proposal::Start { .. }));
     assert!(
-        started2,
-        "SUSTAIN admits a task 49 hours past its own declared `horizon_secs` (1h) — that field \
-         is recorded on `PacingPreference::Sustain` but never read by `forecast`/`step`"
+        started,
+        "a task that can start now is never refused by the horizon"
     );
+}
+
+/// Negative control (SUSTAIN horizon): task 1 completes quickly, task 2's
+/// spacing-derived admit instant lands past a tight 1000s horizon (from
+/// task 1's completion instant, the current decision time at that
+/// point) — refused with `BeyondHorizon`, no `Start`, and no pending
+/// timer left behind for an instant this scenario already knows it can
+/// never honor.
+#[test]
+fn sustain_horizon_refuses_past_the_horizon() {
+    let w = sliding_window(9, 1000, 21_600); // 6h sliding, limit 1000
+    let t0 = OffsetDateTime::UNIX_EPOCH;
+
+    let tasks = TaskSet::validated(vec![
+        task(1, "p", vec![], 100, 60),
+        task(2, "p", vec![], 100, 60),
+    ])
+    .unwrap();
+    let scenario = Scenario {
+        tasks: &tasks,
+        windows: std::slice::from_ref(&w),
+        contract: None,
+        preference: PacingPreference::Sustain {
+            horizon_secs: 1000, // task 2's spacing (2160s) exceeds this
+            working_hours: None,
+            continuity_reserve_bp: 0,
+        },
+    };
+    let events = vec![
+        PacingEvent::ModeChanged { at: t0, seq: 0 },
+        PacingEvent::TaskCompleted {
+            at: t0 + time::Duration::seconds(60),
+            seq: 1,
+            task: SimTaskId(1),
+        },
+    ];
+    let (final_state, trace, _) = simulate(&events, &policy(), &scenario);
+
+    let task2_started = trace
+        .iter()
+        .flat_map(|(_, proposals)| proposals.iter())
+        .any(|p| {
+            matches!(
+                p,
+                Proposal::Start {
+                    task: SimTaskId(2),
+                    ..
+                }
+            )
+        });
+    assert!(
+        !task2_started,
+        "task 2 must never start past the 1000s horizon"
+    );
+    let task2_beyond_horizon = trace
+        .iter()
+        .flat_map(|(_, proposals)| proposals.iter())
+        .any(|p| {
+            matches!(
+                p,
+                Proposal::Hold {
+                    next: NextAdmit::Unavailable(UnavailableReason::BeyondHorizon)
+                }
+            )
+        });
+    assert!(
+        task2_beyond_horizon,
+        "task 2's refusal must name BeyondHorizon"
+    );
+    assert_eq!(
+        final_state.pending_timer(),
+        None,
+        "a task refused outright must never leave a pending timer behind"
+    );
+}
+
+/// Just-inside control, same shape as above but with a 2100s horizon —
+/// large enough that task 2's 2160s-after-task-1-start spacing instant
+/// lands past it... except the horizon is anchored to task 1's
+/// *completion* instant (t0+60, the `now` at task 2's decision), not to
+/// task 1's start — so the real cutoff is t0+60+2100 = t0+2160, exactly
+/// equal to task 2's spacing-derived admit instant. Exactly-at-cutoff is
+/// allowed, so task 2 starts.
+#[test]
+fn sustain_horizon_admits_exactly_at_the_horizon() {
+    let w = sliding_window(10, 1000, 21_600);
+    let t0 = OffsetDateTime::UNIX_EPOCH;
+
+    let tasks = TaskSet::validated(vec![
+        task(1, "p", vec![], 100, 60),
+        task(2, "p", vec![], 100, 60),
+    ])
+    .unwrap();
+    let scenario = Scenario {
+        tasks: &tasks,
+        windows: std::slice::from_ref(&w),
+        contract: None,
+        preference: PacingPreference::Sustain {
+            horizon_secs: 2100,
+            working_hours: None,
+            continuity_reserve_bp: 0,
+        },
+    };
+    let events = vec![
+        PacingEvent::ModeChanged { at: t0, seq: 0 },
+        PacingEvent::TaskCompleted {
+            at: t0 + time::Duration::seconds(60),
+            seq: 1,
+            task: SimTaskId(1),
+        },
+    ];
+    let (_, trace, _) = simulate(&events, &policy(), &scenario);
+
+    let task2_start_at = trace
+        .iter()
+        .flat_map(|(_, proposals)| proposals.iter())
+        .find_map(|p| match p {
+            Proposal::Start {
+                task: SimTaskId(2),
+                at,
+                ..
+            } => Some(*at),
+            _ => None,
+        })
+        .expect("task 2 must start exactly at the horizon boundary, not be refused");
+    assert_eq!(task2_start_at, t0 + time::Duration::seconds(2160));
 }
 
 // ---------------------------------------------------------------------
@@ -923,8 +1318,8 @@ fn sustain_and_burst_genuinely_diverge_under_fresh_parameters() {
         },
     };
 
-    let (burst_state, _) = simulate(&events, &policy(), &burst_scenario);
-    let (sustain_state, _) = simulate(&events, &policy(), &sustain_scenario);
+    let (burst_state, _, _) = simulate(&events, &policy(), &burst_scenario);
+    let (sustain_state, _, _) = simulate(&events, &policy(), &sustain_scenario);
 
     assert!(
         burst_state.active_count() > sustain_state.active_count(),
@@ -974,7 +1369,7 @@ fn three_independent_runs_are_byte_identical_via_serde_json() {
                 amount: QuotaAmount::new(QuotaUnit::Tokens, 90),
             },
         ];
-        let (state, trace) = simulate(&events, &policy(), &scenario);
+        let (state, trace, _) = simulate(&events, &policy(), &scenario);
         let flattened: Vec<(OffsetDateTime, Vec<Proposal>)> = trace
             .into_iter()
             .map(|(tick, proposals)| {
