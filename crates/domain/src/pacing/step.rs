@@ -964,7 +964,7 @@ mod tests {
                 task: SimTaskId(1),
             },
         ];
-        let (_, trace) = crate::pacing::simulate::simulate(&events, &policy(), &scenario);
+        let (_, trace, _) = crate::pacing::simulate::simulate(&events, &policy(), &scenario);
 
         let task2_start_at = trace
             .iter()

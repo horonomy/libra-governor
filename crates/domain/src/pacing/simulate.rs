@@ -39,17 +39,21 @@ pub enum Tick<'a> {
 /// final [`PacerState`] plus the full, ordered trace of `(Tick, Vec<Proposal>)`
 /// pairs — the replayable record AC4's determinism test compares byte-for-byte.
 ///
-/// Thin wrapper over [`simulate_until`] with no upper bound — see that
-/// function's docs for the general form (added for HORO-1767's `quota
-/// explain --as-of` replay, which must never process an event/timer past
-/// the caller's chosen instant).
+/// Thin wrapper over [`simulate_bounded`] with no `until` cutoff and the
+/// default [`MAX_TIMER_TICKS`] budget — see that function's docs for the
+/// general form. The third return value is the same truncation signal
+/// [`simulate_until`] already surfaces (HORO-1792, AC4): `true` iff the
+/// loop stopped because the timer-tick budget was exhausted before every
+/// due instant was processed. A caller that ignores it (as this
+/// function's own callers used to, before AC4) can silently treat a
+/// budget-truncated run as if it had resolved normally — this return
+/// value exists so a caller never has to.
 pub fn simulate<'a>(
     events: &'a [PacingEvent],
     policy: &Policy,
     scenario: &Scenario<'_>,
-) -> (PacerState, Vec<(Tick<'a>, Vec<Proposal>)>) {
-    let (state, trace, _tick_budget_exhausted) = simulate_until(events, policy, scenario, None);
-    (state, trace)
+) -> (PacerState, Vec<(Tick<'a>, Vec<Proposal>)>, bool) {
+    simulate_bounded(events, policy, scenario, None, MAX_TIMER_TICKS)
 }
 
 /// Runs every event in `events` through [`step`] exactly as [`simulate`]
@@ -70,6 +74,22 @@ pub fn simulate_until<'a>(
     policy: &Policy,
     scenario: &Scenario<'_>,
     until: Option<OffsetDateTime>,
+) -> (PacerState, Vec<(Tick<'a>, Vec<Proposal>)>, bool) {
+    simulate_bounded(events, policy, scenario, until, MAX_TIMER_TICKS)
+}
+
+/// The shared replay loop both [`simulate`] and [`simulate_until`]
+/// delegate to (HORO-1792, AC4) — kept private and parameterized on the
+/// timer-tick budget itself (rather than always hardcoding
+/// [`MAX_TIMER_TICKS`]) so a test can force budget exhaustion directly
+/// with a tiny `max_ticks` instead of constructing a scenario large
+/// enough to exhaust the real production budget.
+fn simulate_bounded<'a>(
+    events: &'a [PacingEvent],
+    policy: &Policy,
+    scenario: &Scenario<'_>,
+    until: Option<OffsetDateTime>,
+    max_ticks: usize,
 ) -> (PacerState, Vec<(Tick<'a>, Vec<Proposal>)>, bool) {
     let mut order: Vec<&PacingEvent> = events.iter().collect();
     order.sort_by(|a, b| a.at().cmp(&b.at()).then(a.seq().cmp(&b.seq())));
@@ -116,7 +136,7 @@ pub fn simulate_until<'a>(
             }
             Due::Timer(at) => {
                 ticks += 1;
-                if ticks > MAX_TIMER_TICKS {
+                if ticks > max_ticks {
                     tick_budget_exhausted = true;
                     break;
                 }
@@ -229,8 +249,8 @@ mod tests {
             at: OffsetDateTime::UNIX_EPOCH,
             seq: 0,
         }];
-        let (state_a, trace_a) = simulate(&events, &policy(), &scenario);
-        let (state_b, trace_b) = simulate(&events, &policy(), &scenario);
+        let (state_a, trace_a, _) = simulate(&events, &policy(), &scenario);
+        let (state_b, trace_b, _) = simulate(&events, &policy(), &scenario);
         assert_eq!(format!("{state_a:?}"), format!("{state_b:?}"));
         assert_eq!(format!("{trace_a:?}"), format!("{trace_b:?}"));
     }
@@ -254,7 +274,7 @@ mod tests {
             seq: 0,
         }];
         let start = std::time::Instant::now();
-        let (state, _trace) = simulate(&events, &policy(), &scenario);
+        let (state, _trace, _) = simulate(&events, &policy(), &scenario);
         let elapsed = start.elapsed();
         assert_eq!(state.active_count(), 200);
         assert!(
@@ -292,7 +312,7 @@ mod tests {
             at: OffsetDateTime::UNIX_EPOCH,
             seq: 0,
         }];
-        let (burst_state, _) = simulate(&events, &policy(), &burst_scenario);
+        let (burst_state, _, _) = simulate(&events, &policy(), &burst_scenario);
         assert_eq!(burst_state.active_count(), 9);
 
         let sustain_scenario = Scenario {
@@ -305,7 +325,7 @@ mod tests {
                 continuity_reserve_bp: 0,
             },
         };
-        let (sustain_state, _) = simulate(&events, &policy(), &sustain_scenario);
+        let (sustain_state, _, _) = simulate(&events, &policy(), &sustain_scenario);
         assert_eq!(
             sustain_state.active_count(),
             1,
@@ -350,8 +370,8 @@ mod tests {
             },
         };
 
-        let (burst_state, _) = simulate(&events, &shared_policy, &burst_scenario);
-        let (sustain_state, _) = simulate(&events, &shared_policy, &sustain_scenario);
+        let (burst_state, _, _) = simulate(&events, &shared_policy, &burst_scenario);
+        let (sustain_state, _, _) = simulate(&events, &shared_policy, &sustain_scenario);
 
         // Different schedules under the one shared `Policy` — the
         // non-tautological half (the same contract/policy is actually
@@ -407,8 +427,8 @@ mod tests {
             },
         };
 
-        let (_, burst_trace) = simulate(&events, &shared_policy, &burst_scenario);
-        let (_, sustain_trace) = simulate(&events, &shared_policy, &sustain_scenario);
+        let (_, burst_trace, _) = simulate(&events, &shared_policy, &burst_scenario);
+        let (_, sustain_trace, _) = simulate(&events, &shared_policy, &sustain_scenario);
 
         let burst_hold = first_start_hold(&burst_trace).expect("burst must admit the one task");
         let sustain_hold =
@@ -484,7 +504,7 @@ mod tests {
                 task: SimTaskId(i),
             });
         }
-        let (_, trace) = simulate(&events, &policy(), &scenario);
+        let (_, trace, _) = simulate(&events, &policy(), &scenario);
 
         // Independently-tracked outstanding holds (keyed by task, not by
         // a fresh id per start — a real completion must be able to find
@@ -659,7 +679,7 @@ mod tests {
                 task: SimTaskId(3),
             },
         ];
-        let (_, control_trace) = simulate(
+        let (_, control_trace, _) = simulate(
             &control_events,
             &policy(),
             &scenario_for(&control_tasks, &w),
@@ -685,7 +705,7 @@ mod tests {
                 task: SimTaskId(3),
             },
         ];
-        let (_, overrun_trace) = simulate(
+        let (_, overrun_trace, _) = simulate(
             &overrun_events,
             &policy(),
             &scenario_for(&overrun_tasks, &w),
@@ -781,7 +801,7 @@ mod tests {
                 task: SimTaskId(1),
             },
         ];
-        let (state_a, trace_a) = simulate(&events, &policy(), &scenario);
+        let (state_a, trace_a, _) = simulate(&events, &policy(), &scenario);
         let (state_b, trace_b, exhausted) = simulate_until(&events, &policy(), &scenario, None);
         assert!(!exhausted);
         assert_eq!(format!("{state_a:?}"), format!("{state_b:?}"));
@@ -831,6 +851,48 @@ mod tests {
                 || state.pending_timer().is_none(),
             "task 2's spacing-gated start must still be pending past the cutoff, \
              never silently resolved"
+        );
+    }
+
+    /// AC4 (HORO-1792): `simulate_bounded` with a `max_ticks` budget of 0
+    /// reports `exhausted == true` and the trace contains no synthesized
+    /// `Timer` tick — the same spacing scenario as the two tests above,
+    /// where task 2's start is only ever reachable via a synthesized
+    /// timer tick at t0+2160s, proves the budget is actually enforced
+    /// (not merely plumbed through and ignored) by never letting that
+    /// tick happen at all.
+    #[test]
+    fn simulate_bounded_with_zero_ticks_reports_exhaustion() {
+        let tasks = TaskSet::validated(vec![task(1, 100, 60), task(2, 100, 60)]).unwrap();
+        let w = window(1000, 21_600);
+        let scenario = Scenario {
+            tasks: &tasks,
+            windows: std::slice::from_ref(&w),
+            contract: None,
+            preference: PacingPreference::Sustain {
+                horizon_secs: 21_600,
+                working_hours: None,
+                continuity_reserve_bp: 0,
+            },
+        };
+        let t0 = OffsetDateTime::UNIX_EPOCH;
+        let events = vec![
+            PacingEvent::ModeChanged { at: t0, seq: 0 },
+            PacingEvent::TaskCompleted {
+                at: t0 + time::Duration::seconds(60),
+                seq: 1,
+                task: SimTaskId(1),
+            },
+        ];
+        let (_, trace, exhausted) = simulate_bounded(&events, &policy(), &scenario, None, 0);
+        assert!(
+            exhausted,
+            "a zero-tick budget must report exhaustion once a timer tick is due"
+        );
+        assert!(
+            !trace.iter().any(|(tick, _)| matches!(tick, Tick::Timer(_))),
+            "no synthesized Timer tick must appear in the trace when the budget is exhausted \
+             before the first one is ever processed"
         );
     }
 }

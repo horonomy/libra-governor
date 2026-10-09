@@ -320,7 +320,7 @@ fn window_overrun_via_blind_in_flight_overspend() {
         },
     ];
 
-    let (final_state, trace) = simulate(&events, &policy(), &scenario);
+    let (final_state, trace, _) = simulate(&events, &policy(), &scenario);
 
     let started_b_count = trace
         .iter()
@@ -447,7 +447,7 @@ fn window_overrun_via_duration_estimate_wrong_and_task_still_active() {
     // No `TaskCompleted` for A is ever supplied — the fix must never let
     // B start on an estimate-based schedule while A remains genuinely
     // active.
-    let (final_state, trace) = simulate(&events, &policy(), &scenario);
+    let (final_state, trace, _) = simulate(&events, &policy(), &scenario);
 
     assert_eq!(
         final_state.active_count(),
@@ -545,7 +545,7 @@ fn window_overrun_fix_b_starts_exactly_when_a_real_completion_settles_and_ages_o
             task: SimTaskId(1),
         },
     ];
-    let (final_state, trace) = simulate(&events, &policy(), &scenario);
+    let (final_state, trace, _) = simulate(&events, &policy(), &scenario);
 
     let b_starts: Vec<OffsetDateTime> = trace
         .iter()
@@ -626,7 +626,7 @@ fn sustain_overspend_blocks_second_start_while_task_remains_active() {
             amount: QuotaAmount::new(QuotaUnit::Tokens, 600),
         },
     ];
-    let (final_state, trace) = simulate(&events, &policy(), &scenario);
+    let (final_state, trace, _) = simulate(&events, &policy(), &scenario);
 
     let proposal_count: usize = trace.iter().map(|(_, proposals)| proposals.len()).sum();
     let start_count = trace
@@ -688,7 +688,7 @@ fn sustain_next_start_waits_for_overrun_settled_spend_to_age_out() {
             task: SimTaskId(1),
         },
     ];
-    let (final_state, trace) = simulate(&events, &policy(), &scenario);
+    let (final_state, trace, _) = simulate(&events, &policy(), &scenario);
 
     let task2_start = trace
         .iter()
@@ -753,7 +753,7 @@ fn estimate_revised_event_is_a_no_op() {
         },
         PacingEvent::ModeChanged { at: t0, seq: 1 },
     ];
-    let (_, trace) = simulate(&events, &policy(), &scenario);
+    let (_, trace, _) = simulate(&events, &policy(), &scenario);
 
     let proposals: Vec<&Proposal> = trace.iter().flat_map(|(_, p)| p.iter()).collect();
     assert!(
@@ -803,7 +803,7 @@ fn estimate_revision_is_reflected_in_the_recorded_hold() {
         },
         PacingEvent::ModeChanged { at: t0, seq: 1 },
     ];
-    let (_, trace) = simulate(&events, &policy(), &scenario);
+    let (_, trace, _) = simulate(&events, &policy(), &scenario);
 
     let start = trace
         .iter()
@@ -867,7 +867,7 @@ fn estimate_revision_of_an_active_task_is_ignored_at_settlement() {
             task: SimTaskId(1),
         },
     ];
-    let (_, trace) = simulate(&events, &policy(), &scenario);
+    let (_, trace, _) = simulate(&events, &policy(), &scenario);
 
     let task2_start = trace
         .iter()
@@ -919,7 +919,7 @@ fn policy_deadline_alone_refuses_past_the_cutoff() {
         at: far_past_deadline,
         seq: 0,
     }];
-    let (_, trace) = simulate(&events, &p, &scenario);
+    let (_, trace, _) = simulate(&events, &p, &scenario);
 
     let proposals: Vec<&Proposal> = trace.iter().flat_map(|(_, p)| p.iter()).collect();
     assert!(
@@ -962,7 +962,7 @@ fn target_end_alone_refuses_past_the_cutoff() {
         at: far_past_target_end,
         seq: 0,
     }];
-    let (_, trace) = simulate(&events, &policy(), &scenario);
+    let (_, trace, _) = simulate(&events, &policy(), &scenario);
 
     let proposals: Vec<&Proposal> = trace.iter().flat_map(|(_, p)| p.iter()).collect();
     assert!(
@@ -1008,7 +1008,7 @@ fn sustain_with_a_policy_deadline_reports_past_deadline() {
         at: far_past_deadline,
         seq: 0,
     }];
-    let (_, trace) = simulate(&events, &p, &scenario);
+    let (_, trace, _) = simulate(&events, &p, &scenario);
 
     let proposals: Vec<&Proposal> = trace.iter().flat_map(|(_, p)| p.iter()).collect();
     assert!(
@@ -1054,7 +1054,7 @@ fn exactly_at_cutoff_is_allowed_to_start() {
         at: deadline,
         seq: 0,
     }];
-    let (_, trace) = simulate(&events, &p, &scenario);
+    let (_, trace, _) = simulate(&events, &p, &scenario);
 
     let started = trace
         .iter()
@@ -1094,7 +1094,7 @@ fn sustain_horizon_never_refuses_a_task_admittable_now() {
         at: t0 + time::Duration::hours(50),
         seq: 0,
     }];
-    let (_, trace) = simulate(&events, &policy(), &scenario);
+    let (_, trace, _) = simulate(&events, &policy(), &scenario);
     let started = trace
         .iter()
         .flat_map(|(_, proposals)| proposals.iter())
@@ -1139,7 +1139,7 @@ fn sustain_horizon_refuses_past_the_horizon() {
             task: SimTaskId(1),
         },
     ];
-    let (final_state, trace) = simulate(&events, &policy(), &scenario);
+    let (final_state, trace, _) = simulate(&events, &policy(), &scenario);
 
     let task2_started = trace
         .iter()
@@ -1214,7 +1214,7 @@ fn sustain_horizon_admits_exactly_at_the_horizon() {
             task: SimTaskId(1),
         },
     ];
-    let (_, trace) = simulate(&events, &policy(), &scenario);
+    let (_, trace, _) = simulate(&events, &policy(), &scenario);
 
     let task2_start_at = trace
         .iter()
@@ -1318,8 +1318,8 @@ fn sustain_and_burst_genuinely_diverge_under_fresh_parameters() {
         },
     };
 
-    let (burst_state, _) = simulate(&events, &policy(), &burst_scenario);
-    let (sustain_state, _) = simulate(&events, &policy(), &sustain_scenario);
+    let (burst_state, _, _) = simulate(&events, &policy(), &burst_scenario);
+    let (sustain_state, _, _) = simulate(&events, &policy(), &sustain_scenario);
 
     assert!(
         burst_state.active_count() > sustain_state.active_count(),
@@ -1369,7 +1369,7 @@ fn three_independent_runs_are_byte_identical_via_serde_json() {
                 amount: QuotaAmount::new(QuotaUnit::Tokens, 90),
             },
         ];
-        let (state, trace) = simulate(&events, &policy(), &scenario);
+        let (state, trace, _) = simulate(&events, &policy(), &scenario);
         let flattened: Vec<(OffsetDateTime, Vec<Proposal>)> = trace
             .into_iter()
             .map(|(tick, proposals)| {
