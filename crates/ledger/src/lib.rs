@@ -30,6 +30,7 @@ mod extension;
 mod gateway;
 mod migrations;
 mod query;
+mod renewal;
 mod reservation;
 mod resource_account;
 mod session;
@@ -46,6 +47,7 @@ pub use migrations::latest_known_version;
 pub use query::{
     CalibrationPair, DogfoodPlanRecord, DogfoodReceiptRecord, EvidenceAggregates, TaskTrajectory,
 };
+pub use renewal::GrantRenewalOutcome;
 pub use reservation::{
     AdjustOutcome, ReleaseOutcome, ReserveOutcome, ReserveRequest, SettleOutcome,
 };
