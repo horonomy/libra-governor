@@ -291,9 +291,14 @@ impl PacingEvent {
     }
 }
 
-/// Why [`forecast::earliest_safe_admit`] could not compute a concrete
-/// admit instant — every variant names the concrete window/reason so a
-/// caller never has to parse a string to find out what was missing.
+/// Why an admit instant could not be computed — most variants are
+/// produced by [`forecast::earliest_safe_admit`] itself, but
+/// [`Self::PastDeadline`], [`Self::PastTargetEnd`], and [`Self::BeyondHorizon`]
+/// are produced by [`step::try_admit`] (HORO-1792), which is the only
+/// place a [`PacingPreference`]/`Policy::time.deadline` cutoff is ever
+/// known — `forecast` itself never sees a [`PacingPreference`]. Every
+/// variant names the concrete window/reason so a caller never has to
+/// parse a string to find out what was missing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnavailableReason {
@@ -320,8 +325,12 @@ pub enum UnavailableReason {
     /// The probe walked past [`super::MAX_PROBE_STEPS`] relief hops
     /// without reaching an all-`NotBlocking` instant.
     ProbeBudgetExhausted,
-    /// The forecast horizon (`Policy::time.deadline`, when set) was
-    /// reached before an admit instant was found.
+    /// The resolved admission instant lies more than `Sustain::horizon_secs`
+    /// after the decision instant; produced by `step::try_admit`, never by
+    /// `forecast` (HORO-1792). Before HORO-1792, this variant was instead
+    /// produced by a defensive, never-actually-emitted invariant check in
+    /// `forecast::earliest_safe_admit` — see [`Self::NonAdvancingRelief`]
+    /// for that case's new, distinct name.
     BeyondHorizon,
     /// The task's need alone (before any other candidate's holds are
     /// even considered) exceeds this window's limit/capacity — no
@@ -340,6 +349,27 @@ pub enum UnavailableReason {
     /// on every event, so this naturally retries the next time anything
     /// happens.
     NoProjectedRelief(QuotaWindowId),
+    /// The resolved admission instant is strictly past `Policy::time.
+    /// deadline` (HORO-1792) — produced by `step::try_admit`, which is
+    /// the only place a `Policy` and a candidate's resolved admit instant
+    /// are both in scope. Takes priority over [`Self::PastTargetEnd`] and
+    /// [`Self::BeyondHorizon`] when more than one cutoff is exceeded.
+    PastDeadline,
+    /// The resolved admission instant is strictly past
+    /// `PacingPreference::Burst::target_end` (HORO-1792) — produced by
+    /// `step::try_admit`. Takes priority over [`Self::BeyondHorizon`], but
+    /// not [`Self::PastDeadline`], when more than one cutoff is exceeded.
+    PastTargetEnd,
+    /// A window's own [`crate::quota_window::BlockingStatus::Blocking`]
+    /// reported a relief instant that does not strictly advance past the
+    /// probe's current instant — `evaluate`'s own invariants guarantee a
+    /// relief instant strictly in the future whenever it reports
+    /// `Blocking`, so this variant exists only so a future regression in
+    /// that invariant fails a probe loop honestly instead of spinning
+    /// forever. Defensive only: never actually emitted as of HORO-1792 —
+    /// this used to share [`Self::BeyondHorizon`]'s name before that
+    /// variant was repurposed for the real SUSTAIN horizon refusal.
+    NonAdvancingRelief(QuotaWindowId),
 }
 
 /// Which window is binding the computed admit instant, so a caller can

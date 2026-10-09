@@ -203,6 +203,52 @@ pub(super) fn pending_for_window(window: &QuotaWindow, state: &PacerState) -> Ve
 
 const ACTIVE_HOLD_TAG: u8 = 0x5A;
 
+/// Refuses a candidate whose admission `instant` lies strictly past a
+/// time cutoff `policy`/`preference` declares (HORO-1792, AC1/AC2).
+/// Scope: only compares the admission instant against each cutoff —
+/// never "won't finish by the deadline" (`start + estimate.duration`),
+/// which would reintroduce the estimate-driven timing HORO-1781's fix
+/// (PR #102) deliberately removed. Boundary: `instant == cutoff` is
+/// allowed; only `instant > cutoff` refuses.
+///
+/// Priority when more than one cutoff is exceeded: [`UnavailableReason::
+/// PastDeadline`], then [`UnavailableReason::PastTargetEnd`], then
+/// [`UnavailableReason::BeyondHorizon`]. `forecast` never sees a
+/// [`PacingPreference`] — SUSTAIN's spacing/working-hours delay and the
+/// policy deadline are only known here, inside `try_admit` — so this
+/// check lives in `step.rs`, not `forecast.rs`.
+///
+/// `now` is the current step's real event time, never scenario-start:
+/// SUSTAIN's horizon is anchored to "how far past the current decision
+/// instant", not to a fixed scenario-start instant (which would need new
+/// state this module deliberately does not carry).
+fn cutoff_refusal(
+    instant: OffsetDateTime,
+    policy: &crate::Policy,
+    preference: &PacingPreference,
+    now: OffsetDateTime,
+) -> Option<super::UnavailableReason> {
+    if let Some(deadline) = policy.time.deadline {
+        if instant > deadline {
+            return Some(super::UnavailableReason::PastDeadline);
+        }
+    }
+    if let PacingPreference::Burst { target_end, .. } = preference {
+        if instant > *target_end {
+            return Some(super::UnavailableReason::PastTargetEnd);
+        }
+    }
+    if let PacingPreference::Sustain { horizon_secs, .. } = preference {
+        let cutoff = now.saturating_add(time::Duration::seconds(
+            i64::try_from(*horizon_secs).unwrap_or(i64::MAX),
+        ));
+        if instant > cutoff {
+            return Some(super::UnavailableReason::BeyondHorizon);
+        }
+    }
+    None
+}
+
 /// Tries to admit the next ready task(s) at `now`, mutating a working
 /// copy of `state` as each admitted task's hold becomes visible to the
 /// next candidate in the same pass — exactly the within-step ordering
@@ -291,6 +337,23 @@ fn try_admit(
             }
         }
 
+        // AC1/AC2 (HORO-1792): refuse before ever running the forecast
+        // when the task is already past a declared cutoff at
+        // `earliest_at` — this is what makes an already-dead task report
+        // `PastDeadline`/`PastTargetEnd`/`BeyondHorizon` instead of
+        // whatever window happened to be checked first. The forecast's
+        // own resolved instant is checked again below, since SUSTAIN's
+        // spacing/working-hours delay (folded into `earliest_at` above)
+        // is not the only thing that can push the real admit instant
+        // past a cutoff — a window's own relief can too.
+        if let Some(reason) = cutoff_refusal(earliest_at, policy, &scenario.preference, now) {
+            proposals.push(Proposal::Hold {
+                next: NextAdmit::Unavailable(reason),
+            });
+            skip.insert(task.id);
+            continue;
+        }
+
         let mode = match &scenario.preference {
             PacingPreference::Sustain {
                 continuity_reserve_bp,
@@ -347,6 +410,22 @@ fn try_admit(
             NextAdmit::At { at, .. } | NextAdmit::Paced { at, .. } => Some(at),
             NextAdmit::Unavailable(_) => None,
         };
+
+        // AC1/AC2 (HORO-1792): re-check the cutoff against the
+        // forecast's own resolved instant — a window's relief can push
+        // the real admit instant past a cutoff even when `earliest_at`
+        // itself was still within bounds. Checked before the `match`
+        // below so a refusal here can never fall through to setting a
+        // pending timer.
+        if let Some(instant) = resolved_at {
+            if let Some(reason) = cutoff_refusal(instant, policy, &scenario.preference, now) {
+                proposals.push(Proposal::Hold {
+                    next: NextAdmit::Unavailable(reason),
+                });
+                skip.insert(task.id);
+                continue;
+            }
+        }
 
         match resolved_at {
             Some(instant) if instant <= now => {

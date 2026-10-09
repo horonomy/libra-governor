@@ -460,8 +460,18 @@ mod tests {
             tasks: &tasks,
             windows: std::slice::from_ref(&w),
             contract: None,
+            // HORO-1792: the remaining two tasks' relief does not land
+            // until their predecessors' settled usage ages out of the
+            // 6h sliding window (~6h after the t0+60s completions), well
+            // past a 1h `target_end` — a value this test's original
+            // author could pick without consequence only because
+            // `target_end` was, at the time, never actually consulted.
+            // Now that HORO-1792 enforces it, widen it generously past
+            // that relief instant; the 1h figure was incidental to this
+            // test's actual purpose (independently verifying every
+            // `Start`'s holds), not a deliberate deadline case.
             preference: PacingPreference::Burst {
-                target_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+                target_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(8),
                 max_fanout: 20,
             },
         };
