@@ -101,6 +101,57 @@ pub struct ResourceBound {
     pub hard_ceiling: ResourceAmount,
 }
 
+impl ResourceBound {
+    /// Shifts `target`, `elastic_ceiling`, and `hard_ceiling` all upward
+    /// by `granted` (HORO-1727's bounded renewal mechanism) — never just
+    /// `hard_ceiling`, because shifting only the hard ceiling would leave
+    /// an `Elastic`/`Approval`-mode task stuck at `ApprovalRequired`
+    /// forever even after real capacity was granted.
+    ///
+    /// Returns `self` unchanged (not merely numerically equal — the same
+    /// value, byte-for-byte) whenever `granted` is zero or its
+    /// [`ResourceKind`] does not match this bound's own kind. The latter
+    /// should never happen in practice (a task's resource kind is fixed
+    /// at admission and every renewal grant against it is validated to
+    /// match — see [`Policy::validate_resource`]), so it is treated as
+    /// "no granted capacity" defensively rather than silently mixing
+    /// units or panicking.
+    pub fn extended_by(&self, granted: ResourceAmount) -> ResourceBound {
+        if granted.kind() != self.target.kind() || granted.as_f64() == 0.0 {
+            return self.clone();
+        }
+        let add = granted.as_f64();
+        let shift = |amount: ResourceAmount| {
+            ResourceAmount::from_kind_f64(amount.kind(), amount.as_f64() + add)
+        };
+        ResourceBound {
+            mode: self.mode,
+            target: shift(self.target),
+            elastic_ceiling: self.elastic_ceiling.map(shift),
+            hard_ceiling: shift(self.hard_ceiling),
+        }
+    }
+}
+
+/// The outer bound on how much a task's [`ResourceBound`] may ever be
+/// extended via renewal grants (HORO-1727). `Policy::renewal: None` —
+/// the default — disables renewals entirely for a task; every existing
+/// policy/task behaves exactly as before with zero config changes (see
+/// [`Policy::renewal`]'s own field docs).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RenewalBound {
+    /// The absolute ceiling `effective_hard_limit` (the immutable
+    /// `hard_ceiling` plus every granted renewal) may never exceed.
+    /// Must share [`ResourceBound::hard_ceiling`]'s [`ResourceKind`] and
+    /// be `>=` it — validated by [`Policy::validated`] (see
+    /// [`PolicyValidationError::RenewalLifetimeCeilingKindMismatch`],
+    /// [`PolicyValidationError::RenewalLifetimeCeilingBelowHardCeiling`]).
+    pub lifetime_ceiling: ResourceAmount,
+    /// The maximum number of renewal grants this task may ever receive,
+    /// lifetime (not per-window).
+    pub max_renewals: u32,
+}
+
 /// The pre-authorized wall-clock envelope for a policy (HORO-1137).
 ///
 /// `hard_ceiling_secs` is optional (unlike [`ResourceBound::hard_ceiling`]):
@@ -180,6 +231,18 @@ pub struct Policy {
     /// confidence to pre-authorize spending into.
     pub min_confidence: Confidence,
     pub autonomy: AutonomyBoundary,
+    /// The outer bound on renewal grants against this task's
+    /// [`ResourceBound`] (HORO-1727). `None` — the default on every
+    /// existing policy, since `#[serde(default)]` fills it in for any
+    /// `policy_json` serialized before this field existed — disables
+    /// renewals entirely: `grant_renewal` refuses every request with
+    /// [`crate::RenewalRefusal::RenewalsDisabled`], and every read site
+    /// that applies [`ResourceBound::extended_by`] receives a granted
+    /// amount of zero, which `extended_by` returns its input unchanged
+    /// for. A task must opt in explicitly; nothing is renewable by
+    /// default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewal: Option<RenewalBound>,
 }
 
 /// Why a candidate [`Policy`] configuration was rejected (HORO-1137).
@@ -249,6 +312,31 @@ pub enum PolicyValidationError {
     EmptyRequiredCriteria,
     #[error("resource amount {amount:?} is out of QuotaPercent's documented 0.0..=100.0 domain")]
     ResourceQuotaPercentOutOfRange { amount: ResourceAmount },
+    #[error(
+        "renewal lifetime ceiling kind {lifetime_kind:?} does not match resource kind {resource_kind:?}"
+    )]
+    RenewalLifetimeCeilingKindMismatch {
+        resource_kind: ResourceKind,
+        lifetime_kind: ResourceKind,
+    },
+    #[error(
+        "renewal lifetime ceiling {lifetime_ceiling:?} is below hard ceiling {hard_ceiling:?}"
+    )]
+    RenewalLifetimeCeilingBelowHardCeiling {
+        lifetime_ceiling: ResourceAmount,
+        hard_ceiling: ResourceAmount,
+    },
+    /// `QuotaPercent`'s `0.0..=100.0` domain saturates under
+    /// [`ResourceBound::extended_by`]'s addition (see
+    /// [`ResourceAmount::from_kind_f64`]), while the ledger's raw `REAL`
+    /// `effective_hard_limit` does not — a renewal would silently
+    /// desynchronize the policy bound from the ledger's own accounting.
+    /// Renewals are refused outright for this kind rather than built on
+    /// an arithmetic mismatch.
+    #[error(
+        "renewal is not supported for resource kind {kind:?} (QuotaPercent saturates at 100.0)"
+    )]
+    RenewalUnsupportedForResourceKind { kind: ResourceKind },
 }
 
 impl Policy {
@@ -301,7 +389,53 @@ impl Policy {
             quality_floor,
             min_confidence,
             autonomy,
+            renewal: None,
         })
+    }
+
+    /// Attaches a [`RenewalBound`] to an already-validated policy
+    /// (HORO-1727), opt-in and separate from [`Self::validated`]/
+    /// [`Self::validated_at`] so every existing construction call site
+    /// (including every preset) is unaffected and keeps `renewal: None`
+    /// unless it explicitly calls this.
+    pub fn with_renewal(mut self, renewal: RenewalBound) -> Result<Self, PolicyValidationError> {
+        Self::validate_renewal(&self.resource, &renewal)?;
+        self.renewal = Some(renewal);
+        Ok(self)
+    }
+
+    /// Validates a candidate [`RenewalBound`] against the policy's own
+    /// [`ResourceBound`]: same [`ResourceKind`] as `hard_ceiling`, a
+    /// `lifetime_ceiling` no smaller than `hard_ceiling`, and never
+    /// `QuotaPercent` (see
+    /// [`PolicyValidationError::RenewalUnsupportedForResourceKind`]'s
+    /// docs for why).
+    fn validate_renewal(
+        resource: &ResourceBound,
+        renewal: &RenewalBound,
+    ) -> Result<(), PolicyValidationError> {
+        let resource_kind = resource.hard_ceiling.kind();
+        if resource_kind == ResourceKind::QuotaPercent {
+            return Err(PolicyValidationError::RenewalUnsupportedForResourceKind {
+                kind: resource_kind,
+            });
+        }
+        let lifetime_kind = renewal.lifetime_ceiling.kind();
+        if lifetime_kind != resource_kind {
+            return Err(PolicyValidationError::RenewalLifetimeCeilingKindMismatch {
+                resource_kind,
+                lifetime_kind,
+            });
+        }
+        if renewal.lifetime_ceiling.as_f64() < resource.hard_ceiling.as_f64() {
+            return Err(
+                PolicyValidationError::RenewalLifetimeCeilingBelowHardCeiling {
+                    lifetime_ceiling: renewal.lifetime_ceiling,
+                    hard_ceiling: resource.hard_ceiling,
+                },
+            );
+        }
+        Ok(())
     }
 
     fn validate_resource(resource: &ResourceBound) -> Result<(), PolicyValidationError> {
@@ -1469,6 +1603,7 @@ mod tests {
                 quality_floor: quality_floor(),
                 min_confidence: Confidence::Low,
                 autonomy: AutonomyBoundary::AskOnApproval,
+                renewal: None,
             },
             "balanced must compile to exactly this concrete Policy value, no hidden logic"
         );
@@ -1991,6 +2126,148 @@ mod tests {
             PolicyEvaluationError::InconsistentTimeBound {
                 mode: ConstraintMode::Hard
             }
+        );
+    }
+
+    // -- HORO-1727: bounded renewal mechanism -----------------------------
+
+    #[test]
+    fn extended_by_zero_is_a_byte_identical_no_op() {
+        let bound = elastic_resource_policy().resource;
+        let extended = bound.extended_by(ResourceAmount::UsdCents(0));
+        assert_eq!(
+            extended, bound,
+            "extended_by(0) must return the input unchanged, not merely numerically equal"
+        );
+    }
+
+    #[test]
+    fn extended_by_zero_amount_different_kind_is_still_a_no_op() {
+        // A granted amount of zero tokens against a USD-denominated bound:
+        // the kind mismatch guard and the zero-amount guard must agree.
+        let bound = elastic_resource_policy().resource;
+        let extended = bound.extended_by(ResourceAmount::Tokens(0));
+        assert_eq!(extended, bound);
+    }
+
+    #[test]
+    fn extended_by_shifts_target_elastic_and_hard_ceiling_together() {
+        let bound = elastic_resource_policy().resource;
+        let extended = bound.extended_by(ResourceAmount::UsdCents(500));
+        assert_eq!(extended.target, ResourceAmount::UsdCents(1500));
+        assert_eq!(
+            extended.elastic_ceiling,
+            Some(ResourceAmount::UsdCents(2000))
+        );
+        assert_eq!(extended.hard_ceiling, ResourceAmount::UsdCents(2500));
+        assert_eq!(extended.mode, bound.mode);
+    }
+
+    #[test]
+    fn extended_by_mismatched_kind_is_a_no_op() {
+        let bound = elastic_resource_policy().resource;
+        let extended = bound.extended_by(ResourceAmount::Tokens(500));
+        assert_eq!(extended, bound);
+    }
+
+    #[test]
+    fn policy_json_with_no_renewal_set_serializes_with_no_renewal_key() {
+        let policy = hard_resource_policy();
+        assert!(policy.renewal.is_none());
+        let json = serde_json::to_value(&policy).expect("serializes");
+        assert!(
+            json.get("renewal").is_none(),
+            "a policy with no renewal bound must not serialize a `renewal` key at all \
+             (policy_json byte-identity for every existing config): got {json}"
+        );
+    }
+
+    #[test]
+    fn with_renewal_validates_lifetime_ceiling_kind_matches_resource() {
+        let policy = hard_resource_policy();
+        let err = policy
+            .with_renewal(RenewalBound {
+                lifetime_ceiling: ResourceAmount::Tokens(10_000),
+                max_renewals: 3,
+            })
+            .unwrap_err();
+        assert_eq!(
+            err,
+            PolicyValidationError::RenewalLifetimeCeilingKindMismatch {
+                resource_kind: ResourceKind::Usd,
+                lifetime_kind: ResourceKind::Tokens,
+            }
+        );
+    }
+
+    #[test]
+    fn with_renewal_validates_lifetime_ceiling_at_least_hard_ceiling() {
+        let policy = hard_resource_policy();
+        let err = policy
+            .with_renewal(RenewalBound {
+                lifetime_ceiling: ResourceAmount::UsdCents(500),
+                max_renewals: 3,
+            })
+            .unwrap_err();
+        assert_eq!(
+            err,
+            PolicyValidationError::RenewalLifetimeCeilingBelowHardCeiling {
+                lifetime_ceiling: ResourceAmount::UsdCents(500),
+                hard_ceiling: ResourceAmount::UsdCents(1000),
+            }
+        );
+    }
+
+    #[test]
+    fn with_renewal_rejects_quota_percent() {
+        let policy = Policy::validated(
+            "test-quota-percent",
+            ResourceBound {
+                mode: ConstraintMode::Hard,
+                target: ResourceAmount::QuotaPercent(50.0),
+                elastic_ceiling: None,
+                hard_ceiling: ResourceAmount::QuotaPercent(100.0),
+            },
+            TimeBound {
+                mode: ConstraintMode::Hard,
+                target_secs: 600,
+                elastic_ceiling_secs: None,
+                hard_ceiling_secs: Some(600),
+                deadline: None,
+            },
+            quality_floor(),
+            Confidence::Medium,
+            AutonomyBoundary::AskOnApproval,
+        )
+        .expect("valid policy");
+        let err = policy
+            .with_renewal(RenewalBound {
+                lifetime_ceiling: ResourceAmount::QuotaPercent(100.0),
+                max_renewals: 3,
+            })
+            .unwrap_err();
+        assert_eq!(
+            err,
+            PolicyValidationError::RenewalUnsupportedForResourceKind {
+                kind: ResourceKind::QuotaPercent,
+            }
+        );
+    }
+
+    #[test]
+    fn with_renewal_accepts_a_valid_bound() {
+        let policy = hard_resource_policy()
+            .with_renewal(RenewalBound {
+                lifetime_ceiling: ResourceAmount::UsdCents(5_000),
+                max_renewals: 3,
+            })
+            .expect("valid renewal bound");
+        assert_eq!(
+            policy.renewal,
+            Some(RenewalBound {
+                lifetime_ceiling: ResourceAmount::UsdCents(5_000),
+                max_renewals: 3,
+            })
         );
     }
 }

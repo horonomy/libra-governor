@@ -83,6 +83,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 16,
         sql: include_str!("../migrations/0016_shared_pool_reservation.sql"),
     },
+    Migration {
+        version: 17,
+        sql: include_str!("../migrations/0017_task_budget_renewals.sql"),
+    },
 ];
 
 /// The highest migration version this build of the crate knows about
@@ -408,6 +412,6 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 16);
+        assert_eq!(version, latest_known_version());
     }
 }
