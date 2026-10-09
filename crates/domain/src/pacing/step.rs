@@ -61,7 +61,6 @@ struct ActiveTask {
     settlement_floor: u64,
     #[allow(dead_code)]
     started_at: OffsetDateTime,
-    projected_complete_at: OffsetDateTime,
 }
 
 /// The pacing simulator's own replayable state. `BTreeMap`/`BTreeSet`
@@ -75,8 +74,12 @@ pub struct PacerState {
     /// [`MAX_BACKOFF_RATIO_X100`]. Reset to 100 the first time that
     /// principal completes a task within its estimated duration (AC5).
     backoff_x100: BTreeMap<String, u64>,
-    /// `Some` only while SUSTAIN holds the schedule's one concurrency
-    /// slot — the instant the active task is projected to complete.
+    /// The instant the most recent task was started (not a projected
+    /// completion instant) — `None` until the first `Start`, then set by
+    /// every subsequent one and never reset back to `None`. SUSTAIN's
+    /// spacing check reads it to enforce a minimum gap between starts
+    /// even after a slot frees up early (see `sustain_spacing_is_
+    /// enforced_even_when_a_slot_frees_up_early`'s test below).
     last_start: Option<OffsetDateTime>,
     pending_timer: Option<OffsetDateTime>,
     /// Every completed task's settled usage, append-only — this is what
@@ -173,17 +176,27 @@ fn pending_hold_id(
 }
 
 /// Builds this window's [`PendingHold`] list from every currently active
-/// task whose hold shares the window's unit. `pub(super)`: reused by
+/// task whose hold shares the window's unit. The injected amount is
+/// `hold.value.max(spend_so_far)` — whichever is larger, the reservation
+/// recorded at `Start` time or the largest `Spend` this task has actually
+/// reported since (HORO-1781 fast-follow: `PacerState::spend_so_far` was
+/// already tracked and already read at `TaskCompleted`, but this function
+/// used to ignore it entirely, leaving every other candidate's admission
+/// check blind to a task that was already known, in-scenario, to be
+/// overrunning its hold). `pub(super)`: also reused by
 /// `pacing::view::evaluate_at` (HORO-1767) — never outside `pacing`.
 pub(super) fn pending_for_window(window: &QuotaWindow, state: &PacerState) -> Vec<PendingHold> {
     state
         .active
         .iter()
         .filter(|(_, a)| a.hold.unit == *window.unit())
-        .map(|(task_id, a)| PendingHold {
-            id: pending_hold_id(window.id(), *task_id),
-            amount: a.hold.clone(),
-            completes_at: a.projected_complete_at,
+        .map(|(task_id, a)| {
+            let reported_spend = state.spend_so_far.get(task_id).copied().unwrap_or(0);
+            let amount = a.hold.value.max(reported_spend);
+            PendingHold {
+                id: pending_hold_id(window.id(), *task_id),
+                amount: QuotaAmount::new(a.hold.unit.clone(), amount),
+            }
         })
         .collect()
 }
@@ -348,7 +361,6 @@ fn try_admit(
                     &mut working,
                     task.id,
                     task.principal.0.clone(),
-                    &task.estimate,
                     hold.clone(),
                     settlement_floor,
                     now,
@@ -486,18 +498,10 @@ fn start_task(
     state: &mut PacerState,
     id: SimTaskId,
     principal: String,
-    estimate: &crate::progressive::RemainingWorkEstimate,
     hold: QuotaAmount,
     settlement_floor: u64,
     at: OffsetDateTime,
 ) {
-    let duration_secs = match estimate.duration {
-        crate::progressive::RemainingDuration::Quantiles { p90_secs, .. } => p90_secs,
-        crate::progressive::RemainingDuration::Insufficient { .. } => 0,
-    };
-    let projected_complete_at = at.saturating_add(time::Duration::seconds(
-        i64::try_from(duration_secs).unwrap_or(i64::MAX),
-    ));
     state.active.insert(
         id,
         ActiveTask {
@@ -505,7 +509,6 @@ fn start_task(
             hold,
             settlement_floor,
             started_at: at,
-            projected_complete_at,
         },
     );
     state.last_start = Some(at);

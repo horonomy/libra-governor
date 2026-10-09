@@ -38,7 +38,7 @@ use crate::quota_window::{
 };
 use crate::reservation::{completion_reserve_for, ReservationId};
 use crate::resource_amount::{ResourceAmount, ResourceKind};
-use crate::{CompletionContract, EconomicEventId, Estimate, Policy};
+use crate::{CompletionContract, Estimate, Policy};
 
 use super::{synthetic_uuid, UnavailableReason, MAX_PROBE_STEPS};
 use crate::progressive::{RemainingResource, RemainingWorkEstimate};
@@ -51,18 +51,22 @@ use crate::progressive::{RemainingResource, RemainingWorkEstimate};
 /// the window alone made every in-flight task's hold collapse to one,
 /// which `quota_window::dedup_holds_by_id` then silently deduplicated —
 /// the window looked far less constrained than it really was).
+///
+/// There is deliberately no estimated-completion field here (HORO-1781
+/// fast-follow): a pending hold counts as outstanding for as long as its
+/// task is `active` in `PacerState`, full stop — it is only ever removed
+/// (and folded into `usage` instead) by a real `TaskCompleted` event.
+/// [`crate::quota_window::OutstandingHold`]'s own contract already says
+/// "every `Active` reservation counts, with no `expires_at` filter...
+/// this contract must not invent a second expiry rule"; a prior version
+/// of this module invented exactly that second rule by settling a hold
+/// at its *estimated* completion instant, which let a still-active,
+/// still-overrunning task's footprint age out of a sliding window on a
+/// schedule tied to a duration estimate that need not be true.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingHold {
     pub id: ReservationId,
     pub amount: QuotaAmount,
-    /// The instant this hold is projected to settle into ordinary usage.
-    /// Before this instant the forecast treats it as an outstanding
-    /// hold (reduces headroom, never counted twice); from this instant
-    /// on it is folded into `usage` instead — the mechanism that lets a
-    /// sliding/fixed window's *cumulative* spend, not just its
-    /// currently-concurrent holds, actually constrain admission (AC2:
-    /// "including simultaneous in-flight work").
-    pub completes_at: OffsetDateTime,
 }
 
 /// One quota window's evidence: already-settled usage, in-flight holds
@@ -75,32 +79,6 @@ pub struct WindowInput<'a> {
     pub usage: &'a [QuotaUsage],
     pub pending: &'a [PendingHold],
     pub snapshots: &'a [ProviderSnapshot],
-}
-
-/// Splits `pending` as of probe time `t`: holds not yet settled stay
-/// outstanding; holds whose `completes_at <= t` become ordinary usage
-/// records dated at their completion instant. Returns owned `Vec`s
-/// because [`QuotaWindow::evaluate`] borrows its evidence by reference
-/// and this module has nowhere else to stash them for the duration of
-/// one `check_window` call.
-fn split_pending_as_of(
-    pending: &[PendingHold],
-    t: OffsetDateTime,
-) -> (Vec<OutstandingHold>, Vec<QuotaUsage>) {
-    let mut holds = Vec::new();
-    let mut settled = Vec::new();
-    for p in pending {
-        if p.completes_at <= t {
-            if let Ok(usage) =
-                QuotaUsage::new(EconomicEventId(p.id.0), p.completes_at, p.amount.clone())
-            {
-                settled.push(usage);
-            }
-        } else {
-            holds.push(OutstandingHold::projected(p.id, p.amount.clone()));
-        }
-    }
-    (holds, settled)
 }
 
 /// The caller-chosen pacing mode this probe is being run under. Only the
@@ -241,7 +219,11 @@ fn check_window(
     t: OffsetDateTime,
 ) -> WindowOutcome {
     let window = input.window;
-    let (pending_holds, settled_from_pending) = split_pending_as_of(input.pending, t);
+    let pending_holds: Vec<OutstandingHold> = input
+        .pending
+        .iter()
+        .map(|p| OutstandingHold::projected(p.id, p.amount.clone()))
+        .collect();
 
     if is_gauge(window) {
         // See module docs: a Gauge window has no quantity to inject a
@@ -307,10 +289,8 @@ fn check_window(
     let synthetic_hold = OutstandingHold::projected(synthetic_id, injected);
     let mut holds: Vec<OutstandingHold> = pending_holds;
     holds.push(synthetic_hold);
-    let mut usage: Vec<QuotaUsage> = input.usage.to_vec();
-    usage.extend(settled_from_pending);
     let evidence = QuotaEvidence {
-        usage: &usage,
+        usage: input.usage,
         holds: &holds,
         snapshots: input.snapshots,
     };
@@ -322,19 +302,17 @@ fn check_window(
         }
         BlockingStatus::Blocking => match extract_relief(&eval.state) {
             Relief::At(x) => WindowOutcome::BlockedAt(x),
+            // Relief requires a real `TaskCompleted` — a pending hold
+            // never carries a projected settlement instant of its own
+            // any more (see `PendingHold`'s docs), so there is nothing
+            // here to wait for: no amount of re-probing this window
+            // alone can produce a relief instant. The caller (`step`)
+            // re-runs admission on every event regardless, so this is
+            // not a permanent refusal in practice — just a refusal to
+            // fabricate a timer for something only a future
+            // `TaskCompleted` can actually resolve.
             Relief::AfterOutstandingHoldsSettle => {
-                match input
-                    .pending
-                    .iter()
-                    .map(|p| p.completes_at)
-                    .filter(|c| *c > t)
-                    .min()
-                {
-                    Some(next) => WindowOutcome::BlockedAt(next),
-                    None => WindowOutcome::Unavailable(UnavailableReason::NoProjectedRelief(
-                        window.id(),
-                    )),
-                }
+                WindowOutcome::Unavailable(UnavailableReason::NoProjectedRelief(window.id()))
             }
             Relief::ProviderDeclared(_) => {
                 WindowOutcome::Unavailable(UnavailableReason::ProviderDeclaredReliefOnly)
@@ -779,8 +757,9 @@ mod tests {
 
         // Nine tasks' usage, already settled at t0 (burst started all
         // nine at once and they are modeled as immediately-counted spend
-        // for this fixture — see module docs on `PendingHold` for why a
-        // settled-before-now pending hold becomes ordinary usage).
+        // for this fixture — `WindowInput::usage` is settled usage
+        // supplied directly by the caller, not derived from any pending
+        // hold).
         let usage: Vec<QuotaUsage> = (0..9)
             .map(|_| {
                 QuotaUsage::new(

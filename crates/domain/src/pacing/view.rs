@@ -14,18 +14,17 @@
 //! # Why `evaluate_at` never settles a hold early
 //!
 //! An active task's hold stays an *outstanding* [`OutstandingHold`] for
-//! every instant up to and including `at`, even past its own projected
-//! completion — unlike `forecast::split_pending_as_of`, which the probe
-//! loop uses to let a *future* relief hop fold an about-to-finish hold
-//! into settled usage for the purpose of asking "is it safe to start a
-//! new task". A CLI explain surface answering "what does the evidence
-//! show as of `at`" must never present a *projected* completion as
-//! *actual* settled spend before a real `TaskCompleted` event says so —
-//! presenting a simulated projection as an observed fact is exactly the
-//! false-claim class HORO-1767 exists to remove. Every window evaluation
-//! this module produces therefore counts every currently active task's
-//! hold as outstanding, never as settled, regardless of how its
-//! `projected_complete_at` compares to `at`.
+//! every instant up to and including `at`, settling only on a real
+//! `TaskCompleted` event — the same discipline `step`/`forecast` apply
+//! everywhere after the HORO-1781 fast-follow fix removed their own
+//! prior estimate-gated settlement path. A CLI explain surface answering
+//! "what does the evidence show as of `at`" must never present a
+//! *projected* completion as *actual* settled spend before a real
+//! `TaskCompleted` event says so — presenting a simulated projection as
+//! an observed fact is exactly the false-claim class HORO-1767 exists to
+//! remove. Every window evaluation this module produces therefore counts
+//! every currently active task's hold as outstanding, never as settled,
+//! for as long as the task remains active.
 
 use std::collections::BTreeMap;
 

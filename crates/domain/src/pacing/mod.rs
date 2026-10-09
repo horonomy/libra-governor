@@ -330,10 +330,15 @@ pub enum UnavailableReason {
     /// relief hops discovering the same thing 64 times.
     NeedExceedsWindowLimit(QuotaWindowId),
     /// This window's relief is
-    /// [`crate::quota_window::Relief::AfterOutstandingHoldsSettle`], but
-    /// the caller supplied no projected completion instant after the
-    /// current probe time for any of its outstanding holds — there is
-    /// nothing left to wait for, so no further probing can help.
+    /// [`crate::quota_window::Relief::AfterOutstandingHoldsSettle`] — its
+    /// outstanding holds alone already consume the window's full limit.
+    /// A pending hold carries no projected completion instant of its own
+    /// (HORO-1781 fast-follow: see `pacing::forecast::PendingHold`'s
+    /// docs) — only a real `TaskCompleted` event can ever relieve this,
+    /// so there is nothing this probe alone can wait for. Not a
+    /// permanent refusal in practice: `pacing::step` re-runs admission
+    /// on every event, so this naturally retries the next time anything
+    /// happens.
     NoProjectedRelief(QuotaWindowId),
 }
 
