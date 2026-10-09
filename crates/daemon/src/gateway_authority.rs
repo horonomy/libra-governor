@@ -135,21 +135,39 @@ impl SpendAuthority for LedgerSpendAuthority {
         let policy = &budget.policy;
 
         // Project total committed capacity plus this request's own
-        // worst case. `available(OptionalWork)` already subtracts settled
-        // spend, active reservations, AND the protected Completion
-        // Reserve, so `hard_limit - available` is everything committed
-        // against this task from an optional-work request's point of
-        // view.
-        let optional_headroom = ledger
-            .available(req.task_id, ReservationClass::OptionalWork)
-            .map_err(|e| AuthorityError(e.to_string()))?;
-        let committed = optional_headroom
-            .map(|h| budget.hard_limit.as_f64() - h.value)
-            .unwrap_or(0.0);
+        // worst case. `committed` is read directly from the budget
+        // snapshot's `used()`/`reserved()`/`completion_reserve()`
+        // (HORO-1727), never derived by subtracting `available`'s
+        // headroom from a ceiling — see `crates/daemon/src/server.rs`'s
+        // sibling admission site for the full rationale. The `+
+        // completion_reserve()` term is deliberately kept here (unlike
+        // `server.rs`'s `RequiredWork` site, which has no such term):
+        // `available(OptionalWork)` — which this committed figure used
+        // to be derived from — subtracts the protected Completion
+        // Reserve as well as settled/active spend, because optional work
+        // can never draw into that reserve (see ADR 0003 §3 below). A
+        // gateway spend request must keep seeing the reserve as already
+        // "spoken for", or an optional-work request could be admitted
+        // into capacity this task's required completion work still
+        // needs.
+        let snapshot = ledger
+            .budget_snapshot(req.task_id)
+            .map_err(|e| AuthorityError(e.to_string()))?
+            .ok_or_else(|| AuthorityError("budget disappeared mid-authorize".to_string()))?;
+        let committed = snapshot.used().as_f64()
+            + snapshot.reserved().as_f64()
+            + snapshot.completion_reserve().as_f64();
+        let granted = snapshot.granted();
         let projected =
             ResourceAmount::from_kind_f64(budget.resource_kind, committed + req.amount.as_f64());
 
-        let admission = evaluate_resource_dimension_only(policy, projected)?;
+        // The resource bound evaluated against is shifted by `granted`
+        // (HORO-1727) — see `ResourceBound::extended_by`'s docs. A local
+        // copy: `policy` (== `budget.policy`) is the persisted admission
+        // snapshot and must not be mutated.
+        let mut admission_policy = policy.clone();
+        admission_policy.resource = admission_policy.resource.extended_by(granted);
+        let admission = evaluate_resource_dimension_only(&admission_policy, projected)?;
         let approval_required = match &admission {
             Admission::Deny(_) => {
                 return Ok(SpendDecision::Denied(SpendDenial::PolicyDenied {
