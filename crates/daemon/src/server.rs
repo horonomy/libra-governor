@@ -1019,10 +1019,24 @@ pub(crate) fn handle_preflight_prepared(
         .resource_p80
         .filter(|amount| amount.kind() == budget.resource_kind)
         .unwrap_or(config.policy.resource.target);
-    let required_headroom = ledger.available(task_id, ReservationClass::RequiredWork)?;
-    let committed = required_headroom
-        .map(|h| budget.hard_limit.as_f64() - h.value)
-        .unwrap_or(0.0);
+    // `committed` is read directly from the budget snapshot's own
+    // `used()`/`reserved()` (HORO-1727), never derived by subtracting
+    // `available`'s headroom from a ceiling — a formula that silently
+    // erodes by exactly the granted amount once `available` starts
+    // counting granted renewal capacity, because the ceiling it would
+    // subtract from no longer matches the one `available` computed
+    // against. `RequiredWork`'s own committed figure never includes the
+    // protected Completion Reserve (see `LedgerStore::available`'s doc
+    // comment on the `RequiredWork` formula), matching this call site's
+    // pre-HORO-1727 behavior exactly whenever `granted` is zero — which
+    // is every task today.
+    let snapshot = ledger.budget_snapshot(task_id)?.ok_or_else(|| {
+        DaemonError::Ledger(libra_governor_ledger::LedgerError::TaskNotFound(
+            task_id.to_string(),
+        ))
+    })?;
+    let committed = snapshot.used().as_f64() + snapshot.reserved().as_f64();
+    let granted = snapshot.granted();
     let projected =
         ResourceAmount::from_kind_f64(budget.resource_kind, committed + requested.as_f64());
     let projected_duration_secs = estimate.duration_p80_secs.unwrap_or(0);
@@ -1030,8 +1044,19 @@ pub(crate) fn handle_preflight_prepared(
     // business context has on admission (HORO-1174): deadline narrowing
     // only. `initialize_task_budget`/`adjust_completion_reserve` above
     // still used `config.policy` unconditionally.
+    //
+    // The resource bound evaluated against is `effective_policy.resource`
+    // shifted by `granted` (HORO-1727) — target, elastic ceiling, AND
+    // hard ceiling, never just the hard ceiling (see
+    // `ResourceBound::extended_by`'s own docs for why). This is a local
+    // copy used only for this `evaluate` call: `effective_policy` itself
+    // is left untouched, since it is recorded as "the policy in force"
+    // further down (`enqueue_admission_and_approval_events`) and
+    // `extended_by(0)` is a no-op in any case for every task today.
+    let mut admission_policy = effective_policy.clone();
+    admission_policy.resource = admission_policy.resource.extended_by(granted);
     let mut decision =
-        effective_policy.evaluate(projected, projected_duration_secs, estimate.confidence)?;
+        admission_policy.evaluate(projected, projected_duration_secs, estimate.confidence)?;
 
     // Policy Webhook (HORO-1174): only ever called when the projected
     // admission is ApprovalRequired — a hard-ceiling Deny issues ZERO

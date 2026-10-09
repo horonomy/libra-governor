@@ -121,7 +121,27 @@ type BudgetRow = (
     String, // updated_at
 );
 
-fn row_to_budget(task_id: TaskId, row: BudgetRow) -> Result<TaskBudget, LedgerError> {
+/// Sums every renewal grant against `task_id` (HORO-1727) —
+/// `task_budgets.hard_limit` is immutable, so this is the one quantity
+/// every effective-ceiling read site adds to it (see
+/// [`libra_governor_domain::TaskBudget::effective_hard_limit`]). Zero for
+/// every task that has never had a renewal granted, which is every task
+/// today — see `renewal_not_wired_live`.
+///
+/// Takes `&rusqlite::Connection` rather than `&LedgerStore` so a caller
+/// already inside a transaction (`tx: &rusqlite::Transaction`, which
+/// derefs to `Connection`) reads `task_budget_renewals` with the same
+/// snapshot as the rest of that transaction, rather than opening a second
+/// one.
+fn granted_capacity(conn: &rusqlite::Connection, task_id: TaskId) -> Result<f64, LedgerError> {
+    Ok(conn.query_row(
+        "SELECT COALESCE(SUM(amount), 0.0) FROM task_budget_renewals WHERE task_id = ?1",
+        [task_id.to_string()],
+        |row| row.get(0),
+    )?)
+}
+
+fn row_to_budget(task_id: TaskId, row: BudgetRow, granted: f64) -> Result<TaskBudget, LedgerError> {
     let (
         resource_kind,
         hard_limit,
@@ -141,6 +161,7 @@ fn row_to_budget(task_id: TaskId, row: BudgetRow) -> Result<TaskBudget, LedgerEr
         task_id,
         resource_kind,
         hard_limit: ResourceAmount::from_kind_f64(resource_kind, hard_limit),
+        renewed_capacity: ResourceAmount::from_kind_f64(resource_kind, granted),
         initial_completion_reserve: ResourceAmount::from_kind_f64(
             resource_kind,
             initial_completion_reserve,
@@ -152,6 +173,51 @@ fn row_to_budget(task_id: TaskId, row: BudgetRow) -> Result<TaskBudget, LedgerEr
         created_at: parse_time(&created_at)?,
         updated_at: parse_time(&updated_at)?,
     })
+}
+
+/// The one place `task_budgets` is read and assembled into a
+/// [`TaskBudget`], folding in [`granted_capacity`] (HORO-1727). Every
+/// call site that used to run its own copy of this 10-column `SELECT`
+/// (`task_budget`, `reserve`, `adjust_completion_reserve`) now goes
+/// through here instead — a renewal-aware read a future caller adds can
+/// no longer miss `granted` by copy-pasting an older version of the
+/// query.
+///
+/// Takes `&rusqlite::Connection` so a caller already inside a
+/// transaction (a `&rusqlite::Transaction`, which derefs to `Connection`)
+/// reads both tables from the same snapshot.
+pub(crate) fn read_task_budget_tx(
+    conn: &rusqlite::Connection,
+    task_id: TaskId,
+) -> Result<Option<TaskBudget>, LedgerError> {
+    let row: Option<BudgetRow> = conn
+        .query_row(
+            "SELECT resource_kind, hard_limit, initial_completion_reserve, completion_reserve,
+                    completion_reserve_basis, policy_json, policy_schema_version,
+                    reservation_schema_version, created_at, updated_at
+             FROM task_budgets WHERE task_id = ?1",
+            [task_id.to_string()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let granted = granted_capacity(conn, task_id)?;
+    row_to_budget(task_id, row, granted).map(Some)
 }
 
 /// Raw `reservations` row shape.
@@ -456,46 +522,28 @@ impl LedgerStore {
                 ))
             },
         )?;
+        let granted = granted_capacity(&tx, task_id)?;
         tx.commit()?;
-        row_to_budget(task_id, row)
+        row_to_budget(task_id, row, granted)
     }
 
     /// Reads `task_id`'s [`TaskBudget`], if one has been initialized.
     pub fn task_budget(&self, task_id: TaskId) -> Result<Option<TaskBudget>, LedgerError> {
-        let row: Option<BudgetRow> = self
-            .conn
-            .query_row(
-                "SELECT resource_kind, hard_limit, initial_completion_reserve, completion_reserve,
-                        completion_reserve_basis, policy_json, policy_schema_version,
-                        reservation_schema_version, created_at, updated_at
-                 FROM task_budgets WHERE task_id = ?1",
-                [task_id.to_string()],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                        row.get(9)?,
-                    ))
-                },
-            )
-            .optional()?;
-        row.map(|r| row_to_budget(task_id, r)).transpose()
+        read_task_budget_tx(&self.conn, task_id)
     }
 
     /// Computes the [`Headroom`] available to `class` right now:
-    /// `hard_limit - settled - active` for [`ReservationClass::RequiredWork`]
-    /// (the reserve is NOT subtracted — required work may draw into it),
-    /// and that same figure minus `completion_reserve` for
-    /// [`ReservationClass::OptionalWork`] — the ticket's formula applied
-    /// literally for the class that must never touch the protected floor.
-    /// `Ok(None)` when no budget has been initialized for this task.
+    /// `effective_hard_limit - settled - active` for
+    /// [`ReservationClass::RequiredWork`] (the reserve is NOT subtracted —
+    /// required work may draw into it), and that same figure minus
+    /// `completion_reserve` for [`ReservationClass::OptionalWork`] — the
+    /// ticket's formula applied literally for the class that must never
+    /// touch the protected floor. `effective_hard_limit`
+    /// (`hard_limit + renewed_capacity`, HORO-1727), not the raw
+    /// `hard_limit` alone: for every task with no renewal ever granted
+    /// (every task today) `renewed_capacity` is zero and this is
+    /// identical to the pre-HORO-1727 formula. `Ok(None)` when no budget
+    /// has been initialized for this task.
     pub fn available(
         &self,
         task_id: TaskId,
@@ -505,7 +553,7 @@ impl LedgerStore {
             return Ok(None);
         };
         let (settled, active) = self.settled_and_active(task_id)?;
-        let general = budget.hard_limit.as_f64() - settled - active;
+        let general = budget.effective_hard_limit().as_f64() - settled - active;
         let value = match class {
             ReservationClass::RequiredWork => general,
             ReservationClass::OptionalWork => general - budget.completion_reserve.as_f64(),
@@ -606,12 +654,19 @@ impl LedgerStore {
             [&id],
             |row| row.get(0),
         )?;
+        // Read inside the same snapshot as the four statements above
+        // (HORO-1727) — a renewal grant between this read and the ones
+        // above would otherwise produce a `granted` figure from a
+        // different instant than `settled`/`active`, the exact
+        // single-instant guarantee this method's own docs promise.
+        let granted = granted_capacity(conn, task_id)?;
         if let Some(tx) = tx {
             tx.commit()?;
         }
-        Ok(Some(BudgetSnapshot::new(
+        Ok(Some(BudgetSnapshot::new_with_granted(
             kind_from_str(&kind)?,
             hard_limit,
+            granted,
             completion_reserve,
             settled,
             active,
@@ -660,34 +715,10 @@ impl LedgerStore {
             )));
         }
 
-        let budget_row: Option<BudgetRow> = tx
-            .query_row(
-                "SELECT resource_kind, hard_limit, initial_completion_reserve, completion_reserve,
-                        completion_reserve_basis, policy_json, policy_schema_version,
-                        reservation_schema_version, created_at, updated_at
-                 FROM task_budgets WHERE task_id = ?1",
-                [req.task_id.to_string()],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                        row.get(9)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some(budget_row) = budget_row else {
+        let Some(budget) = read_task_budget_tx(&tx, req.task_id)? else {
             tx.commit()?;
             return Ok(ReserveOutcome::NoBudget);
         };
-        let budget = row_to_budget(req.task_id, budget_row)?;
 
         if req.amount.kind() != budget.resource_kind {
             return Err(LedgerError::ResourceKindMismatch {
@@ -708,7 +739,10 @@ impl LedgerStore {
             [req.task_id.to_string()],
             |row| row.get(0),
         )?;
-        let general = budget.hard_limit.as_f64() - settled - active;
+        // `effective_hard_limit`, not raw `hard_limit` (HORO-1727) — see
+        // `LedgerStore::available`'s doc comment for why this is a no-op
+        // change for every task with no renewal ever granted.
+        let general = budget.effective_hard_limit().as_f64() - settled - active;
         let reserve = budget.completion_reserve.as_f64();
         let optional_headroom = general - reserve;
         let requested = req.amount.as_f64();
@@ -1135,34 +1169,10 @@ impl LedgerStore {
         now: OffsetDateTime,
     ) -> Result<AdjustOutcome, LedgerError> {
         let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
-        let budget_row: Option<BudgetRow> = tx
-            .query_row(
-                "SELECT resource_kind, hard_limit, initial_completion_reserve, completion_reserve,
-                        completion_reserve_basis, policy_json, policy_schema_version,
-                        reservation_schema_version, created_at, updated_at
-                 FROM task_budgets WHERE task_id = ?1",
-                [task_id.to_string()],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                        row.get(9)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some(budget_row) = budget_row else {
+        let Some(budget) = read_task_budget_tx(&tx, task_id)? else {
             tx.commit()?;
             return Ok(AdjustOutcome::NoBudget);
         };
-        let budget = row_to_budget(task_id, budget_row)?;
 
         if new_amount.kind() != budget.resource_kind {
             return Err(LedgerError::ResourceKindMismatch {
@@ -1187,7 +1197,9 @@ impl LedgerStore {
                 [task_id.to_string()],
                 |row| row.get(0),
             )?;
-            let optional_headroom = budget.hard_limit.as_f64() - settled - active - current;
+            // `effective_hard_limit`, not raw `hard_limit` (HORO-1727).
+            let optional_headroom =
+                budget.effective_hard_limit().as_f64() - settled - active - current;
             if delta > optional_headroom {
                 tx.commit()?;
                 return Ok(AdjustOutcome::Insufficient {
@@ -1401,8 +1413,9 @@ mod tests {
             .sum();
         assert!(
             settled + active + budget.completion_reserve.as_f64()
-                <= budget.hard_limit.as_f64() + overrun + 1e-6,
-            "settled + active + reserve must not exceed the hard limit beyond a real overrun"
+                <= budget.effective_hard_limit().as_f64() + overrun + 1e-6,
+            "settled + active + reserve must not exceed the effective hard limit beyond a real \
+             overrun"
         );
     }
 

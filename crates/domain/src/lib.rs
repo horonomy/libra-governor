@@ -56,6 +56,7 @@ mod policy;
 mod progressive;
 mod quota_window;
 mod regime;
+mod renewal;
 mod replan;
 mod replay;
 mod reservation;
@@ -118,7 +119,7 @@ pub use outcome_attestation::{AttestationSource, OutcomeAttestation};
 pub use policy::{
     preset_by_name, Admission, ApprovalRequest, AutonomyBoundary, ConstraintMode,
     ConstraintOutcome, DenyReason, Policy, PolicyDecision, PolicyEvaluationError,
-    PolicyPresetInputs, PolicyValidationError, PresetError, ResourceBound, TimeBound,
+    PolicyPresetInputs, PolicyValidationError, PresetError, RenewalBound, ResourceBound, TimeBound,
     NAMED_PRESETS, POLICY_SCHEMA_VERSION,
 };
 pub use progressive::{
@@ -142,6 +143,10 @@ pub use regime::{
     CacheClass, DimensionUnavailable, DimensionValue, RegimeBasis, RegimeComparison,
     RegimeDimension, RegimeKey, RegimeKeyBuilder, RegimeProvenance, ESTIMATOR_REGIME_SCHEMA,
     REGIME_SCHEMA_VERSION,
+};
+pub use renewal::{
+    RenewalAuthority, RenewalId, RenewalRefusal, RenewalRequest, TaskBudgetRenewal,
+    TASK_BUDGET_RENEWAL_SCHEMA_VERSION,
 };
 pub use replan::{
     evaluate_hysteresis, evaluate_replan_cost_against_policy, possible_tool_loop, should_replan,

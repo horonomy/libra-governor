@@ -254,19 +254,31 @@ fn dfc_elig_05_adapter_never_emits_gap_unknown() {
 /// regression this test exists to catch.
 #[test]
 fn dropped_count_zero_is_provable_no_eviction_path_exists_in_ledger() {
-    let ledger_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ledger");
+    let ledger_crate = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ledger");
+    // Scoped to `src/` and `migrations/` only (matching this test's own
+    // doc comment above: "grepping the ledger crate's own source and
+    // migrations"), not the whole crate directory. `tests/` legitimately
+    // contains a `DELETE FROM` as of HORO-1727's
+    // `renewal_adversarial.rs` — a raw-SQL probe proving the
+    // `task_budget_renewals` append-only trigger REJECTS a delete, the
+    // opposite of an eviction path. Scanning `tests/` too would make this
+    // guard fail on exactly the test that proves the property it exists
+    // to protect.
+    let scan_roots = [ledger_crate.join("src"), ledger_crate.join("migrations")];
     let mut offending = Vec::new();
-    for entry in walk(&ledger_src) {
-        if entry.extension().and_then(|e| e.to_str()) != Some("rs")
-            && entry.extension().and_then(|e| e.to_str()) != Some("sql")
-        {
-            continue;
-        }
-        let Ok(contents) = std::fs::read_to_string(&entry) else {
-            continue;
-        };
-        if contents.contains("DELETE FROM") || contents.contains("DROP TABLE") {
-            offending.push(entry);
+    for root in scan_roots {
+        for entry in walk(&root) {
+            if entry.extension().and_then(|e| e.to_str()) != Some("rs")
+                && entry.extension().and_then(|e| e.to_str()) != Some("sql")
+            {
+                continue;
+            }
+            let Ok(contents) = std::fs::read_to_string(&entry) else {
+                continue;
+            };
+            if contents.contains("DELETE FROM") || contents.contains("DROP TABLE") {
+                offending.push(entry);
+            }
         }
     }
     assert!(

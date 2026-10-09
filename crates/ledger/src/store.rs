@@ -169,7 +169,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 16);
+        assert_eq!(version, crate::migrations::latest_known_version());
     }
 
     #[test]

@@ -261,8 +261,17 @@ pub struct TaskBudget {
     /// reservation and settlement against this task must match it.
     pub resource_kind: crate::resource_amount::ResourceKind,
     /// Copied from `policy.resource.hard_ceiling` at admission — one
-    /// source of truth, no separate limit configuration.
+    /// source of truth, no separate limit configuration. Immutable for
+    /// the life of the task: a renewal grant (HORO-1727) never rewrites
+    /// this field, it adds to [`Self::renewed_capacity`] instead. See
+    /// [`Self::effective_hard_limit`].
     pub hard_limit: ResourceAmount,
+    /// The sum of every renewal grant against this task
+    /// (`task_budget_renewals`), read fresh each time — zero for every
+    /// task that has never had a renewal granted, which is every task
+    /// today (HORO-1727 ships no production path that creates one). See
+    /// [`Self::effective_hard_limit`].
+    pub renewed_capacity: ResourceAmount,
     pub initial_completion_reserve: ResourceAmount,
     /// The live, protected reserve. Shrinks when `RequiredWork` draws
     /// against it; restored on refund/release/expiry.
@@ -275,6 +284,22 @@ pub struct TaskBudget {
     pub reservation_schema_version: String,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
+}
+
+impl TaskBudget {
+    /// `hard_limit + renewed_capacity` (HORO-1727) — the ceiling every
+    /// admission/reservation read site must compare against instead of
+    /// the raw, immutable `hard_limit` alone. With no renewal ever
+    /// granted (`renewed_capacity` zero, true for every task today),
+    /// this is exactly `hard_limit` — the same value, not merely
+    /// numerically equal, since `ResourceAmount::from_kind_f64` of
+    /// `hard_limit.as_f64() + 0.0` reconstructs the identical amount.
+    pub fn effective_hard_limit(&self) -> ResourceAmount {
+        ResourceAmount::from_kind_f64(
+            self.resource_kind,
+            self.hard_limit.as_f64() + self.renewed_capacity.as_f64(),
+        )
+    }
 }
 
 /// Every economic figure about one task's envelope, read in one go
@@ -315,6 +340,14 @@ pub struct TaskBudget {
 pub struct BudgetSnapshot {
     kind: crate::resource_amount::ResourceKind,
     hard_limit: f64,
+    /// Capacity granted via renewal (HORO-1727), on top of `hard_limit`.
+    /// Zero for every task that has never had a renewal granted — which
+    /// is every task today, since nothing in production can create one
+    /// (see `renewal_not_wired_live`). `#[serde(default)]` so a
+    /// `BudgetSnapshot` serialized before this field existed still
+    /// deserializes (as zero granted, i.e. unchanged behavior).
+    #[serde(default)]
+    granted: f64,
     completion_reserve: f64,
     settled: f64,
     active: f64,
@@ -323,8 +356,9 @@ pub struct BudgetSnapshot {
 
 impl BudgetSnapshot {
     /// Builds a snapshot from the figures a single ledger transaction
-    /// read. Only the ledger has a legitimate reason to call this; it is
-    /// public because the ledger is a separate crate, not because a
+    /// read, for a task that has never had a renewal granted (`granted`
+    /// is zero). Only the ledger has a legitimate reason to call this; it
+    /// is public because the ledger is a separate crate, not because a
     /// caller holding four loose numbers should assemble one.
     ///
     /// `const` so a test fixture can be a `const` item: a snapshot
@@ -341,6 +375,34 @@ impl BudgetSnapshot {
         Self {
             kind,
             hard_limit,
+            granted: 0.0,
+            completion_reserve,
+            settled,
+            active,
+            reservation_count,
+        }
+    }
+
+    /// Same as [`Self::new`], for a task that has one or more renewal
+    /// grants on top of `hard_limit` (HORO-1727). A separate constructor
+    /// rather than a new parameter on [`Self::new`] — that `const fn` has
+    /// roughly three dozen call sites across this workspace, none of
+    /// which involve a renewal, and giving it a sixth positional
+    /// parameter would force every one of them to spell out an explicit
+    /// `0.0` for no benefit.
+    pub const fn new_with_granted(
+        kind: crate::resource_amount::ResourceKind,
+        hard_limit: f64,
+        granted: f64,
+        completion_reserve: f64,
+        settled: f64,
+        active: f64,
+        reservation_count: u64,
+    ) -> Self {
+        Self {
+            kind,
+            hard_limit,
+            granted,
             completion_reserve,
             settled,
             active,
@@ -355,14 +417,36 @@ impl BudgetSnapshot {
         self.kind
     }
 
-    /// The task's whole envelope — the ceiling in force for the life of
-    /// the task. `LedgerStore::initialize_task_budget` writes it once and
-    /// never overwrites it, so for a given task this is both the
-    /// *original configured* and the *current effective* ceiling; they
-    /// cannot drift apart. The daemon's configured default can and does
-    /// drift from it, which is a different scope and reported as one.
-    pub fn total(&self) -> ResourceAmount {
+    /// The task's *original*, immutable ceiling as configured at
+    /// admission — never changed by a renewal grant. See [`Self::granted`]
+    /// for how much the *effective* ceiling has been extended beyond this,
+    /// and [`Self::total`] for the two combined. Exposed separately,
+    /// rather than collapsed into one number, because an audit surface
+    /// that cannot tell "what was originally authorized" from "what was
+    /// later granted" cannot answer the question it exists to answer.
+    pub fn original_limit(&self) -> ResourceAmount {
         ResourceAmount::from_kind_f64(self.kind, self.hard_limit)
+    }
+
+    /// Capacity granted via renewal (HORO-1727), on top of
+    /// [`Self::original_limit`]. Zero for every task that has never had a
+    /// renewal granted.
+    pub fn granted(&self) -> ResourceAmount {
+        ResourceAmount::from_kind_f64(self.kind, self.granted)
+    }
+
+    /// The task's whole envelope, *as it stands right now*:
+    /// `original_limit + granted`. `LedgerStore::initialize_task_budget`
+    /// writes `original_limit` once and never overwrites it, and a
+    /// renewal grant never rewrites it either — only adds to `granted` —
+    /// so for a task with no renewal this is exactly `original_limit`,
+    /// unchanged from before HORO-1727. [`Self::remaining`] and
+    /// [`Self::utilization`] are both computed against *this* figure, not
+    /// `original_limit` alone, so a rendering surface's "total" always
+    /// agrees with its own "remaining"/"percent used" — see module docs
+    /// on why that agreement is the whole point of this type.
+    pub fn total(&self) -> ResourceAmount {
+        ResourceAmount::from_kind_f64(self.kind, self.hard_limit + self.granted)
     }
 
     /// What has actually been consumed: the sum of settled reservations.
@@ -400,7 +484,7 @@ impl BudgetSnapshot {
     pub fn remaining(&self) -> Headroom {
         Headroom {
             kind: self.kind,
-            value: self.hard_limit - self.settled - self.active,
+            value: self.hard_limit + self.granted - self.settled - self.active,
         }
     }
 
@@ -417,10 +501,11 @@ impl BudgetSnapshot {
     /// `None` when the limit is not a positive finite number, because a
     /// share of nothing is not zero pressure, it is no reading at all.
     pub fn utilization(&self) -> Option<f64> {
-        if !self.hard_limit.is_finite() || self.hard_limit <= 0.0 {
+        let total = self.hard_limit + self.granted;
+        if !total.is_finite() || total <= 0.0 {
             return None;
         }
-        let value = (self.settled + self.active) / self.hard_limit;
+        let value = (self.settled + self.active) / total;
         value.is_finite().then_some(value)
     }
 
@@ -805,5 +890,64 @@ mod budget_snapshot_tests {
         let quota = BudgetSnapshot::new(ResourceKind::QuotaPercent, 100.0, 20.0, 38.0, 0.0, 1);
         assert_eq!(quota.total(), ResourceAmount::QuotaPercent(100.0));
         assert_eq!(quota.used(), ResourceAmount::QuotaPercent(38.0));
+    }
+
+    // -- HORO-1727: bounded renewal mechanism -----------------------------
+
+    #[test]
+    fn new_defaults_granted_to_zero_and_matches_new_with_granted_zero() {
+        let via_new = partially_spent();
+        let via_granted = BudgetSnapshot::new_with_granted(
+            ResourceKind::Tokens,
+            150_000.0,
+            0.0,
+            30_000.0,
+            18_000.0,
+            70_000.0,
+            2,
+        );
+        assert_eq!(
+            via_new, via_granted,
+            "new() must be identical to new_with_granted(.., granted: 0.0, ..)"
+        );
+    }
+
+    #[test]
+    fn granted_extends_total_and_remaining_but_not_original_limit() {
+        let renewed = BudgetSnapshot::new_with_granted(
+            ResourceKind::Tokens,
+            150_000.0,
+            40_000.0,
+            30_000.0,
+            18_000.0,
+            70_000.0,
+            2,
+        );
+        assert_eq!(renewed.original_limit(), ResourceAmount::Tokens(150_000));
+        assert_eq!(renewed.granted(), ResourceAmount::Tokens(40_000));
+        assert_eq!(renewed.total(), ResourceAmount::Tokens(190_000));
+        // remaining = (150_000 + 40_000) - 18_000 - 70_000 = 102_000
+        assert_eq!(renewed.remaining().value, 102_000.0);
+    }
+
+    #[test]
+    fn granted_keeps_total_remaining_and_utilization_reconciled() {
+        let renewed = BudgetSnapshot::new_with_granted(
+            ResourceKind::Tokens,
+            150_000.0,
+            40_000.0,
+            30_000.0,
+            18_000.0,
+            70_000.0,
+            2,
+        );
+        let sum = renewed.used().as_f64() + renewed.reserved().as_f64() + renewed.remaining().value;
+        assert_eq!(
+            sum,
+            renewed.total().as_f64(),
+            "a granted envelope must reconcile exactly like an unrenewed one"
+        );
+        let utilization = renewed.utilization().unwrap();
+        assert!((utilization - 88_000.0 / 190_000.0).abs() < 1e-12);
     }
 }

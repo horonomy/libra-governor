@@ -689,7 +689,13 @@ impl LedgerStore {
                 outcome: CheckOutcome::NotApplicable,
             });
         };
-        let expected = budget.hard_limit.as_f64() - settled - active_holds;
+        // `effective_hard_limit`, not raw `hard_limit` (HORO-1727):
+        // `headroom` comes from `LedgerStore::available`, which now reads
+        // the effective ceiling too (see its doc comment) — this
+        // reconciliation must compare against the same ceiling `headroom`
+        // was computed from, or every task with a renewal grant would be
+        // permanently `Discrepant` by exactly the granted amount.
+        let expected = budget.effective_hard_limit().as_f64() - settled - active_holds;
         let delta = (expected - headroom.value).abs();
         let outcome = if delta <= budget.resource_kind.reconciliation_epsilon() {
             CheckOutcome::Reconciled
