@@ -119,6 +119,7 @@ fn collect_findings(daemon_present: bool) -> Vec<Finding> {
     findings.push(codex_hooks_finding());
     findings.push(quota_source_mode_finding());
     findings.push(pacing_authority_finding());
+    findings.push(execution_identity_capture_finding());
     findings
 }
 
@@ -152,6 +153,65 @@ fn quota_source_mode_finding() -> Finding {
             "quota-source mode: {}",
             libra_governor_quota_source::describe_active_mode()
         ),
+    }
+}
+
+/// HORO-1603 AC2: a static, side-effect-free statement of which
+/// `horonomy/.github` execution-identity dimensions (`session`, `agent`,
+/// `turn`, `task`, `host`) this build's own write path actually
+/// populates on a real decision — never a reading of any stored row
+/// (this doctor must not query the ledger for this, mirroring this
+/// module's own "a diagnostic must not change the thing it is
+/// diagnosing" rule by never pretending to read it either).
+///
+/// Mirrors Circinus's `execution_identity_capture` check
+/// (`src/circinus/diagnostics/checks.py`) in spirit, not in code: Libra
+/// has no per-decision `ExecutionIdentity` envelope at all today. Only
+/// `session` is captured, as a raw `session_id` column on
+/// `session_preflights`/`session_tasks`/`shadow_runtime_decisions`
+/// (`crates/daemon/src/server.rs`), not as a persisted envelope.
+/// `agent`/`turn` are parsed by the hook into an envelope
+/// (`crates/cli/src/agent/identity.rs`) that only ever reaches a
+/// redacted log line — no daemon request carries them, and the
+/// `ExecutionOwner` IPC that would persist them (HORO-1600,
+/// `crates/ledger/src/execution_owner.rs`) has no production caller
+/// yet (only `crates/daemon/tests/execution_owner.rs` sends it).
+///
+/// `task` is a false-friend case, not a clean "field is missing": every
+/// decision row has its own `task_id`, but that is Libra's own economic
+/// `TaskId` minted per session (see `crates/domain/src/execution_identity.rs`'s
+/// own doc comment and ADR-0002) — a different concept from the
+/// contract's provider-native `turn`/`task` dimension. Reporting it as
+/// captured would be exactly the fabricated-precision failure HORO-1597
+/// exists to close. `host` is implicit (one daemon/one ledger per state
+/// directory, not per machine — `LIBRA_GOVERNOR_STATE_DIR` can override
+/// it) and a real `host_id` is generated but never recorded on a
+/// decision.
+///
+/// `Severity::Ok`, matching `quota_source_mode_finding`/
+/// `pacing_authority_finding` above: partial adoption of the
+/// execution-identity contract is documented, expected scope, not a
+/// defect to warn about.
+fn execution_identity_capture_finding() -> Finding {
+    Finding {
+        id: "execution_identity_capture",
+        severity: Severity::Ok,
+        message: "session: captured (the host's real session_id is sent on every \
+                  Preflight/ToolInvoked/Finalize request and keys session_preflights, \
+                  session_tasks and shadow_runtime_decisions rows -- as a raw session_id \
+                  column, not a persisted ExecutionIdentity envelope) -- agent/turn: not \
+                  captured (hooks parse agent_id/turn_id into an envelope that is only \
+                  written to a redacted log line; no daemon request carries them, and the \
+                  ExecutionOwner IPC that would persist them has no production caller yet) \
+                  -- task: not captured (every decision row has a task_id, but it is \
+                  Libra's own economic TaskId minted per session -- a different concept \
+                  from the contract's provider-native turn/task dimension) -- host: \
+                  implicit (one daemon and one ledger per state directory; a generated \
+                  host_id exists but is not recorded on decisions) -- not a defect: partial \
+                  adoption of the execution-identity contract is expected (horonomy/.github \
+                  governance/product/execution-identity-contract.md#partial-adoption-is-expected-not-a-defect); \
+                  remaining dimensions tracked under HORO-1603, owner-IPC wiring under HORO-1714"
+            .to_string(),
     }
 }
 
@@ -1044,5 +1104,25 @@ mod tests {
         assert_eq!(finding.severity, Severity::Warn);
         assert!(finding.message.contains("predates"));
         assert!(!finding.message.contains("remove the stale socket"));
+    }
+
+    #[test]
+    fn execution_identity_capture_is_truthful_about_partial_adoption() {
+        let finding = execution_identity_capture_finding();
+        assert_eq!(finding.id, "execution_identity_capture");
+        assert_eq!(finding.severity, Severity::Ok);
+        assert!(finding.message.contains("session: captured"));
+        assert!(finding.message.contains("agent/turn: not captured"));
+        assert!(finding.message.contains("task: not captured"));
+        assert!(finding.message.contains("TaskId"));
+        assert!(finding.message.contains("host: implicit"));
+        assert!(finding
+            .message
+            .contains("#partial-adoption-is-expected-not-a-defect"));
+        // Never claim a dimension is captured when it isn't -- the exact
+        // fabricated-precision failure this check exists to avoid.
+        assert!(!finding.message.contains("agent: captured"));
+        assert!(!finding.message.contains("turn: captured"));
+        assert!(!finding.message.contains("task: captured"));
     }
 }
