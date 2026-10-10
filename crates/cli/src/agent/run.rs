@@ -15,13 +15,52 @@
 use std::io::Read;
 use std::path::PathBuf;
 
-use libra_governor_protocol::{FinalizeOutcome, Request, Response};
+use libra_governor_domain::{
+    AssociationUnavailable, ExecutionIdentity, EXECUTION_ASSOCIATION_VERSION,
+};
+use libra_governor_protocol::{
+    ExecutionEffect, ExecutionOperation, ExecutionOwnerOutcome, ExecutionOwnerRequest,
+    FinalizeOutcome, NativeExecutionContext, Request, Response,
+};
 
 use super::event::NormalizedEvent;
 use super::normalize::{normalize, EntryPoint, NormalizeError};
 use super::render;
 use super::AgentKind;
 use crate::client;
+
+/// HORO-1714 decision gate (2026-10-10): the Codex ExecutionOwner route is
+/// off by default. The founder's authorization for decisions A/B/C
+/// explicitly excludes "activation of unverified economic effects" --
+/// building the route is authorized, switching it on for real traffic is a
+/// separate decision requiring real-host Codex verification first. Claude
+/// Code never uses this route regardless of the flag: its byte-exact
+/// contract with the legacy path (`crates/cli/tests/agent_contract.rs`)
+/// stays untouched.
+fn codex_owner_route_enabled() -> bool {
+    std::env::var("LIBRA_GOVERNOR_CODEX_EXECUTION_OWNER")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// A short, honest description of why the owner route produced no
+/// economic effect -- never a claim of success, never silently dropped.
+fn no_effect_text(reason: AssociationUnavailable) -> &'static str {
+    match reason {
+        AssociationUnavailable::Missing => "no bound task exists yet for this lane",
+        AssociationUnavailable::Ambiguous => "association is ambiguous; refusing to guess",
+        AssociationUnavailable::Stale => "this turn has been superseded",
+        AssociationUnavailable::Unsupported => "this event's identity shape is unsupported",
+        AssociationUnavailable::ReplayConflict => "native reference was reused across turns",
+    }
+}
+
+/// Bounded retries for the owner round trip only -- never for the legacy
+/// path, which already has its own best-effort failure handling. A lost
+/// response or storage error is retried a small, fixed number of times
+/// within the hook's own timeout; this is not an unbounded loop and never
+/// retries a result that was actually returned (only transport failure).
+const OWNER_ROUTE_MAX_ATTEMPTS: u32 = 3;
 
 /// Logs `message` prefixed with `agent`'s label — the only place
 /// [`AgentKind`] is observable in this module's behavior; it never
@@ -47,7 +86,11 @@ fn print_context(message: &str) {
 /// Builds this event's [`ExecutionIdentity`] (HORO-1599) and logs a
 /// redacted summary line. Never fails the hook: a host_id or validation
 /// error here is logged and swallowed, exactly like every other
-/// best-effort failure in this module.
+/// best-effort failure in this module. Returns the captured identity so
+/// the Codex owner route (HORO-1714) can reuse the exact same capture for
+/// both identity slots a request needs -- two separate captures would
+/// disagree on `observed_at` and the owner would refuse them as
+/// `Ambiguous`.
 fn capture_and_log_identity(
     log_path: &Result<PathBuf, libra_governor_daemon::paths::PathsError>,
     agent: AgentKind,
@@ -55,7 +98,7 @@ fn capture_and_log_identity(
     session_id: &str,
     agent_id: Option<&str>,
     turn_id: Option<&str>,
-) {
+) -> Option<ExecutionIdentity> {
     let host_id = match libra_governor_daemon::paths::ensure_state_dir()
         .map_err(|e| e.to_string())
         .and_then(|dir| super::identity::resolve_host_id(&dir).map_err(|e| e.to_string()))
@@ -67,7 +110,7 @@ fn capture_and_log_identity(
                 agent,
                 &format!("{entry_label}: could not resolve host_id: {e}"),
             );
-            return;
+            return None;
         }
     };
 
@@ -93,6 +136,7 @@ fn capture_and_log_identity(
                     identity.lineage_status(),
                 ),
             );
+            Some(identity)
         }
         Err(e) => {
             log(
@@ -100,6 +144,7 @@ fn capture_and_log_identity(
                 agent,
                 &format!("{entry_label}: execution identity invalid, not captured: {e}"),
             );
+            None
         }
     }
 }
@@ -173,7 +218,7 @@ pub(crate) fn run_prompt_submit_with_input(agent: AgentKind, raw: &str) {
         }
     };
 
-    capture_and_log_identity(
+    let identity = capture_and_log_identity(
         &log_path,
         agent,
         "preflight",
@@ -206,6 +251,95 @@ pub(crate) fn run_prompt_submit_with_input(agent: AgentKind, raw: &str) {
             return;
         }
     };
+
+    // HORO-1714: Codex, and only behind the default-off gate, uses the
+    // ExecutionOwner route exclusively -- never falling back to the legacy
+    // Preflight path below once this branch is taken, even on a no-effect
+    // outcome. Claude Code never reaches this branch regardless of the
+    // flag.
+    if agent == AgentKind::Codex && codex_owner_route_enabled() {
+        let Some(identity) = identity else {
+            print_context("[libra-governor] no effect: execution identity unavailable.");
+            return;
+        };
+        let request = Request::ExecutionOwner {
+            event: Box::new(ExecutionOwnerRequest {
+                association_version: EXECUTION_ASSOCIATION_VERSION,
+                identity: identity.clone(),
+                native_context: NativeExecutionContext {
+                    identity,
+                    operation: ExecutionOperation::Prompt {
+                        task_hint: prompt,
+                        cwd,
+                        // Codex exposes no native predecessor field; the
+                        // owner's own finalized-predecessor succession
+                        // (decision B) is the only legal path to a second
+                        // turn on an existing lane.
+                        supersedes_turn: None,
+                    },
+                },
+            }),
+        };
+        match client::roundtrip(&stream, request) {
+            Ok(Response::ExecutionOwner(outcome)) => match *outcome {
+                ExecutionOwnerOutcome::Applied {
+                    effect: boxed_effect,
+                    ..
+                } => match *boxed_effect {
+                    ExecutionEffect::Prompt { result } => {
+                        print_context(&render::format_additional_context(&result))
+                    }
+                    other => {
+                        log(
+                            &log_path,
+                            agent,
+                            &format!("preflight: unexpected effect for Prompt: {other:?}"),
+                        );
+                        print_context(
+                            "[libra-governor] preflight skipped: unexpected daemon response.",
+                        );
+                    }
+                },
+                ExecutionOwnerOutcome::Duplicate { .. } => print_context(
+                    "[libra-governor] no effect: this prompt was already applied (replay).",
+                ),
+                ExecutionOwnerOutcome::Unavailable { reason } => print_context(&format!(
+                    "[libra-governor] no effect: {}.",
+                    no_effect_text(reason)
+                )),
+                ExecutionOwnerOutcome::Resolved { .. } => {
+                    log(
+                        &log_path,
+                        agent,
+                        "preflight: Resolved is not a Prompt outcome",
+                    );
+                    print_context(
+                        "[libra-governor] preflight skipped: unexpected daemon response.",
+                    );
+                }
+            },
+            Ok(other) => {
+                log(
+                    &log_path,
+                    agent,
+                    &format!("unexpected response kind for ExecutionOwner: {other:?}"),
+                );
+                print_context("[libra-governor] preflight skipped: unexpected daemon response.");
+            }
+            Err(e) => {
+                log(
+                    &log_path,
+                    agent,
+                    &format!("execution owner request failed: {e}"),
+                );
+                print_context(
+                    "[libra-governor] preflight unavailable: request to daemon failed. \
+                     Proceeding without governance.",
+                );
+            }
+        }
+        return;
+    }
 
     let request = Request::Preflight {
         task_hint: prompt,
@@ -264,14 +398,14 @@ pub(crate) fn run_tool_completed_with_input(agent: AgentKind, raw: &str) {
         }
     };
 
-    let (session_id, tool_name, turn_id, agent_id) = match event {
+    let (session_id, tool_name, native_call_id, turn_id, agent_id) = match event {
         NormalizedEvent::ToolCompleted {
             session_id,
             tool_name,
-            native_call_id: _,
+            native_call_id,
             turn_id,
             agent_id,
-        } => (session_id, tool_name, turn_id, agent_id),
+        } => (session_id, tool_name, native_call_id, turn_id, agent_id),
         NormalizedEvent::RecognizedUnwired { hook_event_name } => {
             log(
                 &log_path,
@@ -295,7 +429,7 @@ pub(crate) fn run_tool_completed_with_input(agent: AgentKind, raw: &str) {
         }
     };
 
-    capture_and_log_identity(
+    let identity = capture_and_log_identity(
         &log_path,
         agent,
         "post-tool-use",
@@ -315,6 +449,87 @@ pub(crate) fn run_tool_completed_with_input(agent: AgentKind, raw: &str) {
             return;
         }
     };
+
+    if agent == AgentKind::Codex && codex_owner_route_enabled() {
+        let Some(identity) = identity else {
+            log(
+                &log_path,
+                agent,
+                "post-tool-use: no effect: execution identity unavailable",
+            );
+            return;
+        };
+        let Some(native_call_id) = native_call_id else {
+            log(
+                &log_path,
+                agent,
+                "post-tool-use: no effect: no native tool_use_id reported for this call",
+            );
+            return;
+        };
+        let request = Request::ExecutionOwner {
+            event: Box::new(ExecutionOwnerRequest {
+                association_version: EXECUTION_ASSOCIATION_VERSION,
+                identity: identity.clone(),
+                native_context: NativeExecutionContext {
+                    identity,
+                    operation: ExecutionOperation::Tool {
+                        native_call_id,
+                        tool_name,
+                    },
+                },
+            }),
+        };
+        // A missing/unreachable response is retried a small bounded
+        // number of times (transport failure only -- never a result that
+        // was actually returned); each attempt opens its own connection
+        // since the stream from a failed attempt cannot be trusted.
+        let mut last_error = None;
+        for _ in 0..OWNER_ROUTE_MAX_ATTEMPTS {
+            let stream = match client::connect_only(&socket_path) {
+                Ok(stream) => stream,
+                Err(e) => {
+                    last_error = Some(e.to_string());
+                    continue;
+                }
+            };
+            match client::roundtrip(&stream, request.clone()) {
+                Ok(Response::ExecutionOwner(outcome)) => {
+                    if let ExecutionOwnerOutcome::Unavailable { reason } = *outcome {
+                        log(
+                            &log_path,
+                            agent,
+                            &format!("post-tool-use: no effect: {}", no_effect_text(reason)),
+                        );
+                    }
+                    last_error = None;
+                    break;
+                }
+                Ok(other) => {
+                    log(
+                        &log_path,
+                        agent,
+                        &format!(
+                            "post-tool-use: unexpected response kind for ExecutionOwner: {other:?}"
+                        ),
+                    );
+                    last_error = None;
+                    break;
+                }
+                Err(e) => {
+                    last_error = Some(e.to_string());
+                }
+            }
+        }
+        if let Some(e) = last_error {
+            log(
+                &log_path,
+                agent,
+                &format!("post-tool-use: execution owner request failed after retries: {e}"),
+            );
+        }
+        return;
+    }
 
     let request = Request::ToolInvoked {
         session_id,
@@ -390,7 +605,7 @@ pub(crate) fn run_turn_completed_with_input(agent: AgentKind, raw: &str) {
         }
     };
 
-    capture_and_log_identity(
+    let identity = capture_and_log_identity(
         &log_path,
         agent,
         "stop",
@@ -424,6 +639,83 @@ pub(crate) fn run_turn_completed_with_input(agent: AgentKind, raw: &str) {
             return;
         }
     };
+
+    if agent == AgentKind::Codex && codex_owner_route_enabled() {
+        let Some(identity) = identity else {
+            log(
+                &log_path,
+                agent,
+                "stop: no effect: execution identity unavailable",
+            );
+            return;
+        };
+        let request = Request::ExecutionOwner {
+            event: Box::new(ExecutionOwnerRequest {
+                association_version: EXECUTION_ASSOCIATION_VERSION,
+                identity: identity.clone(),
+                native_context: NativeExecutionContext {
+                    identity,
+                    operation: ExecutionOperation::Stop {
+                        model,
+                        // The owner route's reader measures a session
+                        // window, not an agent/turn window, and would
+                        // cross-associate sibling usage -- the daemon
+                        // itself refuses any Some() here (Unsupported).
+                        // Never opened by this crate regardless.
+                        transcript_path: None,
+                    },
+                },
+            }),
+        };
+        match client::roundtrip(&stream, request) {
+            Ok(Response::ExecutionOwner(outcome)) => match *outcome {
+                ExecutionOwnerOutcome::Applied {
+                    effect: boxed_effect,
+                    ..
+                } => match *boxed_effect {
+                    ExecutionEffect::Stop { result } => match *result {
+                        FinalizeOutcome::Finalized(result) => {
+                            eprintln!("{}", render::format_receipt_summary(&result))
+                        }
+                        FinalizeOutcome::NoActiveTask => log(
+                            &log_path,
+                            agent,
+                            "stop: no active task for this session, safe no-op",
+                        ),
+                    },
+                    other => log(
+                        &log_path,
+                        agent,
+                        &format!("stop: unexpected effect for Stop: {other:?}"),
+                    ),
+                },
+                ExecutionOwnerOutcome::Duplicate { .. } => log(
+                    &log_path,
+                    agent,
+                    "stop: duplicate, already finalized (replay)",
+                ),
+                ExecutionOwnerOutcome::Unavailable { reason } => log(
+                    &log_path,
+                    agent,
+                    &format!("stop: no effect: {}", no_effect_text(reason)),
+                ),
+                ExecutionOwnerOutcome::Resolved { .. } => {
+                    log(&log_path, agent, "stop: Resolved is not a Stop outcome")
+                }
+            },
+            Ok(other) => log(
+                &log_path,
+                agent,
+                &format!("stop: unexpected response kind for ExecutionOwner: {other:?}"),
+            ),
+            Err(e) => log(
+                &log_path,
+                agent,
+                &format!("stop: execution owner request failed: {e}"),
+            ),
+        }
+        return;
+    }
 
     let request = Request::Finalize {
         session_id,
