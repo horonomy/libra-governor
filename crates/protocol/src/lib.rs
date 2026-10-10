@@ -45,7 +45,7 @@ pub use messages::{
     AdmissionPolicyReport, BudgetPosture, BudgetScope, CalibrationReportResult, ConfiguredBudget,
     DoctorResult, FinalizeOutcome, FinalizeResult, GatewayStatusResult, OutcomeRecordedOutcome,
     OutcomeRecordedResult, PreflightResult, ReconSummary, ReplanState, Request, RequestEnvelope,
-    Response, ResponseEnvelope, StatusResult, StatusScope, TaskSummary,
+    Response, ResponseEnvelope, SignedOutcomeClaimWire, StatusResult, StatusScope, TaskSummary,
 };
 
 /// The protocol version this build of the crate speaks. Bump on any
@@ -158,4 +158,13 @@ pub use messages::{
 /// `deny_unknown_fields`-enforced decoder cannot parse either. Same known
 /// limitation as every earlier bump: a long-lived v12 daemon must be
 /// restarted after upgrading.
-pub const PROTOCOL_VERSION: u32 = 13;
+///
+/// Bumped 13 -> 14 for HORO-1727 PR 5b's verified-provider signature
+/// plumbing: `Request::RecordOutcome` gained `signed_claim: Option<SignedOutcomeClaimWire>`
+/// — a v13 peer's `deny_unknown_fields`-enforced decoder cannot parse it.
+/// Still production-unreachable either way (ADR-0017): nothing populates
+/// `DaemonConfig::outcome_authority` with `Some` outside test code, so
+/// the new field is always `None` on a real push today. Same known
+/// limitation as every earlier bump: a long-lived v13 daemon must be
+/// restarted after upgrading.
+pub const PROTOCOL_VERSION: u32 = 14;

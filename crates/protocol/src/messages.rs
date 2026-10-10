@@ -144,7 +144,39 @@ pub enum Request {
         source_id: String,
         idempotency_key: String,
         outcome: ExecutionOutcome,
+        /// A verified-provider signature over this exact push (HORO-1727
+        /// PR 5b / ADR-0017). `None` for every ordinary push today.
+        /// Deliberately NOT a separate `outcome_kind`/`evidence_digest`
+        /// the caller asserts — the daemon derives both from this same
+        /// request's own `outcome` field before verifying, so a
+        /// signature can never describe content other than what is
+        /// actually persisted. See `SignedOutcomeClaimWire`'s own docs
+        /// for why `task_id`/`plan_id`/`idempotency_key` are not
+        /// repeated here either.
+        signed_claim: Option<SignedOutcomeClaimWire>,
     },
+}
+
+/// The signed portion of a `RecordOutcome` push that is NOT already a
+/// top-level field of [`Request::RecordOutcome`] (HORO-1727 PR 5b).
+/// `task_id`, `plan_id`, and `idempotency_key` are deliberately not
+/// duplicated here — the daemon signs/verifies using the same values
+/// already present on the surrounding request, so there is exactly one
+/// source of truth for what a claim is about, never two fields that
+/// could disagree.
+///
+/// Still production-unreachable (ADR-0017): nothing in `daemon::server`
+/// or `cli` ever constructs a `Some` value for `DaemonConfig::outcome_authority`,
+/// so even a caller who populates this field gets treated as
+/// `Unverified`, exactly like today.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignedOutcomeClaimWire {
+    /// Unix seconds. Checked against the daemon's configured clock-skew
+    /// tolerance, not trusted verbatim.
+    pub issued_at: u64,
+    /// `v1=<hex>` — the same wire shape `libra_governor_extension::sign`
+    /// produces.
+    pub signature: String,
 }
 
 /// Summary of one bounded reconnaissance run. Never contains raw file
@@ -1114,6 +1146,27 @@ mod tests {
             outcome: libra_governor_domain::ExecutionOutcome::Completed {
                 evidence: vec!["https://ci.example.com/runs/42".to_string()],
             },
+            signed_claim: None,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        let round_tripped: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(request, round_tripped);
+    }
+
+    #[test]
+    fn record_outcome_request_with_a_signed_claim_round_trips() {
+        let request = Request::RecordOutcome {
+            task_id: TaskId::new(),
+            plan_id: Some(PlanId::new()),
+            source_id: "example-provider".to_string(),
+            idempotency_key: "ci-run-42".to_string(),
+            outcome: libra_governor_domain::ExecutionOutcome::Completed {
+                evidence: vec!["https://ci.example.com/runs/42".to_string()],
+            },
+            signed_claim: Some(SignedOutcomeClaimWire {
+                issued_at: 1_700_000_000,
+                signature: "v1=deadbeef".to_string(),
+            }),
         };
         let json = serde_json::to_string(&request).unwrap();
         let round_tripped: Request = serde_json::from_str(&json).unwrap();

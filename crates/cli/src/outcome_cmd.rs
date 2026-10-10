@@ -65,6 +65,10 @@ pub fn run() {
         source_id: input.source_id,
         idempotency_key: input.idempotency_key,
         outcome: input.outcome,
+        // The manual CLI stays non-authoritative-only evidence/diagnostics
+        // (HORO-1727 Decision 3) — it has no secret to sign with, so this
+        // is never anything but `None`.
+        signed_claim: None,
     };
 
     match client::roundtrip(&stream, request) {

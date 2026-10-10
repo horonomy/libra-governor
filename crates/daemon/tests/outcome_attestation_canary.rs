@@ -113,6 +113,8 @@ fn config(dir: &Path, policy: Policy) -> DaemonConfig {
         gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER.to_string(),
         extensions: None,
         extension_runtime: std::sync::OnceLock::new(),
+
+        outcome_authority: None,
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
     }
 }
@@ -224,6 +226,7 @@ fn record_outcome(
             source_id: source_id.to_string(),
             idempotency_key: idempotency_key.to_string(),
             outcome,
+            signed_claim: None,
         },
     ) {
         Response::OutcomeRecorded(outcome) => outcome,
