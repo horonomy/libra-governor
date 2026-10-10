@@ -25,6 +25,17 @@ fn identity(provider: &str, agent: &str, turn: &str) -> ExecutionIdentity {
         .build_at(time::OffsetDateTime::now_utc())
         .unwrap()
 }
+/// HORO-1714 decision A (2026-10-10): a real, explicitly represented
+/// agent-absent event -- not a stand-in for a missing field elsewhere.
+/// `session` is a parameter (unlike `identity`'s hardcoded one) so callers
+/// can keep multiple agent-absent lanes distinct within one test.
+fn identity_no_agent(provider: &str, session: &str, turn: &str) -> ExecutionIdentity {
+    ExecutionIdentityBuilder::new("fixture-host", provider)
+        .provider_session_id(session)
+        .turn_id(turn)
+        .build_at(time::OffsetDateTime::now_utc())
+        .unwrap()
+}
 fn owner(identity: ExecutionIdentity, operation: Op) -> Request {
     Request::ExecutionOwner {
         event: Box::new(ExecutionOwnerRequest {
@@ -301,12 +312,26 @@ fn missing_richer_dimensions_mismatched_context_and_legacy_rows_never_guess() {
     assert!(matches!(legacy, Response::Preflight(_)));
     gap(f.outcome(owner(i.clone(), Op::Query {})), Gap::Missing);
     let task = applied(f.outcome(prompt(i.clone())));
-    for field in ["provider_session_id", "agent_id", "turn_id"] {
+    for field in ["provider_session_id", "turn_id"] {
         let mut wire = serde_json::to_value(&i).unwrap();
         wire.as_object_mut().unwrap().remove(field);
         gap(
             f.outcome(owner(serde_json::from_value(wire).unwrap(), Op::Query {})),
             Gap::Unsupported,
+        );
+    }
+    // HORO-1714 decision A (2026-10-10): removing `agent_id` no longer means
+    // "unsupported" -- it is a legitimate, distinct agent-absent lane. This
+    // one was never bound (the bound `i` above has an agent_id, so it lives
+    // on a different lane), so the correct result is Missing, not
+    // Unsupported -- proving the request was accepted and genuinely looked
+    // up, not refused as malformed.
+    {
+        let mut wire = serde_json::to_value(&i).unwrap();
+        wire.as_object_mut().unwrap().remove("agent_id");
+        gap(
+            f.outcome(owner(serde_json::from_value(wire).unwrap(), Op::Query {})),
+            Gap::Missing,
         );
     }
     let mut richer = serde_json::to_value(&i).unwrap();
@@ -804,4 +829,266 @@ fn assert_refused_without_effects(f: &mut Fixture, i: ExecutionIdentity) {
             .map(|table| f.count(table))
             .collect::<Vec<_>>()
     );
+}
+
+// HORO-1714 decisions A/B/C (2026-10-10): agent-absent lanes and owner-managed
+// succession with no native predecessor field. Real daemon/ledger effects via
+// the same `Fixture`/`send` harness as the rest of this file -- no mocks.
+
+#[test]
+fn agent_absent_prompt_is_a_distinct_lane_from_any_agent_present_one() {
+    let mut f = Fixture::new();
+    let no_agent = identity_no_agent("codex", "root-session", "turn-1");
+    let with_agent = identity("codex", "agent", "turn-1");
+    let a = applied(f.outcome(prompt(no_agent)));
+    let b = applied(f.outcome(prompt(with_agent)));
+    assert_ne!(a.task_id, b.task_id);
+}
+
+#[test]
+fn agent_absent_succession_is_refused_while_the_previous_turn_is_still_active() {
+    let mut f = Fixture::new();
+    let turn1 = identity_no_agent("codex", "succession-session", "turn-1");
+    applied(f.outcome(prompt(turn1)));
+    // turn-1 was never finalized (no Stop) -- a successor naming no
+    // predecessor must not be accepted just because the lane is agent-absent.
+    let turn2 = identity_no_agent("codex", "succession-session", "turn-2");
+    let before = f.count("plans");
+    gap(f.outcome(prompt(turn2)), Gap::Ambiguous);
+    assert_eq!(f.count("plans"), before);
+}
+
+#[test]
+fn agent_absent_succession_proceeds_once_the_previous_turn_is_finalized() {
+    let mut f = Fixture::new();
+    let turn1 = identity_no_agent("codex", "succession-session", "turn-1");
+    let first = applied(f.outcome(prompt(turn1.clone())));
+    applied(f.outcome(stop(turn1.clone())));
+    // Decision B: no native predecessor field exists for this provider, so
+    // the owner itself establishes the transition -- permitted only because
+    // turn-1 is now confirmed finalized, never inferred from timestamps,
+    // cwd, or a latest-session lookup.
+    let turn2 = identity_no_agent("codex", "succession-session", "turn-2");
+    let second = applied(f.outcome(prompt(turn2.clone())));
+    assert_eq!(first.task_id, second.task_id);
+    assert_ne!(first.plan_id, second.plan_id);
+    // Late events against the now-superseded turn-1 are stale, not applied,
+    // even though turn-1's own Stop already succeeded once.
+    for r in [
+        tool(turn1.clone(), "late-tool"),
+        stop(turn1.clone()),
+        prompt(turn1),
+    ] {
+        gap(f.outcome(r), Gap::Stale);
+    }
+    applied(f.outcome(tool(turn2.clone(), "current-tool")));
+    applied(f.outcome(stop(turn2)));
+    let t = f.ledger.task_trajectory(second.task_id).unwrap();
+    assert_eq!(t.receipts.len(), 2);
+}
+
+#[test]
+fn agent_absent_identities_differing_only_in_observed_at_are_ambiguous_not_same_acquisition() {
+    let mut f = Fixture::new();
+    let i = identity_no_agent("codex", "same-acquisition-session", "turn-1");
+    applied(f.outcome(prompt(i.clone())));
+    let mut wire = serde_json::to_value(&i).unwrap();
+    wire["observed_at"] = serde_json::json!((time::OffsetDateTime::now_utc()
+        + time::Duration::seconds(1))
+    .format(&time::format_description::well_known::Rfc3339)
+    .unwrap());
+    let drifted: ExecutionIdentity = serde_json::from_value(wire).unwrap();
+    // `handle()` compares `event.identity` against
+    // `event.native_context.identity` for exact equality, including
+    // `observed_at` -- these two copies must describe the same capture, not
+    // a later cache lookup that merely agrees on the position fields.
+    let mismatched = Request::ExecutionOwner {
+        event: Box::new(ExecutionOwnerRequest {
+            association_version: EXECUTION_ASSOCIATION_VERSION,
+            native_context: NativeExecutionContext {
+                identity: i,
+                operation: Op::Tool {
+                    native_call_id: "call".into(),
+                    tool_name: "Read".into(),
+                },
+            },
+            identity: drifted,
+        }),
+    };
+    gap(f.outcome(mismatched), Gap::Ambiguous);
+}
+
+#[test]
+fn agent_absent_lane_never_selects_or_finalizes_an_agent_present_lane() {
+    let mut f = Fixture::new();
+    let no_agent = identity_no_agent("codex", "isolation-session", "turn-1");
+    let with_agent = identity("codex", "agent", "turn-1");
+    let a = applied(f.outcome(prompt(no_agent.clone())));
+    let b = applied(f.outcome(prompt(with_agent.clone())));
+    applied(f.outcome(stop(no_agent)));
+    // Finalizing the agent-absent lane's turn must not touch the
+    // agent-present lane's own in-flight turn, or vice versa.
+    assert_eq!(
+        f.ledger.task_trajectory(a.task_id).unwrap().receipts.len(),
+        1
+    );
+    assert_eq!(
+        f.ledger.task_trajectory(b.task_id).unwrap().receipts.len(),
+        0
+    );
+    applied(f.outcome(tool(with_agent.clone(), "still-active")));
+    applied(f.outcome(stop(with_agent)));
+    assert_eq!(
+        f.ledger.task_trajectory(b.task_id).unwrap().receipts.len(),
+        1
+    );
+}
+
+#[test]
+fn concurrent_agent_absent_successors_against_one_finalized_turn_commit_exactly_once() {
+    // Decision B's atomicity claim does not rest on any single reader
+    // seeing the right value a moment earlier -- it rests on the guarded
+    // compare-and-swap inside one `BEGIN IMMEDIATE` transaction per request.
+    // Proven here with real threads and real SQLite, not a mock, for exactly
+    // the same reason `concurrent_connections_commit_one_prompt_and_preserve_all_other_lanes`
+    // above does.
+    let dir = tempfile::tempdir().unwrap();
+    let seed = LedgerStore::open(dir.path().join("ledger.sqlite3")).unwrap();
+    drop(seed);
+    // Finalize turn-0 on the real shared ledger file via a one-off socket,
+    // so the race below starts from an already-finalized predecessor.
+    {
+        let cfg = config(dir.path(), "setup");
+        let listener = UnixListener::bind(&cfg.socket_path).unwrap();
+        let mut ledger = LedgerStore::open(&cfg.ledger_path).unwrap();
+        let turn0 = identity_no_agent("codex", "concurrent-succession-session", "turn-0");
+        let Response::ExecutionOwner(outcome) = send(
+            &listener,
+            &mut ledger,
+            &cfg,
+            prompt(turn0.clone()),
+            PROTOCOL_VERSION,
+        ) else {
+            panic!("setup prompt failed")
+        };
+        assert!(matches!(*outcome, Outcome::Applied { .. }));
+        let Response::ExecutionOwner(outcome) =
+            send(&listener, &mut ledger, &cfg, stop(turn0), PROTOCOL_VERSION)
+        else {
+            panic!("setup stop failed")
+        };
+        assert!(matches!(*outcome, Outcome::Applied { .. }));
+    }
+    const RACERS: usize = 6;
+    let gate = Arc::new(std::sync::Barrier::new(RACERS));
+    let mut handles = vec![];
+    for index in 0..RACERS {
+        let cfg = config(dir.path(), &format!("racer{index}"));
+        let listener = UnixListener::bind(&cfg.socket_path).unwrap();
+        let gate = gate.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut ledger = LedgerStore::open(&cfg.ledger_path).unwrap();
+            let i = identity_no_agent(
+                "codex",
+                "concurrent-succession-session",
+                &format!("turn-racer-{index}"),
+            );
+            gate.wait();
+            let Response::ExecutionOwner(outcome) =
+                send(&listener, &mut ledger, &cfg, prompt(i), PROTOCOL_VERSION)
+            else {
+                panic!("racer error")
+            };
+            *outcome
+        }));
+    }
+    let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let applied_count = outcomes
+        .iter()
+        .filter(|o| matches!(o, Outcome::Applied { .. }))
+        .count();
+    let ambiguous_count = outcomes
+        .iter()
+        .filter(|o| {
+            matches!(
+                o,
+                Outcome::Unavailable {
+                    reason: Gap::Ambiguous
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        applied_count, 1,
+        "exactly one successor must win: {outcomes:?}"
+    );
+    assert_eq!(ambiguous_count, RACERS - 1);
+    let conn = rusqlite::Connection::open(dir.path().join("ledger.sqlite3")).unwrap();
+    let plans: u64 = conn
+        .query_row("SELECT COUNT(*) FROM plans", [], |r| r.get(0))
+        .unwrap();
+    // turn-0's own plan plus exactly one successor's -- never more than one
+    // economic effect from the race, regardless of how many racers lost.
+    assert_eq!(plans, 2);
+}
+
+#[test]
+fn agent_absent_stop_settles_conservatively_with_usage_known_false_never_zero() {
+    // Decision C: `usage_known=false` is an honest lifecycle observation,
+    // never proof of zero consumption. The owner route forces
+    // `transcript_path: None` for Codex today (no agent-scoped usage
+    // measurement exists yet), so this exercises the real, already-existing
+    // conservative-settlement path end to end and pins it against
+    // regressing into a fabricated zero.
+    let mut f = Fixture::new();
+    let i = identity_no_agent("codex", "usage-session", "turn-1");
+    let target = applied(f.outcome(prompt(i.clone())));
+    applied(f.outcome(stop(i.clone())));
+    let conn = rusqlite::Connection::open(&f.cfg.ledger_path).unwrap();
+    let (amount, settled_amount, usage_known): (f64, Option<f64>, Option<i64>) = conn
+        .query_row(
+            "SELECT amount, settled_amount, usage_known FROM reservations WHERE task_id=?1",
+            [target.task_id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        usage_known,
+        Some(0),
+        "unknown usage must be recorded as false, not left ambiguous"
+    );
+    let settled = settled_amount.expect("settlement must have happened");
+    assert!(
+        settled > 0.0,
+        "unknown usage must settle conservatively at the reserved amount, never 0: got {settled}"
+    );
+    assert_eq!(settled, amount, "with usage unknown, settled_amount must equal the full reservation, never a fabricated measured amount");
+    let receipts: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT actual_usage_json FROM receipts WHERE task_id=?1")
+            .unwrap();
+        stmt.query_map([target.task_id.to_string()], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(receipts.len(), 1);
+    let usage: serde_json::Value = serde_json::from_str(&receipts[0]).unwrap();
+    assert_eq!(
+        usage,
+        serde_json::json!([]),
+        "unknown usage must be an empty actual-usage list, never a zero-valued entry"
+    );
+    // A second Stop against the same unsuperseded turn is an exact replay
+    // hit, not a second settlement -- Stale would require a newer turn to
+    // have superseded this one first, which nothing here does.
+    assert!(matches!(f.outcome(stop(i)), Outcome::Duplicate { target: t } if t == target));
+    let settlements: u64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM reservations WHERE task_id=?1 AND state='settled'",
+            [target.task_id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(settlements, 1);
 }
