@@ -52,9 +52,7 @@ use libra_governor_extension::{
     ProviderClient, ValidatedEventsConfig, ValidatedSurfaceConfig, WireVerdict,
     MAX_ADVISORY_CRITERIA, MAX_ADVISORY_CRITERION_CHARS,
 };
-use libra_governor_ledger::{
-    BusinessContextInsert, LedgerStore, OutcomeAttestationInsert, ReserveOutcome, ReserveRequest,
-};
+use libra_governor_ledger::{BusinessContextInsert, LedgerStore, ReserveOutcome, ReserveRequest};
 use libra_governor_protocol::{
     wire, AdmissionPolicyReport, BudgetPosture, BudgetSnapshot, CalibrationReportResult,
     ConfiguredBudget, DoctorResult, FinalizeOutcome, FinalizeResult, GatewayStatusResult,
@@ -2034,10 +2032,6 @@ fn handle_record_outcome(
 ) -> Result<OutcomeRecordedOutcome, DaemonError> {
     let now = time::OffsetDateTime::now_utc();
 
-    if !ledger.task_exists(task_id)? {
-        return Ok(OutcomeRecordedOutcome::NoSuchTask);
-    }
-
     let stored_source_id = format!("unverified:{source_id}");
     let source = AttestationSource::Unverified {
         claimed_source_id: source_id.to_string(),
@@ -2050,27 +2044,36 @@ fn handle_record_outcome(
     let outcome_kind = outcome_kind_str(&outcome);
     let evidence_json = serde_json::to_string(outcome.evidence())?;
 
-    let inserted = ledger.insert_outcome_attestation(OutcomeAttestationInsert {
-        id: &uuid::Uuid::new_v4().to_string(),
+    let result = ledger.record_outcome_attestation(
+        &uuid::Uuid::new_v4().to_string(),
         task_id,
         plan_id,
-        source: "unverified",
-        source_id: Some(&stored_source_id),
+        "unverified",
+        Some(&stored_source_id),
         outcome_kind,
-        evidence_json: &evidence_json,
+        &evidence_json,
         idempotency_key,
         authoritative,
-        attested_at: now,
-    })?;
-    if !inserted {
-        return Ok(OutcomeRecordedOutcome::Duplicate);
-    }
+        now,
+    )?;
 
-    let receipt_updated = if authoritative {
-        let outcome_json = serde_json::to_string(&outcome)?;
-        ledger.promote_receipt_outcome(task_id, plan_id, &outcome_json)?
-    } else {
-        false
+    let (contract_revision, receipt_updated) = match result {
+        libra_governor_ledger::RecordAttestationOutcome::NoSuchTask => {
+            return Ok(OutcomeRecordedOutcome::NoSuchTask);
+        }
+        libra_governor_ledger::RecordAttestationOutcome::NoSuchPlan => {
+            return Ok(OutcomeRecordedOutcome::NoSuchPlan);
+        }
+        libra_governor_ledger::RecordAttestationOutcome::Duplicate => {
+            return Ok(OutcomeRecordedOutcome::Duplicate);
+        }
+        libra_governor_ledger::RecordAttestationOutcome::IdempotencyKeyReused => {
+            return Ok(OutcomeRecordedOutcome::IdempotencyKeyReused);
+        }
+        libra_governor_ledger::RecordAttestationOutcome::Recorded {
+            contract_revision,
+            receipt_updated,
+        } => (contract_revision, receipt_updated),
     };
 
     if let Some(events) = &extension_runtime(config).events {
@@ -2112,6 +2115,8 @@ fn handle_record_outcome(
     Ok(OutcomeRecordedOutcome::Recorded(Box::new(
         OutcomeRecordedResult {
             attested: outcome,
+            authoritative,
+            contract_revision,
             receipt_updated,
         },
     )))

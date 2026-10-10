@@ -41,6 +41,7 @@ mod write;
 
 pub use extension::{
     BusinessContextInsert, DeliveryEnqueue, OutcomeAttestationInsert, QueuedDeliveryRow,
+    RecordAttestationOutcome,
 };
 pub use gateway::{GatewayRequestClose, GatewayRequestOpen};
 pub use migrations::latest_known_version;

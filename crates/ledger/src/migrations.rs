@@ -87,6 +87,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 17,
         sql: include_str!("../migrations/0017_task_budget_renewals.sql"),
     },
+    Migration {
+        version: 18,
+        sql: include_str!("../migrations/0018_outcome_attestation_revision.sql"),
+    },
 ];
 
 /// The highest migration version this build of the crate knows about
@@ -320,7 +324,26 @@ mod tests {
         apply_all(&mut conn).unwrap();
 
         let schema_after_migration = schema_snapshot(&conn);
+        // Approved exception (ADR-0017, HORO-1727, migration 18):
+        // `outcome_attestations`'s own `CREATE TABLE` text legitimately
+        // changes (a new nullable `contract_revision` column), and it
+        // gains two new append-only triggers. This is a deliberate,
+        // reviewed schema evolution of a pre-migration-15 table, not a
+        // silent regression — the table itself, and every pre-existing
+        // row this test inserted, must still be intact; only its exact
+        // `CREATE TABLE` text is allowed to differ.
+        let approved_evolved_tables = ["outcome_attestations"];
         for definition in &schema_before {
+            if approved_evolved_tables.contains(&definition.2.as_str()) {
+                assert!(
+                    schema_after_migration
+                        .iter()
+                        .any(|(_, _, tbl_name, _)| tbl_name == &definition.2),
+                    "approved-evolved table {:?} must still exist, just with new columns/triggers",
+                    definition.2
+                );
+                continue;
+            }
             assert!(
                 schema_after_migration.contains(definition),
                 "migration 15 changed or removed pre-existing schema definition: {definition:?}"
