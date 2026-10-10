@@ -862,7 +862,13 @@ fn an_admission_event_is_delivered_end_to_end_with_a_verifiable_signature() {
 // ---------------------------------------------------------------------
 
 #[test]
-fn record_outcome_writes_attestation_and_promotes_the_receipt() {
+fn record_outcome_writes_attestation_but_never_promotes_the_receipt() {
+    // Corrected by ADR-0017 (HORO-1727): this test used to assert the
+    // push promoted the receipt. It no longer can -- every real push
+    // through this protocol is unverified and therefore never
+    // authoritative on this deployment. See
+    // `crates/daemon/tests/outcome_authority_not_wired_live.rs` for the
+    // guard against reintroducing an authoritative path silently.
     let dir = tempfile::tempdir().unwrap();
     let config = base_config(dir.path(), elastic_policy(), None);
     let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
@@ -923,7 +929,10 @@ fn record_outcome_writes_attestation_and_promotes_the_receipt() {
     else {
         panic!("expected Recorded outcome, got {outcome_response:?}");
     };
-    assert!(result.receipt_updated);
+    assert!(
+        !result.receipt_updated,
+        "ADR-0017: no real push is authoritative on this deployment"
+    );
     assert_eq!(
         result.attested,
         ExecutionOutcome::Completed {
@@ -935,9 +944,9 @@ fn record_outcome_writes_attestation_and_promotes_the_receipt() {
     assert_eq!(trajectory.receipts.len(), 1);
     assert_eq!(
         trajectory.receipts[0].outcome,
-        ExecutionOutcome::Completed {
-            evidence: vec!["https://ci.example.com/1".to_string()]
-        }
+        ExecutionOutcome::Unknown,
+        "ADR-0017: an unverified attestation must never change the receipt's \
+         recorded outcome"
     );
 
     // A duplicate push (same task, source, idempotency key) is a no-op.
@@ -962,10 +971,9 @@ fn record_outcome_writes_attestation_and_promotes_the_receipt() {
     let trajectory = ledger.task_trajectory(preflight.task_id).unwrap();
     assert_eq!(
         trajectory.receipts[0].outcome,
-        ExecutionOutcome::Completed {
-            evidence: vec!["https://ci.example.com/1".to_string()]
-        },
-        "a duplicate push must not overwrite the already-promoted receipt"
+        ExecutionOutcome::Unknown,
+        "a duplicate push must not change the receipt's outcome, and \
+         ADR-0017 means there was nothing promoted to begin with"
     );
 }
 

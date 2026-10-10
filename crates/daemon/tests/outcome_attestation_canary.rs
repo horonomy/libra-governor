@@ -232,11 +232,13 @@ fn record_outcome(
 }
 
 // ---------------------------------------------------------------------
-// 1. Positive: a genuine external push is recorded and promotes
+// 1. Positive, corrected by ADR-0017: a push is recorded but is never
+//    authoritative, so it never promotes the receipt -- there is no
+//    verified-provider path reachable from the real protocol today.
 // ---------------------------------------------------------------------
 
 #[test]
-fn a_completed_push_from_an_outcome_provider_is_recorded_and_promotes_the_receipt() {
+fn a_completed_push_is_recorded_as_unverified_and_never_promotes_the_receipt() {
     let dir = tempfile::tempdir().unwrap();
     let harness = Harness::new(dir.path(), permissive_policy());
     let mut ledger = LedgerStore::open(&harness.config.ledger_path).unwrap();
@@ -245,7 +247,8 @@ fn a_completed_push_from_an_outcome_provider_is_recorded_and_promotes_the_receip
     let task_id = admit_task(&harness, &mut ledger, &mut current_task, "canary-positive");
 
     // Finalize first, exactly like a real session's Stop hook, so there
-    // is a receipt to promote.
+    // is a receipt that *would* be promoted if this push were
+    // authoritative.
     finalize(&harness, &mut ledger, &mut current_task, "canary-positive");
 
     let outcome = record_outcome(
@@ -265,8 +268,10 @@ fn a_completed_push_from_an_outcome_provider_is_recorded_and_promotes_the_receip
         other => panic!("expected Recorded, got {other:?}"),
     };
     assert!(
-        result.receipt_updated,
-        "a push after Finalize must promote the existing receipt"
+        !result.receipt_updated,
+        "ADR-0017: no real push is authoritative on this deployment, so \
+         even a push claiming to be a genuine CI system must never \
+         promote the receipt"
     );
 }
 
@@ -339,27 +344,14 @@ fn a_duplicate_push_replays_safely_without_a_second_write() {
 }
 
 // ---------------------------------------------------------------------
-// 4. FINDING: nothing distinguishes a real external provider from a
-//    governed agent self-attesting its own completion
+// 4. Corrected by ADR-0017: a local caller's push is recorded, but as
+//    `unverified` and never authoritative -- the original finding this
+//    test proved (every push was authoritative, indistinguishable from
+//    a real external provider) is now a fixed control, not a defect.
 // ---------------------------------------------------------------------
 
 #[test]
-fn finding_a_local_caller_can_self_attest_completion_with_no_distinguishing_signal() {
-    // This test's name says "finding", not "forged push rejected",
-    // because the push is NOT rejected -- that is exactly the point.
-    // `Request::RecordOutcome`'s own doc comment already discloses that
-    // `source_id` is a recorded claim, not an authenticated identity,
-    // and that the trust boundary is the socket's filesystem
-    // permissions (0600) -- consistent with every other `Request`
-    // variant. What this test demonstrates, which was NOT already
-    // disclosed anywhere: `handle_record_outcome` unconditionally
-    // constructs `AttestationSource::Provider` for every push, with no
-    // branch that could ever produce `AttestationSource::Agent`. There
-    // is no way, via the real protocol, for a caller to honestly
-    // self-tag as "this is the agent's own unverified claim" -- every
-    // push through this one real ingestion path is authoritative by
-    // construction, regardless of who is actually on the other end of
-    // the socket.
+fn a_local_callers_push_is_recorded_as_unverified_and_never_authoritative() {
     let dir = tempfile::tempdir().unwrap();
     let harness = Harness::new(dir.path(), permissive_policy());
     let mut ledger = LedgerStore::open(&harness.config.ledger_path).unwrap();
@@ -392,38 +384,53 @@ fn finding_a_local_caller_can_self_attest_completion_with_no_distinguishing_sign
         OutcomeRecordedOutcome::Recorded(result) => *result,
         other => panic!("expected Recorded, got {other:?}"),
     };
-    // The push succeeds and is treated as authoritative -- this is the
-    // finding, reported honestly in the HORO-1727 decision packet, not
-    // a passing security control.
     assert_eq!(
         result.attested,
         ExecutionOutcome::Completed {
             evidence: vec!["(no evidence -- an agent could write anything here)".to_string()]
         }
     );
-    let authoritative: bool = verify_conn(&harness.config.ledger_path)
-        .query_row(
-            "SELECT authoritative FROM outcome_attestations WHERE task_id = ?1",
-            [task_id.to_string()],
-            |row| row.get(0),
-        )
-        .unwrap();
     assert!(
-        authoritative,
-        "FINDING: an unverified self-claim is stored as authoritative=true, \
-         identically to a real external Outcome Provider push -- the \
-         AttestationSource::Agent variant has no production path that can \
-         ever construct it"
+        !result.receipt_updated,
+        "ADR-0017: an unverified self-claim must never promote a receipt"
+    );
+    let (authoritative, source, stored_source_id): (bool, String, Option<String>) =
+        verify_conn(&harness.config.ledger_path)
+            .query_row(
+                "SELECT authoritative, source, source_id FROM outcome_attestations \
+                 WHERE task_id = ?1",
+                [task_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+    assert!(
+        !authoritative,
+        "ADR-0017: an unverified self-claim must never be stored as authoritative"
+    );
+    assert_eq!(source, "unverified");
+    assert_eq!(
+        stored_source_id.as_deref(),
+        Some("unverified:totally-unverified-self-claim"),
+        "the stored source_id must carry the unverified: prefix so a future \
+         verified-provider push can never land in the same dedupe slot"
     );
 }
 
 // ---------------------------------------------------------------------
-// 5. FINDING: two disagreeing authoritative attestations silently
-//    last-writer-wins, with no conflict detection
+// 5. Corrected by ADR-0017: two disagreeing pushes are both recorded
+//    (append-only audit trail intact), but since neither push is ever
+//    authoritative, neither promotes the receipt -- the original
+//    "silent last-writer-wins" finding is structurally unreachable via
+//    the real protocol now. Real conflict detection among authoritative
+//    claims is a PR3 concern, tested at the ledger level (where
+//    `authoritative: true` rows can be constructed directly, the same
+//    way a verified-provider push eventually would) rather than here --
+//    the real daemon protocol cannot produce an authoritative claim at
+//    all as of this PR.
 // ---------------------------------------------------------------------
 
 #[test]
-fn finding_two_disagreeing_authoritative_attestations_silently_overwrite() {
+fn two_disagreeing_unverified_pushes_are_both_recorded_and_neither_promotes() {
     let dir = tempfile::tempdir().unwrap();
     let harness = Harness::new(dir.path(), permissive_policy());
     let mut ledger = LedgerStore::open(&harness.config.ledger_path).unwrap();
@@ -443,7 +450,11 @@ fn finding_two_disagreeing_authoritative_attestations_silently_overwrite() {
             evidence: vec!["https://ci.example.com/a".to_string()],
         },
     );
-    assert!(matches!(completed, OutcomeRecordedOutcome::Recorded(_)));
+    let completed_result = match completed {
+        OutcomeRecordedOutcome::Recorded(result) => *result,
+        other => panic!("expected Recorded, got {other:?}"),
+    };
+    assert!(!completed_result.receipt_updated);
 
     // A second, independently-keyed push (different idempotency_key, so
     // it is NOT deduped) claims the opposite outcome for the same task.
@@ -458,14 +469,15 @@ fn finding_two_disagreeing_authoritative_attestations_silently_overwrite() {
             evidence: vec!["https://ci.example.com/b".to_string()],
         },
     );
-    assert!(matches!(failed, OutcomeRecordedOutcome::Recorded(_)));
+    let failed_result = match failed {
+        OutcomeRecordedOutcome::Recorded(result) => *result,
+        other => panic!("expected Recorded, got {other:?}"),
+    };
+    assert!(
+        !failed_result.receipt_updated,
+        "ADR-0017: an unverified push must never promote, agreeing or not"
+    );
 
-    // FINDING: both rows exist in outcome_attestations (the append-only
-    // audit trail is intact), but receipts.outcome_json now reflects
-    // only the LAST push -- Failed -- with no error, no conflict flag,
-    // and no record of which attestation "won". A reader of
-    // receipts.outcome_json alone cannot tell this task ever had a
-    // disagreement.
     let row_count: i64 = verify_conn(&harness.config.ledger_path)
         .query_row(
             "SELECT COUNT(*) FROM outcome_attestations WHERE task_id = ?1",
@@ -475,7 +487,8 @@ fn finding_two_disagreeing_authoritative_attestations_silently_overwrite() {
         .unwrap();
     assert_eq!(
         row_count, 2,
-        "both disagreeing attestations are independently recorded"
+        "both disagreeing attestations are independently recorded, \
+         append-only audit trail intact"
     );
 
     let promoted_json: String = verify_conn(&harness.config.ledger_path)
@@ -487,9 +500,9 @@ fn finding_two_disagreeing_authoritative_attestations_silently_overwrite() {
         )
         .unwrap();
     assert!(
-        promoted_json.contains("\"failed\""),
-        "FINDING: the later push silently wins with no conflict signal; \
-         promoted outcome_json was {promoted_json}"
+        promoted_json.contains("\"unknown\""),
+        "ADR-0017: neither unverified push may change the receipt's outcome, \
+         agreeing or disagreeing; promoted outcome_json was {promoted_json}"
     );
 }
 
