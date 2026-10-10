@@ -94,6 +94,28 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+## If you run `libra-governor install` from a development build
+
+`install` wires whatever `std::env::current_exe()` resolves to into the live
+hook config (`~/.claude/settings.json` or `~/.codex/hooks.json`) verbatim,
+permanently, until the next `install`. If you installed from a cargo build
+output path (`target/debug/...` or `target/release/...` -- a shared
+cross-worktree target dir makes this worse, since many worktrees' builds
+land in the same path), a later `cargo build` into that same directory will
+silently replace the binary every live hook invocation executes with
+whatever happens to be on that branch at that moment, including
+mid-development, unreviewed code. `install` now warns about this (see
+`crates/cli/src/install_cmd.rs::warn_if_build_output_path`), but it does not
+refuse -- some workflows genuinely want this. `libra-governor doctor` also
+independently detects the resulting drift after the fact (`stale_runtime`
+finding, comparing the running daemon's own executable checksum against the
+one currently installed at the hook path) if a warning was missed.
+
+If you are installing something meant to serve real hook traffic rather
+than a disposable development session, copy the binary to a stable path
+outside any cargo target directory first, and point `install` at that copy
+instead of running it straight from `target/`.
+
 ## Code of conduct
 
 Be respectful and constructive. Report unacceptable behavior per

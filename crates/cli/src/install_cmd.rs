@@ -30,6 +30,45 @@ use crate::{claude_settings, codex_hooks_file};
 /// `uninstall_cmd`'s module docs.
 pub const INSTALL_MARKER_FILE_NAME: &str = "install.json";
 
+/// HORO-1599 2026-10-10 incident: `install` wires whatever
+/// `std::env::current_exe()` resolves to into the live hook config
+/// verbatim -- permanently, until the next `install`. If that path is a
+/// cargo build output directory (`target/debug/...` or
+/// `target/release/...`, shared or per-worktree), any later `cargo build`
+/// into the same target dir silently overwrites the binary every live
+/// hook invocation executes, with whatever happens to be on that branch
+/// at that moment -- exactly what happened here: an in-progress,
+/// unreviewed build replaced the installed hook binary for roughly two
+/// hours before detection. This is a loud warning, not a hard refusal:
+/// some development workflows genuinely want to install straight from a
+/// build directory, but they need to know the risk they're accepting.
+fn build_output_path_warning(binary: &std::path::Path) -> Option<String> {
+    let path_str = binary.to_string_lossy();
+    // Deliberately `target/debug/`/`target/release/` without a leading
+    // slash: a shared cross-worktree target dir is commonly named
+    // something like `shared-target`, not literally `target` -- the
+    // incident this guards against happened at exactly such a path
+    // (`~/.cargo/shared-target/debug/libra-governor`).
+    if path_str.contains("target/debug/") || path_str.contains("target/release/") {
+        Some(format!(
+            "libra-governor install: WARNING -- installing from a cargo build output path \
+             ({path_str}). Any later `cargo build` into this same target directory will \
+             silently replace the binary every live hook invocation executes, including \
+             mid-development, unreviewed code. Prefer installing a copy at a stable path \
+             outside any cargo target directory if this installation is meant to serve real \
+             hook traffic rather than a disposable development session."
+        ))
+    } else {
+        None
+    }
+}
+
+fn warn_if_build_output_path(binary: &std::path::Path) {
+    if let Some(warning) = build_output_path_warning(binary) {
+        eprintln!("{warning}");
+    }
+}
+
 pub fn run() {
     run_claude(true);
 }
@@ -47,6 +86,7 @@ fn run_claude(install_statusline: bool) {
             std::process::exit(1);
         }
     };
+    warn_if_build_output_path(&binary);
 
     let settings_path = match claude_settings::settings_path() {
         Ok(path) => path,
@@ -134,6 +174,7 @@ pub fn run_codex() {
             std::process::exit(1);
         }
     };
+    warn_if_build_output_path(&binary);
 
     let hooks_path = match codex_hooks_file::hooks_path() {
         Ok(path) => path,
@@ -212,6 +253,36 @@ fn write_install_marker_at(binary: &std::path::Path, state_dir: &std::path::Path
         eprintln!(
             "libra-governor install: could not write {}: {e}",
             path.display()
+        );
+    }
+}
+
+#[cfg(test)]
+mod build_output_path_warning_tests {
+    use super::build_output_path_warning;
+    use std::path::Path;
+
+    #[test]
+    fn warns_on_debug_target_path() {
+        assert!(build_output_path_warning(Path::new(
+            "/Users/bryant/.cargo/shared-target/debug/libra-governor"
+        ))
+        .is_some());
+    }
+
+    #[test]
+    fn warns_on_release_target_path() {
+        assert!(build_output_path_warning(Path::new(
+            "/home/ci/repo/target/release/libra-governor"
+        ))
+        .is_some());
+    }
+
+    #[test]
+    fn does_not_warn_on_a_stable_non_build_path() {
+        assert!(
+            build_output_path_warning(Path::new("/Users/bryant/.local/bin/libra-governor"))
+                .is_none()
         );
     }
 }
