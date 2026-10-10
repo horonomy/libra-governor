@@ -61,17 +61,16 @@ fn concurrent_distinct_sessions_never_resolve_each_others_task() {
                         .unwrap();
                     assert_eq!(
                         resolved, own_task,
-                        "session {session_id} resolved a different task on a later call \
-                         (re-resolve must be idempotent even under concurrent writes from \
-                         other sessions)"
+                        "session resolved a different task on a later call (re-resolve must \
+                         be idempotent even under concurrent writes from other sessions)"
                     );
 
                     let looked_up = store.task_id_for_session(&session_id).unwrap();
                     assert_eq!(
                         looked_up,
                         Some(own_task),
-                        "session {session_id} saw task {looked_up:?} instead of its own \
-                         {own_task:?} -- cross-session leakage"
+                        "session saw a different task instead of its own -- cross-session \
+                         leakage"
                     );
 
                     let truth = store.economic_truth_for_session(&session_id).unwrap();
