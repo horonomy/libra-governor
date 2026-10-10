@@ -182,6 +182,22 @@ refuses renewal under a dedicated `UnboundLegacyCompletion` reason
 (Decision 2 — ambiguity must not silently loosen eligibility). No
 existing row is rewritten or deleted.
 
+### 7. Precondition for any real (non-Rust) Outcome Provider: the signing format must be reproduced byte-for-byte
+
+`crates/extension/src/outcome_authority.rs::canonical_bytes` is not
+`serde_json` of a struct — it is four length-prefixed fields in a fixed
+order, documented in that function's own doc comment, with a pinned
+cross-language test vector (`pinned_cross_language_signing_vector`) as
+the authoritative reference. This matters because a general-purpose JSON
+serializer in another language (e.g. Python's `json.dumps`) does not
+byte-match `serde_json`'s output by default — different field separators,
+different non-ASCII escaping — so a provider that signs "the same data"
+through its own JSON encoder would produce a different signature and
+fail closed on every claim. Any future real provider integration must
+implement `canonical_bytes`' exact encoding (and the `evidence_digest`
+sub-format it itself depends on) against that pinned vector before its
+signatures can ever verify.
+
 ## Consequences
 
 ### Gained

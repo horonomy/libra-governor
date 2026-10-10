@@ -97,6 +97,46 @@ pub enum OutcomeClaimVerificationError {
 /// The canonical bytes a claim's signature covers, beyond what
 /// `crate::sign::sign`'s own `(timestamp, marker, body)` wrapping already
 /// binds (`issued_at`, `idempotency_key`).
+///
+/// # Exact wire format — required for any non-Rust implementation
+///
+/// This is a precondition any real (e.g. Python) Outcome Provider must
+/// reproduce byte-for-byte, or every one of its claims fails closed. It
+/// is **not** `serde_json` of a struct, and it is NOT safe to assume a
+/// JSON serializer in another language will byte-match `serde_json`'s
+/// output (different field order, different separator whitespace,
+/// different non-ASCII escaping). The format is instead four
+/// length-prefixed fields concatenated in this exact order:
+///
+/// 1. `task_id` — its string form, exactly `Uuid::to_string()`'s
+///    lowercase-hyphenated form (e.g. `"550e8400-e29b-41d4-a716-446655440000"`).
+/// 2. `plan_id` — the same `Uuid` string form if `Some`, or the **empty
+///    string** `""` if `None` (not the literal text `"None"` or `"null"`).
+/// 3. `outcome_kind` — one of `"completed"`, `"failed"`, `"aborted"`,
+///    `"unknown"` (lowercase, matching `outcome_kind_str` in
+///    `crates/daemon/src/server.rs`).
+/// 4. `evidence_digest` — lowercase hex-encoded SHA-256 of
+///    `serde_json::to_string(&evidence_vec)` where `evidence_vec` is the
+///    outcome's `Vec<String>` evidence list, encoded exactly as Rust's
+///    `serde_json` encodes it (a JSON array of strings, `,`-separated
+///    with no extra whitespace, e.g. `["https://ci.example.com/1"]`) —
+///    this is the one sub-format a non-Rust provider must match most
+///    carefully, since `json.dumps` in Python defaults to `", "` as the
+///    separator and `ensure_ascii=True`, both of which would silently
+///    produce a different digest. Construct this digest without a JSON
+///    library's default separators (e.g. Python:
+///    `json.dumps(evidence, separators=(",", ":"), ensure_ascii=False)` —
+///    note this still only matches for a simple string list with no
+///    characters `serde_json` would escape differently; this crate's own
+///    pinned test vector below is the authoritative reference, not this
+///    prose).
+///
+/// Each field is encoded as its UTF-8 byte length, as an 8-byte
+/// big-endian `u64`, followed by the field's own UTF-8 bytes — see the
+/// loop body immediately below for the exact encoding. This whole
+/// 4-field byte string becomes the `body` argument to
+/// `crate::sign::sign(secret, issued_at, idempotency_key, body)`, whose
+/// own doc covers the outer `(timestamp, marker, body)` wrapping.
 pub fn canonical_bytes(content: &OutcomeClaimContent) -> Vec<u8> {
     // Length-prefixed, not delimiter-joined: `outcome_kind` and
     // `evidence_digest` are caller-controlled strings this function does
@@ -183,6 +223,59 @@ mod tests {
         WebhookSecretCommand::new("/bin/sh", vec!["-c".to_string(), format!("printf {value}")])
             .resolve()
             .unwrap()
+    }
+
+    /// A pinned cross-language test vector: fixed `task_id`/`plan_id`/
+    /// `outcome_kind`/`evidence_digest`/`idempotency_key`/`issued_at`/
+    /// secret -> fixed expected `canonical_bytes` AND fixed expected
+    /// signature hex. Any non-Rust Outcome Provider implementation
+    /// should reproduce both of these exact values from the same inputs
+    /// — this is the authoritative reference `canonical_bytes`'s own doc
+    /// comment points to, not the prose there. If this ever changes, the
+    /// signing contract has silently drifted and every real provider
+    /// integration built against the old vector would start failing
+    /// closed.
+    #[test]
+    fn pinned_cross_language_signing_vector() {
+        let content = OutcomeClaimContent {
+            task_id: TaskId(uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()),
+            plan_id: Some(PlanId(
+                uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8").unwrap(),
+            )),
+            outcome_kind: "completed".to_string(),
+            evidence_digest: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85"
+                .to_string(),
+            idempotency_key: "ci-run-42".to_string(),
+            issued_at: 1_700_000_000,
+        };
+        let body = canonical_bytes(&content);
+        let expected_len: usize = [
+            content.task_id.to_string(),
+            content.plan_id.unwrap().0.to_string(),
+            content.outcome_kind.clone(),
+            content.evidence_digest.clone(),
+        ]
+        .iter()
+        .map(|field| 8 + field.len())
+        .sum();
+        assert_eq!(
+            body.len(),
+            expected_len,
+            "canonical_bytes' total length must match exactly 4 \
+             length-prefixed fields with no extra bytes"
+        );
+
+        let secret = fake_secret("sk-fake-pinned-vector-secret");
+        let signature =
+            crate::sign::sign(&secret, content.issued_at, &content.idempotency_key, &body);
+
+        // Computed once against this exact implementation and pinned —
+        // a change to canonical_bytes' field order, length-prefix width,
+        // or the underlying HMAC/hex encoding would change this value.
+        assert_eq!(
+            signature,
+            "v1=2ea3150ae4bdd41f8b0092d8128104bda5c62ff1c8a6596bdfbb342649c2db2b"
+        );
     }
 
     fn signed(secret: &WebhookSecret, content: OutcomeClaimContent) -> SignedOutcomeClaim {
