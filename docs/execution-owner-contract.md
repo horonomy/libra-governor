@@ -30,10 +30,15 @@ existing authorized native acquisition path.
 
 ## Scope and results
 
-Session, agent and turn IDs must be concrete, nonempty native values. Unknown
-lineage is supported as unknown; missing agent never means root. All optional
-identity dimensions match by presence and value. `correlates_with` is unsuitable
-for selection because its partial matching is deliberately broader.
+Session and turn IDs must be concrete, nonempty native values. Agent ID is
+genuinely optional (HORO-1714 decision A, 2026-10-10): an agent-absent event is
+its own explicitly represented lane, keyed `[host, provider, session, null]` --
+JSON `null`, never the string `"null"`, so it can never collide with an agent
+literally named that. Unknown lineage is supported as unknown; missing agent
+never means root, and any claimed `lineage_status` other than `unknown` without
+a reported `agent_id` is refused (`Unsupported`), not silently coerced. All
+optional identity dimensions match by presence and value. `correlates_with` is
+unsuitable for selection because its partial matching is deliberately broader.
 
 The durable lane is the canonical agent tuple of host/provider/native session/agent.
 All richer v1 dimensions, including tool-instance, lineage, parent, session-lineage,
@@ -47,10 +52,19 @@ Rich identity never falls back to a current/latest host or session result.
 
 - `Prompt { task_hint, cwd, supersedes_turn }` creates/reuses the lane's TaskId and creates a plan;
   a new native turn supersedes the old turn only when its explicitly correlated
-  predecessor matches the current persisted native turn. None is accepted only
-  for a new lane. A delayed/unordered prompt returns stale/ambiguous without
-  mutation; timestamps and opaque turn IDs never establish order. Prompt
-  content is recon input only.
+  predecessor matches the current persisted native turn. `None` is accepted for
+  a new lane, or (HORO-1714 decision B, 2026-10-10) for an existing lane whose
+  current turn is already confirmed **finalized** -- a narrowly scoped,
+  owner-managed succession for providers with no native predecessor field,
+  never inferred from timestamps, cwd, a latest-session lookup, or a
+  hook-local cache. If the current turn is still active (no Stop observed),
+  `None` is refused as ambiguous, exactly as when a predecessor is required
+  and absent. The guard is a compare-and-swap on the lane's `current_turn`
+  column inside the one `BEGIN IMMEDIATE` transaction, not merely a prior
+  read, so concurrent successors against the same finalized turn resolve to
+  exactly one winner. A delayed/unordered prompt returns stale/ambiguous
+  without mutation; timestamps and opaque turn IDs never establish order.
+  Prompt content is recon input only.
 - `Tool { native_call_id, tool_name }` requires an existing active turn. It uses
   the exact current PlanId, including a replan, and returns the resulting target.
 - `Stop { model, transcript_path }` finalizes only that active turn and closes its
@@ -106,8 +120,11 @@ initial association ambiguous. No session/agent/turn is backfilled.
 
 ## Migration and cache policy
 
-SQLite schema **15** adds `execution_lanes`, `execution_turns`, and
-`execution_replays`; it changes no legacy columns. Primary keys index lane/turn
+SQLite schema **15** added `execution_lanes`, `execution_turns`, and
+`execution_replays`; it changes no legacy columns. (Migrations have since
+advanced past 15 for unrelated reasons; these three tables' own shape is
+unchanged by HORO-1714 decisions A/B/C, which are pure application-logic
+changes to how existing columns are read and written.) Primary keys index lane/turn
 and lane/operation/native-ref, so lookup does not scan host history. Owner queries
 read durable state directly; there is no owner cache to become stale on session
 switch or restart. Any future cache must key the exact position and invalidate
@@ -123,6 +140,11 @@ restart protection. No automatic destructive down migration is provided.
 ## Evidence boundary
 
 `crates/daemon/tests/execution_owner.rs` exercises real socket framing, daemon
-policy and SQLite effects with synthetic identity fixtures. Native lifecycle
-characterization is separately recorded in `native-agent-lifecycle-characterization.md`.
-These tests do not claim a real Codex native positive control or complete HORO-1714.
+policy and SQLite effects with synthetic identity fixtures, including (as of
+HORO-1714 decisions A/B/C, 2026-10-10) agent-absent lanes, owner-managed
+succession under real concurrent threads/SQLite, and a real-row assertion that
+unknown usage settles conservatively and never persists as zero. Native
+lifecycle characterization is separately recorded in
+`native-agent-lifecycle-characterization.md`. These tests do not claim a real
+Codex native positive control or complete HORO-1714 -- real measured
+task-level usage and real-host acceptance remain separate, open gates.
