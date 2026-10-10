@@ -1,15 +1,30 @@
 //! [`AttestationSource`]/[`OutcomeAttestation`] — the provenance-tagged
 //! record of who claimed a task finished, and whether that claim is
-//! authoritative (HORO-1174).
+//! authoritative (HORO-1174, corrected by HORO-1727/ADR-0017).
 //!
 //! # Only Provider/GovernorLocal sources are authoritative
 //!
-//! An [`AttestationSource::Agent`] attestation is recorded — it always
-//! writes an `outcome_attestations` row — but never promotes
-//! `receipts.outcome_json`. The model that just did the work is not a
-//! trustworthy witness to whether it succeeded; an external Outcome
-//! Provider (CI, a deployment system) or the Governor's own local
-//! finalize logic are. See [`AttestationSource::is_authoritative`].
+//! An [`AttestationSource::Agent`] or [`AttestationSource::Unverified`]
+//! attestation is recorded — it always writes an `outcome_attestations`
+//! row — but never promotes `receipts.outcome_json`. The model that just
+//! did the work is not a trustworthy witness to whether it succeeded; an
+//! external Outcome Provider (CI, a deployment system) or the Governor's
+//! own local finalize logic are. See [`AttestationSource::is_authoritative`].
+//!
+//! # `Agent` vs `Unverified` — not the same thing
+//!
+//! [`AttestationSource::Agent`] means the daemon has a real, attributed
+//! claim from a specific governed agent (e.g. a future path parsing an
+//! agent's own transcript) — still unused in production as of ADR-0017,
+//! same as before. [`AttestationSource::Unverified`] is what every real
+//! `Request::RecordOutcome` push constructs today (ADR-0017, HORO-1727):
+//! the daemon cannot tell whether the caller is a human running
+//! `libra-governor outcome record` diagnostically, the governed agent
+//! itself, or anything else — it only knows *a* local process with
+//! socket access sent this claim, with no verified identity attached.
+//! Collapsing this into `Agent` would misattribute a human's diagnostic
+//! push as an agent's self-report, which is exactly the kind of invented
+//! ownership this campaign has been told never to do.
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -20,23 +35,35 @@ use crate::{agent::AgentKind, execution_outcome::ExecutionOutcome};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AttestationSource {
-    /// An external Outcome Provider pushed this attestation over the
-    /// daemon's Unix socket (`Request::RecordOutcome`).
+    /// An external Outcome Provider pushed this attestation with a
+    /// verified signature (ADR-0017) over the daemon's Unix socket
+    /// (`Request::RecordOutcome`).
     Provider { provider_id: String },
     /// The Governor's own local finalize logic recorded this outcome
     /// (e.g. `handle_finalize`'s receipt-time outcome).
     GovernorLocal,
     /// The governed agent itself claimed this outcome (e.g. a message in
     /// its own transcript). Recorded for visibility; **never**
-    /// authoritative — see [`Self::is_authoritative`].
+    /// authoritative — see [`Self::is_authoritative`]. Still has no
+    /// production caller as of ADR-0017 — see [`Self::Unverified`] for
+    /// what a real `RecordOutcome` push actually constructs.
     Agent { agent: AgentKind },
+    /// A `RecordOutcome` push with no verified provider signature
+    /// (ADR-0017) — every real push today, until a genuinely
+    /// separate-principal deployment can activate [`Self::Provider`].
+    /// `claimed_source_id` preserves the caller's self-reported
+    /// `source_id` verbatim for diagnostics, but it is a claim, not a
+    /// verified identity — never treated as authoritative, never
+    /// confused with [`Self::Agent`]'s real-attribution meaning.
+    Unverified { claimed_source_id: String },
 }
 
 impl AttestationSource {
-    /// `true` for [`Self::Provider`]/[`Self::GovernorLocal`], `false` for
-    /// [`Self::Agent`] — the one-way valve this module exists to enforce.
+    /// `true` only for [`Self::Provider`]/[`Self::GovernorLocal`] — the
+    /// one-way valve this module exists to enforce. `false` for
+    /// [`Self::Agent`] and [`Self::Unverified`] alike.
     pub fn is_authoritative(&self) -> bool {
-        !matches!(self, Self::Agent { .. })
+        matches!(self, Self::Provider { .. } | Self::GovernorLocal)
     }
 }
 
@@ -73,6 +100,14 @@ mod tests {
         for agent in AgentKind::ALL {
             assert!(!AttestationSource::Agent { agent }.is_authoritative());
         }
+    }
+
+    #[test]
+    fn unverified_is_never_authoritative() {
+        assert!(!AttestationSource::Unverified {
+            claimed_source_id: "anything-at-all".to_string()
+        }
+        .is_authoritative());
     }
 
     #[test]

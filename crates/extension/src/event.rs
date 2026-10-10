@@ -139,7 +139,8 @@ pub struct OutcomeEventData {
     /// same discipline as `ExecutionOutcome::evidence()`.
     pub evidence: Vec<String>,
     /// The closed-set tag of the recorded `AttestationSource` —
-    /// `"provider"` / `"governor_local"` / `"agent"`.
+    /// `"provider"` / `"governor_local"` / `"agent"` / `"unverified"`
+    /// (ADR-0017, HORO-1727).
     pub source: String,
     pub source_id: Option<String>,
     #[serde(with = "time::serde::rfc3339")]

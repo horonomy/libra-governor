@@ -575,12 +575,17 @@ components:
                   description: References only (URLs, ids) — never inlined content.
                 source:
                   type: string
-                  enum: [provider, governor_local, agent]
+                  enum: [provider, governor_local, agent, unverified]
                   description: |
                     R3 — only `provider` and `governor_local` are
                     authoritative and may promote a receipt outcome;
-                    `agent`-sourced attestations are recorded but never
-                    promote. See `crates/domain/src/outcome_attestation.rs::AttestationSource::is_authoritative`.
+                    `agent`- and `unverified`-sourced attestations are
+                    recorded but never promote. `unverified` (ADR-0017,
+                    HORO-1727) is what every real `RecordOutcome` push
+                    constructs today — the daemon has no way to verify a
+                    caller's claimed identity on a single-workstation,
+                    same-OS-user deployment. See
+                    `crates/domain/src/outcome_attestation.rs::AttestationSource::is_authoritative`.
                 source_id:
                   type: string
                   nullable: true

@@ -1996,24 +1996,33 @@ fn outcome_kind_str(outcome: &ExecutionOutcome) -> &'static str {
     }
 }
 
-/// Handles a `RecordOutcome` push (HORO-1174): the one new *inbound*
-/// path this ticket adds, over the daemon's existing Unix socket. Resolves
-/// `task_id`, dedupes on `(task_id, source_id, idempotency_key)`, records
-/// the attestation, promotes `receipts.outcome_json` when the source is
-/// authoritative, enqueues an `outcome` event, and replies.
+/// Handles a `RecordOutcome` push (HORO-1174, corrected by ADR-0017/
+/// HORO-1727): the one new *inbound* path this ticket adds, over the
+/// daemon's existing Unix socket. Resolves `task_id`, dedupes on
+/// `(task_id, source_id, idempotency_key)`, records the attestation,
+/// promotes `receipts.outcome_json` when the source is authoritative,
+/// enqueues an `outcome` event, and replies.
 ///
-/// Every push through this `Request` variant is attributed
-/// `AttestationSource::Provider { provider_id: source_id }` — this
-/// specific inbound path exists for external Outcome Providers (see
-/// `examples/local-providers/report_outcome.sh`). `handle_finalize`
-/// never constructs an `AttestationSource` at all: it always records
-/// `ExecutionOutcome::Unknown` on the receipt itself, by design (a task
-/// must never be inferred "done" merely because the session stopped —
-/// see `handle_finalize`'s own doc comment). `AttestationSource::GovernorLocal`
-/// and `AttestationSource::Agent` are both legal values of the enum with
-/// no production caller yet; an automated Completion Contract
-/// verification path (e.g. a test-running integration) is the kind of
-/// future caller `GovernorLocal` exists for.
+/// **Every push through this `Request` variant is non-authoritative**
+/// (`AttestationSource::Unverified`) — ADR-0017 found that, on this
+/// single-workstation, same-OS-user deployment, nothing distinguishes a
+/// real external Outcome Provider from the governed agent itself
+/// self-attesting: `source_id` is a caller-chosen string with no
+/// verification, the daemon's own secret-resolution commands are
+/// readable by the same user, and a same-user caller can bypass this
+/// path entirely via a direct SQLite write. The stored `source_id` is
+/// prefixed `unverified:` so a future verified-provider push (once a
+/// genuinely separate-principal deployment exists to activate the
+/// authoritative `Provider` variant of `AttestationSource` — see
+/// ADR-0017 decision 2) can never land in the same dedupe slot an
+/// unverified push already occupies.
+///
+/// `handle_finalize` never constructs an `AttestationSource` at all: it
+/// always records `ExecutionOutcome::Unknown` on the receipt itself, by
+/// design (a task must never be inferred "done" merely because the
+/// session stopped — see `handle_finalize`'s own doc comment). The
+/// `GovernorLocal` and `Agent` variants of `AttestationSource` are both
+/// legal values of the enum with no production caller yet.
 fn handle_record_outcome(
     task_id: TaskId,
     plan_id: Option<PlanId>,
@@ -2029,10 +2038,15 @@ fn handle_record_outcome(
         return Ok(OutcomeRecordedOutcome::NoSuchTask);
     }
 
-    let source = AttestationSource::Provider {
-        provider_id: source_id.to_string(),
+    let stored_source_id = format!("unverified:{source_id}");
+    let source = AttestationSource::Unverified {
+        claimed_source_id: source_id.to_string(),
     };
     let authoritative = source.is_authoritative();
+    debug_assert!(
+        !authoritative,
+        "handle_record_outcome must never construct an authoritative source (ADR-0017)"
+    );
     let outcome_kind = outcome_kind_str(&outcome);
     let evidence_json = serde_json::to_string(outcome.evidence())?;
 
@@ -2040,8 +2054,8 @@ fn handle_record_outcome(
         id: &uuid::Uuid::new_v4().to_string(),
         task_id,
         plan_id,
-        source: "provider",
-        source_id: Some(source_id),
+        source: "unverified",
+        source_id: Some(&stored_source_id),
         outcome_kind,
         evidence_json: &evidence_json,
         idempotency_key,
@@ -2066,8 +2080,8 @@ fn handle_record_outcome(
                 plan_id,
                 outcome_kind: outcome_kind.to_string(),
                 evidence: outcome.evidence().to_vec(),
-                source: "provider".to_string(),
-                source_id: Some(source_id.to_string()),
+                source: "unverified".to_string(),
+                source_id: Some(stored_source_id.clone()),
                 attested_at: now,
             };
             let dedupe_key = match plan_id {
