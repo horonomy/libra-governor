@@ -23,6 +23,7 @@ mod client;
 mod config;
 mod dispatcher;
 mod event;
+mod outcome_authority;
 mod queue;
 mod secret;
 mod sign;
@@ -41,6 +42,10 @@ pub use dispatcher::run_dispatcher;
 pub use event::{
     AdmissionEventData, ApprovalEventData, BusinessContextEventRef, EventEnvelope, EventKind,
     ExternalApprovalEventRef, OutcomeEventData, ReplanEventData,
+};
+pub use outcome_authority::{
+    canonical_bytes, verify, OutcomeAuthorityConfig, OutcomeClaimContent,
+    OutcomeClaimVerificationError, SignedOutcomeClaim, TrustedProvider,
 };
 pub use queue::{DeliveryQueue, QueueError, QueuedDelivery};
 pub use secret::{SecretError, WebhookSecret, WebhookSecretCommand};
