@@ -77,6 +77,16 @@ an authenticated identity. This is not a regression introduced by this
 ticket; it is the same boundary the whole daemon protocol has always had,
 now also carrying one more `Request` variant.
 
+**Superseded by ADR 0017 (HORO-1727):** this framing was accurate but
+incomplete — it did not account for a same-OS-user caller bypassing the
+socket entirely via a direct SQLite write, reading whatever secret the
+daemon itself reads, or replacing the daemon's own config/binary. ADR
+0017 states the complete threat model and the resulting decision: on a
+single-workstation, same-user deployment, no code-level change can make
+`RecordOutcome`'s authority boundary hold, so authoritative production
+completion stays structurally disabled until a genuinely
+separate-principal deployment exists.
+
 ### 3. `crates/daemon` has no async runtime; `crates/extension` owns one internally and exposes a blocking API
 
 ADR 0003 §1 deliberately kept async work off the daemon's serial accept
@@ -183,15 +193,22 @@ exactly, not merely that `hard_limit` is unaffected.
 `AttestationSource::Agent { .. }.is_authoritative()` is `false` by
 construction. An Agent-sourced attestation writes an
 `outcome_attestations` row and **never** promotes
-`receipts.outcome_json`. No code path in this ticket ever constructs
-`AttestationSource::Agent` — `Request::RecordOutcome` always attributes to
-`AttestationSource::Provider { provider_id: source_id }`, and
-`handle_finalize`'s own outcome event always attributes to
-`AttestationSource::GovernorLocal`. `AttestationSource::Agent` exists as a
+`receipts.outcome_json`. `AttestationSource::Agent` exists as a
 documented, tested variant for a future path (an agent's own transcript
 claiming completion) that this ticket does not wire up — recorded rather
 than omitted, so a future caller has the type ready without having to
 re-derive the one-way-valve invariant from scratch.
+
+**Corrected by ADR 0017 (HORO-1727):** this section originally claimed
+`Request::RecordOutcome` always attributes to `AttestationSource::Provider`
+and `handle_finalize`'s outcome event always attributes to
+`AttestationSource::GovernorLocal`. The first half is still true (and is
+exactly the problem ADR 0017 fixes — PR 2 there makes every real push
+`Agent`-sourced instead). The second half was never true:
+`handle_finalize` never constructs an `AttestationSource` at all — it
+always records `ExecutionOutcome::Unknown` directly on the receipt (see
+PR #109's doc fix). `GovernorLocal` has zero production callers, exactly
+like `Agent` did before ADR 0017.
 
 ### 8. `receipts.outcome_json` promotion is verified inert to the estimator
 
