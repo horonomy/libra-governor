@@ -129,9 +129,31 @@ pub enum RenewalRefusal {
     /// an oversight.
     UpstreamQuotaBlocking { status: BlockingStatus },
     /// An authoritative (`Provider`/`GovernorLocal`) `Completed`
-    /// attestation already exists for this task — there is no remaining
-    /// work a renewal could fund.
+    /// attestation already exists for this task **at its current
+    /// contract revision** — there is no remaining work a renewal could
+    /// fund. Scoped to the current revision (HORO-1727 Decision 2) so a
+    /// `Completed` claim against a superseded revision cannot keep
+    /// blocking renewals against the task's active Definition of Done.
     TaskAlreadyCompleted,
+    /// `RenewalRequest::contract_revision` does not match the task's
+    /// current contract revision (`MAX(contracts.revision)` for this
+    /// task). A stale request authorized against a since-superseded
+    /// revision must not silently grant against the current one.
+    ContractRevisionMismatch { requested: u32, current: u32 },
+    /// More than one distinct authoritative terminal outcome kind
+    /// (`completed`/`failed`/`aborted`) exists for this task at its
+    /// current contract revision — disagreeing authoritative claims must
+    /// surface as a conflict, never resolve via last-writer-wins
+    /// (HORO-1727 Decision 2).
+    ConflictingCompletionOutcomes,
+    /// An authoritative `Completed` attestation exists with no contract
+    /// revision recorded (`contract_revision IS NULL` — a legacy or
+    /// `plan_id: None` push, deliberately unbound per ADR-0017/the
+    /// `outcome_attestations` migration docs) while the task now has a
+    /// tracked current revision. This claim cannot be proven to apply —
+    /// or not to apply — to the current revision, so it is refused
+    /// conservatively rather than either ignored or trusted.
+    UnboundLegacyCompletion,
 }
 
 /// One persisted grant against a task's [`crate::policy::RenewalBound`]

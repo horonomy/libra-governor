@@ -276,18 +276,67 @@ impl LedgerStore {
             ));
         }
 
-        // Gate: no authoritative Completed attestation may already exist.
-        let already_completed: u32 = tx.query_row(
-            "SELECT COUNT(*) FROM outcome_attestations
-             WHERE task_id = ?1 AND authoritative = 1 AND outcome_kind = 'completed'",
-            [task_id.to_string()],
-            |row| row.get(0),
-        )?;
-        if already_completed > 0 {
+        // Gate: the request must be authorized against the task's
+        // *current* contract revision — a request carrying a stale
+        // revision must not silently grant against whatever revision is
+        // active now (HORO-1727 Decision 2). A task with no recorded
+        // contract yet (`current_revision: None`) has nothing to compare
+        // against, so this gate is skipped rather than refusing on an
+        // absence it cannot interpret.
+        let current_revision = Self::current_contract_revision_tx(&tx, task_id)?;
+        if let Some(current) = current_revision {
+            if request.contract_revision != current {
+                tx.commit()?;
+                return Ok(GrantRenewalOutcome::Refused(
+                    RenewalRefusal::ContractRevisionMismatch {
+                        requested: request.contract_revision,
+                        current,
+                    },
+                ));
+            }
+        }
+
+        // Gate: no authoritative Completed attestation may already exist
+        // for the current revision, and disagreeing authoritative
+        // terminal claims at that revision must surface as a conflict
+        // rather than resolve silently (HORO-1727 Decision 2).
+        // `contract_revision IS NULL` attestations are unbound and are
+        // matched here only when the task itself has no current revision
+        // either — otherwise they are handled by the dedicated
+        // `UnboundLegacyCompletion` gate below.
+        let scoped_kinds = Self::authoritative_terminal_kinds_tx(&tx, task_id, current_revision)?;
+        if scoped_kinds.len() > 1 {
+            tx.commit()?;
+            return Ok(GrantRenewalOutcome::Refused(
+                RenewalRefusal::ConflictingCompletionOutcomes,
+            ));
+        }
+        if scoped_kinds.iter().any(|kind| kind == "completed") {
             tx.commit()?;
             return Ok(GrantRenewalOutcome::Refused(
                 RenewalRefusal::TaskAlreadyCompleted,
             ));
+        }
+
+        // Gate: an unbound (legacy, `contract_revision IS NULL`)
+        // authoritative Completed attestation cannot be proven to apply —
+        // or not to apply — to the task's current revision once one
+        // exists, so it is refused conservatively rather than trusted or
+        // ignored.
+        if current_revision.is_some() {
+            let legacy_completed: u32 = tx.query_row(
+                "SELECT COUNT(*) FROM outcome_attestations
+                 WHERE task_id = ?1 AND contract_revision IS NULL
+                   AND authoritative = 1 AND outcome_kind = 'completed'",
+                [task_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if legacy_completed > 0 {
+                tx.commit()?;
+                return Ok(GrantRenewalOutcome::Refused(
+                    RenewalRefusal::UnboundLegacyCompletion,
+                ));
+            }
         }
 
         // All gates passed — read the audit snapshot and persist.
@@ -343,6 +392,55 @@ impl LedgerStore {
             schema_version: TASK_BUDGET_RENEWAL_SCHEMA_VERSION.to_string(),
             granted_at: now,
         })))
+    }
+
+    fn current_contract_revision_tx(
+        tx: &rusqlite::Connection,
+        task_id: TaskId,
+    ) -> Result<Option<u32>, LedgerError> {
+        let revision: Option<i64> = tx
+            .query_row(
+                "SELECT MAX(revision) FROM contracts WHERE task_id = ?1",
+                [task_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(revision.map(|r| r as u32))
+    }
+
+    fn authoritative_terminal_kinds_tx(
+        tx: &rusqlite::Connection,
+        task_id: TaskId,
+        revision: Option<u32>,
+    ) -> Result<Vec<String>, LedgerError> {
+        let kinds: Vec<String> = match revision {
+            Some(revision) => {
+                let mut stmt = tx.prepare(
+                    "SELECT DISTINCT outcome_kind FROM outcome_attestations
+                     WHERE task_id = ?1 AND contract_revision = ?2 AND authoritative = 1
+                       AND outcome_kind IN ('completed', 'failed', 'aborted')",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![task_id.to_string(), revision], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            }
+            None => {
+                let mut stmt = tx.prepare(
+                    "SELECT DISTINCT outcome_kind FROM outcome_attestations
+                     WHERE task_id = ?1 AND contract_revision IS NULL AND authoritative = 1
+                       AND outcome_kind IN ('completed', 'failed', 'aborted')",
+                )?;
+                let rows = stmt
+                    .query_map([task_id.to_string()], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            }
+        };
+        Ok(kinds)
     }
 
     fn settled_and_active_for_renewal(

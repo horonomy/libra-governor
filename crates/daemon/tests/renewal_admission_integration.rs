@@ -123,13 +123,13 @@ fn renewable_hard_policy() -> Policy {
     .unwrap()
 }
 
-fn renewal_request(amount: u64, key: &str) -> RenewalRequest {
+fn renewal_request(amount: u64, key: &str, contract_revision: u32) -> RenewalRequest {
     RenewalRequest {
         amount: ResourceAmount::Tokens(amount),
         authority: RenewalAuthority::Operator {
             operator_id: "integration-test-operator".to_string(),
         },
-        contract_revision: 1,
+        contract_revision,
         reason: "integration test grant".to_string(),
         idempotency_key: key.to_string(),
     }
@@ -230,11 +230,19 @@ fn a_preflight_projection_between_original_and_extended_ceiling_flips_from_deny_
     );
 
     // Grant a renewal: effective_hard_limit becomes 1,000 + 1,000 =
-    // 2,000.
+    // 2,000. `contract_revision` must match the task's *current*
+    // revision — each of the two preflights above drafts a new contract
+    // revision unconditionally (see ADR-0017's documented precondition),
+    // so it is resolved here rather than assumed to still be 1.
+    let current_revision = ledger
+        .latest_contract(task_id)
+        .unwrap()
+        .expect("a contract exists after preflight")
+        .revision;
     let outcome = ledger
         .grant_renewal(
             task_id,
-            renewal_request(1_000, "preflight-grant-1"),
+            renewal_request(1_000, "preflight-grant-1", current_revision),
             BlockingStatus::NotBlocking,
             time::OffsetDateTime::now_utc(),
         )
@@ -333,12 +341,19 @@ fn a_gateway_request_that_only_fits_without_the_reserve_term_is_policy_denied_no
         "premise: a real reserve exists"
     );
 
+    let current_revision = gateway_ledger
+        .lock()
+        .unwrap()
+        .latest_contract(context.task_id)
+        .unwrap()
+        .expect("a contract exists after preflight")
+        .revision;
     let grant_outcome = gateway_ledger
         .lock()
         .unwrap()
         .grant_renewal(
             context.task_id,
-            renewal_request(1_000, "gateway-grant-1"),
+            renewal_request(1_000, "gateway-grant-1", current_revision),
             BlockingStatus::NotBlocking,
             time::OffsetDateTime::now_utc(),
         )

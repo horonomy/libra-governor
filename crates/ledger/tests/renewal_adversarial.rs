@@ -421,6 +421,165 @@ fn a_non_authoritative_completed_attestation_does_not_block_a_grant() {
 }
 
 // ---------------------------------------------------------------------
+// Revision-scoped completion (HORO-1727 Decision 2)
+// ---------------------------------------------------------------------
+
+#[test]
+fn refuses_a_request_authorized_against_a_stale_contract_revision() {
+    let (_dir, path, mut store) = open_file_store();
+    let task_id = setup(&mut store, &renewable_policy());
+    let v1 = CompletionContract::first(vec![CompletionCriterion::required("tests pass")]);
+    let v2 = v1.next_revision(vec![CompletionCriterion::required("tests pass, updated")]);
+    store.insert_contract(task_id, &v1, now()).unwrap();
+    store.insert_contract(task_id, &v2, now()).unwrap();
+
+    let mut stale = request("k1");
+    stale.contract_revision = 1; // current is 2
+    let outcome = store
+        .grant_renewal(task_id, stale, BlockingStatus::NotBlocking, now())
+        .unwrap();
+    assert_eq!(
+        outcome,
+        GrantRenewalOutcome::Refused(RenewalRefusal::ContractRevisionMismatch {
+            requested: 1,
+            current: 2,
+        })
+    );
+    assert_eq!(renewal_row_count(&path, task_id), 0);
+}
+
+/// A `Completed` claim against a superseded revision must not keep
+/// blocking renewals requested against the task's current revision —
+/// the direct behavioral test for HORO-1727 Decision 2's "current
+/// revision only" rule.
+#[test]
+fn a_completed_attestation_at_a_superseded_revision_does_not_block_renewal_at_the_current_revision()
+{
+    let (_dir, _path, mut store) = open_file_store();
+    let task_id = setup(&mut store, &renewable_policy());
+    let v1 = CompletionContract::first(vec![CompletionCriterion::required("tests pass")]);
+    let v2 = v1.next_revision(vec![CompletionCriterion::required("tests pass, updated")]);
+    store.insert_contract(task_id, &v1, now()).unwrap();
+    store.insert_contract(task_id, &v2, now()).unwrap();
+
+    store
+        .insert_outcome_attestation(OutcomeAttestationInsert {
+            id: "attestation-1",
+            task_id,
+            plan_id: None,
+            contract_revision: Some(1),
+            source: "governor_local",
+            source_id: None,
+            outcome_kind: "completed",
+            evidence_json: "[]",
+            idempotency_key: "finalize-1",
+            authoritative: true,
+            attested_at: now(),
+        })
+        .unwrap();
+
+    let mut current = request("k1");
+    current.contract_revision = 2;
+    let outcome = store
+        .grant_renewal(task_id, current, BlockingStatus::NotBlocking, now())
+        .unwrap();
+    assert!(
+        matches!(outcome, GrantRenewalOutcome::Granted(_)),
+        "a Completed claim bound to revision 1 must not block a renewal at current revision 2, \
+         got {outcome:?}"
+    );
+}
+
+#[test]
+fn refuses_when_the_current_revision_has_disagreeing_authoritative_terminal_outcomes() {
+    let (_dir, path, mut store) = open_file_store();
+    let task_id = setup(&mut store, &renewable_policy());
+    let v1 = CompletionContract::first(vec![CompletionCriterion::required("tests pass")]);
+    store.insert_contract(task_id, &v1, now()).unwrap();
+
+    store
+        .insert_outcome_attestation(OutcomeAttestationInsert {
+            id: "attestation-1",
+            task_id,
+            plan_id: None,
+            contract_revision: Some(1),
+            source: "governor_local",
+            source_id: None,
+            outcome_kind: "completed",
+            evidence_json: "[]",
+            idempotency_key: "claim-completed",
+            authoritative: true,
+            attested_at: now(),
+        })
+        .unwrap();
+    store
+        .insert_outcome_attestation(OutcomeAttestationInsert {
+            id: "attestation-2",
+            task_id,
+            plan_id: None,
+            contract_revision: Some(1),
+            source: "governor_local",
+            source_id: None,
+            outcome_kind: "failed",
+            evidence_json: "[]",
+            idempotency_key: "claim-failed",
+            authoritative: true,
+            attested_at: now(),
+        })
+        .unwrap();
+
+    let mut current = request("k1");
+    current.contract_revision = 1;
+    let outcome = store
+        .grant_renewal(task_id, current, BlockingStatus::NotBlocking, now())
+        .unwrap();
+    assert_eq!(
+        outcome,
+        GrantRenewalOutcome::Refused(RenewalRefusal::ConflictingCompletionOutcomes)
+    );
+    assert_eq!(renewal_row_count(&path, task_id), 0);
+}
+
+/// An unbound (legacy, `contract_revision: None`) authoritative
+/// `Completed` attestation cannot be proven to apply — or not to apply —
+/// to a task's current revision once one exists, so it refuses
+/// conservatively rather than either blocking forever or being ignored.
+#[test]
+fn refuses_conservatively_on_an_unbound_legacy_completed_attestation_once_a_revision_exists() {
+    let (_dir, path, mut store) = open_file_store();
+    let task_id = setup(&mut store, &renewable_policy());
+    let v1 = CompletionContract::first(vec![CompletionCriterion::required("tests pass")]);
+    store.insert_contract(task_id, &v1, now()).unwrap();
+
+    store
+        .insert_outcome_attestation(OutcomeAttestationInsert {
+            id: "attestation-1",
+            task_id,
+            plan_id: None,
+            contract_revision: None,
+            source: "governor_local",
+            source_id: None,
+            outcome_kind: "completed",
+            evidence_json: "[]",
+            idempotency_key: "finalize-1",
+            authoritative: true,
+            attested_at: now(),
+        })
+        .unwrap();
+
+    let mut current = request("k1");
+    current.contract_revision = 1;
+    let outcome = store
+        .grant_renewal(task_id, current, BlockingStatus::NotBlocking, now())
+        .unwrap();
+    assert_eq!(
+        outcome,
+        GrantRenewalOutcome::Refused(RenewalRefusal::UnboundLegacyCompletion)
+    );
+    assert_eq!(renewal_row_count(&path, task_id), 0);
+}
+
+// ---------------------------------------------------------------------
 // Monotonicity / append-only enforcement
 // ---------------------------------------------------------------------
 
