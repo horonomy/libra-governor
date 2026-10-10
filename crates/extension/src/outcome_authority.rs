@@ -98,17 +98,27 @@ pub enum OutcomeClaimVerificationError {
 /// `crate::sign::sign`'s own `(timestamp, marker, body)` wrapping already
 /// binds (`issued_at`, `idempotency_key`).
 pub fn canonical_bytes(content: &OutcomeClaimContent) -> Vec<u8> {
-    format!(
-        "{}.{}.{}.{}",
-        content.task_id,
-        content
-            .plan_id
-            .map(|p| p.0.to_string())
-            .unwrap_or_else(|| "-".to_string()),
-        content.outcome_kind,
-        content.evidence_digest,
-    )
-    .into_bytes()
+    // Length-prefixed, not delimiter-joined: `outcome_kind` and
+    // `evidence_digest` are caller-controlled strings this function does
+    // not otherwise constrain, so a bare separator (even one chosen to
+    // look unlikely, like `.`) would let two different field
+    // combinations canonicalize to identical bytes whenever one field's
+    // content contains that separator — a classic canonicalization
+    // ambiguity that would make a signature over one combination also
+    // verify for the colliding one. An 8-byte big-endian length prefix
+    // per field makes the encoding unambiguous regardless of content.
+    let mut buf = Vec::new();
+    for field in [
+        content.task_id.to_string(),
+        content.plan_id.map(|p| p.0.to_string()).unwrap_or_default(),
+        content.outcome_kind.clone(),
+        content.evidence_digest.clone(),
+    ] {
+        let bytes = field.into_bytes();
+        buf.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        buf.extend_from_slice(&bytes);
+    }
+    buf
 }
 
 /// Constant-time byte comparison — a verification path must not leak
@@ -326,6 +336,31 @@ mod tests {
             a.signature, b.signature,
             "binding plan_id into the signed content must make a claim for one plan/revision \
              unusable for another"
+        );
+    }
+
+    /// A delimiter-joined (rather than length-prefixed) encoding would let
+    /// `outcome_kind: "completed.evidence-x"` with an empty
+    /// `evidence_digest` canonicalize identically to `outcome_kind:
+    /// "completed"` with `evidence_digest: "evidence-x"` — a signature
+    /// valid for one combination would then also verify for the other.
+    /// `canonical_bytes` must not permit this regardless of what
+    /// characters a caller-controlled field contains.
+    #[test]
+    fn canonical_bytes_does_not_collide_across_a_shifted_field_boundary() {
+        let mut a = base_content(TaskId::new());
+        a.outcome_kind = "completed.evidence-x".to_string();
+        a.evidence_digest = String::new();
+
+        let mut b = a.clone();
+        b.outcome_kind = "completed".to_string();
+        b.evidence_digest = "evidence-x".to_string();
+
+        assert_ne!(
+            canonical_bytes(&a),
+            canonical_bytes(&b),
+            "a bare delimiter would let these two different field splits canonicalize to the \
+             same bytes"
         );
     }
 }
