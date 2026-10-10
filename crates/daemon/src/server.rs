@@ -2005,9 +2005,15 @@ fn outcome_kind_str(outcome: &ExecutionOutcome) -> &'static str {
 /// Every push through this `Request` variant is attributed
 /// `AttestationSource::Provider { provider_id: source_id }` — this
 /// specific inbound path exists for external Outcome Providers (see
-/// `examples/local-providers/report_outcome.sh`); `GovernorLocal` is used
-/// internally by `handle_finalize`, and no path yet exercises
-/// `AttestationSource::Agent`.
+/// `examples/local-providers/report_outcome.sh`). `handle_finalize`
+/// never constructs an `AttestationSource` at all: it always records
+/// `ExecutionOutcome::Unknown` on the receipt itself, by design (a task
+/// must never be inferred "done" merely because the session stopped —
+/// see `handle_finalize`'s own doc comment). `AttestationSource::GovernorLocal`
+/// and `AttestationSource::Agent` are both legal values of the enum with
+/// no production caller yet; an automated Completion Contract
+/// verification path (e.g. a test-running integration) is the kind of
+/// future caller `GovernorLocal` exists for.
 fn handle_record_outcome(
     task_id: TaskId,
     plan_id: Option<PlanId>,
