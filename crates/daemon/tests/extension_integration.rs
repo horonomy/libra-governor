@@ -949,8 +949,11 @@ fn record_outcome_writes_attestation_but_never_promotes_the_receipt() {
          recorded outcome"
     );
 
-    // A duplicate push (same task, source, idempotency key) is a no-op.
-    let duplicate_response = send(
+    // Same (task, source, idempotency key) but DIFFERENT content (Failed,
+    // not the original Completed) must be refused as IdempotencyKeyReused
+    // (ADR-0017, HORO-1727 Decision 2) -- not silently treated as the
+    // same no-op "Duplicate" an identical replay would be.
+    let reused_key_response = send(
         &listener,
         &config.socket_path,
         &mut ledger,
@@ -965,8 +968,8 @@ fn record_outcome_writes_attestation_but_never_promotes_the_receipt() {
         },
     );
     assert!(matches!(
-        duplicate_response,
-        Response::OutcomeRecorded(OutcomeRecordedOutcome::Duplicate)
+        reused_key_response,
+        Response::OutcomeRecorded(OutcomeRecordedOutcome::IdempotencyKeyReused)
     ));
     let trajectory = ledger.task_trajectory(preflight.task_id).unwrap();
     assert_eq!(

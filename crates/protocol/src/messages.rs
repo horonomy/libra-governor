@@ -774,31 +774,51 @@ pub struct DoctorResult {
     pub extension_config_error: Option<String>,
 }
 
-/// Everything recorded from a successful `RecordOutcome` push (HORO-1174).
+/// Everything recorded from a successful `RecordOutcome` push (HORO-1174,
+/// corrected by ADR-0017/HORO-1727).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OutcomeRecordedResult {
     pub attested: ExecutionOutcome,
-    /// `true` if this push also promoted `receipts.outcome_json` — see
-    /// `libra_governor_ledger::LedgerStore::promote_receipt_outcome`.
+    /// `true` if this attestation was treated as authoritative. As of
+    /// ADR-0017, always `false` on this deployment — see
+    /// `libra_governor_domain::outcome_attestation::AttestationSource`.
+    pub authoritative: bool,
+    /// The contract revision this attestation is bound to, resolved
+    /// from the request's `plan_id` — `None` when `plan_id` was `None`
+    /// (deliberately unbound; never promotes; never counts toward any
+    /// revision's conflict resolution — see ADR-0017).
+    pub contract_revision: Option<u32>,
+    /// `true` if this push also promoted `receipts.outcome_json` for
+    /// every receipt at `contract_revision` — see
+    /// `libra_governor_ledger::LedgerStore::record_outcome_attestation`.
     /// `false` when the attestation was recorded but no receipt existed
-    /// yet to promote (an outcome pushed before `Finalize` ever ran for
-    /// this task), or when the attestation's
-    /// `AttestationSource::is_authoritative()` was `false` (an
-    /// `Agent`-sourced attestation is recorded but never promotes).
+    /// yet to promote, when `authoritative` was `false`, when
+    /// `contract_revision` was `None`, or when the authoritative claims
+    /// for that revision don't yet agree on one terminal outcome.
     pub receipt_updated: bool,
 }
 
-/// The outcome of a `RecordOutcome` request (HORO-1174). Tagged `"state"`,
-/// mirroring [`FinalizeOutcome`]'s own discipline for the exact same
-/// reason — see that type's docs on the tag-collision bug this avoids.
+/// The outcome of a `RecordOutcome` request (HORO-1174, extended by
+/// ADR-0017/HORO-1727). Tagged `"state"`, mirroring
+/// [`FinalizeOutcome`]'s own discipline for the exact same reason — see
+/// that type's docs on the tag-collision bug this avoids.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum OutcomeRecordedOutcome {
     /// `task_id` has no `tasks` row at all.
     NoSuchTask,
+    /// `plan_id` was `Some(..)` but does not name a real plan belonging
+    /// to `task_id` (ADR-0017).
+    NoSuchPlan,
     /// This exact `(task_id, source_id, idempotency_key)` was already
-    /// recorded — a safe no-op replay, not an error.
+    /// recorded with the same outcome kind and evidence — a safe no-op
+    /// replay, not an error.
     Duplicate,
+    /// This exact `(task_id, source_id, idempotency_key)` was already
+    /// recorded with *different* content (ADR-0017) — refused, nothing
+    /// written. A genuine correction needs its own, different
+    /// `idempotency_key`.
+    IdempotencyKeyReused,
     /// Boxed for the same large-enum-variant reason as
     /// [`FinalizeOutcome::Finalized`].
     Recorded(Box<OutcomeRecordedResult>),
@@ -1104,9 +1124,13 @@ mod tests {
     fn outcome_recorded_outcome_round_trips_every_variant() {
         for outcome in [
             OutcomeRecordedOutcome::NoSuchTask,
+            OutcomeRecordedOutcome::NoSuchPlan,
             OutcomeRecordedOutcome::Duplicate,
+            OutcomeRecordedOutcome::IdempotencyKeyReused,
             OutcomeRecordedOutcome::Recorded(Box::new(OutcomeRecordedResult {
                 attested: libra_governor_domain::ExecutionOutcome::Completed { evidence: vec![] },
+                authoritative: false,
+                contract_revision: Some(1),
                 receipt_updated: true,
             })),
         ] {

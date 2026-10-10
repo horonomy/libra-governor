@@ -150,4 +150,12 @@ pub use messages::{
 /// results. Status now requires an explicit host-latest scope, and unknown
 /// request dimensions fail decoding rather than silently narrowing identity.
 /// A long-lived v11 daemon must be restarted before owner traffic.
-pub const PROTOCOL_VERSION: u32 = 12;
+///
+/// Bumped 12 -> 13 for ADR-0017/HORO-1727's outcome-attestation trust
+/// boundary and conflict-semantics correction: `OutcomeRecordedOutcome`
+/// gained `NoSuchPlan`/`IdempotencyKeyReused`, and `OutcomeRecordedResult`
+/// gained `authoritative`/`contract_revision` — a v12 peer's
+/// `deny_unknown_fields`-enforced decoder cannot parse either. Same known
+/// limitation as every earlier bump: a long-lived v12 daemon must be
+/// restarted after upgrading.
+pub const PROTOCOL_VERSION: u32 = 13;
