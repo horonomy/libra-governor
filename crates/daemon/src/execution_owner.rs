@@ -129,14 +129,28 @@ pub(crate) fn handle(
                 {
                     return Ok(unavailable(Gap::Ambiguous));
                 }
-                match (
-                    ledger.execution_current_turn(&position)?,
-                    supersedes_turn.as_deref(),
-                ) {
+                let current_turn = ledger.execution_current_turn(&position)?;
+                match (current_turn.as_deref(), supersedes_turn.as_deref()) {
                     (None, None) => {}
                     (Some(current), Some(expected)) if current == expected => {}
                     (None, Some(_)) => return Ok(unavailable(Gap::Missing)),
-                    (Some(_), None) => return Ok(unavailable(Gap::Ambiguous)),
+                    (Some(current), None) => {
+                        // HORO-1714 decision B (2026-10-10): a narrowly
+                        // scoped owner-managed succession with no native
+                        // predecessor field is permitted ONLY when the
+                        // lane's previous turn is confirmed finalized.
+                        // Never inferred from timestamps, cwd, a
+                        // latest-session lookup, or a hook-local cache --
+                        // this is the one durable fact a finalized `Stop`
+                        // already recorded.
+                        if ledger
+                            .execution_turn_state_for(&position.lane, current)?
+                            .as_deref()
+                            != Some("finalized")
+                        {
+                            return Ok(unavailable(Gap::Ambiguous));
+                        }
+                    }
                     (Some(_), Some(_)) => return Ok(unavailable(Gap::Stale)),
                 }
                 // Expiry is idempotent maintenance, but must also roll back if
@@ -156,6 +170,7 @@ pub(crate) fn handle(
                     &event.identity,
                     result.task_id,
                     result.plan_id,
+                    current_turn.as_deref(),
                 )?;
                 let target = match ledger.resolve_execution(&position)? {
                     ExecutionLookup::Found(target) => target,

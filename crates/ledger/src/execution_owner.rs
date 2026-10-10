@@ -93,11 +93,24 @@ impl LedgerStore {
         &self,
         position: &ExecutionPosition,
     ) -> Result<Option<String>, LedgerError> {
+        self.execution_turn_state_for(&position.lane, &position.turn)
+    }
+
+    /// Same lookup as [`Self::execution_turn_state`], but for an arbitrary
+    /// `(lane, turn)` pair rather than an incoming `ExecutionPosition`'s own
+    /// turn. HORO-1714 decision B needs this for the lane's *previous*
+    /// turn (the one `supersedes_turn` would have named, had Codex sent
+    /// one) -- a different turn than the new prompt's own `position.turn`.
+    pub fn execution_turn_state_for(
+        &self,
+        lane: &str,
+        turn: &str,
+    ) -> Result<Option<String>, LedgerError> {
         Ok(self
             .conn
             .query_row(
                 "SELECT state FROM execution_turns WHERE lane=?1 AND turn=?2",
-                rusqlite::params![position.lane, position.turn],
+                rusqlite::params![lane, turn],
                 |r| r.get(0),
             )
             .optional()?)
@@ -171,12 +184,22 @@ impl LedgerStore {
         }))
     }
 
+    /// HORO-1714 decision B (2026-10-10): `expected_current` is a
+    /// compare-and-swap guard, not merely a read the caller already did.
+    /// Atomicity against a concurrent racer does not depend on the daemon
+    /// having read the right value a moment earlier -- it depends on this
+    /// single statement, inside the one `BEGIN IMMEDIATE` transaction this
+    /// method requires, refusing to move the lane unless the row it's
+    /// actually updating still matches. Pass `None` for a brand-new lane
+    /// (no existing row to guard against); pass `Some(finalized_turn)` for
+    /// an owner-managed succession with no native predecessor field.
     pub fn bind_execution_turn(
         &mut self,
         position: &ExecutionPosition,
         identity: &ExecutionIdentity,
         task_id: TaskId,
         plan_id: PlanId,
+        expected_current: Option<&str>,
     ) -> Result<(), LedgerError> {
         self.require_owner_transaction()?;
         self.conn.execute(
@@ -185,11 +208,20 @@ impl LedgerStore {
              AND state IN ('active','finalized')",
             [&position.lane],
         )?;
-        self.conn.execute(
+        let rows = self.conn.execute(
             "INSERT INTO execution_lanes(lane,current_turn,exact_context) VALUES(?1,?2,?3)
-            ON CONFLICT(lane) DO UPDATE SET current_turn=excluded.current_turn",
-            rusqlite::params![position.lane, position.turn, position.context],
+            ON CONFLICT(lane) DO UPDATE SET current_turn=excluded.current_turn
+            WHERE execution_lanes.current_turn IS ?4",
+            rusqlite::params![
+                position.lane,
+                position.turn,
+                position.context,
+                expected_current
+            ],
         )?;
+        if rows != 1 {
+            return Err(LedgerError::InvalidExecutionAssociation);
+        }
         self.conn.execute("INSERT INTO execution_turns(lane,turn,exact_identity,identity_json,task_id,initial_plan_id,state)
             VALUES(?1,?2,?3,?4,?5,?6,'active')",
             rusqlite::params![position.lane,position.turn,position.exact,encode(identity)?,task_id.to_string(),plan_id.0.to_string()])?;
