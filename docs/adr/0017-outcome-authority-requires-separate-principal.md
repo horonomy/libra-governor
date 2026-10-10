@@ -198,6 +198,27 @@ implement `canonical_bytes`' exact encoding (and the `evidence_digest`
 sub-format it itself depends on) against that pinned vector before its
 signatures can ever verify.
 
+### 8. Known limitation: the outer HMAC wrapper this reuses bare-delimits its own fields
+
+`crate::sign::sign` (predates HORO-1727, built for HORO-1174 event
+delivery) wraps its payload as `"v1." + timestamp + "." + marker + "." +
+body` with no length prefix between `marker` and `body` — safe for its
+original caller, where `marker` is always a 32-hex-character CSPRNG value
+that can never contain a `.`. This ticket reuses that same function with
+the caller-controlled `idempotency_key` as `marker`, reintroducing
+exactly the canonicalization-ambiguity class decision 7's `canonical_bytes`
+exists to avoid, at the one layer that doesn't get that protection. An
+independent review assessed this as not practically exploitable today —
+`canonical_bytes`' own first two fields are fixed-format UUIDs behind
+8-byte binary length prefixes, so there is no way to construct a usable
+`.`-boundary splice through them — but it is recorded here as a known
+limitation rather than silently relied upon. Restructuring `sign.rs`
+itself to length-prefix its own wrapper is out of this ticket's scope
+(it is shared with HORO-1174's event delivery and would need its own
+review); a future change that lets `idempotency_key` (or any other
+caller-controlled value) become fully attacker-chosen should re-examine
+this.
+
 ## Consequences
 
 ### Gained

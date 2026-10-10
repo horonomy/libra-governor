@@ -46,7 +46,13 @@
 
 use std::path::{Path, PathBuf};
 
-const ALLOWED_FILE: &str = "outcome_authority_wiring.rs";
+/// Relative to the repo root — matched against the FULL relative path,
+/// not just the basename (a prior version of this guard compared only
+/// `file_name()`, which would have silently exempted any other file
+/// anywhere under the scanned crates that happened to share this same
+/// basename; an independent review caught this before it mattered —
+/// `git ls-tree` confirms exactly one file with this name exists today).
+const ALLOWED_FILE: &str = "crates/daemon/src/outcome_authority_wiring.rs";
 
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -65,12 +71,17 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn scan_for_patterns<'a>(root: &Path, patterns: &[&'a str]) -> Vec<(PathBuf, &'a str)> {
+fn scan_for_patterns<'a>(
+    repo_root: &Path,
+    root: &Path,
+    patterns: &[&'a str],
+) -> Vec<(PathBuf, &'a str)> {
     let mut files = Vec::new();
     collect_rs_files(root, &mut files);
     let mut hits = Vec::new();
     for file in files {
-        if file.file_name().and_then(|n| n.to_str()) == Some(ALLOWED_FILE) {
+        let relative = file.strip_prefix(repo_root).unwrap_or(&file);
+        if relative.to_str() == Some(ALLOWED_FILE) {
             continue;
         }
         let Ok(contents) = std::fs::read_to_string(&file) else {
@@ -99,10 +110,18 @@ fn daemon_cli_and_gateway_never_construct_an_authoritative_attestation_source() 
     let root = repo_root();
     // "AttestationSource :: Provider" / "AttestationSource :: GovernorLocal"
     // written without a space to match the real source formatting, kept
-    // as two separate needles so a reformatted `AttestationSource::`
-    // (e.g. via a `use` alias) cannot silently defeat this guard by
-    // happening to not contain the exact substring -- both the
-    // qualified and bare-variant forms are checked.
+    // as two separate needles. This is a plain substring scan, not a
+    // parser: it catches the qualified form used everywhere in this
+    // codebase today, but a `use AttestationSource::Provider as X;`
+    // import alias or a bare unqualified `Provider { .. }` after a glob
+    // `use` would defeat it -- no such alias exists today (checked via
+    // `git grep`), and adding a bare-`Provider`-only pattern would cause
+    // too many false positives (it is a common identifier) to be worth
+    // the trade-off for a lightweight guard. Likewise `authoritative:
+    // true` only catches the literal boolean, not a renamed variable or
+    // a positional bool -- the one real call site passes a variable, so
+    // this is a real but currently-harmless limitation, documented
+    // rather than silently assumed away.
     let patterns = [
         "AttestationSource::Provider",
         "AttestationSource::GovernorLocal",
@@ -113,7 +132,7 @@ fn daemon_cli_and_gateway_never_construct_an_authoritative_attestation_source() 
         if !src.exists() {
             panic!("expected {crate_name}'s src directory to exist at {src:?}");
         }
-        let hits = scan_for_patterns(&src, &patterns);
+        let hits = scan_for_patterns(&root, &src, &patterns);
         assert!(
             hits.is_empty(),
             "ADR-0017 (HORO-1727): no code-level fix can make an authoritative \
@@ -135,13 +154,24 @@ fn daemon_cli_and_gateway_never_construct_an_authoritative_attestation_source() 
 /// (`config_file::load_overrides` returns no such value at all), and the
 /// one real daemon entry point (`cli/src/daemon_cmd.rs::run`) must keep
 /// hardcoding `None`.
+///
+/// Like the test above, this is a literal-substring scan, so it only
+/// catches the struct-construction shape `outcome_authority: Some(` —
+/// not a later field assignment (`config.outcome_authority = Some(..)`)
+/// or a bound-variable construction (`outcome_authority: resolved,`
+/// where `resolved` happens to be `Some(..)`). Confirmed (by an
+/// independent review) that `daemon/src`/`cli/src` have exactly one
+/// `DaemonConfig` construction site in production code
+/// (`cli/src/daemon_cmd.rs::run`) and no later mutation of this field
+/// anywhere, so today's real guarantee rests on that fact, not purely on
+/// this scan — documented rather than silently assumed.
 #[test]
 fn nothing_outside_the_one_allowed_file_ever_sets_outcome_authority_to_some() {
     let root = repo_root();
     let patterns = ["outcome_authority: Some("];
     for crate_name in ["daemon", "cli"] {
         let src = root.join("crates").join(crate_name).join("src");
-        let hits = scan_for_patterns(&src, &patterns);
+        let hits = scan_for_patterns(&root, &src, &patterns);
         assert!(
             hits.is_empty(),
             "ADR-0017 (HORO-1727): no code in `{crate_name}` outside {ALLOWED_FILE} may set \
