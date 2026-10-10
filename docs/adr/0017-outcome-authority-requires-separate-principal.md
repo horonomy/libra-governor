@@ -107,16 +107,26 @@ tracked under HORO-1727) makes this the *only* reachable state in
 production:
 
 - Every real `RecordOutcome` push becomes non-authoritative
-  (`AttestationSource::Agent`, never `Provider`) — see PR 2.
+  (`AttestationSource::Unverified { claimed_source_id }`, never
+  `Provider`) — see PR 2. (**Corrected by ADR 0018:** the shipped code
+  uses `Unverified`, not `Agent` as originally drafted here before PR 2
+  landed; `Agent` remains a legal, production-uncalled variant with a
+  different meaning — see `outcome_attestation.rs`'s own docs.)
 - A verified-signature path (`AttestationSource::Provider`) exists in
   code and is fully tested, but its configuration
-  (`ExtensionConfig.outcome_authority`) is parsed nowhere in
-  `config_file.rs` — there is no way to turn it on from this daemon's
-  real config-loading path. See PR 5. This proves the verification
-  *logic* and its fail-closed behavior; it does not and cannot prove
-  principal separation, because none exists here. The canary built for
-  PR 5 is labeled accordingly — it is not evidence that this mechanism
-  is safe to activate on a shared-principal deployment.
+  (`DaemonConfig::outcome_authority`) is set nowhere outside tests — the
+  one real daemon entry point (`cli/src/daemon_cmd.rs::run`) hardcodes
+  `None`, and a config file structurally cannot populate it either
+  (`config_file::load_overrides` has no corresponding field at all).
+  See PR 5a/5b. This proves the verification *logic* and its
+  fail-closed behavior; it does not and cannot prove principal
+  separation, because none exists here. The canary built for PR 5b is
+  labeled accordingly — it is not evidence that this mechanism is safe
+  to activate on a shared-principal deployment. (**Extended by ADR
+  0018:** also identifies suppression — deleting or never-persisting
+  the authoritative row itself — as a distinct attack no signing scheme
+  closes without the separate principal also owning the ledger of
+  record.)
 - `renewal_not_wired_live.rs` (already shipped) continues to guarantee
   `grant_renewal` has no production caller regardless of attestation
   authority, so this ADR does not change the renewal mechanism's own
@@ -134,6 +144,14 @@ on this deployment. When a genuinely separate-principal deployment is
 built, that is the point to revisit whether the verifier-held-key
 property matters enough to introduce Ed25519 — not before, since no
 secret exists yet for either scheme to protect.
+
+**Revisited by ADR 0018 (HORO-1727/HORO-1749):** that point has now
+arrived for the cross-principal case. ADR 0018 concludes HMAC stays
+correct for same-principal verification (today's structurally-disabled
+case) but any future cross-principal verification (a separate OS user,
+a remote service, CI) must use asymmetric signing or an equivalent
+transparency-log scheme instead — deferred to whichever separate
+principal is eventually chosen, not decided here.
 
 ### 3. `outcome_attestations` becomes genuinely append-only (not append-only by convention)
 
