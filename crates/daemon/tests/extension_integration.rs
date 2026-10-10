@@ -87,6 +87,8 @@ fn base_config(dir: &Path, policy: Policy, extensions: Option<ExtensionConfig>) 
         gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER.to_string(),
         extensions,
         extension_runtime: std::sync::OnceLock::new(),
+
+        outcome_authority: None,
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
     }
 }
@@ -923,6 +925,7 @@ fn record_outcome_writes_attestation_but_never_promotes_the_receipt() {
             outcome: ExecutionOutcome::Completed {
                 evidence: vec!["https://ci.example.com/1".to_string()],
             },
+            signed_claim: None,
         },
     );
     let Response::OutcomeRecorded(OutcomeRecordedOutcome::Recorded(result)) = outcome_response
@@ -965,6 +968,7 @@ fn record_outcome_writes_attestation_but_never_promotes_the_receipt() {
             source_id: "example-provider".to_string(),
             idempotency_key: "ci-run-1".to_string(),
             outcome: ExecutionOutcome::Failed { evidence: vec![] },
+            signed_claim: None,
         },
     );
     assert!(matches!(
@@ -1000,6 +1004,7 @@ fn record_outcome_for_an_unknown_task_reports_no_such_task() {
             source_id: "example-provider".to_string(),
             idempotency_key: "ci-run-1".to_string(),
             outcome: ExecutionOutcome::Completed { evidence: vec![] },
+            signed_claim: None,
         },
     );
     assert!(matches!(

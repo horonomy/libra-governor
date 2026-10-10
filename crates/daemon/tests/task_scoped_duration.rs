@@ -156,6 +156,8 @@ impl Harness {
                 .to_string(),
             extensions: None,
             extension_runtime: std::sync::OnceLock::new(),
+
+            outcome_authority: None,
             progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
         };
         let ledger = LedgerStore::open(&config.ledger_path).unwrap();

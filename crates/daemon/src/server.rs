@@ -153,6 +153,17 @@ pub struct DaemonConfig {
     /// evidence-gate ticket can measure empirically whether that
     /// staleness ever mattered.
     pub progressive_interval_secs: u64,
+    /// The optional set of trusted Outcome Provider signing keys
+    /// (HORO-1727 Decision 1 / ADR-0017). `None` in every production
+    /// deployment today — `crates/cli/src/daemon_cmd.rs::run` is the one
+    /// real daemon entry point and hardcodes `None` here; nothing derives
+    /// this from the loaded `config.json` (`config_file::load_overrides`
+    /// has no corresponding field at all, so a config file structurally
+    /// cannot populate it). Even when `Some`, see
+    /// `crate::outcome_authority_wiring` module docs for why this still
+    /// does not satisfy Decision 1 on a same-OS-user deployment — it
+    /// proves verification logic only, not principal separation.
+    pub outcome_authority: Option<libra_governor_extension::OutcomeAuthorityConfig>,
 }
 
 /// Default [`DaemonConfig::progressive_interval_secs`] — see that
@@ -595,12 +606,16 @@ fn dispatch(
             source_id,
             idempotency_key,
             outcome,
+            signed_claim,
         } => match handle_record_outcome(
-            task_id,
-            plan_id,
-            &source_id,
-            &idempotency_key,
-            outcome,
+            RecordOutcomePush {
+                task_id,
+                plan_id,
+                source_id: &source_id,
+                idempotency_key: &idempotency_key,
+                outcome,
+                signed_claim: signed_claim.as_ref(),
+            },
             ledger,
             config,
         ) {
@@ -2021,34 +2036,88 @@ fn outcome_kind_str(outcome: &ExecutionOutcome) -> &'static str {
 /// session stopped — see `handle_finalize`'s own doc comment). The
 /// `GovernorLocal` and `Agent` variants of `AttestationSource` are both
 /// legal values of the enum with no production caller yet.
-fn handle_record_outcome(
+/// Bundles `Request::RecordOutcome`'s own fields (minus `ledger`/`config`,
+/// which are the handler's ambient state, not part of the push itself) —
+/// kept to exactly these fields so `handle_record_outcome` stays under
+/// clippy's argument-count limit without inventing an unrelated grouping.
+struct RecordOutcomePush<'a> {
     task_id: TaskId,
     plan_id: Option<PlanId>,
-    source_id: &str,
-    idempotency_key: &str,
+    source_id: &'a str,
+    idempotency_key: &'a str,
     outcome: ExecutionOutcome,
+    signed_claim: Option<&'a libra_governor_protocol::SignedOutcomeClaimWire>,
+}
+
+fn handle_record_outcome(
+    push: RecordOutcomePush<'_>,
     ledger: &mut LedgerStore,
     config: &DaemonConfig,
 ) -> Result<OutcomeRecordedOutcome, DaemonError> {
+    let RecordOutcomePush {
+        task_id,
+        plan_id,
+        source_id,
+        idempotency_key,
+        outcome,
+        signed_claim,
+    } = push;
     let now = time::OffsetDateTime::now_utc();
 
-    let stored_source_id = format!("unverified:{source_id}");
-    let source = AttestationSource::Unverified {
-        claimed_source_id: source_id.to_string(),
-    };
-    let authoritative = source.is_authoritative();
-    debug_assert!(
-        !authoritative,
-        "handle_record_outcome must never construct an authoritative source (ADR-0017)"
-    );
     let outcome_kind = outcome_kind_str(&outcome);
     let evidence_json = serde_json::to_string(outcome.evidence())?;
+    let evidence_digest = {
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(evidence_json.as_bytes());
+        digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+
+    // The authoritative variant of `AttestationSource` is constructed in
+    // exactly one place in production (HORO-1727 PR 5b / ADR-0017) — see
+    // `outcome_authority_wiring`'s own module docs, and
+    // `outcome_authority_not_wired_live.rs`'s allowlist. Verification is
+    // attempted against this exact push's own `outcome_kind`/
+    // `evidence_digest`/`idempotency_key`, derived above from the same
+    // request fields the ledger is about to persist — never a
+    // caller-asserted summary that could disagree with the real content.
+    let (source, source_str, stored_source_id, came_from_verified_provider) =
+        match crate::outcome_authority_wiring::verify_claim(
+            config,
+            signed_claim,
+            crate::outcome_authority_wiring::ClaimSubject {
+                task_id,
+                plan_id,
+                outcome_kind,
+                evidence_digest: &evidence_digest,
+                idempotency_key,
+            },
+            now,
+        ) {
+            Some((verified, provider_id)) => (verified, "provider", provider_id, true),
+            None => (
+                AttestationSource::Unverified {
+                    claimed_source_id: source_id.to_string(),
+                },
+                "unverified",
+                format!("unverified:{source_id}"),
+                false,
+            ),
+        };
+    let authoritative = source.is_authoritative();
+    debug_assert!(
+        authoritative == came_from_verified_provider,
+        "handle_record_outcome must only ever be authoritative via a verified provider claim \
+         (ADR-0017)"
+    );
 
     let result = ledger.record_outcome_attestation(
         &uuid::Uuid::new_v4().to_string(),
         task_id,
         plan_id,
-        "unverified",
+        source_str,
         Some(&stored_source_id),
         outcome_kind,
         &evidence_json,
@@ -2083,7 +2152,7 @@ fn handle_record_outcome(
                 plan_id,
                 outcome_kind: outcome_kind.to_string(),
                 evidence: outcome.evidence().to_vec(),
-                source: "unverified".to_string(),
+                source: source_str.to_string(),
                 source_id: Some(stored_source_id.clone()),
                 attested_at: now,
             };
@@ -2596,6 +2665,8 @@ mod tests {
                 .to_string(),
             extensions: None,
             extension_runtime: OnceLock::new(),
+
+            outcome_authority: None,
             progressive_interval_secs: DEFAULT_PROGRESSIVE_INTERVAL_SECS,
         }
     }

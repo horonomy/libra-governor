@@ -164,7 +164,8 @@ fn cadence_only_shadow_decision_never_mutates_existing_ledger_state() {
         gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER.to_string(),
         extensions: None,
         extension_runtime: std::sync::OnceLock::new(),
-        // Always due: the sole purpose of this test is to isolate the
+
+        outcome_authority: None, // Always due: the sole purpose of this test is to isolate the
         // cadence gate from the material-event gate, so it must fire on
         // the very first ToolInvoked call.
         progressive_interval_secs: 0,

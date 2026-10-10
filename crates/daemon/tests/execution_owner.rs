@@ -90,6 +90,8 @@ fn config(dir: &Path, name: &str) -> DaemonConfig {
         gateway_session_header: "x-libra-session".into(),
         extensions: None,
         extension_runtime: OnceLock::new(),
+
+        outcome_authority: None,
         progressive_interval_secs: 60,
     }
 }

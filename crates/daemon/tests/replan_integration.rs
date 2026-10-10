@@ -169,6 +169,8 @@ fn tool_call_count_material_deviation_triggers_a_replan_visible_in_status() {
         gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER.to_string(),
         extensions: None,
         extension_runtime: std::sync::OnceLock::new(),
+
+        outcome_authority: None,
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
     };
 
@@ -318,6 +320,8 @@ fn possible_tool_loop_streak_triggers_a_replan_before_the_count_threshold() {
         gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER.to_string(),
         extensions: None,
         extension_runtime: std::sync::OnceLock::new(),
+
+        outcome_authority: None,
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
     };
 
@@ -398,6 +402,8 @@ fn exhausting_the_auto_replan_budget_escalates_instead_of_replanning_again() {
         gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER.to_string(),
         extensions: None,
         extension_runtime: std::sync::OnceLock::new(),
+
+        outcome_authority: None,
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
     };
 
