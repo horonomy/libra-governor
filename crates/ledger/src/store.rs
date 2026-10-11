@@ -240,7 +240,9 @@ mod tests {
         }
         let reopened = LedgerStore::open(&path).unwrap();
         let names = reopened.trigger_names().unwrap();
-        assert!(!names.iter().any(|n| n == "trg_outcome_attestations_no_delete"));
+        assert!(!names
+            .iter()
+            .any(|n| n == "trg_outcome_attestations_no_delete"));
         // The other three survive untouched.
         for expected in APPEND_ONLY_TRIGGERS
             .iter()
