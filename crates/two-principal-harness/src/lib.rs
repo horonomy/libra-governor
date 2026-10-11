@@ -104,9 +104,12 @@ pub fn assert_disposable() {
     }
 }
 
-// A tiny, dependency-free `getuid()` — this crate takes no `libc`
-// dependency (see `Cargo.toml`), so the one raw syscall it needs is
-// declared directly.
+// A tiny, dependency-free `getuid()`. This predates this crate's PR-2b
+// `libc` dependency (see `Cargo.toml`, added for the
+// `lg-raw-client --print-peer-uid` helper's `SO_PEERCRED`/`getpeereid`
+// probe) and is kept as its own direct syscall declaration rather than
+// switched to `libc::getuid()`, since this one line has no reason to
+// change.
 extern "C" {
     fn getuid() -> u32;
 }
