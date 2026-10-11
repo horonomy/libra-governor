@@ -168,6 +168,100 @@ fn daemon_config(
     }
 }
 
+/// Trusted-principal mode's foreground entry point (ADR-0019, PR-2's
+/// design doc §4.1), reached only via the hidden
+/// `daemon run --trusted-principal-config <path>` argv form in
+/// `main.rs` — never advertised in `USAGE`/`--help`. `config.json` is
+/// never read in this path: every field `daemon_config` needs comes
+/// from the pinned `TrustedPrincipalConfig` or a fixed default.
+///
+/// Returns the process exit code: `0` only if `serve_trusted` returns
+/// (which in practice means an unrecoverable accept-loop I/O error, same
+/// as default-mode `serve`); `2` for any startup failure, printed to
+/// **stderr only** — `daemon.log` is not written to here because the
+/// state dir has not yet been validated at that point.
+#[cfg(feature = "trusted-principal")]
+pub fn run_trusted(config_path: &Path) -> i32 {
+    use libra_governor_daemon::trusted_principal::serve::{bind_trusted_socket, serve_trusted};
+    use libra_governor_daemon::trusted_principal::startup::validate_trusted_startup;
+    use libra_governor_daemon::trusted_principal::TrustedPrincipalConfig;
+
+    let cfg = match TrustedPrincipalConfig::load(config_path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("libra-governor daemon run --trusted-principal-config: {e}");
+            return 2;
+        }
+    };
+
+    let ledger = match validate_trusted_startup(&cfg, config_path) {
+        Ok(ledger) => ledger,
+        Err(e) => {
+            eprintln!("libra-governor daemon run --trusted-principal-config: {e}");
+            return 2;
+        }
+    };
+
+    // Pins process cwd to a root-owned directory, so even a future
+    // relative-path join (should one ever slip past the confused-deputy
+    // sanitizer) resolves under `/`, never under an agent-writable
+    // directory (design doc §4.1 step 3).
+    if let Err(e) = std::env::set_current_dir("/") {
+        eprintln!(
+            "libra-governor daemon run --trusted-principal-config: could not set cwd to /: {e}"
+        );
+        return 2;
+    }
+
+    let config = daemon_config(
+        cfg.socket_path(),
+        cfg.ledger_path(),
+        cfg.log_path(),
+        libra_governor_daemon::default_admission_policy(),
+        None,
+        None,
+    );
+
+    let listener = match bind_trusted_socket(&cfg) {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!(
+                "libra-governor daemon run --trusted-principal-config: could not bind socket: {e}"
+            );
+            return 2;
+        }
+    };
+
+    // Best-effort, same discipline as default-mode `run` (HORO-1380): a
+    // failure here does not stop the daemon from serving.
+    let exe_path = std::env::current_exe().unwrap_or_default();
+    let exe_sha256 = libra_governor_daemon::pidfile::hash_file(&exe_path);
+    let pid_record = libra_governor_daemon::pidfile::PidRecord {
+        pid: std::process::id(),
+        exe_path,
+        started_at: current_rfc3339(),
+        exe_sha256,
+    };
+    if let Err(e) = libra_governor_daemon::pidfile::write(&cfg.state_dir, &pid_record) {
+        libra_governor_daemon::log::append_line(
+            &config.log_path,
+            &format!("trusted daemon: failed to write pid record: {e}"),
+        );
+    }
+
+    libra_governor_daemon::log::append_line(&config.log_path, "trusted daemon started");
+    match serve_trusted(listener, ledger, &config, &cfg) {
+        Ok(()) => 0,
+        Err(e) => {
+            libra_governor_daemon::log::append_line(
+                &config.log_path,
+                &format!("trusted daemon exited with error: {e}"),
+            );
+            1
+        }
+    }
+}
+
 fn current_rfc3339() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
