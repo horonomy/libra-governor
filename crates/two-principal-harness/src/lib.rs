@@ -847,6 +847,80 @@ pub fn trusted_positive_control(daemon: &TrustedDaemon, raw_client_bin: &str) ->
     task_id
 }
 
+/// PR-2c's CLI-based positive control (design doc §7: "In 2c, it
+/// switches to the real `hook user-prompt-submit` and `outcome
+/// record`"). Added **alongside**, not in place of,
+/// [`trusted_positive_control`] — that function's raw-client behavior is
+/// PR-2a's test file `x_confused_deputy.rs`'s existing, unmodified call
+/// site, and ADR-0019 §6/the design doc §8 forbid touching any PR-2a
+/// test file. This is the function PR-2c's own harness tests
+/// (`t05_socket_impersonation.rs`, `t08_no_auto_spawn.rs`) use instead.
+pub fn trusted_positive_control_via_cli(daemon: &TrustedDaemon) -> String {
+    let _ = daemon;
+    let preflight_payload = serde_json::json!({
+        "session_id": "trusted-harness-positive-control-cli",
+        "cwd": "",
+        "prompt": "trusted harness positive control preflight (cli)",
+    })
+    .to_string();
+
+    let out = run_as_with_stdin(
+        &LG_AGENT,
+        PROVIDER_BINARY,
+        &["hook", "user-prompt-submit"],
+        &[("PATH", PATH_ENV), ("HOME", "/home/lg-agent")],
+        &preflight_payload,
+    );
+    if !out.status.success() {
+        panic!(
+            "trusted positive control (cli): hook user-prompt-submit failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let task_id = query_live(
+        PROVIDER_STATE_DIR,
+        "SELECT task_id FROM tasks ORDER BY created_at DESC LIMIT 1;",
+    )
+    .into_iter()
+    .next()
+    .unwrap_or_else(|| {
+        panic!("trusted positive control (cli): no task row appeared after hook user-prompt-submit")
+    });
+
+    let outcome_payload = serde_json::json!({
+        "task_id": task_id,
+        "source_id": "two-principal-harness-trusted-positive-control-cli",
+        "idempotency_key": "trusted-harness-positive-control-cli-1",
+        "outcome": {"kind": "completed", "evidence": ["harness://trusted-positive-control-cli"]},
+    })
+    .to_string();
+
+    // Any non-empty HOME works for the provider's own `outcome record`
+    // invocation: `outcome_cmd.rs` resolves the socket path only to
+    // immediately ignore it once a pinned config is found, and never
+    // calls the identity/host_id machinery that would actually create
+    // anything under it. `PROVIDER_STATE_DIR` is simply a HOME value
+    // already owned by lg-provider.
+    let out = run_as_with_stdin(
+        &LG_PROVIDER,
+        PROVIDER_BINARY,
+        &["outcome", "record"],
+        &[("PATH", PATH_ENV), ("HOME", PROVIDER_STATE_DIR)],
+        &outcome_payload,
+    );
+    if !out.status.success() {
+        panic!(
+            "trusted positive control (cli): outcome record failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    task_id
+}
+
 use std::os::unix::fs::PermissionsExt;
 
 // Deliberately never interpolates the owner spec (`uid:gid`) into a
