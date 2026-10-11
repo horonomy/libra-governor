@@ -22,6 +22,7 @@
 //! `trusted-principal.json` yet — those are PR-2/PR-3.
 
 use std::io::Write as _;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -529,6 +530,321 @@ pub fn reset_state_dirs() {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
             .unwrap_or_else(|e| panic!("chmod {dir}: {e}"));
     }
+
+    // PR-2 additions (ADR-0019 §1/§5, design doc §7 "reset_state_dirs
+    // extended to also remove TRUSTED_CONFIG_PATH and recreate
+    // /run/libra-governor"). Every test starts with the trusted config
+    // absent — `TrustedConfigGuard` installs it only for the duration of
+    // the one test that needs it (design doc §5 "Consequence for the
+    // harness").
+    let _ = std::fs::remove_file(TRUSTED_CONFIG_PATH);
+    let _ = std::fs::remove_dir_all(PROVIDER_SOCKET_DIR);
+    std::fs::create_dir_all(PROVIDER_SOCKET_DIR)
+        .unwrap_or_else(|e| panic!("mkdir {PROVIDER_SOCKET_DIR}: {e}"));
+    chown(
+        Path::new(PROVIDER_SOCKET_DIR),
+        &format!("{}:{LG_CLIENTS_GID}", LG_PROVIDER.uid),
+    );
+    // 2710: owner rwx, group --x (traverse only, no list/create/unlink),
+    // other none. The setgid bit (2000) makes a socket created inside
+    // this directory inherit the lg-clients group.
+    std::fs::set_permissions(PROVIDER_SOCKET_DIR, std::fs::Permissions::from_mode(0o2710))
+        .unwrap_or_else(|e| panic!("chmod {PROVIDER_SOCKET_DIR}: {e}"));
+}
+
+/// Root-owned pinned trusted-principal config path (ADR-0019 §1, mirrors
+/// `libra_governor_daemon::trusted_principal::PINNED_CONFIG_PATH` without
+/// this crate taking a Cargo dependency on `daemon` — see this crate's
+/// `Cargo.toml` doc comment).
+pub const TRUSTED_CONFIG_PATH: &str = "/etc/libra-governor/trusted-principal.json";
+/// Provider-owned, `lg-clients`-group socket directory (ADR-0019 §1
+/// filesystem layout table).
+pub const PROVIDER_SOCKET_DIR: &str = "/run/libra-governor";
+/// `PROVIDER_SOCKET_DIR`/`daemon.sock`.
+pub const PROVIDER_SOCKET: &str = "/run/libra-governor/daemon.sock";
+/// Matches `provision.sh`'s `groupadd --gid 11000 lg-clients`.
+pub const LG_CLIENTS_GID: u32 = 11_000;
+
+/// The trusted-principal JSON config shape this crate writes, mirroring
+/// `libra_governor_daemon::trusted_principal::TrustedPrincipalConfig`'s
+/// fields without a Cargo dependency on `daemon` (this crate drives the
+/// binary only through `std::process::Command` and stdin/file JSON — see
+/// `Cargo.toml`'s doc comment).
+#[derive(Debug, Clone)]
+pub struct ConfigSpec {
+    pub provider_uid: u32,
+    pub agent_uids: Vec<u32>,
+    pub provider_id: String,
+    pub state_dir: String,
+    pub socket_dir: String,
+    pub connection_timeout_ms: u64,
+}
+
+impl Default for ConfigSpec {
+    /// The layout every passing (non-adversarial) test uses: the real
+    /// provider UID, the real agent UID, and the real state/socket
+    /// directories.
+    fn default() -> Self {
+        Self {
+            provider_uid: LG_PROVIDER.uid,
+            agent_uids: vec![LG_AGENT.uid],
+            provider_id: "operator:lg-provider".to_string(),
+            state_dir: PROVIDER_STATE_DIR.to_string(),
+            socket_dir: PROVIDER_SOCKET_DIR.to_string(),
+            connection_timeout_ms: 5000,
+        }
+    }
+}
+
+impl ConfigSpec {
+    fn to_json(&self) -> String {
+        serde_json::json!({
+            "provider_uid": self.provider_uid,
+            "agent_uids": self.agent_uids,
+            "provider_id": self.provider_id,
+            "state_dir": self.state_dir,
+            "socket_dir": self.socket_dir,
+            "connection_timeout_ms": self.connection_timeout_ms,
+        })
+        .to_string()
+    }
+}
+
+/// Installs the trusted-principal config at `path`, root-owned (`0644`),
+/// for the life of this guard — removed on `Drop` so a test's config
+/// never leaks into the next one even on an early `panic!` (ADR-0019
+/// §5's "every test starts with it absent").
+pub struct TrustedConfigGuard {
+    path: PathBuf,
+}
+
+impl TrustedConfigGuard {
+    pub fn install(path: &str, spec: &ConfigSpec) -> Self {
+        assert_disposable();
+        std::fs::write(path, spec.to_json()).unwrap_or_else(|e| panic!("write {path}: {e}"));
+        chown(Path::new(path), "0:0");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
+            .unwrap_or_else(|e| panic!("chmod {path}: {e}"));
+        Self {
+            path: PathBuf::from(path),
+        }
+    }
+
+    /// Same as [`Self::install`], but root-owned with a caller-chosen
+    /// mode and/or owner — for the agent-writable-config refusal cases
+    /// (`x_startup_refuses_group_writable_config`, `t08b`'s
+    /// agent-written-config case).
+    pub fn install_with(path: &str, spec: &ConfigSpec, owner: &str, mode: u32) -> Self {
+        assert_disposable();
+        std::fs::write(path, spec.to_json()).unwrap_or_else(|e| panic!("write {path}: {e}"));
+        chown(Path::new(path), owner);
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .unwrap_or_else(|e| panic!("chmod {path}: {e}"));
+        Self {
+            path: PathBuf::from(path),
+        }
+    }
+}
+
+impl Drop for TrustedConfigGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+const PATH_ENV: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// A running trusted-mode `libra-governor daemon run
+/// --trusted-principal-config <path>` process, started as [`LG_PROVIDER`]
+/// (trusted mode refuses to start as anyone else — see
+/// `check_process_identity`). Readiness is `connect()` succeeding on
+/// [`PROVIDER_SOCKET`]; root's own connection is dropped unclassified by
+/// the daemon, which is fine for a readiness probe (the connection
+/// attempt alone proves the listener is up).
+pub struct TrustedDaemon {
+    child: Child,
+    pub pid: u32,
+}
+
+impl TrustedDaemon {
+    pub fn start(config_path: &str, envs: &[(&str, &str)], timeout: Duration) -> Self {
+        assert_disposable();
+        let mut all_envs = vec![("PATH", PATH_ENV)];
+        all_envs.extend_from_slice(envs);
+        let mut cmd = command_as(
+            &LG_PROVIDER,
+            PROVIDER_BINARY,
+            &["daemon", "run", "--trusted-principal-config", config_path],
+            &all_envs,
+        );
+        let child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| panic!("failed to start trusted daemon: {e}"));
+        let pid = child.id();
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            if UnixStream::connect(PROVIDER_SOCKET).is_ok() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "trusted daemon (pid {pid}) never accepted a connection at \
+                     {PROVIDER_SOCKET} within {timeout:?}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        Self { child, pid }
+    }
+
+    /// Starts trusted mode expecting it to **refuse** — as `principal`
+    /// (not necessarily [`LG_PROVIDER`]; `t08b` starts this as
+    /// [`LG_AGENT`] to prove the UID check alone refuses it), runs to
+    /// completion (a refusing startup exits promptly rather than
+    /// serving), and asserts both that the exit was non-zero and that no
+    /// socket ever came up at [`PROVIDER_SOCKET`]. Returns the process
+    /// [`Output`] so the caller can additionally assert on the specific
+    /// `StartupError` text in stderr.
+    ///
+    /// Asserting "not connectable" rather than "the path does not exist"
+    /// deliberately tolerates a stale socket file left behind by an
+    /// earlier passing start that was killed — a live listener is what
+    /// actually matters here, and `connect()` fails the same way
+    /// (`ECONNREFUSED`) against a stale file as it does against no file
+    /// at all.
+    pub fn start_expecting_refusal(
+        principal: &Principal,
+        config_path: &str,
+        envs: &[(&str, &str)],
+    ) -> Output {
+        assert_disposable();
+        let mut all_envs = vec![("PATH", PATH_ENV)];
+        all_envs.extend_from_slice(envs);
+        let output = run_as(
+            principal,
+            PROVIDER_BINARY,
+            &["daemon", "run", "--trusted-principal-config", config_path],
+            &all_envs,
+        );
+        assert!(
+            !output.status.success(),
+            "expected trusted-mode startup to be refused (non-zero exit); stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            UnixStream::connect(PROVIDER_SOCKET).is_err(),
+            "expected no live listener at {PROVIDER_SOCKET} after a refused trusted-mode start"
+        );
+        output
+    }
+
+    pub fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    pub fn kill9_and_reap(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for TrustedDaemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// This crate takes no Cargo dependency on `libra-governor-protocol`
+/// (see `Cargo.toml`'s doc comment), so this is a hand-kept mirror of
+/// `libra_governor_protocol::PROTOCOL_VERSION` — bump it if that
+/// constant ever changes, or every raw-socket request this crate sends
+/// starts failing on a protocol-version mismatch.
+const RAW_PROTOCOL_VERSION: u32 = 14;
+
+/// PR-2a/2b's positive control (design doc §7 `trusted_positive_control`):
+/// an agent `Preflight` creates a task in the provider ledger over the
+/// real trusted socket, then a provider-UID `RecordOutcome` lands a
+/// (non-authoritative — authoritative attestation is PR-3) row for it.
+/// Both halves go through `lg-raw-client` because no CLI client knows the
+/// pinned endpoint before PR-2c.
+///
+/// `raw_client_bin` is the caller's own
+/// `env!("CARGO_BIN_EXE_lg-raw-client")` — resolved in the calling
+/// integration test file, not here: `CARGO_BIN_EXE_<name>` is only
+/// defined at compile time for an actual integration-test target, and
+/// this library crate itself (built as a plain `lib`, not a test binary)
+/// has no such variable to read.
+pub fn trusted_positive_control(daemon: &TrustedDaemon, raw_client_bin: &str) -> String {
+    let _ = daemon;
+    let preflight = serde_json::json!({
+        "protocol_version": RAW_PROTOCOL_VERSION,
+        "request": {
+            "kind": "preflight",
+            "task_hint": "trusted harness positive control preflight",
+            "cwd": "",
+            "session_id": "trusted-harness-positive-control",
+        }
+    })
+    .to_string();
+
+    let out = run_as(
+        &LG_AGENT,
+        raw_client_bin,
+        &[PROVIDER_SOCKET, &preflight],
+        &[("PATH", PATH_ENV), ("HOME", "/home/lg-agent")],
+    );
+    if !out.status.success() {
+        panic!(
+            "trusted positive control: preflight via lg-raw-client failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let task_id = query_live(
+        PROVIDER_STATE_DIR,
+        "SELECT task_id FROM tasks ORDER BY created_at DESC LIMIT 1;",
+    )
+    .into_iter()
+    .next()
+    .unwrap_or_else(|| panic!("trusted positive control: no task row appeared after preflight"));
+
+    let record_outcome = serde_json::json!({
+        "protocol_version": RAW_PROTOCOL_VERSION,
+        "request": {
+            "kind": "record_outcome",
+            "task_id": task_id,
+            "plan_id": null,
+            "source_id": "two-principal-harness-trusted-positive-control",
+            "idempotency_key": "trusted-harness-positive-control-1",
+            "outcome": {"kind": "completed", "evidence": ["harness://trusted-positive-control"]},
+            "signed_claim": null,
+        }
+    })
+    .to_string();
+
+    let out = run_as(
+        &LG_PROVIDER,
+        raw_client_bin,
+        &[PROVIDER_SOCKET, &record_outcome],
+        &[("PATH", PATH_ENV), ("HOME", "/root")],
+    );
+    if !out.status.success() {
+        panic!(
+            "trusted positive control: record_outcome via lg-raw-client failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    task_id
 }
 
 use std::os::unix::fs::PermissionsExt;
