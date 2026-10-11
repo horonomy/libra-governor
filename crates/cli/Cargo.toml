@@ -16,6 +16,7 @@ libra-governor-daemon = { path = "../daemon" }
 libra-governor-domain = { path = "../domain" }
 libra-governor-estimator = { path = "../estimator" }
 libra-governor-evidence-adapter = { path = "../evidence-adapter" }
+libra-governor-extension = { path = "../extension" }
 libra-governor-gateway = { path = "../gateway" }
 libra-governor-ledger = { path = "../ledger" }
 libra-governor-protocol = { path = "../protocol" }

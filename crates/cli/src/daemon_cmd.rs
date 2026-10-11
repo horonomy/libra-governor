@@ -14,11 +14,9 @@
 //! daemon's own socket. Any check failing refuses to signal anything.
 
 use libra_governor_daemon::{recon::ReconBudget, DaemonConfig, DaemonError};
-use libra_governor_domain::ReplanHysteresisConfig;
+use libra_governor_domain::{Policy, ReplanHysteresisConfig};
 use libra_governor_protocol::{Request, Response};
-use std::path::Path;
-#[cfg(not(target_os = "linux"))]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Serializes tests in this module that mutate `LIBRA_GOVERNOR_STATE_DIR`
@@ -74,23 +72,14 @@ pub fn run() {
             }
         };
 
-    let config = DaemonConfig {
-        socket_path: state_dir.join("daemon.sock"),
-        ledger_path: state_dir.join("ledger.sqlite3"),
+    let config = daemon_config(
+        state_dir.join("daemon.sock"),
+        state_dir.join("ledger.sqlite3"),
         log_path,
-        recon_budget: ReconBudget::default(),
-        replan_hysteresis: ReplanHysteresisConfig::default(),
-        policy: policy.unwrap_or_else(libra_governor_daemon::default_admission_policy),
-        reservation_ttl_secs: DEFAULT_RESERVATION_TTL_SECS,
+        policy.unwrap_or_else(libra_governor_daemon::default_admission_policy),
         gateway,
-        gateway_stats: std::sync::Arc::new(Default::default()),
-        gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER.to_string(),
         extensions,
-        extension_runtime: std::sync::OnceLock::new(),
-
-        outcome_authority: None,
-        progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
-    };
+    );
 
     let listener = match libra_governor_daemon::bind_or_detect_running(&config.socket_path) {
         Ok(listener) => listener,
@@ -139,6 +128,43 @@ pub fn run() {
             &format!("daemon exited with error: {e}"),
         );
         std::process::exit(1);
+    }
+}
+
+/// Builds the one production [`DaemonConfig`] literal this crate
+/// constructs, hardcoding `outcome_authority: None` (HORO-1727 Decision
+/// 1 / ADR-0017 — see that field's own docs) and this crate's default
+/// [`DEFAULT_RESERVATION_TTL_SECS`]/progressive-interval constants.
+///
+/// Extracted from [`run`] with no behavior change (PR-2's design doc §4.1
+/// "Refactor first"), so `outcome_authority_not_wired_live.rs`'s doc
+/// comment — "exactly one production `DaemonConfig` construction site, in
+/// `daemon_cmd.rs`" — stays literally true. Trusted mode's `run_trusted`
+/// (behind the `trusted-principal` feature) calls this same helper rather
+/// than adding a second construction site.
+fn daemon_config(
+    socket_path: PathBuf,
+    ledger_path: PathBuf,
+    log_path: PathBuf,
+    policy: Policy,
+    gateway: Option<libra_governor_gateway::config::GatewayConfig>,
+    extensions: Option<libra_governor_extension::ExtensionConfig>,
+) -> DaemonConfig {
+    DaemonConfig {
+        socket_path,
+        ledger_path,
+        log_path,
+        recon_budget: ReconBudget::default(),
+        replan_hysteresis: ReplanHysteresisConfig::default(),
+        policy,
+        reservation_ttl_secs: DEFAULT_RESERVATION_TTL_SECS,
+        gateway,
+        gateway_stats: std::sync::Arc::new(Default::default()),
+        gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER.to_string(),
+        extensions,
+        extension_runtime: std::sync::OnceLock::new(),
+        outcome_authority: None,
+        progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
     }
 }
 
