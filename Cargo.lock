@@ -865,6 +865,7 @@ dependencies = [
 name = "libra-governor-two-principal-harness"
 version = "0.0.3"
 dependencies = [
+ "libc",
  "serde_json",
 ]
 
