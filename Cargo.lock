@@ -700,6 +700,7 @@ dependencies = [
  "libra-governor-domain",
  "libra-governor-estimator",
  "libra-governor-evidence-adapter",
+ "libra-governor-extension",
  "libra-governor-gateway",
  "libra-governor-ledger",
  "libra-governor-protocol",
