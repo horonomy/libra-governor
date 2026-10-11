@@ -60,7 +60,7 @@ pub use shared_pool::{
     SharedPoolReleaseOutcome, SharedPoolReserveOutcome, SharedPoolReserveRequest,
     SharedPoolSettleOutcome,
 };
-pub use store::LedgerStore;
+pub use store::{LedgerStore, APPEND_ONLY_TRIGGERS};
 pub use write::DOGFOOD_PROFILE_ENV_VAR;
 
 /// Errors returned by the ledger crate.
