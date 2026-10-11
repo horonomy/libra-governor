@@ -58,8 +58,16 @@ pub(crate) struct PinnedEndpoint {
 /// [`connect_verified`], not a filesystem check on a directory the
 /// client does not own.
 pub(crate) fn pinned_endpoint() -> Result<Option<PinnedEndpoint>, ClientError> {
-    let path = Path::new(PINNED_CONFIG_PATH);
+    pinned_endpoint_at(Path::new(PINNED_CONFIG_PATH))
+}
 
+/// The actual resolution logic behind [`pinned_endpoint`], parameterized
+/// on the path so unit tests exercise this exact function against a
+/// tempdir rather than a hand-kept copy of it — the production entry
+/// point always reads the compile-time-pinned `PINNED_CONFIG_PATH`,
+/// which a non-root test process cannot write to, so the path is the
+/// only thing that needs to vary between the real call and a test.
+fn pinned_endpoint_at(path: &Path) -> Result<Option<PinnedEndpoint>, ClientError> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -149,38 +157,11 @@ mod tests {
 
         // In this test process (not uid 0), the file is owned by the
         // test's own uid, not root — `check_path_chain(path, &[0])` must
-        // reject it regardless of its mode.
+        // reject it regardless of its mode. This exercises the real
+        // `pinned_endpoint_at`, the same function `pinned_endpoint` (the
+        // production entry point) calls — not a copy of it.
         let result = pinned_endpoint_at(&path);
         assert!(matches!(result, Err(ClientError::TrustedConfig(_))));
-    }
-
-    /// Test-only seam: the production entry point always reads
-    /// `PINNED_CONFIG_PATH`, which this process cannot write to as a
-    /// non-root user. This mirrors [`pinned_endpoint`] exactly, against
-    /// an arbitrary path, so the absent/invalid branches are reachable
-    /// without root.
-    fn pinned_endpoint_at(path: &Path) -> Result<Option<PinnedEndpoint>, ClientError> {
-        match std::fs::symlink_metadata(path) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                return Err(ClientError::TrustedConfig(format!(
-                    "could not stat the pinned trusted-principal config: {e}"
-                )))
-            }
-        }
-        check_path_chain(path, &[0]).map_err(|e| {
-            ClientError::TrustedConfig(format!(
-                "pinned trusted-principal config path rejected: {e}"
-            ))
-        })?;
-        let cfg = TrustedPrincipalConfig::load(path).map_err(|e| {
-            ClientError::TrustedConfig(format!("invalid pinned trusted-principal config: {e}"))
-        })?;
-        Ok(Some(PinnedEndpoint {
-            socket_path: cfg.socket_path(),
-            provider_uid: cfg.provider_uid,
-        }))
     }
 
     #[test]
