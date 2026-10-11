@@ -57,12 +57,12 @@
 //!   `sustain_horizon_never_refuses_a_task_admittable_now`, and the
 //!   `sustain_horizon_refuses_past_the_horizon`/
 //!   `sustain_horizon_admits_exactly_at_the_horizon` pair below.
-//! - **CONFIRMED:** `EstimateRevised` is recorded but never applied — a
+//! - **FIXED (HORO-1792):** `EstimateRevised` is now applied to the live
+//!   candidate's need, recorded hold, and earliest-safe-admit check — a
 //!   revised-upward estimate that would make a task structurally
-//!   infeasible is silently ignored and the task still starts at its
-//!   stale (now-wrong) hold. See `estimate_revised_event_is_a_no_op`.
-//!   **Deliberately deferred to a separate ticket (HORO-1792 fixes this
-//!   too — see that test's updated assertions).**
+//!   infeasible now refuses admission instead of silently starting at a
+//!   stale (now-wrong) hold. See
+//!   `estimate_revised_over_limit_refuses_admission`.
 //! - **CONFIRMED:** `Proposal` has no variant that could mean cancel —
 //!   verified by an exhaustive match with no wildcard arm, which would
 //!   fail to compile if a third variant were ever added.
@@ -726,7 +726,7 @@ fn sustain_next_start_waits_for_overrun_settled_spend_to_age_out() {
 /// `NeedExceedsWindowLimit` instead of starting at a stale, now-wrong
 /// 100-token need.
 #[test]
-fn estimate_revised_event_is_a_no_op() {
+fn estimate_revised_over_limit_refuses_admission() {
     let w = sliding_window(3, 1000, 21_600);
     let t0 = OffsetDateTime::UNIX_EPOCH;
     let tasks = TaskSet::validated(vec![task(1, "p", vec![], 100, 60)]).unwrap();
