@@ -29,5 +29,10 @@ thiserror.workspace = true
 time.workspace = true
 uuid.workspace = true
 
+[features]
+# The only manifest line allowed to enable the daemon's feature
+# (ADR-0019 §1, workspace feature unification).
+trusted-principal = ["libra-governor-daemon/trusted-principal"]
+
 [dev-dependencies]
 tempfile.workspace = true
