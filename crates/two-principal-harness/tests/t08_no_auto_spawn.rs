@@ -18,10 +18,19 @@
 use std::time::{Duration, Instant};
 
 use libra_governor_two_principal_harness::{
-    assert_disposable, query_live, reset_state_dirs, run_as_with_stdin,
-    trusted_positive_control_via_cli, ConfigSpec, TrustedConfigGuard, TrustedDaemon, LG_AGENT,
-    PROVIDER_BINARY, PROVIDER_STATE_DIR, TRUSTED_CONFIG_PATH,
+    assert_disposable, query_live, reset_state_dirs, run_as_with_stdin, trusted_positive_control,
+    ConfigSpec, TrustedConfigGuard, TrustedDaemon, LG_AGENT, PROVIDER_BINARY, PROVIDER_STATE_DIR,
+    TRUSTED_CONFIG_PATH,
 };
+
+/// `trusted_positive_control`'s signature keeps a `raw_client_bin`
+/// parameter for PR-2a's `x_confused_deputy.rs`'s sake (see that
+/// function's own doc comment) even though its body no longer uses it —
+/// this crate still builds the binary either way, so reusing the same
+/// resolution the other test files use costs nothing.
+fn raw_client() -> &'static str {
+    env!("CARGO_BIN_EXE_lg-raw-client")
+}
 
 const PATH_ENV: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 /// Comfortably past `client.rs`'s own `SPAWN_WAIT_BUDGET` (3s), plus
@@ -161,22 +170,20 @@ fn t08a_trusted_hook_never_spawns_a_daemon() {
 
 /// Design doc §7: "In 2c, it switches to the real `hook
 /// user-prompt-submit` and `outcome record`." This is the direct proof
-/// that [`trusted_positive_control_via_cli`] (this PR's CLI-based
-/// replacement for PR-2a/2b's raw-client `trusted_positive_control`, see
-/// that function's own doc comment for why it is additive rather than a
-/// modification of the PR-2a-owned original) really does drive both
-/// halves through the real CLI subcommands and lands one real,
-/// non-authoritative `outcome_attestations` row.
+/// that `trusted_positive_control` (switched in place for PR-2c; see
+/// that function's own doc comment) really does drive both halves
+/// through the real CLI subcommands and lands one real, non-authoritative
+/// `outcome_attestations` row.
 #[test]
 #[ignore = "runs only inside harness/two-principal/run.sh's disposable container"]
-fn trusted_positive_control_via_cli_lands_a_real_non_authoritative_record() {
+fn trusted_positive_control_lands_a_real_non_authoritative_record_via_the_real_hook() {
     assert_disposable();
     reset_state_dirs();
     let spec = ConfigSpec::default();
     let _guard = TrustedConfigGuard::install(TRUSTED_CONFIG_PATH, &spec);
     let mut daemon = TrustedDaemon::start(TRUSTED_CONFIG_PATH, &[], Duration::from_secs(10));
 
-    let task_id = trusted_positive_control_via_cli(&daemon);
+    let task_id = trusted_positive_control(&daemon, raw_client());
     assert!(
         !task_id.is_empty(),
         "a real task_id must have been assigned"
