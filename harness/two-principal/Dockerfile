@@ -16,10 +16,13 @@ FROM rust:1.90-bookworm@sha256:3914072ca0c3b8aad871db9169a651ccfce30cf58303e5d6f
 WORKDIR /usr/src/app
 COPY . .
 
-# PR-1 builds TODAY's existing binary, unmodified — no `trusted-principal`
-# feature exists yet (that is PR-2/PR-3), so no `--features` flag is
-# passed here (ADR-0019 §6 PR-1, §1 "Default-off mechanism").
-RUN cargo build --release -p libra-governor-cli --locked
+# PR-2 builds the feature-enabled binary (ADR-0019 §6 PR-2, PR-2's
+# design doc §6): the harness image is the one place the
+# `trusted-principal` feature is ever compiled into a binary outside a
+# test run — guarded by
+# `crates/daemon/tests/trusted_principal_default_off_guard.rs`, which
+# confirms no install script or non-harness workflow ever enables it.
+RUN cargo build --release -p libra-governor-cli --locked --features trusted-principal
 
 # Compiles the harness's own test binary ahead of time so the runtime
 # stage never needs to invoke the compiler, only run an already-built
