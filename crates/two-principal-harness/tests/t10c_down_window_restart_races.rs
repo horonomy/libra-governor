@@ -103,6 +103,69 @@ fn attempt_bind(principal: &Principal, socket_path: &str, tag: &str) -> bool {
     bound
 }
 
+/// A bind attempt at a FRESH path (`{dir}/evil-bind-{tag}.sock` — never
+/// an already-existing entry, unlike [`attempt_bind`] against the stale
+/// provider socket), as `principal`. Panics if the bind unexpectedly
+/// succeeds — this helper exists to prove denial, not to probe a race.
+/// Returns `true` iff it was denied specifically for a permission-shaped
+/// reason (`lg-fake-server`'s own stderr): against a FRESH path, a
+/// directory lacking write access denies the bind with `EACCES`/
+/// `EPERM`, not `EADDRINUSE` (`lg-fake-server`'s own doc comment on why
+/// those two cases differ).
+fn attempt_bind_denied(principal: &Principal, dir: &str, tag: &str) -> bool {
+    let socket_path = format!("{dir}/evil-bind-{tag}.sock");
+    let count_file = format!(
+        "/tmp/t10c-fake-count-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _ = std::fs::remove_file(&count_file);
+
+    let mut child = command_as(
+        principal,
+        fake_server_bin(),
+        &[&socket_path, &count_file],
+        &[("PATH", PATH_ENV)],
+    )
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap_or_else(|e| panic!("failed to spawn lg-fake-server: {e}"));
+
+    let deadline = Instant::now() + Duration::from_millis(300);
+    let bound = loop {
+        if Path::new(&count_file).exists() {
+            break true;
+        }
+        if let Ok(Some(_)) = child.try_wait() {
+            break false;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+
+    let _ = child.kill();
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait on lg-fake-server: {e}"));
+    let _ = std::fs::remove_file(&count_file);
+    let _ = std::fs::remove_file(&socket_path);
+
+    assert!(
+        !bound,
+        "attempt_bind_denied: lg-fake-server unexpectedly bound at {socket_path} — this helper \
+         exists only to prove denial"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    stderr.contains("permission denied") || stderr.contains("not permitted")
+}
+
 #[test]
 #[ignore = "runs only inside harness/two-principal/run.sh's disposable container"]
 fn t10c_down_window_create_bind_connect_all_fail() {
@@ -203,6 +266,25 @@ fn t10c_down_window_create_bind_connect_all_fail() {
             !attempt_bind(&LG_AGENT, PROVIDER_SOCKET, &format!("down-{attempts}")),
             "attempt {attempts}: agent must never win the bind race at the pinned socket path \
              during the down window"
+        );
+
+        // A bind at a FRESH name in each dir (never the stale, already-
+        // occupied pinned path above) — this is what actually exercises
+        // the directory's own write permission rather than EADDRINUSE
+        // against an existing entry.
+        assert!(
+            attempt_bind_denied(&LG_AGENT, PROVIDER_STATE_DIR, &format!("state-{attempts}")),
+            "attempt {attempts}: agent must not be able to bind a fresh-named socket in the \
+             provider's state dir during the down window"
+        );
+        assert!(
+            attempt_bind_denied(
+                &LG_AGENT,
+                PROVIDER_SOCKET_DIR,
+                &format!("socket-{attempts}")
+            ),
+            "attempt {attempts}: agent must not be able to bind a fresh-named socket in the \
+             provider's socket dir during the down window"
         );
 
         let out = run_as(

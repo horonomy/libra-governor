@@ -140,18 +140,31 @@ fn t11a_pinned_socket_is_never_served_by_a_non_provider_peer() {
 
     // --- Sensitivity control: in the same-UID layout, with nobody
     // enforcing any boundary against lg-agent on this path, its own
-    // spinning fake server really can win the bind race against a REAL
-    // competing restart loop — not merely bind into an empty directory,
-    // which would only prove `bind()` works, not that the race itself is
-    // winnable. Mirrors the two-principal loop below exactly, but with a
-    // same-UID default-mode daemon standing in for the provider. Proves
-    // the race mechanism is real in this environment and this container
-    // does not simply block all binding races generally — the
-    // two-principal run must defeat it through the permission boundary
-    // specifically, not through some artifact that would have prevented
-    // a win either way. ---
+    // spinning fake server really can TAKE OVER the path from a REAL,
+    // currently-live competing daemon — not merely bind into an empty
+    // directory (which the spinner would win trivially, on its very
+    // first attempt, before any daemon ever started — proving only that
+    // `bind()` works, not that the race itself is winnable against a
+    // live, restarting competitor). So the mirror daemon is started and
+    // confirmed serving FIRST, and the spinner is only started once that
+    // is true. Since this layout gives lg-agent full write access to the
+    // directory, `lg-fake-server`'s own unlink-then-bind (mirroring
+    // production `bind_or_detect_running`'s stale-socket recovery) can
+    // steal the path even from a live listener — this proves the
+    // takeover is real in this environment and this container does not
+    // simply block all binding races generally; the two-principal run
+    // below must defeat the identical attempt through the permission
+    // boundary specifically, not through some artifact that would have
+    // prevented a win either way regardless of permissions. ---
     {
         let socket_path = format!("{SAMEUID_STATE_DIR}/daemon.sock");
+        let mut mirror = DaemonProcess::start(
+            &LG_AGENT,
+            SAMEUID_STATE_DIR,
+            "/home/lg-agent",
+            Duration::from_secs(10),
+        );
+
         let stop = Arc::new(AtomicBool::new(false));
         let wins = Arc::new(AtomicU32::new(0));
         let _stop_guard = StopGuard(stop.clone());
@@ -162,12 +175,6 @@ fn t11a_pinned_socket_is_never_served_by_a_non_provider_peer() {
             std::thread::spawn(move || spin_bind_attempts(LG_AGENT, socket_path, stop, wins))
         };
 
-        let mut mirror = DaemonProcess::start(
-            &LG_AGENT,
-            SAMEUID_STATE_DIR,
-            "/home/lg-agent",
-            Duration::from_secs(10),
-        );
         let mut won = false;
         for _ in 0..RESTART_CYCLES {
             mirror.kill9_and_reap();

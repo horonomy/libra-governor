@@ -46,10 +46,18 @@ fn main() {
     // Best-effort, mirroring production `bind_or_detect_running`'s own
     // stale-socket `remove_file`: this only ever succeeds here if this
     // process's own UID already has write access to the containing
-    // directory — the same precondition `bind` itself needs for the
-    // `AF_UNIX` path entry it creates. If this process lacks that
-    // permission, `remove_file` fails and is ignored, and the `bind`
-    // call below fails for the same underlying reason.
+    // directory. If it lacks that permission, this fails (ignored) and
+    // the `bind` call below then fails too — but not necessarily for the
+    // identical reason: when no entry already exists at `socket_path`,
+    // `bind` fails with the directory's own permission error
+    // (`EACCES`/`EPERM`); when a stale entry is ALREADY there (as after a
+    // `kill -9`) and this process cannot remove it, `bind` instead fails
+    // with `EADDRINUSE` — the kernel's path lookup finds the existing
+    // entry before the parent directory's write permission is even
+    // checked. Either way, no new bind ever lands without directory
+    // write access; callers that need to distinguish the two should
+    // check for an existing entry at `socket_path` themselves rather
+    // than relying on this error text.
     let _ = std::fs::remove_file(socket_path);
 
     let listener = match UnixListener::bind(socket_path) {
