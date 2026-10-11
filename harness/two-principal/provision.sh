@@ -90,12 +90,12 @@ chmod 0700 /var/lib/libra-governor
 # names it explicitly.
 mkdir -p /run/libra-governor
 chown lg-provider:lg-clients /run/libra-governor
-# NOSONAR(shell:S2612): 2710 is owner rwx, group --x (traverse only, no
-# list/create/unlink), other none — "others" gets nothing here. The
-# setgid bit (2000) is what the rule's pattern-matching flags; it grants
-# no write access to anyone and is required so sockets created inside
-# this directory inherit the lg-clients group (ADR-0019 §1).
-chmod 2710 /run/libra-governor
+# 2710 is owner rwx, group --x (traverse only, no list/create/unlink),
+# other none — "others" gets nothing here. The setgid bit (2000) is what
+# the rule's pattern-matching flags; it grants no write access to anyone
+# and is required so sockets created inside this directory inherit the
+# lg-clients group (ADR-0019 §1).
+chmod 2710 /run/libra-governor # NOSONAR(shell:S2612): no other-write grant; see comment above
 
 # Sensitivity-control mirror of today's actual single-account deployment
 # — the SAME layout, entirely owned by lg-agent (ADR-0019 §5 "Roles at

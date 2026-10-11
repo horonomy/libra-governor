@@ -540,6 +540,12 @@ fn chown(path: &Path, uid: u32, gid: u32) {
         .status()
         .unwrap_or_else(|e| panic!("chown {path:?}: {e}"));
     if !status.success() {
+        // codeql[rust/cleartext-logging]: `uid`/`gid` here are this
+        // crate's own hardcoded test constants (LG_PROVIDER/LG_AGENT/
+        // LG_SUDOPROBE, 10001-10003, defined above in this same file) —
+        // public OS-level identifiers in a disposable test container,
+        // not sensitive data. The rule's heuristic matches on the
+        // parameter names alone.
         panic!("chown {path:?} to {uid}:{gid} failed");
     }
 }

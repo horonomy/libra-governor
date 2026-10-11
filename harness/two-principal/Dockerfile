@@ -42,16 +42,18 @@ RUN cargo test -p libra-governor-two-principal-harness --locked --no-run
 # isolation guarantees, which rest entirely on `--network none` plus the
 # OS-user boundary `provision.sh` creates, not on image size.
 #
-# NOSONAR(docker:S6471): this stage's implicit root user is required and
-# intentional, not an oversight. ENTRYPOINT is `provision.sh`, which must
-# run as root to create OS users/groups and chown directories before any
-# test executes; every actual test action then runs as an unprivileged
-# principal via `setpriv` (see `crates/two-principal-harness/src/lib.rs`'s
+# This stage's root user is required and intentional, not an oversight,
+# and is made explicit below (rather than left implicit) for that
+# reason. ENTRYPOINT is `provision.sh`, which must run as root to create
+# OS users/groups and chown directories before any test executes; every
+# actual test action then runs as an unprivileged principal via
+# `setpriv` (see `crates/two-principal-harness/src/lib.rs`'s
 # `run_as`/`command_as`), never as this image's root. The container is
 # always `docker run --rm --network none`, never pushed to a registry,
 # never run with added capabilities — root exists only inside this
 # single disposable, isolated container's own setup step.
 FROM rust:1.90-bookworm@sha256:3914072ca0c3b8aad871db9169a651ccfce30cf58303e5d6f2db16d1d8a7e58f
+USER root
 
 # Deviation from ADR-0019 §5's exact apt list (`sqlite3`, `util-linux`,
 # `procps`, `gdb`): `sudo` is added so the T9 sudo-denial tests exercise
