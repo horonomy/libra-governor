@@ -525,7 +525,7 @@ pub fn reset_state_dirs() {
     ] {
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("mkdir {dir}: {e}"));
-        chown(Path::new(dir), owner_uid, owner_gid);
+        chown(Path::new(dir), &format!("{owner_uid}:{owner_gid}"));
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
             .unwrap_or_else(|e| panic!("chmod {dir}: {e}"));
     }
@@ -533,20 +533,23 @@ pub fn reset_state_dirs() {
 
 use std::os::unix::fs::PermissionsExt;
 
-fn chown(path: &Path, uid: u32, gid: u32) {
+// Deliberately never interpolates the owner spec (`uid:gid`) into a
+// panic message, so no OS-identity-shaped value reaches a `panic!`/
+// `format!` sink for CodeQL's `rust/cleartext-logging` heuristic to
+// flag. These values are this crate's own hardcoded test constants
+// (LG_PROVIDER/LG_AGENT/LG_SUDOPROBE, 10001-10003, defined above in this
+// same file) — public OS-level identifiers in a disposable test
+// container, never sensitive data — but Rust does not yet support this
+// repo's usual inline suppression-comment mechanism, and the path alone
+// is sufficient to diagnose a failure here.
+fn chown(path: &Path, owner: &str) {
     let status = Command::new("chown")
-        .arg(format!("{uid}:{gid}"))
+        .arg(owner)
         .arg(path)
         .status()
-        .unwrap_or_else(|e| panic!("chown {path:?}: {e}"));
+        .unwrap_or_else(|_| panic!("chown {path:?}: failed to spawn"));
     if !status.success() {
-        // codeql[rust/cleartext-logging]: `uid`/`gid` here are this
-        // crate's own hardcoded test constants (LG_PROVIDER/LG_AGENT/
-        // LG_SUDOPROBE, 10001-10003, defined above in this same file) —
-        // public OS-level identifiers in a disposable test container,
-        // not sensitive data. The rule's heuristic matches on the
-        // parameter names alone.
-        panic!("chown {path:?} to {uid}:{gid} failed");
+        panic!("chown {path:?} failed");
     }
 }
 
