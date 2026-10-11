@@ -95,7 +95,7 @@ fn trusted_principal_is_declared_only_by_cli_and_daemon_and_never_default() {
             }
             let is_allowed_declaration = (relative == Path::new("crates/cli/Cargo.toml")
                 || relative == Path::new("crates/daemon/Cargo.toml"))
-                && allowed_lines.iter().any(|allowed| line == *allowed);
+                && allowed_lines.contains(&line);
             assert!(
                 is_allowed_declaration,
                 "ADR-0019 §1: `trusted-principal` must only be declared (outside a comment) \
@@ -131,7 +131,11 @@ fn no_install_script_or_non_harness_workflow_enables_trusted_principal() {
     // ADR-0019 mandates the feature-enabled clippy/test step.
     let allowed_workflow: &Path = Path::new(".github/workflows/two-principal-harness.yml");
     let mut workflows = Vec::new();
-    collect_files_with_ext(&root.join(".github").join("workflows"), "yml", &mut workflows);
+    collect_files_with_ext(
+        &root.join(".github").join("workflows"),
+        "yml",
+        &mut workflows,
+    );
     for workflow in &workflows {
         let relative = workflow.strip_prefix(&root).unwrap_or(workflow);
         if relative == allowed_workflow {
