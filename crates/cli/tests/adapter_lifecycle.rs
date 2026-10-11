@@ -1120,7 +1120,14 @@ fn enabled_stop_callback_sends_legacy_finalize_to_the_configured_local_socket() 
     let listener = UnixListener::bind(state.join("daemon.sock")).unwrap();
     listener.set_nonblocking(true).unwrap();
     let server = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Matches the 10s budget the client subprocess itself gets elsewhere
+        // in this file (see `run_installed_callback`'s own deadline). A
+        // shorter accept-side deadline here raced the client's own, longer
+        // one under process-spawn contention: the client could still finish
+        // inside its budget after the server had already timed out waiting
+        // for the connection, producing a flaky failure (HORO-1830) rather
+        // than a real defect.
+        let deadline = Instant::now() + Duration::from_secs(10);
         let (mut stream, _) = loop {
             match listener.accept() {
                 Ok(connection) => break connection,
@@ -1132,7 +1139,7 @@ fn enabled_stop_callback_sends_legacy_finalize_to_the_configured_local_socket() 
             }
         };
         stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let mut request_line = String::new();
         std::io::BufReader::new(stream.try_clone().unwrap())
