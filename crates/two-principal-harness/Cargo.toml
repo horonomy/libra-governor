@@ -1,0 +1,20 @@
+[package]
+name = "libra-governor-two-principal-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Libra Governor: disposable two-principal (separate OS user) security harness (ADR-0019, HORO-1835). Test-only; never published, never built or run outside the container `harness/two-principal/run.sh` drives."
+publish = false
+
+# Deliberately has NO path dependency on `libra-governor-cli` or
+# `libra-governor-daemon` (ADR-0019 §1 "Workspace feature unification").
+# It drives the already-built `libra-governor` binary purely through
+# `std::process::Command` and stdin JSON, and reads the ledger by
+# shelling out to the system `sqlite3` CLI rather than linking
+# `rusqlite` — so this crate carries no Cargo dependency that a future
+# `trusted-principal` feature on `cli`/`daemon` could ever unify onto.
+[dependencies]
+serde_json.workspace = true
+
+[dev-dependencies]

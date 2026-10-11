@@ -861,6 +861,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "libra-governor-two-principal-harness"
+version = "0.0.3"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "libsqlite3-sys"
 version = "0.38.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
