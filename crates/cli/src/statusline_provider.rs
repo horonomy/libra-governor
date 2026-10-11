@@ -329,6 +329,15 @@ impl From<&ClientError> for NoReading {
             ClientError::Wire(_) => NoReading::ResponseNotUnderstood,
             ClientError::ProtocolMismatch(..) => NoReading::DaemonProtocolMismatch,
             ClientError::DaemonError(_) => NoReading::DaemonReportedError,
+            // ADR-0019 PR-2c: a trusted-mode config failure or a server
+            // identity mismatch both mean "no usable connection to the
+            // real provider was established" — the same fact
+            // `DaemonUnavailable` already establishes for the default
+            // path, so no new `NoReading` variant is warranted.
+            #[cfg(feature = "trusted-principal")]
+            ClientError::TrustedConfig(_) => NoReading::DaemonUnreachable,
+            #[cfg(feature = "trusted-principal")]
+            ClientError::ServerIdentityMismatch => NoReading::DaemonUnreachable,
         }
     }
 }
