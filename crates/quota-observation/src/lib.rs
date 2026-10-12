@@ -12,11 +12,17 @@
 //! back a bounded, trust-labeled answer — display/diagnostics, never a
 //! gate.
 //!
-//! It is also, deliberately, **never a credential broker**: the
-//! one-shot stdio child this crate launches receives no environment
+//! It is also, deliberately, never an *automatic* credential broker:
+//! the one-shot stdio child this crate launches receives no environment
 //! beyond `LANG=C.UTF-8`/`LC_ALL=C.UTF-8` (see [`runner`]), no `HOME`,
-//! and no credential of any kind. This mirrors founder decision E1 for
-//! this campaign.
+//! and no credential passed to it by this crate. This mirrors founder
+//! decision E1 for this campaign. It is a narrower guarantee than "no
+//! credential access is possible": a registered extension still runs as
+//! the same OS user as the host, so if it independently knows an
+//! absolute path to a credential the user can read (e.g. `~/.aws/...`
+//! resolved some other way, not via `HOME`), nothing here stops it from
+//! reading that file itself. What this crate actually guarantees is
+//! narrower and still real: it hands nothing over automatically.
 //!
 //! # Why this crate depends on neither `libra-governor-domain` nor
 //! `libra-governor-quota-source`
