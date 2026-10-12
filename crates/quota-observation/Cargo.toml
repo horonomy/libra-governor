@@ -1,0 +1,19 @@
+[package]
+name = "libra-governor-quota-observation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Libra Governor: bounded one-shot stdio observation runtime (HORO-1854) implementing the accepted design-v2 quota-observation extension contract (HORO-1853) — read-only quota/usage diagnostics, never an admission/pacing/enforcement authority and never a credential broker."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+time = { workspace = true, features = ["macros"] }
+thiserror.workspace = true
+sha2.workspace = true
+rustix.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
