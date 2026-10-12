@@ -102,7 +102,7 @@ fn parse_rfc3339(raw: &str) -> Result<OffsetDateTime, FreshnessError> {
 /// # Staleness is anchored at receipt, not just claimed `observed_at`
 ///
 /// (HORO-1854 adversarial review, should-fix "freshness staleness-bound
-/// escape".) The 5-second [`CLOCK_TOLERANCE`] exists only to forgive a
+/// escape".) The 5-second `CLOCK_TOLERANCE` exists only to forgive a
 /// small wall-vs-monotonic clock discontinuity between the extension's
 /// clock and the host's, at the moment the host actually received the
 /// frame — it is not supposed to let a reading be treated as fresher,
@@ -283,7 +283,7 @@ fn verify_context_binding(
 /// the HORO-1854 adversarial review, B3): first validates the raw wire
 /// coverage rule and rejects a malformed response outright, then
 /// rejects the *entire* response if its declared context/authority
-/// don't match the registration ([`verify_context_binding`]), then
+/// don't match the registration (`verify_context_binding`), then
 /// re-homes any constraint whose `unit`/`metric`/`scope`/
 /// `account_fingerprint` disagrees with the registration's matching
 /// `expected[]` entry into `missing`, then recomputes `coverage` into
