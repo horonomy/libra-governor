@@ -282,17 +282,34 @@ pub enum Metric {
 }
 
 // `Unit`, `Window`, and `Reading` deserialize manually rather than via
-// `#[derive(Deserialize)]` with `#[serde(tag = "kind", deny_unknown_fields)]`.
-// serde's internally-tagged representation does not apply
-// `deny_unknown_fields` correctly to a variant with no fields at all
-// (a true C-like unit variant, e.g. `Tokens` or `Undisclosed`) — it
-// matches on `kind` alone and silently ignores any other keys in the
-// object, regardless of the `deny_unknown_fields` attribute
-// (serde-rs/serde#1358). `Scope`'s variants all carry a required
-// `handle` field, so the derive's struct-like path is exercised there
-// and works correctly; these three enums have at least one fieldless
-// variant, so each gets a small manual `Deserialize` that checks the
-// exact allowed key set itself.
+// `#[derive(Deserialize)]` with `#[serde(tag = "kind", deny_unknown_fields)]`,
+// for two independent reasons:
+//
+// 1. serde's internally-tagged representation does not apply
+//    `deny_unknown_fields` correctly to a variant with no fields at all
+//    (a true C-like unit variant, e.g. `Tokens` or `Undisclosed`) — it
+//    matches on `kind` alone and silently ignores any other keys in the
+//    object, regardless of the `deny_unknown_fields` attribute
+//    (serde-rs/serde#1358). `Scope`'s variants all carry a required
+//    `handle` field, so the derive's struct-like path is exercised there
+//    and works correctly.
+// 2. Deserializing first into `serde_json::Value` (the original shape of
+//    these three manual impls, before HORO-1854's adversarial review)
+//    reintroduces a *second*, more serious gap: `serde_json::Value`'s own
+//    map keeps only the *last* of any duplicate JSON key, so
+//    `{"kind":"used","value":"1","value":"999",...}` silently resolved to
+//    `value: 999` instead of being rejected, and the same applied to a
+//    duplicated `"kind"` key deciding which variant was built. Confirmed
+//    by probe. The fix below never buffers through `Value`: each type
+//    gets a private, flat, `#[derive(Deserialize)]`-with-
+//    `#[serde(deny_unknown_fields)]` helper struct whose fields are all
+//    the variants' fields unioned together as `Option`s. The ordinary
+//    derive macro rejects a duplicate key on its own (including a
+//    duplicate `kind`) — that's the derive's native "duplicate field"
+//    behavior, not something this module re-implements — so dispatching
+//    on `kind` *after* that struct has deserialized closes the gap
+//    without reopening gap #1: a struct-like derive target is exercised
+//    here too, same as `Scope`.
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -304,39 +321,54 @@ pub enum Unit {
     OpaqueCredit { namespace: String },
 }
 
+/// Flat, union-of-all-variants helper for [`Unit`]'s manual
+/// `Deserialize`. `#[serde(deny_unknown_fields)]` here rejects any key
+/// outside `{kind, namespace}` *and*, as an ordinary consequence of the
+/// derive macro (not special-cased by this module), rejects a
+/// duplicate occurrence of either key — including a duplicate `kind` —
+/// rather than silently keeping the last one.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawUnit {
+    kind: String,
+    #[serde(default)]
+    namespace: Option<String>,
+}
+
 impl<'de> Deserialize<'de> for Unit {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         use serde::de::Error;
-        let value = serde_json::Value::deserialize(deserializer)?;
-        let object = value
-            .as_object()
-            .ok_or_else(|| Error::custom("expected a JSON object"))?;
-        let kind = object
-            .get("kind")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| Error::custom("missing field `kind`"))?;
-        let allowed: &[&str] = if kind == "opaque_credit" {
-            &["kind", "namespace"]
-        } else {
-            &["kind"]
+        let raw = RawUnit::deserialize(deserializer)?;
+        let reject_namespace = |raw: &RawUnit| -> Result<(), D::Error> {
+            if raw.namespace.is_some() {
+                return Err(Error::custom("unknown field `namespace`"));
+            }
+            Ok(())
         };
-        if let Some(extra) = object.keys().find(|k| !allowed.contains(&k.as_str())) {
-            return Err(Error::custom(format!("unknown field `{extra}`")));
-        }
-        match kind {
-            "tokens" => Ok(Unit::Tokens),
-            "requests" => Ok(Unit::Requests),
-            "usd_cents" => Ok(Unit::UsdCents),
-            "percent_basis_points" => Ok(Unit::PercentBasisPoints),
+        match raw.kind.as_str() {
+            "tokens" => {
+                reject_namespace(&raw)?;
+                Ok(Unit::Tokens)
+            }
+            "requests" => {
+                reject_namespace(&raw)?;
+                Ok(Unit::Requests)
+            }
+            "usd_cents" => {
+                reject_namespace(&raw)?;
+                Ok(Unit::UsdCents)
+            }
+            "percent_basis_points" => {
+                reject_namespace(&raw)?;
+                Ok(Unit::PercentBasisPoints)
+            }
             "opaque_credit" => {
-                let namespace = object
-                    .get("namespace")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| Error::custom("missing field `namespace`"))?
-                    .to_owned();
+                let namespace = raw
+                    .namespace
+                    .ok_or_else(|| Error::custom("missing field `namespace`"))?;
                 Ok(Unit::OpaqueCredit { namespace })
             }
             other => Err(Error::custom(format!("unknown variant `{other}`"))),
@@ -353,33 +385,28 @@ pub enum Window {
     },
 }
 
+/// Flat helper for [`Window`]'s manual `Deserialize` — see the
+/// comment above [`RawUnit`] for why this shape (rather than
+/// buffering through `serde_json::Value`) is required.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWindow {
+    kind: String,
+    #[serde(default)]
+    declared_reset_at: Option<String>,
+}
+
 impl<'de> Deserialize<'de> for Window {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         use serde::de::Error;
-        let value = serde_json::Value::deserialize(deserializer)?;
-        let object = value
-            .as_object()
-            .ok_or_else(|| Error::custom("expected a JSON object"))?;
-        let kind = object
-            .get("kind")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| Error::custom("missing field `kind`"))?;
-        let allowed: &[&str] = &["kind", "declared_reset_at"];
-        if let Some(extra) = object.keys().find(|k| !allowed.contains(&k.as_str())) {
-            return Err(Error::custom(format!("unknown field `{extra}`")));
-        }
-        match kind {
-            "opaque" => {
-                let declared_reset_at = match object.get("declared_reset_at") {
-                    None | Some(serde_json::Value::Null) => None,
-                    Some(serde_json::Value::String(s)) => Some(s.clone()),
-                    Some(_) => return Err(Error::custom("declared_reset_at must be a string")),
-                };
-                Ok(Window::Opaque { declared_reset_at })
-            }
+        let raw = RawWindow::deserialize(deserializer)?;
+        match raw.kind.as_str() {
+            "opaque" => Ok(Window::Opaque {
+                declared_reset_at: raw.declared_reset_at,
+            }),
             other => Err(Error::custom(format!("unknown variant `{other}`"))),
         }
     }
@@ -394,48 +421,82 @@ pub enum Reading {
     Undisclosed,
 }
 
+/// Flat helper for [`Reading`]'s manual `Deserialize` — see the
+/// comment above [`RawUnit`] for why this shape (rather than
+/// buffering through `serde_json::Value`) is required. Fields are the
+/// union of every variant's fields; each variant's arm below checks
+/// that only the fields it actually owns were present.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawReading {
+    kind: String,
+    #[serde(default)]
+    value: Option<Quantity>,
+    #[serde(default)]
+    limit: Option<Quantity>,
+    #[serde(default)]
+    used_basis_points: Option<Quantity>,
+}
+
 impl<'de> Deserialize<'de> for Reading {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         use serde::de::Error;
-        let value = serde_json::Value::deserialize(deserializer)?;
-        let object = value
-            .as_object()
-            .ok_or_else(|| Error::custom("expected a JSON object"))?;
-        let kind = object
-            .get("kind")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| Error::custom("missing field `kind`"))?;
-        let allowed: &[&str] = match kind {
-            "used" | "remaining" => &["kind", "value", "limit"],
-            "utilization" => &["kind", "used_basis_points"],
-            _ => &["kind"],
+        let raw = RawReading::deserialize(deserializer)?;
+        let reject_used_basis_points = || -> Result<(), D::Error> {
+            if raw.used_basis_points.is_some() {
+                return Err(Error::custom("unknown field `used_basis_points`"));
+            }
+            Ok(())
         };
-        if let Some(extra) = object.keys().find(|k| !allowed.contains(&k.as_str())) {
-            return Err(Error::custom(format!("unknown field `{extra}`")));
-        }
-        let quantity = |key: &str| -> Result<Quantity, D::Error> {
-            let raw = object
-                .get(key)
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| Error::custom(format!("missing field `{key}`")))?;
-            Quantity::parse(raw).map_err(|e| Error::custom(e.to_string()))
-        };
-        match kind {
-            "used" => Ok(Reading::Used {
-                value: quantity("value")?,
-                limit: quantity("limit")?,
-            }),
-            "remaining" => Ok(Reading::Remaining {
-                value: quantity("value")?,
-                limit: quantity("limit")?,
-            }),
-            "utilization" => Ok(Reading::Utilization {
-                used_basis_points: quantity("used_basis_points")?,
-            }),
-            "undisclosed" => Ok(Reading::Undisclosed),
+        match raw.kind.as_str() {
+            "used" => {
+                reject_used_basis_points()?;
+                Ok(Reading::Used {
+                    value: raw
+                        .value
+                        .ok_or_else(|| Error::custom("missing field `value`"))?,
+                    limit: raw
+                        .limit
+                        .ok_or_else(|| Error::custom("missing field `limit`"))?,
+                })
+            }
+            "remaining" => {
+                reject_used_basis_points()?;
+                Ok(Reading::Remaining {
+                    value: raw
+                        .value
+                        .ok_or_else(|| Error::custom("missing field `value`"))?,
+                    limit: raw
+                        .limit
+                        .ok_or_else(|| Error::custom("missing field `limit`"))?,
+                })
+            }
+            "utilization" => {
+                if raw.value.is_some() {
+                    return Err(Error::custom("unknown field `value`"));
+                }
+                if raw.limit.is_some() {
+                    return Err(Error::custom("unknown field `limit`"));
+                }
+                Ok(Reading::Utilization {
+                    used_basis_points: raw
+                        .used_basis_points
+                        .ok_or_else(|| Error::custom("missing field `used_basis_points`"))?,
+                })
+            }
+            "undisclosed" => {
+                if raw.value.is_some() {
+                    return Err(Error::custom("unknown field `value`"));
+                }
+                if raw.limit.is_some() {
+                    return Err(Error::custom("unknown field `limit`"));
+                }
+                reject_used_basis_points()?;
+                Ok(Reading::Undisclosed)
+            }
             other => Err(Error::custom(format!("unknown variant `{other}`"))),
         }
     }
@@ -651,21 +712,34 @@ mod tests {
 
     #[test]
     fn unit_rejects_extra_field_on_unit_variant() {
+        // Tightened (HORO-1854 adversarial review, test-quality fix):
+        // `.contains("x")` alone matches almost any serde error, since
+        // "expected" itself contains an `x`. Pin down the specific,
+        // meaningful substring instead.
         let err = serde_json::from_str::<Unit>(r#"{"kind":"tokens","x":1}"#).unwrap_err();
-        assert!(err.to_string().contains("unknown field") || err.to_string().contains("x"));
+        assert!(
+            err.to_string().contains("unknown field `x`"),
+            "unexpected error message: {err}"
+        );
     }
 
     #[test]
     fn reading_rejects_extra_field_on_undisclosed_variant() {
         let err = serde_json::from_str::<Reading>(r#"{"kind":"undisclosed","x":1}"#).unwrap_err();
-        assert!(err.to_string().contains("unknown field") || err.to_string().contains("x"));
+        assert!(
+            err.to_string().contains("unknown field `x`"),
+            "unexpected error message: {err}"
+        );
     }
 
     #[test]
     fn scope_rejects_extra_field() {
         let err = serde_json::from_str::<Scope>(r#"{"kind":"principal","handle":"a","x":1}"#)
             .unwrap_err();
-        assert!(err.to_string().contains("unknown field") || err.to_string().contains("x"));
+        assert!(
+            err.to_string().contains("unknown field `x`"),
+            "unexpected error message: {err}"
+        );
     }
 
     #[test]
@@ -678,6 +752,47 @@ mod tests {
             Window::Opaque {
                 declared_reset_at: None
             }
+        );
+    }
+
+    // Regression tests for B2 (HORO-1854 adversarial review): before the
+    // fix, all three manual `Deserialize` impls buffered through
+    // `serde_json::Value`, whose map keeps only the *last* of any
+    // duplicate JSON key — so each of these three probes was silently
+    // accepted with the second occurrence's value winning, on
+    // money-bearing fields (`value`/`limit` in particular). Each must
+    // now be a hard deserialization error.
+    #[test]
+    fn duplicate_value_key_on_a_reading_is_rejected_not_silently_resolved() {
+        let err = serde_json::from_str::<Reading>(
+            r#"{"kind":"used","value":"1","value":"999","limit":"1000"}"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate field `value`"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_kind_key_on_a_reading_is_rejected_not_silently_resolved() {
+        let err = serde_json::from_str::<Reading>(
+            r#"{"kind":"undisclosed","kind":"used","value":"1","limit":"1000"}"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate field `kind`"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_kind_key_on_a_unit_is_rejected_not_silently_resolved() {
+        let err =
+            serde_json::from_str::<Unit>(r#"{"kind":"tokens","kind":"usd_cents"}"#).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate field `kind`"),
+            "unexpected error message: {err}"
         );
     }
 
