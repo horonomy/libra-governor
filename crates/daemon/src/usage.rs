@@ -139,6 +139,9 @@ use serde::Deserialize;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+mod codex_turn;
+pub use codex_turn::observe_codex_turn;
+
 /// How much of the transcript tail this is willing to read, in bytes.
 ///
 /// The scan window is "since the previous receipt on this task", which is
@@ -188,9 +191,13 @@ impl TurnUsage {
 /// content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageUnavailable {
-    /// The host's hook payload carried no `transcript_path`, or the
-    /// caller deliberately withheld it (the execution-owner route does,
-    /// because this reader measures a session window, not an agent one).
+    /// The host's hook payload carried no `transcript_path`. Before
+    /// HORO-1863 this also covered the execution-owner route
+    /// deliberately withholding the path for every identity, because this
+    /// session-window reader cannot tell one lane's tokens from a
+    /// sibling's. The owner route now forwards a Codex identity's path to
+    /// [`codex_turn::observe_codex_turn`] instead of to this reader; every
+    /// other identity still reaches this variant exactly as before.
     NoTranscriptPath,
     /// The path could not be opened, read, or seeked.
     Unreadable,
@@ -211,6 +218,21 @@ pub enum UsageUnavailable {
     /// downstream, because the first is a fact about spend and the second
     /// is the absence of one.
     NoUsageInWindow,
+    /// A Codex turn-scoped read (HORO-1863) never found the turn's own
+    /// start marker (`event_msg`/`task_started` with a matching
+    /// `turn_id`) before exhausting the scan cap or reaching the start of
+    /// the file. Unlike the session-window reader above, a turn-scoped
+    /// read has an exact lower bound to find; not finding it means the
+    /// read cannot be trusted to cover the whole turn.
+    TurnIncomplete,
+    /// A Codex turn-scoped read (HORO-1863) found a record that
+    /// contradicts the turn's own internal accounting invariants (see
+    /// `codex_turn` module docs) — a wrong `session_id`, a second
+    /// `thread_id`, or a sum that disagrees with the turn's own reported
+    /// running total. Never partially trusted: the whole read is
+    /// discarded rather than reporting a total built from inconsistent
+    /// inputs.
+    Inconsistent,
 }
 
 /// The result of trying to measure the window.
@@ -242,6 +264,8 @@ impl UsageObservation {
             UsageObservation::Unavailable(UsageUnavailable::NoUsageInWindow) => {
                 "no_usage_in_window"
             }
+            UsageObservation::Unavailable(UsageUnavailable::TurnIncomplete) => "turn_incomplete",
+            UsageObservation::Unavailable(UsageUnavailable::Inconsistent) => "usage_inconsistent",
         }
     }
 }
@@ -373,9 +397,9 @@ pub(crate) enum ScanEnd<B> {
 /// whichever comes first.
 ///
 /// This is the one place this module seeks and re-assembles chunk-spanning
-/// lines; [`scan`] and (HORO-1863) `codex_turn::observe_codex_turn` differ
-/// only in what `visit` does with each line and in how they interpret
-/// where the scan stopped.
+/// lines; [`scan`] and [`codex_turn::observe_codex_turn`] differ only in
+/// what `visit` does with each line and in how they interpret where the
+/// scan stopped.
 pub(crate) fn scan_lines_backward<B>(
     path: &Path,
     cap_bytes: u64,
@@ -712,6 +736,8 @@ mod tests {
             UsageObservation::Unavailable(UsageUnavailable::Unreadable),
             UsageObservation::Unavailable(UsageUnavailable::ScanCapReached),
             UsageObservation::Unavailable(UsageUnavailable::NoUsageInWindow),
+            UsageObservation::Unavailable(UsageUnavailable::TurnIncomplete),
+            UsageObservation::Unavailable(UsageUnavailable::Inconsistent),
         ] {
             let label = observation.reason_label();
             assert!(

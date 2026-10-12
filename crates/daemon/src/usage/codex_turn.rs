@@ -1,0 +1,740 @@
+//! Turn-scoped, measured Codex usage for the Execution Owner `Stop` route
+//! (HORO-1863).
+//!
+//! # Why this exists, and why it is not [`super::observe_transcript_window`]
+//!
+//! The owner route's `Stop` arm used to refuse every `transcript_path` it
+//! was offered (`AssociationUnavailable::Unsupported`), because the only
+//! reader available (`super::scan`, now `super::observe_transcript_window`)
+//! measures a *session* window: everything in the rollout since the
+//! previous receipt. On a lane that only ever runs one turn at a time that
+//! is fine. It is wrong the moment a session has concurrent lanes — several
+//! agents or subagents writing into the same rollout file — because the
+//! session window has no way to tell one lane's tokens from another's. The
+//! owner route exists specifically to give each lane its own accounting, so
+//! handing it a reader that re-merges every lane back together would silently
+//! reintroduce the cross-attribution bug this route exists to fix.
+//!
+//! This reader instead scans backward for exactly one turn: it sums only
+//! the `token_usage_record` lines whose `payload.turn_id` matches the
+//! caller's turn, never `root_turn_id` (matching on `root_turn_id` would
+//! pull a subagent's whole tree into its parent's total — the same
+//! cross-attribution bug, reintroduced one field over).
+//!
+//! # Start bound
+//!
+//! The backward scan stops as soon as it finds `event_msg`/`task_started`
+//! for this `turn_id` — the one durable marker of where this turn began.
+//! Reaching the start of the file or the scan cap first means the turn's
+//! extent was never established, so the read cannot be trusted:
+//! [`UsageUnavailable::TurnIncomplete`] (start of file) or
+//! [`UsageUnavailable::ScanCapReached`] (cap) respectively — kept distinct
+//! because they are different operational signals (a turn whose start truly
+//! predates the cap vs. a cap that is simply too small).
+//!
+//! # End bound — what the public Codex source shows, and the deviation that follows
+//!
+//! The ticket's own research task asked whether the *last*
+//! `token_usage_record` for a turn is always on disk before the `Stop` hook
+//! fires. Reading `openai/codex` at `main` (the 0.153–0.162 era these
+//! rollouts were captured from is close behind it) settles the ordering,
+//! and it settles it against the strict end-bound the ticket proposed as
+//! the safe fallback:
+//!
+//! - `codex-rs/core/src/session/turn.rs`, `run_turn`: once the model's
+//!   final response for a turn needs no follow-up, it calls
+//!   `run_turn_stop_hooks(&sess, &step_context, ...)` and `.await`s it
+//!   in-line, *inside* the per-step loop, before `run_turn` returns.
+//! - `codex-rs/core/src/tasks/mod.rs`, `on_task_finished`: only runs once
+//!   `run_turn` has returned. It is what builds and sends
+//!   `EventMsg::TurnComplete` (the rollout's `task_complete`), and it is
+//!   also where the *explicit* terminal `flush_rollout().await` barrier
+//!   lives (`"failed to flush rollout after emitting terminal turn
+//!   event"`).
+//!
+//! So `task_complete` is persisted strictly *after* the `Stop` hook — our
+//! daemon's handler necessarily returns before that write even happens, not
+//! merely before it is flushed. Requiring `task_complete` as specified
+//! would make the strict variant fail on every single real Codex turn, not
+//! "some genuinely-finished turns" as the ticket anticipated — the ordering
+//! isn't a race, it's a guarantee in the wrong direction. **Deviation:**
+//! this reader does not gate on `task_complete` at all.
+//!
+//! The usage record itself is a closer call. `record_observed_response_completed`
+//! (`codex-rs/core/src/session/mod.rs`) runs earlier in the same step,
+//! before the `Stop` hook, and does `.await` its
+//! `persist_rollout_items(&[RolloutItem::TokenUsageRecord(record)])`. But
+//! that call only sends a command on a bounded `mpsc` channel
+//! (`codex-rs/rollout/src/recorder.rs`, `RolloutRecorder`: `tx.send(..)`
+//! into a 256-slot channel to a background writer task); the `.await`
+//! resolves once the send succeeds, not once the background writer has
+//! performed the actual `write(2)`. The only hard barrier for that is
+//! `RolloutRecorder::flush()`, which is not called between this persist and
+//! the `Stop` hook dispatch — it is called only later, from the same
+//! terminal path as `task_complete` above. So whether the final record is
+//! already visible to an independent reader at `Stop` time is genuinely
+//! unconfirmed by the source: it depends on the background writer task
+//! having been scheduled in the interval between the channel send and our
+//! hook's round trip, which in every realistic case (process spawn + Unix
+//! socket round trip vs. a tokio task wakeup) is a near-certainty but not a
+//! guarantee.
+//!
+//! Given the strict variant is actively broken rather than merely
+//! conservative, this module takes the loose bound: `task_started` for the
+//! start, no `task_complete` requirement for the end. The risk this leaves
+//! — the newest record for the turn still sitting unflushed in the
+//! channel — is bounded by the invariants below, not left unchecked: a scan
+//! that lands mid-write of a multi-response turn will disagree with
+//! `turn_token_usage`'s own running total (see below) and come back
+//! [`UsageUnavailable::Inconsistent`], never a silent undercount. And per
+//! this ticket's core safety rule, any failure mode here still finalizes
+//! the turn unmeasured (`usage_known = false`) rather than ever falling
+//! back to a session- or file-wide count.
+//!
+//! # Consistency checks
+//!
+//! Every `token_usage_record` whose `turn_id` matches is required to agree
+//! with the turn's own self-reported invariants before it is trusted:
+//! `cached_input_tokens <= input_tokens`, `reasoning_output_tokens <=
+//! output_tokens`, and (when `total_tokens` is present)
+//! `total_tokens == input_tokens + output_tokens`. A matching record whose
+//! `session_id` differs from the caller's, or whose `thread_id` differs
+//! from an earlier match's, is also disqualifying. All of these mark the
+//! whole read [`UsageUnavailable::Inconsistent`] immediately — never
+//! partially trusted.
+//!
+//! The strongest check runs once the turn's start is reached: the sum of
+//! every matched record's own `usage` fields must equal the *newest*
+//! matched record's `turn_token_usage` (a running total Codex itself
+//! maintains per turn). Disagreement here is exactly what an unflushed or
+//! truncated record looks like, and it is caught rather than undercounted.
+//!
+//! **Deviation from the ticket's literal spec:** the spec asked for any
+//! nonzero `cache_write_input_tokens` to be treated as an unexplained
+//! drift signal ("never observed non-zero" in the sampled rollouts) and
+//! marked `Inconsistent`. That premise does not hold in this repository:
+//! `crates/daemon/tests/fixtures/codex-rollout-token-usage.jsonl` is real
+//! `codex-cli 0.160.0` serializer output with `cache_write_input_tokens`
+//! 300 and 400, and `super::CodexRawUsage::into_disjoint` (added in
+//! HORO-1714, already merged) already treats it as legitimate fresh input
+//! mapped to `cache_creation_input_tokens`. Following the spec literally
+//! would make the identical record `Measured` on the legacy session-window
+//! route and `Inconsistent` on this turn-scoped route for the same
+//! underlying spend. This reader reuses `into_disjoint` for exactly that
+//! reason: so `fresh_tokens()` agrees between the two routes for the same
+//! data. A missing `cache_write_input_tokens` (older rollouts predate the
+//! field) defaults to 0, matching the same leniency `into_disjoint` already
+//! has.
+//!
+//! # Privacy
+//!
+//! Same discipline as the rest of this module: narrow structs only, never
+//! `serde_json::Value`. No prompt or tool-output content is deserialized.
+
+use std::ops::ControlFlow;
+use std::path::Path;
+
+use serde::Deserialize;
+
+use super::{
+    scan_lines_backward, CodexRawUsage, ScanEnd, TurnUsage, UsageObservation, UsageUnavailable,
+};
+
+/// The `type` tag of a Codex rollout line carrying one response's usage.
+const TOKEN_USAGE_RECORD: &str = "token_usage_record";
+/// The `type` tag of a lifecycle line, narrowed further by its own nested
+/// `payload.type`.
+const EVENT_MSG: &str = "event_msg";
+/// `event_msg` payload tag marking where a turn began.
+const TASK_STARTED: &str = "task_started";
+
+/// Only the top-level `type` tag — enough to route to a narrower struct
+/// without materializing anything else on this line.
+#[derive(Deserialize)]
+struct TaggedLine {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+/// The four Responses-API-shaped counts, read wherever they appear
+/// (`payload.usage` and `payload.turn_token_usage` share this shape).
+/// `i64` because Codex writes these signed and clamps negatives itself;
+/// `reasoning_output_tokens`/`total_tokens` are read here (unlike
+/// [`super::CodexRawUsage`]) because this module validates them, it does
+/// not just partition them.
+#[derive(Deserialize, Default, Clone, Copy)]
+struct CodexUsageFields {
+    input_tokens: Option<i64>,
+    cached_input_tokens: Option<i64>,
+    cache_write_input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    reasoning_output_tokens: Option<i64>,
+    total_tokens: Option<i64>,
+}
+
+impl CodexUsageFields {
+    fn get(field: Option<i64>) -> i64 {
+        field.unwrap_or(0).max(0)
+    }
+
+    /// The per-record self-consistency invariants this module's docs claim
+    /// always hold for real Codex output. A violation here is a format-
+    /// drift signal, not something to silently clamp away.
+    fn internally_consistent(&self) -> bool {
+        if self.input_tokens.is_none() || self.output_tokens.is_none() {
+            // Required counts; an older breakdown field may be absent, but
+            // these two never are on a genuine usage record.
+            return false;
+        }
+        let input = Self::get(self.input_tokens);
+        let cached = Self::get(self.cached_input_tokens);
+        let output = Self::get(self.output_tokens);
+        let reasoning = Self::get(self.reasoning_output_tokens);
+        if cached > input {
+            return false;
+        }
+        if reasoning > output {
+            return false;
+        }
+        if let Some(total) = self.total_tokens {
+            if total.max(0) != input + output {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Converts to the shared [`CodexRawUsage`] shape so this reader's
+    /// per-record partitioning into [`TurnUsage`]'s disjoint counts is
+    /// byte-for-byte the same policy the legacy session-window route
+    /// already applies (HORO-1714) — see this module's doc header on why
+    /// that reuse, rather than a stricter re-validation of
+    /// `cache_write_input_tokens`, is the deliberate choice here.
+    fn as_codex_raw_usage(&self) -> CodexRawUsage {
+        CodexRawUsage {
+            input_tokens: self.input_tokens,
+            cached_input_tokens: self.cached_input_tokens,
+            cache_write_input_tokens: self.cache_write_input_tokens,
+            output_tokens: self.output_tokens,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct TokenUsageRecordPayload {
+    turn_id: String,
+    thread_id: String,
+    session_id: String,
+    usage: CodexUsageFields,
+    turn_token_usage: CodexUsageFields,
+}
+
+#[derive(Deserialize)]
+struct TokenUsageRecordLine {
+    payload: TokenUsageRecordPayload,
+}
+
+#[derive(Deserialize)]
+struct EventMsgPayload {
+    #[serde(rename = "type")]
+    kind: String,
+    turn_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct EventMsgLine {
+    payload: EventMsgPayload,
+}
+
+/// Why the backward scan over one line stopped, distinct from
+/// [`UsageUnavailable`] because it is purely internal control flow for
+/// [`observe_codex_turn`] — it never crosses the function boundary.
+enum StepOutcome {
+    /// `task_started` for this turn was found: the scan has reached this
+    /// turn's own start and must stop, successfully, regardless of the
+    /// chosen end bound (see this module's doc header).
+    FoundStart,
+    /// A matched record failed a consistency check. The whole read is
+    /// discarded immediately — never partially trusted.
+    Inconsistent,
+}
+
+/// Running, unclamped sums of every matched record's raw `usage` fields,
+/// kept separately from the disjoint [`TurnUsage`] this function also
+/// accumulates. Comparing *this* against the newest match's
+/// `turn_token_usage` is the strong self-consistency check from this
+/// module's docs; comparing the already-clamped [`TurnUsage`] would let an
+/// out-of-range `cache_write_input_tokens` silently change the answer.
+#[derive(Default, Clone, Copy)]
+struct RawTotals {
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    cache_write_input_tokens: i64,
+    output_tokens: i64,
+}
+
+impl RawTotals {
+    fn add(&mut self, fields: &CodexUsageFields) {
+        self.input_tokens += CodexUsageFields::get(fields.input_tokens);
+        self.cached_input_tokens += CodexUsageFields::get(fields.cached_input_tokens);
+        self.cache_write_input_tokens += CodexUsageFields::get(fields.cache_write_input_tokens);
+        self.output_tokens += CodexUsageFields::get(fields.output_tokens);
+    }
+
+    fn matches(&self, newest: &CodexUsageFields) -> bool {
+        self.input_tokens == CodexUsageFields::get(newest.input_tokens)
+            && self.cached_input_tokens == CodexUsageFields::get(newest.cached_input_tokens)
+            && self.cache_write_input_tokens
+                == CodexUsageFields::get(newest.cache_write_input_tokens)
+            && self.output_tokens == CodexUsageFields::get(newest.output_tokens)
+    }
+}
+
+/// Measures usage for exactly one Codex turn: `turn_id`, cross-checked
+/// against `session_id`. See this module's header for the full contract.
+/// `cap_bytes` bounds the backward scan exactly as
+/// [`super::observe_transcript_window`]'s does.
+pub fn observe_codex_turn(
+    path: &Path,
+    session_id: &str,
+    turn_id: &str,
+    cap_bytes: u64,
+) -> UsageObservation {
+    let mut usage = TurnUsage::default();
+    let mut raw_totals = RawTotals::default();
+    let mut newest_turn_token_usage: Option<CodexUsageFields> = None;
+    let mut seen_thread_id: Option<String> = None;
+
+    let end = match scan_lines_backward(path, cap_bytes, |line| {
+        step(
+            line,
+            session_id,
+            turn_id,
+            &mut usage,
+            &mut raw_totals,
+            &mut newest_turn_token_usage,
+            &mut seen_thread_id,
+        )
+    }) {
+        Ok(end) => end,
+        Err(unavailable) => return UsageObservation::Unavailable(unavailable),
+    };
+
+    match end {
+        ScanEnd::Visitor(StepOutcome::Inconsistent) => {
+            UsageObservation::Unavailable(UsageUnavailable::Inconsistent)
+        }
+        ScanEnd::Visitor(StepOutcome::FoundStart) => {
+            if usage.records == 0 {
+                return UsageObservation::Unavailable(UsageUnavailable::NoUsageInWindow);
+            }
+            match newest_turn_token_usage {
+                Some(newest) if raw_totals.matches(&newest) => UsageObservation::Measured(usage),
+                _ => UsageObservation::Unavailable(UsageUnavailable::Inconsistent),
+            }
+        }
+        ScanEnd::StartOfFile => UsageObservation::Unavailable(UsageUnavailable::TurnIncomplete),
+        ScanEnd::CapReached => UsageObservation::Unavailable(UsageUnavailable::ScanCapReached),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn step(
+    line: &[u8],
+    session_id: &str,
+    turn_id: &str,
+    usage: &mut TurnUsage,
+    raw_totals: &mut RawTotals,
+    newest_turn_token_usage: &mut Option<CodexUsageFields>,
+    seen_thread_id: &mut Option<String>,
+) -> ControlFlow<StepOutcome> {
+    if line.is_empty() {
+        return ControlFlow::Continue(());
+    }
+    let Ok(tagged) = serde_json::from_slice::<TaggedLine>(line) else {
+        // Concurrent writer, truncated tail, or a line shape this module
+        // does not model (e.g. `response_item`) — never fatal.
+        return ControlFlow::Continue(());
+    };
+    match tagged.kind.as_str() {
+        TOKEN_USAGE_RECORD => {
+            let Ok(record) = serde_json::from_slice::<TokenUsageRecordLine>(line) else {
+                return ControlFlow::Continue(());
+            };
+            let payload = record.payload;
+            if payload.turn_id != turn_id {
+                return ControlFlow::Continue(());
+            }
+            if payload.session_id != session_id {
+                return ControlFlow::Break(StepOutcome::Inconsistent);
+            }
+            match seen_thread_id {
+                Some(existing) if *existing != payload.thread_id => {
+                    return ControlFlow::Break(StepOutcome::Inconsistent);
+                }
+                Some(_) => {}
+                None => *seen_thread_id = Some(payload.thread_id.clone()),
+            }
+            if !payload.usage.internally_consistent() {
+                return ControlFlow::Break(StepOutcome::Inconsistent);
+            }
+            raw_totals.add(&payload.usage);
+            let raw = payload.usage.as_codex_raw_usage().into_disjoint();
+            usage.input_tokens = usage
+                .input_tokens
+                .saturating_add(raw.input_tokens.unwrap_or(0));
+            usage.cache_creation_input_tokens = usage
+                .cache_creation_input_tokens
+                .saturating_add(raw.cache_creation_input_tokens.unwrap_or(0));
+            usage.cache_read_input_tokens = usage
+                .cache_read_input_tokens
+                .saturating_add(raw.cache_read_input_tokens.unwrap_or(0));
+            usage.output_tokens = usage
+                .output_tokens
+                .saturating_add(raw.output_tokens.unwrap_or(0));
+            usage.records += 1;
+            // Backward scan visits newest-first: the first match sets the
+            // comparison baseline, later (older) matches never overwrite it.
+            if newest_turn_token_usage.is_none() {
+                *newest_turn_token_usage = Some(payload.turn_token_usage);
+            }
+            ControlFlow::Continue(())
+        }
+        EVENT_MSG => {
+            let Ok(event) = serde_json::from_slice::<EventMsgLine>(line) else {
+                return ControlFlow::Continue(());
+            };
+            if event.payload.kind == TASK_STARTED
+                && event.payload.turn_id.as_deref() == Some(turn_id)
+            {
+                return ControlFlow::Break(StepOutcome::FoundStart);
+            }
+            ControlFlow::Continue(())
+        }
+        _ => ControlFlow::Continue(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::usage::DEFAULT_SCAN_CAP_BYTES;
+    use std::io::Write;
+
+    /// A synthetic rollout line set modeled on the real shapes documented
+    /// in `super`'s module header and in
+    /// `crates/daemon/tests/fixtures/codex-rollout-token-usage.jsonl`
+    /// (which itself has no `task_started`, so it cannot serve unmodified
+    /// as a positive fixture for a start-bound reader).
+    fn task_started(turn_id: &str) -> String {
+        format!(
+            r#"{{"type":"event_msg","payload":{{"type":"task_started","turn_id":"{turn_id}"}}}}"#
+        )
+    }
+
+    fn task_complete(turn_id: &str) -> String {
+        format!(
+            r#"{{"type":"event_msg","payload":{{"type":"task_complete","turn_id":"{turn_id}"}}}}"#
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn usage_record(
+        turn_id: &str,
+        thread_id: &str,
+        session_id: &str,
+        input: i64,
+        cached: i64,
+        write: i64,
+        output: i64,
+        reasoning: i64,
+        turn_input: i64,
+        turn_cached: i64,
+        turn_write: i64,
+        turn_output: i64,
+        turn_reasoning: i64,
+    ) -> String {
+        format!(
+            r#"{{"type":"token_usage_record","payload":{{"turn_id":"{turn_id}","thread_id":"{thread_id}","session_id":"{session_id}","root_turn_id":"{turn_id}","response_id":"resp","usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"cache_write_input_tokens":{write},"output_tokens":{output},"reasoning_output_tokens":{reasoning},"total_tokens":{total}}},"turn_token_usage":{{"input_tokens":{turn_input},"cached_input_tokens":{turn_cached},"cache_write_input_tokens":{turn_write},"output_tokens":{turn_output},"reasoning_output_tokens":{turn_reasoning},"total_tokens":{turn_total}}},"thread_token_usage":{{"input_tokens":{turn_input},"cached_input_tokens":{turn_cached},"cache_write_input_tokens":{turn_write},"output_tokens":{turn_output},"reasoning_output_tokens":{turn_reasoning},"total_tokens":{turn_total}}}}}}}"#,
+            total = input + output,
+            turn_total = turn_input + turn_output,
+        )
+    }
+
+    fn write_lines(lines: &[String]) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        for line in lines {
+            writeln!(f, "{line}").unwrap();
+        }
+        f.flush().unwrap();
+        f
+    }
+
+    const T1: &str = "turn-1";
+    const T2: &str = "turn-2";
+    const THREAD: &str = "thread-1";
+    const SESSION: &str = "session-1";
+
+    #[test]
+    fn a_single_record_turn_is_measured_exactly() {
+        let f = write_lines(&[
+            task_started(T1),
+            usage_record(T1, THREAD, SESSION, 100, 20, 10, 5, 2, 100, 20, 10, 5, 2),
+            task_complete(T1),
+        ]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().expect("single consistent record");
+        assert_eq!(usage.records, 1);
+        // input(100) - cached(20) - write(10) = 70 fresh input, + write(10)
+        // cache_creation, + output(5) = fresh_tokens.
+        assert_eq!(usage.fresh_tokens(), 70 + 10 + 5);
+    }
+
+    #[test]
+    fn cache_semantics_guard_fresh_tokens_excludes_cache_reads() {
+        let f = write_lines(&[
+            task_started(T1),
+            usage_record(
+                T1, THREAD, SESSION, 1000, 900, 0, 10, 0, 1000, 900, 0, 10, 0,
+            ),
+        ]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().unwrap();
+        assert_eq!(
+            usage.fresh_tokens(),
+            110,
+            "900 of the 1000 input tokens were a cache read and must not count as fresh"
+        );
+    }
+
+    #[test]
+    fn interleaved_sibling_turns_are_never_cross_attributed() {
+        // T1 and T2 interleaved by position (as if two lanes shared one
+        // rollout file). Reading T1 must sum only T1's own records.
+        let f = write_lines(&[
+            task_started(T1),
+            task_started(T2),
+            usage_record(T1, THREAD, SESSION, 100, 0, 0, 10, 0, 100, 0, 0, 10, 0),
+            usage_record(T2, THREAD, SESSION, 500, 0, 0, 50, 0, 500, 0, 0, 50, 0),
+            usage_record(T1, THREAD, SESSION, 200, 0, 0, 20, 0, 300, 0, 0, 30, 0),
+            task_complete(T1),
+            task_complete(T2),
+        ]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed
+            .measured()
+            .expect("T1's own two records are self-consistent");
+        assert_eq!(usage.records, 2, "only T1's two records, never T2's");
+        assert_eq!(
+            usage.fresh_tokens(),
+            300 + 30,
+            "exactly T1's own total, not T1+T2"
+        );
+    }
+
+    #[test]
+    fn wrong_session_record_is_inconsistent() {
+        let f = write_lines(&[
+            task_started(T1),
+            usage_record(T1, THREAD, "other-session", 10, 0, 0, 5, 0, 10, 0, 0, 5, 0),
+        ]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        assert_eq!(
+            observed,
+            UsageObservation::Unavailable(UsageUnavailable::Inconsistent)
+        );
+    }
+
+    #[test]
+    fn a_second_distinct_thread_id_is_inconsistent() {
+        let f = write_lines(&[
+            task_started(T1),
+            usage_record(T1, "thread-a", SESSION, 10, 0, 0, 5, 0, 10, 0, 0, 5, 0),
+            usage_record(T1, "thread-b", SESSION, 10, 0, 0, 5, 0, 20, 0, 0, 10, 0),
+        ]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        assert_eq!(
+            observed,
+            UsageObservation::Unavailable(UsageUnavailable::Inconsistent)
+        );
+    }
+
+    #[test]
+    fn two_sequential_turns_each_measure_only_their_own_records() {
+        let f = write_lines(&[
+            task_started(T1),
+            usage_record(T1, THREAD, SESSION, 100, 0, 0, 10, 0, 100, 0, 0, 10, 0),
+            task_complete(T1),
+            task_started(T2),
+            usage_record(T2, THREAD, SESSION, 50, 0, 0, 5, 0, 50, 0, 0, 5, 0),
+            task_complete(T2),
+        ]);
+        let observed_t2 = observe_codex_turn(f.path(), SESSION, T2, DEFAULT_SCAN_CAP_BYTES);
+        assert_eq!(observed_t2.measured().unwrap().fresh_tokens(), 55);
+        let observed_t1 = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        assert_eq!(observed_t1.measured().unwrap().fresh_tokens(), 110);
+    }
+
+    #[test]
+    fn old_format_token_count_only_is_no_usage_in_window() {
+        let f = write_lines(&[
+            task_started(T1),
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{}}}"#.to_string(),
+            task_complete(T1),
+        ]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        assert_eq!(
+            observed,
+            UsageObservation::Unavailable(UsageUnavailable::NoUsageInWindow)
+        );
+    }
+
+    #[test]
+    fn token_count_mirror_alongside_a_real_record_is_not_double_counted() {
+        let f = write_lines(&[
+            task_started(T1),
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{}}}"#.to_string(),
+            usage_record(T1, THREAD, SESSION, 10, 0, 0, 5, 0, 10, 0, 0, 5, 0),
+        ]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().unwrap();
+        assert_eq!(usage.records, 1);
+    }
+
+    #[test]
+    fn missing_task_started_before_start_of_file_is_turn_incomplete() {
+        let f = write_lines(&[usage_record(
+            T1, THREAD, SESSION, 10, 0, 0, 5, 0, 10, 0, 0, 5, 0,
+        )]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        assert_eq!(
+            observed,
+            UsageObservation::Unavailable(UsageUnavailable::TurnIncomplete)
+        );
+    }
+
+    #[test]
+    fn exhausting_the_scan_cap_before_task_started_is_scan_cap_reached_not_turn_incomplete() {
+        // The backward scan reads from EOF toward the start of the file, so
+        // `task_started` must sit at the *start* (far from EOF) with enough
+        // bytes after it that a small cap exhausts before the scan ever
+        // reaches it -- putting it last would make it the very first line
+        // read backward, never exercising the cap at all.
+        let filler = "x".repeat(4_000);
+        let mut lines = vec![task_started(T1)];
+        for i in 0..50 {
+            lines.push(format!(
+                r#"{{"type":"event_msg","pad":"{filler}","payload":{{"type":"unrelated_{i}"}}}}"#
+            ));
+        }
+        let f = write_lines(&lines);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, 256);
+        assert_eq!(
+            observed,
+            UsageObservation::Unavailable(UsageUnavailable::ScanCapReached)
+        );
+    }
+
+    #[test]
+    fn inconsistent_sum_against_the_turns_own_running_total_is_caught() {
+        // The record's own `turn_token_usage` claims a running total that
+        // disagrees with the sum of the one matched record's `usage` --
+        // exactly what an unflushed earlier record for this turn would
+        // look like.
+        let f = write_lines(&[
+            task_started(T1),
+            usage_record(T1, THREAD, SESSION, 10, 0, 0, 5, 0, 999, 0, 0, 999, 0),
+        ]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        assert_eq!(
+            observed,
+            UsageObservation::Unavailable(UsageUnavailable::Inconsistent)
+        );
+    }
+
+    #[test]
+    fn cached_exceeding_input_is_inconsistent() {
+        let f = write_lines(&[
+            task_started(T1),
+            usage_record(T1, THREAD, SESSION, 10, 20, 0, 5, 0, 10, 20, 0, 5, 0),
+        ]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        assert_eq!(
+            observed,
+            UsageObservation::Unavailable(UsageUnavailable::Inconsistent)
+        );
+    }
+
+    #[test]
+    fn reasoning_exceeding_output_is_inconsistent() {
+        let f = write_lines(&[
+            task_started(T1),
+            usage_record(T1, THREAD, SESSION, 10, 0, 0, 5, 20, 10, 0, 0, 5, 20),
+        ]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        assert_eq!(
+            observed,
+            UsageObservation::Unavailable(UsageUnavailable::Inconsistent)
+        );
+    }
+
+    #[test]
+    fn real_serializer_nonzero_cache_write_is_measured_not_inconsistent() {
+        // The deviation documented in this module's header: real
+        // codex-cli 0.160.0 output has nonzero cache_write_input_tokens
+        // (see crates/daemon/tests/fixtures/codex-rollout-token-usage.jsonl),
+        // contradicting the ticket's premise that it is never observed
+        // nonzero. This must measure, not score Inconsistent.
+        let f = write_lines(&[
+            task_started(T1),
+            usage_record(
+                T1, THREAD, SESSION, 1000, 600, 300, 50, 20, 1000, 600, 300, 50, 20,
+            ),
+        ]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed
+            .measured()
+            .expect("nonzero cache_write is legitimate fresh input");
+        assert_eq!(
+            usage.fresh_tokens(),
+            450,
+            "matches Codex's own blended_total for this record"
+        );
+    }
+
+    #[test]
+    fn missing_cache_write_field_defaults_to_zero() {
+        let line = format!(
+            r#"{{"type":"token_usage_record","payload":{{"turn_id":"{T1}","thread_id":"{THREAD}","session_id":"{SESSION}","root_turn_id":"{T1}","response_id":"resp","usage":{{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0,"total_tokens":15}},"turn_token_usage":{{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0,"total_tokens":15}}}}}}"#
+        );
+        let f = write_lines(&[task_started(T1), line]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed
+            .measured()
+            .expect("absent field is not a parse failure");
+        assert_eq!(usage.fresh_tokens(), 15);
+    }
+
+    #[test]
+    fn a_record_straddling_a_chunk_boundary_is_counted_once() {
+        let filler = "x".repeat(4_000);
+        let mut lines = vec![task_started(T1)];
+        for i in 0..100 {
+            lines.push(format!(
+                r#"{{"type":"event_msg","pad":"{filler}","payload":{{"type":"noop_{i}"}}}}"#
+            ));
+        }
+        lines.push(usage_record(
+            T1, THREAD, SESSION, 10, 0, 0, 5, 0, 10, 0, 0, 5, 0,
+        ));
+        let f = write_lines(&lines);
+        assert!(
+            std::fs::metadata(f.path()).unwrap().len() > 256 * 1024,
+            "the fixture must actually span more than one chunk or it tests nothing"
+        );
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().unwrap();
+        assert_eq!(usage.records, 1, "parsed once, not zero or twice");
+        assert_eq!(usage.fresh_tokens(), 15);
+    }
+}
