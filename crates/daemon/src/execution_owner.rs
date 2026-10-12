@@ -3,7 +3,7 @@
 //! native context is a claim by a local socket client, not plugin authentication.
 use crate::server::{DaemonConfig, DaemonError};
 use libra_governor_domain::{
-    AssociationUnavailable as Gap, ExecutionPosition, EXECUTION_ASSOCIATION_VERSION,
+    AgentKind, AssociationUnavailable as Gap, ExecutionPosition, EXECUTION_ASSOCIATION_VERSION,
 };
 use libra_governor_ledger::{ExecutionLookup, LedgerStore};
 use libra_governor_protocol::{
@@ -47,11 +47,16 @@ pub(crate) fn handle(
         ExecutionOperation::Stop {
             transcript_path, ..
         } => {
-            // The existing transcript reader measures a session window, not
-            // an agent/turn window. Offering it here would cross-associate
-            // sibling usage. Keep that limitation explicit until native
-            // agent-scoped measurement exists.
-            if transcript_path.is_some() {
+            // The session-window reader (`crate::usage::observe_transcript_window`)
+            // cannot tell one lane's tokens from a sibling's, so offering it
+            // here would cross-associate usage. HORO-1863 adds a turn-scoped
+            // reader (`crate::usage::observe_codex_turn`) that sums only
+            // this turn's own records, but Codex's rollout shape is the
+            // only one it understands -- every other identity still
+            // refuses `Some(_)` outright, unchanged from before.
+            if transcript_path.is_some()
+                && event.identity.tool_provider() != AgentKind::Codex.as_tool_provider()
+            {
                 return Ok(unavailable(Gap::Unsupported));
             }
             ("stop", position.turn.as_str())
@@ -74,6 +79,31 @@ pub(crate) fn handle(
             task_hint,
             &config.recon_budget,
         )),
+        _ => None,
+    };
+    // Measured the same way recon is: bounded, pure with respect to the
+    // ledger, and finished before the write lock is taken (HORO-1863). A
+    // slow-to-open or adversarial `transcript_path` (e.g. a FIFO with no
+    // writer) must never be able to hold the database transaction open --
+    // see the comment above `with_immediate_transaction` on recon staying
+    // bounded and pure. Only ever `Some` for a Codex identity with
+    // `transcript_path: Some(_)`; the arm above already refused every
+    // other combination.
+    let codex_turn_observation = match operation {
+        ExecutionOperation::Stop {
+            transcript_path: Some(path),
+            ..
+        } if event.identity.tool_provider() == AgentKind::Codex.as_tool_provider() => {
+            Some(crate::usage::observe_codex_turn(
+                std::path::Path::new(path),
+                // `ExecutionPosition::from_identity` already required
+                // `provider_session_id` to be present and non-empty to
+                // reach this point.
+                event.identity.provider_session_id().unwrap_or_default(),
+                position.turn.as_str(),
+                crate::usage::DEFAULT_SCAN_CAP_BYTES,
+            ))
+        }
         _ => None,
     };
     if tag != "query" {
@@ -218,14 +248,27 @@ pub(crate) fn handle(
                     ExecutionLookup::Unavailable(reason) => return Ok(unavailable(reason)),
                 };
                 let mut summary = None;
-                let result = crate::server::handle_finalize(
+                // Replay/duplicate-detection and staleness were already
+                // checked above, under this same lock, before this arm
+                // runs -- a duplicate Stop never reaches a second
+                // measurement or a second effect.
+                let result = crate::server::finalize_with_usage(
                     &session,
                     model.clone(),
                     Some(event.identity.tool_provider().to_owned()),
-                    None,
                     ledger,
                     &mut summary,
                     config,
+                    move |_usage_window_start| {
+                        // Already fully computed above, before this
+                        // transaction opened -- this closure never touches
+                        // the transcript path itself.
+                        codex_turn_observation.unwrap_or(
+                            crate::usage::UsageObservation::Unavailable(
+                                crate::usage::UsageUnavailable::NoTranscriptPath,
+                            ),
+                        )
+                    },
                 )?;
                 if !matches!(result, FinalizeOutcome::Finalized(_)) {
                     return Err(

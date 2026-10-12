@@ -4,7 +4,19 @@
 use crate::{ExecutionIdentity, LineageStatus, PlanId, TaskId};
 use serde::{Deserialize, Serialize};
 
-pub const EXECUTION_ASSOCIATION_VERSION: u32 = 1;
+/// Wire-only compatibility gate for the Execution Owner IPC request —
+/// never persisted to the ledger (replay/lane rows carry no version
+/// column). Bumping it is safe exactly because of that: an old daemon
+/// simply refuses a new CLI's requests outright
+/// (`AssociationUnavailable::Unsupported`) instead of silently
+/// misinterpreting a richer payload or leaving a lane permanently
+/// `Ambiguous`.
+///
+/// HORO-1863 bumped this 1 -> 2 when the owner `Stop` arm started accepting
+/// `transcript_path` for Codex identities (previously refused
+/// unconditionally) — a behavior change on the daemon side worth gating
+/// even though the wire shape itself did not grow a new field.
+pub const EXECUTION_ASSOCIATION_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

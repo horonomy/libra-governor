@@ -37,6 +37,15 @@ pub enum ExecutionOperation {
     },
     Stop {
         model: Option<String>,
+        /// Turn-scoped, measured usage for Codex identities only
+        /// (HORO-1863): the daemon sums only this turn's own
+        /// `token_usage_record` lines from the Codex rollout at this
+        /// path, cross-checked against the request's `session_id` and
+        /// `turn_id`, never a whole-session or whole-file total. Every
+        /// other provider's identity still refuses `Some(_)` here
+        /// outright (`AssociationUnavailable::Unsupported`) — this
+        /// field's acceptance is provider-gated, not a general contract
+        /// change.
         transcript_path: Option<String>,
     },
     Query {},
@@ -106,7 +115,7 @@ fn strict_identity<'de, D: serde::Deserializer<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libra_governor_domain::ExecutionIdentityBuilder;
+    use libra_governor_domain::{ExecutionIdentityBuilder, EXECUTION_ASSOCIATION_VERSION};
     #[test]
     fn full_owner_identity_roundtrips_and_unhandled_richer_identity_is_rejected() {
         let identity = ExecutionIdentityBuilder::new("fixture-host", "codex")
@@ -120,7 +129,7 @@ mod tests {
             .build_at(time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap())
             .unwrap();
         let request = ExecutionOwnerRequest {
-            association_version: 1,
+            association_version: EXECUTION_ASSOCIATION_VERSION,
             identity: identity.clone(),
             native_context: NativeExecutionContext {
                 identity,
@@ -165,7 +174,7 @@ mod tests {
             protocol_version: crate::PROTOCOL_VERSION,
             request: crate::Request::ExecutionOwner {
                 event: Box::new(ExecutionOwnerRequest {
-                    association_version: 1,
+                    association_version: EXECUTION_ASSOCIATION_VERSION,
                     identity: identity.clone(),
                     native_context: NativeExecutionContext {
                         identity,

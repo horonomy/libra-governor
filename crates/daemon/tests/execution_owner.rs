@@ -6,9 +6,9 @@ use libra_governor_domain::{
 };
 use libra_governor_ledger::LedgerStore;
 use libra_governor_protocol::{
-    wire, ExecutionOperation as Op, ExecutionOwnerOutcome as Outcome, ExecutionOwnerRequest,
-    NativeExecutionContext, Request, RequestEnvelope, Response, ResponseEnvelope, TaskSummary,
-    PROTOCOL_VERSION,
+    wire, ExecutionEffect, ExecutionOperation as Op, ExecutionOwnerOutcome as Outcome,
+    ExecutionOwnerRequest, FinalizeOutcome, NativeExecutionContext, Request, RequestEnvelope,
+    Response, ResponseEnvelope, TaskSummary, PROTOCOL_VERSION,
 };
 use std::{
     io::BufReader,
@@ -399,7 +399,12 @@ fn receipt_failure_rolls_back_settlement_close_and_replay_then_retry_applies_onc
 #[test]
 fn protocol_or_owner_version_skew_and_session_transcript_cannot_create_effects() {
     let mut f = Fixture::new();
-    let i = identity("codex", "agent", "turn");
+    // HORO-1863 narrows the Stop `transcript_path` guard this test's last
+    // assertion exercises to non-Codex identities only; "claude_code" here
+    // (not "codex", used merely as a placeholder provider by every other
+    // test in this file) keeps this test actually exercising that guard
+    // rather than accidentally testing the newly-allowed Codex path.
+    let i = identity("claude_code", "agent", "turn");
     let r = send(
         &f.listener,
         &mut f.ledger,
@@ -1093,4 +1098,268 @@ fn agent_absent_stop_settles_conservatively_with_usage_known_false_never_zero() 
         )
         .unwrap();
     assert_eq!(settlements, 1);
+}
+
+// ---------------------------------------------------------------------
+// HORO-1863: Codex Stop accepts `transcript_path`, turn-scoped and measured.
+// ---------------------------------------------------------------------
+
+const ROLLOUT_SESSION: &str = "same-native-session";
+
+fn rollout_task_started(turn_id: &str) -> String {
+    format!(r#"{{"type":"event_msg","payload":{{"type":"task_started","turn_id":"{turn_id}"}}}}"#)
+}
+
+fn rollout_task_complete(turn_id: &str) -> String {
+    format!(r#"{{"type":"event_msg","payload":{{"type":"task_complete","turn_id":"{turn_id}"}}}}"#)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rollout_usage_record(
+    turn_id: &str,
+    thread_id: &str,
+    session_id: &str,
+    input: i64,
+    cached: i64,
+    write: i64,
+    output: i64,
+) -> String {
+    format!(
+        r#"{{"type":"token_usage_record","payload":{{"turn_id":"{turn_id}","thread_id":"{thread_id}","session_id":"{session_id}","root_turn_id":"{turn_id}","response_id":"resp","usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"cache_write_input_tokens":{write},"output_tokens":{output},"reasoning_output_tokens":0,"total_tokens":{total}}},"turn_token_usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"cache_write_input_tokens":{write},"output_tokens":{output},"reasoning_output_tokens":0,"total_tokens":{total}}},"thread_token_usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"cache_write_input_tokens":{write},"output_tokens":{output},"reasoning_output_tokens":0,"total_tokens":{total}}}}}}}"#,
+        total = input + output,
+    )
+}
+
+fn write_rollout(dir: &Path, name: &str, lines: &[String]) -> std::path::PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    path
+}
+
+fn codex_stop(i: ExecutionIdentity, transcript_path: &std::path::Path) -> Request {
+    owner(
+        i,
+        Op::Stop {
+            model: None,
+            transcript_path: Some(transcript_path.to_string_lossy().into_owned()),
+        },
+    )
+}
+
+#[test]
+fn codex_stop_with_transcript_path_is_applied_and_measures_its_own_turn() {
+    let mut f = Fixture::new();
+    let i = identity("codex", "agent", "turn");
+    let target = applied(f.outcome(prompt(i.clone())));
+    let rollout = write_rollout(
+        f.dir.path(),
+        "rollout.jsonl",
+        &[
+            rollout_task_started("turn"),
+            rollout_usage_record("turn", "thread-1", ROLLOUT_SESSION, 1000, 600, 300, 50),
+            rollout_task_complete("turn"),
+        ],
+    );
+    applied(f.outcome(codex_stop(i, &rollout)));
+    let conn = rusqlite::Connection::open(&f.cfg.ledger_path).unwrap();
+    let (usage_known, settled_amount): (Option<i64>, Option<f64>) = conn
+        .query_row(
+            "SELECT usage_known, settled_amount FROM reservations WHERE task_id=?1",
+            [target.task_id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        usage_known,
+        Some(1),
+        "a consistent turn-scoped read must settle as measured"
+    );
+    // fresh = (1000 - 600 - 300) + 300 + 50 = 450
+    assert_eq!(settled_amount, Some(450.0));
+    let actual_usage_json: String = conn
+        .query_row(
+            "SELECT actual_usage_json FROM receipts WHERE task_id=?1",
+            [target.task_id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let usage: serde_json::Value = serde_json::from_str(&actual_usage_json).unwrap();
+    assert_ne!(
+        usage,
+        serde_json::json!([]),
+        "a measured Codex turn must never record an empty actual_usage"
+    );
+}
+
+#[test]
+fn sibling_lanes_sharing_one_rollout_each_measure_only_their_own_turn() {
+    let mut f = Fixture::new();
+    let a = identity("codex", "agent-a", "turn-a");
+    let b = identity("codex", "agent-b", "turn-b");
+    let ta = applied(f.outcome(prompt(a.clone())));
+    let tb = applied(f.outcome(prompt(b.clone())));
+    let rollout = write_rollout(
+        f.dir.path(),
+        "shared-rollout.jsonl",
+        &[
+            rollout_task_started("turn-a"),
+            rollout_task_started("turn-b"),
+            rollout_usage_record("turn-a", "thread-1", ROLLOUT_SESSION, 100, 0, 0, 10),
+            rollout_usage_record("turn-b", "thread-1", ROLLOUT_SESSION, 500, 0, 0, 50),
+            rollout_task_complete("turn-a"),
+            rollout_task_complete("turn-b"),
+        ],
+    );
+    applied(f.outcome(codex_stop(a, &rollout)));
+    applied(f.outcome(codex_stop(b, &rollout)));
+    let conn = rusqlite::Connection::open(&f.cfg.ledger_path).unwrap();
+    let settled = |task_id: libra_governor_domain::TaskId| -> f64 {
+        conn.query_row(
+            "SELECT settled_amount FROM reservations WHERE task_id=?1",
+            [task_id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(settled(ta.task_id), 110.0, "turn-a's own tokens only");
+    assert_eq!(
+        settled(tb.task_id),
+        550.0,
+        "turn-b's own tokens only, never turn-a's"
+    );
+}
+
+#[test]
+fn duplicate_codex_stop_never_double_counts_and_next_turn_measures_independently() {
+    let mut f = Fixture::new();
+    let i = identity("codex", "agent", "turn-1");
+    let target = applied(f.outcome(prompt(i.clone())));
+    let rollout = write_rollout(
+        f.dir.path(),
+        "rollout.jsonl",
+        &[
+            rollout_task_started("turn-1"),
+            rollout_usage_record("turn-1", "thread-1", ROLLOUT_SESSION, 100, 0, 0, 10),
+            rollout_task_complete("turn-1"),
+        ],
+    );
+    applied(f.outcome(codex_stop(i.clone(), &rollout)));
+    assert!(matches!(
+        f.outcome(codex_stop(i.clone(), &rollout)),
+        Outcome::Duplicate { target: t } if t == target
+    ));
+    let conn = rusqlite::Connection::open(&f.cfg.ledger_path).unwrap();
+    let settlements: u64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM reservations WHERE task_id=?1 AND state='settled'",
+            [target.task_id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(settlements, 1, "a replayed Stop must never settle twice");
+
+    // A genuinely later turn on the same lane measures only its own records.
+    let next = identity("codex", "agent", "turn-2");
+    let mut p2 = prompt(next.clone());
+    if let Request::ExecutionOwner { event } = &mut p2 {
+        if let Op::Prompt {
+            supersedes_turn, ..
+        } = &mut event.native_context.operation
+        {
+            *supersedes_turn = Some("turn-1".into());
+        }
+    }
+    let target2 = applied(f.outcome(p2));
+    let rollout2 = write_rollout(
+        f.dir.path(),
+        "rollout2.jsonl",
+        &[
+            rollout_task_started("turn-2"),
+            rollout_usage_record("turn-2", "thread-1", ROLLOUT_SESSION, 7, 0, 0, 3),
+            rollout_task_complete("turn-2"),
+        ],
+    );
+    applied(f.outcome(codex_stop(next, &rollout2)));
+    // A supersession keeps the same task_id with a second plan/reservation
+    // row, so this must select turn-2's own (newest) reservation, not
+    // reuse turn-1's already-settled one.
+    let settled2: f64 = conn
+        .query_row(
+            "SELECT settled_amount FROM reservations WHERE task_id=?1 AND plan_id=?2",
+            rusqlite::params![target2.task_id.to_string(), target2.plan_id.0.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(settled2, 10.0);
+}
+
+#[test]
+fn measurement_failure_still_finalizes_unmeasured_and_unblocks_the_lane() {
+    // The bug this ticket fixes: a measurement failure must never leave the
+    // lane stuck. Finalize as usage_known=false and prove the *next* prompt
+    // on this lane (with supersedes_turn: None, exactly like a fresh turn
+    // after a normal Stop) still succeeds -- never Ambiguous.
+    let mut f = Fixture::new();
+    let i = identity("codex", "agent", "turn-1");
+    let target = applied(f.outcome(prompt(i.clone())));
+    // No task_started at all: an old/foreign-format rollout.
+    let rollout = write_rollout(
+        f.dir.path(),
+        "rollout.jsonl",
+        &[rollout_usage_record(
+            "turn-1",
+            "thread-1",
+            ROLLOUT_SESSION,
+            100,
+            0,
+            0,
+            10,
+        )],
+    );
+    let outcome = f.outcome(codex_stop(i, &rollout));
+    let result = match outcome {
+        Outcome::Applied { effect, .. } => *effect,
+        other => panic!("measurement failure must still finalize the turn: {other:?}"),
+    };
+    match result {
+        ExecutionEffect::Stop { result } => match *result {
+            FinalizeOutcome::Finalized(_) => {}
+            other => panic!("expected Finalized: {other:?}"),
+        },
+        other => panic!("expected Stop effect: {other:?}"),
+    }
+    let conn = rusqlite::Connection::open(&f.cfg.ledger_path).unwrap();
+    let (usage_known, settled_amount, amount): (Option<i64>, Option<f64>, f64) = conn
+        .query_row(
+            "SELECT usage_known, settled_amount, amount FROM reservations WHERE task_id=?1",
+            [target.task_id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        usage_known,
+        Some(0),
+        "an incomplete turn-scoped read must settle unmeasured"
+    );
+    assert_eq!(
+        settled_amount,
+        Some(amount),
+        "unmeasured usage settles conservatively at the full reservation, never a guess"
+    );
+    // The lane is not stuck: a genuinely new turn with no native
+    // predecessor is accepted exactly as it would be after a normal Stop.
+    let next = identity("codex", "agent", "turn-2");
+    applied(f.outcome(prompt(next)));
+}
+
+#[test]
+fn stale_association_version_against_the_current_daemon_is_unsupported() {
+    let mut f = Fixture::new();
+    let i = identity("codex", "agent", "turn");
+    let mut old = prompt(i);
+    if let Request::ExecutionOwner { event } = &mut old {
+        event.association_version = 1;
+    }
+    gap(f.outcome(old), Gap::Unsupported);
+    assert_eq!(f.count("tasks"), 0);
 }
