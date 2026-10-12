@@ -1,0 +1,1 @@
+{"protocol_version":"libra.quota-observation/0.1","request_id":"__REQUEST_ID__","extension_id":"examplecorp.quota","extension_version":"0.1.0","error":{"code":"auth_required","retry":"after_user_action"}}
