@@ -8,7 +8,10 @@ PR55. TaskId remains Libra's separate economic unit.
 ## IPC and authority
 
 Send `Request::ExecutionOwner { event: ExecutionOwnerRequest }` over the existing
-local Unix socket using **IPC protocol 12**, **association_version 1** and
+local Unix socket using **IPC protocol 12**, **association_version 2** (bumped
+from 1 by HORO-1863 when the owner `Stop` arm started accepting a Codex
+identity's `transcript_path`; wire-only, never persisted, so an older daemon
+simply refuses a newer CLI's requests outright) and
 **ExecutionIdentity envelope_version 1**. `Response::ExecutionOwner` returns
 `ExecutionOwnerOutcome`. Version mismatch is explicit and commits no effect.
 Unhandled identity dimensions are rejected on owner IPC, even where the shared
@@ -69,6 +72,10 @@ Rich identity never falls back to a current/latest host or session result.
   the exact current PlanId, including a replan, and returns the resulting target.
 - `Stop { model, transcript_path }` finalizes only that active turn and closes its
   association. The existing economic policy and provenance semantics apply.
+  For a Codex identity, HORO-1863 additionally accepts `transcript_path` and
+  measures usage turn-scoped (never session-scoped) from the Codex rollout;
+  see "Supported boundaries" below. Every other identity's `transcript_path`
+  is still refused as before.
 - `Query` reads the requested active turn's exact TaskId, current PlanId, initial
   PlanId and lineage, plus the ledger budget snapshot. It uses no cross-lane cache.
 
@@ -104,11 +111,20 @@ Exact read-only Query remains available in those configurations.
 Bounded recon and first-use extension credential validation run before the write lock. Queue writes may join the transaction;
 external event delivery remains outside it.
 
-A supplied session transcript path is also unsupported: the current reader
-measures a session window and cannot prove agent/turn ownership. With no path,
-usage remains unavailable and settlement retains the existing conservative
-`usage_known=false` provenance; it is not measured billing. No sibling's usage is
-silently attributed. This is a real capability limit for the consumer.
+A supplied session transcript path remains unsupported for every identity
+except Codex: the session-window reader cannot prove agent/turn ownership, and
+offering it would cross-associate sibling usage. For a Codex identity
+(HORO-1863), the daemon instead reads the rollout turn-scoped
+(`libra_governor_daemon::usage::observe_codex_turn`): it sums only the
+`token_usage_record` lines whose `turn_id` matches this turn, cross-checked
+against `session_id` and the turn's own self-reported running total, and
+never falls back to a session- or file-wide count on any failure. With no
+path, or when the turn-scoped read cannot be trusted (an incomplete or
+internally inconsistent rollout), usage remains unavailable and settlement
+retains the existing conservative `usage_known=false` provenance; it is not
+measured billing. No sibling's usage is silently attributed. Real measured
+usage is a capability Codex alone has today; every other identity's limit is
+unchanged.
 
 Legacy hooks remain compatible. Legacy `StatusResult.scope` is explicitly
 `host_latest_observation`; shared provider labels identify the latest selected
