@@ -56,13 +56,59 @@
 //! `libra_governor_domain::resource_amount`'s own module header exists to
 //! prevent.
 //!
+//! # Codex rollouts (HORO-1714)
+//!
+//! Codex's `Stop` payload also carries `transcript_path`, pointing at its
+//! rollout file (`$CODEX_HOME/sessions/.../rollout-*.jsonl`). Usage there
+//! is one `{"type":"token_usage_record","payload":{...}}` line per
+//! completed model response, timestamped in RFC 3339 like Claude Code's
+//! records, so the window, backwards scan and scan cap are unchanged.
+//! Only the extraction differs, and only in one respect that matters:
+//! the counts are **nested**, not disjoint.
+//!
+//! Codex copies the Responses API's usage object, where
+//! `cached_input_tokens` and `cache_write_input_tokens` are breakdowns
+//! *of* `input_tokens`, and `reasoning_output_tokens` is a breakdown *of*
+//! `output_tokens` (`total_tokens == input_tokens + output_tokens`). In
+//! Claude Code's shape `input_tokens` already excludes both cache
+//! classes. Copying `input_tokens` across by name would therefore put
+//! every cached re-read back into [`TurnUsage::fresh_tokens`] — the ~25x
+//! inflation the section above exists to prevent, arriving under a field
+//! name that looks correct.
+//!
+//! So a Codex record is partitioned into the same disjoint counts before
+//! it is summed:
+//!
+//! - `cached_input_tokens` -> `cache_read_input_tokens`. A prefix served
+//!   from cache, excluded for the same reason as Claude's cache reads.
+//! - `cache_write_input_tokens` -> `cache_creation_input_tokens`. Input
+//!   ingested and written to cache on this response: fresh work.
+//! - the remainder of `input_tokens` -> `input_tokens`.
+//! - `output_tokens` -> `output_tokens` as is. Reasoning tokens are
+//!   already inside it; adding `reasoning_output_tokens` again would
+//!   count them twice. They are real billed output and they are counted
+//!   — once.
+//!
+//! The result is that `fresh_tokens()` equals Codex's own
+//! `TokenUsage::blended_total()` (non-cached input + output), the figure
+//! Codex itself prints as "tokens used". That is an upstream anchor, not
+//! a definition invented here.
+//!
+//! Only `payload.usage` is read. The same line carries
+//! `turn_token_usage` and `thread_token_usage`, which are running totals;
+//! summing those per record would grow quadratically with the session.
+//! The `event_msg`/`token_count` lines are a second view of the same
+//! responses (and can repeat a `last_token_usage` without a new response,
+//! or carry a synthetic total-only figure after a context-window fill),
+//! so they are never counted alongside the records.
+//!
 //! # Privacy
 //!
 //! The transcript is the single most sensitive local artifact this
 //! product can see: it holds prompts, file contents and tool output. This
 //! module reads it and extracts **only** the four integer counts above.
-//! Parsing goes through the narrow [`TranscriptRecord`] struct rather
-//! than a `serde_json::Value`, so message content is skipped during
+//! Parsing goes through the narrow [`TranscriptRecord`] and
+//! [`CodexUsageRecord`] structs rather than a `serde_json::Value`, so message content is skipped during
 //! deserialization instead of being materialized into an owned tree. No
 //! text is retained, returned, logged, or included in any error: the
 //! error type carries a reason code, never a line, a path excerpt, or a
@@ -108,14 +154,16 @@ pub const DEFAULT_SCAN_CAP_BYTES: u64 = 8 * 1024 * 1024;
 const CHUNK_BYTES: usize = 256 * 1024;
 
 /// The four raw per-turn counts the host reports, summed over every
-/// assistant record inside the measured window.
+/// usage record inside the measured window. Disjoint by construction:
+/// Codex's nested counts are partitioned into this shape before summing
+/// (see the module header).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TurnUsage {
     pub input_tokens: u64,
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
     pub output_tokens: u64,
-    /// How many assistant records contributed. Zero means the window
+    /// How many usage records contributed. Zero means the window
     /// contained no usage-bearing record at all, which is reported as
     /// [`UsageUnavailable::NoUsageInWindow`] rather than as a measured
     /// zero — see that variant's docs.
@@ -139,8 +187,9 @@ impl TurnUsage {
 /// content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageUnavailable {
-    /// The host's hook payload carried no `transcript_path`. True of
-    /// Codex today — see `docs/adr/0004-agent-adapter-contract.md`.
+    /// The host's hook payload carried no `transcript_path`, or the
+    /// caller deliberately withheld it (the execution-owner route does,
+    /// because this reader measures a session window, not an agent one).
     NoTranscriptPath,
     /// The path could not be opened, read, or seeked.
     Unreadable,
@@ -154,7 +203,7 @@ pub enum UsageUnavailable {
     /// measurement either covers its window or it is not a measurement.
     ScanCapReached,
     /// The window was read in full and contained no usage-bearing
-    /// assistant record.
+    /// record.
     ///
     /// Distinct from `Measured(0)`, which this module never produces: a
     /// real zero and "nothing was observed" must not be the same value
@@ -223,7 +272,58 @@ struct RawUsage {
     output_tokens: Option<u64>,
 }
 
-/// Sums host-reported usage over every assistant record in `path` whose
+/// The `type` tag of a Codex rollout line carrying one response's usage.
+const CODEX_USAGE_RECORD: &str = "token_usage_record";
+
+/// A Codex `token_usage_record` line, narrowed to `payload.usage`. The
+/// running totals beside it (`turn_token_usage`, `thread_token_usage`)
+/// are skipped by serde — see the module header for why they must never
+/// be summed.
+#[derive(Deserialize)]
+struct CodexUsageRecord {
+    payload: CodexUsagePayload,
+}
+
+#[derive(Deserialize)]
+struct CodexUsagePayload {
+    usage: CodexRawUsage,
+}
+
+/// Codex writes these as `i64` and clamps negatives to zero wherever it
+/// consumes them. Reading `u64` would make one negative count fail the
+/// whole record, silently dropping its other counts — an undercount.
+/// `reasoning_output_tokens` is deliberately not read: it is a subset of
+/// `output_tokens`, so it carries no count that is not already summed.
+#[derive(Deserialize)]
+struct CodexRawUsage {
+    input_tokens: Option<i64>,
+    cached_input_tokens: Option<i64>,
+    cache_write_input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+}
+
+impl CodexRawUsage {
+    /// Partitions Codex's nested input counts into the disjoint shape
+    /// [`TurnUsage`] sums. Each cache class is capped at what is left of
+    /// `input_tokens`, so the three input parts always add back up to it
+    /// and `fresh_tokens()` stays equal to Codex's `blended_total()` even
+    /// if a record's breakdowns are inconsistent.
+    fn into_disjoint(self) -> RawUsage {
+        let count = |v: Option<i64>| u64::try_from(v.unwrap_or(0)).unwrap_or(0);
+        let input = count(self.input_tokens);
+        let cache_read = count(self.cached_input_tokens).min(input);
+        let cache_creation = count(self.cache_write_input_tokens).min(input - cache_read);
+        RawUsage {
+            input_tokens: Some(input - cache_read - cache_creation),
+            cache_creation_input_tokens: Some(cache_creation),
+            cache_read_input_tokens: Some(cache_read),
+            output_tokens: Some(count(self.output_tokens)),
+        }
+    }
+}
+
+/// Sums host-reported usage over every usage record in `path` — a Claude
+/// Code `assistant` record or a Codex `token_usage_record` — whose
 /// timestamp is at or after `window_start`.
 ///
 /// `window_start` must be the end of the last already-accounted window —
@@ -328,7 +428,7 @@ fn scan(
 }
 
 enum LineVerdict {
-    /// Not an assistant usage record, or unparseable — ignore it.
+    /// Not a usage record, or unparseable — ignore it.
     Skip,
     /// Older than the window: the backwards scan is done.
     Older,
@@ -355,12 +455,20 @@ fn consider_line(line: &[u8], window_start: OffsetDateTime) -> LineVerdict {
             }
         }
     }
-    if record.kind.as_deref() != Some("assistant") {
-        return LineVerdict::Skip;
-    }
-    match record.message.and_then(|m| m.usage) {
-        Some(raw) => LineVerdict::Counted(raw),
-        None => LineVerdict::Skip,
+    match record.kind.as_deref() {
+        Some("assistant") => match record.message.and_then(|m| m.usage) {
+            Some(raw) => LineVerdict::Counted(raw),
+            None => LineVerdict::Skip,
+        },
+        // Parsed a second time, narrowly, only once the tag matches: a
+        // provider-specific `payload` field on the shared record would
+        // make every line whose payload has another shape fail to parse,
+        // losing its timestamp and with it the window boundary.
+        Some(CODEX_USAGE_RECORD) => match serde_json::from_slice::<CodexUsageRecord>(line) {
+            Ok(record) => LineVerdict::Counted(record.payload.usage.into_disjoint()),
+            Err(_) => LineVerdict::Skip,
+        },
+        _ => LineVerdict::Skip,
     }
 }
 
