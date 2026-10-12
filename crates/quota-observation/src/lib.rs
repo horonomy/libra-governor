@@ -41,9 +41,12 @@
 //! `utilization`/`undisclosed`; `tokens`/`requests`/`usd_cents`/
 //! `percent_basis_points`/`opaque_credit`), and every numeric value
 //! ([`wire::Quantity`]) is a canonical, unsigned, `i64::MAX`-bounded
-//! *decimal string* that must serialize back out byte-identical to what
-//! was received — a wire-format stability requirement across extension
-//! versions that `domain`'s in-process `u64`/`QuotaAmount`
+//! *decimal string* whose decoded digits serialize back out stably and
+//! idempotently (see [`wire::Quantity`]'s own doc for the one edge case
+//! — a `\uXXXX`-escaped digit string — where that is not quite
+//! byte-identical to the original wire bytes) — a wire-format stability
+//! requirement across extension versions that `domain`'s in-process
+//! `u64`/`QuotaAmount`
 //! representation was never designed for. Similarly,
 //! `libra-governor-domain`'s `quota_window` module's own `PoolId` is an
 //! unrelated opaque string identifier for a *different* concept (a
