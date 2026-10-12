@@ -39,7 +39,7 @@
 //!
 //! `deadline` bounds start + write + read + exit. On top of that,
 //! `invoke()`/`run_one_shot()` can take up to two further bounded grace
-//! waits of [`JOIN_GRACE`] each (one for the writer thread, one for the
+//! waits of `JOIN_GRACE` each (one for the writer thread, one for the
 //! reader thread) while deciding whether it is safe to join each
 //! helper thread — see the tail of `run_one_shot`. So the real worst
 //! case before this function returns is `deadline + 2 * JOIN_GRACE`,
@@ -183,12 +183,15 @@ fn kill_owned_process_group(pid: u32) {
 const JOIN_GRACE: Duration = Duration::from_millis(1_000);
 
 /// Serializes this crate's own `Command::spawn()` calls against each
-/// other. `std::process::Command` creates the stdio pipe file
-/// descriptors and only marks them close-on-exec *after* `fork()`
-/// returns in the parent — there is a real window, between pipe
-/// creation and that flag being set, during which a `spawn()` running
-/// concurrently on another thread can `fork()` and inherit an
-/// in-flight invocation's pipe fds into an unrelated child. Observed in
+/// other. On platforms without an atomic "create this pipe already
+/// close-on-exec" syscall, `std::process::Command` creates the stdio
+/// pipe file descriptors with a plain `pipe()` and only marks them
+/// close-on-exec with a separate, later `fcntl(F_SETFD, FD_CLOEXEC)`
+/// call — there is a real window, between the `pipe()` call and that
+/// `fcntl` taking effect, during which a `fork()` happening concurrently
+/// on another thread (from an unrelated `spawn()`) can inherit an
+/// in-flight invocation's not-yet-CLOEXEC pipe fds into its own child.
+/// Observed in
 /// practice (HORO-1854 adversarial review): with two concurrent
 /// invocations, a stray byte sequence from one child's output showed up
 /// in a frame read for a different invocation. Holding this lock only
@@ -392,14 +395,20 @@ fn run_one_shot(
         // reaps it directly, with no group-kill beforehand — so a
         // backgrounded grandchild the leader spawned (e.g. `sleep 30 &`)
         // is never killed and outlives `invoke()` returning `Ok`. The
-        // correct fix is to detect exit without reaping (e.g.
-        // `waitid(WEXITED | WNOHANG | WNOWAIT)`), kill the group, and
-        // only then perform the single reaping `wait()` — but that
-        // changes this function's one load-bearing ordering rule (see
-        // the module docs) and deserves its own focused change with
-        // platform verification on both CI targets (macOS and Linux),
-        // not a rushed edit alongside unrelated fixes. Tracked as a
-        // follow-up; not landed here.
+        // correct fix is to detect exit without reaping, kill the group,
+        // and only then perform the single reaping `wait()` — changing
+        // this function's one load-bearing ordering rule (see the module
+        // docs), which this change does not attempt to do carelessly.
+        // `rustix::process::waitid` with `WaitIdOptions::{EXITED,
+        // NOHANG, NOWAIT}` is confirmed available in this crate's
+        // already-pinned rustix 1.1.5 on both macOS and Linux (it is
+        // only excluded for OpenBSD/Redox/WASI) — so this is *not*
+        // blocked on dependency availability. What's missing is
+        // empirical verification of `WNOWAIT`'s actual runtime behavior
+        // on both CI targets, which this change's scope and time budget
+        // did not include; landing it without that verification risks a
+        // real regression in the module's one load-bearing invariant.
+        // Tracked as a follow-up; not landed here.
         match reaped_status {
             Some(status) => status,
             None => kill_and_reap(&mut child),
@@ -837,10 +846,8 @@ esac
              could not block the return"
         );
 
-        // Clean up the escaped process so the test run doesn't leak it
-        // (it survives the group kill by design — that's the point of
-        // this test). Poll for the pidfile briefly: the grandchild write
-        // can lag slightly under scheduling pressure.
+        // Poll for the pidfile briefly: the grandchild write can lag
+        // slightly under scheduling pressure.
         let poll_deadline = Instant::now() + Duration::from_secs(5);
         let mut grandchild_pid: Option<i32> = None;
         while Instant::now() < poll_deadline {
@@ -852,12 +859,35 @@ esac
             }
             thread::sleep(Duration::from_millis(20));
         }
-        if let Some(pid) = grandchild_pid {
-            use rustix::process::{Pid, Signal};
-            if let Some(pid) = Pid::from_raw(pid) {
-                let _ = rustix::process::kill_process(pid, Signal::KILL);
-            }
-        }
+        let grandchild_pid = grandchild_pid
+            .expect("the grandchild should have written its pidfile well within the poll window");
+
+        // This is what makes the test actually prove the escape, rather
+        // than merely prove a timeout happened for some other reason
+        // (e.g. `setsid` silently failing, in which case the ordinary
+        // group kill would have reached the grandchild too, the reader
+        // would have seen EOF, and this test would pass against the
+        // pre-fix code as well): confirm the grandchild is still alive
+        // *before* cleaning it up. `kill(pid, 0)`-style existence checks
+        // can keep succeeding on an already-killed-but-not-yet-reaped
+        // zombie, but this process was never a child of this test (it
+        // reparented after its `setsid()`-calling parent exited), so
+        // there is no zombie-vs-dead ambiguity here.
+        use rustix::io::Errno;
+        use rustix::process::{test_kill_process, Pid, Signal};
+        let pid = Pid::from_raw(grandchild_pid).expect("a valid pid was recorded");
+        assert_ne!(
+            test_kill_process(pid),
+            Err(Errno::SRCH),
+            "the grandchild should still be alive — if it's gone, this test may have \
+             passed for the wrong reason (e.g. setsid failing silently, letting the \
+             ordinary group kill reach it after all)"
+        );
+
+        // Clean up the escaped process so the test run doesn't leak it
+        // (it survives the group kill by design — that's the point of
+        // this test).
+        let _ = rustix::process::kill_process(pid, Signal::KILL);
     }
 
     #[test]
