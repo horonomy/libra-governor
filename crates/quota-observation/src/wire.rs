@@ -43,8 +43,14 @@ pub enum WireValidationError {
 
 /// A canonical, unsigned decimal quantity string: `0` or `[1-9][0-9]*`,
 /// no leading zero, no sign, no exponent, value `<= i64::MAX`. The
-/// canonical string is retained verbatim (not reformatted) so a
-/// round-tripped frame is byte-identical.
+/// *decoded* string is retained verbatim (not reformatted or
+/// re-parsed through the numeric value), so re-serializing it is
+/// stable and idempotent. This is not quite byte-identical to the
+/// original wire bytes in every case: a JSON string can spell the same
+/// digits with a `\uXXXX` escape (e.g. `"12"` decodes to the
+/// same digit string as `"12"`), and this type has no way to tell those
+/// two input encodings apart once decoded — re-serializing always
+/// emits the plain, unescaped digits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Quantity {
     canonical: String,
@@ -321,6 +327,25 @@ pub enum Unit {
     OpaqueCredit { namespace: String },
 }
 
+/// Distinguishes "key absent" from "key present with an explicit JSON
+/// `null`" for one of these flat helper structs' optional fields.
+/// Plain `Option<T>` deserialization (even with `#[serde(default)]`)
+/// collapses *both* cases to `None`, which would let
+/// `{"kind":"undisclosed","value":null}` sneak past an `is_some()`
+/// presence check meant to catch a key that variant does not own at
+/// all — the key is present (with a `null` value), but a bare
+/// `Option<Quantity>` field can't tell that apart from the key being
+/// absent entirely. Wrapping in a second `Option` layer here keeps that
+/// distinction: `None` = absent, `Some(None)` = present-but-null,
+/// `Some(Some(v))` = present-with-value.
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 /// Flat, union-of-all-variants helper for [`Unit`]'s manual
 /// `Deserialize`. `#[serde(deny_unknown_fields)]` here rejects any key
 /// outside `{kind, namespace}` *and*, as an ordinary consequence of the
@@ -331,8 +356,8 @@ pub enum Unit {
 #[serde(deny_unknown_fields)]
 struct RawUnit {
     kind: String,
-    #[serde(default)]
-    namespace: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    namespace: Option<Option<String>>,
 }
 
 impl<'de> Deserialize<'de> for Unit {
@@ -342,6 +367,9 @@ impl<'de> Deserialize<'de> for Unit {
     {
         use serde::de::Error;
         let raw = RawUnit::deserialize(deserializer)?;
+        // `.is_some()` on the outer `Option` means "the `namespace` key
+        // was present in the JSON object at all" — true even for an
+        // explicit `null` value. See [`deserialize_present`].
         let reject_namespace = |raw: &RawUnit| -> Result<(), D::Error> {
             if raw.namespace.is_some() {
                 return Err(Error::custom("unknown field `namespace`"));
@@ -366,8 +394,12 @@ impl<'de> Deserialize<'de> for Unit {
                 Ok(Unit::PercentBasisPoints)
             }
             "opaque_credit" => {
+                // `.flatten()` folds "absent" and "present-but-null"
+                // into the same `None` — both are "no usable namespace
+                // string" for this required field.
                 let namespace = raw
                     .namespace
+                    .flatten()
                     .ok_or_else(|| Error::custom("missing field `namespace`"))?;
                 Ok(Unit::OpaqueCredit { namespace })
             }
@@ -430,12 +462,12 @@ pub enum Reading {
 #[serde(deny_unknown_fields)]
 struct RawReading {
     kind: String,
-    #[serde(default)]
-    value: Option<Quantity>,
-    #[serde(default)]
-    limit: Option<Quantity>,
-    #[serde(default)]
-    used_basis_points: Option<Quantity>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    value: Option<Option<Quantity>>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    limit: Option<Option<Quantity>>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    used_basis_points: Option<Option<Quantity>>,
 }
 
 impl<'de> Deserialize<'de> for Reading {
@@ -445,6 +477,13 @@ impl<'de> Deserialize<'de> for Reading {
     {
         use serde::de::Error;
         let raw = RawReading::deserialize(deserializer)?;
+        // `.is_some()` on each of these outer `Option`s means "the key
+        // was present in the JSON object at all", including an explicit
+        // `null` value — see [`deserialize_present`]. Without this, a
+        // probe like `{"kind":"undisclosed","value":null}` would sneak
+        // past a presence check built on a plain `Option<Quantity>`
+        // field, since `null` and "absent" both deserialize to `None`
+        // there.
         let reject_used_basis_points = || -> Result<(), D::Error> {
             if raw.used_basis_points.is_some() {
                 return Err(Error::custom("unknown field `used_basis_points`"));
@@ -457,9 +496,11 @@ impl<'de> Deserialize<'de> for Reading {
                 Ok(Reading::Used {
                     value: raw
                         .value
+                        .flatten()
                         .ok_or_else(|| Error::custom("missing field `value`"))?,
                     limit: raw
                         .limit
+                        .flatten()
                         .ok_or_else(|| Error::custom("missing field `limit`"))?,
                 })
             }
@@ -468,9 +509,11 @@ impl<'de> Deserialize<'de> for Reading {
                 Ok(Reading::Remaining {
                     value: raw
                         .value
+                        .flatten()
                         .ok_or_else(|| Error::custom("missing field `value`"))?,
                     limit: raw
                         .limit
+                        .flatten()
                         .ok_or_else(|| Error::custom("missing field `limit`"))?,
                 })
             }
@@ -484,6 +527,7 @@ impl<'de> Deserialize<'de> for Reading {
                 Ok(Reading::Utilization {
                     used_basis_points: raw
                         .used_basis_points
+                        .flatten()
                         .ok_or_else(|| Error::custom("missing field `used_basis_points`"))?,
                 })
             }
@@ -792,6 +836,32 @@ mod tests {
             serde_json::from_str::<Unit>(r#"{"kind":"tokens","kind":"usd_cents"}"#).unwrap_err();
         assert!(
             err.to_string().contains("duplicate field `kind`"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    // Regression tests for a follow-on gap in the same B2 fix: a
+    // present-but-`null` value for a key that variant doesn't own must
+    // still be rejected as unknown, not silently treated the same as
+    // the key being absent. A naive `Option<Quantity>` field collapses
+    // both cases to `None`, which would let these two probes slip past
+    // an `is_some()` presence check.
+    #[test]
+    fn present_but_null_field_on_undisclosed_reading_is_still_rejected() {
+        let err =
+            serde_json::from_str::<Reading>(r#"{"kind":"undisclosed","value":null}"#).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field `value`"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn present_but_null_namespace_on_a_non_opaque_credit_unit_is_still_rejected() {
+        let err =
+            serde_json::from_str::<Unit>(r#"{"kind":"tokens","namespace":null}"#).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field `namespace`"),
             "unexpected error message: {err}"
         );
     }
