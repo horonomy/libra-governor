@@ -657,12 +657,15 @@ pub(crate) fn run_turn_completed_with_input(agent: AgentKind, raw: &str) {
                     identity,
                     operation: ExecutionOperation::Stop {
                         model,
-                        // The owner route's reader measures a session
-                        // window, not an agent/turn window, and would
-                        // cross-associate sibling usage -- the daemon
-                        // itself refuses any Some() here (Unsupported).
-                        // Never opened by this crate regardless.
-                        transcript_path: None,
+                        // Relayed verbatim, never opened here (HORO-1725,
+                        // HORO-1863): a lossy conversion is still a
+                        // conversion, and this crate has no business
+                        // reading the transcript. The daemon accepts this
+                        // for Codex identities only (turn-scoped, measured
+                        // usage); every other provider's identity still
+                        // gets `Unsupported` for any `Some(_)` here,
+                        // unchanged.
+                        transcript_path: transcript_path.map(|p| p.to_string_lossy().into_owned()),
                     },
                 },
             }),
