@@ -388,6 +388,39 @@ mod tests {
         ));
     }
 
+    /// Companion to the order test above: dropping one declared runtime
+    /// file (same remaining files, same digests, nothing on disk
+    /// touched) is a *membership* change, not just an order change, and
+    /// must be caught the same way — via the launch tuple, since the
+    /// manifest digest still cannot see into `approval.runtime_files` at
+    /// all.
+    #[test]
+    fn dropped_runtime_file_invalidates_trust_via_the_launch_tuple_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = write_executable(dir.path(), "ext", b"binary-one");
+        let lib_a = write_executable(dir.path(), "a.so", b"lib-a");
+        let lib_b = write_executable(dir.path(), "b.so", b"lib-b");
+        let runtime_files = vec![
+            RuntimeFileDigest {
+                path: lib_a.to_str().unwrap().to_owned(),
+                sha256: String::new(),
+            },
+            RuntimeFileDigest {
+                path: lib_b.to_str().unwrap().to_owned(),
+                sha256: String::new(),
+            },
+        ];
+        let registration = approve(build(&executable, runtime_files));
+        assert!(verify_identity(&registration).is_ok());
+
+        let mut dropped = registration.clone();
+        dropped.approval.runtime_files.pop();
+        assert!(matches!(
+            verify_identity(&dropped).unwrap_err(),
+            IdentityError::LaunchTupleDigestMismatch { .. }
+        ));
+    }
+
     #[test]
     fn changed_declared_runtime_file_invalidates_trust() {
         let dir = tempfile::tempdir().unwrap();
