@@ -250,8 +250,15 @@ pub(crate) fn handle(
                 let mut summary = None;
                 // Replay/duplicate-detection and staleness were already
                 // checked above, under this same lock, before this arm
-                // runs -- a duplicate Stop never reaches a second
-                // measurement or a second effect.
+                // runs -- a duplicate Stop never reaches a second ledger
+                // effect. It does *not* avoid a second measurement:
+                // `codex_turn_observation` is computed unconditionally for
+                // every Stop carrying a Codex transcript_path, before the
+                // write lock is even taken (see above), so a replayed Stop
+                // re-reads and re-scans the transcript every time -- just
+                // wasted work, since the closure below only consumes the
+                // value already computed and the ledger write that follows
+                // is what the replay check actually short-circuits.
                 let result = crate::server::finalize_with_usage(
                     &session,
                     model.clone(),
