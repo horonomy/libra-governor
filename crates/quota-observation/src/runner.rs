@@ -9,6 +9,20 @@
 //! misbehaving extension that backgrounds a grandchild holding stdout
 //! open cannot hang the host past the deadline.
 //!
+//! # Group-kill is not full containment
+//!
+//! Killing the owned process group reaches every descendant that stays
+//! *in* the group. It is not a sandbox: a descendant that calls
+//! `setsid()` (or otherwise detaches itself from the group) survives
+//! the kill by design — nothing in this module can reach it, since the
+//! only identifier this code kills by is the group id. The guarantee
+//! this module actually provides is narrower than "nothing outlives the
+//! deadline": it is that `invoke()` itself always returns on time
+//! regardless of what an escaped descendant does afterward. See
+//! `run_one_shot`'s tail (the bounded-join section) for how that is
+//! kept true even when a reader thread is wedged forever on a pipe an
+//! escaped process still holds open.
+//!
 //! # The one load-bearing ordering rule
 //!
 //! `kill_process_group` must never be called after this process has
@@ -20,11 +34,25 @@
 //! module's control flow is written so every kill happens strictly
 //! before the single reaping call for that child; macOS/Linux only, no
 //! Windows process-group support is attempted.
+//!
+//! # Deadline budget
+//!
+//! `deadline` bounds start + write + read + exit. On top of that,
+//! `invoke()`/`run_one_shot()` can take up to two further bounded grace
+//! waits of [`JOIN_GRACE`] each (one for the writer thread, one for the
+//! reader thread) while deciding whether it is safe to join each
+//! helper thread — see the tail of `run_one_shot`. So the real worst
+//! case before this function returns is `deadline + 2 * JOIN_GRACE`,
+//! not `deadline` alone. Neither grace wait is spent joining a thread
+//! that is still blocked on an escaped descendant's pipe — see the
+//! module docs above — so this bound holds even against the setsid
+//! attack a regression test in this module exercises.
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -80,6 +108,18 @@ pub enum InvokeError {
 /// this crate without going through steps (1) and (2) first — the
 /// re-measure-before-every-invocation guarantee is enforced by this
 /// function being the only path in, not by caller discipline.
+///
+/// # Precondition this function does not itself check
+///
+/// Cross-registration `(account_fingerprint, pool_alias)` uniqueness
+/// ([`crate::registration::load_registrations`]'s
+/// `check_pool_uniqueness`) is the *loader's* responsibility, not this
+/// function's: `invoke` only ever sees the one [`Registration`] it was
+/// called with, so it has no way to detect a duplicate pool binding
+/// declared in a sibling registration file. Callers must go through
+/// `load_registrations` (or re-run the same uniqueness check
+/// themselves) before calling `invoke` on registrations assembled any
+/// other way.
 pub fn invoke(
     registration: &Registration,
     request: &[u8],
@@ -136,6 +176,29 @@ fn kill_owned_process_group(pid: u32) {
     }
 }
 
+/// Bound on each of the two post-kill joins (writer, reader) in
+/// `run_one_shot`'s tail. See the module-level "Deadline budget" docs:
+/// the real worst-case wall time before `run_one_shot` returns is
+/// `deadline + 2 * JOIN_GRACE`, not `deadline` alone.
+const JOIN_GRACE: Duration = Duration::from_millis(1_000);
+
+/// Serializes this crate's own `Command::spawn()` calls against each
+/// other. `std::process::Command` creates the stdio pipe file
+/// descriptors and only marks them close-on-exec *after* `fork()`
+/// returns in the parent — there is a real window, between pipe
+/// creation and that flag being set, during which a `spawn()` running
+/// concurrently on another thread can `fork()` and inherit an
+/// in-flight invocation's pipe fds into an unrelated child. Observed in
+/// practice (HORO-1854 adversarial review): with two concurrent
+/// invocations, a stray byte sequence from one child's output showed up
+/// in a frame read for a different invocation. Holding this lock only
+/// across the `spawn()` call (not the whole `run_one_shot`) serializes
+/// just the fork/exec moment, which is all that is actually racy; it
+/// does not protect against some other, unrelated piece of code in the
+/// same host process also spawning children outside this crate — that
+/// remains a host-wide concern out of this crate's scope.
+static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
 /// Runs `executable` as a one-shot stdio child: fixed argv, an
 /// environment containing **only** `LANG=C.UTF-8`/`LC_ALL=C.UTF-8`
 /// (`env_clear` first — no ambient inheritance of any kind, including
@@ -171,6 +234,12 @@ fn run_one_shot(
         .env_clear()
         .env("LANG", "C.UTF-8")
         .env("LC_ALL", "C.UTF-8")
+        // The child must never silently run with whatever directory the
+        // host process happened to have as its own cwd (which may be a
+        // path chosen for, or meaningful to, something else entirely).
+        // "/" always exists and is never writable by an unprivileged
+        // extension, so this is a safe, deterministic default.
+        .current_dir("/")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -183,9 +252,13 @@ fn run_one_shot(
         command.process_group(0);
     }
 
-    let mut child = command
-        .spawn()
-        .map_err(|error| RunError::Spawn(executable.to_owned(), error.to_string()))?;
+    let mut child = {
+        // See [`SPAWN_LOCK`]: held only across the fork/exec call itself.
+        let _spawn_guard = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        command
+            .spawn()
+            .map_err(|error| RunError::Spawn(executable.to_owned(), error.to_string()))?
+    };
     let pid = child.id();
 
     let mut stdin = child.stdin.take().expect("stdin was piped");
@@ -313,6 +386,20 @@ fn run_one_shot(
             }
             thread::sleep(poll_step);
         }
+        // KNOWN LIMITATION, deliberately not fixed in this pass (HORO-1854
+        // adversarial review, should-fix item "success-path stragglers
+        // survive"): if the leader exits 0 on its own, `try_wait` above
+        // reaps it directly, with no group-kill beforehand — so a
+        // backgrounded grandchild the leader spawned (e.g. `sleep 30 &`)
+        // is never killed and outlives `invoke()` returning `Ok`. The
+        // correct fix is to detect exit without reaping (e.g.
+        // `waitid(WEXITED | WNOHANG | WNOWAIT)`), kill the group, and
+        // only then perform the single reaping `wait()` — but that
+        // changes this function's one load-bearing ordering rule (see
+        // the module docs) and deserves its own focused change with
+        // platform verification on both CI targets (macOS and Linux),
+        // not a rushed edit alongside unrelated fixes. Tracked as a
+        // follow-up; not landed here.
         match reaped_status {
             Some(status) => status,
             None => kill_and_reap(&mut child),
@@ -320,20 +407,42 @@ fn run_one_shot(
     };
 
     // The process group is now dead (or exited on its own), so the
-    // pipes should close promptly. Bound the join anyway: never call an
-    // unconditional `join()`, since a file descriptor held open by an
-    // unrelated process outside the group could still wedge a thread.
-    let grace = Duration::from_millis(1_000);
-    let write_result = write_rx.recv_timeout(grace);
+    // pipes should close promptly in the overwhelmingly common case.
+    // But never call an unconditional `join()`: a descendant that
+    // escaped the group (e.g. via `setsid()`) can hold a pipe open
+    // indefinitely, and a thread blocked reading or writing that pipe
+    // would then block this join forever — defeating the whole point
+    // of the deadline (see the module's "Group-kill is not full
+    // containment" docs). So each helper thread is joined *only* when
+    // its channel recv has already told us the thread is done (it sent
+    // its result and is finishing, not still blocked in I/O); otherwise
+    // the handle is dropped and the thread is left running detached.
+    // This bounds the extra time this function can spend here to at
+    // most `2 * JOIN_GRACE` beyond `deadline` (see the module's
+    // "Deadline budget" docs), regardless of what an escaped descendant
+    // does afterward.
+    let write_result = write_rx.recv_timeout(JOIN_GRACE);
+    if write_result.is_ok() {
+        let _ = writer.join();
+    }
+
     let read_result = match read_result {
-        Some(result) => result,
-        None => match read_rx.recv_timeout(grace) {
-            Ok(result) => result,
+        Some(result) => {
+            // Phase 1 already received a result on this channel, so the
+            // reader thread already sent and is finishing (or has
+            // finished) on its own — safe to join without risking a
+            // block on an escaped descendant's pipe.
+            let _ = reader.join();
+            result
+        }
+        None => match read_rx.recv_timeout(JOIN_GRACE) {
+            Ok(result) => {
+                let _ = reader.join();
+                result
+            }
             Err(_) => Err("stdout read did not complete".into()),
         },
     };
-    let _ = writer.join();
-    let _ = reader.join();
 
     if let Some(reason) = abort_reason {
         return Err(reason);
@@ -374,7 +483,6 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::Mutex;
 
     /// Rust's default test harness runs every test in this file in
     /// parallel. Most of the tests below spawn a real child process and
@@ -437,6 +545,29 @@ case "$mode" in
   flood)
     /bin/cat >/dev/null
     exec /usr/bin/yes x
+    ;;
+  pwd)
+    /bin/cat >/dev/null
+    printf '{"cwd":"%s"}' "$(/bin/pwd)"
+    exit 0
+    ;;
+  setsid_escape)
+    /bin/cat >/dev/null
+    exec /usr/bin/perl -e '
+      use POSIX qw(setsid);
+      my $pidfile = shift;
+      my $pid = fork();
+      if (!defined $pid) { exit 1; }
+      if ($pid == 0) {
+        POSIX::setsid();
+        open(my $fh, ">", $pidfile) or exit 1;
+        print $fh "$$\n";
+        close $fh;
+        sleep 30;
+        exit 0;
+      }
+      exit 0;
+    ' "$2"
     ;;
   *)
     exit 99
@@ -659,6 +790,80 @@ esac
         handle.join().unwrap();
         assert!(matches!(error, RunError::Cancelled));
         assert!(start.elapsed() < Duration::from_secs(15));
+    }
+
+    // Regression test for B1 (HORO-1854 adversarial review): a
+    // grandchild that calls `setsid()` leaves the owned process group
+    // entirely, so `kill_owned_process_group` can never reach it — it
+    // keeps the stdout pipe's write end open forever, and the reader
+    // thread blocks in `read_to_end` with no EOF ever arriving. Before
+    // this fix, `run_one_shot`'s tail unconditionally called
+    // `reader.join()`, which then blocked for as long as the escaped
+    // process lived (confirmed by probe: ~12.4s against a 1s deadline).
+    // After the fix, the thread is joined only when its channel recv
+    // already proved it was done, so this must return `Timeout` close
+    // to the deadline, not 10x it.
+    #[test]
+    fn escaped_setsid_grandchild_cannot_block_the_return_past_deadline_plus_grace() {
+        let _guard = SUBPROCESS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let script = fixture_script(dir.path());
+        let pidfile = dir.path().join("escaped.pid");
+        let args = vec![
+            "setsid_escape".to_string(),
+            pidfile.to_str().unwrap().to_string(),
+        ];
+        let cancel = AtomicBool::new(false);
+        let deadline_ms = 1_000;
+        let start = Instant::now();
+        let error = run_one_shot(
+            script.to_str().unwrap(),
+            &args,
+            b"{}",
+            Duration::from_millis(deadline_ms),
+            &cancel,
+        )
+        .unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(matches!(error, RunError::Timeout));
+        // Bound is `deadline + 2 * JOIN_GRACE` (see the module docs);
+        // generous headroom on top for scheduling jitter under parallel
+        // test load, but nowhere near the 30s the escaped process sleeps
+        // for — that gap is exactly what distinguishes "bounded" from
+        // "blocked on the attacker".
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "took {elapsed:?}, expected well under 10s if the escaped grandchild \
+             could not block the return"
+        );
+
+        // Clean up the escaped process so the test run doesn't leak it
+        // (it survives the group kill by design — that's the point of
+        // this test). Poll for the pidfile briefly: the grandchild write
+        // can lag slightly under scheduling pressure.
+        let poll_deadline = Instant::now() + Duration::from_secs(5);
+        let mut grandchild_pid: Option<i32> = None;
+        while Instant::now() < poll_deadline {
+            if let Ok(text) = fs::read_to_string(&pidfile) {
+                if let Ok(pid) = text.trim().parse::<i32>() {
+                    grandchild_pid = Some(pid);
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        if let Some(pid) = grandchild_pid {
+            use rustix::process::{Pid, Signal};
+            if let Some(pid) = Pid::from_raw(pid) {
+                let _ = rustix::process::kill_process(pid, Signal::KILL);
+            }
+        }
+    }
+
+    #[test]
+    fn child_runs_with_a_fixed_working_directory_regardless_of_the_hosts_own_cwd() {
+        let frame = run(&["pwd"], GENEROUS_DEADLINE_MS).unwrap();
+        assert_eq!(frame, br#"{"cwd":"/"}"#);
     }
 
     fn minimal_approved_registration(executable: &std::path::Path) -> Registration {
