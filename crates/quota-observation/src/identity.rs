@@ -330,18 +330,61 @@ mod tests {
         let registration = approve(build(&executable, vec![]));
         assert!(verify_identity(&registration).is_ok());
 
+        // Tightened (HORO-1854 adversarial review, test-quality fix):
         // `transport.args` is part of both the manifest (the whole
-        // registration minus `approval`) and the launch tuple, so a
-        // changed argv is caught by the manifest check first — it runs
-        // earlier in `verify_identity`'s sequence. Either failure mode
-        // is a correct refusal; this test only asserts that no file on
-        // disk needs to change for the mismatch to be detected.
+        // registration minus `approval`) and the launch tuple, and
+        // `verify_identity` checks the manifest digest first — so this
+        // mismatch is always caught there, never reaching the launch
+        // tuple check at all. The previous version of this test accepted
+        // either variant, which meant it could not actually prove argv
+        // is covered by the launch tuple specifically (as opposed to
+        // only the manifest); see
+        // `changed_runtime_files_order_invalidates_trust_via_the_launch_tuple_alone`
+        // below for a test that isolates the launch-tuple-only case.
         let mut mutated = registration.clone();
         mutated.transport.args.push("--extra-flag".into());
         assert!(matches!(
             verify_identity(&mutated).unwrap_err(),
             IdentityError::ManifestDigestMismatch { .. }
-                | IdentityError::LaunchTupleDigestMismatch { .. }
+        ));
+    }
+
+    // Regression/coverage test (HORO-1854 adversarial review,
+    // test-quality fix): `approval.runtime_files` lives inside the
+    // `approval` block, which `manifest_digest` deliberately excludes
+    // (the approval record cannot bind over itself) — so the manifest
+    // digest is *blind* to `runtime_files` entirely. The launch tuple
+    // digest is the only thing that covers it, and `launch_tuple_digest`
+    // folds the declared files in through in their *declared order*
+    // (see its own doc comment), not a sorted/order-insensitive set — so
+    // reordering the same set of files (same membership, same digests)
+    // without touching any file on disk must still invalidate trust,
+    // and must do so specifically via `LaunchTupleDigestMismatch`, since
+    // the manifest digest cannot see this change at all.
+    #[test]
+    fn changed_runtime_files_order_invalidates_trust_via_the_launch_tuple_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = write_executable(dir.path(), "ext", b"binary-one");
+        let lib_a = write_executable(dir.path(), "a.so", b"lib-a");
+        let lib_b = write_executable(dir.path(), "b.so", b"lib-b");
+        let runtime_files = vec![
+            RuntimeFileDigest {
+                path: lib_a.to_str().unwrap().to_owned(),
+                sha256: String::new(),
+            },
+            RuntimeFileDigest {
+                path: lib_b.to_str().unwrap().to_owned(),
+                sha256: String::new(),
+            },
+        ];
+        let registration = approve(build(&executable, runtime_files));
+        assert!(verify_identity(&registration).is_ok());
+
+        let mut reordered = registration.clone();
+        reordered.approval.runtime_files.swap(0, 1);
+        assert!(matches!(
+            verify_identity(&reordered).unwrap_err(),
+            IdentityError::LaunchTupleDigestMismatch { .. }
         ));
     }
 
