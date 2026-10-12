@@ -1,0 +1,765 @@
+//! The one-shot stdio subprocess runner (HORO-1853 design-v2 transport).
+//!
+//! Spawns the exact approved executable with fixed argv and a fixed
+//! two-variable environment, writes one request frame to stdin, closes
+//! stdin, reads one response frame from stdout until EOF, and waits for
+//! exit code 0 — all bounded by one deadline covering start, write,
+//! read, and exit together. On timeout or cancellation, the *owned
+//! process group* is killed (not just the direct child), so a
+//! misbehaving extension that backgrounds a grandchild holding stdout
+//! open cannot hang the host past the deadline.
+//!
+//! # The one load-bearing ordering rule
+//!
+//! `kill_process_group` must never be called after this process has
+//! already been reaped (by `try_wait`/`wait` returning `Some`/`Ok`).
+//! Once reaped, the OS is free to recycle the PID — and since the
+//! killed group is identified by that same numeric value (`-pid`), a
+//! kill issued afterward could hit an unrelated, unrelated-to-us
+//! process group that happens to have been assigned the same id. This
+//! module's control flow is written so every kill happens strictly
+//! before the single reaping call for that child; macOS/Linux only, no
+//! Windows process-group support is attempted.
+
+use std::io::{Read, Write};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
+use serde::de::DeserializeOwned;
+
+use crate::identity::{self, IdentityError};
+use crate::registration::{Registration, RegistrationError};
+
+/// Request frame size cap (HORO-1853 design-v2).
+pub const MAX_REQUEST_BYTES: usize = 16 * 1024;
+/// Response frame size cap (HORO-1853 design-v2).
+pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, thiserror::Error)]
+pub enum RunError {
+    #[error("request frame of {0} bytes exceeds the {MAX_REQUEST_BYTES}-byte cap")]
+    RequestTooLarge(usize),
+    #[error("failed to spawn {0:?}: {1}")]
+    Spawn(String, String),
+    #[error("deadline exceeded")]
+    Timeout,
+    #[error("cancelled")]
+    Cancelled,
+    #[error("response exceeded the {MAX_RESPONSE_BYTES}-byte cap")]
+    ResponseTooLarge,
+    #[error("i/o error: {0}")]
+    Io(String),
+    #[error("process exited with a non-zero or signalled status: {0:?}")]
+    NonZeroExit(Option<i32>),
+}
+
+/// Error from the crate's one public entry point, [`invoke`].
+#[derive(Debug, thiserror::Error)]
+pub enum InvokeError {
+    #[error("registration is invalid: {0}")]
+    Registration(#[from] RegistrationError),
+    #[error("identity verification failed: {0}")]
+    Identity(#[from] IdentityError),
+    #[error("run failed: {0}")]
+    Run(#[from] RunError),
+}
+
+/// The crate's sole public entry point for executing a registered
+/// extension. In order, every call: (1) re-validates the registration's
+/// own structural/semantic invariants, (2) re-measures and verifies its
+/// code identity against the bound approval digests
+/// ([`identity::verify_identity`]), and only then (3) runs the one-shot
+/// stdio transport. `run_one_shot` itself is a private implementation
+/// detail precisely so that there is no way to reach it from outside
+/// this crate without going through steps (1) and (2) first — the
+/// re-measure-before-every-invocation guarantee is enforced by this
+/// function being the only path in, not by caller discipline.
+pub fn invoke(
+    registration: &Registration,
+    request: &[u8],
+    cancel: &AtomicBool,
+) -> Result<Vec<u8>, InvokeError> {
+    registration.validate()?;
+    identity::verify_identity(registration)?;
+    let deadline = Duration::from_millis(registration.timeout_ms);
+    let frame = run_one_shot(
+        &registration.transport.executable,
+        &registration.transport.args,
+        request,
+        deadline,
+        cancel,
+    )?;
+    Ok(frame)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum FrameError {
+    #[error("response frame is empty")]
+    Empty,
+    #[error("response frame did not parse as a single JSON value: {0}")]
+    Invalid(String),
+    #[error("response frame has trailing bytes after the first JSON value")]
+    TrailingOutput,
+}
+
+/// Parses exactly one JSON frame from `bytes`: a single JSON value,
+/// optionally followed by one trailing `\n` and nothing else. Any other
+/// trailing content — a second frame, unterminated garbage, anything —
+/// is rejected; `serde_json::from_slice` alone would silently accept
+/// trailing whitespace, which this protocol does not allow.
+pub fn parse_single_frame<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, FrameError> {
+    let mut stream = serde_json::Deserializer::from_slice(bytes).into_iter::<T>();
+    let value = match stream.next() {
+        Some(Ok(value)) => value,
+        Some(Err(error)) => return Err(FrameError::Invalid(error.to_string())),
+        None => return Err(FrameError::Empty),
+    };
+    let offset = stream.byte_offset();
+    let trailing = &bytes[offset..];
+    if !(trailing.is_empty() || trailing == b"\n") {
+        return Err(FrameError::TrailingOutput);
+    }
+    Ok(value)
+}
+
+#[cfg(unix)]
+fn kill_owned_process_group(pid: u32) {
+    use rustix::process::{kill_process_group, Pid, Signal};
+    if let Some(pid) = Pid::from_raw(pid as i32) {
+        let _ = kill_process_group(pid, Signal::KILL);
+    }
+}
+
+/// Runs `executable` as a one-shot stdio child: fixed argv, an
+/// environment containing **only** `LANG=C.UTF-8`/`LC_ALL=C.UTF-8`
+/// (`env_clear` first — no ambient inheritance of any kind, including
+/// `HOME` and any credential-shaped variable), stderr discarded. Writes
+/// `request` to stdin then closes it, reads at most
+/// [`MAX_RESPONSE_BYTES`] + 1 bytes from stdout, and requires exit code
+/// 0. `deadline` bounds the whole operation (start + write + read +
+/// exit); `cancel` is polled throughout and, like a deadline expiry,
+/// triggers an owned-process-group kill rather than merely dropping the
+/// `Child` handle (which would leak the process).
+///
+/// Private: see [`invoke`] for why this is never reachable from outside
+/// the crate on its own.
+fn run_one_shot(
+    executable: &str,
+    args: &[String],
+    request: &[u8],
+    deadline: Duration,
+    cancel: &AtomicBool,
+) -> Result<Vec<u8>, RunError> {
+    if request.len() > MAX_REQUEST_BYTES {
+        return Err(RunError::RequestTooLarge(request.len()));
+    }
+
+    // The deadline covers start + write + read + exit together, per
+    // spec — computed before `spawn()`, not after, so that even the
+    // process creation itself is inside the bound.
+    let deadline_at = Instant::now() + deadline;
+
+    let mut command = Command::new(executable);
+    command
+        .args(args)
+        .env_clear()
+        .env("LANG", "C.UTF-8")
+        .env("LC_ALL", "C.UTF-8")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        // New, independent process group led by this child, so a
+        // timeout/cancel kill can reach every descendant it spawns —
+        // not just the direct child — without also hitting our own
+        // process group.
+        command.process_group(0);
+    }
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| RunError::Spawn(executable.to_owned(), error.to_string()))?;
+    let pid = child.id();
+
+    let mut stdin = child.stdin.take().expect("stdin was piped");
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+
+    let request_owned = request.to_vec();
+    let (write_tx, write_rx) = mpsc::channel();
+    let writer = thread::spawn(move || {
+        let result = stdin.write_all(&request_owned).map_err(|e| e.to_string());
+        let _ = write_tx.send(result);
+    });
+
+    let (read_tx, read_rx) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut limited = (&mut stdout).take(MAX_RESPONSE_BYTES as u64 + 1);
+        let mut buf = Vec::new();
+        let result = limited
+            .read_to_end(&mut buf)
+            .map(|_| buf)
+            .map_err(|e| e.to_string());
+        let _ = read_tx.send(result);
+    });
+
+    let poll_step = Duration::from_millis(10);
+
+    // Kills the owned process group and reaps exactly once via a
+    // blocking `wait()`. Only ever called while `child` is confirmed
+    // *not yet reaped* — an exited-but-unreaped leader is a zombie,
+    // which keeps its PID (and therefore its process group id)
+    // reserved, so `killpg` against it is still safe even though it
+    // has already exited. This is what makes it safe to call from
+    // Phase 1 below, where the leader itself may already be a zombie
+    // while a grandchild it backgrounded is still very much alive and
+    // holding stdout open.
+    let kill_and_reap = |child: &mut std::process::Child| -> std::process::ExitStatus {
+        #[cfg(unix)]
+        kill_owned_process_group(pid);
+        // `wait()` on an already-exited-but-unreaped child returns
+        // immediately with its real status; it does not block waiting
+        // for a group member we just killed to separately exit, since
+        // `wait()` here only reaps *this* `Child` handle's own pid.
+        child.wait().unwrap_or_else(|_| {
+            // Reaping itself failing is exceedingly unlikely (the pid
+            // is definitely ours); fall back to a status object that
+            // reports failure rather than panicking.
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                std::process::ExitStatus::from_raw(1)
+            }
+            #[cfg(not(unix))]
+            {
+                std::process::exit(1)
+            }
+        })
+    };
+
+    // Phase 1: wait for a complete response frame (reader EOF/cap/err),
+    // or for a timeout/cancel — deliberately *not* calling `try_wait`
+    // here. A misbehaving extension whose leader exits immediately but
+    // leaves a backgrounded grandchild holding stdout open must still
+    // be caught by the deadline: reaping the leader early and declaring
+    // victory the moment it exits, while that grandchild silently lives
+    // on past the deadline, is exactly the hang this transport exists
+    // to prevent.
+    let mut abort_reason: Option<RunError> = None;
+    let read_result = loop {
+        if cancel.load(Ordering::SeqCst) {
+            abort_reason = Some(RunError::Cancelled);
+            break None;
+        }
+        let remaining = deadline_at.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            abort_reason = Some(RunError::Timeout);
+            break None;
+        }
+        match read_rx.recv_timeout(remaining.min(poll_step)) {
+            Ok(result) => break Some(result),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                break Some(Err("reader thread disconnected".into()));
+            }
+        }
+    };
+
+    // An over-cap frame is itself a reason to abort and kill now,
+    // before Phase 2: otherwise a flooding child whose writer thread is
+    // still blocked on a full pipe would never exit on its own, and
+    // Phase 2's exit-wait would simply burn the rest of the deadline
+    // and return `Timeout` instead of `ResponseTooLarge`.
+    if abort_reason.is_none() {
+        if let Some(Ok(bytes)) = &read_result {
+            if bytes.len() > MAX_RESPONSE_BYTES {
+                abort_reason = Some(RunError::ResponseTooLarge);
+            }
+        }
+    }
+
+    let status = if abort_reason.is_some() {
+        kill_and_reap(&mut child)
+    } else {
+        // A complete (or over-cap, or errored) frame arrived. The
+        // leader may or may not have exited yet; bound the wait for
+        // its exit by whatever deadline remains.
+        let mut reaped_status = None;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    reaped_status = Some(status);
+                    break;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    abort_reason = Some(RunError::Io(error.to_string()));
+                    break;
+                }
+            }
+            if cancel.load(Ordering::SeqCst) {
+                abort_reason = Some(RunError::Cancelled);
+                break;
+            }
+            if Instant::now() >= deadline_at {
+                abort_reason = Some(RunError::Timeout);
+                break;
+            }
+            thread::sleep(poll_step);
+        }
+        match reaped_status {
+            Some(status) => status,
+            None => kill_and_reap(&mut child),
+        }
+    };
+
+    // The process group is now dead (or exited on its own), so the
+    // pipes should close promptly. Bound the join anyway: never call an
+    // unconditional `join()`, since a file descriptor held open by an
+    // unrelated process outside the group could still wedge a thread.
+    let grace = Duration::from_millis(1_000);
+    let write_result = write_rx.recv_timeout(grace);
+    let read_result = match read_result {
+        Some(result) => result,
+        None => match read_rx.recv_timeout(grace) {
+            Ok(result) => result,
+            Err(_) => Err("stdout read did not complete".into()),
+        },
+    };
+    let _ = writer.join();
+    let _ = reader.join();
+
+    if let Some(reason) = abort_reason {
+        return Err(reason);
+    }
+
+    let frame = read_result.map_err(RunError::Io)?;
+    if frame.len() > MAX_RESPONSE_BYTES {
+        return Err(RunError::ResponseTooLarge);
+    }
+    // A write failure (e.g. the child closed stdin early without
+    // reading all of it) is not itself fatal if the child still
+    // produced a complete frame and exited successfully — some
+    // extensions may not need the full request. It is surfaced only
+    // when nothing useful came back.
+    if !status.success() {
+        return Err(RunError::NonZeroExit(exit_code(&status)));
+    }
+    if frame.is_empty() {
+        if let Ok(Err(error)) = write_result {
+            return Err(RunError::Io(error));
+        }
+    }
+    Ok(frame)
+}
+
+#[cfg(unix)]
+fn exit_code(status: &std::process::ExitStatus) -> Option<i32> {
+    status.code()
+}
+
+#[cfg(not(unix))]
+fn exit_code(status: &std::process::ExitStatus) -> Option<i32> {
+    status.code()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A single POSIX `sh` fixture script, mode-dispatched by `argv[1]`
+    /// (not an env var — `env_clear` strips those before this process
+    /// ever sees them). Uses only absolute paths, since `run_one_shot`
+    /// clears `PATH`.
+    fn fixture_script(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("fixture.sh");
+        let script = r#"#!/bin/sh
+mode="$1"
+case "$mode" in
+  ok)
+    /bin/cat >/dev/null
+    printf '%s' '{"ok":true}'
+    exit 0
+    ;;
+  nonzero)
+    /bin/cat >/dev/null
+    printf '%s' '{"ok":true}'
+    exit 7
+    ;;
+  garbage)
+    /bin/cat >/dev/null
+    printf '%s' 'not-json-at-all'
+    exit 0
+    ;;
+  trailing)
+    /bin/cat >/dev/null
+    printf '%s' '{"ok":true}trailing-garbage'
+    exit 0
+    ;;
+  oversized)
+    /bin/cat >/dev/null
+    /usr/bin/yes 'x' | /usr/bin/head -c "$2"
+    exit 0
+    ;;
+  group_hold)
+    /bin/sleep 30 &
+    exec /bin/sleep 30
+    ;;
+  early_exit)
+    /bin/sleep 30 &
+    echo $! > "$2"
+    exit 0
+    ;;
+  flood)
+    /bin/cat >/dev/null
+    exec /usr/bin/yes x
+    ;;
+  *)
+    exit 99
+    ;;
+esac
+"#;
+        fs::write(&path, script).unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    fn run(args: &[&str], deadline_ms: u64) -> Result<Vec<u8>, RunError> {
+        let dir = tempfile::tempdir().unwrap();
+        let script = fixture_script(dir.path());
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let cancel = AtomicBool::new(false);
+        run_one_shot(
+            script.to_str().unwrap(),
+            &args,
+            b"{}",
+            Duration::from_millis(deadline_ms),
+            &cancel,
+        )
+    }
+
+    #[test]
+    fn happy_path_returns_the_single_frame() {
+        let frame = run(&["ok"], 2_000).unwrap();
+        assert_eq!(frame, br#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn nonzero_exit_is_a_failure_even_with_a_valid_frame() {
+        let error = run(&["nonzero"], 2_000).unwrap_err();
+        assert!(matches!(error, RunError::NonZeroExit(Some(7))));
+    }
+
+    #[test]
+    fn oversized_response_is_rejected() {
+        let error = run(&["oversized", &(MAX_RESPONSE_BYTES + 1).to_string()], 2_000).unwrap_err();
+        assert!(matches!(error, RunError::ResponseTooLarge));
+    }
+
+    // Regression test: a child that floods stdout indefinitely (never
+    // hits EOF on its own, unlike the `oversized`-mode fixture which
+    // writes an exact byte count and then exits) must still be caught
+    // and killed promptly once the cap is exceeded — not left to burn
+    // the whole deadline waiting for an exit that will never happen
+    // while its writer thread sits blocked on a full pipe.
+    #[test]
+    fn flooding_child_is_capped_and_killed_promptly_not_timed_out() {
+        let start = Instant::now();
+        let error = run(&["flood"], 5_000).unwrap_err();
+        assert!(matches!(error, RunError::ResponseTooLarge));
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "took {:?}, expected well under the 5s deadline",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn exact_cap_sized_response_is_accepted_by_the_transport() {
+        let frame = run(&["oversized", &MAX_RESPONSE_BYTES.to_string()], 2_000).unwrap();
+        assert_eq!(frame.len(), MAX_RESPONSE_BYTES);
+    }
+
+    #[test]
+    fn request_over_the_cap_is_rejected_before_spawning() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = fixture_script(dir.path());
+        let cancel = AtomicBool::new(false);
+        let oversized_request = vec![b'x'; MAX_REQUEST_BYTES + 1];
+        let error = run_one_shot(
+            script.to_str().unwrap(),
+            &["ok".to_string()],
+            &oversized_request,
+            Duration::from_millis(2_000),
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(matches!(error, RunError::RequestTooLarge(_)));
+    }
+
+    #[test]
+    fn timeout_kills_the_whole_owned_process_group_within_the_deadline_plus_margin() {
+        let start = Instant::now();
+        let error = run(&["group_hold"], 300).unwrap_err();
+        assert!(matches!(error, RunError::Timeout));
+        // If only the direct child (not the whole group) had been
+        // killed, the backgrounded `sleep 30` holding stdout open would
+        // have made the reader thread block for the full 30s instead of
+        // returning promptly after the deadline.
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "took {:?}, expected well under 5s if the whole group died",
+            start.elapsed()
+        );
+    }
+
+    // Regression test: a leader that backgrounds a grandchild holding
+    // stdout open and then exits *immediately* (rather than lingering,
+    // as `group_hold` does) must still have that grandchild killed
+    // within the deadline. Phase 1 deliberately never calls `try_wait`
+    // while waiting for a response frame, specifically so an
+    // already-reaped-or-reapable leader can't cause this code to
+    // declare victory while a live grandchild still holds the pipe.
+    #[test]
+    fn leader_exiting_immediately_does_not_leak_a_grandchild_holding_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = fixture_script(dir.path());
+        let pidfile = dir.path().join("grandchild.pid");
+        let args = vec![
+            "early_exit".to_string(),
+            pidfile.to_str().unwrap().to_string(),
+        ];
+        let cancel = AtomicBool::new(false);
+        let start = Instant::now();
+        let error = run_one_shot(
+            script.to_str().unwrap(),
+            &args,
+            b"{}",
+            // Generous relative to the assertion below: under heavy
+            // parallel-test scheduling load, even a trivial fork+exec
+            // can take longer than a very tight deadline to actually
+            // start running, which would otherwise make this test flaky
+            // for a reason unrelated to what it verifies.
+            Duration::from_millis(1_000),
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(matches!(error, RunError::Timeout));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            start.elapsed()
+        );
+
+        // Confirm the grandchild is actually dead — not merely that we
+        // stopped waiting on it. `kill(pid, 0)` can keep succeeding on
+        // an already-killed-but-not-yet-reaped zombie until the OS
+        // reaps it, so poll briefly rather than sleeping once and
+        // risking a flake.
+        let pid_text = fs::read_to_string(&pidfile).unwrap();
+        let grandchild_pid: i32 = pid_text.trim().parse().unwrap();
+        use rustix::io::Errno;
+        use rustix::process::{test_kill_process, Pid};
+        let grandchild_pid = Pid::from_raw(grandchild_pid).expect("a valid pid was recorded");
+        let poll_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if test_kill_process(grandchild_pid) == Err(Errno::SRCH) {
+                break;
+            }
+            assert!(
+                Instant::now() < poll_deadline,
+                "grandchild pid {grandchild_pid:?} should have been killed via the owned process group"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn cancellation_flag_stops_a_hanging_child_promptly() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let script = fixture_script(dir.path());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_setter = Arc::clone(&cancel);
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            cancel_setter.store(true, Ordering::SeqCst);
+        });
+        let start = Instant::now();
+        let error = run_one_shot(
+            script.to_str().unwrap(),
+            &["group_hold".to_string()],
+            b"{}",
+            Duration::from_secs(30),
+            &cancel,
+        )
+        .unwrap_err();
+        handle.join().unwrap();
+        assert!(matches!(error, RunError::Cancelled));
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    fn minimal_approved_registration(executable: &std::path::Path) -> Registration {
+        use crate::registration::{
+            Approval, Consent, ExpectedConstraint, FixedEnvironment, ObservationConfidence,
+            RegisteredContext, RuntimeFileDigest, Transport, TransportKind, TrustMode,
+        };
+        use crate::wire::{Metric, Scope, Unit};
+        let mut registration = Registration {
+            registration_id: "reg-a".into(),
+            extension_id: "ext.example".into(),
+            extension_version: "1.0.0".into(),
+            enabled: true,
+            transport: Transport {
+                kind: TransportKind::OneshotStdio,
+                executable: executable.to_str().unwrap().to_owned(),
+                args: vec!["ok".into()],
+                environment: FixedEnvironment {
+                    lang: "C.UTF-8".into(),
+                    lc_all: "C.UTF-8".into(),
+                },
+            },
+            context: RegisteredContext {
+                selector: "sel".into(),
+                handle: "handle".into(),
+                principal: "principal".into(),
+                authority: "authority".into(),
+            },
+            expected: vec![ExpectedConstraint {
+                id: "c1".into(),
+                scope: Scope::Account {
+                    handle: "acct".into(),
+                },
+                metric: Metric::TotalTokens,
+                unit: Unit::Tokens,
+                window_uuid: "win-1".into(),
+                provider: "anthropic".into(),
+                account_fingerprint: "fp".into(),
+                pool_alias: "alias".into(),
+                max_staleness_secs: 60,
+                window_length_secs: 3600,
+                capacity_ceiling: None,
+            }],
+            binding_revision: "1".into(),
+            binding_verified_at: "2026-10-12T00:00:00Z".into(),
+            scope_configured_at: "2026-10-12T00:00:00Z".into(),
+            timeout_ms: 2_000,
+            trust_mode: TrustMode::ObservationOnly,
+            observation_confidence: ObservationConfidence::Low,
+            approval: Approval {
+                approved: true,
+                revision: "1".into(),
+                executable_sha256: String::new(),
+                manifest_sha256: String::new(),
+                launch_tuple_sha256: String::new(),
+                runtime_files: Vec::<RuntimeFileDigest>::new(),
+                endpoint_owner: "owner".into(),
+                consent: Consent {
+                    consented_by: "operator".into(),
+                    recorded_at_reference: "ref-1".into(),
+                },
+            },
+        };
+        // Approve: fill in the three bound digests from current disk
+        // state, exactly as an approval workflow would, reusing
+        // `identity`'s own digest functions (now `pub(crate)`) rather
+        // than re-deriving the same canonical-JSON math here — that
+        // duplication previously skipped `identity`'s defensive
+        // `sort_all_objects()` call and would have silently diverged
+        // under Cargo feature unification (e.g. some other workspace
+        // member enabling `serde_json/preserve_order`).
+        let executable_digest = identity::digest_file(executable).unwrap();
+        registration.approval.executable_sha256 = executable_digest.clone();
+        registration.approval.manifest_sha256 = identity::manifest_digest(&registration);
+        registration.approval.launch_tuple_sha256 =
+            identity::launch_tuple_digest(&registration, &executable_digest, &[]);
+        registration
+    }
+
+    #[test]
+    fn invoke_runs_the_transport_after_registration_and_identity_checks_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = fixture_script(dir.path());
+        let registration = minimal_approved_registration(&script);
+        let cancel = AtomicBool::new(false);
+        let frame = invoke(&registration, b"{}", &cancel).unwrap();
+        assert_eq!(frame, br#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn invoke_refuses_a_disabled_registration_before_ever_spawning() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = fixture_script(dir.path());
+        let mut registration = minimal_approved_registration(&script);
+        registration.enabled = false;
+        let cancel = AtomicBool::new(false);
+        let error = invoke(&registration, b"{}", &cancel).unwrap_err();
+        assert!(matches!(
+            error,
+            InvokeError::Identity(IdentityError::Disabled)
+        ));
+    }
+
+    #[test]
+    fn invoke_refuses_when_the_executable_was_edited_after_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = fixture_script(dir.path());
+        let registration = minimal_approved_registration(&script);
+        // Re-approve, then tamper with the file afterward.
+        fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        let cancel = AtomicBool::new(false);
+        let error = invoke(&registration, b"{}", &cancel).unwrap_err();
+        assert!(matches!(
+            error,
+            InvokeError::Identity(IdentityError::ExecutableDigestMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn frame_parsing_accepts_exactly_one_value_with_optional_trailing_newline() {
+        let value: serde_json::Value = parse_single_frame(br#"{"a":1}"#).unwrap();
+        assert_eq!(value, serde_json::json!({"a":1}));
+        let value: serde_json::Value = parse_single_frame(b"{\"a\":1}\n").unwrap();
+        assert_eq!(value, serde_json::json!({"a":1}));
+    }
+
+    #[test]
+    fn frame_parsing_rejects_trailing_garbage_and_empty_and_invalid() {
+        assert!(matches!(
+            parse_single_frame::<serde_json::Value>(b"").unwrap_err(),
+            FrameError::Empty
+        ));
+        assert!(matches!(
+            parse_single_frame::<serde_json::Value>(b"not-json").unwrap_err(),
+            FrameError::Invalid(_)
+        ));
+        assert!(matches!(
+            parse_single_frame::<serde_json::Value>(br#"{"a":1}{"b":2}"#).unwrap_err(),
+            FrameError::TrailingOutput
+        ));
+        assert!(matches!(
+            parse_single_frame::<serde_json::Value>(br#"{"a":1}garbage"#).unwrap_err(),
+            FrameError::TrailingOutput
+        ));
+    }
+
+    #[test]
+    fn runner_surfaces_garbage_and_trailing_output_as_raw_frames_for_the_caller_to_parse() {
+        // run_one_shot itself is transport-only; framing validation is a
+        // separate call the caller makes on the returned bytes.
+        let frame = run(&["garbage"], 2_000).unwrap();
+        assert!(parse_single_frame::<serde_json::Value>(&frame).is_err());
+        let frame = run(&["trailing"], 2_000).unwrap();
+        assert!(parse_single_frame::<serde_json::Value>(&frame).is_err());
+    }
+}
