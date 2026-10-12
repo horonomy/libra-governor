@@ -1042,11 +1042,12 @@ fn concurrent_agent_absent_successors_against_one_finalized_turn_commit_exactly_
 #[test]
 fn agent_absent_stop_settles_conservatively_with_usage_known_false_never_zero() {
     // Decision C: `usage_known=false` is an honest lifecycle observation,
-    // never proof of zero consumption. The owner route forces
-    // `transcript_path: None` for Codex today (no agent-scoped usage
-    // measurement exists yet), so this exercises the real, already-existing
-    // conservative-settlement path end to end and pins it against
-    // regressing into a fabricated zero.
+    // never proof of zero consumption. HORO-1863 added a turn-scoped
+    // Codex reader, but only when the `Stop` carries a `transcript_path`;
+    // this fixture's `stop(i.clone())` deliberately omits one (see
+    // `identity_no_agent`/`stop`), which is still a real, supported shape
+    // (e.g. a host that cannot resolve the path) and must still settle
+    // conservatively rather than fabricate a zero.
     let mut f = Fixture::new();
     let i = identity_no_agent("codex", "usage-session", "turn-1");
     let target = applied(f.outcome(prompt(i.clone())));
