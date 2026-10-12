@@ -50,4 +50,5 @@
 //! dependency** on either crate, nor on `crates/daemon`,
 //! `crates/extension`, `crates/cli`, or the host adapter registry.
 
+pub mod registration;
 pub mod wire;
