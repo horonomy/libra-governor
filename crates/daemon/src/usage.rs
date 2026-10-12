@@ -679,4 +679,192 @@ mod tests {
             );
         }
     }
+
+    /// Eight consecutive lines from a real rollout written by `codex-cli
+    /// 0.160.0` (`codex exec`, then `codex exec resume --last`) under an
+    /// isolated `$HOME`/`$CODEX_HOME`, against a local mock Responses
+    /// endpoint. Every key path is Codex's own serializer output; only the
+    /// count values were chosen by the mock, so that every breakdown is
+    /// non-zero. For each turn: the assistant `response_item`, its
+    /// `token_usage_record`, the `event_msg`/`token_count` mirror, and
+    /// `task_complete`.
+    ///
+    /// Turn 1: input 1000 (600 cached, 300 cache-write), output 50 (20
+    /// reasoning). Turn 2: input 2000 (1500 cached, 400 cache-write),
+    /// output 80 (30 reasoning). Codex itself printed "tokens used 450"
+    /// after turn 1 and "1,030" after turn 2.
+    const CODEX_ROLLOUT: &str = include_str!("../tests/fixtures/codex-rollout-token-usage.jsonl");
+
+    fn at(rfc3339: &str) -> OffsetDateTime {
+        OffsetDateTime::parse(rfc3339, &Rfc3339).unwrap()
+    }
+
+    fn codex_lines() -> Vec<String> {
+        CODEX_ROLLOUT.lines().map(str::to_owned).collect()
+    }
+
+    /// The real turn-2 `token_usage_record`, as a value to derive variants
+    /// from without hand-writing its shape.
+    fn codex_record_turn_2() -> serde_json::Value {
+        let line = codex_lines()
+            .into_iter()
+            .filter(|l| l.contains(r#""type":"token_usage_record""#))
+            .nth(1)
+            .unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    #[test]
+    fn codex_rollout_usage_is_partitioned_into_disjoint_counts() {
+        let f = write_transcript(&codex_lines());
+        let observed =
+            observe_transcript_window(f.path(), at("2026-10-12T03:17:00Z"), DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed
+            .measured()
+            .expect("both token_usage_records are in the window");
+        assert_eq!(
+            usage.records, 2,
+            "one record per completed response; the token_count mirrors must not add a second sample"
+        );
+        assert_eq!(usage.cache_read_input_tokens, 600 + 1_500);
+        assert_eq!(usage.cache_creation_input_tokens, 300 + 400);
+        assert_eq!(
+            usage.input_tokens,
+            (1_000 - 600 - 300) + (2_000 - 1_500 - 400),
+            "Codex's input_tokens includes both cache classes; copying it across by name would \
+             re-count every cached prefix"
+        );
+        assert_eq!(
+            usage.output_tokens,
+            50 + 80,
+            "reasoning tokens are already inside output_tokens and must not be added again"
+        );
+        assert_eq!(
+            usage.fresh_tokens(),
+            1_030,
+            "must equal Codex's own blended_total — what it printed as `tokens used` after turn 2"
+        );
+    }
+
+    #[test]
+    fn codex_window_excludes_responses_already_accounted_for() {
+        let f = write_transcript(&codex_lines());
+        let observed =
+            observe_transcript_window(f.path(), at("2026-10-12T03:17:02Z"), DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().expect("turn 2 is in the window");
+        assert_eq!(usage.records, 1);
+        assert_eq!(usage.fresh_tokens(), (2_000 - 1_500) + 80);
+    }
+
+    #[test]
+    fn codex_running_totals_beside_the_usage_are_never_summed() {
+        let mut record = codex_record_turn_2();
+        for total in ["turn_token_usage", "thread_token_usage"] {
+            record["payload"][total]["input_tokens"] = serde_json::json!(1_000_000_000);
+            record["payload"][total]["output_tokens"] = serde_json::json!(1_000_000_000);
+        }
+        let f = write_transcript(&[record.to_string()]);
+        let observed = observe_transcript_window(f.path(), epoch_plus(0), DEFAULT_SCAN_CAP_BYTES);
+        assert_eq!(
+            observed.measured().unwrap().fresh_tokens(),
+            (2_000 - 1_500) + 80,
+            "turn/thread totals are cumulative; summing them per record grows quadratically"
+        );
+    }
+
+    #[test]
+    fn a_codex_compaction_copy_of_a_usage_record_is_not_counted() {
+        let record = codex_record_turn_2();
+        let compacted = serde_json::json!({
+            "timestamp": record["timestamp"],
+            "type": "compacted",
+            "payload": {
+                "message": "summary",
+                "latest_token_usage_record": record["payload"],
+            },
+        });
+        let f = write_transcript(&[compacted.to_string()]);
+        let observed = observe_transcript_window(f.path(), epoch_plus(0), DEFAULT_SCAN_CAP_BYTES);
+        assert_eq!(
+            observed,
+            UsageObservation::Unavailable(UsageUnavailable::NoUsageInWindow),
+            "a compaction checkpoint repeats a response already counted where it happened"
+        );
+    }
+
+    #[test]
+    fn malformed_or_partial_codex_usage_lines_are_skipped_without_panicking() {
+        let real = codex_record_turn_2();
+        let mut no_usage = real.clone();
+        no_usage["payload"].as_object_mut().unwrap().remove("usage");
+        let mut non_numeric = real.clone();
+        non_numeric["payload"]["usage"]["input_tokens"] = serde_json::json!("lots");
+        let mut payload_not_an_object = real.clone();
+        payload_not_an_object["payload"] = serde_json::json!([1, 2, 3]);
+        let whole = real.to_string();
+        let truncated = &whole[..whole.len() / 2];
+
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        for line in [
+            no_usage.to_string(),
+            non_numeric.to_string(),
+            payload_not_an_object.to_string(),
+            whole.clone(),
+        ] {
+            writeln!(f, "{line}").unwrap();
+        }
+        // The host appends concurrently, so the last line can be cut off.
+        write!(f, "{truncated}").unwrap();
+        f.flush().unwrap();
+
+        let observed = observe_transcript_window(f.path(), epoch_plus(0), DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed
+            .measured()
+            .expect("the one well-formed record still counts");
+        assert_eq!(usage.records, 1);
+        assert_eq!(usage.fresh_tokens(), (2_000 - 1_500) + 80);
+    }
+
+    #[test]
+    fn a_negative_or_missing_codex_count_is_zero_not_a_dropped_record() {
+        let mut negative = codex_record_turn_2();
+        negative["payload"]["usage"]["cached_input_tokens"] = serde_json::json!(-5);
+        // Older rollouts predate the field; Codex itself defaults it to 0.
+        negative["payload"]["usage"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cache_write_input_tokens");
+        let f = write_transcript(&[negative.to_string()]);
+        let observed = observe_transcript_window(f.path(), epoch_plus(0), DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed
+            .measured()
+            .expect("one bad count must not discard the record's other counts");
+        assert_eq!(usage.records, 1);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+        assert_eq!(usage.fresh_tokens(), 2_000 + 80);
+    }
+
+    #[test]
+    fn inconsistent_codex_breakdowns_never_exceed_the_reported_input() {
+        let mut record = codex_record_turn_2();
+        record["payload"]["usage"] = serde_json::json!({
+            "input_tokens": 100,
+            "cached_input_tokens": 80,
+            "cache_write_input_tokens": 50,
+            "output_tokens": 10,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 110,
+        });
+        let f = write_transcript(&[record.to_string()]);
+        let usage = observe_transcript_window(f.path(), epoch_plus(0), DEFAULT_SCAN_CAP_BYTES)
+            .measured()
+            .unwrap();
+        assert_eq!(
+            usage.input_tokens + usage.cache_creation_input_tokens + usage.cache_read_input_tokens,
+            100,
+            "the three input parts are a partition of input_tokens"
+        );
+        assert_eq!(usage.fresh_tokens(), 100 - 80 + 10);
+    }
 }
