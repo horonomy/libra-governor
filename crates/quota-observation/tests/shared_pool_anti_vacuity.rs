@@ -514,7 +514,7 @@ fn attack3_eight_concurrent_sessions_see_one_pool_never_five_hundred_times_eight
                     "the limit string must be verbatim \"500\""
                 );
             }
-            other => panic!("expected Used, got {other:?}"),
+            _other => panic!("expected Used, got a different Reading variant"),
         }
         let expected_entry = registration
             .expected
@@ -955,7 +955,12 @@ fn attack7_every_error_code_yields_extension_error_and_no_bound_result() {
         let observed = observe(&registration, common::fixed_now());
         match observed.result {
             Err(ObserveError::ExtensionError(code)) => assert_eq!(code, expected_code),
-            other => panic!("expected ExtensionError({expected_code:?}), got {other:?}"),
+            other => {
+                let _ = other;
+                panic!(
+                    "expected ExtensionError({expected_code:?}), got a different observe() outcome"
+                )
+            }
         }
     }
 }

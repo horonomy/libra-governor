@@ -291,7 +291,7 @@ fn n26_control_utilization_reading_without_limit_parses_and_preserves_overdraw()
             assert_eq!(used_basis_points.as_str(), "10500");
             assert_eq!(used_basis_points.value(), 10_500);
         }
-        other => panic!("expected Utilization, got {other:?}"),
+        _other => panic!("expected Utilization, got a different Reading variant"),
     }
 }
 
@@ -356,7 +356,7 @@ fn duplicate_key_control_unit_and_reading_with_no_duplicate_parse() {
             assert_eq!(value.value(), 1);
             assert_eq!(limit.value(), 2);
         }
-        other => panic!("expected Used, got {other:?}"),
+        _other => panic!("expected Used, got a different Reading variant"),
     }
 }
 
@@ -440,6 +440,6 @@ fn coverage_and_missing_reason_round_trip_scenario_c_overdraw_and_missing() {
                 "overdraw must be preserved, not clamped"
             );
         }
-        other => panic!("expected Used reading, got {other:?}"),
+        _other => panic!("expected Used reading, got a different Reading variant"),
     }
 }

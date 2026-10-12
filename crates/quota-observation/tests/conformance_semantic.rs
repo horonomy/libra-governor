@@ -241,7 +241,7 @@ fn p02_scenario_a_exact_used_and_limit_preserved() {
             assert_eq!(value.value(), 600_000);
             assert_eq!(limit.value(), 1_000_000);
         }
-        other => panic!("expected Used, got {other:?}"),
+        _other => panic!("expected Used, got a different Reading variant"),
     }
     assert!(freshness::is_fresh(&bound.constraints[0], 300, None, now(), now()).unwrap());
 }
@@ -317,7 +317,7 @@ fn p03_scenario_b_separate_units_and_windows_no_conversion_performed() {
             // No "used" field exists anywhere on Constraint/Reading — an
             // evaluator computing 1000-120=880 is Phase-B/out of scope.
         }
-        other => panic!("expected Remaining, got {other:?}"),
+        _other => panic!("expected Remaining, got a different Reading variant"),
     }
     assert_eq!(requests.upstream_enforcement, UpstreamEnforcement::Hard);
 }
@@ -412,7 +412,7 @@ fn p04_scenario_c_large_integer_and_overdraw_survive_binding_partial_coverage() 
         .unwrap();
     match &org_credits.reading {
         Reading::Used { value, .. } => assert_eq!(value.value(), 9_007_199_254_740_993),
-        other => panic!("expected Used, got {other:?}"),
+        _other => panic!("expected Used, got a different Reading variant"),
     }
     assert!(serde_json::to_string(org_credits)
         .unwrap()
@@ -432,7 +432,7 @@ fn p04_scenario_c_large_integer_and_overdraw_survive_binding_partial_coverage() 
             assert_eq!(value.value(), 10_500);
             assert_eq!(limit.value(), 10_000);
         }
-        other => panic!("expected Used, got {other:?}"),
+        _other => panic!("expected Used, got a different Reading variant"),
     }
 }
 
@@ -507,7 +507,7 @@ fn p06_utilization_over_100_percent_preserved_not_clamped() {
     let bound = bind(&result, &requested, &registration);
     match &bound.constraints[0].reading {
         Reading::Utilization { used_basis_points } => assert_eq!(used_basis_points.value(), 10_500),
-        other => panic!("expected Utilization, got {other:?}"),
+        _other => panic!("expected Utilization, got a different Reading variant"),
     }
 }
 
@@ -600,7 +600,7 @@ fn p09_zero_used_zero_limit_does_not_panic_and_is_preserved() {
             assert_eq!(value.value(), 0);
             assert_eq!(limit.value(), 0);
         }
-        other => panic!("expected Used, got {other:?}"),
+        _other => panic!("expected Used, got a different Reading variant"),
     }
     assert!(freshness::is_fresh(&bound.constraints[0], 300, None, now(), now()).unwrap());
 }
