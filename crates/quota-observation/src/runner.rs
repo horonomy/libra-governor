@@ -374,6 +374,22 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Mutex;
+
+    /// Rust's default test harness runs every test in this file in
+    /// parallel. Most of the tests below spawn a real child process and
+    /// some wait on a real wall-clock deadline (to exercise the
+    /// kill/timeout path itself) — run enough of those at once on a
+    /// loaded machine and they start starving each other for CPU and
+    /// fork() scheduling, producing exactly the kind of flake a
+    /// deadline bump can never fully outrun (observed in practice: a
+    /// test that passes 5/5 in isolation failed 2/4 when run alongside
+    /// this module's other subprocess tests). Acquiring this lock for
+    /// the duration of a subprocess-spawning test serializes just the
+    /// tests that actually need real OS scheduling, rather than paying
+    /// for serialization (or chasing ever-larger deadlines) on the
+    /// whole file.
+    static SUBPROCESS_SERIAL: Mutex<()> = Mutex::new(());
 
     /// A single POSIX `sh` fixture script, mode-dispatched by `argv[1]`
     /// (not an env var — `env_clear` strips those before this process
@@ -435,6 +451,7 @@ esac
     }
 
     fn run(args: &[&str], deadline_ms: u64) -> Result<Vec<u8>, RunError> {
+        let _guard = SUBPROCESS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let script = fixture_script(dir.path());
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
@@ -448,21 +465,38 @@ esac
         )
     }
 
+    // These "should succeed quickly" tests use a generous deadline
+    // (not a tight one) on purpose: the fixture scripts normally
+    // complete in single-digit milliseconds, but this module's many
+    // subprocess-spawning tests run in parallel by default within this
+    // one test binary, and — observed in practice on this machine
+    // under heavy external load (another worktree's `cargo doc` run
+    // holding the shared build lock for hours) — that parallelism can
+    // occasionally push even a trivial fork+exec well past a second.
+    // The deadline here is "don't hang forever," not "must be fast" —
+    // speed is asserted only in the tests that specifically exercise
+    // the timeout/kill path below.
+    const GENEROUS_DEADLINE_MS: u64 = 15_000;
+
     #[test]
     fn happy_path_returns_the_single_frame() {
-        let frame = run(&["ok"], 2_000).unwrap();
+        let frame = run(&["ok"], GENEROUS_DEADLINE_MS).unwrap();
         assert_eq!(frame, br#"{"ok":true}"#);
     }
 
     #[test]
     fn nonzero_exit_is_a_failure_even_with_a_valid_frame() {
-        let error = run(&["nonzero"], 2_000).unwrap_err();
+        let error = run(&["nonzero"], GENEROUS_DEADLINE_MS).unwrap_err();
         assert!(matches!(error, RunError::NonZeroExit(Some(7))));
     }
 
     #[test]
     fn oversized_response_is_rejected() {
-        let error = run(&["oversized", &(MAX_RESPONSE_BYTES + 1).to_string()], 2_000).unwrap_err();
+        let error = run(
+            &["oversized", &(MAX_RESPONSE_BYTES + 1).to_string()],
+            GENEROUS_DEADLINE_MS,
+        )
+        .unwrap_err();
         assert!(matches!(error, RunError::ResponseTooLarge));
     }
 
@@ -475,18 +509,27 @@ esac
     #[test]
     fn flooding_child_is_capped_and_killed_promptly_not_timed_out() {
         let start = Instant::now();
-        let error = run(&["flood"], 5_000).unwrap_err();
+        // A generous deadline (20s) so that, under heavy parallel-test
+        // load, a genuinely prompt cap-detection+kill (expected to take
+        // single-digit milliseconds) still has enormous headroom before
+        // it would be indistinguishable from simply timing out.
+        let error = run(&["flood"], 20_000).unwrap_err();
         assert!(matches!(error, RunError::ResponseTooLarge));
         assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "took {:?}, expected well under the 5s deadline",
+            start.elapsed() < Duration::from_secs(15),
+            "took {:?}, expected well under the 20s deadline if the cap triggered the kill \
+             rather than the deadline itself",
             start.elapsed()
         );
     }
 
     #[test]
     fn exact_cap_sized_response_is_accepted_by_the_transport() {
-        let frame = run(&["oversized", &MAX_RESPONSE_BYTES.to_string()], 2_000).unwrap();
+        let frame = run(
+            &["oversized", &MAX_RESPONSE_BYTES.to_string()],
+            GENEROUS_DEADLINE_MS,
+        )
+        .unwrap();
         assert_eq!(frame.len(), MAX_RESPONSE_BYTES);
     }
 
@@ -500,7 +543,7 @@ esac
             script.to_str().unwrap(),
             &["ok".to_string()],
             &oversized_request,
-            Duration::from_millis(2_000),
+            Duration::from_millis(GENEROUS_DEADLINE_MS),
             &cancel,
         )
         .unwrap_err();
@@ -510,15 +553,19 @@ esac
     #[test]
     fn timeout_kills_the_whole_owned_process_group_within_the_deadline_plus_margin() {
         let start = Instant::now();
-        let error = run(&["group_hold"], 300).unwrap_err();
+        // Deliberately a short deadline (this test exercises the
+        // timeout path itself), but the elapsed-time assertion below is
+        // generous for the same parallel-load reason as
+        // `GENEROUS_DEADLINE_MS` above.
+        let error = run(&["group_hold"], 500).unwrap_err();
         assert!(matches!(error, RunError::Timeout));
         // If only the direct child (not the whole group) had been
         // killed, the backgrounded `sleep 30` holding stdout open would
         // have made the reader thread block for the full 30s instead of
         // returning promptly after the deadline.
         assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "took {:?}, expected well under 5s if the whole group died",
+            start.elapsed() < Duration::from_secs(15),
+            "took {:?}, expected well under 15s if the whole group died",
             start.elapsed()
         );
     }
@@ -532,6 +579,7 @@ esac
     // declare victory while a live grandchild still holds the pipe.
     #[test]
     fn leader_exiting_immediately_does_not_leak_a_grandchild_holding_stdout() {
+        let _guard = SUBPROCESS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let script = fixture_script(dir.path());
         let pidfile = dir.path().join("grandchild.pid");
@@ -545,18 +593,21 @@ esac
             script.to_str().unwrap(),
             &args,
             b"{}",
-            // Generous relative to the assertion below: under heavy
-            // parallel-test scheduling load, even a trivial fork+exec
-            // can take longer than a very tight deadline to actually
-            // start running, which would otherwise make this test flaky
-            // for a reason unrelated to what it verifies.
-            Duration::from_millis(1_000),
+            // Generous relative to the assertion below: this module's
+            // own tests spawn many subprocesses in parallel within one
+            // test binary, and — observed in practice on this machine
+            // under heavy external load — even a trivial fork+exec can
+            // take several seconds to actually start running and write
+            // its pidfile under that scheduling pressure, which would
+            // otherwise make this test flaky for a reason unrelated to
+            // what it verifies.
+            Duration::from_millis(6_000),
             &cancel,
         )
         .unwrap_err();
         assert!(matches!(error, RunError::Timeout));
         assert!(
-            start.elapsed() < Duration::from_secs(5),
+            start.elapsed() < Duration::from_secs(15),
             "took {:?}",
             start.elapsed()
         );
@@ -564,14 +615,14 @@ esac
         // Confirm the grandchild is actually dead — not merely that we
         // stopped waiting on it. `kill(pid, 0)` can keep succeeding on
         // an already-killed-but-not-yet-reaped zombie until the OS
-        // reaps it, so poll briefly rather than sleeping once and
-        // risking a flake.
+        // reaps it, so poll rather than sleeping once and risking a
+        // flake.
         let pid_text = fs::read_to_string(&pidfile).unwrap();
         let grandchild_pid: i32 = pid_text.trim().parse().unwrap();
         use rustix::io::Errno;
         use rustix::process::{test_kill_process, Pid};
         let grandchild_pid = Pid::from_raw(grandchild_pid).expect("a valid pid was recorded");
-        let poll_deadline = Instant::now() + Duration::from_secs(2);
+        let poll_deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if test_kill_process(grandchild_pid) == Err(Errno::SRCH) {
                 break;
@@ -587,6 +638,7 @@ esac
     #[test]
     fn cancellation_flag_stops_a_hanging_child_promptly() {
         use std::sync::Arc;
+        let _guard = SUBPROCESS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let script = fixture_script(dir.path());
         let cancel = Arc::new(AtomicBool::new(false));
@@ -606,7 +658,7 @@ esac
         .unwrap_err();
         handle.join().unwrap();
         assert!(matches!(error, RunError::Cancelled));
-        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(start.elapsed() < Duration::from_secs(15));
     }
 
     fn minimal_approved_registration(executable: &std::path::Path) -> Registration {
@@ -653,7 +705,7 @@ esac
             binding_revision: "1".into(),
             binding_verified_at: "2026-10-12T00:00:00Z".into(),
             scope_configured_at: "2026-10-12T00:00:00Z".into(),
-            timeout_ms: 2_000,
+            timeout_ms: 10_000,
             trust_mode: TrustMode::ObservationOnly,
             observation_confidence: ObservationConfidence::Low,
             approval: Approval {
@@ -688,6 +740,7 @@ esac
 
     #[test]
     fn invoke_runs_the_transport_after_registration_and_identity_checks_pass() {
+        let _guard = SUBPROCESS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let script = fixture_script(dir.path());
         let registration = minimal_approved_registration(&script);
@@ -757,9 +810,9 @@ esac
     fn runner_surfaces_garbage_and_trailing_output_as_raw_frames_for_the_caller_to_parse() {
         // run_one_shot itself is transport-only; framing validation is a
         // separate call the caller makes on the returned bytes.
-        let frame = run(&["garbage"], 2_000).unwrap();
+        let frame = run(&["garbage"], GENEROUS_DEADLINE_MS).unwrap();
         assert!(parse_single_frame::<serde_json::Value>(&frame).is_err());
-        let frame = run(&["trailing"], 2_000).unwrap();
+        let frame = run(&["trailing"], GENEROUS_DEADLINE_MS).unwrap();
         assert!(parse_single_frame::<serde_json::Value>(&frame).is_err());
     }
 }
