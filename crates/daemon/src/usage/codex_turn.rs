@@ -83,15 +83,51 @@
 //! conservative, this module takes the loose bound: `task_started` for the
 //! start, no `task_complete` requirement for the end. The risk this leaves
 //! — the newest record for the turn still sitting unflushed in the
-//! channel — is bounded by the invariants below, not left unchecked: a scan
-//! that lands mid-write of a multi-response turn will disagree with
-//! `turn_token_usage`'s own running total (see below) and come back
-//! [`UsageUnavailable::Inconsistent`], never a silent undercount. And per
-//! this ticket's core safety rule, any failure mode here still finalizes
-//! the turn unmeasured (`usage_known = false`) rather than ever falling
-//! back to a session- or file-wide count.
+//! channel — is **not fully closed** by the invariants below, and this
+//! doc previously overstated that it was. There are two distinct
+//! sub-cases:
+//!
+//! - **The last line on disk is a half-written record.** The background
+//!   writer's `write(2)` was interrupted mid-line (this reader ran between
+//!   two partial writes, or the process was killed mid-write). This is
+//!   detected directly: a complete JSONL line always ends in `\n`, so this
+//!   reader first checks whether the file's final byte is `\n` before
+//!   scanning at all, and treats anything else as
+//!   [`UsageUnavailable::Inconsistent`] rather than silently proceeding —
+//!   a half-written tail line could otherwise fail [`TaggedLine`]'s parse,
+//!   be skipped as "not a line this module models", and leave the previous
+//!   (older, lower) record's `turn_token_usage` as the scan's "newest"
+//!   total, which then spuriously agrees with the sum of records the scan
+//!   actually found. Closing *that* path is the point of the check.
+//! - **The newest record for the turn never reached the file at all** —
+//!   it is still sitting in the writer's bounded `mpsc` channel,
+//!   unconsumed, when this reader runs. Nothing is malformed or missing a
+//!   trailing newline; the file is simply, legitimately, one record short
+//!   of the truth. **This sub-case cannot be detected from the reader
+//!   side.** There is no Codex-side end-of-turn marker this reader can
+//!   wait for without reintroducing the `task_complete` ordering problem
+//!   documented above, and the running-total check only catches a
+//!   *mismatch* — a wholly absent final record simply makes the second-
+//!   newest record look like the newest, and the sum of what's on disk
+//!   agrees with it by construction. This read therefore sums to a true
+//!   but incomplete total and reports it `Measured`. This is a real,
+//!   accepted residual risk, not a solved one; the reasoning in the
+//!   previous paragraph bounds it in practice (near-certainty, not a
+//!   guarantee) but does not eliminate it.
+//!
+//! Per this ticket's core safety rule, every *detected* failure mode here
+//! still finalizes the turn unmeasured (`usage_known = false`) rather than
+//! ever falling back to a session- or file-wide count. The undetectable
+//! sub-case above is the one gap that rule cannot close, because there is
+//! nothing to detect.
 //!
 //! # Consistency checks
+//!
+//! Before the scan even starts, the file's final byte is checked: anything
+//! other than `\n` (and the file is non-empty) means the last line was
+//! still being written, and the whole read is
+//! [`UsageUnavailable::Inconsistent`] immediately (see the end-bound
+//! section above for why this exists).
 //!
 //! Every `token_usage_record` whose `turn_id` matches is required to agree
 //! with the turn's own self-reported invariants before it is trusted:
@@ -102,6 +138,18 @@
 //! from an earlier match's, is also disqualifying. All of these mark the
 //! whole read [`UsageUnavailable::Inconsistent`] immediately — never
 //! partially trusted.
+//!
+//! This also covers a record that is *for this turn* but fails to parse at
+//! all: the full [`TokenUsageRecordLine`] struct requires `turn_id`,
+//! `thread_id`, `session_id`, `usage`, and `turn_token_usage` to all be
+//! present and well-typed, so a single malformed field fails the whole
+//! parse. Without a cross-check, that record would simply be skipped —
+//! bypassing every invariant above for exactly the record they exist to
+//! check, and reproducing the missing-final-record undercount if it was
+//! the newest one. So a record whose full parse fails is re-parsed against
+//! a narrow struct exposing only `payload.turn_id` (tolerant of everything
+//! else); if that narrow `turn_id` matches the caller's, the line is
+//! [`UsageUnavailable::Inconsistent`] rather than silently skipped.
 //!
 //! The strongest check runs once the turn's start is reached: the sum of
 //! every matched record's own `usage` fields must equal the *newest*
@@ -197,7 +245,13 @@ impl CodexUsageFields {
             return false;
         }
         if let Some(total) = self.total_tokens {
-            if total.max(0) != input + output {
+            // `checked_add`, not `+`: real data can't approach i64::MAX,
+            // but an overflow here must read as a format-drift signal
+            // (`false`), never as a wrapped/panicking arithmetic op.
+            let Some(sum) = input.checked_add(output) else {
+                return false;
+            };
+            if total.max(0) != sum {
                 return false;
             }
         }
@@ -232,6 +286,21 @@ struct TokenUsageRecordPayload {
 #[derive(Deserialize)]
 struct TokenUsageRecordLine {
     payload: TokenUsageRecordPayload,
+}
+
+/// The narrow shape used to recover `turn_id` from a `token_usage_record`
+/// line whose full [`TokenUsageRecordLine`] parse failed — tolerant of
+/// every other field being missing or malformed. See this module's header
+/// on why a record that fails to parse must still be checked for `turn_id`
+/// before it is treated as unrelated.
+#[derive(Deserialize)]
+struct NarrowTurnIdPayload {
+    turn_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct NarrowTurnIdLine {
+    payload: NarrowTurnIdPayload,
 }
 
 #[derive(Deserialize)]
@@ -274,11 +343,41 @@ struct RawTotals {
 }
 
 impl RawTotals {
-    fn add(&mut self, fields: &CodexUsageFields) {
-        self.input_tokens += CodexUsageFields::get(fields.input_tokens);
-        self.cached_input_tokens += CodexUsageFields::get(fields.cached_input_tokens);
-        self.cache_write_input_tokens += CodexUsageFields::get(fields.cache_write_input_tokens);
-        self.output_tokens += CodexUsageFields::get(fields.output_tokens);
+    /// `false` on overflow (real data can never approach `i64::MAX`, so this
+    /// is a hardening backstop, not an expected path) — the caller treats it
+    /// exactly like any other consistency failure rather than wrapping or
+    /// panicking.
+    #[must_use]
+    fn add(&mut self, fields: &CodexUsageFields) -> bool {
+        let Some(input_tokens) = self
+            .input_tokens
+            .checked_add(CodexUsageFields::get(fields.input_tokens))
+        else {
+            return false;
+        };
+        let Some(cached_input_tokens) = self
+            .cached_input_tokens
+            .checked_add(CodexUsageFields::get(fields.cached_input_tokens))
+        else {
+            return false;
+        };
+        let Some(cache_write_input_tokens) = self
+            .cache_write_input_tokens
+            .checked_add(CodexUsageFields::get(fields.cache_write_input_tokens))
+        else {
+            return false;
+        };
+        let Some(output_tokens) = self
+            .output_tokens
+            .checked_add(CodexUsageFields::get(fields.output_tokens))
+        else {
+            return false;
+        };
+        self.input_tokens = input_tokens;
+        self.cached_input_tokens = cached_input_tokens;
+        self.cache_write_input_tokens = cache_write_input_tokens;
+        self.output_tokens = output_tokens;
+        true
     }
 
     fn matches(&self, newest: &CodexUsageFields) -> bool {
@@ -288,6 +387,34 @@ impl RawTotals {
                 == CodexUsageFields::get(newest.cache_write_input_tokens)
             && self.output_tokens == CodexUsageFields::get(newest.output_tokens)
     }
+}
+
+/// `true` when `path` is empty or its final byte is `\n`; `false` when the
+/// file is non-empty and does not end in a newline, meaning its last line
+/// was still being written when this read ran. Checked up front, separate
+/// from [`scan_lines_backward`]'s own tolerance for an unparseable tail
+/// line: that tolerance is correct for
+/// [`super::observe_transcript_window`], whose session window is expected
+/// to race a concurrent writer, but here it would let a half-written final
+/// record silently drop out of the scan and manufacture a false pass of
+/// the turn's own running-total check (see this module's header).
+fn ends_with_newline(path: &Path) -> Result<bool, UsageUnavailable> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    super::reject_non_regular_file(path)?;
+    let mut file = std::fs::File::open(path).map_err(|_| UsageUnavailable::Unreadable)?;
+    let len = file
+        .seek(SeekFrom::End(0))
+        .map_err(|_| UsageUnavailable::Unreadable)?;
+    if len == 0 {
+        return Ok(true);
+    }
+    file.seek(SeekFrom::End(-1))
+        .map_err(|_| UsageUnavailable::Unreadable)?;
+    let mut last_byte = [0u8; 1];
+    file.read_exact(&mut last_byte)
+        .map_err(|_| UsageUnavailable::Unreadable)?;
+    Ok(last_byte[0] == b'\n')
 }
 
 /// Measures usage for exactly one Codex turn: `turn_id`, cross-checked
@@ -300,6 +427,12 @@ pub fn observe_codex_turn(
     turn_id: &str,
     cap_bytes: u64,
 ) -> UsageObservation {
+    match ends_with_newline(path) {
+        Ok(true) => {}
+        Ok(false) => return UsageObservation::Unavailable(UsageUnavailable::Inconsistent),
+        Err(unavailable) => return UsageObservation::Unavailable(unavailable),
+    }
+
     let mut usage = TurnUsage::default();
     let mut raw_totals = RawTotals::default();
     let mut newest_turn_token_usage: Option<CodexUsageFields> = None;
@@ -358,8 +491,25 @@ fn step(
     };
     match tagged.kind.as_str() {
         TOKEN_USAGE_RECORD => {
-            let Ok(record) = serde_json::from_slice::<TokenUsageRecordLine>(line) else {
-                return ControlFlow::Continue(());
+            let record = match serde_json::from_slice::<TokenUsageRecordLine>(line) {
+                Ok(record) => record,
+                Err(_) => {
+                    // The full parse requires turn_id/thread_id/session_id/
+                    // usage/turn_token_usage to all be present and
+                    // well-typed; any single malformed field fails it even
+                    // when this line is for our turn. Re-check the narrow
+                    // `turn_id` shape before treating the line as
+                    // unrelated -- a record for the right turn that fails
+                    // here must not be silently skipped (see this module's
+                    // header).
+                    let narrow_turn_id = serde_json::from_slice::<NarrowTurnIdLine>(line)
+                        .ok()
+                        .and_then(|narrow| narrow.payload.turn_id);
+                    if narrow_turn_id.as_deref() == Some(turn_id) {
+                        return ControlFlow::Break(StepOutcome::Inconsistent);
+                    }
+                    return ControlFlow::Continue(());
+                }
             };
             let payload = record.payload;
             if payload.turn_id != turn_id {
@@ -378,7 +528,9 @@ fn step(
             if !payload.usage.internally_consistent() {
                 return ControlFlow::Break(StepOutcome::Inconsistent);
             }
-            raw_totals.add(&payload.usage);
+            if !raw_totals.add(&payload.usage) {
+                return ControlFlow::Break(StepOutcome::Inconsistent);
+            }
             let raw = payload.usage.as_codex_raw_usage().into_disjoint();
             usage.input_tokens = usage
                 .input_tokens
@@ -736,5 +888,113 @@ mod tests {
         let usage = observed.measured().unwrap();
         assert_eq!(usage.records, 1, "parsed once, not zero or twice");
         assert_eq!(usage.fresh_tokens(), 15);
+    }
+
+    #[test]
+    fn a_half_written_final_line_is_inconsistent_not_silently_undercounted() {
+        // Without the trailing-newline pre-check, this would simply fail
+        // `TaggedLine`'s parse and be skipped, leaving the single
+        // complete record's own `turn_token_usage` as "newest" -- which
+        // then spuriously agrees with itself and returns Measured(10..)
+        // instead of catching that the turn's real newest record never
+        // made it to disk.
+        let complete_lines = [
+            task_started(T1),
+            usage_record(T1, THREAD, SESSION, 10, 0, 0, 5, 0, 10, 0, 0, 5, 0),
+        ];
+        // The turn's real newest record, truncated mid-write (no closing
+        // `}` and, critically, no trailing newline).
+        let truncated_tail = r#"{"type":"token_usage_record","payload":{"turn_id":"turn-1""#;
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        for line in &complete_lines {
+            writeln!(f, "{line}").unwrap();
+        }
+        write!(f, "{truncated_tail}").unwrap();
+        f.flush().unwrap();
+
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        assert_eq!(
+            observed,
+            UsageObservation::Unavailable(UsageUnavailable::Inconsistent)
+        );
+    }
+
+    #[test]
+    fn empty_file_is_treated_as_ending_in_newline() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        // An empty file has no task_started either, so this still reports
+        // TurnIncomplete -- the point of this test is only that the
+        // trailing-newline check itself does not misfire on an empty file.
+        assert_eq!(
+            observed,
+            UsageObservation::Unavailable(UsageUnavailable::TurnIncomplete)
+        );
+    }
+
+    #[test]
+    fn a_right_turn_record_with_a_malformed_field_is_inconsistent_not_skipped() {
+        // thread_id is a number instead of a string: the full
+        // TokenUsageRecordLine parse fails, but the narrow turn_id still
+        // matches T1, so this must be Inconsistent, not silently skipped
+        // (which would let a cross-attributed or truncated record through
+        // undetected).
+        let malformed = format!(
+            r#"{{"type":"token_usage_record","payload":{{"turn_id":"{T1}","thread_id":123,"session_id":"{SESSION}","usage":{{"input_tokens":10,"output_tokens":5}},"turn_token_usage":{{"input_tokens":10,"output_tokens":5}}}}}}"#
+        );
+        let f = write_lines(&[task_started(T1), malformed]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        assert_eq!(
+            observed,
+            UsageObservation::Unavailable(UsageUnavailable::Inconsistent)
+        );
+    }
+
+    #[test]
+    fn a_malformed_record_for_a_different_turn_is_skipped_not_inconsistent() {
+        // Same malformed shape as above, but for T2 -- irrelevant to a
+        // T1 read, so it must not affect the outcome at all.
+        let malformed = format!(
+            r#"{{"type":"token_usage_record","payload":{{"turn_id":"{T2}","thread_id":123,"session_id":"{SESSION}","usage":{{"input_tokens":10,"output_tokens":5}},"turn_token_usage":{{"input_tokens":10,"output_tokens":5}}}}}}"#
+        );
+        let f = write_lines(&[
+            task_started(T1),
+            malformed,
+            usage_record(T1, THREAD, SESSION, 10, 0, 0, 5, 0, 10, 0, 0, 5, 0),
+        ]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed
+            .measured()
+            .expect("the malformed T2 line is irrelevant to T1");
+        assert_eq!(usage.records, 1);
+    }
+
+    #[test]
+    fn root_turn_id_equal_to_parent_turn_id_is_never_used_for_matching() {
+        // Every other fixture in this module sets root_turn_id == turn_id,
+        // which leaves this reader's "root_turn_id is never read" claim
+        // untested: a reader that accidentally matched on root_turn_id
+        // would pass every other test here. This fixture gives a subagent
+        // record a root_turn_id equal to the *parent's* turn_id while its
+        // own turn_id is T2, so a reader that matched on root_turn_id
+        // would wrongly pull it into a T1 read.
+        let subagent_record = format!(
+            r#"{{"type":"token_usage_record","payload":{{"turn_id":"{T2}","thread_id":"{THREAD}","session_id":"{SESSION}","root_turn_id":"{T1}","response_id":"resp","usage":{{"input_tokens":500,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":50,"reasoning_output_tokens":0,"total_tokens":550}},"turn_token_usage":{{"input_tokens":500,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":50,"reasoning_output_tokens":0,"total_tokens":550}},"thread_token_usage":{{"input_tokens":500,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":50,"reasoning_output_tokens":0,"total_tokens":550}}}}}}"#
+        );
+        let f = write_lines(&[
+            task_started(T1),
+            usage_record(T1, THREAD, SESSION, 100, 0, 0, 10, 0, 100, 0, 0, 10, 0),
+            subagent_record,
+        ]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed
+            .measured()
+            .expect("T1's own record is self-consistent regardless of the subagent line");
+        assert_eq!(
+            usage.records, 1,
+            "the subagent's record (turn_id T2, root_turn_id T1) must never be counted toward T1"
+        );
+        assert_eq!(usage.fresh_tokens(), 110);
     }
 }

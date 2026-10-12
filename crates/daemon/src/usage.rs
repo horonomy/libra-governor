@@ -391,6 +391,24 @@ pub(crate) enum ScanEnd<B> {
     CapReached,
 }
 
+/// Refuses a `path` that does not resolve to a regular file, without
+/// opening it. `transcript_path` is attacker-reachable input (it comes
+/// from a hook payload / Codex rollout path), and `File::open` on a FIFO
+/// with no writer on the other end blocks the calling thread indefinitely
+/// — this daemon only serves one connection at a time, so that would hang
+/// every other request. `std::fs::metadata` is a plain `stat` (following
+/// symlinks, unlike `lstat`), which never blocks on a FIFO's open
+/// semantics, so this check is safe to run before any open and still
+/// allows a path that is legitimately a symlink to a regular file.
+pub(crate) fn reject_non_regular_file(path: &Path) -> Result<(), UsageUnavailable> {
+    let metadata = std::fs::metadata(path).map_err(|_| UsageUnavailable::Unreadable)?;
+    if metadata.is_file() {
+        Ok(())
+    } else {
+        Err(UsageUnavailable::Unreadable)
+    }
+}
+
 /// Scans `path` backwards from EOF in [`CHUNK_BYTES`] chunks, calling
 /// `visit` once per complete line (newest first), stopping at the first
 /// [`ControlFlow::Break`], the start of the file, or `cap_bytes`,
@@ -405,6 +423,7 @@ pub(crate) fn scan_lines_backward<B>(
     cap_bytes: u64,
     mut visit: impl FnMut(&[u8]) -> ControlFlow<B>,
 ) -> Result<ScanEnd<B>, UsageUnavailable> {
+    reject_non_regular_file(path)?;
     let mut file = File::open(path).map_err(|_| UsageUnavailable::Unreadable)?;
     let len = file
         .seek(SeekFrom::End(0))

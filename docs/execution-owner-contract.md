@@ -120,11 +120,25 @@ offering it would cross-associate sibling usage. For a Codex identity
 against `session_id` and the turn's own self-reported running total, and
 never falls back to a session- or file-wide count on any failure. With no
 path, or when the turn-scoped read cannot be trusted (an incomplete or
-internally inconsistent rollout), usage remains unavailable and settlement
-retains the existing conservative `usage_known=false` provenance; it is not
-measured billing. No sibling's usage is silently attributed. Real measured
-usage is a capability Codex alone has today; every other identity's limit is
-unchanged.
+internally inconsistent rollout, or a rollout file whose final line was
+still being written when the read ran), usage remains unavailable and
+settlement retains the existing conservative `usage_known=false`
+provenance; it is not measured billing. No sibling's usage is silently
+attributed. Real measured usage is a capability Codex alone has today;
+every other identity's limit is unchanged.
+
+One residual risk is accepted rather than closed: if the turn's genuinely
+newest usage record has been sent to Codex's background rollout writer but
+not yet reached disk at all (still sitting in its bounded channel, as
+opposed to a half-written line, which *is* detected and rejected above),
+this reader has no way to tell the difference from a turn that legitimately
+ended one response earlier, and reports a true-but-incomplete total as
+`Measured`. There is no Codex-side end-of-turn marker available to close
+this without reintroducing the `task_complete` ordering problem this
+module's own doc header already ruled out. In practice this window is a
+process spawn plus a Unix socket round trip against a single tokio task
+wakeup, so it is a near-certainty rather than a guarantee — but it is not a
+guarantee, and this document previously implied it was.
 
 Legacy hooks remain compatible. Legacy `StatusResult.scope` is explicitly
 `host_latest_observation`; shared provider labels identify the latest selected
