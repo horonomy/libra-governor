@@ -28,6 +28,22 @@ fn now() -> OffsetDateTime {
     common::fixed_now()
 }
 
+/// Binds a response, panicking on failure without echoing the `Err`'s
+/// `Debug` output (which embeds the registration's account fingerprint).
+/// CodeQL's `rust/cleartext-logging` query flags `.unwrap()` here because
+/// a test panic message is, in its sink model, indistinguishable from a
+/// production log line — even though these fixtures are entirely
+/// synthetic. A static panic message sidesteps that without weakening
+/// what the test actually checks (the assertions that follow this call).
+fn bind(
+    result: &SnapshotResult,
+    requested: &[String],
+    registration: &Registration,
+) -> libra_governor_quota_observation::freshness::BoundSnapshotResult {
+    freshness::apply_account_binding(result, requested, registration)
+        .unwrap_or_else(|_| panic!("apply_account_binding failed on a known-good test fixture"))
+}
+
 fn expected(
     id: &str,
     fingerprint: &str,
@@ -218,7 +234,7 @@ fn p02_scenario_a_exact_used_and_limit_preserved() {
         missing: vec![],
     };
     let requested = vec!["tokens_month".to_string()];
-    let bound = freshness::apply_account_binding(&result, &requested, &registration).unwrap();
+    let bound = bind(&result, &requested, &registration);
     assert_eq!(bound.coverage, Coverage::Complete);
     match &bound.constraints[0].reading {
         Reading::Used { value, limit } => {
@@ -287,7 +303,7 @@ fn p03_scenario_b_separate_units_and_windows_no_conversion_performed() {
         missing: vec![],
     };
     let requested = vec!["team_budget".to_string(), "requests_hour".to_string()];
-    let bound = freshness::apply_account_binding(&result, &requested, &registration).unwrap();
+    let bound = bind(&result, &requested, &registration);
     assert_eq!(bound.constraints.len(), 2);
     let requests = bound
         .constraints
@@ -383,7 +399,7 @@ fn p04_scenario_c_large_integer_and_overdraw_survive_binding_partial_coverage() 
         "project_budget".to_string(),
         "rolling_requests".to_string(),
     ];
-    let bound = freshness::apply_account_binding(&result, &requested, &registration).unwrap();
+    let bound = bind(&result, &requested, &registration);
     assert_eq!(bound.coverage, Coverage::Partial);
     assert_eq!(bound.constraints.len(), 2);
     assert_eq!(bound.missing.len(), 1);
@@ -450,7 +466,7 @@ fn p05_undisclosed_reading_still_yields_complete_coverage() {
         missing: vec![],
     };
     let requested = vec!["tokens_month".to_string()];
-    let bound = freshness::apply_account_binding(&result, &requested, &registration).unwrap();
+    let bound = bind(&result, &requested, &registration);
     assert_eq!(bound.coverage, Coverage::Complete);
     assert_eq!(bound.constraints[0].reading, Reading::Undisclosed);
 }
@@ -488,7 +504,7 @@ fn p06_utilization_over_100_percent_preserved_not_clamped() {
         missing: vec![],
     };
     let requested = vec!["project_budget".to_string()];
-    let bound = freshness::apply_account_binding(&result, &requested, &registration).unwrap();
+    let bound = bind(&result, &requested, &registration);
     match &bound.constraints[0].reading {
         Reading::Utilization { used_basis_points } => assert_eq!(used_basis_points.value(), 10_500),
         other => panic!("expected Utilization, got {other:?}"),
@@ -531,7 +547,7 @@ fn p07_n46_original_source_time_preserved_host_applies_max_age_not_acquisition_t
         missing: vec![],
     };
     let requested = vec!["tokens_month".to_string()];
-    let bound = freshness::apply_account_binding(&result, &requested, &registration).unwrap();
+    let bound = bind(&result, &requested, &registration);
     assert_eq!(bound.constraints[0].observed_at, "2027-01-18T11:55:00Z");
 
     // Within the 300s max_staleness (now - observed_at == 330s... use a
@@ -578,7 +594,7 @@ fn p09_zero_used_zero_limit_does_not_panic_and_is_preserved() {
         missing: vec![],
     };
     let requested = vec!["tokens_month".to_string()];
-    let bound = freshness::apply_account_binding(&result, &requested, &registration).unwrap();
+    let bound = bind(&result, &requested, &registration);
     match &bound.constraints[0].reading {
         Reading::Used { value, limit } => {
             assert_eq!(value.value(), 0);
@@ -618,7 +634,7 @@ fn p10_all_requested_ids_missing_is_partial_with_no_constraints() {
         ],
     };
     let requested = vec!["tokens_month".to_string(), "requests_hour".to_string()];
-    let bound = freshness::apply_account_binding(&result, &requested, &registration).unwrap();
+    let bound = bind(&result, &requested, &registration);
     assert_eq!(bound.coverage, Coverage::Partial);
     assert!(bound.constraints.is_empty());
     assert_eq!(bound.missing.len(), 2);
@@ -856,7 +872,7 @@ fn unit_mismatch_is_rejected_into_missing_not_silently_accepted() {
         missing: vec![],
     };
     let requested = vec!["tokens_month".to_string()];
-    let bound = freshness::apply_account_binding(&result, &requested, &registration).unwrap();
+    let bound = bind(&result, &requested, &registration);
     assert_eq!(bound.coverage, Coverage::Partial);
     assert!(bound.constraints.is_empty());
     assert_eq!(bound.missing[0].reason, MissingReason::UnsupportedUnit);
@@ -888,7 +904,7 @@ fn metric_mismatch_is_rejected_into_missing_not_silently_accepted() {
         missing: vec![],
     };
     let requested = vec!["tokens_month".to_string()];
-    let bound = freshness::apply_account_binding(&result, &requested, &registration).unwrap();
+    let bound = bind(&result, &requested, &registration);
     assert_eq!(bound.coverage, Coverage::Partial);
     assert!(bound.constraints.is_empty());
     assert_eq!(bound.missing[0].reason, MissingReason::UnsupportedMetric);
@@ -927,7 +943,7 @@ fn scope_mismatch_is_rejected_into_missing_not_silently_accepted() {
         missing: vec![],
     };
     let requested = vec!["tokens_month".to_string()];
-    let bound = freshness::apply_account_binding(&result, &requested, &registration).unwrap();
+    let bound = bind(&result, &requested, &registration);
     assert_eq!(bound.coverage, Coverage::Partial);
     assert!(bound.constraints.is_empty());
     assert_eq!(
@@ -1170,7 +1186,7 @@ fn n50_soft_upstream_enforcement_is_never_retyped_as_hard() {
         missing: vec![],
     };
     let requested = vec!["team_budget".to_string()];
-    let bound = freshness::apply_account_binding(&result, &requested, &registration).unwrap();
+    let bound = bind(&result, &requested, &registration);
     assert_eq!(
         bound.constraints[0].upstream_enforcement,
         UpstreamEnforcement::Soft
