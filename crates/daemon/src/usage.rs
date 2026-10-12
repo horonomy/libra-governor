@@ -132,6 +132,7 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::ops::ControlFlow;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -351,17 +352,40 @@ pub fn observe_transcript_window(
     }
 }
 
-fn scan(
+/// How a backward scan over a JSONL file ended, for a caller that needs to
+/// distinguish "the visitor asked to stop" from the two cases it cannot
+/// control: the scan ran off the start of the file, or it exhausted its
+/// byte budget first.
+pub(crate) enum ScanEnd<B> {
+    /// `visit` returned [`ControlFlow::Break`], carrying its value.
+    Visitor(B),
+    /// The scan reached the start of the file without the visitor
+    /// breaking.
+    StartOfFile,
+    /// [`CHUNK_BYTES`]-bounded reading exhausted `cap_bytes` before either
+    /// of the above.
+    CapReached,
+}
+
+/// Scans `path` backwards from EOF in [`CHUNK_BYTES`] chunks, calling
+/// `visit` once per complete line (newest first), stopping at the first
+/// [`ControlFlow::Break`], the start of the file, or `cap_bytes`,
+/// whichever comes first.
+///
+/// This is the one place this module seeks and re-assembles chunk-spanning
+/// lines; [`scan`] and (HORO-1863) `codex_turn::observe_codex_turn` differ
+/// only in what `visit` does with each line and in how they interpret
+/// where the scan stopped.
+pub(crate) fn scan_lines_backward<B>(
     path: &Path,
-    window_start: OffsetDateTime,
-    scan_cap_bytes: u64,
-) -> Result<TurnUsage, UsageUnavailable> {
+    cap_bytes: u64,
+    mut visit: impl FnMut(&[u8]) -> ControlFlow<B>,
+) -> Result<ScanEnd<B>, UsageUnavailable> {
     let mut file = File::open(path).map_err(|_| UsageUnavailable::Unreadable)?;
     let len = file
         .seek(SeekFrom::End(0))
         .map_err(|_| UsageUnavailable::Unreadable)?;
 
-    let mut usage = TurnUsage::default();
     // Bytes belonging to a line whose beginning lies in an
     // earlier (not-yet-read) chunk.
     let mut partial_head: Vec<u8> = Vec::new();
@@ -372,9 +396,9 @@ fn scan(
         // Clamped to the remaining budget, not just checked between
         // chunks: a bound that permits one more whole chunk before it
         // trips is not the bound it claims to be.
-        let remaining_budget = scan_cap_bytes.saturating_sub(scanned);
+        let remaining_budget = cap_bytes.saturating_sub(scanned);
         if remaining_budget == 0 {
-            return Err(UsageUnavailable::ScanCapReached);
+            return Ok(ScanEnd::CapReached);
         }
         let want = CHUNK_BYTES.min(pos as usize).min(remaining_budget as usize);
         let start = pos - want as u64;
@@ -399,32 +423,49 @@ fn scan(
         }
 
         for line in lines.iter().rev() {
-            match consider_line(line, window_start) {
-                LineVerdict::Older => return Ok(usage),
-                LineVerdict::Skip => {}
-                LineVerdict::Counted(raw) => {
-                    usage.input_tokens = usage
-                        .input_tokens
-                        .saturating_add(raw.input_tokens.unwrap_or(0));
-                    usage.cache_creation_input_tokens = usage
-                        .cache_creation_input_tokens
-                        .saturating_add(raw.cache_creation_input_tokens.unwrap_or(0));
-                    usage.cache_read_input_tokens = usage
-                        .cache_read_input_tokens
-                        .saturating_add(raw.cache_read_input_tokens.unwrap_or(0));
-                    usage.output_tokens = usage
-                        .output_tokens
-                        .saturating_add(raw.output_tokens.unwrap_or(0));
-                    usage.records += 1;
-                }
+            if let ControlFlow::Break(value) = visit(line) {
+                return Ok(ScanEnd::Visitor(value));
             }
         }
     }
 
-    // Reached the start of the file without finding anything older than
-    // the window: the window covers the whole transcript, so the total is
-    // complete.
-    Ok(usage)
+    Ok(ScanEnd::StartOfFile)
+}
+
+fn scan(
+    path: &Path,
+    window_start: OffsetDateTime,
+    scan_cap_bytes: u64,
+) -> Result<TurnUsage, UsageUnavailable> {
+    let mut usage = TurnUsage::default();
+    let end = scan_lines_backward(path, scan_cap_bytes, |line| {
+        match consider_line(line, window_start) {
+            LineVerdict::Older => ControlFlow::Break(()),
+            LineVerdict::Skip => ControlFlow::Continue(()),
+            LineVerdict::Counted(raw) => {
+                usage.input_tokens = usage
+                    .input_tokens
+                    .saturating_add(raw.input_tokens.unwrap_or(0));
+                usage.cache_creation_input_tokens = usage
+                    .cache_creation_input_tokens
+                    .saturating_add(raw.cache_creation_input_tokens.unwrap_or(0));
+                usage.cache_read_input_tokens = usage
+                    .cache_read_input_tokens
+                    .saturating_add(raw.cache_read_input_tokens.unwrap_or(0));
+                usage.output_tokens = usage
+                    .output_tokens
+                    .saturating_add(raw.output_tokens.unwrap_or(0));
+                usage.records += 1;
+                ControlFlow::Continue(())
+            }
+        }
+    })?;
+    match end {
+        // A record older than the window, or the start of the file: either
+        // way the window has been read in full.
+        ScanEnd::Visitor(()) | ScanEnd::StartOfFile => Ok(usage),
+        ScanEnd::CapReached => Err(UsageUnavailable::ScanCapReached),
+    }
 }
 
 enum LineVerdict {
