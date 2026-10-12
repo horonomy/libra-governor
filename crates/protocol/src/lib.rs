@@ -167,4 +167,17 @@ pub use messages::{
 /// the new field is always `None` on a real push today. Same known
 /// limitation as every earlier bump: a long-lived v13 daemon must be
 /// restarted after upgrading.
-pub const PROTOCOL_VERSION: u32 = 14;
+///
+/// Bumped 14 -> 15 for HORO-1863's Codex turn-scoped measured usage:
+/// `libra_governor_domain::EXECUTION_ASSOCIATION_VERSION` moved 1 -> 2 in
+/// the same change (the owner route now accepts `Stop.transcript_path`
+/// for a Codex identity instead of unconditionally refusing it), and the
+/// daemon only self-restarts on a *newer* protocol version offered by a
+/// client (see HORO-1169). Without this bump, an already-running v14
+/// daemon would silently return `Unsupported` for every Codex owner-route
+/// operation after this ships, with no restart trigger, until an operator
+/// restarts it by hand — the same failure mode HORO-1169 fixed once
+/// already. This bump is precedent, not new association-version wire
+/// data: `EXECUTION_ASSOCIATION_VERSION` is carried on
+/// `ExecutionOwnerRequest` itself and is never persisted.
+pub const PROTOCOL_VERSION: u32 = 15;

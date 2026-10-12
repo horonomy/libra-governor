@@ -8,10 +8,13 @@ PR55. TaskId remains Libra's separate economic unit.
 ## IPC and authority
 
 Send `Request::ExecutionOwner { event: ExecutionOwnerRequest }` over the existing
-local Unix socket using **IPC protocol 12**, **association_version 2** (bumped
+local Unix socket using **IPC protocol 15**, **association_version 2** (bumped
 from 1 by HORO-1863 when the owner `Stop` arm started accepting a Codex
 identity's `transcript_path`; wire-only, never persisted, so an older daemon
-simply refuses a newer CLI's requests outright) and
+simply refuses a newer CLI's requests outright, and `PROTOCOL_VERSION` was
+bumped 14 -> 15 in the same change so a running older daemon self-restarts
+onto the new binary instead of silently returning `Unsupported` forever —
+see `libra_governor_protocol::PROTOCOL_VERSION`'s doc comment) and
 **ExecutionIdentity envelope_version 1**. `Response::ExecutionOwner` returns
 `ExecutionOwnerOutcome`. Version mismatch is explicit and commits no effect.
 Unhandled identity dimensions are rejected on owner IPC, even where the shared
@@ -163,7 +166,7 @@ on the committed turn/plan transition.
 Upgrade preserves old rows as unattributed legacy records. Downgrade is an
 operator operation: stop newer clients/daemon first and restore a pre-upgrade
 backup for full rollback. An older binary can read the unchanged legacy tables,
-but cannot consume owner protocol 12 or reinterpret owner state as native session
+but cannot consume owner protocol 15 or reinterpret owner state as native session
 truth. Do not drop replay history while accepting owner traffic: that would erase
 restart protection. No automatic destructive down migration is provided.
 
