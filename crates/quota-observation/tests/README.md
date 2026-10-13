@@ -55,7 +55,7 @@ by that review and remain open exactly as before.
 | P05 | Undisclosed reading, complete coverage possible | `conformance_semantic.rs::p05_undisclosed_reading_still_yields_complete_coverage` — evaluator-Indeterminate half out of scope (no evaluator in this crate) |
 | P06 | Utilization >100% preserved, never clamped | `conformance_semantic.rs::p06_utilization_over_100_percent_preserved_not_clamped` — evaluator-Blocking half out of scope |
 | P07 | Original source time preserved, host max-age applied | `conformance_semantic.rs::p07_n46_original_source_time_preserved_host_applies_max_age_not_acquisition_time` |
-| P08 | New epoch accepted only if coherent; old values never reused | out of scope: this crate has no cache/reuse mechanism at all (one-shot transport, nothing persisted between calls), so "old values reused" cannot occur by construction. Partially illustrated by `shared_pool_anti_vacuity.rs::attack6_host_environment_never_reaches_the_child_and_identity_is_never_response_derived` (two different epochs, independently evaluated) |
+| P08 | New epoch accepted only if coherent; old values never reused | out of scope: this crate has no cache/reuse mechanism at all (one-shot transport, nothing persisted between calls), so "old values reused" cannot occur by construction. Partially illustrated by `shared_pool_anti_vacuity.rs::attack6_host_environment_never_reaches_the_child_and_the_captured_request_carries_no_identity_fields` (two different epochs, independently evaluated) |
 | P09 | Zero/zero reading, not divide-by-zero or healthy | `conformance_semantic.rs::p09_zero_used_zero_limit_does_not_panic_and_is_preserved` — evaluator-Blocking half out of scope |
 | P10 | All source failures missing, partial, no empty-healthy | `conformance_semantic.rs::p10_all_requested_ids_missing_is_partial_with_no_constraints`; subprocess-level repeat in `shared_pool_anti_vacuity.rs::attack7_all_missing_is_partial_with_zero_constraints` |
 
@@ -158,10 +158,10 @@ written):
 
 1. `attack1_eight_registrations_sharing_one_pool_identity_collide` (+ 2 controls)
 2. `attack2_field_isolation_table` (+ exhaustiveness guard + 2 controls)
-3. `attack3_eight_concurrent_sessions_see_one_pool_never_five_hundred_times_eight`, `attack3_anti_replay_control_one_sessions_frame_is_rejected_as_another_sessions_response`
-4. `attack4_disabled_duplicate_loads_alongside_the_enabled_original`, `attack4_invoke_refuses_the_disabled_copy_and_flipping_enabled_trips_the_manifest_digest`
+3. `attack3_eight_concurrent_sessions_are_all_correct_and_never_corrupt_each_others_frames` (concurrency correctness; the "never 500x8 pools" multi-registration property is attack1's, not this one — see its own section comment), `attack3_anti_replay_control_one_sessions_frame_is_rejected_as_another_sessions_response`
+4. `attack4_disabled_duplicate_loads_alongside_the_enabled_original`, `attack4_invoke_refuses_the_disabled_copy_and_flipping_enabled_in_memory_is_refused_at_the_manifest_gate` (does not by itself prove the manifest digest covers `enabled` — see `identity.rs`'s own `flipping_enabled_without_reapproval_trips_the_manifest_digest` unit test for that property)
 5. `attack5_wrong_account_fingerprint_is_rehomed_to_missing_and_never_echoed_in_the_request`
-6. `attack6_host_environment_never_reaches_the_child_and_identity_is_never_response_derived`
+6. `attack6_host_environment_never_reaches_the_child_and_the_captured_request_carries_no_identity_fields`
 7. `attack7_every_error_code_yields_extension_error_and_no_bound_result`, `attack7_all_missing_is_partial_with_zero_constraints`, `attack7_stale_elapsed_and_future_readings_stay_present_but_not_fresh`, `attack7_valid_frame_plus_nonzero_exit_yields_no_bound_result`, `attack7_valid_frame_while_grandchild_holds_stdout_times_out_with_no_bound_result`
 
 ## Fixture inventory
