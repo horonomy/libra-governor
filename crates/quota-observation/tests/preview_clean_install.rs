@@ -37,8 +37,8 @@
 //!   never downloads anything or compares against an externally
 //!   published checksum (see `docs/quota-observation/preview-delivery.md`
 //!   for what that would involve).
-//! - **Windows.** This crate has no Windows support at all (PR #135's
-//!   own description states this explicitly) — this test, like the
+//! - **Windows.** This crate has no Windows support at all (HORO-1854's
+//!   own PR description states this explicitly) — this test, like the
 //!   crate itself, is Unix-only in practice (it does not run under
 //!   `#[cfg(windows)]` exclusion directly, but neither does anything it
 //!   exercises support that platform).

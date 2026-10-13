@@ -1,7 +1,7 @@
 # Quota-observation preview delivery (HORO-1857)
 
 See [`README.md`](README.md)'s status banner first: experimental 0.x
-preview, observation-only, depends on unmerged PRs #135/#137, no CLI
+preview, observation-only, merged to `main` (HORO-1854/1855), no CLI
 exists for this protocol yet. This doc covers platform support,
 download/build integrity, and the clean-install procedure the smoke
 test in `crates/quota-observation/tests/preview_clean_install.rs`
@@ -18,7 +18,7 @@ exercises.
 This repository's CI (`.github/workflows/ci.yml`, `build-and-test` job)
 runs exactly this matrix — `os: [ubuntu-latest, macos-latest]` — no
 Windows runner exists in CI at all. This is not an oversight this doc
-is working around: PR #135's own description states it plainly under
+is working around: HORO-1854's own PR description states it plainly under
 "Explicitly NOT in this slice (by design)": **"no Windows support."**
 The reason is structural, not just untested: process-group kill
 (`runner::kill_owned_process_group`, and the `process_group(0)` call
