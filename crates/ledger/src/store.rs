@@ -109,7 +109,39 @@ impl LedgerStore {
         conn.pragma_update(None, "foreign_keys", true)?;
         Ok(())
     }
+
+    /// The names of every trigger currently defined in this database,
+    /// alphabetically ordered. Read-only, not feature-gated, no behavior
+    /// change — added so a caller (today: ADR-0019/HORO-1835's PR-2
+    /// `trusted_principal::validate_trusted_startup`) can confirm the
+    /// append-only trigger set is intact without this crate exposing its
+    /// `pub(crate)` `Connection` directly.
+    pub fn trigger_names(&self) -> Result<Vec<String>, LedgerError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut names = Vec::new();
+        for row in rows {
+            names.push(row?);
+        }
+        Ok(names)
+    }
 }
+
+/// The four append-only triggers ADR-0019 §1 requires to be present
+/// before trusted mode may bind its socket: two guarding
+/// `outcome_attestations` (migration `0018`) and two guarding
+/// `task_budget_renewals` (migration `0017`). Read-only, no behavior
+/// change — this is a named reference for [`LedgerStore::trigger_names`]
+/// callers to compare against, not a new constraint this crate enforces
+/// itself.
+pub const APPEND_ONLY_TRIGGERS: [&str; 4] = [
+    "trg_outcome_attestations_no_delete",
+    "trg_outcome_attestations_no_update",
+    "trg_task_budget_renewals_no_delete",
+    "trg_task_budget_renewals_no_update",
+];
 
 /// Sets the main ledger file, and its `-wal`/`-shm` WAL-mode sidecars (if
 /// present — `open_in_memory` never has them, and even an on-disk store
@@ -179,5 +211,44 @@ mod tests {
             store.schema_version().unwrap(),
             crate::migrations::latest_known_version()
         );
+    }
+
+    #[test]
+    fn trigger_names_reports_all_four_append_only_triggers_after_open_in_memory() {
+        let store = LedgerStore::open_in_memory().unwrap();
+        let mut names = store.trigger_names().unwrap();
+        names.sort();
+        let mut expected = APPEND_ONLY_TRIGGERS.to_vec();
+        expected.sort();
+        assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn a_dropped_trigger_is_reported_missing_after_reopening_a_file_db() {
+        // Regression proof for ADR-0019: `migrations::apply_all` only
+        // applies versions above `MAX(version)` in `schema_migrations`,
+        // so a dropped trigger is NOT silently recreated by 0017/0018's
+        // `CREATE TRIGGER IF NOT EXISTS` on reopen.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.sqlite3");
+        {
+            let store = LedgerStore::open(&path).unwrap();
+            store
+                .conn
+                .execute_batch("DROP TRIGGER trg_outcome_attestations_no_delete;")
+                .unwrap();
+        }
+        let reopened = LedgerStore::open(&path).unwrap();
+        let names = reopened.trigger_names().unwrap();
+        assert!(!names
+            .iter()
+            .any(|n| n == "trg_outcome_attestations_no_delete"));
+        // The other three survive untouched.
+        for expected in APPEND_ONLY_TRIGGERS
+            .iter()
+            .filter(|t| **t != "trg_outcome_attestations_no_delete")
+        {
+            assert!(names.iter().any(|n| n == expected));
+        }
     }
 }

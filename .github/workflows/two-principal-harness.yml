@@ -35,3 +35,29 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: run the disposable two-principal harness
         run: harness/two-principal/run.sh
+
+  # ADR-0019 §6 PR-2 / PR-2's design doc §6: proves the feature-enabled
+  # binary builds, lints clean, and passes its own unit/integration
+  # suite — on Linux AND macOS — while also being the mechanical proof
+  # that compiling `trusted-principal` in changes nothing about
+  # default-mode behavior (no pinned config exists on either runner).
+  # The macOS leg is compile plus unit/integration tests only: it does
+  # NOT run the container harness above (ADR-0019 R8's Phase 2 macOS
+  # harness work remains separate future work, and nothing here runs on
+  # a developer's own Mac).
+  trusted-principal-build:
+    name: trusted-principal feature build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch @ 2026-09-18
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo clippy -p libra-governor-cli -p libra-governor-daemon --features trusted-principal --all-targets -- -D warnings
+      - run: cargo test -p libra-governor-cli -p libra-governor-daemon --features trusted-principal
