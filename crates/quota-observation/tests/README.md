@@ -105,7 +105,7 @@ by that review and remain open exactly as before.
 | N40 | Partial without missing | `conformance_semantic.rs::n40_partial_with_empty_missing_is_rejected` |
 | N41 | Same owner bound to inconsistent UUID | Out of scope: obsolete under design-v2, replaced by `shared_pool_anti_vacuity.rs` items 1–2 (`attack1_*`, `attack2_*`) |
 | N42 | Rebound identity with reused old UUID | Out of scope: same as N41 |
-| N43 | Owner name in ID not eligible for log | Out of scope: belongs to the HORO-1854 CLI slice or HORO-1856 (doctor/logging surface), not yet built |
+| N43 | Owner name in ID not eligible for log | Out of scope: belongs to the HORO-1870 (CLI slice) |
 | N44 | Empty configured expected set | `conformance_semantic.rs::n44_empty_configured_expected_set_is_rejected_at_load_time` (+ control) |
 | N45 | Context reset, no old-healthy fallback | Out of scope: no caching layer exists in this one-shot crate; the property holds vacuously by construction (there is nothing to fall back to) |
 | N46 | Current acquisition time substituted for old source | Same test as P07: `conformance_semantic.rs::p07_n46_original_source_time_preserved_host_applies_max_age_not_acquisition_time` |
@@ -113,8 +113,8 @@ by that review and remain open exactly as before.
 | N48 | context_valid_until earlier than reading validity | `conformance_semantic.rs::n48_context_valid_until_earlier_than_reading_valid_until_still_expires_it` (+ control) |
 | N49 | Passed reset, fabricated refill | Out of scope per instruction (evaluator-related) |
 | N50 | Source soft limit retyped as hard permission | `conformance_semantic.rs::n50_soft_upstream_enforcement_is_never_retyped_as_hard` |
-| N51 | Synthetic secret in stderr/upstream error/raw payload doesn't reach diagnostics | Out of scope: belongs to a diagnostics/logging surface this crate doesn't have yet (HORO-1856) |
-| N52 | Machine-readable local quota output not auto-uploaded | Out of scope per instruction (CLI/doctor, HORO-1854 CLI slice or HORO-1856) |
+| N51 | Synthetic secret in stderr/upstream error/raw payload doesn't reach diagnostics | Out of scope: belongs to HORO-1870 (CLI slice) |
+| N52 | Machine-readable local quota output not auto-uploaded | Out of scope per instruction (CLI/doctor, HORO-1870) |
 | N53 | Doctor passive mode, no process | Out of scope per instruction (same as N52) |
 | N54 | Doctor explicit probe, describe-only, no network | Out of scope per instruction (same as N52) |
 | N55 | Known Blocking survives other unavailable | Out of scope per instruction (evaluator-related, with N49) |
