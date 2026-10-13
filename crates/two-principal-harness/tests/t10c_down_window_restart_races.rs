@@ -333,6 +333,17 @@ fn t10c_down_window_create_bind_connect_all_fail() {
     );
 
     // Prove it is not merely alive but actually serving.
+    //
+    // `lg-raw-client` exits 0 on ANY reply it successfully reads off the
+    // socket — including `Response::Error` (e.g. a protocol-version
+    // mismatch or a malformed request) — so a bare exit-code check here
+    // would pass just as happily on a failure response, silently
+    // converting this into a test of the error path instead of the
+    // success path. The actual oracle is the reply's own `kind`, which
+    // must be the `status` success variant, not merely a process exit
+    // code. (Hardcoded `14` must track `libra_governor_protocol::PROTOCOL_VERSION`;
+    // this crate deliberately takes no Cargo dependency on `cli`/`daemon`,
+    // but a future protocol bump still needs this literal updated by hand.)
     let out = run_as(
         &LG_AGENT,
         raw_client_bin(),
@@ -346,6 +357,18 @@ fn t10c_down_window_create_bind_connect_all_fail() {
         out.status.success(),
         "the restarted provider must serve a normal request: stderr={}",
         String::from_utf8_lossy(&out.stderr)
+    );
+    let reply: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "the restarted provider's reply was not valid JSON: {e}; stdout was {:?}",
+            out.stdout
+        )
+    });
+    assert_eq!(
+        reply.get("response").and_then(|r| r.get("kind")),
+        Some(&serde_json::Value::String("status".to_string())),
+        "the restarted provider must answer a `status` request with the `status` \
+         success variant, not an error or any other response kind: full reply={reply:?}"
     );
 
     restarted.kill9_and_reap();
