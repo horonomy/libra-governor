@@ -196,12 +196,46 @@ fn write_atomically(
     })
 }
 
+/// Forces a freshly-registered candidate to the unapproved state,
+/// regardless of what the operator-authored file itself claims.
+///
+/// `register` never trusts a candidate's self-declared
+/// `approval.approved`/digest fields: without this, a crafted
+/// registration file could claim `approved: true` with arbitrary
+/// (forged, or merely stale) digest strings, and `register` would write
+/// it straight into the trusted registrations directory without this
+/// CLI ever performing a real measurement. `verify_identity` would still
+/// catch a *wrong* digest on first real invocation, so this was not a
+/// full authentication bypass — but it let `register` silently accept an
+/// unearned "already approved" claim, defeating the explicit two-step
+/// register-then-`approve` flow (see `trust-and-lifecycle.md`'s framing
+/// of approval as a drift detector, and this ticket's own design) that
+/// the rest of this command family's trust model relies on. `approve`
+/// remains the *only* command that can set `approved: true`, and it only
+/// ever does so from digests it just measured from disk itself.
+fn force_unapproved(mut candidate: Registration) -> Registration {
+    candidate.approval.approved = false;
+    candidate.approval.executable_sha256 = String::new();
+    candidate.approval.manifest_sha256 = String::new();
+    candidate.approval.launch_tuple_sha256 = String::new();
+    for runtime_file in &mut candidate.approval.runtime_files {
+        runtime_file.sha256 = String::new();
+    }
+    candidate
+}
+
 /// `register`: validates `candidate` against the current directory
 /// contents (schema/semantic validation, a fresh `registration_id`, and
-/// pool uniqueness including the candidate), then writes it to
-/// `<dir>/<registration_id>.json` atomically under the directory lock.
+/// pool uniqueness including the candidate), forces it to the unapproved
+/// state regardless of what it claims (see [`force_unapproved`]), then
+/// writes it to `<dir>/<registration_id>.json` atomically under the
+/// directory lock. A subsequent [`approve`] call is always required
+/// before the registration can be invoked at all
+/// (`identity::verify_identity` rejects `approved: false` before
+/// measuring anything).
 pub fn register(candidate: Registration) -> Result<PathBuf, StoreError> {
     validate_registration_id(&candidate.registration_id)?;
+    let candidate = force_unapproved(candidate);
     candidate.validate()?;
 
     let dir = ensure_registrations_dir()?;
@@ -456,6 +490,53 @@ mod tests {
             register(sample("reg-a", "fp1", "alias1", true)).unwrap();
             let err = register(sample("reg-a", "fp2", "alias2", true)).unwrap_err();
             assert!(matches!(err, StoreError::AlreadyExists(id, _) if id == "reg-a"));
+        });
+    }
+
+    /// Regression test for the authorization-bypass finding caught before
+    /// this PR was opened: a candidate file that self-declares
+    /// `approval.approved: true` with forged (non-empty, arbitrary)
+    /// digest strings must never be trusted as-is. `register` must force
+    /// it to unapproved with cleared digests on disk, and a subsequent
+    /// `approve` call must still be required (and must itself measure
+    /// real digests, not reuse the forged ones) before the registration
+    /// verifies.
+    #[test]
+    fn register_never_trusts_a_candidates_self_declared_approval_or_digests() {
+        with_state_dir(|_state_dir| {
+            let mut forged = sample("reg-a", "fp", "alias", true);
+            forged.approval.approved = true;
+            forged.approval.executable_sha256 = "sha256:forged-executable".into();
+            forged.approval.manifest_sha256 = "sha256:forged-manifest".into();
+            forged.approval.launch_tuple_sha256 = "sha256:forged-launch-tuple".into();
+
+            register(forged).unwrap();
+
+            let dir = registrations_dir().unwrap();
+            let (_, on_disk) = find(&dir, "reg-a").unwrap();
+            assert!(
+                !on_disk.approval.approved,
+                "register must never persist a candidate's self-declared approved:true"
+            );
+            assert_eq!(on_disk.approval.executable_sha256, "");
+            assert_eq!(on_disk.approval.manifest_sha256, "");
+            assert_eq!(on_disk.approval.launch_tuple_sha256, "");
+
+            // verify_identity (via invoke, exercised indirectly here
+            // through approve's own measurement path) still requires a
+            // real approve call: approving measures fresh digests from
+            // disk, which must differ from the forged strings above.
+            let approved = approve("reg-a").unwrap();
+            assert!(approved.approval.approved);
+            assert_ne!(
+                approved.approval.executable_sha256,
+                "sha256:forged-executable"
+            );
+            assert_ne!(approved.approval.manifest_sha256, "sha256:forged-manifest");
+            assert_ne!(
+                approved.approval.launch_tuple_sha256,
+                "sha256:forged-launch-tuple"
+            );
         });
     }
 
