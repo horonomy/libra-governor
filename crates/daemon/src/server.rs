@@ -462,7 +462,14 @@ pub fn handle_connection(
     Ok(shut_down_after_reply)
 }
 
-fn dispatch(
+// `pub(crate)`, not private: trusted-principal mode's own accept loop
+// (`trusted_principal::serve::serve_trusted`, behind the non-default
+// `trusted-principal` feature) calls this exact function after its own
+// confused-deputy sanitizer runs, rather than duplicating dispatch
+// logic. This is a visibility change only — `serve` and
+// `handle_connection` (and its 20 test call sites) are not touched, so
+// default mode's behavior is byte-identical (PR-2's design doc §4.3).
+pub(crate) fn dispatch(
     request: Request,
     ledger: &mut LedgerStore,
     current_task: &mut Option<TaskSummary>,
@@ -1794,6 +1801,47 @@ pub(crate) fn handle_finalize(
     current_task: &mut Option<TaskSummary>,
     config: &DaemonConfig,
 ) -> Result<FinalizeOutcome, DaemonError> {
+    finalize_with_usage(
+        session_id,
+        model,
+        provider,
+        ledger,
+        current_task,
+        config,
+        |usage_window_start| match transcript_path {
+            Some(path) => crate::usage::observe_transcript_window(
+                std::path::Path::new(path),
+                usage_window_start,
+                crate::usage::DEFAULT_SCAN_CAP_BYTES,
+            ),
+            None => crate::usage::UsageObservation::Unavailable(
+                crate::usage::UsageUnavailable::NoTranscriptPath,
+            ),
+        },
+    )
+}
+
+/// The full finalize-with-usage logic (HORO-1725), split out of
+/// [`handle_finalize`] (HORO-1863) so the Execution Owner `Stop` route can
+/// reuse every "exactly one active reservation", ledger-write, and receipt
+/// step byte-for-byte, while supplying its own `observe` closure instead of
+/// the legacy session-window reader.
+///
+/// `observe` receives `usage_window_start` because the legacy caller's
+/// window is session-shaped and needs it to compute its reader's window;
+/// the owner route's observation is already fully computed (bounded,
+/// pure, and finished before any ledger write — see `execution_owner.rs`)
+/// before this function is ever called, so its closure ignores the
+/// argument and returns that precomputed value.
+pub(crate) fn finalize_with_usage(
+    session_id: &str,
+    model: Option<String>,
+    provider: Option<String>,
+    ledger: &mut LedgerStore,
+    current_task: &mut Option<TaskSummary>,
+    config: &DaemonConfig,
+    observe: impl FnOnce(time::OffsetDateTime) -> crate::usage::UsageObservation,
+) -> Result<FinalizeOutcome, DaemonError> {
     let Some(task_id) = ledger.task_id_for_session(session_id)? else {
         return Ok(FinalizeOutcome::NoActiveTask);
     };
@@ -1855,16 +1903,7 @@ pub(crate) fn handle_finalize(
     let usage_window_start = ledger
         .last_receipt_recorded_at(task_id)?
         .unwrap_or(started_at);
-    let observation = match transcript_path {
-        Some(path) => crate::usage::observe_transcript_window(
-            std::path::Path::new(path),
-            usage_window_start,
-            crate::usage::DEFAULT_SCAN_CAP_BYTES,
-        ),
-        None => crate::usage::UsageObservation::Unavailable(
-            crate::usage::UsageUnavailable::NoTranscriptPath,
-        ),
-    };
+    let observation = observe(usage_window_start);
     // One `Tokens` entry or none — never a second amount of the same
     // kind, which `resource_quantiles` would treat as an independent
     // sample and skew its own quantiles with.

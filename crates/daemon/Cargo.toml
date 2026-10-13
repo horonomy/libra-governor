@@ -25,6 +25,11 @@ num-cmp.workspace = true
 rustix.workspace = true
 libc.workspace = true
 
+[features]
+# ADR-0019 §1: default-off; never add to `default`. Guarded by
+# tests/trusted_principal_default_off_guard.rs.
+trusted-principal = []
+
 [dev-dependencies]
 tempfile.workspace = true
 rusqlite.workspace = true

@@ -132,11 +132,15 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::ops::ControlFlow;
 use std::path::Path;
 
 use serde::Deserialize;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+
+mod codex_turn;
+pub use codex_turn::observe_codex_turn;
 
 /// How much of the transcript tail this is willing to read, in bytes.
 ///
@@ -187,9 +191,13 @@ impl TurnUsage {
 /// content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageUnavailable {
-    /// The host's hook payload carried no `transcript_path`, or the
-    /// caller deliberately withheld it (the execution-owner route does,
-    /// because this reader measures a session window, not an agent one).
+    /// The host's hook payload carried no `transcript_path`. Before
+    /// HORO-1863 this also covered the execution-owner route
+    /// deliberately withholding the path for every identity, because this
+    /// session-window reader cannot tell one lane's tokens from a
+    /// sibling's. The owner route now forwards a Codex identity's path to
+    /// [`codex_turn::observe_codex_turn`] instead of to this reader; every
+    /// other identity still reaches this variant exactly as before.
     NoTranscriptPath,
     /// The path could not be opened, read, or seeked.
     Unreadable,
@@ -210,6 +218,21 @@ pub enum UsageUnavailable {
     /// downstream, because the first is a fact about spend and the second
     /// is the absence of one.
     NoUsageInWindow,
+    /// A Codex turn-scoped read (HORO-1863) never found the turn's own
+    /// start marker (`event_msg`/`task_started` with a matching
+    /// `turn_id`) before exhausting the scan cap or reaching the start of
+    /// the file. Unlike the session-window reader above, a turn-scoped
+    /// read has an exact lower bound to find; not finding it means the
+    /// read cannot be trusted to cover the whole turn.
+    TurnIncomplete,
+    /// A Codex turn-scoped read (HORO-1863) found a record that
+    /// contradicts the turn's own internal accounting invariants (see
+    /// `codex_turn` module docs) — a wrong `session_id`, a second
+    /// `thread_id`, or a sum that disagrees with the turn's own reported
+    /// running total. Never partially trusted: the whole read is
+    /// discarded rather than reporting a total built from inconsistent
+    /// inputs.
+    Inconsistent,
 }
 
 /// The result of trying to measure the window.
@@ -241,6 +264,8 @@ impl UsageObservation {
             UsageObservation::Unavailable(UsageUnavailable::NoUsageInWindow) => {
                 "no_usage_in_window"
             }
+            UsageObservation::Unavailable(UsageUnavailable::TurnIncomplete) => "turn_incomplete",
+            UsageObservation::Unavailable(UsageUnavailable::Inconsistent) => "usage_inconsistent",
         }
     }
 }
@@ -351,17 +376,59 @@ pub fn observe_transcript_window(
     }
 }
 
-fn scan(
+/// How a backward scan over a JSONL file ended, for a caller that needs to
+/// distinguish "the visitor asked to stop" from the two cases it cannot
+/// control: the scan ran off the start of the file, or it exhausted its
+/// byte budget first.
+pub(crate) enum ScanEnd<B> {
+    /// `visit` returned [`ControlFlow::Break`], carrying its value.
+    Visitor(B),
+    /// The scan reached the start of the file without the visitor
+    /// breaking.
+    StartOfFile,
+    /// [`CHUNK_BYTES`]-bounded reading exhausted `cap_bytes` before either
+    /// of the above.
+    CapReached,
+}
+
+/// Refuses a `path` that does not resolve to a regular file, without
+/// opening it. `transcript_path` is attacker-reachable input (it comes
+/// from a hook payload / Codex rollout path), and `File::open` on a FIFO
+/// with no writer on the other end blocks the calling thread indefinitely
+/// — this daemon only serves one connection at a time, so that would hang
+/// every other request. `std::fs::metadata` is a plain `stat` (following
+/// symlinks, unlike `lstat`), which never blocks on a FIFO's open
+/// semantics, so this check is safe to run before any open and still
+/// allows a path that is legitimately a symlink to a regular file.
+pub(crate) fn reject_non_regular_file(path: &Path) -> Result<(), UsageUnavailable> {
+    let metadata = std::fs::metadata(path).map_err(|_| UsageUnavailable::Unreadable)?;
+    if metadata.is_file() {
+        Ok(())
+    } else {
+        Err(UsageUnavailable::Unreadable)
+    }
+}
+
+/// Scans `path` backwards from EOF in [`CHUNK_BYTES`] chunks, calling
+/// `visit` once per complete line (newest first), stopping at the first
+/// [`ControlFlow::Break`], the start of the file, or `cap_bytes`,
+/// whichever comes first.
+///
+/// This is the one place this module seeks and re-assembles chunk-spanning
+/// lines; [`scan`] and [`codex_turn::observe_codex_turn`] differ only in
+/// what `visit` does with each line and in how they interpret where the
+/// scan stopped.
+pub(crate) fn scan_lines_backward<B>(
     path: &Path,
-    window_start: OffsetDateTime,
-    scan_cap_bytes: u64,
-) -> Result<TurnUsage, UsageUnavailable> {
+    cap_bytes: u64,
+    mut visit: impl FnMut(&[u8]) -> ControlFlow<B>,
+) -> Result<ScanEnd<B>, UsageUnavailable> {
+    reject_non_regular_file(path)?;
     let mut file = File::open(path).map_err(|_| UsageUnavailable::Unreadable)?;
     let len = file
         .seek(SeekFrom::End(0))
         .map_err(|_| UsageUnavailable::Unreadable)?;
 
-    let mut usage = TurnUsage::default();
     // Bytes belonging to a line whose beginning lies in an
     // earlier (not-yet-read) chunk.
     let mut partial_head: Vec<u8> = Vec::new();
@@ -372,9 +439,9 @@ fn scan(
         // Clamped to the remaining budget, not just checked between
         // chunks: a bound that permits one more whole chunk before it
         // trips is not the bound it claims to be.
-        let remaining_budget = scan_cap_bytes.saturating_sub(scanned);
+        let remaining_budget = cap_bytes.saturating_sub(scanned);
         if remaining_budget == 0 {
-            return Err(UsageUnavailable::ScanCapReached);
+            return Ok(ScanEnd::CapReached);
         }
         let want = CHUNK_BYTES.min(pos as usize).min(remaining_budget as usize);
         let start = pos - want as u64;
@@ -399,32 +466,49 @@ fn scan(
         }
 
         for line in lines.iter().rev() {
-            match consider_line(line, window_start) {
-                LineVerdict::Older => return Ok(usage),
-                LineVerdict::Skip => {}
-                LineVerdict::Counted(raw) => {
-                    usage.input_tokens = usage
-                        .input_tokens
-                        .saturating_add(raw.input_tokens.unwrap_or(0));
-                    usage.cache_creation_input_tokens = usage
-                        .cache_creation_input_tokens
-                        .saturating_add(raw.cache_creation_input_tokens.unwrap_or(0));
-                    usage.cache_read_input_tokens = usage
-                        .cache_read_input_tokens
-                        .saturating_add(raw.cache_read_input_tokens.unwrap_or(0));
-                    usage.output_tokens = usage
-                        .output_tokens
-                        .saturating_add(raw.output_tokens.unwrap_or(0));
-                    usage.records += 1;
-                }
+            if let ControlFlow::Break(value) = visit(line) {
+                return Ok(ScanEnd::Visitor(value));
             }
         }
     }
 
-    // Reached the start of the file without finding anything older than
-    // the window: the window covers the whole transcript, so the total is
-    // complete.
-    Ok(usage)
+    Ok(ScanEnd::StartOfFile)
+}
+
+fn scan(
+    path: &Path,
+    window_start: OffsetDateTime,
+    scan_cap_bytes: u64,
+) -> Result<TurnUsage, UsageUnavailable> {
+    let mut usage = TurnUsage::default();
+    let end = scan_lines_backward(path, scan_cap_bytes, |line| {
+        match consider_line(line, window_start) {
+            LineVerdict::Older => ControlFlow::Break(()),
+            LineVerdict::Skip => ControlFlow::Continue(()),
+            LineVerdict::Counted(raw) => {
+                usage.input_tokens = usage
+                    .input_tokens
+                    .saturating_add(raw.input_tokens.unwrap_or(0));
+                usage.cache_creation_input_tokens = usage
+                    .cache_creation_input_tokens
+                    .saturating_add(raw.cache_creation_input_tokens.unwrap_or(0));
+                usage.cache_read_input_tokens = usage
+                    .cache_read_input_tokens
+                    .saturating_add(raw.cache_read_input_tokens.unwrap_or(0));
+                usage.output_tokens = usage
+                    .output_tokens
+                    .saturating_add(raw.output_tokens.unwrap_or(0));
+                usage.records += 1;
+                ControlFlow::Continue(())
+            }
+        }
+    })?;
+    match end {
+        // A record older than the window, or the start of the file: either
+        // way the window has been read in full.
+        ScanEnd::Visitor(()) | ScanEnd::StartOfFile => Ok(usage),
+        ScanEnd::CapReached => Err(UsageUnavailable::ScanCapReached),
+    }
 }
 
 enum LineVerdict {
@@ -671,6 +755,8 @@ mod tests {
             UsageObservation::Unavailable(UsageUnavailable::Unreadable),
             UsageObservation::Unavailable(UsageUnavailable::ScanCapReached),
             UsageObservation::Unavailable(UsageUnavailable::NoUsageInWindow),
+            UsageObservation::Unavailable(UsageUnavailable::TurnIncomplete),
+            UsageObservation::Unavailable(UsageUnavailable::Inconsistent),
         ] {
             let label = observation.reason_label();
             assert!(

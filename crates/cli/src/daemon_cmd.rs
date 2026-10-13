@@ -14,11 +14,9 @@
 //! daemon's own socket. Any check failing refuses to signal anything.
 
 use libra_governor_daemon::{recon::ReconBudget, DaemonConfig, DaemonError};
-use libra_governor_domain::ReplanHysteresisConfig;
+use libra_governor_domain::{Policy, ReplanHysteresisConfig};
 use libra_governor_protocol::{Request, Response};
-use std::path::Path;
-#[cfg(not(target_os = "linux"))]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Serializes tests in this module that mutate `LIBRA_GOVERNOR_STATE_DIR`
@@ -74,23 +72,14 @@ pub fn run() {
             }
         };
 
-    let config = DaemonConfig {
-        socket_path: state_dir.join("daemon.sock"),
-        ledger_path: state_dir.join("ledger.sqlite3"),
+    let config = daemon_config(
+        state_dir.join("daemon.sock"),
+        state_dir.join("ledger.sqlite3"),
         log_path,
-        recon_budget: ReconBudget::default(),
-        replan_hysteresis: ReplanHysteresisConfig::default(),
-        policy: policy.unwrap_or_else(libra_governor_daemon::default_admission_policy),
-        reservation_ttl_secs: DEFAULT_RESERVATION_TTL_SECS,
+        policy.unwrap_or_else(libra_governor_daemon::default_admission_policy),
         gateway,
-        gateway_stats: std::sync::Arc::new(Default::default()),
-        gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER.to_string(),
         extensions,
-        extension_runtime: std::sync::OnceLock::new(),
-
-        outcome_authority: None,
-        progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
-    };
+    );
 
     let listener = match libra_governor_daemon::bind_or_detect_running(&config.socket_path) {
         Ok(listener) => listener,
@@ -139,6 +128,137 @@ pub fn run() {
             &format!("daemon exited with error: {e}"),
         );
         std::process::exit(1);
+    }
+}
+
+/// Builds the one production [`DaemonConfig`] literal this crate
+/// constructs, hardcoding `outcome_authority: None` (HORO-1727 Decision
+/// 1 / ADR-0017 — see that field's own docs) and this crate's default
+/// [`DEFAULT_RESERVATION_TTL_SECS`]/progressive-interval constants.
+///
+/// Extracted from [`run`] with no behavior change (PR-2's design doc §4.1
+/// "Refactor first"), so `outcome_authority_not_wired_live.rs`'s doc
+/// comment — "exactly one production `DaemonConfig` construction site, in
+/// `daemon_cmd.rs`" — stays literally true. Trusted mode's `run_trusted`
+/// (behind the `trusted-principal` feature) calls this same helper rather
+/// than adding a second construction site.
+fn daemon_config(
+    socket_path: PathBuf,
+    ledger_path: PathBuf,
+    log_path: PathBuf,
+    policy: Policy,
+    gateway: Option<libra_governor_gateway::config::GatewayConfig>,
+    extensions: Option<libra_governor_extension::ExtensionConfig>,
+) -> DaemonConfig {
+    DaemonConfig {
+        socket_path,
+        ledger_path,
+        log_path,
+        recon_budget: ReconBudget::default(),
+        replan_hysteresis: ReplanHysteresisConfig::default(),
+        policy,
+        reservation_ttl_secs: DEFAULT_RESERVATION_TTL_SECS,
+        gateway,
+        gateway_stats: std::sync::Arc::new(Default::default()),
+        gateway_session_header: libra_governor_gateway::proxy::DEFAULT_SESSION_HEADER.to_string(),
+        extensions,
+        extension_runtime: std::sync::OnceLock::new(),
+        outcome_authority: None,
+        progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
+    }
+}
+
+/// Trusted-principal mode's foreground entry point (ADR-0019, PR-2's
+/// design doc §4.1), reached only via the hidden
+/// `daemon run --trusted-principal-config <path>` argv form in
+/// `main.rs` — never advertised in `USAGE`/`--help`. `config.json` is
+/// never read in this path: every field `daemon_config` needs comes
+/// from the pinned `TrustedPrincipalConfig` or a fixed default.
+///
+/// Returns the process exit code: `0` only if `serve_trusted` returns
+/// (which in practice means an unrecoverable accept-loop I/O error, same
+/// as default-mode `serve`); `2` for any startup failure, printed to
+/// **stderr only** — `daemon.log` is not written to here because the
+/// state dir has not yet been validated at that point.
+#[cfg(feature = "trusted-principal")]
+pub fn run_trusted(config_path: &Path) -> i32 {
+    use libra_governor_daemon::trusted_principal::serve::{bind_trusted_socket, serve_trusted};
+    use libra_governor_daemon::trusted_principal::startup::validate_trusted_startup;
+    use libra_governor_daemon::trusted_principal::TrustedPrincipalConfig;
+
+    let cfg = match TrustedPrincipalConfig::load(config_path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("libra-governor daemon run --trusted-principal-config: {e}");
+            return 2;
+        }
+    };
+
+    let ledger = match validate_trusted_startup(&cfg, config_path) {
+        Ok(ledger) => ledger,
+        Err(e) => {
+            eprintln!("libra-governor daemon run --trusted-principal-config: {e}");
+            return 2;
+        }
+    };
+
+    // Pins process cwd to a root-owned directory, so even a future
+    // relative-path join (should one ever slip past the confused-deputy
+    // sanitizer) resolves under `/`, never under an agent-writable
+    // directory (design doc §4.1 step 3).
+    if let Err(e) = std::env::set_current_dir("/") {
+        eprintln!(
+            "libra-governor daemon run --trusted-principal-config: could not set cwd to /: {e}"
+        );
+        return 2;
+    }
+
+    let config = daemon_config(
+        cfg.socket_path(),
+        cfg.ledger_path(),
+        cfg.log_path(),
+        libra_governor_daemon::default_admission_policy(),
+        None,
+        None,
+    );
+
+    let listener = match bind_trusted_socket(&cfg) {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!(
+                "libra-governor daemon run --trusted-principal-config: could not bind socket: {e}"
+            );
+            return 2;
+        }
+    };
+
+    // Best-effort, same discipline as default-mode `run` (HORO-1380): a
+    // failure here does not stop the daemon from serving.
+    let exe_path = std::env::current_exe().unwrap_or_default();
+    let exe_sha256 = libra_governor_daemon::pidfile::hash_file(&exe_path);
+    let pid_record = libra_governor_daemon::pidfile::PidRecord {
+        pid: std::process::id(),
+        exe_path,
+        started_at: current_rfc3339(),
+        exe_sha256,
+    };
+    if let Err(e) = libra_governor_daemon::pidfile::write(&cfg.state_dir, &pid_record) {
+        libra_governor_daemon::log::append_line(
+            &config.log_path,
+            &format!("trusted daemon: failed to write pid record: {e}"),
+        );
+    }
+
+    libra_governor_daemon::log::append_line(&config.log_path, "trusted daemon started");
+    match serve_trusted(listener, ledger, &config, &cfg) {
+        Ok(()) => 0,
+        Err(e) => {
+            libra_governor_daemon::log::append_line(
+                &config.log_path,
+                &format!("trusted daemon exited with error: {e}"),
+            );
+            1
+        }
     }
 }
 

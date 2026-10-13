@@ -8,6 +8,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
+mod interpreter_warmup;
+
 const ADAPTER_ID: &str = "external_probe_fixture";
 const PYTHON: &str = "/usr/bin/python3";
 const BASE_MANIFEST: &str =
@@ -45,6 +47,7 @@ fn path_string(path: &Path) -> String {
 }
 
 fn fixture(mode: &str) -> Fixture {
+    interpreter_warmup::warm_fixture_interpreter();
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
     let home = temp.path().join("home");

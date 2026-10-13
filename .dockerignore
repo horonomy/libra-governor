@@ -1,0 +1,11 @@
+# Keeps the harness image's build context (repo root) small and
+# deterministic. Only `harness/two-principal/Dockerfile` uses a context
+# wider than its own directory today, but `.dockerignore` applies
+# wherever `docker build` is invoked from this root, so this file is
+# written generally rather than scoped to one Dockerfile.
+/target
+/target-*
+.git
+.DS_Store
+/experiments
+/site/book

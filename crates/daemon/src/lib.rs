@@ -21,6 +21,8 @@ pub mod paths;
 pub mod pidfile;
 pub mod recon;
 pub mod server;
+#[cfg(feature = "trusted-principal")]
+pub mod trusted_principal;
 pub mod usage;
 
 pub use server::{
