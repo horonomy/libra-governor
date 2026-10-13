@@ -11,6 +11,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
+mod interpreter_warmup;
+
 const PLANNER: &str = "external_config_fixture";
 const PROFILE: &str = "libra.claude-hooks.v1";
 const PYTHON: &str = "/usr/bin/python3";
@@ -47,6 +49,7 @@ fn path_string(path: &Path) -> String {
 }
 
 fn make_fixture() -> Fixture {
+    interpreter_warmup::warm_fixture_interpreter();
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_owned();
     let state = root.join("state");
