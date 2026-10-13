@@ -1,8 +1,9 @@
 # Quota-observation author guide (HORO-1856)
 
 See [`README.md`](README.md)'s status banner first: experimental 0.x
-preview, observation-only, merged to `main` (HORO-1854/1855), no CLI
-exists for this protocol yet.
+preview, observation-only, merged to `main` (HORO-1854/1855). The
+operator CLI (HORO-1870) is merged too — see "Operator CLI" below for
+the real `libra-governor quota-observation` command reference.
 
 This guide documents the one-shot stdio runtime contract and
 `describe`/`snapshot` wire operations exactly as
@@ -299,3 +300,101 @@ compatibility guarantee the host enforces — the host does not reject a
 `supported_versions` list or omitted `"quota.snapshot"` from
 `capabilities`. Do not build an extension that depends on the host
 performing any such negotiation; there is none.
+
+## Operator CLI (`libra-governor quota-observation`, HORO-1870)
+
+This is the real, merged operator surface — `crates/cli/src/quota_observation_cmd/mod.rs`
+is the source of truth for exact syntax; this section mirrors it.
+
+```
+libra-governor quota-observation register <registration-file>
+libra-governor quota-observation approve <registration-id>
+libra-governor quota-observation enable <registration-id>
+libra-governor quota-observation disable <registration-id>
+libra-governor quota-observation uninstall <registration-id> [--note-executable]
+libra-governor quota-observation doctor [<registration-id>] [--probe]
+libra-governor quota-observation inspect <registration-id> [--constraint-ids <id1,id2,...>]
+```
+
+Three escalating tiers:
+
+- **`doctor`** — fully passive. Lists registrations from disk; no
+  extension process is ever started.
+- **`doctor --probe`** — opt-in. A `describe` bootstrap call only (no
+  `snapshot`), for each enabled+approved registration (or a named one).
+  Reports identity/capabilities and protocol-version compatibility;
+  never quota availability/coverage. A disabled or unapproved
+  registration is listed but skipped, not probed.
+- **`inspect`** — the one command that performs a live, explicitly
+  consented `snapshot` round trip. The only command in the whole
+  surface that can report quota availability/partial/stale, and it
+  refuses a disabled or unapproved registration outright.
+
+`register` never trusts a candidate file's self-declared
+`approval.approved`/digest fields — it force-clears them to the
+unapproved state on every write, regardless of what the file claims
+(see `trust-and-lifecycle.md`'s framing of approval as a drift
+detector). A subsequent `approve` call is always required before a
+registration can be invoked at all.
+
+### Verified example — full lifecycle
+
+Run against a real, isolated state directory via
+`LIBRA_GOVERNOR_STATE_DIR` (the same override
+`crates/cli/tests/quota_observation_cli.rs` uses), with
+`examples/quota-observation-extension/registration.template.json`
+(`transport.executable` pointed at a locally installed copy of
+`examples/quota-observation-extension/quota-ext.sh`) as the
+registration file. Every command and its output below was actually run
+against this repository's own checked-in files, not hand-typed.
+
+```bash
+$ libra-governor quota-observation register registration.json
+registered: wrote /path/to/state/quota-observation/registrations/sample-quota-ext-registration.json
+
+$ libra-governor quota-observation doctor
+sample-quota-ext-registration — extension org.example.sample-quota-ext 0.1.0 — enabled=true approved=false
+
+$ libra-governor quota-observation approve sample-quota-ext-registration
+approved "sample-quota-ext-registration" (extension "org.example.sample-quota-ext" "0.1.0")
+
+$ libra-governor quota-observation doctor
+sample-quota-ext-registration — extension org.example.sample-quota-ext 0.1.0 — enabled=true approved=true
+
+$ libra-governor quota-observation doctor --probe
+sample-quota-ext-registration — extension org.example.sample-quota-ext 0.1.0 — enabled=true approved=true
+  --probe: extension_id=org.example.sample-quota-ext extension_version=0.1.0 supported_versions=["libra.quota-observation/0.1"] capabilities=["quota.snapshot"] — this host's protocol version is supported
+
+$ libra-governor quota-observation inspect sample-quota-ext-registration
+coverage=Complete context.selector=sample-session authority=sample-authority
+  constraint tokens_month scope=Account { handle: "sample-account" } metric=TotalTokens unit=Tokens reading=Used { value: Quantity { canonical: "600000", value: 600000 }, limit: Quantity { canonical: "1000000", value: 1000000 } } upstream_enforcement=Unknown observed_at=2027-01-18T12:00:00Z [stale]
+
+$ libra-governor quota-observation disable sample-quota-ext-registration
+disabled "sample-quota-ext-registration"
+
+$ libra-governor quota-observation doctor --probe
+sample-quota-ext-registration — extension org.example.sample-quota-ext 0.1.0 — enabled=false approved=true
+  skipped --probe: registration is disabled
+
+$ libra-governor quota-observation enable sample-quota-ext-registration
+enabled "sample-quota-ext-registration"
+note: re-enabling does not require re-approval — the manifest digest is unchanged from the last approval (trust-and-lifecycle.md).
+
+$ libra-governor quota-observation uninstall sample-quota-ext-registration
+uninstalled "sample-quota-ext-registration" (removed /path/to/state/quota-observation/registrations/sample-quota-ext-registration.json)
+
+$ libra-governor quota-observation doctor
+no quota-observation registrations found in /path/to/state/quota-observation/registrations
+```
+
+The `[stale]` tag on the `inspect` reading above is real, not an
+artifact of the demo: the sample extension's canned response declares
+`observed_at: 2027-01-18T12:00:00Z`, which is in the future relative to
+when this example was run, so the freshness check in
+`src/freshness.rs` correctly refuses to call it fresh. Nothing is
+persisted beyond raw display either way — see the "Freshness" section
+above.
+
+There is no `--json` output on any subcommand — every example above is
+the literal human-readable text the command prints, not a serialized
+sample.
