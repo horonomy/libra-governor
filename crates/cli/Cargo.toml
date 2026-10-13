@@ -16,6 +16,7 @@ libra-governor-daemon = { path = "../daemon" }
 libra-governor-domain = { path = "../domain" }
 libra-governor-estimator = { path = "../estimator" }
 libra-governor-evidence-adapter = { path = "../evidence-adapter" }
+libra-governor-extension = { path = "../extension" }
 libra-governor-gateway = { path = "../gateway" }
 libra-governor-ledger = { path = "../ledger" }
 libra-governor-protocol = { path = "../protocol" }
@@ -28,6 +29,11 @@ sha2.workspace = true
 thiserror.workspace = true
 time.workspace = true
 uuid.workspace = true
+
+[features]
+# The only manifest line allowed to enable the daemon's feature
+# (ADR-0019 §1, workspace feature unification).
+trusted-principal = ["libra-governor-daemon/trusted-principal"]
 
 [dev-dependencies]
 tempfile.workspace = true

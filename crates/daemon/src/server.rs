@@ -462,7 +462,14 @@ pub fn handle_connection(
     Ok(shut_down_after_reply)
 }
 
-fn dispatch(
+// `pub(crate)`, not private: trusted-principal mode's own accept loop
+// (`trusted_principal::serve::serve_trusted`, behind the non-default
+// `trusted-principal` feature) calls this exact function after its own
+// confused-deputy sanitizer runs, rather than duplicating dispatch
+// logic. This is a visibility change only — `serve` and
+// `handle_connection` (and its 20 test call sites) are not touched, so
+// default mode's behavior is byte-identical (PR-2's design doc §4.3).
+pub(crate) fn dispatch(
     request: Request,
     ledger: &mut LedgerStore,
     current_task: &mut Option<TaskSummary>,

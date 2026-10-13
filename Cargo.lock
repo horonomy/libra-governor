@@ -700,6 +700,7 @@ dependencies = [
  "libra-governor-domain",
  "libra-governor-estimator",
  "libra-governor-evidence-adapter",
+ "libra-governor-extension",
  "libra-governor-gateway",
  "libra-governor-ledger",
  "libra-governor-protocol",
@@ -858,6 +859,14 @@ dependencies = [
  "tempfile",
  "thiserror",
  "time",
+]
+
+[[package]]
+name = "libra-governor-two-principal-harness"
+version = "0.0.3"
+dependencies = [
+ "libc",
+ "serde_json",
 ]
 
 [[package]]
