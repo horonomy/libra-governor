@@ -1,0 +1,1 @@
+{"bootstrap_version":"libra.quota-bootstrap/1","request_id":"__REQUEST_ID__","result":{"extension_id":"examplecorp.quota","extension_version":"0.1.0","supported_versions":["libra.quota-observation/0.1"],"capabilities":["quota.snapshot"]}}

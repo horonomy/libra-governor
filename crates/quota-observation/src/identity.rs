@@ -454,4 +454,52 @@ mod tests {
             IdentityError::ManifestDigestMismatch { .. }
         ));
     }
+
+    /// Proves `enabled` is itself covered by the manifest digest — the
+    /// property `tests/shared_pool_anti_vacuity.rs`'s `attack4` cannot
+    /// prove through the crate's public API (see that test's own
+    /// comment): `approve()` here is this module's *test-only* helper,
+    /// which can compute digests for a registration with
+    /// `enabled == false`, unlike the integration suite's black-box
+    /// `tests/common::approve()` (which refuses to run against anything
+    /// not already enabled). Build disabled, approve while disabled
+    /// (digests bound to `enabled == false`), then flip `enabled` to
+    /// `true` in memory without re-approving: if `enabled` were excluded
+    /// from the manifest digest's computation, this would verify
+    /// successfully; because it's included, flipping it invalidates the
+    /// manifest digest specifically.
+    #[test]
+    fn flipping_enabled_without_reapproval_trips_the_manifest_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = write_executable(dir.path(), "ext", b"binary-one");
+        let mut disabled = build(&executable, vec![]);
+        disabled.enabled = false;
+        let disabled = approve(disabled);
+        // `verify_identity` checks `Disabled` before it ever measures a
+        // digest (see its own doc comment), so there is no "verifies ok
+        // while disabled" state to assert here — that's the exact gap
+        // that makes this property untestable through the public API
+        // alone, and the reason this test lives in-crate.
+        assert_eq!(
+            verify_identity(&disabled).unwrap_err(),
+            IdentityError::Disabled
+        );
+
+        let mut flipped = disabled.clone();
+        flipped.enabled = true;
+        assert!(
+            matches!(
+                verify_identity(&flipped).unwrap_err(),
+                IdentityError::ManifestDigestMismatch { .. }
+            ),
+            "enabled must be covered by the manifest digest"
+        );
+
+        // Control: re-approving after the flip (recomputing all three
+        // digests against the now-enabled state) must succeed — the
+        // failure above comes only from the stale approval, not from
+        // some permanent inability to approve an enabled registration.
+        let reapproved = approve(flipped);
+        assert!(verify_identity(&reapproved).is_ok());
+    }
 }
