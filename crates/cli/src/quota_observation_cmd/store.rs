@@ -292,3 +292,217 @@ pub fn uninstall(id: &str) -> Result<(PathBuf, Registration), StoreError> {
     drop(guard);
     Ok((path, registration))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libra_governor_quota_observation::registration::{
+        Approval, Consent, ExpectedConstraint, FixedEnvironment, ObservationConfidence,
+        RegisteredContext, Transport, TransportKind, TrustMode,
+    };
+    use libra_governor_quota_observation::wire::{Metric, Scope, Unit};
+    use std::sync::Mutex;
+
+    // `LIBRA_GOVERNOR_STATE_DIR` is process-global via std::env::set_var;
+    // serialize every test in this module that touches it, exactly like
+    // `libra_governor_daemon::paths`'s own `ENV_LOCK` pattern, so no two
+    // tests can observe each other's override.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_state_dir<T>(body: impl FnOnce(&Path) -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("LIBRA_GOVERNOR_STATE_DIR", dir.path());
+        let result = body(dir.path());
+        std::env::remove_var("LIBRA_GOVERNOR_STATE_DIR");
+        result
+    }
+
+    /// A real, stable, absolute file path this test binary can always
+    /// read regardless of platform (`/bin/true` is at a different path
+    /// on macOS than on Linux) — `measure_identity` only ever reads these
+    /// bytes, it never executes them, so any real file works.
+    fn stand_in_executable() -> String {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("Cargo.toml")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn sample(id: &str, fingerprint: &str, alias: &str, enabled: bool) -> Registration {
+        Registration {
+            registration_id: id.into(),
+            extension_id: "ext.example".into(),
+            extension_version: "1.0.0".into(),
+            enabled,
+            transport: Transport {
+                kind: TransportKind::OneshotStdio,
+                executable: stand_in_executable(),
+                args: vec![],
+                environment: FixedEnvironment {
+                    lang: "C.UTF-8".into(),
+                    lc_all: "C.UTF-8".into(),
+                },
+            },
+            context: RegisteredContext {
+                selector: "sel".into(),
+                handle: "handle".into(),
+                principal: "principal".into(),
+                authority: "authority".into(),
+            },
+            expected: vec![ExpectedConstraint {
+                id: "c1".into(),
+                scope: Scope::Account {
+                    handle: "acct".into(),
+                },
+                metric: Metric::TotalTokens,
+                unit: Unit::Tokens,
+                window_uuid: "win-1".into(),
+                provider: "anthropic".into(),
+                account_fingerprint: fingerprint.into(),
+                pool_alias: alias.into(),
+                max_staleness_secs: 60,
+                window_length_secs: 3600,
+                capacity_ceiling: None,
+            }],
+            binding_revision: "1".into(),
+            binding_verified_at: "2026-10-12T00:00:00Z".into(),
+            scope_configured_at: "2026-10-12T00:00:00Z".into(),
+            timeout_ms: 5_000,
+            trust_mode: TrustMode::ObservationOnly,
+            observation_confidence: ObservationConfidence::Low,
+            approval: Approval {
+                approved: false,
+                revision: "1".into(),
+                executable_sha256: String::new(),
+                manifest_sha256: String::new(),
+                launch_tuple_sha256: String::new(),
+                runtime_files: vec![],
+                endpoint_owner: "owner".into(),
+                consent: Consent {
+                    consented_by: "operator".into(),
+                    recorded_at_reference: "ref-1".into(),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn ensure_registrations_dir_creates_mode_0700_under_the_state_dir() {
+        with_state_dir(|state_dir| {
+            let dir = ensure_registrations_dir().unwrap();
+            assert_eq!(
+                dir,
+                state_dir.join("quota-observation").join("registrations")
+            );
+            let mode = fs::metadata(&dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        });
+    }
+
+    #[test]
+    fn ensure_registrations_dir_tightens_an_already_existing_looser_directory() {
+        with_state_dir(|_state_dir| {
+            let dir = registrations_dir().unwrap();
+            fs::create_dir_all(&dir).unwrap();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+            let dir = ensure_registrations_dir().unwrap();
+            let mode = fs::metadata(&dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        });
+    }
+
+    #[test]
+    fn write_atomically_then_load_round_trips_and_sets_mode_0600() {
+        with_state_dir(|_state_dir| {
+            let dir = ensure_registrations_dir().unwrap();
+            let guard = acquire_lock(&dir).unwrap();
+            let registration = sample("reg-a", "fp", "alias", true);
+            let path = file_path_for(&dir, "reg-a");
+            write_atomically(&guard, &path, &registration).unwrap();
+            drop(guard);
+
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+            let loaded = load_with_paths(&dir).unwrap();
+            assert_eq!(loaded.len(), 1);
+            assert_eq!(loaded[0].1, registration);
+        });
+    }
+
+    #[test]
+    fn load_with_paths_returns_empty_when_the_directory_does_not_exist_yet() {
+        with_state_dir(|_state_dir| {
+            let dir = registrations_dir().unwrap();
+            assert!(!dir.exists());
+            assert_eq!(load_with_paths(&dir).unwrap(), Vec::new());
+        });
+    }
+
+    #[test]
+    fn register_rejects_a_registration_id_containing_a_slash() {
+        with_state_dir(|_state_dir| {
+            let candidate = sample("a/b", "fp", "alias", true);
+            assert!(matches!(
+                register(candidate),
+                Err(StoreError::InvalidRegistrationId(_))
+            ));
+        });
+    }
+
+    #[test]
+    fn register_then_register_again_with_the_same_id_is_rejected() {
+        with_state_dir(|_state_dir| {
+            register(sample("reg-a", "fp1", "alias1", true)).unwrap();
+            let err = register(sample("reg-a", "fp2", "alias2", true)).unwrap_err();
+            assert!(matches!(err, StoreError::AlreadyExists(id, _) if id == "reg-a"));
+        });
+    }
+
+    #[test]
+    fn register_rejects_a_second_enabled_registration_on_the_same_pool() {
+        with_state_dir(|_state_dir| {
+            register(sample("reg-a", "fp-shared", "alias-shared", true)).unwrap();
+            let err = register(sample("reg-b", "fp-shared", "alias-shared", true)).unwrap_err();
+            assert!(matches!(err, StoreError::Registration(_)));
+        });
+    }
+
+    #[test]
+    fn find_approve_set_enabled_and_uninstall_round_trip() {
+        with_state_dir(|_state_dir| {
+            register(sample("reg-a", "fp", "alias", true)).unwrap();
+
+            let approved = approve("reg-a").unwrap();
+            assert!(approved.approval.approved);
+            assert!(!approved.approval.executable_sha256.is_empty());
+
+            let disabled = set_enabled("reg-a", false).unwrap();
+            assert!(!disabled.enabled);
+            // Disabling must never clear an existing approval.
+            assert!(disabled.approval.approved);
+
+            let reenabled = set_enabled("reg-a", true).unwrap();
+            assert!(reenabled.enabled);
+            assert_eq!(
+                reenabled.approval.manifest_sha256, approved.approval.manifest_sha256,
+                "re-enabling must not change the bound approval digests"
+            );
+
+            let (path, _) = uninstall("reg-a").unwrap();
+            assert!(!path.exists());
+        });
+    }
+
+    #[test]
+    fn approve_enable_disable_uninstall_report_not_found_for_a_missing_id() {
+        with_state_dir(|_state_dir| {
+            assert!(matches!(approve("nope"), Err(StoreError::NotFound(_, _))));
+            assert!(matches!(
+                set_enabled("nope", true),
+                Err(StoreError::NotFound(_, _))
+            ));
+            assert!(matches!(uninstall("nope"), Err(StoreError::NotFound(_, _))));
+        });
+    }
+}
