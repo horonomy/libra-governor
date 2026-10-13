@@ -160,11 +160,20 @@ fn x_confused_deputy_provider_never_opens_agent_named_paths() {
         "sensitivity control's Finalize must actually reach the transcript read, not vacuously \
          return no_active_task: {response}"
     );
+    // The log's own content is deliberately never interpolated into this
+    // assertion's panic message, and the message is fully static with no
+    // interpolation at all (CodeQL `rust/cleartext-logging`): this is the
+    // daemon's own `daemon.log`, which by this repo's own privacy
+    // invariant never carries a secret, but the static check cannot know
+    // that from a variable merely named `*_log` — which test failed and
+    // its assertion text are sufficient to diagnose a failure here,
+    // exactly as `two-principal-harness::chown`'s doc comment already
+    // establishes for the same query elsewhere in this crate.
     let sameuid_log = read_log_as_root(SAMEUID_STATE_DIR);
     assert!(
         !sameuid_log.contains("host usage no_transcript_path"),
         "sensitivity control: the daemon must have actually attempted to read the real \
-         transcript file rather than treating the path as absent; log was: {sameuid_log}"
+         transcript file rather than treating the path as absent"
     );
 
     drop(sameuid_daemon);
@@ -227,11 +236,14 @@ fn x_confused_deputy_provider_never_opens_agent_named_paths() {
         "trusted mode's Finalize must still reach `finalized` (not vacuously no_active_task) \
          so the usage-reading guard actually means something: {response}"
     );
+    // Same discipline as the sensitivity control's `sameuid_log` above:
+    // the daemon log's own content is never interpolated, and the
+    // message is fully static (CodeQL `rust/cleartext-logging`).
     let trusted_log = read_log_as_root(PROVIDER_STATE_DIR);
     assert!(
         trusted_log.contains("host usage no_transcript_path"),
         "trusted mode must log that the transcript path was treated as absent, proving \
-         strip_agent_named_paths blanked it before dispatch; log was: {trusted_log}"
+         strip_agent_named_paths blanked it before dispatch"
     );
 
     daemon.kill9_and_reap();
