@@ -1,0 +1,54 @@
+{
+  "registration_id": "sample-quota-ext-registration",
+  "extension_id": "org.example.sample-quota-ext",
+  "extension_version": "0.1.0",
+  "enabled": true,
+  "transport": {
+    "kind": "oneshot_stdio",
+    "executable": "/absolute/path/to/your/install/of/quota-ext.sh",
+    "args": [],
+    "environment": {
+      "LANG": "C.UTF-8",
+      "LC_ALL": "C.UTF-8"
+    }
+  },
+  "context": {
+    "selector": "sample-session",
+    "handle": "sample-handle",
+    "principal": "sample-principal",
+    "authority": "sample-authority"
+  },
+  "expected": [
+    {
+      "id": "tokens_month",
+      "scope": { "kind": "account", "handle": "sample-account" },
+      "metric": "total_tokens",
+      "unit": { "kind": "tokens" },
+      "window_uuid": "30000000-0000-4000-8000-000000000001",
+      "provider": "sample-provider",
+      "account_fingerprint": "fp-smoke-0001",
+      "pool_alias": "sample-pool",
+      "max_staleness_secs": 300,
+      "window_length_secs": 2592000
+    }
+  ],
+  "binding_revision": "1",
+  "binding_verified_at": "2027-01-18T11:59:00Z",
+  "scope_configured_at": "2027-01-18T11:58:00Z",
+  "timeout_ms": 5000,
+  "trust_mode": "observation_only",
+  "observation_confidence": "low",
+  "approval": {
+    "approved": false,
+    "revision": "0",
+    "executable_sha256": "",
+    "manifest_sha256": "",
+    "launch_tuple_sha256": "",
+    "runtime_files": [],
+    "endpoint_owner": "owner@example.invalid",
+    "consent": {
+      "consented_by": "",
+      "recorded_at_reference": ""
+    }
+  }
+}
