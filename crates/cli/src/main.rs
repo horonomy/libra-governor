@@ -82,6 +82,14 @@
 //!   persisted ledger tables (HORO-1672). `--principal`/`--organization`
 //!   are accepted selectors, always answered honestly as not-yet-configured
 //!   in v0.0.3 rather than rejected as unknown.
+//! - `quota-observation register|approve|enable|disable|uninstall|doctor|inspect`
+//!   — the operator CLI over `libra-governor-quota-observation`'s
+//!   registration lifecycle and read/probe surface (HORO-1870 PR2).
+//!   `doctor` is fully passive; `doctor --probe` is an opt-in
+//!   describe-only bootstrap round trip; `inspect` is the one command
+//!   that performs a live, explicitly consented `snapshot` round trip and
+//!   can report quota availability/partial/stale. See that module's own
+//!   docs.
 
 mod adapter_cmd;
 mod adapter_hook;
@@ -107,6 +115,7 @@ mod install_cmd;
 mod outcome_cmd;
 mod presentation;
 mod quota_cmd;
+mod quota_observation_cmd;
 mod statusline;
 mod statusline_provider;
 #[cfg(feature = "trusted-principal")]
@@ -144,6 +153,13 @@ Usage:
   libra-governor outcome record
   libra-governor economics explain --task|--session|--account|--principal|--organization <value> [--json]
   libra-governor quota explain --replay <path> [--as-of <rfc3339>] [--json] [--width <n>]
+  libra-governor quota-observation register <registration-file>
+  libra-governor quota-observation approve <registration-id>
+  libra-governor quota-observation enable <registration-id>
+  libra-governor quota-observation disable <registration-id>
+  libra-governor quota-observation uninstall <registration-id> [--note-executable]
+  libra-governor quota-observation doctor [<registration-id>] [--probe]
+  libra-governor quota-observation inspect <registration-id> [--constraint-ids <id1,id2,...>]
 
 Global options:
   -h, --help     Print this help and exit
@@ -219,6 +235,7 @@ fn main() {
         ["dogfood-evidence", "export"] => dogfood_evidence_cmd::run(),
         ["outcome", "record"] => outcome_cmd::run(),
         ["quota", "explain", ..] => std::process::exit(quota_cmd::run(&args[2..])),
+        ["quota-observation", ..] => std::process::exit(quota_observation_cmd::run(&args[1..])),
         ["economics", "explain", sel, value]
             if matches!(
                 *sel,
