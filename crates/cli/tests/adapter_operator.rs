@@ -7,6 +7,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
+mod interpreter_warmup;
+
 const PROFILE: &str = "libra.claude-hooks.v1";
 const PYTHON: &str = "/usr/bin/python3";
 const EXTERNAL_ID: &str = "fixture_operator_source";
@@ -24,6 +26,7 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
+    interpreter_warmup::warm_fixture_interpreter();
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_owned();
     let state = root.join("state");
