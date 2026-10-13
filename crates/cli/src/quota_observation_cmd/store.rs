@@ -335,16 +335,21 @@ mod tests {
         RegisteredContext, Transport, TransportKind, TrustMode,
     };
     use libra_governor_quota_observation::wire::{Metric, Scope, Unit};
-    use std::sync::Mutex;
 
-    // `LIBRA_GOVERNOR_STATE_DIR` is process-global via std::env::set_var;
-    // serialize every test in this module that touches it, exactly like
-    // `libra_governor_daemon::paths`'s own `ENV_LOCK` pattern, so no two
-    // tests can observe each other's override.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
+    // `LIBRA_GOVERNOR_STATE_DIR` is process-global via std::env::set_var.
+    // `daemon_cmd.rs` has its own tests that mutate the same env var and
+    // already defines a crate-shared lock for exactly this
+    // (`crate::daemon_cmd::state_dir_env_lock`) — reuse that one lock
+    // rather than defining a second, module-private one: two independent
+    // locks guarding the same process-global don't serialize against each
+    // other, so a `daemon_cmd` test and this module's tests could
+    // otherwise race under cargo's parallel test execution within this
+    // one binary (observed as a rare, non-reproducible failure before this
+    // fix).
     fn with_state_dir<T>(body: impl FnOnce(&Path) -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::daemon_cmd::state_dir_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("LIBRA_GOVERNOR_STATE_DIR", dir.path());
         let result = body(dir.path());
