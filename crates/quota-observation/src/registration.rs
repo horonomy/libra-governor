@@ -331,7 +331,11 @@ struct Binding {
 /// current process's view. Uniqueness deliberately does not constrain
 /// metric/unit: two distinct `pool_alias` values against the same
 /// account for two genuinely separate limits are allowed.
-fn check_pool_uniqueness(
+///
+/// Public so an operator-facing `register` command (HORO-1870 PR2) can
+/// run this same check against the already-loaded registrations plus a
+/// new candidate before accepting it, without duplicating the scan.
+pub fn check_pool_uniqueness(
     registrations: &[(PathBuf, Registration)],
 ) -> Result<(), RegistrationError> {
     let mut seen: HashMap<(String, String), Binding> = HashMap::new();
