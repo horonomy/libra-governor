@@ -15,6 +15,15 @@
 //! deliberately ptraces a *child* of the attacking process (always
 //! permitted under scope 1) rather than an unrelated same-UID process,
 //! so it is not itself blocked by Yama.
+//!
+//! Evidence note: whenever `ptrace_scope >= 1`, a denial in the REAL
+//! attack (t09b, lg-agent against lg-provider) cannot be attributed to
+//! the UID boundary alone — both the kernel's cross-UID ptrace check and
+//! Yama's own policy return the same `EPERM`/"Operation not permitted",
+//! so this environment cannot by itself distinguish "the UID boundary
+//! denied it" from "Yama denied it (and the UID boundary was never
+//! reached)". Only the sensitivity control (same-UID, parent→child,
+//! scope-1-exempt) isolates the UID boundary's own behavior.
 
 use libra_governor_two_principal_harness::{
     assert_disposable, positive_control, reset_state_dirs, run_as, yama_ptrace_scope, LG_AGENT,
@@ -75,39 +84,62 @@ fn t09b_agent_cannot_ptrace_the_provider() {
     // of Yama's default restricted scope (1), and clearly same-UID —
     // proving the ptrace mechanism itself is live in this container, not
     // blocked by this environment's own seccomp/Yama posture.
-    let mut spawn_cmd = libra_governor_two_principal_harness::command_as(
-        &LG_AGENT,
-        "sleep",
-        &["30"],
-        &[("PATH", PATH_ENV), ("HOME", "/home/lg-agent")],
-    );
-    let mut own_child = spawn_cmd.spawn().expect("spawn agent's own sleep child");
-    let own_child_pid = own_child.id();
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
+    //
+    // The target must be gdb's OWN child, not merely a process this test
+    // binary happened to spawn under the same UID: Yama's default
+    // restricted scope (1) permits an attach only from a process to one
+    // of its *own* descendants, so a `sleep` started directly by this
+    // Rust test binary (`command_as(...).spawn()`) is a SIBLING of the
+    // `gdb` process `run_as` execs next — not its descendant — and Yama
+    // would deny that attach too, silently turning this "always
+    // permitted" sensitivity control into a false positive that can
+    // never fail even when ptrace is genuinely broken. `sh -c 'sleep 30
+    // & exec gdb -p $! ...'` makes `gdb` fork `sleep` itself (then
+    // `exec` replaces the shell with `gdb` in the same pid), so `gdb` is
+    // the real, direct parent of its target.
+    //
+    // The oracle is gdb's own output text, not its exit code: `gdb
+    // -batch ... -ex quit` can exit 0 even when the preceding `-p`
+    // attach itself failed, which would make this control pass for the
+    // wrong reason (see the real-attempt assertion below for the same
+    // principle).
     let sensitivity_attach = run_as(
         &LG_AGENT,
-        "gdb",
+        "sh",
         &[
-            "-nx",
-            "-batch",
-            "-p",
-            &own_child_pid.to_string(),
-            "-ex",
-            "detach",
-            "-ex",
-            "quit",
+            "-c",
+            "sleep 30 & exec gdb -nx -batch -p \"$!\" -ex detach -ex quit",
         ],
         &[("PATH", PATH_ENV), ("HOME", "/home/lg-agent")],
     );
+    let sensitivity_stdout = String::from_utf8_lossy(&sensitivity_attach.stdout).to_lowercase();
+    let sensitivity_stderr = String::from_utf8_lossy(&sensitivity_attach.stderr).to_lowercase();
     assert!(
-        sensitivity_attach.status.success(),
-        "sensitivity control: lg-agent must be able to ptrace its own child; stderr={}",
-        String::from_utf8_lossy(&sensitivity_attach.stderr)
+        sensitivity_stdout.contains("attaching to process")
+            && !sensitivity_stdout.contains("not permitted")
+            && !sensitivity_stderr.contains("not permitted"),
+        "sensitivity control: lg-agent must be able to ptrace its own child \
+         (gdb's own spawned `sleep`, not merely a same-UID sibling); \
+         stdout={sensitivity_stdout} stderr={sensitivity_stderr}"
     );
 
-    own_child.kill().ok();
-    own_child.wait().ok();
+    // Best-effort cleanup of the backgrounded `sleep 30` (gdb's own
+    // child, now reparented since gdb already quit) so a passing test
+    // doesn't leave a 30s orphan running in the disposable container.
+    // gdb's "Attaching to process <pid>" line is parsed for the pid;
+    // failure to find or kill it is not itself a test failure.
+    if let Some(pid_str) = sensitivity_stdout
+        .lines()
+        .find(|l| l.contains("attaching to process"))
+        .and_then(|l| l.split_whitespace().last())
+    {
+        let _ = run_as(
+            &LG_AGENT,
+            "kill",
+            &["-9", pid_str],
+            &[("PATH", PATH_ENV), ("HOME", "/home/lg-agent")],
+        );
+    }
 
     // Real attempt: lg-agent against the provider. `gdb`'s own exit code
     // is not treated as the sole oracle (its exit path for an attach
