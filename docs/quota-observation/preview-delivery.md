@@ -72,18 +72,22 @@ and cannot prove.
    value that becomes `approval.executable_sha256`.
 3. **Write a registration** pointing `transport.executable` at that
    installed path, with a real, honest `endpoint_owner` and `consent`,
-   and `approval.approved: false` with the three digest fields blank —
-   see
+   `enabled: true`, and `approval.approved: true` with the three digest
+   fields still blank — see
    [`examples/quota-observation-extension/registration.template.json`](../../examples/quota-observation-extension/registration.template.json)
-   for the exact shape.
-4. **Approve it**: measure the real executable/manifest/launch-tuple
-   digests from the file now on disk and write them into the
-   registration's `approval` block, then set `approved: true`. **No CLI
-   performs this step today** (pending CLI slice, ticket TBD) — see
-   `tests/common/mod.rs::approve`'s own doc comment for why this
-   repository's test suite drives this through the crate's own public
-   `identity::verify_identity` function in a loop rather than through
-   any command.
+   for the exact shape. **Set `approved: true` before you have real
+   digests, not after**: `verify_identity` rejects as
+   `NotApproved`/`Disabled` before it ever measures anything, so there
+   is no way to discover the real digests until `enabled`/`approved`
+   are already set this way.
+4. **Approve it for real**: measure the real
+   executable/manifest/launch-tuple digests from the file now on disk
+   and write them into the registration's `approval` block, replacing
+   the blank placeholders from step 3. **No CLI performs this step
+   today** (pending HORO-1870) — see `tests/common/mod.rs::approve`'s
+   own doc comment for why this repository's test suite drives this
+   through the crate's own public `identity::verify_identity` function
+   in a loop rather than through any command.
 5. **Invoke `describe`, then `snapshot`**, through
    `crates/quota-observation`'s own public API
    (`runner::invoke` + `runner::parse_single_frame`, or the full
@@ -98,8 +102,12 @@ and cannot prove.
    [`trust-and-lifecycle.md`](trust-and-lifecycle.md)'s "Uninstall"
    section).
 
-`tests/preview_clean_install.rs` automates steps 1–6 above end to end
-against the sample extension in
+`tests/preview_clean_install.rs` automates steps 1 and 3–6 above end to
+end against the sample extension in
 [`examples/quota-observation-extension/`](../../examples/quota-observation-extension/),
 using the test-only self-approval helper for step 4 — not a real
-operator approval flow, since none exists yet.
+operator approval flow, since none exists yet. It does not automate
+step 2 (checking the checksum against a published value — see the
+test's own module doc comment); it also exercises one additional check
+step 1–6 doesn't list above: tampering with the installed executable
+after approval is caught as `ExecutableDigestMismatch`.
