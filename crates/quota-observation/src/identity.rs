@@ -186,6 +186,118 @@ pub fn verify_identity(registration: &Registration) -> Result<(), IdentityError>
     Ok(())
 }
 
+/// The digests an approval binds, freshly re-measured from disk right
+/// now — the same values [`verify_identity`] re-derives on every
+/// invocation, surfaced here so an operator-facing `approve` command can
+/// measure them once, show them to the operator, and bind them into a
+/// [`Registration`]'s [`crate::registration::Approval`] via [`approve`].
+/// `executable_sha256`/`manifest_sha256`/`launch_tuple_sha256` mirror
+/// `Approval`'s own fields of the same name. `runtime_file_digests` is
+/// `(path, sha256)` pairs in exactly the declared order of the
+/// registration's `approval.runtime_files` at measurement time —
+/// [`approve`] uses both the order and the path to line each measured
+/// digest back up with the declared entry it belongs to, rather than
+/// trusting positional order alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeasuredIdentity {
+    pub executable_sha256: String,
+    pub manifest_sha256: String,
+    pub launch_tuple_sha256: String,
+    pub runtime_file_digests: Vec<(String, String)>,
+}
+
+/// Measures `registration`'s executable digest, manifest digest,
+/// per-runtime-file digests, and launch-tuple digest fresh from disk, in
+/// the same order [`verify_identity`] checks them, reusing its exact
+/// private canonicalization ([`digest_file`], [`manifest_digest`],
+/// [`launch_tuple_digest`]) rather than reimplementing it. Unlike
+/// [`verify_identity`], this does **not** compare the result against
+/// `registration.approval`'s existing (possibly blank) digest fields —
+/// it has no notion of "mismatch", only "what is on disk right now".
+/// That comparison is `verify_identity`'s job at invocation time; this
+/// function's job is to produce the values an `approve` operation binds
+/// in the first place.
+pub fn measure_identity(registration: &Registration) -> Result<MeasuredIdentity, IdentityError> {
+    let executable_digest = digest_file(Path::new(&registration.transport.executable))?;
+
+    let mut runtime_file_digests = Vec::with_capacity(registration.approval.runtime_files.len());
+    for declared in &registration.approval.runtime_files {
+        let measured = digest_file(Path::new(&declared.path))?;
+        runtime_file_digests.push((declared.path.clone(), measured));
+    }
+
+    let manifest_measured = manifest_digest(registration);
+    let launch_tuple_measured =
+        launch_tuple_digest(registration, &executable_digest, &runtime_file_digests);
+
+    Ok(MeasuredIdentity {
+        executable_sha256: executable_digest,
+        manifest_sha256: manifest_measured,
+        launch_tuple_sha256: launch_tuple_measured,
+        runtime_file_digests,
+    })
+}
+
+/// Failure modes of an operator-facing approval.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ApprovalError {
+    /// `approve` itself never touches disk — a caller measures first via
+    /// [`measure_identity`] and passes the result in — so this variant
+    /// exists to let that caller propagate a measurement failure through
+    /// the same `Result` chain as the approval step itself, via `?`,
+    /// rather than inventing a second error type for what is really one
+    /// operator-facing operation.
+    #[error("failed to measure identity before approval: {0}")]
+    Measurement(#[from] IdentityError),
+    /// `measured.runtime_file_digests` does not correspond, path-for-path
+    /// and in order, to `registration.approval.runtime_files` — e.g. a
+    /// [`MeasuredIdentity`] measured against a different registration, or
+    /// a registration whose declared runtime files changed between
+    /// measuring and approving. Caught here rather than silently
+    /// approving against the wrong files.
+    #[error(
+        "measured runtime file digests do not match the registration's declared runtime files"
+    )]
+    RuntimeFilesMismatch,
+}
+
+/// Binds `measured`'s digests into `registration.approval`, setting
+/// `approval.approved = true` and each declared runtime file's
+/// `sha256`. Touches nothing else on `registration` — not `enabled`,
+/// not any `expected[]` entry, not
+/// `approval.revision`/`endpoint_owner`/`consent`. Callers are
+/// responsible for measuring `measured` against this same registration
+/// (see [`measure_identity`]); this function checks only that
+/// `measured.runtime_file_digests` lines up path-for-path with
+/// `registration.approval.runtime_files`, returning
+/// [`ApprovalError::RuntimeFilesMismatch`] if not — it does not
+/// re-measure anything itself.
+pub fn approve(
+    mut registration: Registration,
+    measured: MeasuredIdentity,
+) -> Result<Registration, ApprovalError> {
+    if measured.runtime_file_digests.len() != registration.approval.runtime_files.len() {
+        return Err(ApprovalError::RuntimeFilesMismatch);
+    }
+    for (declared, (path, digest)) in registration
+        .approval
+        .runtime_files
+        .iter_mut()
+        .zip(measured.runtime_file_digests.into_iter())
+    {
+        if declared.path != path {
+            return Err(ApprovalError::RuntimeFilesMismatch);
+        }
+        declared.sha256 = digest;
+    }
+
+    registration.approval.approved = true;
+    registration.approval.executable_sha256 = measured.executable_sha256;
+    registration.approval.manifest_sha256 = measured.manifest_sha256;
+    registration.approval.launch_tuple_sha256 = measured.launch_tuple_sha256;
+    Ok(registration)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,5 +613,68 @@ mod tests {
         // some permanent inability to approve an enabled registration.
         let reapproved = approve(flipped);
         assert!(verify_identity(&reapproved).is_ok());
+    }
+
+    #[test]
+    fn measure_identity_then_approve_produces_a_registration_that_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = write_executable(dir.path(), "ext", b"binary-one");
+        let lib_a = write_executable(dir.path(), "a.so", b"lib-a");
+        let runtime_files = vec![RuntimeFileDigest {
+            path: lib_a.to_str().unwrap().to_owned(),
+            sha256: String::new(),
+        }];
+        let unapproved = build(&executable, runtime_files);
+
+        let measured = super::measure_identity(&unapproved).unwrap();
+        let approved = super::approve(unapproved, measured).unwrap();
+
+        assert!(approved.approval.approved);
+        assert!(verify_identity(&approved).is_ok());
+    }
+
+    #[test]
+    fn approve_sets_only_approved_flag_and_the_three_digests() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = write_executable(dir.path(), "ext", b"binary-one");
+        let mut unapproved = build(&executable, vec![]);
+        unapproved.approval.approved = false;
+        let before = unapproved.clone();
+
+        let measured = super::measure_identity(&unapproved).unwrap();
+        let approved = super::approve(unapproved, measured.clone()).unwrap();
+
+        assert!(approved.approval.approved);
+        assert_eq!(
+            approved.approval.executable_sha256,
+            measured.executable_sha256
+        );
+        assert_eq!(approved.approval.manifest_sha256, measured.manifest_sha256);
+        assert_eq!(
+            approved.approval.launch_tuple_sha256,
+            measured.launch_tuple_sha256
+        );
+
+        // Nothing else moved.
+        let mut expected_approval = before.approval.clone();
+        expected_approval.approved = true;
+        expected_approval.executable_sha256 = measured.executable_sha256;
+        expected_approval.manifest_sha256 = measured.manifest_sha256;
+        expected_approval.launch_tuple_sha256 = measured.launch_tuple_sha256;
+        assert_eq!(approved.approval, expected_approval);
+        assert_eq!(approved.context, before.context);
+        assert_eq!(approved.transport, before.transport);
+        assert_eq!(approved.enabled, before.enabled);
+    }
+
+    #[test]
+    fn measure_identity_surfaces_io_error_for_a_missing_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let registration = build(&missing, vec![]);
+        assert!(matches!(
+            super::measure_identity(&registration).unwrap_err(),
+            IdentityError::Io(_, _)
+        ));
     }
 }
