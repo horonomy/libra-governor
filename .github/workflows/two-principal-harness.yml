@@ -1,0 +1,37 @@
+name: Two-principal harness
+
+# Deliberately minimal (ADR-0019 §5 "Orchestration and teardown": "It
+# just calls run.sh") — this is new CI surface, and this repository's
+# policy requires changes to CI definitions to get explicit review
+# before merge, so this workflow does nothing beyond what
+# `harness/two-principal/run.sh` itself already does locally.
+#
+# `workflow_dispatch` plus a path filter, not `push`/`pull_request` on
+# every change — the harness only needs to re-run when something it
+# actually exercises changes.
+on:
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - "crates/daemon/**"
+      - "crates/cli/**"
+      - "crates/ledger/**"
+      # ADR-0019 §5 names daemon/cli/ledger/harness explicitly; these two
+      # extra entries are a small, deliberate addition so an edit to the
+      # harness's own test fixtures or to this workflow file also
+      # triggers it, rather than only ever running via manual dispatch.
+      - "crates/two-principal-harness/**"
+      - "harness/**"
+      - ".github/workflows/two-principal-harness.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  two-principal-harness:
+    name: two-principal harness (disposable container)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: run the disposable two-principal harness
+        run: harness/two-principal/run.sh
