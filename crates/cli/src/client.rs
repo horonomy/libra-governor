@@ -37,6 +37,20 @@ pub enum ClientError {
     ProtocolMismatch(u32, u32),
     #[error("daemon returned an error: {0}")]
     DaemonError(String),
+    /// The pinned trusted-principal config (ADR-0019, PR-2c) is present
+    /// but unreadable, untrustworthy, or invalid. Never reached in a
+    /// default build.
+    #[cfg(feature = "trusted-principal")]
+    #[error("trusted-principal config error: {0}")]
+    TrustedConfig(String),
+    /// The server's kernel-attested peer uid did not match the pinned
+    /// config's `provider_uid`. Deliberately carries no uid in its
+    /// `Display` — matching the CodeQL `rust/cleartext-logging` lesson
+    /// already applied elsewhere in this module tree (see
+    /// `trusted_principal::peer`'s own doc comment).
+    #[cfg(feature = "trusted-principal")]
+    #[error("the server's identity did not match the pinned trusted-principal configuration")]
+    ServerIdentityMismatch,
 }
 
 fn connect_once(socket_path: &Path) -> std::io::Result<UnixStream> {
@@ -50,6 +64,10 @@ fn connect_once(socket_path: &Path) -> std::io::Result<UnixStream> {
 /// statusline subcommand, which must not become a daemon-spawning race
 /// factory on every refresh tick.
 pub fn connect_only(socket_path: &Path) -> Result<UnixStream, ClientError> {
+    #[cfg(feature = "trusted-principal")]
+    if let Some(ep) = crate::trusted_client::pinned_endpoint()? {
+        return crate::trusted_client::connect_verified(&ep, REQUEST_TIMEOUT);
+    }
     connect_once(socket_path)
         .map_err(|e| ClientError::DaemonUnavailable(socket_path.to_path_buf(), e.to_string()))
 }
@@ -80,6 +98,10 @@ pub fn connect_only_with_budget(
             "no time left in the caller's budget to attempt a request".to_string(),
         ));
     }
+    #[cfg(feature = "trusted-principal")]
+    if let Some(ep) = crate::trusted_client::pinned_endpoint()? {
+        return crate::trusted_client::connect_verified(&ep, budget);
+    }
     let connect = |path: &Path| -> std::io::Result<UnixStream> {
         let stream = UnixStream::connect(path)?;
         stream.set_read_timeout(Some(budget))?;
@@ -94,6 +116,10 @@ pub fn connect_only_with_budget(
 /// connection attempt fails, then polling for readiness up to
 /// [`SPAWN_WAIT_BUDGET`]. Used by the `hook` subcommand only.
 pub fn ensure_daemon_connection(socket_path: &Path) -> Result<UnixStream, ClientError> {
+    #[cfg(feature = "trusted-principal")]
+    if let Some(ep) = crate::trusted_client::pinned_endpoint()? {
+        return crate::trusted_client::connect_verified(&ep, REQUEST_TIMEOUT);
+    }
     if let Ok(stream) = connect_once(socket_path) {
         return Ok(stream);
     }

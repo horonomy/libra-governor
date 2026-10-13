@@ -109,6 +109,8 @@ mod presentation;
 mod quota_cmd;
 mod statusline;
 mod statusline_provider;
+#[cfg(feature = "trusted-principal")]
+mod trusted_client;
 mod uninstall_cmd;
 mod write_lock;
 
@@ -174,6 +176,17 @@ fn main() {
         ["adapter-hook", ..] => std::process::exit(adapter_hook::run(&args[1..])),
         ["daemon", "run"] => daemon_cmd::run(),
         ["daemon", "stop"] => std::process::exit(daemon_cmd::stop()),
+        // Hidden, undocumented entry point for ADR-0019/HORO-1835's
+        // trusted-principal mode (deliberately absent from USAGE/--help —
+        // the positioning guard watches this file, but only the
+        // "local-first execution governor" ... "{USAGE}" span, so this
+        // match arm is outside its scanned range). A default build (no
+        // `trusted-principal` feature) sends this argv to the fallback
+        // arm below, which exits 2.
+        #[cfg(feature = "trusted-principal")]
+        ["daemon", "run", "--trusted-principal-config", path] => {
+            std::process::exit(daemon_cmd::run_trusted(std::path::Path::new(path)))
+        }
         ["hook", "user-prompt-submit"] => hook::run(),
         ["hook", "post-tool-use"] => hook_post_tool_use::run(),
         ["hook", "stop"] => hook_stop::run(),
