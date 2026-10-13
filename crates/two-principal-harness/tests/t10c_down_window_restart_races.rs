@@ -341,16 +341,20 @@ fn t10c_down_window_create_bind_connect_all_fail() {
     // converting this into a test of the error path instead of the
     // success path. The actual oracle is the reply's own `kind`, which
     // must be the `status` success variant, not merely a process exit
-    // code. (Hardcoded `14` must track `libra_governor_protocol::PROTOCOL_VERSION`;
-    // this crate deliberately takes no Cargo dependency on `cli`/`daemon`,
-    // but a future protocol bump still needs this literal updated by hand.)
+    // code. This crate deliberately takes no Cargo *production* dependency
+    // on `cli`/`daemon`, but a test-only dev-dependency on
+    // `libra-governor-protocol` keeps this request's version current
+    // automatically — see the earlier `14`-vs-`15` mismatch this exact
+    // literal caused when PROTOCOL_VERSION moved without this file being
+    // updated by hand.
+    let status_request = format!(
+        r#"{{"protocol_version":{},"request":{{"kind":"status"}}}}"#,
+        libra_governor_protocol::PROTOCOL_VERSION
+    );
     let out = run_as(
         &LG_AGENT,
         raw_client_bin(),
-        &[
-            PROVIDER_SOCKET,
-            r#"{"protocol_version":14,"request":{"kind":"status"}}"#,
-        ],
+        &[PROVIDER_SOCKET, &status_request],
         &[("PATH", PATH_ENV), ("HOME", "/home/lg-agent")],
     );
     assert!(

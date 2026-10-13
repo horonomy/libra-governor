@@ -97,8 +97,11 @@ fn t10b_newer_protocol_envelope_does_not_shut_down_the_provider() {
 
     // Prove it is not merely alive but still SERVING: a normal request
     // must still get a normal reply.
-    let normal = r#"{"protocol_version":14,"request":{"kind":"status"}}"#;
-    let out = send(PROVIDER_SOCKET, normal);
+    let normal = format!(
+        r#"{{"protocol_version":{},"request":{{"kind":"status"}}}}"#,
+        libra_governor_protocol::PROTOCOL_VERSION
+    );
+    let out = send(PROVIDER_SOCKET, &normal);
     assert!(
         out.status.success(),
         "trusted provider must still serve a normal request after the mismatched envelope"

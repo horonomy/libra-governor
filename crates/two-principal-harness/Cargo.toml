@@ -11,9 +11,13 @@ publish = false
 # `libra-governor-daemon` (ADR-0019 §1 "Workspace feature unification").
 # It drives the already-built `libra-governor` binary purely through
 # `std::process::Command` and stdin JSON, and reads the ledger by
-# shelling out to the system `sqlite3` CLI rather than linking
-# `rusqlite` — so this crate carries no Cargo dependency that a future
-# `trusted-principal` feature on `cli`/`daemon` could ever unify onto.
+# shelling out to the system `sqlite3` CLI — the crate's own code never
+# calls `rusqlite` to do that (the dev-dependency below pulls rusqlite
+# in transitively through `libra-governor-protocol`'s own dependency
+# chain, for an unrelated reason; that's a build-graph detail, not a
+# change in how this crate reads the ledger) — so this crate carries no
+# Cargo dependency that a future `trusted-principal` feature on
+# `cli`/`daemon` could ever unify onto.
 [dependencies]
 serde_json.workspace = true
 # PR-2b addition, for `lg-raw-client --print-peer-uid`'s own
@@ -24,3 +28,13 @@ serde_json.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+# Test-only: lets harness tests reference `PROTOCOL_VERSION` instead of a
+# hardcoded literal, so a protocol bump is picked up automatically here
+# instead of silently producing a runtime "protocol version mismatch"
+# failure (as happened when PROTOCOL_VERSION moved 14->15 and these
+# tests' hardcoded `14` literals were missed). A dev-dependency never
+# ships in the harness container's actual runtime artifact, so this
+# doesn't reopen the production dependency isolation above. It does
+# transitively link `rusqlite` (via `libra-governor-ledger`) into the
+# harness test binaries — see the comment above this block.
+libra-governor-protocol = { path = "../protocol" }

@@ -73,7 +73,7 @@ fn send(principal: &Principal, home: &str, socket: &str, json: &str) -> serde_js
 /// passes never collide on `session_id`/`idempotency_key`.
 fn seed_task_and_record_outcome(socket: &str, tag: &str) {
     let preflight = serde_json::json!({
-        "protocol_version": 14,
+        "protocol_version": libra_governor_protocol::PROTOCOL_VERSION,
         "request": {
             "kind": "preflight",
             "task_hint": format!("t07b {tag} preflight"),
@@ -89,7 +89,7 @@ fn seed_task_and_record_outcome(socket: &str, tag: &str) {
         .to_string();
 
     let outcome = serde_json::json!({
-        "protocol_version": 14,
+        "protocol_version": libra_governor_protocol::PROTOCOL_VERSION,
         "request": {
             "kind": "record_outcome",
             "task_id": task_id,
