@@ -21,14 +21,14 @@ documented here). Mirrors the style of the existing
 > Phase A conformance kit, HORO-1855). Nothing documented here is
 > available on `main` yet.
 >
-> **No CLI exists for this protocol.** There is no `register`,
+> **No CLI exists for this protocol yet.** There is no `register`,
 > `approve`, or `observe` command anywhere in this codebase today. Every
 > operator-facing step described in these docs that would normally be a
 > CLI invocation is instead written against `crates/quota-observation`'s
-> own public library API, and is explicitly labelled **"pending CLI
-> slice, ticket TBD"** at the point it applies. Do not infer a ticket
-> number for that slice from anything in these docs — none has been
-> created.
+> own public library API, and is explicitly labelled **"pending
+> HORO-1870"** at the point it applies. HORO-1870 owns the CLI slice
+> (register/inspect/approve/enable/disable/uninstall) and is blocked on
+> HORO-1854 (#135) and HORO-1855 (#137) merging first.
 
 ## What's here
 

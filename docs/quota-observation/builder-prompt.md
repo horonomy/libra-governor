@@ -149,7 +149,7 @@ For each run, check:
    for a complete worked example of this shape.
 
 **Reminder**: there is no CLI to perform the approval step today
-(pending CLI slice, ticket TBD). Approving a registration currently
+(pending HORO-1870). Approving a registration currently
 means calling `crates/quota-observation`'s own public
 `identity::verify_identity` (to discover the correct digests) and
 writing them into the registration file yourself, or — if you are
