@@ -98,24 +98,40 @@ fn t09b_agent_cannot_ptrace_the_provider() {
     // `exec` replaces the shell with `gdb` in the same pid), so `gdb` is
     // the real, direct parent of its target.
     //
+    // `sleep`'s own stdout/stderr are explicitly redirected to
+    // `/dev/null` rather than left to inherit the shell's (and
+    // therefore `run_as`'s piped) descriptors: a backgrounded `&` job
+    // keeps its parent's fds open for as long as IT runs, so without
+    // this redirect `Command::output()` blocks reading EOF from this
+    // pipe for the full 30s even after `gdb` itself has exited — proven
+    // empirically (CI: this test hung for exactly 30.10s before this
+    // fix).
+    //
     // The oracle is gdb's own output text, not its exit code: `gdb
     // -batch ... -ex quit` can exit 0 even when the preceding `-p`
     // attach itself failed, which would make this control pass for the
     // wrong reason (see the real-attempt assertion below for the same
-    // principle).
+    // principle). It is NOT "Attaching to process" — proven empirically
+    // (CI) that this gdb build/config does not print that line for a
+    // non-interactive `-batch -p` attach — but a successful attach
+    // followed by `-ex detach` does always print `"<pid>) detached"`,
+    // and `-ex detach` only ever runs at all if the preceding attach
+    // itself succeeded (gdb refuses `detach` with nothing attached).
     let sensitivity_attach = run_as(
         &LG_AGENT,
         "sh",
         &[
             "-c",
-            "sleep 30 & exec gdb -nx -batch -p \"$!\" -ex detach -ex quit",
+            "sleep 30 >/dev/null 2>&1 & \
+             printf 'sensitivity_target_pid=%s\\n' \"$!\"; \
+             exec gdb -nx -batch -p \"$!\" -ex detach -ex quit",
         ],
         &[("PATH", PATH_ENV), ("HOME", "/home/lg-agent")],
     );
     let sensitivity_stdout = String::from_utf8_lossy(&sensitivity_attach.stdout).to_lowercase();
     let sensitivity_stderr = String::from_utf8_lossy(&sensitivity_attach.stderr).to_lowercase();
     assert!(
-        sensitivity_stdout.contains("attaching to process")
+        sensitivity_stdout.contains("detached")
             && !sensitivity_stdout.contains("not permitted")
             && !sensitivity_stderr.contains("not permitted"),
         "sensitivity control: lg-agent must be able to ptrace its own child \
@@ -126,12 +142,12 @@ fn t09b_agent_cannot_ptrace_the_provider() {
     // Best-effort cleanup of the backgrounded `sleep 30` (gdb's own
     // child, now reparented since gdb already quit) so a passing test
     // doesn't leave a 30s orphan running in the disposable container.
-    // gdb's "Attaching to process <pid>" line is parsed for the pid;
+    // The pid this test's own `printf` line printed is parsed back out;
     // failure to find or kill it is not itself a test failure.
     if let Some(pid_str) = sensitivity_stdout
         .lines()
-        .find(|l| l.contains("attaching to process"))
-        .and_then(|l| l.split_whitespace().last())
+        .find(|l| l.starts_with("sensitivity_target_pid="))
+        .and_then(|l| l.split('=').nth(1))
     {
         let _ = run_as(
             &LG_AGENT,
