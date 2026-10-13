@@ -329,6 +329,25 @@ impl From<&ClientError> for NoReading {
             ClientError::Wire(_) => NoReading::ResponseNotUnderstood,
             ClientError::ProtocolMismatch(..) => NoReading::DaemonProtocolMismatch,
             ClientError::DaemonError(_) => NoReading::DaemonReportedError,
+            // ADR-0019 PR-2c. Neither of these establishes the one fact
+            // `DaemonUnreachable` is reserved for ("the thing is not
+            // there" — see `availability`'s own doc comment) — a
+            // mismatched or unresolvable trusted config says nothing
+            // about whether a daemon process exists, only that this
+            // client could not (or chose not to) talk to it.
+            //
+            // `TrustedConfig` means the client could not even determine
+            // where to connect — the direct analogue of
+            // `SocketPathUnresolved`.
+            #[cfg(feature = "trusted-principal")]
+            ClientError::TrustedConfig(_) => NoReading::SocketPathUnresolved,
+            // `ServerIdentityMismatch` means a process WAS listening and
+            // answered the kernel-level peer-credential check — this
+            // client simply refused to trust it. That is a real
+            // connection whose answer could not be accepted, the same
+            // shape of fact `ResponseNotUnderstood` already covers.
+            #[cfg(feature = "trusted-principal")]
+            ClientError::ServerIdentityMismatch => NoReading::ResponseNotUnderstood,
         }
     }
 }

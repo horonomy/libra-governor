@@ -109,6 +109,8 @@ mod presentation;
 mod quota_cmd;
 mod statusline;
 mod statusline_provider;
+#[cfg(feature = "trusted-principal")]
+mod trusted_client;
 mod uninstall_cmd;
 mod write_lock;
 

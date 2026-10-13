@@ -115,7 +115,12 @@ fn kind_of(metadata: &Metadata) -> FileKind {
 /// because these are root-pinned paths, not agent-named ones (canonicalizing
 /// an agent-named path would be the confused-deputy read `serve.rs`'s
 /// sanitizer exists to prevent).
-fn check_path_chain(path: &Path, owners: &[u32]) -> Result<(), StartupError> {
+///
+/// `pub`, not `pub(crate)`: PR-2c's client-side pinned-endpoint
+/// resolution (`crates/cli/src/trusted_client.rs`) reuses this exact
+/// function (design doc §5: "canonicalize, then
+/// `check_path_chain(path, &[0])`") rather than duplicating the walk.
+pub fn check_path_chain(path: &Path, owners: &[u32]) -> Result<(), StartupError> {
     let canonical = path.canonicalize().map_err(|_| StartupError::PathChain {
         path: path.to_path_buf(),
     })?;

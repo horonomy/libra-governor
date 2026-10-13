@@ -761,48 +761,41 @@ impl Drop for TrustedDaemon {
     }
 }
 
-/// This crate takes no Cargo dependency on `libra-governor-protocol`
-/// (see `Cargo.toml`'s doc comment), so this is a hand-kept mirror of
-/// `libra_governor_protocol::PROTOCOL_VERSION` — bump it if that
-/// constant ever changes, or every raw-socket request this crate sends
-/// starts failing on a protocol-version mismatch.
-const RAW_PROTOCOL_VERSION: u32 = 14;
-
-/// PR-2a/2b's positive control (design doc §7 `trusted_positive_control`):
+/// PR-2a/2b/2c's positive control (design doc §7 `trusted_positive_control`):
 /// an agent `Preflight` creates a task in the provider ledger over the
 /// real trusted socket, then a provider-UID `RecordOutcome` lands a
 /// (non-authoritative — authoritative attestation is PR-3) row for it.
-/// Both halves go through `lg-raw-client` because no CLI client knows the
-/// pinned endpoint before PR-2c.
 ///
-/// `raw_client_bin` is the caller's own
-/// `env!("CARGO_BIN_EXE_lg-raw-client")` — resolved in the calling
-/// integration test file, not here: `CARGO_BIN_EXE_<name>` is only
-/// defined at compile time for an actual integration-test target, and
-/// this library crate itself (built as a plain `lib`, not a test binary)
-/// has no such variable to read.
+/// As of PR-2c, this switches to the real `hook user-prompt-submit` and
+/// `outcome record` CLI subcommands (design doc §7: "In 2c, it switches
+/// to the real hook"), now that `trusted_client.rs` lets a real CLI
+/// client find the pinned endpoint. Before PR-2c both halves went
+/// through `lg-raw-client` because no CLI client knew it yet.
+///
+/// `raw_client_bin` is no longer used by this function's own body, but
+/// the parameter stays: this function's existing call site in PR-2a's
+/// `x_confused_deputy.rs` (which this PR must not touch) passes
+/// `env!("CARGO_BIN_EXE_lg-raw-client")` positionally, and changing the
+/// signature would force an edit there.
 pub fn trusted_positive_control(daemon: &TrustedDaemon, raw_client_bin: &str) -> String {
-    let _ = daemon;
-    let preflight = serde_json::json!({
-        "protocol_version": RAW_PROTOCOL_VERSION,
-        "request": {
-            "kind": "preflight",
-            "task_hint": "trusted harness positive control preflight",
-            "cwd": "",
-            "session_id": "trusted-harness-positive-control",
-        }
+    let _ = (daemon, raw_client_bin);
+    let preflight_payload = serde_json::json!({
+        "session_id": "trusted-harness-positive-control-cli",
+        "cwd": "",
+        "prompt": "trusted harness positive control preflight (cli)",
     })
     .to_string();
 
-    let out = run_as(
+    let out = run_as_with_stdin(
         &LG_AGENT,
-        raw_client_bin,
-        &[PROVIDER_SOCKET, &preflight],
+        PROVIDER_BINARY,
+        &["hook", "user-prompt-submit"],
         &[("PATH", PATH_ENV), ("HOME", "/home/lg-agent")],
+        &preflight_payload,
     );
     if !out.status.success() {
         panic!(
-            "trusted positive control: preflight via lg-raw-client failed: stdout={} stderr={}",
+            "trusted positive control (cli): hook user-prompt-submit failed: stdout={} stderr={}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
@@ -814,31 +807,34 @@ pub fn trusted_positive_control(daemon: &TrustedDaemon, raw_client_bin: &str) ->
     )
     .into_iter()
     .next()
-    .unwrap_or_else(|| panic!("trusted positive control: no task row appeared after preflight"));
+    .unwrap_or_else(|| {
+        panic!("trusted positive control (cli): no task row appeared after hook user-prompt-submit")
+    });
 
-    let record_outcome = serde_json::json!({
-        "protocol_version": RAW_PROTOCOL_VERSION,
-        "request": {
-            "kind": "record_outcome",
-            "task_id": task_id,
-            "plan_id": null,
-            "source_id": "two-principal-harness-trusted-positive-control",
-            "idempotency_key": "trusted-harness-positive-control-1",
-            "outcome": {"kind": "completed", "evidence": ["harness://trusted-positive-control"]},
-            "signed_claim": null,
-        }
+    let outcome_payload = serde_json::json!({
+        "task_id": task_id,
+        "source_id": "two-principal-harness-trusted-positive-control-cli",
+        "idempotency_key": "trusted-harness-positive-control-cli-1",
+        "outcome": {"kind": "completed", "evidence": ["harness://trusted-positive-control-cli"]},
     })
     .to_string();
 
-    let out = run_as(
+    // Any non-empty HOME works for the provider's own `outcome record`
+    // invocation: `outcome_cmd.rs` resolves the socket path only to
+    // immediately ignore it once a pinned config is found, and never
+    // calls the identity/host_id machinery that would actually create
+    // anything under it. `PROVIDER_STATE_DIR` is simply a HOME value
+    // already owned by lg-provider.
+    let out = run_as_with_stdin(
         &LG_PROVIDER,
-        raw_client_bin,
-        &[PROVIDER_SOCKET, &record_outcome],
-        &[("PATH", PATH_ENV), ("HOME", "/root")],
+        PROVIDER_BINARY,
+        &["outcome", "record"],
+        &[("PATH", PATH_ENV), ("HOME", PROVIDER_STATE_DIR)],
+        &outcome_payload,
     );
     if !out.status.success() {
         panic!(
-            "trusted positive control: record_outcome via lg-raw-client failed: stdout={} stderr={}",
+            "trusted positive control (cli): outcome record failed: stdout={} stderr={}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
