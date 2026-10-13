@@ -25,12 +25,13 @@ admission/pacing/enforcement decision. Its only job is to answer
   treating `extension_id` as an opaque string).
 - **How the extension gets its own credentials (E1)** — see
   [`trust-and-lifecycle.md`](trust-and-lifecycle.md)'s E1 section. The
-  host hands you nothing; decide your own credential-resolution
-  mechanism now (env var your *own* process reads before `exec`-ing
-  into this one-shot binary is a common choice, but the one-shot
-  process itself receives a cleared environment — resolve the
-  credential in whatever wraps or produces the registered executable,
-  not inside the one-shot binary's own runtime).
+  host spawns your registered executable directly with a cleared
+  environment — there is no process of your own that runs first to set
+  one up. A realistic option is a credential file at a fixed, absolute
+  path your executable reads itself at runtime; **never** list that
+  file in `runtime_files` (its hash would bind into the launch-tuple
+  digest, breaking approval on every routine credential rotation — see
+  `trust-and-lifecycle.md`'s E1 section for why).
 - **Constraint list**: for each quota/usage limit you will report,
   decide its `id` (stable, you choose it), `scope`
   (`principal`/`account`/`team`/`organization`/`project`/
