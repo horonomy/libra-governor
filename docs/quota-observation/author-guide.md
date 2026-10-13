@@ -1,12 +1,12 @@
 # Quota-observation author guide (HORO-1856)
 
 See [`README.md`](README.md)'s status banner first: experimental 0.x
-preview, observation-only, depends on unmerged PRs #135/#137, no CLI
+preview, observation-only, merged to `main` (HORO-1854/1855), no CLI
 exists for this protocol yet.
 
 This guide documents the one-shot stdio runtime contract and
 `describe`/`snapshot` wire operations exactly as
-`crates/quota-observation` (PR #135) implements them — field names and
+`crates/quota-observation` implements them — field names and
 rules below are taken directly from `crates/quota-observation/src/runner.rs`
 and `crates/quota-observation/src/wire.rs`, not from the original design
 doc's prose, so where the two differ this guide follows the code.

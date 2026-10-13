@@ -2,7 +2,7 @@
 
 See [`README.md`](README.md)'s status banner first. Everything below
 describes `crates/quota-observation` (`src/identity.rs`,
-`src/registration.rs`) exactly as it exists in PR #135 — where a claim
+`src/registration.rs`) exactly as it exists on `main` — where a claim
 below was verified against the actual code rather than assumed from the
 original design prose, that's noted explicitly.
 

@@ -15,11 +15,9 @@ documented here). Mirrors the style of the existing
 > will under this design — see the crate's own `lib.rs` module docs for
 > the authoritative scope statement.
 >
-> **Depends on two unmerged pull requests**, referenced here by PR
-> number only (never a commit SHA or version tag, since both are still
-> moving): **#135** (the crate itself, HORO-1854) and **#137** (the
-> Phase A conformance kit, HORO-1855). Nothing documented here is
-> available on `main` yet.
+> **On `main`.** `crates/quota-observation` (HORO-1854, PR #135) and its
+> Phase A conformance kit (HORO-1855, PR #137) are merged. Referenced
+> here by PR number for history, not because anything is still pending.
 >
 > **No CLI exists for this protocol yet.** There is no `register`,
 > `approve`, or `observe` command anywhere in this codebase today. Every
@@ -27,8 +25,8 @@ documented here). Mirrors the style of the existing
 > CLI invocation is instead written against `crates/quota-observation`'s
 > own public library API, and is explicitly labelled **"pending
 > HORO-1870"** at the point it applies. HORO-1870 owns the CLI slice
-> (register/inspect/approve/enable/disable/uninstall) and is blocked on
-> HORO-1854 (#135) and HORO-1855 (#137) merging first.
+> (register/inspect/approve/enable/disable/uninstall) and is now
+> unblocked (its dependencies, HORO-1854 and HORO-1855, are merged).
 
 ## What's here
 
@@ -43,8 +41,9 @@ documented here). Mirrors the style of the existing
 ## Relationship to the design doc and the crate itself
 
 These docs describe the **accepted HORO-1853 design-v2 contract** as
-`crates/quota-observation` (PR #135) and its conformance kit (PR #137)
-actually implement it today — not an aspirational future version. Where
+`crates/quota-observation` (HORO-1854) and its conformance kit
+(HORO-1855) actually implement it today on `main` — not an aspirational
+future version. Where
 the crate has a known, disclosed gap against the original design plan
 (see `crates/quota-observation/tests/README.md`'s `G1`–`G11` catalog),
 these docs say so explicitly rather than describing the gap as closed.

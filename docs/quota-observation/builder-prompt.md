@@ -3,8 +3,8 @@
 A copy-pasteable template for a human or an LLM to follow when building
 a new `quota-observation` one-shot stdio extension against the accepted
 contract. See [`README.md`](README.md)'s status banner first:
-experimental 0.x preview, observation-only, depends on unmerged PRs
-#135/#137, no CLI exists for this protocol yet.
+experimental 0.x preview, observation-only, merged to `main`
+(HORO-1854/1855), no CLI exists for this protocol yet.
 
 ---
 
