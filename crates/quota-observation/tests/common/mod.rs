@@ -19,7 +19,7 @@ use time::macros::datetime;
 use time::OffsetDateTime;
 
 use libra_governor_quota_observation::freshness::{self, BoundSnapshotResult, FreshnessError};
-use libra_governor_quota_observation::identity::{self, IdentityError};
+use libra_governor_quota_observation::identity;
 use libra_governor_quota_observation::registration::{
     Approval, CapacityCeiling, Consent, ExpectedConstraint, FixedEnvironment,
     ObservationConfidence, RegisteredContext, Registration, RuntimeFileDigest, Transport,
@@ -68,43 +68,19 @@ pub fn unique_request_id(tag: &str) -> String {
     format!("r-{tag}-{counter}-{nanos}")
 }
 
-/// Approves `registration` by repeatedly calling the crate's own
-/// public [`identity::verify_identity`] and copying the `measured`
-/// digest out of whichever mismatch it reports back into the matching
-/// `approval.*_sha256` field, until it returns `Ok(())` or four
-/// rounds pass without converging. This is the only way an integration
-/// test can approve a registration: `manifest_digest`/
-/// `launch_tuple_digest`/`digest_file` are `pub(crate)` in
-/// `src/identity.rs`, not visible outside the crate, by design (so
-/// that recomputing a digest independently here could never
-/// accidentally diverge from the crate's own canonicalization). The
-/// loop order mirrors `verify_identity`'s own check order: executable
-/// digest, then manifest digest, then launch-tuple digest.
-///
-/// Requires `registration.enabled == true` and
-/// `registration.approval.approved == true` going in —
-/// `verify_identity` checks `Disabled`/`NotApproved` before it
-/// measures anything, so this loop cannot discover a digest mismatch
-/// while either of those is the actual failure.
-pub fn approve(mut registration: Registration) -> Registration {
-    for _ in 0..4 {
-        match identity::verify_identity(&registration) {
-            Ok(()) => return registration,
-            Err(IdentityError::ExecutableDigestMismatch { measured, .. }) => {
-                registration.approval.executable_sha256 = measured;
-            }
-            Err(IdentityError::ManifestDigestMismatch { measured, .. }) => {
-                registration.approval.manifest_sha256 = measured;
-            }
-            Err(IdentityError::LaunchTupleDigestMismatch { measured, .. }) => {
-                registration.approval.launch_tuple_sha256 = measured;
-            }
-            Err(_) => panic!(
-                "approve(): registration must be enabled+approved before approving, got a different IdentityError variant"
-            ),
-        }
-    }
-    panic!("approve(): did not converge after 4 rounds");
+/// Approves `registration` using the crate's own public
+/// [`identity::measure_identity`]/[`identity::approve`] API: measure
+/// every digest fresh from disk, then bind them into
+/// `registration.approval` with `approved = true`. This is the
+/// supported way for any caller outside the crate — including this test
+/// harness — to approve a registration; `manifest_digest`/
+/// `launch_tuple_digest`/`digest_file` stay `pub(crate)` in
+/// `src/identity.rs`, never duplicated here.
+pub fn approve(registration: Registration) -> Registration {
+    let measured = identity::measure_identity(&registration)
+        .expect("approve(): fixture's executable/runtime files must be readable to measure");
+    identity::approve(registration, measured)
+        .expect("approve(): binding freshly measured digests never fails")
 }
 
 /// Builds a minimal, valid, approved [`Registration`] whose transport
