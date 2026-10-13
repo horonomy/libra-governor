@@ -124,7 +124,7 @@ fn x_confused_deputy_provider_never_opens_agent_named_paths() {
     let sameuid_socket = format!("{SAMEUID_STATE_DIR}/daemon.sock");
 
     let preflight = serde_json::json!({
-        "protocol_version": 14,
+        "protocol_version": libra_governor_protocol::PROTOCOL_VERSION,
         "request": {
             "kind": "preflight",
             "task_hint": "confused deputy sensitivity control",
@@ -144,7 +144,7 @@ fn x_confused_deputy_provider_never_opens_agent_named_paths() {
     );
 
     let finalize = serde_json::json!({
-        "protocol_version": 14,
+        "protocol_version": libra_governor_protocol::PROTOCOL_VERSION,
         "request": {
             "kind": "finalize",
             "session_id": "x-confused-deputy-sameuid",
@@ -187,7 +187,7 @@ fn x_confused_deputy_provider_never_opens_agent_named_paths() {
     let _ = trusted_positive_control(&daemon, raw_client());
 
     let trusted_preflight = serde_json::json!({
-        "protocol_version": 14,
+        "protocol_version": libra_governor_protocol::PROTOCOL_VERSION,
         "request": {
             "kind": "preflight",
             "task_hint": "confused deputy trusted run",
@@ -215,7 +215,7 @@ fn x_confused_deputy_provider_never_opens_agent_named_paths() {
     write_transcript(&evil_transcript, "/home/lg-agent");
 
     let trusted_finalize = serde_json::json!({
-        "protocol_version": 14,
+        "protocol_version": libra_governor_protocol::PROTOCOL_VERSION,
         "request": {
             "kind": "finalize",
             "session_id": "x-confused-deputy-trusted",

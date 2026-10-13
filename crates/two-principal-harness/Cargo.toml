@@ -24,3 +24,11 @@ serde_json.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+# Test-only: lets harness tests reference `PROTOCOL_VERSION` instead of a
+# hardcoded literal, so a protocol bump breaks the build here instead of
+# silently producing a runtime "protocol version mismatch" failure (as
+# happened when PROTOCOL_VERSION moved 14->15 and these tests' hardcoded
+# `14` literals were missed). A dev-dependency never ships in the harness
+# container's actual runtime artifact, so this doesn't reopen the
+# production dependency isolation above.
+libra-governor-protocol = { path = "../protocol" }
