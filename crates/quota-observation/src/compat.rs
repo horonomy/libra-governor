@@ -1,15 +1,20 @@
-//! Read-only protocol-version compatibility reporting (HORO-1870,
-//! closing part of gap G9 — see `tests/README.md`'s compatibility-matrix
-//! row 7): given a parsed [`BootstrapResponse`], report whether this
-//! host's own [`PROTOCOL_VERSION`] appears in the extension's declared
+//! Read-only protocol-version compatibility reporting (HORO-1870):
+//! given a parsed [`BootstrapResponse`], report whether this host's own
+//! [`PROTOCOL_VERSION`] appears in the extension's declared
 //! `supported_versions`.
+//!
+//! This does **not** address gap G9 (`tests/README.md`'s
+//! compatibility-matrix row 7, which is about `BootstrapResult`'s
+//! `capabilities` never being cross-checked against what a `snapshot`
+//! call requires) — this module never reads `capabilities` at all.
+//! `protocol_version`/`bootstrap_version` negotiation is its own,
+//! separately-unticketed unenforced gap this module makes observable to
+//! an operator; G9 itself remains completely open.
 //!
 //! This is display-only for an operator CLI (a `describe`/`doctor`
 //! command, HORO-1870 PR2) — it does **not** enforce or reject
 //! anything. `crate::runner` is unchanged by this module's existence,
-//! and no new rejection behavior is added anywhere in this crate: gap
-//! G9 stays open as "unenforced" by design, this only makes the fact
-//! observable to an operator instead of silently unexamined.
+//! and no new rejection behavior is added anywhere in this crate.
 
 use crate::wire::{BootstrapResponse, PROTOCOL_VERSION};
 

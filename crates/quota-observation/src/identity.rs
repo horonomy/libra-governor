@@ -283,7 +283,7 @@ pub fn approve(
         .approval
         .runtime_files
         .iter_mut()
-        .zip(measured.runtime_file_digests.into_iter())
+        .zip(measured.runtime_file_digests)
     {
         if declared.path != path {
             return Err(ApprovalError::RuntimeFilesMismatch);
@@ -631,6 +631,45 @@ mod tests {
 
         assert!(approved.approval.approved);
         assert!(verify_identity(&approved).is_ok());
+    }
+
+    #[test]
+    fn approve_refuses_a_measured_identity_whose_runtime_files_are_reordered() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = write_executable(dir.path(), "ext", b"binary-one");
+        let lib_a = write_executable(dir.path(), "a.so", b"lib-a");
+        let lib_b = write_executable(dir.path(), "b.so", b"lib-b");
+        let runtime_files_ab = vec![
+            RuntimeFileDigest {
+                path: lib_a.to_str().unwrap().to_owned(),
+                sha256: String::new(),
+            },
+            RuntimeFileDigest {
+                path: lib_b.to_str().unwrap().to_owned(),
+                sha256: String::new(),
+            },
+        ];
+        let runtime_files_ba = vec![
+            RuntimeFileDigest {
+                path: lib_b.to_str().unwrap().to_owned(),
+                sha256: String::new(),
+            },
+            RuntimeFileDigest {
+                path: lib_a.to_str().unwrap().to_owned(),
+                sha256: String::new(),
+            },
+        ];
+        // Measure against the (a, b)-ordered registration, then try to
+        // approve the (b, a)-ordered one with that measurement — a stand-in
+        // for "approving against a stale or mismatched MeasuredIdentity".
+        let measured_against_ab =
+            super::measure_identity(&build(&executable, runtime_files_ab)).unwrap();
+        let differently_ordered = build(&executable, runtime_files_ba);
+
+        assert_eq!(
+            super::approve(differently_ordered, measured_against_ab).unwrap_err(),
+            ApprovalError::RuntimeFilesMismatch
+        );
     }
 
     #[test]
