@@ -512,7 +512,10 @@ fn attack3_eight_concurrent_sessions_are_all_correct_and_never_corrupt_each_othe
 
     assert_eq!(results.len(), 8);
     for observed in &results {
-        let ok = observed.result.as_ref().unwrap_or_else(|e| panic!("{e:?}"));
+        let ok = observed
+            .result
+            .as_ref()
+            .unwrap_or_else(|_| panic!("expected an Ok observe() outcome, got an error"));
         assert_eq!(ok.bound.constraints.len(), 1);
         match &ok.bound.constraints[0].reading {
             libra_governor_quota_observation::wire::Reading::Used { limit, .. } => {
@@ -1055,7 +1058,9 @@ fn attack7_stale_elapsed_and_future_readings_stay_present_but_not_fresh() {
             "eng-shared-pool",
         );
         let observed = observe(&registration, common::fixed_now());
-        let ok = observed.result.unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        let ok = observed
+            .result
+            .unwrap_or_else(|_| panic!("{name}: expected an Ok observe() outcome, got an error"));
         assert_eq!(
             ok.bound.constraints.len(),
             1,

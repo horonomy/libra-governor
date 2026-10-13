@@ -99,8 +99,8 @@ pub fn approve(mut registration: Registration) -> Registration {
             Err(IdentityError::LaunchTupleDigestMismatch { measured, .. }) => {
                 registration.approval.launch_tuple_sha256 = measured;
             }
-            Err(other) => panic!(
-                "approve(): registration must be enabled+approved before approving, got {other:?}"
+            Err(_) => panic!(
+                "approve(): registration must be enabled+approved before approving, got a different IdentityError variant"
             ),
         }
     }
