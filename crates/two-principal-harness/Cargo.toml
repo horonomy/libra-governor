@@ -16,5 +16,11 @@ publish = false
 # `trusted-principal` feature on `cli`/`daemon` could ever unify onto.
 [dependencies]
 serde_json.workspace = true
+# PR-2b addition, for `lg-raw-client --print-peer-uid`'s own
+# SO_PEERCRED/getpeereid probe (design doc §7 "Helper binaries": "std-only
+# plus optional libc"). Safe per design doc §6: "libc has no such feature
+# to unify" with the `trusted-principal` Cargo feature this crate takes no
+# dependency on.
+libc.workspace = true
 
 [dev-dependencies]
