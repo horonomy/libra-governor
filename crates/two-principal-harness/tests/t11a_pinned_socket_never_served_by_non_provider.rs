@@ -280,10 +280,17 @@ fn t11a_pinned_socket_is_never_served_by_a_non_provider_peer() {
         "at least one connect probe must have succeeded across {RESTART_CYCLES} restarts, \
          otherwise the peer-uid assertion below would be vacuous"
     );
+    // The observed uid values are deliberately never interpolated into
+    // this assertion's panic message, and the message is fully static
+    // (CodeQL `rust/cleartext-logging`): the condition itself already
+    // proves the invariant failed, and these are public OS-level
+    // identifiers in a disposable test container, never sensitive data
+    // — same discipline this crate already establishes for the same
+    // query (`two-principal-harness::chown`'s doc comment,
+    // `x_confused_deputy.rs`'s daemon-log assertions).
     assert!(
         uids.iter().all(|&uid| uid == LG_PROVIDER.uid),
-        "every successful probe must report the provider's peer uid, never any other \
-         (observed uids: {uids:?})"
+        "every successful probe must report the provider's peer uid, never any other"
     );
 
     daemon.kill9_and_reap();
