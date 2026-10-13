@@ -2,7 +2,7 @@
 
 See [`README.md`](README.md)'s status banner first. Everything below
 describes `crates/quota-observation` (`src/identity.rs`,
-`src/registration.rs`) exactly as it exists in PR #135 — where a claim
+`src/registration.rs`) exactly as it exists on `main` — where a claim
 below was verified against the actual code rather than assumed from the
 original design prose, that's noted explicitly.
 
@@ -12,15 +12,16 @@ Three separate SHA-256 digests, each formatted as **`sha256:<hex>`**
 (never raw `shasum`/`sha256sum` output, which has no `sha256:` prefix
 and a different field order than this crate's canonical JSON). **Do
 not hand-compute one of these with `jq -S` + `shasum`** to verify or
-reproduce a value: `manifest_digest`'s canonicalization recursively
-sorts every JSON object's keys (`serde_json::Value::sort_all_objects`)
-and `Quantity` fields serialize as the exact decimal string they were
-parsed from — neither of those is something a shell pipeline of
-`jq -S`/`shasum` reliably reproduces, and this crate deliberately keeps
-the three digest functions `pub(crate)` (not exported) so there is only
-one implementation of this canonicalization to ever diverge from — see
-`identity.rs`'s own module docs on why cross-checking it externally
-is not supported.
+reproduce a value: `manifest_digest` hashes the *re-serialized*
+`Registration` struct — serde's own field defaults, any `None` field
+omitted, and the exact compact formatting `serde_json` produces — not
+the registration file's raw bytes, and not merely its keys in sorted
+order (`jq -S` does sort recursively, but that alone doesn't reproduce
+serde's own serialization). This crate deliberately keeps the three
+digest functions `pub(crate)` (not exported) so there is only one
+implementation of this to ever diverge from — see
+`tests/common/mod.rs::approve`'s own doc comment for the fuller
+reasoning on why external cross-checking isn't supported.
 
 | Digest | Binds |
 |---|---|
@@ -130,7 +131,7 @@ registration minus `approval`).
 
 **On this specific point, verify against the code rather than
 intuition** — the empirical behavior, confirmed by running
-`runner::invoke` against a real approved registration in this session:
+`runner::invoke` against a real approved registration:
 
 1. Approve a registration while `enabled: true`. `manifest_sha256` is
    recorded for that state.
@@ -152,8 +153,11 @@ the registration's current field values. What *does* trip
 `ManifestDigestMismatch` is changing **any other field** while
 disabled (or re-enabling a registration whose manifest digest was never
 correctly computed for *any* state to begin with — see
-`shared_pool_anti_vacuity.rs::attack4_invoke_refuses_the_disabled_copy_and_flipping_enabled_trips_the_manifest_digest`,
-which demonstrates exactly that second case, not the first).
+`shared_pool_anti_vacuity.rs::attack4_invoke_refuses_the_disabled_copy_and_flipping_enabled_in_memory_is_refused_at_the_manifest_gate`,
+which demonstrates exactly that second case, not the first, and
+`identity::tests::flipping_enabled_without_reapproval_trips_the_manifest_digest`
+(`src/identity.rs`), which is the test that actually proves `enabled`
+is covered by the digest in the first place).
 
 ## Rollback
 

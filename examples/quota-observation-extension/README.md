@@ -58,16 +58,21 @@ invokes a registered extension: no `PATH`, no `HOME`, nothing beyond
 
 1. Copy `quota-ext.sh` somewhere stable and `chmod 755` it.
 2. Copy `registration.template.json`, fill in `transport.executable`
-   with that file's absolute path, and run an approval step that
-   measures the three digests (`executable_sha256`, `manifest_sha256`,
-   `launch_tuple_sha256`) and sets `approval.approved: true` — see
-   `docs/quota-observation/trust-and-lifecycle.md` for exactly what
-   each digest binds. **No CLI command performs this today** — there
-   is no `register`/`approve`/`observe` CLI surface anywhere in this
-   codebase yet (ticket TBD); the only way to drive this today is
-   through `crates/quota-observation`'s own public library functions,
-   the way `crates/quota-observation/tests/common/mod.rs::approve`
-   does it in this repository's own test suite.
+   with that file's absolute path, set `enabled: true` and
+   `approval.approved: true` with the three digest fields still blank
+   (`verify_identity` rejects as `NotApproved`/`Disabled` before it
+   measures anything, so the digests can't be discovered until those
+   two flags are already set this way), then measure the three real
+   digests (`executable_sha256`, `manifest_sha256`,
+   `launch_tuple_sha256`) from the files now on disk and write them
+   in — see `docs/quota-observation/trust-and-lifecycle.md` for
+   exactly what each digest binds. **No CLI command performs this
+   today** — there is no `register`/`approve`/`observe` CLI surface
+   anywhere in this codebase yet (pending HORO-1870); the only way to
+   drive this today is through `crates/quota-observation`'s own public
+   library functions, the way
+   `crates/quota-observation/tests/common/mod.rs::approve` does it in
+   this repository's own test suite.
 3. Once approved, `crates/quota-observation::runner::invoke` can run
    this registration directly.
 

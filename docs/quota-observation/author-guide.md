@@ -1,12 +1,12 @@
 # Quota-observation author guide (HORO-1856)
 
 See [`README.md`](README.md)'s status banner first: experimental 0.x
-preview, observation-only, depends on unmerged PRs #135/#137, no CLI
+preview, observation-only, merged to `main` (HORO-1854/1855), no CLI
 exists for this protocol yet.
 
 This guide documents the one-shot stdio runtime contract and
 `describe`/`snapshot` wire operations exactly as
-`crates/quota-observation` (PR #135) implements them — field names and
+`crates/quota-observation` implements them — field names and
 rules below are taken directly from `crates/quota-observation/src/runner.rs`
 and `crates/quota-observation/src/wire.rs`, not from the original design
 doc's prose, so where the two differ this guide follows the code.
@@ -39,7 +39,7 @@ with:
 - **Exit code must be 0.** A non-zero or signalled exit is treated as a
   failure regardless of whether you wrote a valid response frame.
 - **Request frame capped at 16 KiB; response frame capped at 64 KiB**
-  (`runner::MAX_REQUEST_BYTES`/`MAX_REQUEST_BYTES`/`MAX_RESPONSE_BYTES`).
+  (`runner::MAX_REQUEST_BYTES`/`runner::MAX_RESPONSE_BYTES`).
   An over-cap response triggers an immediate kill, not a graceful
   rejection.
 - **`timeout_ms` must be `100..=10000`** (`registration::TIMEOUT_MS_RANGE`
@@ -248,10 +248,42 @@ above) implementing this same contract against one static canned
 response, with a registration template showing how the identity set
 (`extension_id`/`context`/each constraint's
 `id`/`scope`/`metric`/`unit`/`account_fingerprint`) must agree exactly
-between the extension's own response and its registration — a mismatch
-on any of these re-homes that constraint into `missing`
-(`account_fingerprint_mismatch`), per
-[`trust-and-lifecycle.md`](trust-and-lifecycle.md).
+between the extension's own response and its registration. **A
+mismatch is not uniform** — each field fails differently
+(`crates/quota-observation/src/freshness.rs`):
+- `extension_id`/`extension_version` mismatch rejects the **whole
+  response** (`ExtensionIdMismatch`/`ExtensionVersionMismatch`).
+- `context` (`selector`/`handle`/`principal`) or `authority` mismatch
+  rejects the **whole response** (`ContextMismatch`) — see lines
+  103-106 above, which already say this.
+- An unrequested constraint `id` rejects the **whole response**
+  (`UnrequestedConstraintId`, `src/wire.rs`).
+- A `unit` mismatch re-homes that one constraint into `missing` as
+  `unsupported_unit`; a `metric` mismatch as `unsupported_metric`.
+- Only a `scope` or `account_fingerprint` mismatch re-homes that one
+  constraint into `missing` as `account_fingerprint_mismatch`.
+
+The response must also echo the request's `protocol_version` and
+`request_id` exactly, and `extension_id`/`extension_version` must equal
+the values in the registration — any of these failing rejects the
+whole response the same way. See
+[`trust-and-lifecycle.md`](trust-and-lifecycle.md) for what each
+digest binds and [`conformance_semantic.rs`] for the tests proving
+this field-by-field behavior.
+
+### Freshness
+
+A reading is fresh (`is_fresh`) only if **all** hold
+(`crates/quota-observation/src/freshness.rs`): `observed_at <=
+received_at + 5s` (a strict future-timestamp check, with a 5-second
+tolerance for host/extension clock discontinuity only — this
+tolerance never also extends the staleness bound below); `now -
+min(observed_at, received_at) <= max_staleness_secs` (the constraint's
+*registered* bound, never a default); and, if present, `now <
+valid_until` and `now < context_valid_until` (both strict, no
+tolerance). A stale reading is never dropped from `constraints` —
+`is_fresh` gates whether the host trusts it for anything beyond raw
+display, not whether it's returned at all.
 
 ## Version compatibility
 
