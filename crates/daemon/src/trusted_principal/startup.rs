@@ -19,11 +19,6 @@ pub enum StartupError {
     )]
     ProcessIdentity,
     #[error(
-        "trusted mode refuses to start: the config file must be owned by uid 0 and must \
-             not be group- or other-writable"
-    )]
-    ConfigFile,
-    #[error(
         "trusted mode refuses to start: {path} is not owned by root or the provider, or is \
              group- or other-writable"
     )]
@@ -46,16 +41,23 @@ pub enum StartupError {
     Io(#[from] std::io::Error),
 }
 
-/// Runs ADR-0019 §1's startup checks 1 through 5 in order, returning the
+/// Runs ADR-0019 §1's startup checks in order, returning the
 /// already-migrated ledger. The caller binds the socket only after this
 /// succeeds, and `serve_trusted` reuses this same `LedgerStore` rather
 /// than reopening it.
+///
+/// The config FILE's own ownership/mode is deliberately not re-checked
+/// here by path — [`TrustedPrincipalConfig::load`] already verified that
+/// atomically against the same open handle it read from, closing a
+/// check-then-reopen TOCTOU window (HORO-1835 security review). This
+/// function's `check_path_chain` still separately walks every ANCESTOR
+/// directory of `config_path` (and of the executable, state dir, and
+/// socket dir).
 pub fn validate_trusted_startup(
     cfg: &TrustedPrincipalConfig,
     config_path: &Path,
 ) -> Result<LedgerStore, StartupError> {
     check_process_identity(cfg)?;
-    check_config_file(config_path)?;
     for path in [
         std::env::current_exe().map_err(StartupError::Io)?,
         config_path.to_path_buf(),
@@ -77,15 +79,6 @@ fn check_process_identity(cfg: &TrustedPrincipalConfig) -> Result<(), StartupErr
     let effective = rustix::process::geteuid().as_raw();
     if real == 0 || real != cfg.provider_uid || effective != cfg.provider_uid {
         return Err(StartupError::ProcessIdentity);
-    }
-    Ok(())
-}
-
-fn check_config_file(config_path: &Path) -> Result<(), StartupError> {
-    let canonical = config_path.canonicalize().map_err(StartupError::Io)?;
-    let metadata = std::fs::symlink_metadata(&canonical).map_err(StartupError::Io)?;
-    if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-        return Err(StartupError::ConfigFile);
     }
     Ok(())
 }
@@ -257,26 +250,6 @@ mod tests {
             FileKind::Dir,
         )];
         assert!(evaluate_chain(&components, &[0, 10001]).is_ok());
-    }
-
-    // `TrustedPrincipalConfig` has no `Serialize` derive (deliberately —
-    // it is a config shape this daemon only ever reads); these tests
-    // build the JSON by hand instead.
-    fn write_config_json(dir: &Path, json: &str) -> PathBuf {
-        let path = dir.join("trusted-principal.json");
-        std::fs::write(&path, json).unwrap();
-        path
-    }
-
-    #[test]
-    fn check_config_file_rejects_a_group_writable_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_config_json(dir.path(), "{}");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
-        assert!(matches!(
-            check_config_file(&path),
-            Err(StartupError::ConfigFile)
-        ));
     }
 
     #[test]
