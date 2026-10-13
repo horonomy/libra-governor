@@ -16,8 +16,8 @@ use libra_governor_quota_observation::freshness::{self, FreshnessError};
 use libra_governor_quota_observation::identity::IdentityError;
 use libra_governor_quota_observation::registration::{
     load_registrations, Approval, CapacityCeiling, Consent, ExpectedConstraint, FixedEnvironment,
-    ObservationConfidence, PoolId, RegisteredContext, Registration, RegistrationError,
-    RuntimeFileDigest, Transport, TransportKind, TrustMode,
+    ObservationConfidence, RegisteredContext, Registration, RegistrationError, RuntimeFileDigest,
+    Transport, TransportKind, TrustMode,
 };
 use libra_governor_quota_observation::runner::{self, InvokeError};
 use libra_governor_quota_observation::wire::{
@@ -463,16 +463,25 @@ fn attack2_control_differing_only_in_pool_alias_loads_separately() {
 }
 
 // ---------------------------------------------------------------------
-// 3. 500×sessions via the concurrency route: 8 threads observing one
-//    approved registration concurrently must all succeed, all see the
-//    same limit string verbatim, all derive the same single PoolId,
-//    and each result's request_id must equal what its own thread sent
-//    — plus an anti-replay control proving one session's frame can
-//    never be accepted as another session's response.
+// 3. Concurrency safety: 8 threads observing one approved registration
+//    concurrently must all succeed, all see the same limit string
+//    verbatim, and each result's request_id must equal what its own
+//    thread sent — plus an anti-replay control proving one session's
+//    frame can never be accepted as another session's response.
+//
+//    This is NOT the "500 x N sessions must never multiply into N
+//    pools" property (that's attack1's job, via the registration-file
+//    route, which genuinely feeds `load_registrations` multiple
+//    registrations). All 8 threads below observe the *same single*
+//    approved `Registration` value, so there is only ever one
+//    `PoolId` in play by construction — a prior version of this test
+//    computed a `PoolId` per thread and asserted the resulting set's
+//    length was 1, which could never have failed regardless of what
+//    the pool-uniqueness code does, and has been removed.
 // ---------------------------------------------------------------------
 
 #[test]
-fn attack3_eight_concurrent_sessions_see_one_pool_never_five_hundred_times_eight() {
+fn attack3_eight_concurrent_sessions_are_all_correct_and_never_corrupt_each_others_frames() {
     let _guard = SUBPROCESS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let script = copy_script(dir.path());
@@ -502,7 +511,6 @@ fn attack3_eight_concurrent_sessions_see_one_pool_never_five_hundred_times_eight
     });
 
     assert_eq!(results.len(), 8);
-    let mut pool_ids = HashSet::new();
     for observed in &results {
         let ok = observed.result.as_ref().unwrap_or_else(|e| panic!("{e:?}"));
         assert_eq!(ok.bound.constraints.len(), 1);
@@ -516,23 +524,7 @@ fn attack3_eight_concurrent_sessions_see_one_pool_never_five_hundred_times_eight
             }
             _other => panic!("expected Used, got a different Reading variant"),
         }
-        let expected_entry = registration
-            .expected
-            .iter()
-            .find(|e| e.id == ok.bound.constraints[0].id)
-            .unwrap();
-        let pool_id = PoolId::new(
-            expected_entry.account_fingerprint.clone(),
-            expected_entry.pool_alias.clone(),
-        )
-        .unwrap();
-        pool_ids.insert(pool_id.to_string());
     }
-    assert_eq!(
-        pool_ids.len(),
-        1,
-        "500 x 8 sessions must never multiply into 8 pools"
-    );
 
     for observed in &results {
         // Each observation's own request_id is exactly what its own
@@ -586,8 +578,23 @@ fn attack3_anti_replay_control_one_sessions_frame_is_rejected_as_another_session
 // 4. A disabled duplicate can't be smuggled in: it loads today (by
 //    design — disabled registrations are exempt from the uniqueness
 //    check), but invoke() still refuses it as-stored, and flipping
-//    `enabled` in memory without re-approval trips the manifest digest
-//    (which covers `enabled`), never silently succeeding.
+//    `enabled` in memory without re-approval is refused at the
+//    manifest gate rather than silently succeeding.
+//
+//    This does NOT, by itself, prove the manifest digest covers
+//    `enabled` specifically: the disabled copy below is stored with a
+//    blank `manifest_sha256`, so the second assertion would pass the
+//    same way for ANY manifest mismatch, covered field or not — it
+//    can't distinguish "enabled is in the digest" from "the digest is
+//    simply wrong". That property can't be proven through this
+//    crate's public API at all (`verify_identity` returns
+//    `IdentityError::Disabled` before it ever measures a manifest for
+//    a disabled registration, and the black-box `approve()` helper
+//    refuses to run against anything not already enabled); it's
+//    proven instead by
+//    `identity::tests::flipping_enabled_without_reapproval_trips_the_manifest_digest`
+//    in `src/identity.rs`, which has the crate-internal access needed
+//    to compute real digests while `enabled == false`.
 // ---------------------------------------------------------------------
 
 #[test]
@@ -607,7 +614,8 @@ fn attack4_disabled_duplicate_loads_alongside_the_enabled_original() {
 }
 
 #[test]
-fn attack4_invoke_refuses_the_disabled_copy_and_flipping_enabled_trips_the_manifest_digest() {
+fn attack4_invoke_refuses_the_disabled_copy_and_flipping_enabled_in_memory_is_refused_at_the_manifest_gate(
+) {
     let _guard = SUBPROCESS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let script = copy_script(dir.path());
@@ -667,9 +675,12 @@ fn attack4_invoke_refuses_the_disabled_copy_and_flipping_enabled_trips_the_manif
             error,
             InvokeError::Identity(IdentityError::ManifestDigestMismatch { .. })
         ),
-        "the manifest digest covers `enabled`, so flipping it without re-approval must be caught \
-         as a manifest mismatch, not silently accepted and not an executable mismatch (the \
-         executable digest was deliberately set correctly to isolate this)"
+        "a disabled copy whose manifest digest was never genuinely computed (blank, as stored) \
+         must still be refused at the manifest gate when flipped to enabled in memory, never \
+         silently accepted and never an executable mismatch (the executable digest was \
+         deliberately set correctly to isolate this) — note this does not by itself prove the \
+         digest covers `enabled`, see this test's section comment and \
+         `identity::tests::flipping_enabled_without_reapproval_trips_the_manifest_digest` for that"
     );
 }
 
@@ -764,14 +775,24 @@ fn attack5_wrong_account_fingerprint_is_rehomed_to_missing_and_never_echoed_in_t
 // 6. Host identity is not promoted to a session/task identity. This
 //    crate has no session concept at all (structural-only check): the
 //    child process receives nothing from this host process's
-//    environment beyond LANG/LC_ALL, and two observations with
-//    different request ids and different response epochs still derive
-//    the exact same PoolId (identity comes from the registration's own
-//    expected[] entries, never from anything in a response).
+//    environment beyond LANG/LC_ALL, and the host's own captured
+//    request carries exactly the SnapshotRequest's 7 wire fields, none
+//    of them account/pool identity.
+//
+//    An earlier version of this test also asserted that `pool_x` and
+//    `pool_y` — each built directly from `registration_x`/
+//    `registration_y`'s own literal `account_fingerprint`/`pool_alias`
+//    constructor arguments, never from anything in either response —
+//    compared equal. Since both registrations were constructed with
+//    the identical literal pool identity to begin with, that assertion
+//    could never have failed regardless of whether the response could
+//    influence `PoolId` derivation, and has been removed; this test no
+//    longer makes any claim about response-derived identity.
 // ---------------------------------------------------------------------
 
 #[test]
-fn attack6_host_environment_never_reaches_the_child_and_identity_is_never_response_derived() {
+fn attack6_host_environment_never_reaches_the_child_and_the_captured_request_carries_no_identity_fields(
+) {
     let _guard = SUBPROCESS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let script = copy_script(dir.path());
@@ -820,22 +841,6 @@ fn attack6_host_environment_never_reaches_the_child_and_identity_is_never_respon
     let ok_y = observed_y.result.unwrap();
     assert_eq!(ok_x.bound.context.epoch, "epoch_x");
     assert_eq!(ok_y.bound.context.epoch, "epoch_y");
-
-    let pool_x = PoolId::new(
-        registration_x.expected[0].account_fingerprint.clone(),
-        registration_x.expected[0].pool_alias.clone(),
-    )
-    .unwrap();
-    let pool_y = PoolId::new(
-        registration_y.expected[0].account_fingerprint.clone(),
-        registration_y.expected[0].pool_alias.clone(),
-    )
-    .unwrap();
-    assert_eq!(
-        pool_x.to_string(),
-        pool_y.to_string(),
-        "different request ids and different response epochs must still map to one PoolId"
-    );
 
     // Environment allowlist, empirically confirmed on this platform
     // under env_clear(): only LANG, LC_ALL, PWD, SHLVL and `_` (the
