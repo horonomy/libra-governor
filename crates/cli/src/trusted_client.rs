@@ -24,7 +24,9 @@ use std::time::Duration;
 
 use libra_governor_daemon::trusted_principal::peer::peer_uid;
 use libra_governor_daemon::trusted_principal::startup::check_path_chain;
-use libra_governor_daemon::trusted_principal::{TrustedPrincipalConfig, PINNED_CONFIG_PATH};
+use libra_governor_daemon::trusted_principal::{
+    ConfigError, TrustedPrincipalConfig, PINNED_CONFIG_PATH,
+};
 
 use crate::client::ClientError;
 
@@ -48,15 +50,32 @@ pub(crate) struct PinnedEndpoint {
 /// cannot silently fall back to default-mode connect behavior on a
 /// validation failure.
 ///
-/// Validates the config file's own identity only: canonicalizes it,
-/// then walks its directory chain requiring root ownership all the way
-/// up (the same check the server's own startup sequence runs on its
-/// pinned paths), then parses and field-validates it. It does **not**
-/// walk the configured socket directory — the server's own startup
-/// sequence already does that on its side, and the client's
-/// authentication of the server is the peer-identity check in
-/// [`connect_verified`], not a filesystem check on a directory the
-/// client does not own.
+/// Validates the config file's own identity, then its directory chain,
+/// then parses and field-validates it. It does **not** walk the
+/// configured socket directory — the server's own startup sequence
+/// already does that on its side, and the client's authentication of
+/// the server is the peer-identity check in [`connect_verified`], not a
+/// filesystem check on a directory the client does not own.
+///
+/// Order matters here (HORO-1835 security review, fix 3 client-side
+/// half): [`TrustedPrincipalConfig::load`] is tried FIRST, not after a
+/// separate path-based existence/ownership probe. `load` opens the file
+/// exactly once (`O_NOFOLLOW`) and verifies ownership/mode via `fstat`
+/// on that SAME already-open handle before reading its contents — an
+/// earlier version of this function called `check_path_chain` (a
+/// separate, path-based stat of this same leaf file) BEFORE `load`,
+/// which reintroduced on the client side exactly the check-then-reopen
+/// TOCTOU window `load`'s own atomic open was built to close
+/// server-side: an attacker with write access to a directory in `path`
+/// could swap the file between the two independent lookups. Trying
+/// `load` first means the content this function ultimately trusts is
+/// provably the same file whose ownership `load` just verified.
+/// `check_path_chain` still runs afterward, for defense-in-depth on
+/// every ANCESTOR directory (and, redundantly but harmlessly, the leaf
+/// again by path) — by that point `load` has already proven what was
+/// read is what was verified, so a later, path-based re-check cannot
+/// un-read already-trusted content; it can only refuse to proceed
+/// further.
 pub(crate) fn pinned_endpoint() -> Result<Option<PinnedEndpoint>, ClientError> {
     pinned_endpoint_at(Path::new(PINNED_CONFIG_PATH))
 }
@@ -68,24 +87,27 @@ pub(crate) fn pinned_endpoint() -> Result<Option<PinnedEndpoint>, ClientError> {
 /// which a non-root test process cannot write to, so the path is the
 /// only thing that needs to vary between the real call and a test.
 fn pinned_endpoint_at(path: &Path) -> Result<Option<PinnedEndpoint>, ClientError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    let cfg = match TrustedPrincipalConfig::load(path) {
+        Ok(cfg) => cfg,
+        // The pinned config simply being absent is not an error — default
+        // (non-trusted) behavior is unchanged in that case. `load`'s open
+        // call itself reports this (`ENOENT` via `rustix::fs::open`),
+        // rather than a separate preliminary `symlink_metadata` probe —
+        // one path lookup for "does it exist", not two.
+        Err(ConfigError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
         Err(e) => {
             return Err(ClientError::TrustedConfig(format!(
-                "could not stat the pinned trusted-principal config: {e}"
-            )))
+                "invalid pinned trusted-principal config: {e}"
+            )));
         }
-    }
+    };
 
     check_path_chain(path, &[0]).map_err(|e| {
         ClientError::TrustedConfig(format!(
             "pinned trusted-principal config path rejected: {e}"
         ))
-    })?;
-
-    let cfg = TrustedPrincipalConfig::load(path).map_err(|e| {
-        ClientError::TrustedConfig(format!("invalid pinned trusted-principal config: {e}"))
     })?;
 
     Ok(Some(PinnedEndpoint {
@@ -156,10 +178,12 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         // In this test process (not uid 0), the file is owned by the
-        // test's own uid, not root — `check_path_chain(path, &[0])` must
-        // reject it regardless of its mode. This exercises the real
-        // `pinned_endpoint_at`, the same function `pinned_endpoint` (the
-        // production entry point) calls — not a copy of it.
+        // test's own uid, not root — `TrustedPrincipalConfig::load`'s own
+        // `fstat`-based ownership check (tried first; see this function's
+        // doc comment on ordering) must reject it, regardless of mode.
+        // This exercises the real `pinned_endpoint_at`, the same function
+        // `pinned_endpoint` (the production entry point) calls — not a
+        // copy of it.
         let result = pinned_endpoint_at(&path);
         assert!(matches!(result, Err(ClientError::TrustedConfig(_))));
     }

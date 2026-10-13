@@ -254,8 +254,13 @@ fn stale_runtime_finding(state_dir: &Path, daemon_present: bool) -> Option<Findi
         message: format!(
             "the running daemon's executable (sha256 {running_sha}) differs from the binary \
              currently installed at {binary_path} (sha256 {installed_sha}) — binary upgraded \
-             while daemon exists; run `libra-governor daemon stop` — the next hook invocation \
-             will respawn it automatically"
+             while daemon exists; run `libra-governor daemon stop` — the *next real user \
+             prompt's* UserPromptSubmit hook will respawn it automatically (that path uses \
+             ensure_daemon_connection and waits for readiness). PostToolUse's fire_and_forget \
+             never spawns a daemon by design (see client.rs), so any tool calls remaining in \
+             an already-started turn will keep failing until that session's next prompt — if \
+             other sessions are active, consider `libra-governor daemon run &` immediately \
+             instead of waiting on this"
         ),
     })
 }
