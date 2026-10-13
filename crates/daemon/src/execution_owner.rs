@@ -89,6 +89,19 @@ pub(crate) fn handle(
     // bounded and pure. Only ever `Some` for a Codex identity with
     // `transcript_path: Some(_)`; the arm above already refused every
     // other combination.
+    //
+    // This path is caller-supplied and opened with no ownership/location
+    // check -- a confused-deputy shape that matters only when the daemon
+    // reads it with MORE privilege than the caller has. In trusted-principal
+    // mode, that's exactly what `strip_agent_named_paths` (serve.rs) exists
+    // to prevent: it blanks `Stop.transcript_path` to `None` before any
+    // request reaches this function, so `codex_turn_observation` is always
+    // `None` there (tested:
+    // `strip_agent_named_paths_blanks_execution_owner_stop_transcript_path`).
+    // In default (single-principal) mode this code path IS reachable, but
+    // the daemon runs as the same OS user as the caller -- reading a path
+    // the caller names is equivalent to the caller reading it directly, so
+    // there is no deputy with greater privilege to confuse.
     let codex_turn_observation = match operation {
         ExecutionOperation::Stop {
             transcript_path: Some(path),
