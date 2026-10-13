@@ -17,6 +17,7 @@ pub mod peer;
 pub mod serve;
 pub mod startup;
 
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -52,6 +53,11 @@ pub enum ConfigError {
     Io(#[from] std::io::Error),
     #[error("could not parse trusted-principal config: {0}")]
     Parse(#[from] serde_json::Error),
+    #[error(
+        "trusted mode refuses to start: the config file must be owned by uid 0 and must \
+         not be group- or other-writable"
+    )]
+    FileOwnershipOrMode,
     #[error("provider_uid must not be 0")]
     ProviderUidIsRoot,
     #[error("agent_uids must be non-empty and must not contain 0 or provider_uid")]
@@ -69,13 +75,39 @@ pub enum ConfigError {
 }
 
 impl TrustedPrincipalConfig {
-    /// Reads `path` (no env, no HOME, no XDG), parses it, and runs
-    /// [`Self::validate_fields`]. Does NOT check file ownership —
-    /// [`startup::validate_trusted_startup`] (server) and the client's
-    /// own pinned-endpoint resolution (PR-2c) each do that themselves,
-    /// against their own trust requirements.
+    /// Opens `path` exactly once — with `O_NOFOLLOW`, refusing a symlink
+    /// at the final path component — verifies ownership (uid 0) and mode
+    /// (not group- or other-writable) via `fstat` on that SAME already-
+    /// open handle, then reads and parses its contents from that same
+    /// handle, and finally runs [`Self::validate_fields`].
+    ///
+    /// The ownership/mode check and the read are tied to one `fstat`+
+    /// `read` pair against one open file descriptor so they can never
+    /// observe two different underlying files: a path-based "verify by
+    /// stat(path), then separately re-open(path) and read" sequence
+    /// leaves a TOCTOU window in which an attacker with write access to
+    /// a directory in `path` can swap the file between the check and
+    /// the read (PR-2a/PR-2c independent security review, HORO-1835).
+    /// [`startup::validate_trusted_startup`]'s own `check_path_chain`
+    /// still separately verifies every ANCESTOR directory in `path`; the
+    /// leaf file's own ownership/mode is verified here and only here.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let contents = std::fs::read_to_string(path)?;
+        let fd = rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        let mut file = std::fs::File::from(fd);
+
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            return Err(ConfigError::FileOwnershipOrMode);
+        }
+
+        let mut contents = String::new();
+        std::io::Read::read_to_string(&mut file, &mut contents)?;
+
         let config: Self = serde_json::from_str(&contents)?;
         config.validate_fields()?;
         Ok(config)
@@ -319,5 +351,54 @@ mod tests {
     fn connection_timeout_converts_millis_to_a_duration() {
         let cfg = valid();
         assert_eq!(cfg.connection_timeout(), Duration::from_millis(5000));
+    }
+
+    // `load`'s own ownership/mode/symlink checks (HORO-1835 security
+    // review, fix 3): these run as whatever uid the test process has —
+    // never root in CI — so they can only exercise the "not owned by
+    // uid 0" and "final component is a symlink" rejections; a root-owned
+    // happy path is covered instead by the two-principal-harness's
+    // disposable container (`x_startup_checks.rs`), which really does
+    // run as root there.
+
+    #[test]
+    fn load_rejects_a_config_file_not_owned_by_uid_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trusted-principal.json");
+        std::fs::write(
+            &path,
+            r#"{"provider_uid":10001,"agent_uids":[10002],
+               "provider_id":"operator:lg-provider","state_dir":"/var/lib/libra-governor",
+               "socket_dir":"/run/libra-governor","connection_timeout_ms":5000}"#,
+        )
+        .unwrap();
+
+        // The test process is never uid 0 in CI, so this file is already
+        // owned by the "wrong" uid — exactly the condition `load` must
+        // refuse via the `fstat` it performs on its own already-open
+        // handle, not a separate path-based stat.
+        assert!(matches!(
+            TrustedPrincipalConfig::load(&path),
+            Err(ConfigError::FileOwnershipOrMode)
+        ));
+    }
+
+    #[test]
+    fn load_rejects_a_symlink_at_the_final_path_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real-trusted-principal.json");
+        std::fs::write(&real, "{}").unwrap();
+        let link = dir.path().join("trusted-principal.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // `load` opens with `O_NOFOLLOW`: a symlinked final component
+        // must be refused outright (an `Io` error from the open itself),
+        // never silently followed and then separately checked — that
+        // "check the resolved target, then re-open by the original
+        // path" shape is exactly the TOCTOU this fix closes.
+        assert!(matches!(
+            TrustedPrincipalConfig::load(&link),
+            Err(ConfigError::Io(_))
+        ));
     }
 }
