@@ -11,9 +11,13 @@ for how approval/digests/lifecycle work. Mirrors the layout style of
 extension system — ADR-0005's loopback-HTTP business-context/policy/events
 extensions, not this one).
 
-**Status**: observation-only preview, 0.x, no CLI wiring yet — see the
-status banner in `docs/quota-observation/README.md` before using this
-for anything beyond reading the protocol by example.
+**Status**: observation-only preview, 0.x. The operator CLI (HORO-1870,
+`libra-governor quota-observation <register|approve|enable|disable|
+uninstall|doctor|inspect>`) is merged — see the status banner in
+`docs/quota-observation/README.md` and
+[`docs/quota-observation/author-guide.md`](../../docs/quota-observation/author-guide.md)'s
+"Operator CLI" section for the full reference before using this for
+anything beyond reading the protocol by example.
 
 ## Files
 
@@ -58,28 +62,32 @@ invokes a registered extension: no `PATH`, no `HOME`, nothing beyond
 
 1. Copy `quota-ext.sh` somewhere stable and `chmod 755` it.
 2. Copy `registration.template.json`, fill in `transport.executable`
-   with that file's absolute path, set `enabled: true` and
-   `approval.approved: true` with the three digest fields still blank
-   (`verify_identity` rejects as `NotApproved`/`Disabled` before it
-   measures anything, so the digests can't be discovered until those
-   two flags are already set this way), then measure the three real
-   digests (`executable_sha256`, `manifest_sha256`,
-   `launch_tuple_sha256`) from the files now on disk and write them
-   in — see `docs/quota-observation/trust-and-lifecycle.md` for
-   exactly what each digest binds. **No CLI command performs this
-   today** — there is no `register`/`approve`/`observe` CLI surface
-   anywhere in this codebase yet (pending HORO-1870); the only way to
-   drive this today is through `crates/quota-observation`'s own public
-   library functions, the way
-   `crates/quota-observation/tests/common/mod.rs::approve` does it in
-   this repository's own test suite.
-3. Once approved, `crates/quota-observation::runner::invoke` can run
-   this registration directly.
+   with that file's absolute path and set `enabled: true` — the
+   `approval` block's own contents don't matter yet: `register` (next
+   step) force-clears `approval.approved` and every digest field to
+   unapproved/blank on write regardless of what the file claims.
+3. Register, then approve it for real:
+
+   ```bash
+   libra-governor quota-observation register registration.json
+   libra-governor quota-observation approve sample-quota-ext-registration
+   ```
+
+   `approve` measures the real `executable_sha256`/`manifest_sha256`/
+   `launch_tuple_sha256` digests from the files now on disk and writes
+   them into the registration's `approval` block — see
+   `docs/quota-observation/trust-and-lifecycle.md` for exactly what
+   each digest binds, and
+   `docs/quota-observation/author-guide.md`'s "Operator CLI" section
+   for a full, verified example of this exact sequence's real output.
+4. Once approved, `libra-governor quota-observation inspect
+   sample-quota-ext-registration` runs this registration directly (a
+   live `snapshot` round trip); `doctor --probe` performs a
+   `describe`-only round trip without touching quota data.
 
 ## What this sample is not
 
 Not a real provider integration, not a template for handling a real
 credential (see the author-guide's E1 section — if you're building a
 real extension, your credential never goes in `args` or
-`runtime_files`), and not evidence that any CLI wiring exists for this
-protocol today.
+`runtime_files`).

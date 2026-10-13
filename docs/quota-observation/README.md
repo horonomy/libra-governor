@@ -19,20 +19,22 @@ documented here). Mirrors the style of the existing
 > Phase A conformance kit (HORO-1855, PR #137) are merged. Referenced
 > here by PR number for history, not because anything is still pending.
 >
-> **No CLI exists for this protocol yet.** There is no `register`,
-> `approve`, or `observe` command anywhere in this codebase today. Every
-> operator-facing step described in these docs that would normally be a
-> CLI invocation is instead written against `crates/quota-observation`'s
-> own public library API, and is explicitly labelled **"pending
-> HORO-1870"** at the point it applies. HORO-1870 owns the CLI slice
-> (register/inspect/approve/enable/disable/uninstall) and is now
-> unblocked (its dependencies, HORO-1854 and HORO-1855, are merged).
+> **The operator CLI exists.** HORO-1870 shipped it, merged to `main`:
+> `libra-governor quota-observation <register|approve|enable|disable|
+> uninstall|doctor|inspect>`. `doctor` is fully passive (lists
+> registrations from disk, no extension process ever starts);
+> `doctor --probe` performs a `describe`-only bootstrap round trip per
+> enabled+approved registration; `inspect` is the one command that
+> performs a live, explicitly consented `snapshot` round trip and the
+> only one that can report quota availability/coverage. See
+> [`author-guide.md`](author-guide.md)'s "Operator CLI" section for the
+> full command reference with real, verified examples.
 
 ## What's here
 
 | Doc | Covers |
 |---|---|
-| [`author-guide.md`](author-guide.md) | The one-shot stdio runtime contract, the `describe`/`snapshot` wire operations, and real, fixture-verified CLI examples of driving a sample extension directly (extension-side only — no Libra daemon/CLI involved). |
+| [`author-guide.md`](author-guide.md) | The one-shot stdio runtime contract, the `describe`/`snapshot` wire operations, real fixture-verified examples of driving a sample extension directly (extension-side only — no Libra daemon/CLI involved), and the real `libra-governor quota-observation` operator CLI reference. |
 | [`trust-and-lifecycle.md`](trust-and-lifecycle.md) | Approval digests, what each one binds, the `endpoint_owner`/`consent` fields, pool identity, disable/rollback/uninstall. |
 | [`builder-prompt.md`](builder-prompt.md) | A copy-pasteable template (for a human or an LLM) to build a new extension against this contract from scratch. |
 | [`preview-delivery.md`](preview-delivery.md) | (HORO-1857) Platform support matrix, download integrity, and the clean-install procedure the smoke test in `crates/quota-observation/tests/preview_clean_install.rs` exercises. |

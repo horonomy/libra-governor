@@ -1,8 +1,10 @@
 # Quota-observation preview delivery (HORO-1857)
 
 See [`README.md`](README.md)'s status banner first: experimental 0.x
-preview, observation-only, merged to `main` (HORO-1854/1855), no CLI
-exists for this protocol yet. This doc covers platform support,
+preview, observation-only, merged to `main` (HORO-1854/1855). The
+operator CLI (HORO-1870) is merged too — see
+[`author-guide.md`](author-guide.md)'s "Operator CLI" section for the
+full command reference. This doc covers platform support,
 download/build integrity, and the clean-install procedure the smoke
 test in `crates/quota-observation/tests/preview_clean_install.rs`
 exercises.
@@ -71,43 +73,56 @@ and cannot prove.
    extension's author published (see "Integrity" above) — this is the
    value that becomes `approval.executable_sha256`.
 3. **Write a registration** pointing `transport.executable` at that
-   installed path, with a real, honest `endpoint_owner` and `consent`,
-   `enabled: true`, and `approval.approved: true` with the three digest
-   fields still blank — see
+   installed path, with a real, honest `endpoint_owner` and `consent`
+   and `enabled: true` — see
    [`examples/quota-observation-extension/registration.template.json`](../../examples/quota-observation-extension/registration.template.json)
-   for the exact shape. **Set `approved: true` before you have real
-   digests, not after**: `verify_identity` rejects as
-   `NotApproved`/`Disabled` before it ever measures anything, so there
-   is no way to discover the real digests until `enabled`/`approved`
-   are already set this way.
-4. **Approve it for real**: measure the real
-   executable/manifest/launch-tuple digests from the file now on disk
-   and write them into the registration's `approval` block, replacing
-   the blank placeholders from step 3. **No CLI performs this step
-   today** (pending HORO-1870) — see `tests/common/mod.rs::approve`'s
-   own doc comment for why this repository's test suite drives this
-   through the crate's own public `identity::verify_identity` function
-   in a loop rather than through any command.
-5. **Invoke `describe`, then `snapshot`**, through
-   `crates/quota-observation`'s own public API
-   (`runner::invoke` + `runner::parse_single_frame`, or the full
-   reference pipeline in `tests/common/mod.rs::observe`), and confirm
-   you get back a parseable response with the coverage you expect.
-6. **Exercise the lifecycle**: disable it (`enabled: false` — confirm
-   `IdentityError::Disabled`), remove the registration file entirely
-   (confirm it no longer loads), and re-register the same pool from
-   scratch (confirm it loads cleanly, with no leftover state from the
-   earlier registration — this crate persists nothing of its own
-   outside the registration file; see
+   for the exact shape. The `approval` block's own contents don't
+   matter at this point: `register` (step 4 below) force-clears
+   `approval.approved` and every digest field to unapproved/blank on
+   write regardless of what the file claims, so there is no benefit to
+   hand-setting `approved: true` here — see `trust-and-lifecycle.md`'s
+   framing of approval as a drift detector for why.
+4. **Register it, then approve it for real**:
+
+   ```bash
+   libra-governor quota-observation register <registration-file>
+   libra-governor quota-observation approve <registration-id>
+   ```
+
+   `register` validates the candidate (schema, pool uniqueness, a
+   fresh `registration_id`) and writes it force-cleared to unapproved.
+   `approve` then measures the real executable/manifest/launch-tuple
+   digests from the files now on disk and writes them into the
+   registration's `approval` block — the only command that can set
+   `approved: true`, and only from digests it just measured itself.
+   See [`author-guide.md`](author-guide.md)'s "Operator CLI" section
+   for a full, verified example of this sequence's real output.
+5. **Invoke `describe`, then `snapshot`**, via
+   `libra-governor quota-observation doctor --probe` (a `describe`-only
+   round trip) and `libra-governor quota-observation inspect
+   <registration-id>` (the one command that performs a live `snapshot`
+   round trip), and confirm you get back a parseable response with the
+   coverage you expect.
+6. **Exercise the lifecycle**: `libra-governor quota-observation
+   disable <registration-id>` (confirm a subsequent `inspect` refuses
+   it as disabled), `libra-governor quota-observation uninstall
+   <registration-id>` (confirm `doctor` no longer lists it), and
+   re-register the same pool from scratch (confirm it loads cleanly,
+   with no leftover state from the earlier registration — this crate
+   persists nothing of its own outside the registration file; see
    [`trust-and-lifecycle.md`](trust-and-lifecycle.md)'s "Uninstall"
    section).
 
 `tests/preview_clean_install.rs` automates steps 1 and 3–6 above end to
 end against the sample extension in
 [`examples/quota-observation-extension/`](../../examples/quota-observation-extension/),
-using the test-only self-approval helper for step 4 — not a real
-operator approval flow, since none exists yet. It does not automate
-step 2 (checking the checksum against a published value — see the
-test's own module doc comment); it also exercises one additional check
-step 1–6 doesn't list above: tampering with the installed executable
-after approval is caught as `ExecutableDigestMismatch`.
+using the test-only self-approval helper for step 4 rather than the
+real `libra-governor quota-observation approve` command — that test
+predates the CLI (HORO-1870) and still drives the crate's own public
+`identity::verify_identity` function directly, in a loop, the same way
+it always has; it was not updated to shell out to the CLI binary. It
+does not automate step 2 (checking the checksum against a published
+value — see the test's own module doc comment); it also exercises one
+additional check step 1–6 doesn't list above: tampering with the
+installed executable after approval is caught as
+`ExecutableDigestMismatch`.

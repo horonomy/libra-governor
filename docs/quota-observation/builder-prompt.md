@@ -4,7 +4,11 @@ A copy-pasteable template for a human or an LLM to follow when building
 a new `quota-observation` one-shot stdio extension against the accepted
 contract. See [`README.md`](README.md)'s status banner first:
 experimental 0.x preview, observation-only, merged to `main`
-(HORO-1854/1855), no CLI exists for this protocol yet.
+(HORO-1854/1855). The operator CLI (HORO-1870,
+`libra-governor quota-observation <register|approve|enable|disable|
+uninstall|doctor|inspect>`) is merged too — see
+[`author-guide.md`](author-guide.md)'s "Operator CLI" section for the
+full reference.
 
 ---
 
@@ -149,10 +153,20 @@ For each run, check:
    [`examples/quota-observation-extension/registration.template.json`](../../examples/quota-observation-extension/registration.template.json)
    for a complete worked example of this shape.
 
-**Reminder**: there is no CLI to perform the approval step today
-(pending HORO-1870). Approving a registration currently
-means calling `crates/quota-observation`'s own public
-`identity::verify_identity` (to discover the correct digests) and
-writing them into the registration file yourself, or — if you are
-working inside this repository's own test suite — using
-`tests/common/mod.rs::approve`, which does exactly that in a loop.
+**Reminder**: approving a registration is a real two-command operator
+flow today —
+
+```bash
+libra-governor quota-observation register <registration-file>
+libra-governor quota-observation approve <registration-id>
+```
+
+`register` never trusts a candidate file's self-declared
+`approval.approved`/digest fields — it force-clears them to the
+unapproved state on write regardless of what the file claims, so the
+"empty `approval` block" shape above is already what `register`
+enforces even if your template claimed otherwise. `approve` then
+measures the real executable/manifest/launch-tuple digests fresh from
+disk and writes them in — see
+[`author-guide.md`](author-guide.md)'s "Operator CLI" section for a
+full, verified example of this sequence end to end.
