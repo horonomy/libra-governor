@@ -14,6 +14,19 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+/// The bootstrap/describe envelope's `bootstrap_version` wire literal
+/// this crate speaks and expects an extension to echo back. Only one
+/// bootstrap version is implemented today (see `tests/README.md`'s
+/// compatibility-matrix rows 1-4, out of scope until a second version
+/// ships) — named here so operator-facing code (HORO-1870's CLI, PR2)
+/// and this crate's own fixtures reference one constant instead of
+/// repeating the string.
+pub const BOOTSTRAP_VERSION: &str = "libra.quota-bootstrap/1";
+
+/// The snapshot envelope's `protocol_version` wire literal this crate
+/// speaks. See [`BOOTSTRAP_VERSION`].
+pub const PROTOCOL_VERSION: &str = "libra.quota-observation/0.1";
+
 /// A structural defect in a parsed wire frame: the JSON deserialized
 /// (field names/types matched) but a cross-field or semantic invariant
 /// this protocol requires did not hold.
@@ -905,7 +918,7 @@ mod tests {
     #[test]
     fn bootstrap_response_rejects_both_and_neither() {
         let both = BootstrapResponse {
-            bootstrap_version: "libra.quota-bootstrap/1".into(),
+            bootstrap_version: BOOTSTRAP_VERSION.into(),
             request_id: "r1".into(),
             result: Some(BootstrapResult {
                 extension_id: "e".into(),
@@ -924,7 +937,7 @@ mod tests {
             WireValidationError::BothResultAndError
         );
         let neither = BootstrapResponse {
-            bootstrap_version: "libra.quota-bootstrap/1".into(),
+            bootstrap_version: BOOTSTRAP_VERSION.into(),
             request_id: "r1".into(),
             result: None,
             error: None,
@@ -938,7 +951,7 @@ mod tests {
     #[test]
     fn snapshot_request_validates_budget_and_nonempty_constraints() {
         let base = SnapshotRequest {
-            protocol_version: "libra.quota-observation/0.1".into(),
+            protocol_version: PROTOCOL_VERSION.into(),
             request_id: "r1".into(),
             operation: SnapshotOperation::Snapshot,
             context_selector: "sel".into(),
