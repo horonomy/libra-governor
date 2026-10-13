@@ -704,6 +704,7 @@ dependencies = [
  "libra-governor-gateway",
  "libra-governor-ledger",
  "libra-governor-protocol",
+ "libra-governor-quota-observation",
  "libra-governor-quota-source",
  "rustix",
  "serde",
