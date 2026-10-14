@@ -1,0 +1,22 @@
+{
+  "name": "t7_burst_to_sustain",
+  "description": "A burst-to-sustain transition: the scenario starts in BURST (wide fanout) and switches to SUSTAIN (one admit at a time, spaced) partway through, via a PreferenceChanged exogenous event. StaticBudget (preference-blind) is unaffected; Paced must visibly change its own admission cadence after the switch.",
+  "initial_preference": { "mode": "burst", "target_end_offset_secs": 21600, "max_fanout": 5 },
+  "windows": [
+    { "name": "main", "unit": "tokens", "kind": { "kind": "sliding", "length_secs": 21600, "limit": 1000 } }
+  ],
+  "tasks": [
+    { "id": 1, "principal": "hank", "depends_on": [], "priority": "normal", "relative_duration_secs": 60, "relative_spend": 100, "unit": "tokens" },
+    { "id": 2, "principal": "hank", "depends_on": [], "priority": "normal", "relative_duration_secs": 60, "relative_spend": 100, "unit": "tokens" },
+    { "id": 3, "principal": "hank", "depends_on": [], "priority": "normal", "relative_duration_secs": 60, "relative_spend": 100, "unit": "tokens" },
+    { "id": 4, "principal": "hank", "depends_on": [], "priority": "normal", "relative_duration_secs": 60, "relative_spend": 100, "unit": "tokens" },
+    { "id": 5, "principal": "hank", "depends_on": [], "priority": "normal", "relative_duration_secs": 60, "relative_spend": 100, "unit": "tokens" }
+  ],
+  "events": [
+    {
+      "kind": "preference_changed",
+      "offset_secs": 10,
+      "preference": { "mode": "sustain", "horizon_secs": 21600, "continuity_reserve_bp": 0 }
+    }
+  ]
+}

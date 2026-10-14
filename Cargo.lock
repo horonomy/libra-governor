@@ -838,6 +838,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "libra-governor-pacing-gate"
+version = "0.0.3"
+dependencies = [
+ "libra-governor-domain",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+ "uuid",
+]
+
+[[package]]
 name = "libra-governor-protocol"
 version = "0.0.3"
 dependencies = [

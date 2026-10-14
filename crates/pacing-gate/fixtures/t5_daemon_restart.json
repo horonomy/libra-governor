@@ -1,0 +1,15 @@
+{
+  "name": "t5_daemon_restart",
+  "description": "A daemon restart mid-run: task 1 completes, then the daemon restarts (wiping any strategy's in-memory state) before task 2 — which depends on task 1 — is ever decided. The world's ground truth (task 1 already completed) survives the restart untouched; only a strategy's own belief is wiped, via Strategy::on_restart.",
+  "initial_preference": { "mode": "sustain", "horizon_secs": 21600, "continuity_reserve_bp": 0 },
+  "windows": [
+    { "name": "main", "unit": "tokens", "kind": { "kind": "sliding", "length_secs": 21600, "limit": 1000 } }
+  ],
+  "tasks": [
+    { "id": 1, "principal": "frank", "depends_on": [], "priority": "normal", "relative_duration_secs": 30, "relative_spend": 100, "unit": "tokens" },
+    { "id": 2, "principal": "frank", "depends_on": [1], "priority": "normal", "relative_duration_secs": 30, "relative_spend": 100, "unit": "tokens" }
+  ],
+  "events": [
+    { "kind": "daemon_restart", "offset_secs": 45 }
+  ]
+}

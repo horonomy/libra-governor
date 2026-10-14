@@ -1,0 +1,13 @@
+{
+  "name": "t6_overrun_backoff",
+  "description": "A principal overruns its own hold mid-task (reports real spend far above its original estimate) before completing on time. The world must record the true overrun; a pacing-aware strategy is expected to throttle (never cancel) that principal's later starts in response — mirrors pacing::step.rs's own 'sustain_never_cancels_on_overrun' regression.",
+  "initial_preference": { "mode": "burst", "target_end_offset_secs": 21600, "max_fanout": 4 },
+  "windows": [
+    { "name": "main", "unit": "tokens", "kind": { "kind": "sliding", "length_secs": 21600, "limit": 700 } }
+  ],
+  "tasks": [
+    { "id": 1, "principal": "gina", "depends_on": [], "priority": "normal", "relative_duration_secs": 60, "relative_spend": 100, "unit": "tokens", "overrun_spend": 400 },
+    { "id": 2, "principal": "gina", "depends_on": [1], "priority": "normal", "relative_duration_secs": 60, "relative_spend": 100, "unit": "tokens" }
+  ],
+  "events": []
+}

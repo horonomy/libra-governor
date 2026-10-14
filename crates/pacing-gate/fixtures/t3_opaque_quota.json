@@ -1,0 +1,15 @@
+{
+  "name": "t3_opaque_quota",
+  "description": "Insufficient/honest opaque quota: the fixture tells the strategy a generous remaining figure via QuotaSnapshotTold, but the window's true headroom (already consumed by an earlier real, world-visible spend) is far smaller. Proves the world and the told snapshot are never the same thing, and that World::true_occupancy, not the told figure, is what PR-B's verifier must trust.",
+  "initial_preference": { "mode": "burst", "target_end_offset_secs": 3600, "max_fanout": 1 },
+  "windows": [
+    { "name": "opaque", "unit": "tokens", "kind": { "kind": "sliding", "length_secs": 3600, "limit": 400 } }
+  ],
+  "tasks": [
+    { "id": 1, "principal": "dave", "depends_on": [], "priority": "normal", "relative_duration_secs": 60, "relative_spend": 150, "unit": "tokens" }
+  ],
+  "events": [
+    { "kind": "foreign_spend", "offset_secs": 0, "window": "opaque", "amount": 380, "unit": "tokens" },
+    { "kind": "quota_snapshot_told", "offset_secs": 5, "window": "opaque", "remaining": 1000 }
+  ]
+}
