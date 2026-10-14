@@ -102,6 +102,15 @@ pub enum DriveLogEntry {
     ForeignSpend { window: String, amount: u64 },
     Restart,
     PreferenceChanged,
+    /// PR-B addition: records every instant the driver actually gave the
+    /// strategy a decision opportunity (`ready` was non-empty), and what
+    /// it did with it — regardless of whether anything started. Without
+    /// this, `verify.rs` could only see *that* a task eventually started
+    /// (via `Started`), never *when it had its chance and didn't* — the
+    /// distinction AC1's false-throttle vs. involuntary-wait metric
+    /// depends on. Always logged alongside (never replacing) any
+    /// `Started` entries the same `decide` call produces.
+    Offered { ready: Vec<u32>, started: Vec<u32> },
 }
 
 /// The full result of one `run_trace` call: the ordered log and the
@@ -156,6 +165,16 @@ pub fn run_trace(
     // An initial poll at the epoch, so a task with no dependencies and no
     // triggering exogenous event still gets a first decision chance.
     push(&mut queue, &mut seq, TRACE_EPOCH, QueueKind::Poll);
+
+    // The last `next_wake` instant this driver has already scheduled a
+    // `Poll` for — deduplicates repeated scheduling of the same wake
+    // instant across consecutive queue items (every queue item re-checks
+    // `next_wake`, and an unresolved `Hold` reports the same instant
+    // until the queue actually reaches it). See `Strategy::next_wake`'s
+    // docs for why this exists at all (PR-B finding: `Paced` under-
+    // completed 5 of 9 fixtures with no scheduled wake for a quota-only
+    // hold).
+    let mut last_scheduled_wake: Option<OffsetDateTime> = None;
 
     let mut steps = 0usize;
     while let Some(item) = queue.pop() {
@@ -219,56 +238,78 @@ pub fn run_trace(
         // start newly-ready work — a completion may have freed a
         // dependency, a restart may have reset internal pacing, etc.
         let ready = world.ready_tasks(&spec.tasks);
-        if ready.is_empty() {
-            continue;
-        }
-        let decided = strategy.decide(at, &ready);
-        for task_id in decided {
-            if !ready.contains(&task_id) {
-                // The strategy named a task that isn't actually ready
-                // (already active/completed, or unknown) — ignored, not
-                // a panic: a strategy mutant that does this is exactly
-                // the kind of thing PR-B's verifier should be free to
-                // flag, never something this driver crashes on.
-                continue;
-            }
-            let task_spec = spec
-                .task(task_id)
-                .expect("ready_tasks only ever returns ids present in spec.tasks");
-            if world.start_task(task_spec, at).is_err() {
-                continue;
-            }
-            log.push((at, DriveLogEntry::Started { task: task_id }));
-            // Open a claim on every window sharing this task's unit —
-            // mirrors `pacing::step::pending_for_window`'s "every window
-            // of the task's unit sees the hold" rule. Opened at the
-            // task's declared `relative_spend` floor; a later
-            // `overrun_spend` report (if any) raises it further.
-            for window in &spec.windows {
-                if window.unit == task_spec.unit {
-                    let _ = world.open_claim(task_id, &window.name, task_spec.relative_spend);
+        if !ready.is_empty() {
+            let decided = strategy.decide(at, &ready);
+            let mut started_now: Vec<u32> = Vec::new();
+            for task_id in decided {
+                if !ready.contains(&task_id) {
+                    // The strategy named a task that isn't actually ready
+                    // (already active/completed, or unknown) — ignored, not
+                    // a panic: a strategy mutant that does this is exactly
+                    // the kind of thing PR-B's verifier should be free to
+                    // flag, never something this driver crashes on.
+                    continue;
                 }
-            }
-            let duration = time::Duration::seconds(
-                i64::try_from(task_spec.relative_duration_secs).unwrap_or(i64::MAX),
-            );
-            if let Some(overrun) = task_spec.overrun_spend {
+                let task_spec = spec
+                    .task(task_id)
+                    .expect("ready_tasks only ever returns ids present in spec.tasks");
+                if world.start_task(task_spec, at).is_err() {
+                    continue;
+                }
+                started_now.push(task_id);
+                log.push((at, DriveLogEntry::Started { task: task_id }));
+                // Open a claim on every window sharing this task's unit —
+                // mirrors `pacing::step::pending_for_window`'s "every window
+                // of the task's unit sees the hold" rule. Opened at the
+                // task's declared `relative_spend` floor; a later
+                // `overrun_spend` report (if any) raises it further.
+                for window in &spec.windows {
+                    if window.unit == task_spec.unit {
+                        let _ =
+                            world.open_claim(task_id, &window.name, task_spec.relative_spend);
+                    }
+                }
+                let duration = time::Duration::seconds(
+                    i64::try_from(task_spec.relative_duration_secs).unwrap_or(i64::MAX),
+                );
+                if let Some(overrun) = task_spec.overrun_spend {
+                    push(
+                        &mut queue,
+                        &mut seq,
+                        at + duration / 2,
+                        QueueKind::SpendReport {
+                            task: task_id,
+                            amount: overrun,
+                        },
+                    );
+                }
                 push(
                     &mut queue,
                     &mut seq,
-                    at + duration / 2,
-                    QueueKind::SpendReport {
-                        task: task_id,
-                        amount: overrun,
-                    },
+                    at + duration,
+                    QueueKind::Completion { task: task_id },
                 );
             }
-            push(
-                &mut queue,
-                &mut seq,
-                at + duration,
-                QueueKind::Completion { task: task_id },
-            );
+            log.push((
+                at,
+                DriveLogEntry::Offered {
+                    ready: ready.clone(),
+                    started: started_now,
+                },
+            ));
+        }
+
+        // Ask the strategy whether it still has an internal reason to be
+        // revisited with no further external event (see
+        // `Strategy::next_wake`'s docs) — checked unconditionally, not
+        // only when `ready` was non-empty: a `decide` call earlier in
+        // this run may have left a `Hold` wake instant pending that this
+        // item did nothing to resolve.
+        if let Some(wake) = strategy.next_wake(at) {
+            if wake > at && last_scheduled_wake != Some(wake) {
+                push(&mut queue, &mut seq, wake, QueueKind::Poll);
+                last_scheduled_wake = Some(wake);
+            }
         }
     }
 

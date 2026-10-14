@@ -94,6 +94,39 @@ pub trait Strategy {
     /// `PacerState` is real in-memory scheduling state a restart must
     /// discard (t5's scenario).
     fn on_restart(&mut self) {}
+
+    /// The next instant at which this strategy's own admission decision
+    /// could change with **no further external event** — a quota
+    /// window's sliding bound aging a hold out, or a refill-bucket tick
+    /// — distinct from any instant a trace's own `ExogenousEvent` or
+    /// task completion already forces the driver to visit regardless.
+    /// Default: `None` (no strategy-internal wake instant). `StaticBudget`
+    /// never overrides this — its admission is purely concurrency-gated
+    /// and only ever changes on `TaskCompleted`, which the driver already
+    /// revisits unconditionally.
+    ///
+    /// PR-B finding: `Paced::decide` only ever reported `Proposal::Start`
+    /// task ids, silently discarding every `Proposal::Hold { next }` it
+    /// received from `pacing::step` (see that match arm below). The
+    /// driver, in turn, only ever scheduled one `Poll` at the trace
+    /// epoch and otherwise only re-asked the strategy after an event
+    /// already in its queue — never at a `Hold`'s own wake instant. A
+    /// `Paced` run that holds a ready task purely because of a
+    /// sliding-window bound (not because of a future task completion or
+    /// fixture event) could therefore starve indefinitely: nothing ever
+    /// told the driver when to look again. Measured before this fix:
+    /// `t1_multi_window` completed 2/4 tasks, `t4_delayed_settlement`
+    /// 1/2, `t5_daemon_restart` 1/2, `t6_overrun_backoff` 1/2, and
+    /// `x0_unguarded` 1/5 — every one of them silently incomplete, with
+    /// `World::active_count() == 0` (so `world_consistency.rs`'s
+    /// existing assertions never caught it; they check internal
+    /// consistency, not completeness). This method plus
+    /// `crate::drive::run_trace`'s new poll-scheduling make that wake
+    /// instant visible to the driver without changing `Strategy::decide`'s
+    /// signature or any other PR-A behavior.
+    fn next_wake(&self, _now: OffsetDateTime) -> Option<OffsetDateTime> {
+        None
+    }
 }
 
 /// The simplest strategy: admits up to `max_concurrent` ready tasks at a
@@ -276,6 +309,15 @@ impl Strategy for Paced {
         // definition, read from durable config, not runtime state).
         self.state = PacerState::default();
         self.seq = 0;
+    }
+
+    /// `PacerState::pending_timer` already tracks exactly this — the
+    /// earliest instant `try_admit` found a held task that could become
+    /// admissible with no new event, recomputed on every `step` call —
+    /// so this is a read of existing state, not new bookkeeping. See
+    /// the trait docs above for why the driver needs this exposed.
+    fn next_wake(&self, _now: OffsetDateTime) -> Option<OffsetDateTime> {
+        self.state.pending_timer()
     }
 }
 
