@@ -150,10 +150,19 @@ pub trait Strategy {
     /// per that same internal state), so it is silently never started —
     /// permanently, not just delayed. Confirmed fixed on
     /// `t4_delayed_settlement` (now completes 2/2, was 1/2) — see
-    /// `tests/world_consistency.rs`'s dedicated regression test. x0's
-    /// and t6's own incompleteness are separately legitimate (a real
-    /// `PastTargetEnd` cutoff and a real AC1 false-throttle
-    /// respectively — see `verify.rs`), not instances of this bug.
+    /// `tests/world_consistency.rs`'s dedicated regression test. x0's own
+    /// incompleteness is separately legitimate (a real `PastTargetEnd`
+    /// cutoff — see `verify.rs`), not an instance of this bug. t6's own
+    /// incompleteness IS a real AC1 false throttle at the one instant
+    /// it is observed (`verify.rs` confirms real headroom existed) —
+    /// but PR-B found that observation is also the LAST one task 2 ever
+    /// gets: `Paced::next_wake` never schedules a future recheck after
+    /// the overrun backoff, so what t6's own fixture description calls
+    /// "throttle (never cancel)" is, in this strategy's actual observed
+    /// behavior, a permanent cancel in practice — see
+    /// `tests/verify_fixture_claims.rs`'s own doc comment for detail and
+    /// disclosure status (not fixed here; same `domain::pacing`
+    /// out-of-scope reasoning as `on_restart`'s `completed`-wipe above).
     fn drain_pending_starts(&mut self) -> Vec<u32> {
         Vec::new()
     }

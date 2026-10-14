@@ -129,7 +129,13 @@ impl Strategy for ForgetfulBaseline {
     }
 
     /// Deliberately a no-op for every event, including `TaskCompleted` —
-    /// this is the mutant's whole point: never renews, never checks in,
-    /// abandons tracking the instant a task it started actually finishes.
+    /// this is the mutant's whole point: it never reacts to a task it
+    /// started actually finishing, abandoning its own capacity
+    /// accounting the instant that happens. ("Never renews, never checks
+    /// in" describes the belief-staleness failure mode this models, not
+    /// a literal lease/renewal/check-in protocol — the driver has no
+    /// session-identity or lease-renewal channel at all; see
+    /// `ForeignSession`'s own docs for the identity side of that same
+    /// limitation.)
     fn notify(&mut self, _event: &DriveEvent) {}
 }

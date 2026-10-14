@@ -96,17 +96,26 @@
 //!   could, given the one the strategy already admitted alongside them.
 //!   Post-batch state asks the right question instead.
 //!
-//! # Time-bracketed, not entry-counted
+//! # Elapsed-time intervals, not entry counts or naive brackets
 //!
 //! An `Offered` entry is logged at *every* poll where `ready` is
 //! non-empty, so the same held task can appear in many consecutive
-//! entries, sometimes at the same instant. Counting entries would make
-//! every duration-shaped metric below change with poll granularity alone
-//! (the exact bug this module's own regression guards against — see
-//! `tests/verify_metrics.rs`). Every metric here is instead computed as
-//! a **time interval** per task (first-seen to last-seen, or first-seen
-//! to started), and every *count* is a count of **distinct tasks**
-//! affected, never of log entries.
+//! entries, sometimes at the same instant. Counting entries, or even
+//! taking a naive first-seen-to-last-seen bracket across only the
+//! `Offered` sightings, would both get the duration wrong: a task sighted
+//! eligible exactly once, long before it is finally started by some much
+//! later event, would score a bracket (or an entry count) that has
+//! nothing to do with how long it actually waited.
+//!
+//! `verify`'s own loop instead opens a per-task interval the instant an
+//! `Offered` entry confirms it eligible (ready, held, real headroom
+//! available), and closes it — crediting real elapsed wall-clock time —
+//! at whatever log entry comes next, of ANY kind: that task's own
+//! `Started` entry, a later `Offered` entry that re-confirms or ends
+//! eligibility, or (if nothing ever closes it) the trace's own end. Every
+//! *count* in this module is a count of **distinct tasks** affected,
+//! never of log entries — see `tests/verify_metrics.rs` and this
+//! module's own unit tests for the regression this guards against.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -155,11 +164,27 @@ pub struct TaskOutcome {
     /// headroom for it? One bool per task, not one per `Offered` sighting
     /// — see module docs on time-bracketing, not entry-counting.
     pub false_throttled: bool,
-    /// `[first_held_at, last_held_at]` bracketing every consecutive
-    /// false-throttle-eligible sighting — the interval this task's
-    /// `false_throttle_secs` contribution is computed from.
-    pub false_throttle_first_at: Option<OffsetDateTime>,
-    pub false_throttle_last_at: Option<OffsetDateTime>,
+    /// Total wall-clock seconds this task spent in a confirmed
+    /// false-throttle-eligible state, computed as real elapsed time
+    /// between log entries (see `verify`'s own loop: an eligible
+    /// interval opens at the `Offered` entry that finds it eligible and
+    /// closes at whatever log entry comes next — that task's own
+    /// `Started` entry, a later `Offered` entry that re-confirms or ends
+    /// eligibility, or trace end), NOT a per-sighting count and NOT a
+    /// naive first-seen-to-last-seen bracket (which would silently
+    /// under-count a task sighted eligible only once, long before it
+    /// finally starts — see module docs).
+    pub false_throttle_secs: i64,
+    /// True when this task's false-throttle-eligible interval was still
+    /// open at the end of the trace — i.e. it was confirmed eligible at
+    /// its last sighting and never started. A separate signal from
+    /// `false_throttle_secs` because the true remaining duration is
+    /// genuinely unknowable past the trace's own end (crediting it
+    /// arbitrary time would fabricate evidence this verifier does not
+    /// have) — this flag is what makes that worst case visible instead
+    /// of silently reading as "zero false-throttle seconds, nothing to
+    /// see here".
+    pub stranded_with_headroom: bool,
 }
 
 impl TaskOutcome {
@@ -174,16 +199,6 @@ impl TaskOutcome {
             }
             (Some(_), Some(_)) => Some(0),
             _ => None,
-        }
-    }
-
-    /// Seconds this task spent in a confirmed false-throttle state —
-    /// `0` if it was never false-throttled.
-    pub fn false_throttle_secs(&self) -> i64 {
-        match (self.false_throttle_first_at, self.false_throttle_last_at) {
-            (Some(first), Some(last)) if last > first => (last - first).whole_seconds(),
-            (Some(_), Some(_)) => 0,
-            _ => 0,
         }
     }
 }
@@ -201,6 +216,13 @@ pub struct Violation {
 /// The full result of verifying one (fixture, strategy) run — every
 /// field computed from `World`/driver-log ground truth, per this
 /// module's own docs.
+///
+/// Disclosed scope gap: AC1's own text mentions "involuntary 429/wait" —
+/// this crate has no notion of a rate-limit HTTP response at all (no
+/// fixture, strategy, or driver code path ever constructs or reacts to
+/// one). `involuntary_wait_secs` measures ready-to-started delay
+/// regardless of cause; it does not and cannot distinguish a 429-shaped
+/// real-world wait from any other kind within this simulation harness.
 #[derive(Debug, Clone)]
 pub struct VerifyReport {
     pub fixture: String,
@@ -225,6 +247,9 @@ pub struct VerifyReport {
     /// multiple hops of a dependency chain — a disclosed simplification,
     /// not a claim of full cascade accounting.
     pub downstream_cooldown_secs: i64,
+    /// Count of tasks whose false-throttle-eligible interval was still
+    /// open at trace end — see [`TaskOutcome::stranded_with_headroom`].
+    pub stranded_with_headroom_count: usize,
     /// `tasks_completed as f64 / tasks_total as f64` — a basic
     /// completion-floor proxy for AC1's "completion-contract compliance"
     /// term. This is NOT a read of
@@ -233,7 +258,23 @@ pub struct VerifyReport {
     /// driver or `World` at all) — just the fraction of the trace's own
     /// declared tasks that the ground-truth world confirms completed.
     pub completion_rate: f64,
+    /// Real AC2 violations: starting this task would have exceeded a
+    /// window's limit using CONTROLLED-only occupancy (this crate's own
+    /// task starts/spends/completions) — the paths under this strategy's
+    /// actual authority, which is exactly what AC2's own text scopes the
+    /// hard-limit guarantee to ("every hard limit respected for paths
+    /// under actual authority; uncontrolled activity explicitly excluded
+    /// from guarantee"). See [`Self::uncontrolled_overlap_violations`]
+    /// for the separate, non-AC2-violating case.
     pub hard_limit_violations: Vec<Violation>,
+    /// A task's start did NOT violate the window under controlled-only
+    /// occupancy, but WOULD if a third party's `ForeignSpend` is also
+    /// counted — real overlap with uncontrolled activity, explicitly
+    /// excluded from the AC2 guarantee by the ticket's own text, so these
+    /// are reported separately rather than folded into
+    /// [`Self::hard_limit_violations`] (which would misrepresent an
+    /// AC2-compliant strategy as having violated its own guarantee).
+    pub uncontrolled_overlap_violations: Vec<Violation>,
     pub principal_violations: Vec<Violation>,
     pub per_task: Vec<TaskOutcome>,
 }
@@ -256,17 +297,28 @@ pub struct VerifyReport {
 /// timestamped and re-applies each window's own declared decay at query
 /// time, rather than reconstructing `World`'s literal (non-decaying)
 /// arithmetic.
+/// `settled`/`open` entries also tag whether a contribution is
+/// "controlled" (this crate's own task starts/spends/completions — paths
+/// under a strategy's actual authority) or "uncontrolled" (a third
+/// party's `ForeignSpend` — AC2's text explicitly excludes uncontrolled
+/// activity from the hard-limit guarantee, so the hard-limit check must
+/// be able to ask "controlled-only" separately from "including
+/// uncontrolled overlap too" — see [`occupancy_of`]'s `include_foreign`
+/// parameter and [`VerifyReport::uncontrolled_overlap_violations`]).
 #[derive(Default, Clone)]
 struct Occupancy {
-    /// Timestamped settled/foreign-spend contributions per window name,
-    /// in application order — aged out per [`window_limit`]'s sibling,
-    /// [`occupancy_of`], according to that window's own declared kind.
-    settled: BTreeMap<String, Vec<(OffsetDateTime, u64)>>,
+    /// Timestamped `(at, amount, is_foreign)` contributions per window
+    /// name, in application order — aged out per [`window_limit`]'s
+    /// sibling, [`Occupancy::occupancy_of`], according to that window's
+    /// own declared kind.
+    settled: BTreeMap<String, Vec<(OffsetDateTime, u64, bool)>>,
     /// Current open-claim `(unit, amount)` per task id — the amount is
     /// identical across every window sharing that task's unit, mirroring
     /// `World::open_claim`'s own "every window of the unit sees the same
     /// amount" rule. Open claims never decay by age — they are live,
-    /// current commitments, not historical spend.
+    /// current commitments, not historical spend. Always controlled
+    /// (every open claim here comes from this crate's own
+    /// `DriveLogEntry::Started`/`Spend`, never from `ForeignSpend`).
     open: BTreeMap<u32, (TraceUnit, u64)>,
 }
 
@@ -296,7 +348,7 @@ impl Occupancy {
             self.settled
                 .entry(w.name.clone())
                 .or_default()
-                .push((at, settled));
+                .push((at, settled, false));
         }
     }
 
@@ -304,15 +356,21 @@ impl Occupancy {
         self.settled
             .entry(window.to_string())
             .or_default()
-            .push((at, amount));
+            .push((at, amount, true));
     }
 
     /// True occupancy of `window` as of `at`: every still-open claim
-    /// whose unit matches this window (no decay — live commitments),
-    /// plus settled/foreign spend aged per the window's own declared
-    /// kind (see this type's own docs for why `Sliding` must decay here
-    /// even though `World` itself never does).
-    fn occupancy_of(&self, window: &WindowSpec, at: OffsetDateTime) -> u64 {
+    /// whose unit matches this window (no decay — live commitments,
+    /// always controlled), plus settled/foreign spend aged per the
+    /// window's own declared kind (see this type's own docs for why
+    /// `Sliding` must decay here even though `World` itself never does).
+    /// `include_foreign` selects whether `ForeignSpend` contributions
+    /// count — `false` answers "how full is this window using only
+    /// paths under a strategy's own authority" (the AC2 hard-limit
+    /// question), `true` answers "how full is this window, full stop"
+    /// (the AC1 false-throttle/quota-waste question — real headroom
+    /// genuinely is reduced by a third party's real spend).
+    fn occupancy_of(&self, window: &WindowSpec, at: OffsetDateTime, include_foreign: bool) -> u64 {
         let open_sum: u64 = self
             .open
             .values()
@@ -320,31 +378,37 @@ impl Occupancy {
             .map(|(_, amount)| *amount)
             .sum();
         let settled_sum: u64 = match self.settled.get(&window.name) {
-            Some(entries) => match window.kind {
-                WindowSpecKind::Sliding { length_secs, .. } => {
-                    let horizon = at
-                        - time::Duration::seconds(i64::try_from(length_secs).unwrap_or(i64::MAX));
-                    entries
-                        .iter()
-                        .filter(|(t, _)| *t > horizon && *t <= at)
-                        .map(|(_, a)| *a)
-                        .sum()
-                }
-                // Conservative simplification, documented: a refill
-                // bucket's real ceiling only ever grows back toward
-                // `capacity` over time (refill accrual is never modeled
-                // here), so summing every settled entry with no decay
-                // can only ever OVERSTATE real occupancy (understate
-                // headroom), never the reverse. No fixture in this crate
-                // currently uses `RefillBucket` at all, so this path is
-                // untested against a real scenario — flagged here rather
-                // than silently assumed correct.
-                WindowSpecKind::RefillBucket { .. } => entries
+            Some(entries) => {
+                let entries = entries
                     .iter()
-                    .filter(|(t, _)| *t <= at)
-                    .map(|(_, a)| *a)
-                    .sum(),
-            },
+                    .filter(|(_, _, foreign)| include_foreign || !foreign);
+                match window.kind {
+                    WindowSpecKind::Sliding { length_secs, .. } => {
+                        let horizon = at
+                            - time::Duration::seconds(
+                                i64::try_from(length_secs).unwrap_or(i64::MAX),
+                            );
+                        entries
+                            .filter(|(t, _, _)| *t > horizon && *t <= at)
+                            .map(|(_, a, _)| *a)
+                            .sum()
+                    }
+                    // Conservative simplification, documented: a refill
+                    // bucket's real ceiling only ever grows back toward
+                    // `capacity` over time (refill accrual is never
+                    // modeled here), so summing every settled entry with
+                    // no decay can only ever OVERSTATE real occupancy
+                    // (understate headroom), never the reverse. No
+                    // fixture in this crate currently uses
+                    // `RefillBucket` at all, so this path is untested
+                    // against a real scenario — flagged here rather than
+                    // silently assumed correct.
+                    WindowSpecKind::RefillBucket { .. } => entries
+                        .filter(|(t, _, _)| *t <= at)
+                        .map(|(_, a, _)| *a)
+                        .sum(),
+                }
+            }
             None => 0,
         };
         open_sum + settled_sum
@@ -360,17 +424,19 @@ fn window_limit(window: &WindowSpec) -> u64 {
 
 /// Would starting `task` at `at`, given `occ`'s current state, violate
 /// any window sharing its unit? Returns the names of every window it
-/// would violate (empty means "fits everywhere").
+/// would violate (empty means "fits everywhere"). See
+/// [`Occupancy::occupancy_of`]'s docs for `include_foreign`.
 fn would_violate(
     spec: &TraceSpec,
     occ: &Occupancy,
     task: &TraceTask,
     at: OffsetDateTime,
+    include_foreign: bool,
 ) -> Vec<String> {
     let mut violated = Vec::new();
     for w in Occupancy::matching_windows(spec, task.unit) {
         let limit = window_limit(w);
-        let after = occ.occupancy_of(w, at) + task.relative_spend;
+        let after = occ.occupancy_of(w, at, include_foreign) + task.relative_spend;
         if after > limit {
             violated.push(w.name.clone());
         }
@@ -396,14 +462,15 @@ pub fn verify(spec: &TraceSpec, meta: StrategyMeta, outcome: &DriveOutcome) -> V
                     first_ready_at: None,
                     started_at: None,
                     false_throttled: false,
-                    false_throttle_first_at: None,
-                    false_throttle_last_at: None,
+                    false_throttle_secs: 0,
+                    stranded_with_headroom: false,
                 },
             )
         })
         .collect();
 
     let mut hard_limit_violations = Vec::new();
+    let mut uncontrolled_overlap_violations = Vec::new();
     let mut principal_violations = Vec::new();
     // `None` between batches. Set to a clone of `occ` the moment the
     // first `Started` entry of a new decision batch is seen, accumulates
@@ -412,29 +479,71 @@ pub fn verify(spec: &TraceSpec, meta: StrategyMeta, outcome: &DriveOutcome) -> V
     // why the false-throttle check must see pre-batch state while the
     // hard-limit check must see each sibling start in call order.
     let mut batch_occ: Option<Occupancy> = None;
+    // Tasks currently inside an open false-throttle-eligible interval,
+    // keyed by the instant that interval opened. Closed (credited to
+    // `false_throttle_secs`) at the timestamp of whatever log entry comes
+    // next, regardless of its kind or which task it concerns — see
+    // module docs ("Time-bracketed, not entry-counted") for why this is
+    // real elapsed time, not a sighting count or a naive
+    // first-seen-to-last-seen bracket.
+    let mut open_since: BTreeMap<u32, OffsetDateTime> = BTreeMap::new();
 
     for (at, entry) in &outcome.log {
         let at = *at;
+
+        // Close every currently-open eligible interval at this entry's
+        // own timestamp, crediting real elapsed time — reopened below
+        // (same iteration) only if this is an `Offered` entry that
+        // re-confirms the task is still ready, held, and eligible.
+        for (task_id, opened_at) in std::mem::take(&mut open_since) {
+            let delta = (at - opened_at).whole_seconds().max(0);
+            if let Some(out) = per_task.get_mut(&task_id) {
+                out.false_throttle_secs += delta;
+            }
+        }
+
         match entry {
             DriveLogEntry::Started { task } => {
                 let Some(task_spec) = spec.task(*task) else {
                     continue;
                 };
                 let current = batch_occ.get_or_insert_with(|| occ.clone());
-                // Hard-limit check: evaluated against `current`, which
-                // already includes any sibling task started earlier in
-                // this same batch — exactly mirroring `World`'s own
-                // sequential `start_task`/`open_claim` call order.
-                let violated = would_violate(spec, current, task_spec, at);
-                if !violated.is_empty() {
+                // Hard-limit check (AC2): CONTROLLED-only occupancy —
+                // the paths under this strategy's actual authority, per
+                // AC2's own text. Already includes any sibling task
+                // started earlier in this same batch — exactly mirroring
+                // `World`'s own sequential `start_task`/`open_claim` call
+                // order.
+                let controlled_violated = would_violate(spec, current, task_spec, at, false);
+                if !controlled_violated.is_empty() {
                     hard_limit_violations.push(Violation {
                         task: *task,
                         at,
                         detail: format!(
-                            "starting task {task} violates window(s) {violated:?} given true \
-                             occupancy at this instant"
+                            "starting task {task} violates window(s) {controlled_violated:?} \
+                             using CONTROLLED-only occupancy at this instant (an AC2 violation: \
+                             this is under the strategy's own authority)"
                         ),
                     });
+                } else {
+                    // Only meaningful to ask "does FULL (including
+                    // foreign) occupancy also violate" when the
+                    // controlled-only check already passed — otherwise
+                    // it would just restate the same AC2 violation above.
+                    let full_violated = would_violate(spec, current, task_spec, at, true);
+                    if !full_violated.is_empty() {
+                        uncontrolled_overlap_violations.push(Violation {
+                            task: *task,
+                            at,
+                            detail: format!(
+                                "starting task {task} fits under controlled-only occupancy but \
+                                 violates window(s) {full_violated:?} once a third party's real \
+                                 ForeignSpend is also counted — real overlap with uncontrolled \
+                                 activity, explicitly excluded from the AC2 guarantee by the \
+                                 ticket's own text, not an AC2 violation"
+                            ),
+                        });
+                    }
                 }
                 if let Some(owning) = &meta.owning_principal {
                     if task_spec.principal != *owning {
@@ -509,18 +618,31 @@ pub fn verify(spec: &TraceSpec, meta: StrategyMeta, outcome: &DriveOutcome) -> V
                     let Some(task_spec) = spec.task(task_id) else {
                         continue;
                     };
-                    let violated = would_violate(spec, &occ, task_spec, at);
+                    // Real headroom (AC1's own question), not
+                    // controlled-only: a third party's real spend
+                    // genuinely reduces available capacity, regardless
+                    // of whether it counts toward the AC2 guarantee.
+                    let violated = would_violate(spec, &occ, task_spec, at, true);
                     if violated.is_empty() {
                         if let Some(out) = per_task.get_mut(&task_id) {
                             out.false_throttled = true;
-                            if out.false_throttle_first_at.is_none() {
-                                out.false_throttle_first_at = Some(at);
-                            }
-                            out.false_throttle_last_at = Some(at);
                         }
+                        open_since.insert(task_id, at);
                     }
                 }
             }
+        }
+    }
+
+    // Trace end: any interval still open never got a later log entry to
+    // close it against — the task was eligible right up to the end and
+    // never started. The true remaining duration past the trace's own
+    // end is genuinely unknowable (crediting one would fabricate
+    // evidence), so this is flagged via `stranded_with_headroom` instead
+    // of guessed into `false_throttle_secs` — see that field's own docs.
+    for task_id in open_since.keys() {
+        if let Some(out) = per_task.get_mut(task_id) {
+            out.stranded_with_headroom = true;
         }
     }
 
@@ -532,14 +654,16 @@ pub fn verify(spec: &TraceSpec, meta: StrategyMeta, outcome: &DriveOutcome) -> V
         .filter_map(TaskOutcome::involuntary_wait_secs)
         .sum();
     let false_throttle_task_count = per_task.values().filter(|t| t.false_throttled).count();
-    let false_throttle_secs = per_task
+    let false_throttle_secs = per_task.values().map(|t| t.false_throttle_secs).sum();
+    let stranded_with_headroom_count = per_task
         .values()
-        .map(TaskOutcome::false_throttle_secs)
-        .sum();
+        .filter(|t| t.stranded_with_headroom)
+        .count();
 
-    // Quota waste: unused headroom at trace-end, counted only for a
-    // window that saw at least one false-throttled task sharing its
-    // unit — see `VerifyReport::quota_waste`'s own docs.
+    // Quota waste: unused headroom at trace-end (full occupancy,
+    // including foreign spend — the real question), counted only for a
+    // window that saw at least one false-throttled task sharing its unit
+    // — see `VerifyReport::quota_waste`'s own docs.
     let false_throttled_units: BTreeSet<TraceUnit> = per_task
         .values()
         .filter(|t| t.false_throttled)
@@ -550,7 +674,7 @@ pub fn verify(spec: &TraceSpec, meta: StrategyMeta, outcome: &DriveOutcome) -> V
     for w in &spec.windows {
         if false_throttled_units.contains(&w.unit) {
             let limit = window_limit(w);
-            let final_occ = occ.occupancy_of(w, trace_end);
+            let final_occ = occ.occupancy_of(w, trace_end, true);
             quota_waste += limit.saturating_sub(final_occ);
         }
     }
@@ -564,7 +688,7 @@ pub fn verify(spec: &TraceSpec, meta: StrategyMeta, outcome: &DriveOutcome) -> V
     let downstream_cooldown_secs = per_task
         .values()
         .filter(|t| depended_on.contains(&t.task))
-        .map(TaskOutcome::false_throttle_secs)
+        .map(|t| t.false_throttle_secs)
         .sum();
 
     let completion_rate = if tasks_total == 0 {
@@ -584,8 +708,10 @@ pub fn verify(spec: &TraceSpec, meta: StrategyMeta, outcome: &DriveOutcome) -> V
         false_throttle_secs,
         quota_waste,
         downstream_cooldown_secs,
+        stranded_with_headroom_count,
         completion_rate,
         hard_limit_violations,
+        uncontrolled_overlap_violations,
         principal_violations,
         per_task: per_task.into_values().collect(),
     }
@@ -608,51 +734,9 @@ mod tests {
             first_ready_at: None,
             started_at: None,
             false_throttled: false,
-            false_throttle_first_at: None,
-            false_throttle_last_at: None,
+            false_throttle_secs: 0,
+            stranded_with_headroom: false,
         }
-    }
-
-    /// Direct proof that these two metrics are bracket-interval math
-    /// (first-seen to last-seen), never a per-sighting count: three
-    /// sightings of the same held task collapse to exactly one interval
-    /// duration, identical to what two sightings at the same two
-    /// endpoints would give — a verifier that instead multiplied by
-    /// sighting count would report a bigger number here, and would also
-    /// change its answer if `drive::run_trace`'s own poll cadence changed
-    /// (a fix to that cadence, like the `next_wake`/`drain_pending_starts`
-    /// fixes this same PR-B session already made, must never silently
-    /// move this crate's own AC1 metrics).
-    #[test]
-    fn false_throttle_duration_is_bracket_interval_not_sighting_count() {
-        let mut three_sightings = task_outcome();
-        three_sightings.false_throttle_first_at = Some(at(10));
-        three_sightings.false_throttle_last_at = Some(at(40));
-
-        let mut two_sightings_same_span = task_outcome();
-        two_sightings_same_span.false_throttle_first_at = Some(at(10));
-        two_sightings_same_span.false_throttle_last_at = Some(at(40));
-
-        assert_eq!(
-            three_sightings.false_throttle_secs(),
-            two_sightings_same_span.false_throttle_secs(),
-            "the SAME [first, last] bracket must give the same duration regardless of how many \
-             sightings fell inside it"
-        );
-        assert_eq!(three_sightings.false_throttle_secs(), 30);
-    }
-
-    #[test]
-    fn false_throttle_secs_is_zero_for_a_single_sighting() {
-        let mut single = task_outcome();
-        single.false_throttle_first_at = Some(at(10));
-        single.false_throttle_last_at = Some(at(10));
-        assert_eq!(single.false_throttle_secs(), 0);
-    }
-
-    #[test]
-    fn false_throttle_secs_is_zero_when_never_held() {
-        assert_eq!(task_outcome().false_throttle_secs(), 0);
     }
 
     #[test]

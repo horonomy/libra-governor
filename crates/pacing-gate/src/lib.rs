@@ -8,7 +8,7 @@
 //! `Paced` strategy is careful never to trip (it calls into `pacing`
 //! from *this* crate, never from `daemon`/`gateway`/`ledger`).
 //!
-//! # PR-A scope (this PR)
+//! # PR-A scope (merged — PR #150)
 //!
 //! - [`trace`]: frozen trace fixtures — relative workload, not absolute
 //!   schedule.

@@ -97,9 +97,9 @@ fn paced_completes_every_task_on_t4_delayed_settlement() {
 /// consumes the strategy's one Sustain-mode fanout slot forever — task 2
 /// is never reconsidered again. Fixing this correctly needs a
 /// `domain::pacing::step::PacerState` constructor/method this crate
-/// cannot add (`domain/src/pacing` is out of scope here) — recommended
-/// as a follow-up in the PR body, not filed as a ticket (the ticket
-/// brief authorized exactly one new ticket: the ledger ordering bug).
+/// cannot add (`domain/src/pacing` is out of scope here). Filed as
+/// HORO-1881, per the ticket brief's own "lean toward a new ticket"
+/// guidance for this finding.
 #[test]
 fn paced_currently_strands_a_dependent_task_after_a_restart_on_t5() {
     use libra_governor_pacing_gate::drive::DriveLogEntry;

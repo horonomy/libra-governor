@@ -206,6 +206,31 @@ fn forgetful_baseline_is_caught_leaking_capacity_accounting_on_t0() {
     );
 }
 
+/// The real discriminator between `ForgetfulBaseline` and an honest
+/// strategy is COMPLETION, not false-throttle presence: an honest
+/// `StaticBudget(1)` — the same concurrency cap as the mutant above —
+/// ALSO shows false throttles on this fixture (its ample 1000-token
+/// window has real headroom the whole time; `StaticBudget` enforces only
+/// concurrency, never quota, so a concurrency-held task genuinely does
+/// show real headroom by this verifier's own quota-only false-throttle
+/// definition). What `StaticBudget(1)` does differently — and what
+/// actually proves it is honest, not leaking — is complete all 3 tasks
+/// anyway, because it correctly processes every `TaskCompleted` and
+/// frees its one slot each time.
+#[test]
+fn static_budget_with_the_same_concurrency_cap_still_completes_every_task_on_t0() {
+    let spec = fixtures::load("t0_occupancy").unwrap();
+    let strategy = StaticBudget::new(1);
+    let meta = StrategyMeta::of(&strategy);
+    let outcome = run_trace(&spec, Box::new(strategy)).unwrap();
+    let report = verify(&spec, meta, &outcome);
+    assert_eq!(
+        report.tasks_completed, report.tasks_total,
+        "StaticBudget(1) must complete every task eventually, unlike ForgetfulBaseline(1): {:?}",
+        report.per_task
+    );
+}
+
 #[test]
 fn static_budget_with_no_concurrency_cap_never_false_throttles_on_t0() {
     // max_concurrent == tasks_total: this honest strategy never needs
