@@ -1,0 +1,13 @@
+{
+  "name": "x1_foreign_session",
+  "description": "Adversarial negative control (unnumbered, parallel to x0_unguarded): two distinct principals share one trace, with ample window capacity so no hard-limit violation is possible — isolating PR-B's ForeignSession mutant's identity violation from any quota concern. Exists so verify.rs's principal check has a fixture where an honest, principal-scoped strategy never starts another principal's task, while ForeignSession (claiming to act only for 'mallory') visibly does, by starting 'victim''s task 2 too.",
+  "initial_preference": { "mode": "burst", "target_end_offset_secs": 3600, "max_fanout": 4 },
+  "windows": [
+    { "name": "ample", "unit": "tokens", "kind": { "kind": "sliding", "length_secs": 3600, "limit": 10000 } }
+  ],
+  "tasks": [
+    { "id": 1, "principal": "mallory", "depends_on": [], "priority": "normal", "relative_duration_secs": 30, "relative_spend": 50, "unit": "tokens" },
+    { "id": 2, "principal": "victim", "depends_on": [], "priority": "normal", "relative_duration_secs": 30, "relative_spend": 50, "unit": "tokens" }
+  ],
+  "events": []
+}

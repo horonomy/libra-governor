@@ -157,6 +157,21 @@ pub trait Strategy {
     fn drain_pending_starts(&mut self) -> Vec<u32> {
         Vec::new()
     }
+
+    /// The principal this strategy claims to act only on behalf of, if
+    /// it scopes itself to one. Default `None`: a strategy that makes no
+    /// identity claim at all (every strategy in this file) cannot be
+    /// checked for violating one — `None` is "unscoped", never "trusted
+    /// to be honest about its scope". PR-B's `verify::verify` reads this
+    /// once, before `drive::run_trace` consumes the strategy, and checks
+    /// every task it actually starts (via the ground-truth
+    /// `trace::TraceTask::principal`, never via anything the strategy
+    /// itself reports) against this claim — see
+    /// `mutants::ForeignSession`, the one strategy in this crate that
+    /// both claims a principal here and then violates it in `decide`.
+    fn owning_principal(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// The simplest strategy: admits up to `max_concurrent` ready tasks at a

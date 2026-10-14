@@ -55,10 +55,11 @@ fn every_fixture_json_file_on_disk_is_registered() {
 }
 
 #[test]
-fn exactly_nine_fixtures_are_registered() {
+fn exactly_ten_fixtures_are_registered() {
     assert_eq!(
         fixtures::ALL.len(),
-        9,
-        "see lib.rs module docs for the t0..t7 plus x0_unguarded numbering this resolves to"
+        10,
+        "see lib.rs module docs for the t0..t7 plus x0_unguarded/x1_foreign_session numbering \
+         this resolves to (x1_foreign_session added in PR-B for the ForeignSession mutant)"
     );
 }
