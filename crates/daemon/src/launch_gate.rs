@@ -308,6 +308,16 @@ pub fn handle_renew(
 /// module's own concurrency-model docs. A future move to a
 /// thread-per-connection model would need to push this identity check
 /// into the ledger's own atomic transaction instead.
+///
+/// Deliberately, unlike [`handle_admit`]/[`handle_renew`]/
+/// [`handle_status`], this function takes no `launcher: Option<&..>` and
+/// never checks `not_enabled`/`admin_disabled`. If an operator disables
+/// or removes the `[launcher]` config section while jobs it already
+/// admitted are still running, their holds must still be releasable —
+/// otherwise turning the gate off (or a config edit that drops a pool)
+/// would strand those slots held until TTL expiry instead of letting the
+/// operator free them immediately. This asymmetry with the other three
+/// handlers is intentional, not an oversight.
 pub fn handle_release(
     ledger: &mut LedgerStore,
     reservation_id: libra_governor_domain::SharedPoolReservationId,

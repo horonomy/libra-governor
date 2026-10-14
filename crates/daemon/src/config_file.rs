@@ -310,11 +310,11 @@ struct RawLaunchGateConfig {
 /// in-file duplicates) — this function has no ledger access (it runs
 /// before `LedgerStore::open`, and `doctor_cmd` calls it with no daemon
 /// running at all), so it cannot check an alias against an
-/// already-persisted pool's unit. That check instead happens at
-/// `crate::launch_gate::start_launch_gate` startup time, which does have
-/// a ledger handle — see that function's own docs for why a unit
-/// mismatch there is a per-pool "disabled, logged" outcome rather than an
-/// error this function could raise.
+/// already-persisted pool's unit. That check instead happens lazily
+/// inside `crate::launch_gate::handle_admit`, on first use of a pool,
+/// which does have a ledger handle — see that function's own docs for
+/// why a unit mismatch there is a per-pool "disabled, logged" outcome
+/// rather than an error this function could raise.
 fn resolve_launcher(
     raw: RawLaunchGateConfig,
 ) -> Result<crate::launch_gate::LaunchGateConfig, ConfigFileError> {
