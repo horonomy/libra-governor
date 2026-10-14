@@ -90,6 +90,14 @@
 //!   that performs a live, explicitly consented `snapshot` round trip and
 //!   can report quota availability/partial/stale. See that module's own
 //!   docs.
+//! - `run --pool <alias> [--max-wait <secs>] -- <command...>` — the
+//!   launch-gate's one real launcher/queue wrapper (HORO-1766 PR2):
+//!   admits against PR1's `[launcher]` pool before spawning, renews while
+//!   the job runs, releases on exit. Fails closed (exit 75) rather than
+//!   ever spawning unadmitted. See `crate::run_cmd` module docs.
+//! - `launch status` — read-only rendering of every configured
+//!   `[launcher]` pool's admission posture (HORO-1766 PR2). Never spawns
+//!   the daemon.
 
 mod adapter_cmd;
 mod adapter_hook;
@@ -112,10 +120,12 @@ mod hook;
 mod hook_post_tool_use;
 mod hook_stop;
 mod install_cmd;
+mod launch_cmd;
 mod outcome_cmd;
 mod presentation;
 mod quota_cmd;
 mod quota_observation_cmd;
+mod run_cmd;
 mod statusline;
 mod statusline_provider;
 #[cfg(feature = "trusted-principal")]
@@ -160,6 +170,8 @@ Usage:
   libra-governor quota-observation uninstall <registration-id> [--note-executable]
   libra-governor quota-observation doctor [<registration-id>] [--probe]
   libra-governor quota-observation inspect <registration-id> [--constraint-ids <id1,id2,...>]
+  libra-governor run --pool <alias> [--max-wait <secs>] -- <command> [args...]
+  libra-governor launch status
 
 Global options:
   -h, --help     Print this help and exit
@@ -236,6 +248,8 @@ fn main() {
         ["outcome", "record"] => outcome_cmd::run(),
         ["quota", "explain", ..] => std::process::exit(quota_cmd::run(&args[2..])),
         ["quota-observation", ..] => std::process::exit(quota_observation_cmd::run(&args[1..])),
+        ["run", ..] => std::process::exit(run_cmd::run(&args[1..])),
+        ["launch", "status"] => std::process::exit(launch_cmd::status()),
         ["economics", "explain", sel, value]
             if matches!(
                 *sel,
@@ -265,6 +279,29 @@ fn main() {
         // acquisition failure).
         ["__lock_test_hold", config_path, hold_ms] => {
             write_lock::test_hold_cmd::run(config_path, hold_ms)
+        }
+        // Hidden, undocumented test fixture for HORO-1766's `run` wrapper
+        // test suite (`tests/launch_run.rs`). Not part of the public CLI
+        // surface — deliberately absent from USAGE/--help. Dumps this
+        // process's own environment as a JSON object (sorted keys) to
+        // `<out-path>`, then exits 0. Used as the `run` wrapper's child
+        // command in AC3's environment-passthrough test: this is a
+        // byte-exact, portable, null-safe alternative to shelling out to
+        // `env`/`env -0` (unsupported by BSD `env` on macOS), since both
+        // sides of the comparison go through the same JSON serializer.
+        ["__dump_env", out_path] => {
+            let vars: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+            let json = match serde_json::to_vec(&vars) {
+                Ok(json) => json,
+                Err(e) => {
+                    eprintln!("libra-governor __dump_env: failed to serialize environment: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if let Err(e) = std::fs::write(out_path, json) {
+                eprintln!("libra-governor __dump_env: failed to write {out_path}: {e}");
+                std::process::exit(1);
+            }
         }
         _ => {
             eprintln!("libra-governor: unknown or missing subcommand\n\n{USAGE}");
