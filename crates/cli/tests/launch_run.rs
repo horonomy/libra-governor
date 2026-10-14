@@ -616,22 +616,23 @@ fn ac4_sigint_to_the_whole_process_group_lets_the_child_exit_normally() {
     let sandbox = Sandbox::new();
     sandbox.write_config(&launcher_config(1));
 
-    let started = sandbox.state.path().join("started");
-    // Deliberately no SIGINT trap: default disposition terminates the
-    // child immediately, which is exactly what must happen here -- if the
-    // wrapper had left SIGINT `SIG_IGN`'d, that disposition would survive
-    // `execve` and this child would ignore it and hang forever instead.
-    let script = format!(
-        "touch '{}'; while true; do sleep 1; done",
-        started.display()
-    );
+    // Deliberately no SIGINT trap and deliberately no shell at all:
+    // spawn `sleep` directly as the wrapper's own argv instead of via
+    // `sh -c "..."`. Default disposition must terminate the child
+    // immediately -- if the wrapper had left SIGINT `SIG_IGN`'d, that
+    // disposition would survive `execve` and this child would ignore it
+    // and hang forever instead. A shell in the child's exec chain (even
+    // one that `exec`s into `sleep`, leaving no separate shell process
+    // alive) was investigated as a possible confound and ruled out as
+    // definitively causal; spawning `sleep` directly removes it as a
+    // variable entirely and is also simply a cleaner, more minimal test.
 
     // The wrapper is put in its OWN process group (distinct from this
     // test binary's), so `kill -INT -<pgid>` can safely target exactly
     // {wrapper, child} without also signaling the test harness itself --
     // modeling a real foreground shell job, where the terminal's own job
     // control already does this.
-    let mut command = sandbox.command(&["run", "--pool", "agents", "--", "sh", "-c", &script]);
+    let mut command = sandbox.command(&["run", "--pool", "agents", "--", "sleep", "300"]);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -642,7 +643,17 @@ fn ac4_sigint_to_the_whole_process_group_lets_the_child_exit_normally() {
         .expect("spawn wrapper in its own process group");
     let wrapper_pid = w1.id();
 
-    assert!(wait_for_marker(&started, BOUNDED_WAIT), "job never started");
+    // No marker file to wait on (no shell, nothing to `touch` it) --
+    // poll for the `sleep` child to actually appear under the wrapper
+    // instead, which is the real readiness condition this test needs.
+    let child_appeared = wait_for(BOUNDED_WAIT, || {
+        Command::new("pgrep")
+            .args(["-P", &wrapper_pid.to_string(), "-x", "sleep"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    });
+    assert!(child_appeared, "job never started");
 
     let status = Command::new("kill")
         .args(["-INT", &format!("-{wrapper_pid}")])
