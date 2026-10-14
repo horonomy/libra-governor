@@ -92,6 +92,7 @@ fn config(dir: &Path, name: &str) -> DaemonConfig {
         extension_runtime: OnceLock::new(),
 
         outcome_authority: None,
+        launch_gate: None,
         progressive_interval_secs: 60,
     }
 }

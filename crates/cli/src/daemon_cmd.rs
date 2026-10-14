@@ -57,28 +57,31 @@ pub fn run() {
     // `libra_governor_daemon::config_file` module docs — and a present
     // but invalid file falls back to today's hardcoded defaults rather
     // than aborting startup, logged so it is visible rather than silent.
-    let (policy, gateway, extensions) =
-        match libra_governor_daemon::config_file::load_overrides(&state_dir) {
-            Ok((policy, gateway, extensions)) => (policy, gateway, extensions),
-            Err(e) => {
-                libra_governor_daemon::log::append_line(
-                    &log_path,
-                    &format!(
-                    "daemon: {} rejected — falling back to default policy/gateway/extensions: {e}",
+    let overrides = match libra_governor_daemon::config_file::load_overrides(&state_dir) {
+        Ok(overrides) => overrides,
+        Err(e) => {
+            libra_governor_daemon::log::append_line(
+                &log_path,
+                &format!(
+                    "daemon: {} rejected — falling back to default policy/gateway/extensions/\
+                     launcher: {e}",
                     libra_governor_daemon::config_file::CONFIG_FILE_NAME
                 ),
-                );
-                (None, None, None)
-            }
-        };
+            );
+            libra_governor_daemon::config_file::ConfigOverrides::default()
+        }
+    };
 
     let config = daemon_config(
         state_dir.join("daemon.sock"),
         state_dir.join("ledger.sqlite3"),
         log_path,
-        policy.unwrap_or_else(libra_governor_daemon::default_admission_policy),
-        gateway,
-        extensions,
+        overrides
+            .policy
+            .unwrap_or_else(libra_governor_daemon::default_admission_policy),
+        overrides.gateway,
+        overrides.extensions,
+        overrides.launcher,
     );
 
     let listener = match libra_governor_daemon::bind_or_detect_running(&config.socket_path) {
@@ -149,6 +152,7 @@ fn daemon_config(
     policy: Policy,
     gateway: Option<libra_governor_gateway::config::GatewayConfig>,
     extensions: Option<libra_governor_extension::ExtensionConfig>,
+    launch_gate: Option<libra_governor_daemon::launch_gate::LaunchGateConfig>,
 ) -> DaemonConfig {
     DaemonConfig {
         socket_path,
@@ -165,6 +169,7 @@ fn daemon_config(
         extension_runtime: std::sync::OnceLock::new(),
         outcome_authority: None,
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
+        launch_gate,
     }
 }
 
@@ -218,6 +223,7 @@ pub fn run_trusted(config_path: &Path) -> i32 {
         cfg.ledger_path(),
         cfg.log_path(),
         libra_governor_daemon::default_admission_policy(),
+        None,
         None,
         None,
     );

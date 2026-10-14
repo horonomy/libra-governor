@@ -118,6 +118,7 @@ impl Sandbox {
             extension_runtime: std::sync::OnceLock::new(),
 
             outcome_authority: None,
+            launch_gate: None,
             progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
         };
         let listener = libra_governor_daemon::bind_or_detect_running(&config.socket_path).unwrap();

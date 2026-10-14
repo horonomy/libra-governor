@@ -89,6 +89,23 @@ pub enum ConfigFileError {
          [gateway].credential_command"
     )]
     GovernorHeldMissingCredentialCommand,
+    /// HORO-1766: a `[launcher].pools[].alias` may never contain `/` — it
+    /// is namespaced into a ledger `PoolId` as `launch:<alias>`, and a
+    /// `/` would let an alias collide with, or be confused for, a
+    /// different pool-id segment boundary elsewhere in the ledger's flat
+    /// `PoolId` string space.
+    #[error("[launcher].pools[].alias {alias:?} must not contain '/'")]
+    LaunchAliasContainsSlash { alias: String },
+    /// An empty alias is never a meaningful pool name and would collide
+    /// with every other empty alias in the same config.
+    #[error("[launcher].pools[].alias must not be empty")]
+    LaunchAliasEmpty,
+    /// Two pool entries in the same `[launcher]` section named the same
+    /// alias — refused rather than silently letting the later entry win,
+    /// which would make the file's own meaning depend on declaration
+    /// order.
+    #[error("[launcher].pools[] declares alias {alias:?} more than once")]
+    LaunchAliasDuplicate { alias: String },
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -96,6 +113,7 @@ struct RawConfigFile {
     policy: Option<RawPolicyConfig>,
     gateway: Option<RawGatewayConfig>,
     extensions: Option<RawExtensionsConfig>,
+    launcher: Option<RawLaunchGateConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -208,25 +226,33 @@ fn resolve_extensions(raw: RawExtensionsConfig) -> libra_governor_extension::Ext
     }
 }
 
+/// The `(Policy, GatewayConfig, ExtensionConfig, LaunchGateConfig)`
+/// overrides [`load_overrides`] produces. A struct, not a bare tuple —
+/// HORO-1766 is the second field added since this was a 2-tuple
+/// (HORO-1174 added `extensions` to what was originally `(Policy,
+/// GatewayConfig)`), and a positional tuple that keeps growing a new slot
+/// per ticket is exactly the kind of "what does the 4th field mean again"
+/// ambiguity a named struct exists to avoid.
+#[derive(Debug, Default)]
+pub struct ConfigOverrides {
+    pub policy: Option<Policy>,
+    pub gateway: Option<GatewayConfig>,
+    pub extensions: Option<libra_governor_extension::ExtensionConfig>,
+    /// HORO-1766's opt-in launch-gate admission primitive. `None` — the
+    /// default — means no `[launcher]` section was present, which is what
+    /// makes every `Admit` answer `Unavailable { reason: not_enabled }`
+    /// (ADR-0020: off by default).
+    pub launcher: Option<crate::launch_gate::LaunchGateConfig>,
+}
+
 /// Reads and parses `<state_dir>/config.json`, if it exists, into the
-/// `(Policy, GatewayConfig, ExtensionConfig)` overrides `daemon_cmd::run`
-/// should use in place of its own hardcoded defaults. `Ok((None, None,
-/// None))` when the file is simply absent — the normal case for every
-/// existing deployment.
-#[allow(clippy::type_complexity)]
-pub fn load_overrides(
-    state_dir: &Path,
-) -> Result<
-    (
-        Option<Policy>,
-        Option<GatewayConfig>,
-        Option<libra_governor_extension::ExtensionConfig>,
-    ),
-    ConfigFileError,
-> {
+/// [`ConfigOverrides`] `daemon_cmd::run` should use in place of its own
+/// hardcoded defaults. Every field defaults to `None` when the file is
+/// simply absent — the normal case for every existing deployment.
+pub fn load_overrides(state_dir: &Path) -> Result<ConfigOverrides, ConfigFileError> {
     let path = state_dir.join(CONFIG_FILE_NAME);
     if !path.exists() {
-        return Ok((None, None, None));
+        return Ok(ConfigOverrides::default());
     }
 
     let raw_text = std::fs::read_to_string(&path).map_err(|source| ConfigFileError::Io {
@@ -242,7 +268,78 @@ pub fn load_overrides(
     let policy = raw.policy.map(resolve_policy).transpose()?;
     let gateway = raw.gateway.map(resolve_gateway).transpose()?;
     let extensions = raw.extensions.map(resolve_extensions);
-    Ok((policy, gateway, extensions))
+    let launcher = raw.launcher.map(resolve_launcher).transpose()?;
+    Ok(ConfigOverrides {
+        policy,
+        gateway,
+        extensions,
+        launcher,
+    })
+}
+
+/// One `[launcher].pools[]` entry as `config.json` writes it (HORO-1766).
+#[derive(Debug, Deserialize)]
+struct RawLaunchPoolConfig {
+    alias: String,
+    capacity: u64,
+    #[serde(default = "default_pool_enabled")]
+    enabled: bool,
+}
+
+fn default_pool_enabled() -> bool {
+    true
+}
+
+fn default_hold_ttl_secs() -> u64 {
+    crate::launch_gate::DEFAULT_HOLD_TTL_SECS
+}
+
+/// `[launcher]` — the opt-in launch-gate admission primitive over shared
+/// slot pools (HORO-1766). Absent (`None` on [`RawConfigFile`]) means the
+/// gate is off; see [`crate::launch_gate`] module docs and
+/// `docs/adr/0020-launch-gate-actuator.md`.
+#[derive(Debug, Deserialize)]
+struct RawLaunchGateConfig {
+    #[serde(default)]
+    pools: Vec<RawLaunchPoolConfig>,
+    #[serde(default = "default_hold_ttl_secs")]
+    hold_ttl_secs: u64,
+}
+
+/// Validates parse-level shape only (alias non-empty, no `/`, no
+/// in-file duplicates) — this function has no ledger access (it runs
+/// before `LedgerStore::open`, and `doctor_cmd` calls it with no daemon
+/// running at all), so it cannot check an alias against an
+/// already-persisted pool's unit. That check instead happens at
+/// `crate::launch_gate::start_launch_gate` startup time, which does have
+/// a ledger handle — see that function's own docs for why a unit
+/// mismatch there is a per-pool "disabled, logged" outcome rather than an
+/// error this function could raise.
+fn resolve_launcher(
+    raw: RawLaunchGateConfig,
+) -> Result<crate::launch_gate::LaunchGateConfig, ConfigFileError> {
+    let mut seen = std::collections::HashSet::with_capacity(raw.pools.len());
+    let mut pools = Vec::with_capacity(raw.pools.len());
+    for p in raw.pools {
+        if p.alias.is_empty() {
+            return Err(ConfigFileError::LaunchAliasEmpty);
+        }
+        if p.alias.contains('/') {
+            return Err(ConfigFileError::LaunchAliasContainsSlash { alias: p.alias });
+        }
+        if !seen.insert(p.alias.clone()) {
+            return Err(ConfigFileError::LaunchAliasDuplicate { alias: p.alias });
+        }
+        pools.push(crate::launch_gate::LaunchPoolConfig {
+            alias: p.alias,
+            capacity: p.capacity,
+            enabled: p.enabled,
+        });
+    }
+    Ok(crate::launch_gate::LaunchGateConfig {
+        pools,
+        hold_ttl_secs: raw.hold_ttl_secs,
+    })
 }
 
 fn resolve_policy(raw: RawPolicyConfig) -> Result<Policy, ConfigFileError> {
@@ -292,7 +389,8 @@ mod tests {
     #[test]
     fn absent_config_file_produces_no_overrides() {
         let dir = tempfile::tempdir().unwrap();
-        let (policy, gateway, _extensions) = load_overrides(dir.path()).unwrap();
+        let overrides = load_overrides(dir.path()).unwrap();
+        let (policy, gateway) = (overrides.policy, overrides.gateway);
         assert!(policy.is_none());
         assert!(gateway.is_none());
     }
@@ -306,7 +404,8 @@ mod tests {
         )
         .unwrap();
 
-        let (policy, gateway, _extensions) = load_overrides(dir.path()).unwrap();
+        let overrides = load_overrides(dir.path()).unwrap();
+        let (policy, gateway) = (overrides.policy, overrides.gateway);
         let policy = policy.expect("policy override must be present");
         assert_eq!(policy.name, "deadline_first");
         assert!(gateway.is_none());
@@ -343,7 +442,8 @@ mod tests {
         )
         .unwrap();
 
-        let (policy, gateway, _extensions) = load_overrides(dir.path()).unwrap();
+        let overrides = load_overrides(dir.path()).unwrap();
+        let (policy, gateway) = (overrides.policy, overrides.gateway);
         assert!(policy.is_none());
         let gateway = gateway.expect("gateway override must be present");
         assert_eq!(gateway.bind_addr, "127.0.0.1:18080".parse().unwrap());
@@ -389,5 +489,91 @@ mod tests {
 
         let err = load_overrides(dir.path()).unwrap_err();
         assert!(matches!(err, ConfigFileError::Parse { .. }));
+    }
+
+    #[test]
+    fn a_launcher_section_with_sensible_defaults_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE_NAME),
+            r#"{"launcher": {"pools": [{"alias": "agents", "capacity": 2}]}}"#,
+        )
+        .unwrap();
+
+        let overrides = load_overrides(dir.path()).unwrap();
+        let launcher = overrides
+            .launcher
+            .expect("launcher override must be present");
+        assert_eq!(
+            launcher.hold_ttl_secs,
+            crate::launch_gate::DEFAULT_HOLD_TTL_SECS
+        );
+        assert_eq!(launcher.pools.len(), 1);
+        assert_eq!(launcher.pools[0].alias, "agents");
+        assert_eq!(launcher.pools[0].capacity, 2);
+        assert!(launcher.pools[0].enabled, "enabled must default to true");
+    }
+
+    #[test]
+    fn a_launcher_pool_may_be_explicitly_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE_NAME),
+            r#"{"launcher": {"pools": [{"alias": "agents", "capacity": 2, "enabled": false}], "hold_ttl_secs": 120}}"#,
+        )
+        .unwrap();
+
+        let overrides = load_overrides(dir.path()).unwrap();
+        let launcher = overrides.launcher.unwrap();
+        assert_eq!(launcher.hold_ttl_secs, 120);
+        assert!(!launcher.pools[0].enabled);
+    }
+
+    #[test]
+    fn a_launcher_alias_containing_a_slash_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE_NAME),
+            r#"{"launcher": {"pools": [{"alias": "a/b", "capacity": 2}]}}"#,
+        )
+        .unwrap();
+
+        let err = load_overrides(dir.path()).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigFileError::LaunchAliasContainsSlash { alias } if alias == "a/b"
+        ));
+    }
+
+    #[test]
+    fn an_empty_launcher_alias_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE_NAME),
+            r#"{"launcher": {"pools": [{"alias": "", "capacity": 2}]}}"#,
+        )
+        .unwrap();
+
+        let err = load_overrides(dir.path()).unwrap_err();
+        assert!(matches!(err, ConfigFileError::LaunchAliasEmpty));
+    }
+
+    #[test]
+    fn a_duplicate_launcher_alias_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE_NAME),
+            r#"{"launcher": {"pools": [
+                {"alias": "agents", "capacity": 2},
+                {"alias": "agents", "capacity": 5}
+            ]}}"#,
+        )
+        .unwrap();
+
+        let err = load_overrides(dir.path()).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigFileError::LaunchAliasDuplicate { alias } if alias == "agents"
+        ));
     }
 }
