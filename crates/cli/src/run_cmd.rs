@@ -122,6 +122,31 @@ fn install_signal_handlers() -> std::io::Result<()> {
             }
         }
     }
+
+    // The whole zombie-preservation argument for pid-pinning (module
+    // doc, `run`'s step 4/6 loop) depends on the spawned child staying a
+    // reapable zombie after it exits. POSIX `SIG_IGN` on `SIGCHLD`
+    // (unlike a real handler) survives `execve`, so if this process
+    // inherited that disposition from whatever invoked it (a shell/
+    // supervisor with job control off, `trap '' CHLD`, etc.), the kernel
+    // auto-reaps the child the instant it exits and `waitid(..., NOWAIT)`
+    // below never observes the exit — a permanent hang that also leaks
+    // the held slot forever via the renew loop. Reset to `SIG_DFL`
+    // explicitly rather than trusting the ambient disposition.
+    //
+    // SAFETY: same as above — a plain `sigaction` call, no async-signal-
+    // unsafe state touched.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = libc::SIG_DFL;
+        if libc::sigemptyset(&mut action.sa_mask) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
     Ok(())
 }
 
@@ -396,15 +421,29 @@ pub fn run(args: &[String]) -> i32 {
     // forward a single SIGTERM on cancel intent, and renew the hold
     // roughly every 60s.
     loop {
-        let exited = matches!(
-            process::waitid(
-                WaitId::Pid(child_pid),
-                WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
-            ),
-            Ok(Some(_))
-        );
-        if exited {
-            break;
+        match process::waitid(
+            WaitId::Pid(child_pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+        ) {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(e) => {
+                // An error here (e.g. ECHILD, which is exactly what a
+                // reset-but-still-inherited reaping race would produce)
+                // means this process can no longer prove the child is
+                // still its own un-reaped zombie — the whole pid-pinning
+                // safety argument has broken down. Never fold this into
+                // "still running": that is how a `SIGCHLD=SIG_IGN`-style
+                // ambient disposition turns into a permanent hang and a
+                // permanently leaked slot. Treat it as terminal instead.
+                status_line(&format!(
+                    "lost the ability to observe the job's exit state via waitid ({e}); \
+                     releasing the held slot and exiting without sending further signals to \
+                     pid {child_pid} (its identity can no longer be verified)"
+                ));
+                guard.release_now();
+                return 1;
+            }
         }
 
         if TERMINATE_REQUESTED.load(Ordering::SeqCst) && !term_forwarded {
