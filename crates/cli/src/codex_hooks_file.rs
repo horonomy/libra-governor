@@ -517,10 +517,27 @@ fn remove_locked(path: &Path) -> Result<Removed, CodexHooksError> {
                     matchers_to_drop.push(idx);
                 }
             }
+            // Codex keys hook trust by (event, group_idx, handler_idx), so
+            // `Vec::remove` on a group that is NOT the array's current
+            // tail would shift every later group's index down by one --
+            // silently changing a foreign hook's trust key even though
+            // its content never changed (HORO-1876). Only remove a group
+            // when it is (still, after any prior removals in this same
+            // pass) the last element; otherwise leave its already-emptied
+            // `{"hooks": []}` matcher in place as a tombstone, matching
+            // Fornax's own equivalent fix (PR #265) for the identical
+            // shared-array problem.
             for idx in matchers_to_drop.into_iter().rev() {
-                entries_arr.remove(idx);
+                if idx == entries_arr.len() - 1 {
+                    entries_arr.remove(idx);
+                }
             }
-            if entries_arr.is_empty() {
+            if entries_arr.iter().all(|m| {
+                m.get("hooks")
+                    .and_then(Value::as_array)
+                    .map(|h| h.is_empty())
+                    .unwrap_or(false)
+            }) {
                 events_to_drop.push(event.to_string());
             }
         }
@@ -944,10 +961,99 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let value: Value = serde_json::from_str(&text).unwrap();
         let stop = value["hooks"]["Stop"].as_array().unwrap();
-        assert_eq!(stop.len(), 1, "the foreign matcher must survive");
+        // Our own (now-empty) group is left in place as a `{"hooks": []}`
+        // tombstone rather than removed, specifically because removing it
+        // would shift the foreign group from index 1 to index 0 --
+        // Codex keys hook trust by (event, group_idx, handler_idx), so
+        // that shift would silently invalidate the foreign group's trust
+        // state even though its content never changed (HORO-1876).
+        assert_eq!(stop.len(), 2, "our own emptied group must be left as a tombstone, not removed, so the foreign group's index never shifts");
         assert_eq!(
-            stop[0]["hooks"][0]["command"],
-            "/usr/local/bin/other stop-notify"
+            stop[0]["hooks"].as_array().unwrap().len(),
+            0,
+            "our own group is emptied but kept as a tombstone at its original index"
+        );
+        assert_eq!(
+            stop[1]["hooks"][0]["command"], "/usr/local/bin/other stop-notify",
+            "the foreign matcher must survive at its original index, unshifted"
+        );
+    }
+
+    #[test]
+    fn uninstall_before_a_foreign_group_leaves_a_tombstone_so_a_later_foreign_groups_index_never_shifts(
+    ) {
+        // HORO-1876: a third group after the foreign one makes the index-
+        // preservation claim unambiguous -- if our removal ever shifted
+        // indices, this foreign group would move from index 2 to index 1.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let seed = serde_json::json!({
+            "hooks": {
+                "PostToolUse": [
+                    { "hooks": [{ "type": "command", "command": "/opt/libra/bin/libra-governor codex-hook post-tool-use" }] },
+                    { "hooks": [{ "type": "command", "command": "/usr/local/bin/fornax post-tool-use" }] },
+                    { "hooks": [{ "type": "command", "command": "/usr/local/bin/another-tool post-tool-use" }] }
+                ]
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+
+        remove(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        let entries = value["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(
+            entries.len(),
+            3,
+            "our own emptied group stays in place as a tombstone; nothing is removed from the middle"
+        );
+        assert_eq!(
+            entries[0]["hooks"].as_array().unwrap().len(),
+            0,
+            "our own group at its original index 0 is emptied, not removed"
+        );
+        assert_eq!(
+            entries[1]["hooks"][0]["command"], "/usr/local/bin/fornax post-tool-use",
+            "the first foreign group stays at its original index 1"
+        );
+        assert_eq!(
+            entries[2]["hooks"][0]["command"], "/usr/local/bin/another-tool post-tool-use",
+            "the second foreign group stays at its original index 2, unshifted"
+        );
+    }
+
+    #[test]
+    fn uninstall_after_every_foreign_group_actually_removes_our_own_trailing_group() {
+        // When nothing foreign follows ours, there is nothing to protect
+        // from an index shift -- removing our own trailing group (rather
+        // than leaving a needless tombstone) matches Fornax's own
+        // equivalent fix and keeps the file minimal.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let seed = serde_json::json!({
+            "hooks": {
+                "PostToolUse": [
+                    { "hooks": [{ "type": "command", "command": "/usr/local/bin/fornax post-tool-use" }] },
+                    { "hooks": [{ "type": "command", "command": "/opt/libra/bin/libra-governor codex-hook post-tool-use" }] }
+                ]
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+
+        remove(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        let entries = value["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "our own trailing group is actually removed, not left as a needless tombstone"
+        );
+        assert_eq!(
+            entries[0]["hooks"][0]["command"], "/usr/local/bin/fornax post-tool-use",
+            "the foreign group stays at its original index 0, unaffected"
         );
     }
 }
