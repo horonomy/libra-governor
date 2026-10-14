@@ -39,6 +39,7 @@ documented here). Mirrors the style of the existing
 | [`builder-prompt.md`](builder-prompt.md) | A copy-pasteable template (for a human or an LLM) to build a new extension against this contract from scratch. |
 | [`preview-delivery.md`](preview-delivery.md) | (HORO-1857) Platform support matrix, download integrity, and the clean-install procedure the smoke test in `crates/quota-observation/tests/preview_clean_install.rs` exercises. |
 | [`../../examples/quota-observation-extension/`](../../examples/quota-observation-extension/) | A runnable reference sample extension implementing this contract. |
+| [`private-extension-lifecycle-walkthrough.md`](private-extension-lifecycle-walkthrough.md) | (HORO-1857) A real, executed register→approve→doctor→inspect→upgrade→rollback→uninstall walkthrough against a from-scratch sample extension in a separate project tree, with AC5 coexistence evidence. Locally-built binary — explicitly not AC1 evidence. |
 
 ## Relationship to the design doc and the crate itself
 
