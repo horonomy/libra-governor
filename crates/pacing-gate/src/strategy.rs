@@ -114,18 +114,48 @@ pub trait Strategy {
     /// `Paced` run that holds a ready task purely because of a
     /// sliding-window bound (not because of a future task completion or
     /// fixture event) could therefore starve indefinitely: nothing ever
-    /// told the driver when to look again. Measured before this fix:
-    /// `t1_multi_window` completed 2/4 tasks, `t4_delayed_settlement`
-    /// 1/2, `t5_daemon_restart` 1/2, `t6_overrun_backoff` 1/2, and
-    /// `x0_unguarded` 1/5 — every one of them silently incomplete, with
-    /// `World::active_count() == 0` (so `world_consistency.rs`'s
-    /// existing assertions never caught it; they check internal
-    /// consistency, not completeness). This method plus
-    /// `crate::drive::run_trace`'s new poll-scheduling make that wake
-    /// instant visible to the driver without changing `Strategy::decide`'s
-    /// signature or any other PR-A behavior.
+    /// told the driver when to look again. Confirmed fixed on
+    /// `t1_multi_window` (now completes 4/4, was 2/4) — see
+    /// `tests/world_consistency.rs`'s dedicated regression test. This
+    /// method plus `crate::drive::run_trace`'s new poll-scheduling make
+    /// that wake instant visible to the driver without changing
+    /// `Strategy::decide`'s signature or any other PR-A behavior. (Two
+    /// further, distinct desyncs this same investigation found —
+    /// `notify` discarding `Proposal::Start`, and `on_restart` wiping
+    /// `completed` — are documented at `drain_pending_starts` and at
+    /// `tests/world_consistency.rs`'s t5 test, respectively; `next_wake`
+    /// alone does not fix either.)
     fn next_wake(&self, _now: OffsetDateTime) -> Option<OffsetDateTime> {
         None
+    }
+
+    /// Drains any task this strategy already internally decided to
+    /// start as a side effect of a prior `notify` call, but had no way
+    /// to report until now — processed by the driver exactly like
+    /// `decide`'s own return value (claims opened, completion
+    /// scheduled). Default: empty.
+    ///
+    /// PR-B finding, same root cause class as `next_wake` above but more
+    /// severe: `pacing::step::step` always runs its admission pass
+    /// (`try_admit`) on *every* event, including `TaskCompleted`/`Spend`/
+    /// `ModeChanged` — not only the `ModeChanged` tick `Paced::decide`
+    /// sends. `Paced::notify` calls `self.apply(...)` for
+    /// `TaskCompleted`/`Spend`/`PreferenceChanged` and discarded the
+    /// returned `Vec<Proposal>` entirely. When that discarded batch
+    /// contained a `Proposal::Start`, `pacing::step`'s own `try_admit`
+    /// had *already* mutated `PacerState::active` to include it — so the
+    /// strategy's internal belief is "this task is running" while the
+    /// real `World` was never told to start it at all. The task then
+    /// never appears ready to `try_admit` again (it is already active,
+    /// per that same internal state), so it is silently never started —
+    /// permanently, not just delayed. Confirmed fixed on
+    /// `t4_delayed_settlement` (now completes 2/2, was 1/2) — see
+    /// `tests/world_consistency.rs`'s dedicated regression test. x0's
+    /// and t6's own incompleteness are separately legitimate (a real
+    /// `PastTargetEnd` cutoff and a real AC1 false-throttle
+    /// respectively — see `verify.rs`), not instances of this bug.
+    fn drain_pending_starts(&mut self) -> Vec<u32> {
+        Vec::new()
     }
 }
 
@@ -197,6 +227,12 @@ pub struct Paced {
     preference: PacingPreference,
     state: PacerState,
     seq: u64,
+    /// Task ids `pacing::step`'s own admission pass started as a side
+    /// effect of a `notify`-triggered event (never `decide`'s own
+    /// `ModeChanged` tick — that path already reports its own starts
+    /// directly via `decide`'s return value). See
+    /// `Strategy::drain_pending_starts`'s docs for why this exists.
+    pending_starts: Vec<u32>,
 }
 
 impl Paced {
@@ -216,6 +252,7 @@ impl Paced {
             preference: to_pacing_preference(initial_preference),
             state: PacerState::default(),
             seq: 0,
+            pending_starts: Vec::new(),
         }
     }
 
@@ -234,6 +271,20 @@ impl Paced {
         let (new_state, proposals) = pacing_step(&self.state, &event, &self.policy, &scenario);
         self.state = new_state;
         proposals
+    }
+
+    /// Records every `Proposal::Start` this `apply()` call produced into
+    /// `pending_starts`, for `drain_pending_starts` to surface to the
+    /// driver later. Only ever called from `notify`'s event-specific
+    /// arms — `decide` reports its own `apply()` call's starts directly
+    /// via its return value instead (see `Strategy::drain_pending_starts`'s
+    /// docs for why both paths exist).
+    fn stash_pending_starts(&mut self, proposals: Vec<Proposal>) {
+        self.pending_starts
+            .extend(proposals.into_iter().filter_map(|p| match p {
+                Proposal::Start { task, .. } => Some(task.0),
+                Proposal::Hold { .. } => None,
+            }));
     }
 }
 
@@ -270,11 +321,12 @@ impl Strategy for Paced {
         match event {
             DriveEvent::TaskCompleted { task, at } => {
                 let seq = self.next_seq();
-                self.apply(PacingEvent::TaskCompleted {
+                let proposals = self.apply(PacingEvent::TaskCompleted {
                     at: *at,
                     seq,
                     task: SimTaskId(*task),
                 });
+                self.stash_pending_starts(proposals);
             }
             DriveEvent::Spend { task, at, amount } => {
                 let unit = self
@@ -283,17 +335,19 @@ impl Strategy for Paced {
                     .map(|t| estimate_unit(&t.estimate))
                     .unwrap_or(QuotaUnit::Tokens);
                 let seq = self.next_seq();
-                self.apply(PacingEvent::Spend {
+                let proposals = self.apply(PacingEvent::Spend {
                     at: *at,
                     seq,
                     task: SimTaskId(*task),
                     amount: QuotaAmount::new(unit, *amount),
                 });
+                self.stash_pending_starts(proposals);
             }
             DriveEvent::PreferenceChanged { at, preference } => {
                 self.preference = to_pacing_preference(preference);
                 let seq = self.next_seq();
-                self.apply(PacingEvent::ModeChanged { at: *at, seq });
+                let proposals = self.apply(PacingEvent::ModeChanged { at: *at, seq });
+                self.stash_pending_starts(proposals);
             }
             // By design: see this struct's own docs on why `pacing` has
             // no event shape for either variant.
@@ -318,6 +372,10 @@ impl Strategy for Paced {
     /// the trait docs above for why the driver needs this exposed.
     fn next_wake(&self, _now: OffsetDateTime) -> Option<OffsetDateTime> {
         self.state.pending_timer()
+    }
+
+    fn drain_pending_starts(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.pending_starts)
     }
 }
 

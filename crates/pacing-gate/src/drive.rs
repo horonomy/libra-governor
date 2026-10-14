@@ -96,10 +96,21 @@ impl PartialOrd for QueueItem {
 /// runs of the same fixture/strategy pair.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DriveLogEntry {
-    Started { task: u32 },
-    Spend { task: u32, amount: u64 },
-    Completed { task: u32, settled: u64 },
-    ForeignSpend { window: String, amount: u64 },
+    Started {
+        task: u32,
+    },
+    Spend {
+        task: u32,
+        amount: u64,
+    },
+    Completed {
+        task: u32,
+        settled: u64,
+    },
+    ForeignSpend {
+        window: String,
+        amount: u64,
+    },
     Restart,
     PreferenceChanged,
     /// PR-B addition: records every instant the driver actually gave the
@@ -109,8 +120,18 @@ pub enum DriveLogEntry {
     /// (via `Started`), never *when it had its chance and didn't* — the
     /// distinction AC1's false-throttle vs. involuntary-wait metric
     /// depends on. Always logged alongside (never replacing) any
-    /// `Started` entries the same `decide` call produces.
-    Offered { ready: Vec<u32>, started: Vec<u32> },
+    /// `Started` entries the same `decide` call produces. `rejected`
+    /// names every task id the strategy proposed starting that the
+    /// driver refused because it was not actually ready (already active
+    /// or completed in the real `World`) — the signature of a strategy
+    /// whose own internal belief has desynced from ground truth (e.g.
+    /// `Paced` re-proposing a task its restart-wiped state no longer
+    /// remembers as completed; see `Strategy::on_restart`'s docs).
+    Offered {
+        ready: Vec<u32>,
+        started: Vec<u32>,
+        rejected: Vec<u32>,
+    },
 }
 
 /// The full result of one `run_trace` call: the ordered log and the
@@ -238,9 +259,19 @@ pub fn run_trace(
         // start newly-ready work — a completion may have freed a
         // dependency, a restart may have reset internal pacing, etc.
         let ready = world.ready_tasks(&spec.tasks);
+        // Any task the strategy already internally started as a side
+        // effect of the `notify` call this item may just have triggered
+        // (see `Strategy::drain_pending_starts`'s docs) is processed
+        // alongside whatever a fresh `decide` call proposes — both are
+        // just "task ids the strategy wants started now" from the
+        // driver's point of view.
+        let mut decided: Vec<u32> = strategy.drain_pending_starts();
         if !ready.is_empty() {
-            let decided = strategy.decide(at, &ready);
+            decided.extend(strategy.decide(at, &ready));
+        }
+        if !ready.is_empty() || !decided.is_empty() {
             let mut started_now: Vec<u32> = Vec::new();
+            let mut rejected_now: Vec<u32> = Vec::new();
             for task_id in decided {
                 if !ready.contains(&task_id) {
                     // The strategy named a task that isn't actually ready
@@ -248,6 +279,7 @@ pub fn run_trace(
                     // a panic: a strategy mutant that does this is exactly
                     // the kind of thing PR-B's verifier should be free to
                     // flag, never something this driver crashes on.
+                    rejected_now.push(task_id);
                     continue;
                 }
                 let task_spec = spec
@@ -265,8 +297,7 @@ pub fn run_trace(
                 // `overrun_spend` report (if any) raises it further.
                 for window in &spec.windows {
                     if window.unit == task_spec.unit {
-                        let _ =
-                            world.open_claim(task_id, &window.name, task_spec.relative_spend);
+                        let _ = world.open_claim(task_id, &window.name, task_spec.relative_spend);
                     }
                 }
                 let duration = time::Duration::seconds(
@@ -295,6 +326,7 @@ pub fn run_trace(
                 DriveLogEntry::Offered {
                     ready: ready.clone(),
                     started: started_now,
+                    rejected: rejected_now,
                 },
             ));
         }
