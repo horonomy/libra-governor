@@ -804,10 +804,11 @@ fn overlapping_provider_snapshots_reflect_only_the_latest_value_never_summed() {
 /// ingestion order. See HORO-1768's ticket text (the Jira ticket number
 /// in this test's `#[ignore]` reason is filed from that investigation)
 /// for the disclosure; this is a deliberately-deferred, disclosed
-/// finding, not a bypassed test that should currently pass — no live
-/// caller currently feeds `ingest_pool_provider_snapshot` out-of-order
-/// readings (quota-source always ingests in request order), so
-/// production exposure is nil today.
+/// finding, not a bypassed test that should currently pass — verified by
+/// grep (`rg ingest_pool_provider_snapshot`): no non-test caller of
+/// `ingest_pool_provider_snapshot` exists anywhere in this workspace
+/// today (every call site is either this file or `shared_pool.rs`'s own
+/// `#[cfg(test)]` module), so production exposure is nil today.
 #[test]
 #[ignore = "HORO-1880 finding: ingest_pool_provider_snapshot has no observed_at ordering \
             check, so a stale out-of-order snapshot can overwrite a newer, more-restrictive \
