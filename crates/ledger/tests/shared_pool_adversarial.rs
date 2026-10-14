@@ -48,7 +48,15 @@
 //!    100-year bound (mirroring `quota_window::MAX_SLIDING_LENGTH_SECS`'s
 //!    precedent) so `checked_add` never needs the unsafe fallback.
 //!
-//! Every test in this file passes; none is `#[ignore]`d.
+//! Every test in this file passes except one: HORO-1768 PR-B added
+//! [`stale_out_of_order_snapshot_incorrectly_overwrites_a_newer_more_restrictive_reading`],
+//! a disclosed, deliberately-deferred `#[ignore]`d finding (same
+//! legitimate pattern as the HORO-1779 findings above before they were
+//! fixed) — `ingest_pool_provider_snapshot`'s upsert has no `observed_at`
+//! ordering check, so a stale out-of-order snapshot can overwrite a
+//! newer, more-restrictive reading. See that test's own doc comment and
+//! HORO-1880 for detail; not fixed here (no live caller currently
+//! triggers it, so exposure is nil today).
 
 use std::sync::{Arc, Barrier};
 
@@ -763,6 +771,104 @@ fn overlapping_provider_snapshots_reflect_only_the_latest_value_never_summed() {
         admission_after_3.external_overhang, 3,
         "a later, lower snapshot must replace the prior reading, not combine with it (7+3=10 \
          would be the double-counted/sticky-high failure mode)"
+    );
+}
+
+/// HORO-1768 PR-B finding: `ingest_pool_provider_snapshot` is an
+/// unconditional `ON CONFLICT(pool_id) DO UPDATE` upsert
+/// (`shared_pool.rs`'s own schema keeps exactly one snapshot row per
+/// `pool_id`) with no comparison of the newly-ingested row's own
+/// `observed_at` against the row it is about to replace. Every existing
+/// overlapping-snapshot test above only ever ingests snapshots in
+/// correct wall-clock AND `observed_at` order (same instant, or strictly
+/// later `observed_at`) — none exercises a snapshot that arrives LATER
+/// in wall-clock time but carries an OLDER `observed_at` than the row
+/// already stored (a reordered/retried delivery of a provider poll,
+/// which `response.rs`'s acquisition boundary has no way to prevent
+/// since it only ever sees one HTTP response at a time, not the
+/// sequence).
+///
+/// Walkthrough against a 10-unit pool:
+/// 1. At `t0`, ingest a fresh, disclosed snapshot: `used = 9`. Overhang
+///    is 9, remaining is 1 — correctly conservative.
+/// 2. A STALE snapshot observed at `t0 - 60s` (i.e. it was actually
+///    taken BEFORE the one already stored) arrives afterward and is
+///    ingested with `used = 2`. Because the upsert has no `observed_at`
+///    ordering check, it unconditionally overwrites the stored row.
+///
+/// If this bug is live, overhang drops to 2 and remaining incorrectly
+/// jumps back up to 8 — not because real external usage actually
+/// decreased, but purely because a stale, out-of-order reading arrived
+/// second. A correct implementation must keep the row reflecting the
+/// snapshot with the LATER `observed_at` (9, not 2) regardless of
+/// ingestion order. See HORO-1768's ticket text (the Jira ticket number
+/// in this test's `#[ignore]` reason is filed from that investigation)
+/// for the disclosure; this is a deliberately-deferred, disclosed
+/// finding, not a bypassed test that should currently pass — no live
+/// caller currently feeds `ingest_pool_provider_snapshot` out-of-order
+/// readings (quota-source always ingests in request order), so
+/// production exposure is nil today.
+#[test]
+#[ignore = "HORO-1880 finding: ingest_pool_provider_snapshot has no observed_at ordering \
+            check, so a stale out-of-order snapshot can overwrite a newer, more-restrictive \
+            reading and silently reopen capacity that is still really spent externally"]
+fn stale_out_of_order_snapshot_incorrectly_overwrites_a_newer_more_restrictive_reading() {
+    let mut store = LedgerStore::open_in_memory().unwrap();
+    store
+        .ensure_pool(&pool_id(), &QuotaUnit::Tokens, 10, now())
+        .unwrap();
+
+    let t0 = now();
+    let stale_observed_at = t0 - time::Duration::seconds(60);
+
+    store
+        .ingest_pool_provider_snapshot(
+            &pool_id(),
+            t0,
+            Some(t0 + time::Duration::seconds(3600)),
+            &GaugeReading::Used {
+                used: QuotaAmount::new(QuotaUnit::Tokens, 9),
+                limit: Some(10),
+            },
+            Confidence::High,
+            t0,
+        )
+        .unwrap();
+    let admission_after_9 = store.pool_admission(&pool_id(), t0).unwrap().unwrap();
+    assert_eq!(admission_after_9.external_overhang, 9);
+    assert_eq!(admission_after_9.remaining(), 1);
+
+    // A stale, out-of-order reading (its own `observed_at` PREDATES the
+    // snapshot already stored) arrives later in wall-clock time and is
+    // ingested with a much lower `used` figure.
+    store
+        .ingest_pool_provider_snapshot(
+            &pool_id(),
+            stale_observed_at,
+            Some(stale_observed_at + time::Duration::seconds(3600)),
+            &GaugeReading::Used {
+                used: QuotaAmount::new(QuotaUnit::Tokens, 2),
+                limit: Some(10),
+            },
+            Confidence::High,
+            t0,
+        )
+        .unwrap();
+    let admission_after_stale = store.pool_admission(&pool_id(), t0).unwrap().unwrap();
+    assert_eq!(
+        admission_after_stale.external_overhang,
+        9,
+        "a stale, out-of-order snapshot (observed_at predates the stored reading) must never \
+         overwrite the newer, more-restrictive reading — got overhang={} (remaining={}), \
+         confirming the stale snapshot incorrectly won",
+        admission_after_stale.external_overhang,
+        admission_after_stale.remaining()
+    );
+    assert_eq!(
+        admission_after_stale.remaining(),
+        1,
+        "remaining must stay at 1 (the true, still-real external usage never decreased) — a \
+         jump back up to 8 is the oversubscription-reopening failure mode this test documents"
     );
 }
 
