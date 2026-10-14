@@ -1,5 +1,60 @@
 //! Independent verifier (HORO-1768 PR-B).
 //!
+//! # AC4 coverage ("at least one invalid/corrupted snapshot, concurrent
+//! reservation race and lost-response case correctly detected")
+//!
+//! This crate does not itself implement AC4 — it is a simulation harness
+//! for pacing admission, not a ledger/quota-source test suite. HORO-1768's
+//! own dependency notes claimed AC4 is mostly already covered elsewhere;
+//! verified here (reading each file on current `main`, not assumed) by
+//! exact test name, per sub-case:
+//!
+//! - **Invalid/corrupted snapshot**: `crates/quota-source/src/response.rs`
+//!   (`#[cfg(test)]`) — `a_malformed_body_is_unavailable`,
+//!   `a_unit_mismatch_is_unavailable`,
+//!   `an_unsupported_schema_version_is_unavailable`; `crates/quota-source/src/fixture.rs`
+//!   (`#[cfg(test)]`) — `rejects_a_fixture_with_an_unexpected_field`,
+//!   `rejects_a_fixture_provenance_with_an_unexpected_field`,
+//!   `rejects_a_subject_mismatch_from_a_fixture`,
+//!   `rejects_an_unparseable_timestamp`,
+//!   `rejects_an_unsupported_schema_version`,
+//!   `rejects_a_unit_mismatched_fixture`, `rejects_a_stale_fixture`.
+//! - **Concurrent reservation race**: `crates/ledger/tests/shared_pool_adversarial.rs`
+//!   — `concurrent_contention_varied_parameters_never_oversubscribes`,
+//!   `concurrent_same_principal_same_key_race_grants_exactly_once`,
+//!   `concurrent_cross_principal_idempotency_key_race_never_merges`,
+//!   `concurrent_duplicate_settlement_never_double_counts`;
+//!   `crates/ledger/tests/reservation_concurrency.rs` —
+//!   `concurrent_optional_reservations_never_double_spend_the_shared_envelope`,
+//!   `concurrent_required_work_reservations_never_over_draw_the_completion_reserve`;
+//!   `crates/daemon/tests/launch_gate_integration.rs` —
+//!   `concurrent_admits_never_collectively_exceed_capacity`.
+//! - **Lost-response case**: `crates/daemon/tests/launch_gate_integration.rs`
+//!   — `retrying_admit_after_the_original_hold_expired_never_resolves_to_start`
+//!   and `retrying_admit_after_the_original_hold_was_released_never_resolves_to_start`
+//!   (both explicitly model "the original Start response was lost in
+//!   transit"); `crates/ledger/tests/reservation_concurrency.rs` —
+//!   `a_reservation_left_active_by_a_crashed_process_is_reclaimed_on_reconciliation`
+//!   (a crashed-process variant of the same class).
+//!
+//! `crates/domain/src/quota_window/tests.rs` was also checked: it covers
+//! DST/timezone-ambiguous window-boundary math (e.g.
+//! `daily_reset_spans_23_hours_across_spring_forward`), real robustness
+//! coverage but NOT one of AC4's three named sub-cases — noted here so
+//! this citation list is not silently missing a file the ticket's own
+//! dependency notes named, not claimed as AC4 evidence.
+//!
+//! Conclusion: HORO-1768's own claim holds — AC4 is genuinely covered by
+//! existing, already-merged tests; no new regression test was needed for
+//! AC4 itself. The one new regression test this PR *does* add elsewhere
+//! (`crates/ledger/tests/shared_pool_adversarial.rs`'s
+//! `stale_out_of_order_snapshot_incorrectly_overwrites_a_newer_more_restrictive_reading`,
+//! `#[ignore]`d, HORO-1880) is a DIFFERENT, PR-B-session-discovered
+//! finding — a stale-but-well-formed snapshot silently overwriting a
+//! newer one via unconditional upsert — distinct from AC4's "invalid/
+//! corrupted snapshot" sub-case (which is about malformed/schema-invalid
+//! data, already covered above).
+//!
 //! [`verify`] computes every AC1 metric **structurally**, from
 //! [`crate::world::World`]'s timestamped, ground-truth event log
 //! ([`crate::world::World::log`]) plus the frozen [`crate::trace::TraceSpec`]
