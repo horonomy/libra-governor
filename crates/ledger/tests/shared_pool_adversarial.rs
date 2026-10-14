@@ -473,26 +473,19 @@ fn fresh_external_snapshot_predating_all_holds_is_double_counted_against_capacit
     assert!(matches!(first, SharedPoolReserveOutcome::Granted(_)));
 
     // The CORRECT remaining at this instant is 2 (10 capacity - 4
-    // external, still real and never retracted - 4 active). Asserted as
-    // `remaining() == 2` (not a direct check of the actual, buggy
-    // `external_overhang` value) so this line itself still holds under a
-    // correct fix — only the final `Insufficient` assertion below is
-    // the one that currently fails.
+    // external, still real and never retracted - 4 active). Fixed in
+    // d1d006b/841ce15 (HORO-1779).
     let admission_before_second = store.pool_admission(&pool_id(), t2).unwrap().unwrap();
     assert_eq!(
         admission_before_second.remaining(),
         2,
-        "true remaining is 10 - 4(external, still real) - 4(active) = 2; the current \
-         implementation instead computes external_overhang=0 here (got overhang={}), so \
-         remaining reads as 6",
+        "true remaining is 10 - 4(external, still real) - 4(active) = 2 (got overhang={})",
         admission_before_second.external_overhang
     );
 
-    // This asserts the CORRECT, expected outcome (a regression target
-    // for a future fix), not the implementation's actual behavior — as
-    // of this PR it fails with `Granted` instead of `Insufficient`,
-    // which is exactly why the test is `#[ignore]`d. Run with
-    // `--ignored` to see it fail for this precise reason.
+    // This asserts the CORRECT, expected outcome. It used to fail with
+    // `Granted` instead of `Insufficient` (HORO-1779 finding), fixed in
+    // d1d006b/841ce15 — no longer `#[ignore]`d.
     let second = store
         .reserve_shared(req(&pool_id(), &principal(2), "s2", 6, "k2", t2, 900))
         .unwrap();
@@ -561,10 +554,10 @@ fn settled_hold_after_the_fact_also_masks_a_predating_snapshots_overhang() {
 /// which recomputes admission the same way `pool_admission` does but
 /// only counts settled spend recorded AT OR BEFORE the snapshot's
 /// `observed_at` as potentially already reflected in it. Demonstrates
-/// that this correlation — not "subtract only `settled`, not `active`",
-/// which was checked separately and still fails (see
+/// that this correlation — not merely "subtract only `settled`, not
+/// `active`", which is checked separately in
 /// `settled_hold_after_the_fact_also_masks_a_predating_snapshots_overhang`
-/// above) — is what actually closes the gap.
+/// above — is what actually closes the gap.
 #[test]
 fn time_correlated_overhang_would_correctly_refuse_the_oversubscribed_request() {
     // Re-derives the exact scenario's raw numbers (not a call into
@@ -1032,12 +1025,11 @@ fn ttl_overflow_fallback_lets_a_second_caller_be_granted_capacity_the_first_stil
         reservation.expires_at
     );
 
-    // This asserts the CORRECT, expected outcome (a regression target
-    // for a future fix): a caller requesting an enormous/"effectively
-    // unlimited" TTL should NOT have its hold swept as stale a moment
-    // later. As of this PR it currently reclaims it (`expired.len() ==
-    // 1`), which is exactly why this test is `#[ignore]`d — run with
-    // `--ignored` to see it fail for this precise reason.
+    // This asserts the CORRECT, expected outcome: a caller requesting an
+    // enormous/"effectively unlimited" TTL should NOT have its hold swept
+    // as stale a moment later. It used to reclaim it (`expired.len() ==
+    // 1`, HORO-1779 finding), fixed in d1d006b/841ce15 — no longer
+    // `#[ignore]`d.
     let expired = store.expire_stale_shared_pool_reservations(now()).unwrap();
     assert_eq!(
         expired.len(),
