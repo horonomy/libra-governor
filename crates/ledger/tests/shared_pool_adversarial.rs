@@ -10,9 +10,15 @@
 //! scenario named in HORO-1779's subtask text, not a restatement of the
 //! implementer's own 22 tests.
 //!
-//! # Honest result: AC1 and AC3 do not jointly hold (two independent
-//! counterexamples, both `#[ignore]`d with the reason inline — run with
-//! `--ignored` to reproduce)
+//! # AC1/AC3 counterexamples — found, fixed, now regression-tested (not `#[ignore]`d)
+//!
+//! The two findings below were originally recorded as BLOCKING, each
+//! reproduced by a dedicated counterexample test. Both were fixed in
+//! `d1d006b` (🐛 "Fix shared-pool overhang masking and TTL-overflow
+//! phantom allowance") and the fix was itself fixed for a
+//! parser-differential timestamp bug in `841ce15`. All three regression
+//! tests below now pass and are no longer `#[ignore]`d — see HORO-1779's
+//! Jira history for the original findings.
 //!
 //! 1. [`fresh_external_snapshot_predating_all_holds_is_double_counted_against_capacity`]
 //!    (active-hold variant) and
@@ -20,38 +26,29 @@
 //!    (settled-hold variant) — a provider snapshot's `observed_at`
 //!    strictly precedes every Libra-side hold it is compared against (so
 //!    the snapshot's reported usage structurally CANNOT already include
-//!    that hold — it was ingested first), yet the pool still ends up
-//!    oversubscribed in both variants. Root cause: [`PoolAdmission`]'s
-//!    `external_overhang` is computed in
+//!    that hold — it was ingested first), yet the pool previously ended
+//!    up oversubscribed in both variants. Root cause: [`PoolAdmission`]'s
+//!    `external_overhang` was computed in
 //!    `LedgerStore::external_overhang_tx` as
 //!    `used_value.saturating_sub(settled + active)`, with no comparison
-//!    against the snapshot's own `observed_at` at all. **Verified fix
-//!    direction does NOT include "subtract only `settled`, not
-//!    `active`"** — that variant was checked and still fails (it merely
-//!    moves the same masking from the active-hold case to the
-//!    settled-hold case; see
-//!    [`settled_hold_after_the_fact_also_masks_a_predating_snapshots_overhang`]).
-//!    The verified fix direction is time correlation: only subtract
-//!    Libra-known activity that happened AT OR BEFORE the snapshot's own
-//!    `observed_at` (i.e. `settled_at <= observed_at`, using the same
-//!    RFC3339 whole-second string-comparison convention
-//!    `expire_stale_shared_pool_reservations` already relies on) — see
+//!    against the snapshot's own `observed_at` at all. The fix never
+//!    subtracts `active` at all; it subtracts only `settled` rows whose
+//!    `settled_at` is at or before the snapshot's `observed_at` — see
 //!    [`time_correlated_overhang_would_correctly_refuse_the_oversubscribed_request`]
-//!    for empirical confirmation this direction actually closes the gap,
-//!    and [`snapshot_overhang_correctly_zeroes_once_later_settlement_matches_it`]
-//!    for the non-`#[ignore]`d companion case where subtracting IS
-//!    correct (a settlement that happens AFTER the snapshot legitimately
-//!    retires that much of its reported overhang).
+//!    for empirical confirmation this direction closes the gap, and
+//!    [`snapshot_overhang_correctly_zeroes_once_later_settlement_matches_it`]
+//!    for the companion case where subtracting IS correct (a settlement
+//!    that happens AFTER the snapshot legitimately retires that much of
+//!    its reported overhang).
 //! 2. [`ttl_overflow_fallback_lets_a_second_caller_be_granted_capacity_the_first_still_believes_it_holds`] —
-//!    `ttl_secs` overflow collapses `expires_at` to `now()` (the
-//!    documented fallback), which means a caller requesting an
-//!    enormous/"effectively unlimited" TTL has its hold immediately
-//!    swept as stale and its capacity re-granted to someone else while
-//!    still active — the opposite of the caller's intent, and a genuine
-//!    phantom-free-allowance scenario in AC2's own terms.
+//!    `ttl_secs` overflow previously collapsed `expires_at` to `now()`,
+//!    so a caller requesting an enormous/"effectively unlimited" TTL had
+//!    its hold immediately swept as stale and re-granted to a second
+//!    caller while still active. Fixed by clamping `ttl_secs` to a
+//!    100-year bound (mirroring `quota_window::MAX_SLIDING_LENGTH_SECS`'s
+//!    precedent) so `checked_add` never needs the unsafe fallback.
 //!
-//! Both are recorded as BLOCKING findings — see the Jira comment on
-//! HORO-1779. Every other test in this file passes and is NOT `#[ignore]`d.
+//! Every test in this file passes; none is `#[ignore]`d.
 
 use std::sync::{Arc, Barrier};
 
@@ -443,11 +440,6 @@ fn concurrent_duplicate_settlement_never_double_counts() {
 /// once Libra's active sum happens to equal a snapshot's figure. See
 /// this file's module docs for the suggested fix direction.
 #[test]
-#[ignore = "HORO-1779 BLOCKING: AC1/AC3 oversubscription via a pre-dating \
-            provider snapshot whose overhang is masked by `active` holds \
-            reaching its reported figure — see module docs. Run with \
-            --ignored to reproduce; do not delete or silently fix this \
-            test's assertions without re-verifying against a real patch."]
 fn fresh_external_snapshot_predating_all_holds_is_double_counted_against_capacity() {
     let mut store = LedgerStore::open_in_memory().unwrap();
     store
@@ -481,26 +473,19 @@ fn fresh_external_snapshot_predating_all_holds_is_double_counted_against_capacit
     assert!(matches!(first, SharedPoolReserveOutcome::Granted(_)));
 
     // The CORRECT remaining at this instant is 2 (10 capacity - 4
-    // external, still real and never retracted - 4 active). Asserted as
-    // `remaining() == 2` (not a direct check of the actual, buggy
-    // `external_overhang` value) so this line itself still holds under a
-    // correct fix — only the final `Insufficient` assertion below is
-    // the one that currently fails.
+    // external, still real and never retracted - 4 active). Fixed in
+    // d1d006b/841ce15 (HORO-1779).
     let admission_before_second = store.pool_admission(&pool_id(), t2).unwrap().unwrap();
     assert_eq!(
         admission_before_second.remaining(),
         2,
-        "true remaining is 10 - 4(external, still real) - 4(active) = 2; the current \
-         implementation instead computes external_overhang=0 here (got overhang={}), so \
-         remaining reads as 6",
+        "true remaining is 10 - 4(external, still real) - 4(active) = 2 (got overhang={})",
         admission_before_second.external_overhang
     );
 
-    // This asserts the CORRECT, expected outcome (a regression target
-    // for a future fix), not the implementation's actual behavior — as
-    // of this PR it fails with `Granted` instead of `Insufficient`,
-    // which is exactly why the test is `#[ignore]`d. Run with
-    // `--ignored` to see it fail for this precise reason.
+    // This asserts the CORRECT, expected outcome. It used to fail with
+    // `Granted` instead of `Insufficient` (HORO-1779 finding), fixed in
+    // d1d006b/841ce15 — no longer `#[ignore]`d.
     let second = store
         .reserve_shared(req(&pool_id(), &principal(2), "s2", 6, "k2", t2, 900))
         .unwrap();
@@ -520,9 +505,6 @@ fn fresh_external_snapshot_predating_all_holds_is_double_counted_against_capacit
 /// regardless of time, so settling (not just holding) the matching
 /// amount equally masks the snapshot's still-real external 4 units.
 #[test]
-#[ignore = "HORO-1779 BLOCKING: AC1/AC3 oversubscription, settled-hold \
-            variant of the active-hold counterexample above — see module \
-            docs. Run with --ignored to reproduce."]
 fn settled_hold_after_the_fact_also_masks_a_predating_snapshots_overhang() {
     let mut store = LedgerStore::open_in_memory().unwrap();
     store
@@ -572,10 +554,10 @@ fn settled_hold_after_the_fact_also_masks_a_predating_snapshots_overhang() {
 /// which recomputes admission the same way `pool_admission` does but
 /// only counts settled spend recorded AT OR BEFORE the snapshot's
 /// `observed_at` as potentially already reflected in it. Demonstrates
-/// that this correlation — not "subtract only `settled`, not `active`",
-/// which was checked separately and still fails (see
+/// that this correlation — not merely "subtract only `settled`, not
+/// `active`", which is checked separately in
 /// `settled_hold_after_the_fact_also_masks_a_predating_snapshots_overhang`
-/// above) — is what actually closes the gap.
+/// above — is what actually closes the gap.
 #[test]
 fn time_correlated_overhang_would_correctly_refuse_the_oversubscribed_request() {
     // Re-derives the exact scenario's raw numbers (not a call into
@@ -1005,9 +987,6 @@ fn two_settlements_at_i64_max_capacity_overflow_sum_into_a_hard_error() {
 /// sweep, a SECOND, independent caller is `Granted` the exact same
 /// capacity the first caller still believes it holds.
 #[test]
-#[ignore = "HORO-1779 BLOCKING: ttl_secs overflow collapses expires_at to now(), letting a \
-            still-active holder's capacity be re-granted to a second caller immediately — \
-            see module docs. Run with --ignored to reproduce."]
 fn ttl_overflow_fallback_lets_a_second_caller_be_granted_capacity_the_first_still_believes_it_holds(
 ) {
     let mut store = LedgerStore::open_in_memory().unwrap();
@@ -1046,12 +1025,11 @@ fn ttl_overflow_fallback_lets_a_second_caller_be_granted_capacity_the_first_stil
         reservation.expires_at
     );
 
-    // This asserts the CORRECT, expected outcome (a regression target
-    // for a future fix): a caller requesting an enormous/"effectively
-    // unlimited" TTL should NOT have its hold swept as stale a moment
-    // later. As of this PR it currently reclaims it (`expired.len() ==
-    // 1`), which is exactly why this test is `#[ignore]`d — run with
-    // `--ignored` to see it fail for this precise reason.
+    // This asserts the CORRECT, expected outcome: a caller requesting an
+    // enormous/"effectively unlimited" TTL should NOT have its hold swept
+    // as stale a moment later. It used to reclaim it (`expired.len() ==
+    // 1`, HORO-1779 finding), fixed in d1d006b/841ce15 — no longer
+    // `#[ignore]`d.
     let expired = store.expire_stale_shared_pool_reservations(now()).unwrap();
     assert_eq!(
         expired.len(),
