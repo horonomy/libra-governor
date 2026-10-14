@@ -28,9 +28,10 @@
 //!   `ForeignSession`, `ForgetfulBaseline`) that each deliberately
 //!   violate one guarantee AC2 claims is structurally enforced, proving
 //!   `verify` actually catches a real violation.
-//! - `report` (a later commit in this same PR): a pure `Verdict`/
-//!   `EvidenceClass` type labeling every row this crate produces as
-//!   `EvidenceClass::Simulation`.
+//! - [`report`]: a pure `Verdict`/`EvidenceClass` type. Every row this
+//!   crate itself produces is `EvidenceClass::Simulation` — PR-C (live
+//!   occupancy) and real external calibration are what would eventually
+//!   populate the other evidence classes, not this crate.
 //!
 //! # Fixture numbering
 //!
@@ -49,6 +50,7 @@
 
 pub mod drive;
 pub mod mutants;
+pub mod report;
 pub mod strategy;
 pub mod trace;
 pub mod verify;
