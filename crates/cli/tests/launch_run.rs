@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -611,6 +611,48 @@ fn ac4_a_child_that_ignores_sigterm_keeps_its_hold_and_keeps_running() {
     let _ = wait_for_exit(&mut w1, BOUNDED_WAIT);
 }
 
+/// Regression test for the actual bug this ticket chased (see the long
+/// comment inside [`ac4_sigint_to_the_whole_process_group_lets_the_child_exit_normally`]):
+/// `kill -INT -<pgid>` (two separate dash-led arguments, no `--`) is
+/// silently mistargeted by procps-ng's `kill` on Debian/Ubuntu, including
+/// GitHub Actions' `ubuntu-latest` runners. This test is independent of
+/// the wrapper/daemon entirely -- a bare `sleep` in its own process group
+/// -- so it isolates the OS/`kill`-binary behavior itself and fails fast
+/// (well under a second) if a future edit drops the `--` separator again
+/// anywhere this pattern is used.
+#[test]
+fn kill_dash_signal_requires_a_separator_before_a_negative_pgid() {
+    let mut child = Command::new("sleep")
+        .arg("300")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("spawn a disposable child in its own process group");
+    let pgid = child.id();
+
+    let status = Command::new("kill")
+        .args(["-INT", "--", &format!("-{pgid}")])
+        .status()
+        .unwrap();
+    assert!(status.success(), "kill -INT -- -<pgid> must succeed");
+
+    let exit_status = wait_for_exit(&mut child, BOUNDED_WAIT)
+        .expect("child must receive SIGINT and exit with its default disposition");
+    // `sleep` is signaled directly here (no wrapper re-encoding the exit as
+    // `128 + signal` via a normal `exit()` call, unlike `ac4`'s assertion on
+    // the wrapper's own exit code) -- its `ExitStatus::code()` is `None`
+    // and `.signal()` carries the terminating signal instead.
+    assert_eq!(
+        exit_status.signal(),
+        Some(libc::SIGINT),
+        "child must die from SIGINT delivered via `--`-separated `kill -INT -- -<pgid>`; a \
+         mistargeted kill (the `--`-less form that first motivated this test) would leave the \
+         child running and this would time out instead"
+    );
+}
+
 #[test]
 fn ac4_sigint_to_the_whole_process_group_lets_the_child_exit_normally() {
     let sandbox = Sandbox::new();
@@ -655,8 +697,23 @@ fn ac4_sigint_to_the_whole_process_group_lets_the_child_exit_normally() {
     });
     assert!(child_appeared, "job never started");
 
+    // `--` is required here, not cosmetic: procps-ng's `kill` (as shipped
+    // on Debian/Ubuntu, including GitHub Actions' `ubuntu-latest` runners)
+    // parses a second dash-led argument through `getopt`-style short-option
+    // bundling when it is not preceded by `--`. Confirmed via `strace` in a
+    // native (non-emulated) `linux/arm64` container: `kill -INT -4015`
+    // issues the syscall `kill(-4, SIGINT)` -- only the FIRST digit after
+    // the dash survives (`-12345` -> `-1`, `-777888` -> `-7`, etc.) -- and
+    // still reports a zero exit status even when that mistargeted pid does
+    // not exist (`ESRCH`), so `status.success()` alone never catches the
+    // mis-parse. This is exactly why this test previously hung forever:
+    // the real wrapper process group was never signaled at all, so `sleep`
+    // never received SIGINT and the wrapper's `waitid` loop never observed
+    // an exit. `kill -INT -- -4015` forces everything after `--` to be
+    // treated as a positional operand and issues the correct
+    // `kill(-4015, SIGINT)`.
     let status = Command::new("kill")
-        .args(["-INT", &format!("-{wrapper_pid}")])
+        .args(["-INT", "--", &format!("-{wrapper_pid}")])
         .status()
         .unwrap();
     assert!(
