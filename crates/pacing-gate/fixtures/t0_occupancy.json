@@ -1,0 +1,14 @@
+{
+  "name": "t0_occupancy",
+  "description": "Baseline: steady occupancy. Three independent tasks, one principal, one window with plenty of headroom. No exogenous events. Every strategy should admit all three without contention.",
+  "initial_preference": { "mode": "burst", "target_end_offset_secs": 3600, "max_fanout": 3 },
+  "windows": [
+    { "name": "hourly", "unit": "tokens", "kind": { "kind": "sliding", "length_secs": 3600, "limit": 1000 } }
+  ],
+  "tasks": [
+    { "id": 1, "principal": "alice", "depends_on": [], "priority": "normal", "relative_duration_secs": 60, "relative_spend": 100, "unit": "tokens" },
+    { "id": 2, "principal": "alice", "depends_on": [], "priority": "normal", "relative_duration_secs": 90, "relative_spend": 100, "unit": "tokens" },
+    { "id": 3, "principal": "alice", "depends_on": [], "priority": "normal", "relative_duration_secs": 120, "relative_spend": 100, "unit": "tokens" }
+  ],
+  "events": []
+}

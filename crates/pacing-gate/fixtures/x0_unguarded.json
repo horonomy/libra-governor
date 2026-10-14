@@ -1,0 +1,16 @@
+{
+  "name": "x0_unguarded",
+  "description": "Adversarial negative control (unnumbered, following two-principal-harness's x_confused_deputy.rs convention): a tiny window that only fits one of five ready tasks at a time. Exists so PR-B's `Unguarded` mutant strategy (admits every ready task regardless of quota) has a fixture where it visibly diverges from any honest strategy's admitted count — this PR only freezes the fixture; the verifier that would actually catch the divergence is PR-B's job.",
+  "initial_preference": { "mode": "burst", "target_end_offset_secs": 21600, "max_fanout": 5 },
+  "windows": [
+    { "name": "tiny", "unit": "tokens", "kind": { "kind": "sliding", "length_secs": 21600, "limit": 120 } }
+  ],
+  "tasks": [
+    { "id": 1, "principal": "ivan", "depends_on": [], "priority": "normal", "relative_duration_secs": 30, "relative_spend": 100, "unit": "tokens" },
+    { "id": 2, "principal": "ivan", "depends_on": [], "priority": "normal", "relative_duration_secs": 30, "relative_spend": 100, "unit": "tokens" },
+    { "id": 3, "principal": "ivan", "depends_on": [], "priority": "normal", "relative_duration_secs": 30, "relative_spend": 100, "unit": "tokens" },
+    { "id": 4, "principal": "ivan", "depends_on": [], "priority": "normal", "relative_duration_secs": 30, "relative_spend": 100, "unit": "tokens" },
+    { "id": 5, "principal": "ivan", "depends_on": [], "priority": "normal", "relative_duration_secs": 30, "relative_spend": 100, "unit": "tokens" }
+  ],
+  "events": []
+}

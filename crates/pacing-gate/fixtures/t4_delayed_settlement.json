@@ -1,0 +1,15 @@
+{
+  "name": "t4_delayed_settlement",
+  "description": "A delayed bill: a third party's real spend against the shared window posts (ForeignSpend) long after this trace's own task has already completed, modeling a provider that settles usage well after the fact. The world must still fold it into true occupancy whenever it arrives, never only at the instant a strategy happened to look.",
+  "initial_preference": { "mode": "burst", "target_end_offset_secs": 7200, "max_fanout": 1 },
+  "windows": [
+    { "name": "billed", "unit": "tokens", "kind": { "kind": "sliding", "length_secs": 3600, "limit": 600 } }
+  ],
+  "tasks": [
+    { "id": 1, "principal": "erin", "depends_on": [], "priority": "normal", "relative_duration_secs": 60, "relative_spend": 100, "unit": "tokens" },
+    { "id": 2, "principal": "erin", "depends_on": [1], "priority": "normal", "relative_duration_secs": 60, "relative_spend": 100, "unit": "tokens" }
+  ],
+  "events": [
+    { "kind": "foreign_spend", "offset_secs": 500, "window": "billed", "amount": 450, "unit": "tokens" }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "name": "t2_concurrent_session",
+  "description": "A concurrent session (a different, untracked principal) claims shared capacity on the same window via real, world-visible spend that is never reported to any strategy. An honest strategy only ever sees the window's told snapshot; the world's true headroom is tighter than that.",
+  "initial_preference": { "mode": "burst", "target_end_offset_secs": 3600, "max_fanout": 2 },
+  "windows": [
+    { "name": "shared", "unit": "tokens", "kind": { "kind": "sliding", "length_secs": 3600, "limit": 500 } }
+  ],
+  "tasks": [
+    { "id": 1, "principal": "carol", "depends_on": [], "priority": "normal", "relative_duration_secs": 60, "relative_spend": 200, "unit": "tokens" },
+    { "id": 2, "principal": "carol", "depends_on": [], "priority": "normal", "relative_duration_secs": 60, "relative_spend": 200, "unit": "tokens" }
+  ],
+  "events": [
+    { "kind": "foreign_spend", "offset_secs": 10, "window": "shared", "amount": 300, "unit": "tokens" }
+  ]
+}

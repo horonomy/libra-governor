@@ -1,0 +1,16 @@
+{
+  "name": "t1_multi_window",
+  "description": "Multiple overlapping quota windows: an hourly sliding window and a daily sliding window both constrain the same tasks' tokens unit at once. A task must fit both simultaneously, never just the tighter-looking one in isolation.",
+  "initial_preference": { "mode": "burst", "target_end_offset_secs": 7200, "max_fanout": 4 },
+  "windows": [
+    { "name": "hourly", "unit": "tokens", "kind": { "kind": "sliding", "length_secs": 3600, "limit": 350 } },
+    { "name": "daily", "unit": "tokens", "kind": { "kind": "sliding", "length_secs": 86400, "limit": 900 } }
+  ],
+  "tasks": [
+    { "id": 1, "principal": "bob", "depends_on": [], "priority": "normal", "relative_duration_secs": 60, "relative_spend": 150, "unit": "tokens" },
+    { "id": 2, "principal": "bob", "depends_on": [], "priority": "normal", "relative_duration_secs": 60, "relative_spend": 150, "unit": "tokens" },
+    { "id": 3, "principal": "bob", "depends_on": [], "priority": "normal", "relative_duration_secs": 60, "relative_spend": 150, "unit": "tokens" },
+    { "id": 4, "principal": "bob", "depends_on": [], "priority": "normal", "relative_duration_secs": 60, "relative_spend": 150, "unit": "tokens" }
+  ],
+  "events": []
+}

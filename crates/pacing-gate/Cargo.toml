@@ -1,0 +1,22 @@
+[package]
+name = "libra-governor-pacing-gate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Libra Governor: falsification harness for the pacing scheduler (HORO-1768). Test-only; freezes workload fixtures and a closed-loop driver/world model so a strategy's self-report can be checked against ground truth. Never wires a live admission path — see crates/domain/src/pacing/mod.rs's HORO-1727 seam and domain/tests/pacing_not_wired_live.rs."
+publish = false
+
+# Falsifies `pacing`, never fixes it: this crate only ever *reads*
+# `libra-governor-domain`'s public API (the `Paced` strategy replays
+# `pacing::step` against a frozen trace) and never modifies `pacing/*`,
+# `step.rs`, `daemon/src`, `gateway/src`, or `ledger/src` (HORO-1768
+# scope). See `src/strategy.rs`'s `Paced` docs for why it is marked
+# `SimulationOnly`.
+[dependencies]
+libra-governor-domain = { path = "../domain" }
+serde.workspace = true
+serde_json.workspace = true
+time = { workspace = true, features = ["macros"] }
+uuid.workspace = true
+thiserror.workspace = true
