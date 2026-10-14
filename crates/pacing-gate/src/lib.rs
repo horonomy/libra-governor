@@ -8,7 +8,7 @@
 //! `Paced` strategy is careful never to trip (it calls into `pacing`
 //! from *this* crate, never from `daemon`/`gateway`/`ledger`).
 //!
-//! # PR-A scope (this PR)
+//! # PR-A scope (merged — PR #150)
 //!
 //! - [`trace`]: frozen trace fixtures — relative workload, not absolute
 //!   schedule.
@@ -19,8 +19,19 @@
 //! - [`drive`]: the closed-loop driver that replays a trace's workload
 //!   against a strategy.
 //!
-//! Full metrics/verdict computation (`verify`/`report`) is PR-B's scope,
-//! not this one's — this crate does not define those modules yet.
+//! # PR-B scope (this PR)
+//!
+//! - [`verify`]: an independent verifier computing every AC1 metric
+//!   structurally from the [`world::World`]'s ground-truth log — never
+//!   from a strategy's own self-report.
+//! - [`mutants`]: negative-control strategies (`Unguarded`,
+//!   `ForeignSession`, `ForgetfulBaseline`) that each deliberately
+//!   violate one guarantee AC2 claims is structurally enforced, proving
+//!   `verify` actually catches a real violation.
+//! - [`report`]: a pure `Verdict`/`EvidenceClass` type. Every row this
+//!   crate itself produces is `EvidenceClass::Simulation` — PR-C (live
+//!   occupancy) and real external calibration are what would eventually
+//!   populate the other evidence classes, not this crate.
 //!
 //! # Fixture numbering
 //!
@@ -29,14 +40,20 @@
 //! Resolved here as: `t0`..`t7` (8 fixtures, one per named scenario in
 //! the brief, with `t6_overrun_backoff` filling the one scenario the
 //! brief's prose lists but the `t0..t7` naming didn't have a slot for)
-//! plus one unnumbered adversarial fixture, `x0_unguarded` — following
-//! `two-principal-harness`'s own `x_confused_deputy.rs`/
-//! `x_startup_checks.rs` convention for an adversarial test outside the
-//! main numbered sequence. See `fixtures/` for all nine.
+//! plus two unnumbered adversarial fixtures, `x0_unguarded` (PR-A) and
+//! `x1_foreign_session` (PR-B, added so the `ForeignSession` mutant's
+//! identity violation has a fixture with more than one principal to
+//! violate) — following `two-principal-harness`'s own
+//! `x_confused_deputy.rs`/`x_startup_checks.rs` convention for an
+//! adversarial test outside the main numbered sequence. See `fixtures/`
+//! for all ten.
 
 pub mod drive;
+pub mod mutants;
+pub mod report;
 pub mod strategy;
 pub mod trace;
+pub mod verify;
 pub mod world;
 
 /// Every frozen fixture's raw JSON, embedded at compile time so a
@@ -68,6 +85,7 @@ pub mod fixtures {
         ("t6_overrun_backoff", fixture!("t6_overrun_backoff")),
         ("t7_burst_to_sustain", fixture!("t7_burst_to_sustain")),
         ("x0_unguarded", fixture!("x0_unguarded")),
+        ("x1_foreign_session", fixture!("x1_foreign_session")),
     ];
 
     pub fn load(name: &str) -> Result<TraceSpec, TraceError> {

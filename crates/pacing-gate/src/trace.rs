@@ -44,7 +44,7 @@ pub fn window_uuid(window_name: &str) -> Uuid {
 /// in. A small closed set, not `libra_governor_domain::QuotaUnit`
 /// directly, so a fixture file never needs to spell that type's full
 /// serde shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TraceUnit {
     Tokens,
