@@ -132,6 +132,7 @@ mod tests {
             extensions: None,
             extension_runtime: std::sync::OnceLock::new(),
             outcome_authority: authority,
+            launch_gate: None,
             progressive_interval_secs: crate::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
         }
     }

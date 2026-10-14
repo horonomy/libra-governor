@@ -155,6 +155,14 @@ pub enum Request {
         /// repeated here either.
         signed_claim: Option<SignedOutcomeClaimWire>,
     },
+    /// The launch-gate IPC (HORO-1766): admit/renew/release/status over
+    /// an opt-in shared slot pool. See `crate::launch` module docs. A
+    /// struct variant wrapping the inner [`crate::LaunchRequest`] enum
+    /// (mirroring `ExecutionOwner { event }` above), rather than
+    /// flattening it directly into this enum — `Request` and
+    /// `LaunchRequest` would otherwise both need the same serde `tag`
+    /// name, producing a duplicate-key collision on the wire.
+    Launch { launch: crate::LaunchRequest },
 }
 
 /// The signed portion of a `RecordOutcome` push that is NOT already a
@@ -889,6 +897,10 @@ pub enum Response {
     Doctor(Box<DoctorResult>),
     /// Answers a `RecordOutcome` request (HORO-1174).
     OutcomeRecorded(OutcomeRecordedOutcome),
+    /// Answers a `Launch` request (HORO-1766). Boxed for the same
+    /// large-enum-variant reason as its siblings: `LaunchOutcome::StatusReport`
+    /// carries a `Vec<PoolStatus>`.
+    Launch(Box<crate::LaunchOutcome>),
     /// The daemon could not (or would not) answer the request — e.g. a
     /// protocol version mismatch, or an internal error it caught rather
     /// than let propagate as a crash.

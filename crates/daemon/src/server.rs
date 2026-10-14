@@ -164,6 +164,12 @@ pub struct DaemonConfig {
     /// does not satisfy Decision 1 on a same-OS-user deployment — it
     /// proves verification logic only, not principal separation.
     pub outcome_authority: Option<libra_governor_extension::OutcomeAuthorityConfig>,
+    /// The opt-in launch-gate admission primitive (HORO-1766). `None` —
+    /// the default — means no `[launcher]` section was present in
+    /// `config.json`: every `Launch::Admit` answers `Unavailable {
+    /// reason: not_enabled }` (ADR-0020: off by default). See
+    /// `crate::launch_gate` module docs.
+    pub launch_gate: Option<crate::launch_gate::LaunchGateConfig>,
 }
 
 /// Default [`DaemonConfig::progressive_interval_secs`] — see that
@@ -634,6 +640,47 @@ pub(crate) fn dispatch(
                 }
             }
         },
+        Request::Launch { launch } => {
+            let now = time::OffsetDateTime::now_utc();
+            let outcome = match launch {
+                libra_governor_protocol::LaunchRequest::Admit {
+                    pool_alias,
+                    launch_id,
+                } => crate::launch_gate::handle_admit(
+                    ledger,
+                    config.launch_gate.as_ref(),
+                    &pool_alias,
+                    launch_id,
+                    now,
+                ),
+                libra_governor_protocol::LaunchRequest::Renew {
+                    reservation_id,
+                    launch_id,
+                } => crate::launch_gate::handle_renew(
+                    ledger,
+                    config.launch_gate.as_ref(),
+                    reservation_id,
+                    launch_id,
+                    now,
+                ),
+                libra_governor_protocol::LaunchRequest::Release {
+                    reservation_id,
+                    launch_id,
+                } => crate::launch_gate::handle_release(ledger, reservation_id, launch_id, now),
+                libra_governor_protocol::LaunchRequest::Status {} => {
+                    crate::launch_gate::handle_status(ledger, config.launch_gate.as_ref(), now)
+                }
+            };
+            match outcome {
+                Ok(outcome) => Response::Launch(Box::new(outcome)),
+                Err(e) => {
+                    log::append_line(&config.log_path, &format!("launch gate error: {e}"));
+                    Response::Error {
+                        message: "internal error handling launch gate request".to_string(),
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2441,7 +2488,12 @@ fn handle_doctor(ledger: &LedgerStore, config: &DaemonConfig) -> DoctorResult {
                     (false, true, None, true)
                 } else {
                     match crate::config_file::load_overrides(dir) {
-                        Ok((policy_on_disk, gateway_on_disk, _extensions_on_disk)) => {
+                        Ok(crate::config_file::ConfigOverrides {
+                            policy: policy_on_disk,
+                            gateway: gateway_on_disk,
+                            extensions: _extensions_on_disk,
+                            launcher: _launcher_on_disk,
+                        }) => {
                             // A present, *valid* config.json can still
                             // disagree with what this already-running
                             // daemon holds in memory — the common "edited
@@ -2706,6 +2758,7 @@ mod tests {
             extension_runtime: OnceLock::new(),
 
             outcome_authority: None,
+            launch_gate: None,
             progressive_interval_secs: DEFAULT_PROGRESSIVE_INTERVAL_SECS,
         }
     }

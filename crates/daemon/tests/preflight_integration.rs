@@ -45,6 +45,7 @@ fn preflight_returns_sane_result_within_recon_budget() {
         extension_runtime: std::sync::OnceLock::new(),
 
         outcome_authority: None,
+        launch_gate: None,
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
     };
 
@@ -144,6 +145,7 @@ fn second_preflight_for_same_session_supersedes_the_first() {
         extension_runtime: std::sync::OnceLock::new(),
 
         outcome_authority: None,
+        launch_gate: None,
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
     };
 
@@ -297,6 +299,7 @@ fn preflight_selects_a_bucketed_tier_once_same_repo_history_exists() {
         extension_runtime: std::sync::OnceLock::new(),
 
         outcome_authority: None,
+        launch_gate: None,
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
     };
 

@@ -20,9 +20,14 @@
 
 pub mod execution_owner;
 pub mod host_event;
+pub mod launch;
 pub use execution_owner::{
     ExecutionEffect, ExecutionOperation, ExecutionOwnerOutcome, ExecutionOwnerRequest,
     NativeExecutionContext,
+};
+pub use launch::{
+    LaunchOutcome, LaunchRequest, PoolStatus, UnavailableReason, WaitReason,
+    LAUNCH_GATE_ENFORCEMENT_SCOPE,
 };
 mod messages;
 pub mod wire;
@@ -36,7 +41,8 @@ pub use libra_governor_domain::Estimate;
 pub use libra_governor_domain::{
     BudgetSnapshot, BusinessContextSummary, Confidence, CredentialCustody, EnforcementCapabilities,
     EnforcementTier, ExecutionOutcome, Headroom, MonetaryEnforcement, NoMonetaryCap, PlanId,
-    PolicyDecision, ResourceAmount, ResourceKind, TaskId, UsageAccounting,
+    PolicyDecision, ReservationState, ResourceAmount, ResourceKind, SharedPoolReservationId,
+    TaskId, UsageAccounting,
 };
 pub use libra_governor_estimator::{
     AdmissionOutcome, AdmissionPolicy, AdmissionStats, CoverageReport, QuantileCoverage, Stratum,
@@ -180,4 +186,13 @@ pub use messages::{
 /// already. This bump is precedent, not new association-version wire
 /// data: `EXECUTION_ASSOCIATION_VERSION` is carried on
 /// `ExecutionOwnerRequest` itself and is never persisted.
-pub const PROTOCOL_VERSION: u32 = 15;
+///
+/// Bumped 15 -> 16 for HORO-1766's launch-gate admission primitive:
+/// `Request` gained `Launch` and `Response` gained the matching `Launch`
+/// variant, which a v15 peer's `deny_unknown_fields`-enforced decoder
+/// cannot parse. Off by default either way (no `[launcher]` section in
+/// `config.json` means every `Admit` answers `Unavailable { reason:
+/// not_enabled }`) — but the shape itself is new wire data, so the bump
+/// follows every earlier precedent: a long-lived v15 daemon must be
+/// restarted after upgrading before launch-gate traffic is reachable.
+pub const PROTOCOL_VERSION: u32 = 16;

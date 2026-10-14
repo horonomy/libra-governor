@@ -112,6 +112,11 @@ pub(crate) fn strip_agent_named_paths(request: &mut Request) {
         | Request::GatewayStatus
         | Request::Doctor
         | Request::RecordOutcome { .. } => {}
+        // `LaunchRequest`'s variants carry only `pool_alias: String`,
+        // `launch_id`/`reservation_id` (opaque identifiers, never a
+        // filesystem path) — see `crates/protocol/src/launch.rs`. No
+        // sink exists here to strip.
+        Request::Launch { .. } => {}
     }
 }
 

@@ -171,6 +171,7 @@ fn tool_call_count_material_deviation_triggers_a_replan_visible_in_status() {
         extension_runtime: std::sync::OnceLock::new(),
 
         outcome_authority: None,
+        launch_gate: None,
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
     };
 
@@ -322,6 +323,7 @@ fn possible_tool_loop_streak_triggers_a_replan_before_the_count_threshold() {
         extension_runtime: std::sync::OnceLock::new(),
 
         outcome_authority: None,
+        launch_gate: None,
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
     };
 
@@ -404,6 +406,7 @@ fn exhausting_the_auto_replan_budget_escalates_instead_of_replanning_again() {
         extension_runtime: std::sync::OnceLock::new(),
 
         outcome_authority: None,
+        launch_gate: None,
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
     };
 

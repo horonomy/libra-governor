@@ -257,6 +257,24 @@ pub enum SharedPoolReleaseOutcome {
     NotFound,
 }
 
+/// The outcome of [`LedgerStore::renew_shared`] (HORO-1766).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SharedPoolRenewOutcome {
+    /// `expires_at` was extended. Nothing else about the row changed.
+    Renewed(Box<SharedPoolReservation>),
+    /// No row exists with this id at all.
+    NotFound,
+    /// A row exists but did not satisfy the renew contract: either
+    /// `principal_id`/`session_id` did not match exactly, or the row was
+    /// not currently `active` (already settled/released/expired), or it
+    /// was `active` but already past its own `expires_at` (stale,
+    /// awaiting a sweep). Refused, never silently extended — the current
+    /// stored row is returned for diagnostics; it is never mutated by a
+    /// refused renew. See module docs for why a wrong-identity or
+    /// non-active renew must never "succeed" quietly.
+    Refused(Box<SharedPoolReservation>),
+}
+
 impl LedgerStore {
     /// Creates `pool_id`'s [`QuotaPool`] with `capacity`/`unit`, if one
     /// does not already exist. Never overwrites an existing pool's
@@ -775,6 +793,79 @@ impl LedgerStore {
             .expect("row just updated in this same transaction");
         tx.commit()?;
         Ok(SharedPoolReleaseOutcome::Released(Box::new(
+            updated_reservation,
+        )))
+    }
+
+    /// Atomically extends shared-pool hold `id`'s `expires_at` to
+    /// `now + min(ttl_secs, MAX_TTL_SECS)` (HORO-1766) — the launch-gate's
+    /// keep-alive primitive for a long-running hold. Runs in an IMMEDIATE
+    /// transaction, exactly the same discipline as every other mutating
+    /// method in this module.
+    ///
+    /// Extends the expiry **only** for a row that is, in the same instant
+    /// this transaction observes it: currently `active`, held by exactly
+    /// this `principal_id`/`session_id` pair, and not already past its
+    /// own `expires_at` (a stale-but-not-yet-swept hold is refused, not
+    /// silently resurrected — it must go through the normal
+    /// expire-then-reserve path instead). Anything else — wrong identity,
+    /// not found, not active, already stale — is refused and the row is
+    /// left completely untouched; this never "succeeds" quietly on a
+    /// mismatch.
+    pub fn renew_shared(
+        &mut self,
+        id: SharedPoolReservationId,
+        principal_id: &PrincipalId,
+        session_id: &str,
+        now: OffsetDateTime,
+        ttl_secs: u64,
+    ) -> Result<SharedPoolRenewOutcome, LedgerError> {
+        let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
+        let Some(reservation) = Self::get_shared_reservation_tx(&tx, id)? else {
+            tx.commit()?;
+            return Ok(SharedPoolRenewOutcome::NotFound);
+        };
+
+        let identity_matches =
+            reservation.principal_id == *principal_id && reservation.session_id == session_id;
+        let currently_fresh =
+            reservation.state == ReservationState::Active && reservation.expires_at > now;
+        if !identity_matches || !currently_fresh {
+            tx.commit()?;
+            return Ok(SharedPoolRenewOutcome::Refused(Box::new(reservation)));
+        }
+
+        // Same overflow-safe TTL clamp/checked-add discipline as
+        // `reserve_shared` — see that method's own docs for why a bare
+        // cast/duration-add is rejected outright rather than silently
+        // truncated or allowed to panic.
+        let ttl_seconds = i64::try_from(ttl_secs.min(MAX_TTL_SECS)).unwrap_or(i64::MAX);
+        let new_expires_at = now
+            .checked_add(time::Duration::seconds(ttl_seconds))
+            .ok_or_else(invalid)?;
+
+        let updated = tx.execute(
+            "UPDATE shared_pool_reservations SET expires_at = ?1
+             WHERE id = ?2 AND state = 'active' AND principal_id = ?3 AND session_id = ?4",
+            rusqlite::params![
+                rfc3339(new_expires_at)?,
+                id.0.to_string(),
+                principal_id.0,
+                session_id,
+            ],
+        )?;
+        if updated == 0 {
+            // Lost a race against a concurrent settle/release/expire on
+            // this same row between the read above and this write.
+            let current = Self::get_shared_reservation_tx(&tx, id)?
+                .expect("row existed moments ago under the same write lock");
+            tx.commit()?;
+            return Ok(SharedPoolRenewOutcome::Refused(Box::new(current)));
+        }
+        let updated_reservation = Self::get_shared_reservation_tx(&tx, id)?
+            .expect("row just updated in this same transaction");
+        tx.commit()?;
+        Ok(SharedPoolRenewOutcome::Renewed(Box::new(
             updated_reservation,
         )))
     }
@@ -1577,6 +1668,196 @@ mod tests {
         // the task-level activity above: still exactly fully consumed.
         let admission = store.pool_admission(&pool_id(), now()).unwrap().unwrap();
         assert_eq!(admission.remaining(), 0);
+    }
+
+    #[test]
+    fn renew_extends_expiry_for_the_matching_active_holder() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        store
+            .ensure_pool(&pool_id(), &QuotaUnit::Tokens, 10, now())
+            .unwrap();
+        let SharedPoolReserveOutcome::Granted(reservation) = reserve(&mut store, "s1", 5, "k1")
+        else {
+            panic!("expected Granted");
+        };
+        let original_expiry = reservation.expires_at;
+
+        let later = now() + time::Duration::seconds(60);
+        let outcome = store
+            .renew_shared(reservation.id, &principal(1), "s1", later, 900)
+            .unwrap();
+        match outcome {
+            SharedPoolRenewOutcome::Renewed(renewed) => {
+                assert!(renewed.expires_at > original_expiry);
+                assert_eq!(renewed.expires_at, later + time::Duration::seconds(900));
+                assert_eq!(renewed.state, ReservationState::Active);
+            }
+            other => panic!("expected Renewed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn renew_with_wrong_principal_is_refused_not_silently_applied() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        store
+            .ensure_pool(&pool_id(), &QuotaUnit::Tokens, 10, now())
+            .unwrap();
+        let SharedPoolReserveOutcome::Granted(reservation) = reserve(&mut store, "s1", 5, "k1")
+        else {
+            panic!("expected Granted");
+        };
+        let original_expiry = reservation.expires_at;
+
+        let outcome = store
+            .renew_shared(reservation.id, &principal(2), "s1", now(), 900)
+            .unwrap();
+        match outcome {
+            SharedPoolRenewOutcome::Refused(current) => {
+                assert_eq!(
+                    current.expires_at, original_expiry,
+                    "expiry must be untouched"
+                );
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn renew_with_wrong_session_is_refused_not_silently_applied() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        store
+            .ensure_pool(&pool_id(), &QuotaUnit::Tokens, 10, now())
+            .unwrap();
+        let SharedPoolReserveOutcome::Granted(reservation) = reserve(&mut store, "s1", 5, "k1")
+        else {
+            panic!("expected Granted");
+        };
+        let original_expiry = reservation.expires_at;
+
+        let outcome = store
+            .renew_shared(
+                reservation.id,
+                &principal(1),
+                "a-different-session",
+                now(),
+                900,
+            )
+            .unwrap();
+        match outcome {
+            SharedPoolRenewOutcome::Refused(current) => {
+                assert_eq!(current.expires_at, original_expiry);
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn renew_on_a_released_row_is_refused() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        store
+            .ensure_pool(&pool_id(), &QuotaUnit::Tokens, 10, now())
+            .unwrap();
+        let SharedPoolReserveOutcome::Granted(reservation) = reserve(&mut store, "s1", 5, "k1")
+        else {
+            panic!("expected Granted");
+        };
+        store.release_shared(reservation.id, now()).unwrap();
+
+        let outcome = store
+            .renew_shared(reservation.id, &principal(1), "s1", now(), 900)
+            .unwrap();
+        match outcome {
+            SharedPoolRenewOutcome::Refused(current) => {
+                assert_eq!(current.state, ReservationState::Released);
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn renew_on_an_expired_row_is_refused() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        store
+            .ensure_pool(&pool_id(), &QuotaUnit::Tokens, 10, now())
+            .unwrap();
+        store
+            .reserve_shared(SharedPoolReserveRequest {
+                pool_id: &pool_id(),
+                principal_id: &principal(1),
+                session_id: "s1",
+                amount: 5,
+                unit: &QuotaUnit::Tokens,
+                idempotency_key: "k1",
+                now: now(),
+                ttl_secs: 60,
+            })
+            .unwrap();
+        let later = now() + time::Duration::seconds(120);
+        let expired = store.expire_stale_shared_pool_reservations(later).unwrap();
+        assert_eq!(expired.len(), 1);
+
+        let outcome = store
+            .renew_shared(expired[0].id, &principal(1), "s1", later, 900)
+            .unwrap();
+        match outcome {
+            SharedPoolRenewOutcome::Refused(current) => {
+                assert_eq!(current.state, ReservationState::Expired);
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn renew_on_a_stale_but_not_yet_swept_active_row_is_refused() {
+        // A hold that is still technically `state == active` in storage
+        // but already past its own `expires_at` (the sweep just hasn't
+        // run yet) must not be resurrected by a renew — it must go
+        // through the expire-then-reserve path instead.
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        store
+            .ensure_pool(&pool_id(), &QuotaUnit::Tokens, 10, now())
+            .unwrap();
+        let SharedPoolReserveOutcome::Granted(reservation) = store
+            .reserve_shared(SharedPoolReserveRequest {
+                pool_id: &pool_id(),
+                principal_id: &principal(1),
+                session_id: "s1",
+                amount: 5,
+                unit: &QuotaUnit::Tokens,
+                idempotency_key: "k1",
+                now: now(),
+                ttl_secs: 60,
+            })
+            .unwrap()
+        else {
+            panic!("expected Granted");
+        };
+        let past_expiry = now() + time::Duration::seconds(120);
+
+        let outcome = store
+            .renew_shared(reservation.id, &principal(1), "s1", past_expiry, 900)
+            .unwrap();
+        match outcome {
+            SharedPoolRenewOutcome::Refused(current) => {
+                assert_eq!(current.state, ReservationState::Active);
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn renew_on_a_nonexistent_id_reports_not_found() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let outcome = store
+            .renew_shared(
+                SharedPoolReservationId::new(),
+                &principal(1),
+                "s1",
+                now(),
+                900,
+            )
+            .unwrap();
+        assert!(matches!(outcome, SharedPoolRenewOutcome::NotFound));
     }
 
     #[test]

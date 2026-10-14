@@ -15,6 +15,7 @@ pub mod features;
 pub mod gateway_authority;
 pub mod host_binding;
 pub mod host_runtime;
+pub mod launch_gate;
 pub mod log;
 pub mod outcome_authority_wiring;
 pub mod paths;

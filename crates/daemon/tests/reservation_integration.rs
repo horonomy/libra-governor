@@ -72,6 +72,7 @@ fn base_config(dir: &Path, policy: Policy) -> DaemonConfig {
         extension_runtime: std::sync::OnceLock::new(),
 
         outcome_authority: None,
+        launch_gate: None,
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
     }
 }
