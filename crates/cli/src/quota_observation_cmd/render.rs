@@ -7,8 +7,63 @@
 use libra_governor_quota_observation::compat::DescribeCompatibility;
 use libra_governor_quota_observation::freshness::{self, BoundSnapshotResult};
 use libra_governor_quota_observation::registration::Registration;
-use libra_governor_quota_observation::wire::{BootstrapResponse, Coverage, WireError};
+use libra_governor_quota_observation::wire::{
+    BootstrapResponse, Coverage, Metric, Reading, Scope, Unit, WireError,
+};
 use time::OffsetDateTime;
+
+/// `scope`'s one-line operator-facing form — `<kind>:<handle>`, never the
+/// `{kind: "account", handle: "acct"}`-shaped `Debug` output a future
+/// reader would otherwise copy-paste into something expecting a plain
+/// string.
+fn format_scope(scope: &Scope) -> String {
+    let (kind, handle) = match scope {
+        Scope::Principal { handle } => ("principal", handle),
+        Scope::Account { handle } => ("account", handle),
+        Scope::Team { handle } => ("team", handle),
+        Scope::Organization { handle } => ("organization", handle),
+        Scope::Project { handle } => ("project", handle),
+        Scope::SharedPool { handle } => ("shared_pool", handle),
+        Scope::Provider { handle } => ("provider", handle),
+    };
+    format!("{kind}:{handle}")
+}
+
+fn format_metric(metric: Metric) -> &'static str {
+    match metric {
+        Metric::TotalTokens => "total_tokens",
+        Metric::InputTokens => "input_tokens",
+        Metric::OutputTokens => "output_tokens",
+        Metric::Requests => "requests",
+        Metric::Spend => "spend",
+        Metric::CreditUsage => "credit_usage",
+        Metric::Utilization => "utilization",
+    }
+}
+
+fn format_unit(unit: &Unit) -> String {
+    match unit {
+        Unit::Tokens => "tokens".to_string(),
+        Unit::Requests => "requests".to_string(),
+        Unit::UsdCents => "usd_cents".to_string(),
+        Unit::PercentBasisPoints => "percent_basis_points".to_string(),
+        Unit::OpaqueCredit { namespace } => format!("opaque_credit:{namespace}"),
+    }
+}
+
+/// `reading`'s one-line operator-facing form, using [`Quantity`]'s own
+/// `Display` (the exact canonical decimal string, never `Debug`'s
+/// `Quantity { canonical: "600000", value: 600000 }` struct dump).
+fn format_reading(reading: &Reading) -> String {
+    match reading {
+        Reading::Used { value, limit } => format!("used {value} of {limit}"),
+        Reading::Remaining { value, limit } => format!("{value} remaining of {limit}"),
+        Reading::Utilization { used_basis_points } => {
+            format!("{used_basis_points} basis points used")
+        }
+        Reading::Undisclosed => "undisclosed".to_string(),
+    }
+}
 
 /// `doctor`'s one passive-mode line per registration — no live call, just
 /// what is already on disk.
@@ -110,13 +165,13 @@ pub fn snapshot_result_summary(
             None => "unknown (no matching expected[] entry)",
         };
         lines.push(format!(
-            "  constraint {} scope={:?} metric={:?} unit={:?} reading={:?} \
+            "  constraint {} scope={} metric={} unit={} reading={} \
              upstream_enforcement={:?} observed_at={} [{freshness_tag}]",
             constraint.id,
-            constraint.scope,
-            constraint.metric,
-            constraint.unit,
-            constraint.reading,
+            format_scope(&constraint.scope),
+            format_metric(constraint.metric),
+            format_unit(&constraint.unit),
+            format_reading(&constraint.reading),
             constraint.upstream_enforcement,
             constraint.observed_at,
         ));

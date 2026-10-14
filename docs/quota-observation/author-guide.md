@@ -367,7 +367,7 @@ sample-quota-ext-registration â€” extension org.example.sample-quota-ext 0.1.0 â
 
 $ libra-governor quota-observation inspect sample-quota-ext-registration
 coverage=Complete context.selector=sample-session authority=sample-authority
-  constraint tokens_month scope=Account { handle: "sample-account" } metric=TotalTokens unit=Tokens reading=Used { value: Quantity { canonical: "600000", value: 600000 }, limit: Quantity { canonical: "1000000", value: 1000000 } } upstream_enforcement=Unknown observed_at=2027-01-18T12:00:00Z [stale]
+  constraint tokens_month scope=account:sample-account metric=total_tokens unit=tokens reading=used 600000 of 1000000 upstream_enforcement=Unknown observed_at=2027-01-18T12:00:00Z [stale]
 
 $ libra-governor quota-observation disable sample-quota-ext-registration
 disabled "sample-quota-ext-registration"
