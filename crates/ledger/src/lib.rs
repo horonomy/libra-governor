@@ -57,8 +57,8 @@ pub use resource_account::{
     RecordedShadowDecision,
 };
 pub use shared_pool::{
-    SharedPoolReleaseOutcome, SharedPoolReserveOutcome, SharedPoolReserveRequest,
-    SharedPoolSettleOutcome,
+    SharedPoolReleaseOutcome, SharedPoolRenewOutcome, SharedPoolReserveOutcome,
+    SharedPoolReserveRequest, SharedPoolSettleOutcome,
 };
 pub use store::{LedgerStore, APPEND_ONLY_TRIGGERS};
 pub use write::DOGFOOD_PROFILE_ENV_VAR;
