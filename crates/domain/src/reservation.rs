@@ -245,9 +245,14 @@ pub enum CompletionReserveBasis {
     /// local receipt history carrying a real, kind-matching resource
     /// figure.
     EstimateP80,
-    /// Computed from the policy's own resource target — the basis used
-    /// whenever no kind-matching estimate quantile is available (e.g. a
-    /// cold-start estimate).
+    /// Computed from [`Policy::turn_fallback_request`] — the policy's
+    /// turn-scoped `cold_start_request` when a [`crate::TurnBound`] is
+    /// configured (HORO-1727 Decision B), else its plain resource target
+    /// — the basis used whenever no kind-matching estimate quantile is
+    /// available (e.g. a cold-start estimate). The variant name predates
+    /// the turn-scoped ceiling and is kept as-is (it is a persisted
+    /// ledger column value) even though it no longer always means
+    /// literally `resource.target`.
     PolicyTarget,
 }
 
@@ -560,8 +565,9 @@ pub const COMPLETION_RESERVE_MAX_FRACTION: f64 = 0.50;
 /// docs). Basis selection prefers the estimate's P80 resource quantile
 /// when one exists and its [`crate::ResourceKind`] matches the policy's
 /// resource kind; otherwise (cold-start estimate, or a kind mismatch) it
-/// falls back to the policy's own resource target — the only resource
-/// figure that always exists. The reserved fraction grows with the
+/// falls back to [`Policy::turn_fallback_request`] (HORO-1727 Decision
+/// B) — the only resource figure that always exists, whether or not a
+/// turn-scoped ceiling is configured. The reserved fraction grows with the
 /// number of required completion criteria (more required verification
 /// work implies more protected capacity is owed), clamped at
 /// [`COMPLETION_RESERVE_MAX_FRACTION`], and the resulting amount is
@@ -576,7 +582,10 @@ pub fn completion_reserve_for(
         .and_then(|e| e.resource_p80)
         .filter(|amount| amount.kind() == policy_kind)
         .map(|amount| (amount, CompletionReserveBasis::EstimateP80))
-        .unwrap_or((policy.resource.target, CompletionReserveBasis::PolicyTarget));
+        .unwrap_or((
+            policy.turn_fallback_request(),
+            CompletionReserveBasis::PolicyTarget,
+        ));
 
     let required_criteria_count = contract.required_criteria().count();
     let fraction = (COMPLETION_RESERVE_BASE_FRACTION

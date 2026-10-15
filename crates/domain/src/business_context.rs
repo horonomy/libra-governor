@@ -148,7 +148,21 @@ pub fn apply_business_context(
         base.autonomy,
         now,
     ) {
-        Ok(derived) => (derived, true),
+        // `Policy::validated_at` always produces `turn: None` — re-attach
+        // `base`'s own turn bound (HORO-1727 Decision B), if any, so a
+        // business-context deadline narrowing (which only ever touches
+        // `time`) does not silently disable the turn-scoped ceiling as a
+        // side effect. Re-validation can never fail here: `resource` is
+        // copied from `base` unchanged, so `base.turn` (already valid
+        // against it) stays valid; `unwrap_or(derived)` is a defensive
+        // fallback only, never expected to trigger.
+        Ok(derived) => {
+            let derived = match base.turn {
+                Some(turn) => derived.clone().with_turn_bound(turn).unwrap_or(derived),
+                None => derived,
+            };
+            (derived, true)
+        }
         Err(_) => (base.clone(), false),
     }
 }

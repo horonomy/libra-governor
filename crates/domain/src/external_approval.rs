@@ -103,6 +103,7 @@ mod tests {
             .required_criteria()
             .cloned()
             .collect(),
+            turn_outcome: None,
         }
     }
 
