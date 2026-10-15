@@ -1143,18 +1143,23 @@ fn future_dated_observed_at_is_rejected_outright_not_stored_as_a_sticky_poison_r
 /// with a `Barrier` so both threads actually race to ingest at the same
 /// instant.
 ///
-/// A bare `Barrier` alone is not enough to discriminate the bug: the
-/// thread that reaches the barrier LAST proceeds immediately, so which
+/// A bare `Barrier` alone is not enough to discriminate the bug: both
+/// threads are released by the barrier at the same instant, so which
 /// thread's `BEGIN IMMEDIATE` actually commits second (and thus matters
 /// for the ordering check) would otherwise depend entirely on
 /// unpredictable OS scheduling — a run could pass even without the fix
 /// if the correct reading happened to commit second every time. To
 /// actually exercise the case the bug lives in — the stale reading's
 /// `ingest_pool_provider_snapshot` call committing AFTER the correct
-/// one — alternating iterations add a tiny sleep to whichever thread
-/// should arrive at its own `BEGIN IMMEDIATE` first, biasing (not
-/// guaranteeing, since this is still real OS scheduling) each ordering
-/// to occur across the 50 iterations. Regardless of which thread's
+/// one — alternating iterations add a short post-barrier sleep to
+/// whichever thread should commit SECOND, biasing (not guaranteeing,
+/// since this is still real OS scheduling) each ordering to occur
+/// across the 50 iterations: on even iterations the correct thread
+/// sleeps, so the stale reading likely commits first and is then
+/// overwritten by the correct one (the easy ordering); on odd
+/// iterations the stale thread sleeps, so the correct reading likely
+/// commits first and the STALE reading commits second — the exact
+/// ordering the original bug lived in. Regardless of which thread's
 /// transaction actually commits second, the final stored reading must
 /// always be the one with the later `observed_at` (overhang = 9), never
 /// the stale one (overhang = 2) — a time-of-check/time-of-use gap
@@ -1175,11 +1180,14 @@ fn concurrent_racing_ingests_never_let_a_stale_reading_win_the_ordering_check() 
         }
 
         let barrier = Arc::new(Barrier::new(2));
-        // Alternate which thread gets a tiny head-start delay after the
-        // barrier releases both threads, so across 50 iterations both
-        // "correct commits first" and "correct commits last" orderings
-        // actually occur — not just whichever the OS scheduler happens
-        // to prefer every time.
+        // Alternate which thread gets a short post-barrier delay (so it
+        // likely commits SECOND), so across 50 iterations both "stale
+        // commits first" and "stale commits last" orderings actually
+        // occur — not just whichever the OS scheduler happens to prefer
+        // every time. `delay_the_correct_thread = true` means the
+        // correct reading is delayed and so likely commits last; `false`
+        // means the stale reading is delayed and so likely commits last
+        // instead — the ordering the original bug lived in.
         let delay_the_correct_thread = iteration % 2 == 0;
 
         let correct_path = path.clone();
