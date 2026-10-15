@@ -707,6 +707,15 @@ fn settled_spend_at_or_past_the_hard_limit_reports_exhausted() {
             OffsetDateTime::now_utc(),
         )
         .unwrap();
+    // The actual transition HORO-1884 asked for: a `Status` read showing
+    // `Remaining` before the settlement that exhausts the envelope, not
+    // just the terminal `Exhausted` state in isolation.
+    assert_eq!(
+        harness.status().task_budget,
+        Some(BudgetPosture::Remaining { fraction_left: 1.0 }),
+        "precondition: before any draw, the envelope must report Remaining"
+    );
+
     let hold = match harness
         .ledger
         .reserve(ReserveRequest {
@@ -756,10 +765,12 @@ fn settled_spend_at_or_past_the_hard_limit_reports_exhausted() {
         .available(preflight.task_id, ReservationClass::RequiredWork)
         .unwrap()
         .unwrap();
-    assert!(
-        headroom.value <= 0.0,
-        "precondition: settled spend at the hard limit must leave no headroom, got {}",
-        headroom.value
+    assert_eq!(
+        headroom.value, 0.0,
+        "precondition: settling exactly at the hard limit, with the plan's own \
+         work-envelope hold already released, must leave exactly zero headroom \
+         — not merely non-positive — pinning this as the exact-boundary case \
+         rather than an arbitrary overrun past it"
     );
 
     assert_eq!(
