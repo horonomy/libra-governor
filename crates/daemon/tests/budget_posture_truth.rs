@@ -663,6 +663,124 @@ fn the_share_is_recomputed_per_request_rather_than_cached() {
     );
 }
 
+// --- HORO-1884: the Exhausted posture, end-to-end through Status -------
+
+#[test]
+fn settled_spend_at_or_past_the_hard_limit_reports_exhausted() {
+    // The companion to `a_task_with_no_reservation_reports_uncommitted_
+    // rather_than_a_full_envelope` above: this file already drives
+    // `Uncommitted` end-to-end through a real `Status` reply, but had no
+    // equivalent for `Exhausted` — `from_snapshot`'s other non-`Remaining`
+    // branch was only covered by hand-built `BudgetSnapshot`s in
+    // `crates/protocol/src/messages.rs`'s unit tests, which cannot catch a
+    // daemon that derives the wrong posture from a real ledger (the same
+    // gap this whole file exists to close for `Uncommitted` — see the
+    // module docs above). HORO-1884 flagged this as the one BudgetPosture
+    // transition a real native Codex run had not yet observed; this closes
+    // it without needing one, since `BudgetPosture::Exhausted` is a pure
+    // function of settled+active vs. the hard limit, not of what produced
+    // that settlement.
+    //
+    // Reaching it needs no reservation that itself exceeds headroom
+    // (`reserve` refuses that outright, `ReserveOutcome::Insufficient`) —
+    // `settle`'s own `actual` cost is never clamped to the held amount
+    // (see `LedgerStore::settle`'s docs: an overrun is recorded, never
+    // dropped), so a modest hold settled at the task's full hard limit
+    // reaches "settled >= hard_limit" the same way a real overrunning task
+    // would.
+    let mut harness = Harness::new(admitting_policy());
+    let preflight = harness.preflight("exhausted-session");
+    let budget = harness
+        .ledger
+        .task_budget(preflight.task_id)
+        .unwrap()
+        .unwrap();
+
+    // Release the plan's own work-envelope hold first (as the zero-cost
+    // test above does), so the only reservation left is the one this test
+    // settles, and the overrun is attributable to exactly one event.
+    harness
+        .ledger
+        .release_active_for_plan(
+            preflight.task_id,
+            preflight.plan_id,
+            OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+    // The actual transition HORO-1884 asked for: a `Status` read showing
+    // `Remaining` before the settlement that exhausts the envelope, not
+    // just the terminal `Exhausted` state in isolation.
+    assert_eq!(
+        harness.status().task_budget,
+        Some(BudgetPosture::Remaining { fraction_left: 1.0 }),
+        "precondition: before any draw, the envelope must report Remaining"
+    );
+
+    let hold = match harness
+        .ledger
+        .reserve(ReserveRequest {
+            task_id: preflight.task_id,
+            session_id: "exhausted-session",
+            plan_id: None,
+            class: ReservationClass::RequiredWork,
+            amount: ResourceAmount::from_kind_f64(
+                budget.resource_kind,
+                budget.hard_limit.as_f64() / 8.0,
+            ),
+            idempotency_key: "budget-truth-exhausted-hold",
+            now: OffsetDateTime::now_utc(),
+            ttl_secs: 900,
+        })
+        .unwrap()
+    {
+        ReserveOutcome::Granted(reservation) => *reservation,
+        other => panic!("precondition: the hold must be granted, got {other:?}"),
+    };
+
+    let outcome = harness
+        .ledger
+        .settle(
+            hold.id,
+            Some(ResourceAmount::from_kind_f64(
+                budget.resource_kind,
+                budget.hard_limit.as_f64(),
+            )),
+            OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            libra_governor_ledger::SettleOutcome::Settled {
+                overrun: Some(_),
+                ..
+            }
+        ),
+        "precondition: settling at the full hard limit against a fraction-sized \
+         hold must record a real overrun, got {outcome:?}"
+    );
+
+    let headroom = harness
+        .ledger
+        .available(preflight.task_id, ReservationClass::RequiredWork)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        headroom.value, 0.0,
+        "precondition: settling exactly at the hard limit, with the plan's own \
+         work-envelope hold already released, must leave exactly zero headroom \
+         — not merely non-positive — pinning this as the exact-boundary case \
+         rather than an arbitrary overrun past it"
+    );
+
+    assert_eq!(
+        harness.status().task_budget,
+        Some(BudgetPosture::Exhausted),
+        "settled spend at or past the hard limit must report Exhausted \
+         through the same Status path a real overrunning task would use"
+    );
+}
+
 #[test]
 fn reopening_the_ledger_does_not_reset_the_share() {
     // §10/§12's restart case, at the layer that owns the fact: the share
