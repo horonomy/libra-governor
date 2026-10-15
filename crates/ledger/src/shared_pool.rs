@@ -927,6 +927,52 @@ impl LedgerStore {
     /// accumulated/summed as spend). A duplicate/replayed ingest of the
     /// same reading is a safe no-op in effect, not just in intent — the
     /// upsert overwrites with the same values.
+    ///
+    /// # Ordering (HORO-1880)
+    ///
+    /// Only replaces the stored row when the new row's `observed_at` is
+    /// at least as recent as the stored row's `observed_at`, or no row is
+    /// stored yet. A delivery that arrives later in wall-clock time but
+    /// carries a strictly OLDER `observed_at` than what is already stored
+    /// (a reordered/retried provider poll) is a safe no-op instead of an
+    /// overwrite — without this check, such a stale reading could
+    /// silently replace a newer, more-restrictive reading and reopen
+    /// capacity that is still really spent externally. On an exact tie
+    /// (`observed_at` equal to the stored value) the new row wins — the
+    /// same last-write-wins discipline
+    /// `overlapping_provider_snapshots_reflect_only_the_latest_value_never_summed`
+    /// (in `tests/shared_pool_adversarial.rs`) already exercises for
+    /// same-instant re-ingests, and the only sensible tie-break since
+    /// neither reading can be shown to be "more current" than the other.
+    ///
+    /// Comparing as parsed `OffsetDateTime` values rather than RFC3339
+    /// strings sidesteps the same parser-differential risk
+    /// `settled_before_tx`'s own docs describe: the `time` crate's
+    /// Rfc3339 formatter omits a zero fractional-second component, so two
+    /// timestamps sharing a whole second but differing in fractional
+    /// precision do not always sort the same lexically as chronologically.
+    ///
+    /// `observed_at` strictly after `now` is rejected outright (`Err`),
+    /// never stored — zero tolerance, matching the exact precedent
+    /// `quota-source::provenance::AcquiredReading::validated` already
+    /// sets at the acquisition boundary (`snapshot.observed_at() > now`
+    /// => `AcquisitionError::FutureObservedAt`, no skew allowance): any
+    /// reading that reaches this method through that boundary already
+    /// satisfies `observed_at <= now`, so this guard can never reject
+    /// anything the boundary accepted. Keep this in sync with
+    /// `AcquiredReading::validated` — if that check ever grows a skew
+    /// tolerance, this one must too, or a reading the boundary accepts
+    /// would start being rejected here. This method has no live caller
+    /// today (verified by `rg ingest_pool_provider_snapshot`), so it
+    /// cannot assume every caller will route through that boundary
+    /// first; without its own guard, a single future-dated `observed_at`
+    /// (provider clock skew, a seconds/milliseconds unit bug, a malformed
+    /// timestamp) would permanently win every ordering comparison above:
+    /// every subsequent *correct* reading has an older `observed_at` and
+    /// would be silently rejected as "stale" forever, and once the
+    /// poisoned row's own `valid_until` passes, `external_overhang_tx`
+    /// returns 0 — a permanent, silent fail-open exactly as serious as
+    /// the bug this ticket fixes.
     pub fn ingest_pool_provider_snapshot(
         &mut self,
         pool_id: &PoolId,
@@ -936,6 +982,9 @@ impl LedgerStore {
         confidence: Confidence,
         now: OffsetDateTime,
     ) -> Result<(), LedgerError> {
+        if observed_at > now {
+            return Err(invalid());
+        }
         let (disclosed, used_value, declared_limit) = match reading {
             GaugeReading::Undisclosed => (false, None, None),
             GaugeReading::Used { used, limit } => (
@@ -948,6 +997,24 @@ impl LedgerStore {
             LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
         })?;
         let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
+
+        let existing_observed_at: Option<String> = tx
+            .query_row(
+                "SELECT observed_at FROM shared_pool_provider_snapshots WHERE pool_id = ?1",
+                [&pool_id.0],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing_observed_at) = existing_observed_at {
+            if observed_at < parse_time(&existing_observed_at)? {
+                // Stale, out-of-order delivery: strictly predates the row
+                // already stored. Never overwrite — see this method's own
+                // docs for why.
+                tx.commit()?;
+                return Ok(());
+            }
+        }
+
         tx.execute(
             "INSERT INTO shared_pool_provider_snapshots (
                 pool_id, observed_at, valid_until, disclosed, used_value, declared_limit,

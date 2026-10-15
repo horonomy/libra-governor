@@ -49,11 +49,11 @@
 //! AC4 itself. The one new regression test this PR *does* add elsewhere
 //! (`crates/ledger/tests/shared_pool_adversarial.rs`'s
 //! `stale_out_of_order_snapshot_incorrectly_overwrites_a_newer_more_restrictive_reading`,
-//! `#[ignore]`d, HORO-1880) is a DIFFERENT, PR-B-session-discovered
-//! finding — a stale-but-well-formed snapshot silently overwriting a
-//! newer one via unconditional upsert — distinct from AC4's "invalid/
-//! corrupted snapshot" sub-case (which is about malformed/schema-invalid
-//! data, already covered above).
+//! HORO-1880, originally `#[ignore]`d and now fixed/unignored) is a
+//! DIFFERENT, PR-B-session-discovered finding — a stale-but-well-formed
+//! snapshot silently overwriting a newer one via unconditional upsert —
+//! distinct from AC4's "invalid/corrupted snapshot" sub-case (which is
+//! about malformed/schema-invalid data, already covered above).
 //!
 //! [`verify`] computes every AC1 metric **structurally**, from
 //! [`crate::world::World`]'s timestamped, ground-truth event log
