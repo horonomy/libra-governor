@@ -1134,14 +1134,24 @@ fn future_dated_observed_at_is_rejected_outright_not_stored_as_a_sticky_poison_r
     assert_eq!(admission.remaining(), 1);
 }
 
-/// A real multi-thread, multi-connection race stress-checking that the
-/// read-compare-write ordering check stays serialized by the existing
-/// `TransactionBehavior::Immediate` write lock, not just correct when run
-/// sequentially: many iterations, each spawning two threads against a
-/// fresh on-disk store — one ingesting the correct, newer-`observed_at`
-/// reading, the other ingesting a stale, older-`observed_at` reading —
-/// with a `Barrier` so both threads actually race to ingest at the same
-/// instant.
+/// A real multi-thread, multi-connection race stress-checking that
+/// write-write ordering between two concurrent ingests stays serialized
+/// by the existing `TransactionBehavior::Immediate` write lock, not just
+/// correct when run sequentially: many iterations, each spawning two
+/// threads against a fresh on-disk store — one ingesting the correct,
+/// newer-`observed_at` reading, the other ingesting a stale,
+/// older-`observed_at` reading — with a `Barrier` so both threads
+/// actually race to ingest at the same instant.
+///
+/// This exercises commit ordering, not the read-compare-write window in
+/// isolation: the post-barrier sleep below delays a thread's entire
+/// `ingest_pool_provider_snapshot` call, not just the gap between its
+/// read and its write, so this test cannot by itself distinguish "the
+/// read-compare-write is atomic" from "whichever thread's whole call
+/// starts first wins" — it only proves the two commits are serialized
+/// and the later-`observed_at` one always wins, which is what the
+/// shipped code's correctness actually depends on (its read and write
+/// share one transaction).
 ///
 /// A bare `Barrier` alone is not enough to discriminate the bug: both
 /// threads are released by the barrier at the same instant, so which
