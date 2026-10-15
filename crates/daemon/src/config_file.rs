@@ -350,13 +350,27 @@ fn resolve_policy(raw: RawPolicyConfig) -> Result<Policy, ConfigFileError> {
             "required verification (tests/build/lint) passes",
         )]),
     };
-    preset_by_name(&raw.preset, inputs).map_err(|err| match err {
+    let preset = raw.preset.clone();
+    let policy = preset_by_name(&raw.preset, inputs).map_err(|err| match err {
         PresetError::UnknownPreset { name, .. } => ConfigFileError::UnknownPreset { preset: name },
         PresetError::Invalid(source) => ConfigFileError::InvalidPolicy {
-            preset: raw.preset.clone(),
+            preset: preset.clone(),
             source,
         },
-    })
+    })?;
+    // Attach the same default turn-scoped ceiling (HORO-1727 Decision B)
+    // every `config.json` user gets, same as
+    // `crates/daemon::default_admission_policy` — see
+    // `crate::server::default_turn_bound` for the derivation. Can never
+    // fail in practice: the default turn bound's amounts are
+    // `ResourceAmount::Tokens`, matching every named preset's own
+    // `resource_target` kind here (`RawPolicyConfig::resource_target_tokens`
+    // has no other representable kind), and `ceiling >=
+    // cold_start_request` is a fixed invariant of the constants
+    // themselves.
+    policy
+        .with_turn_bound(crate::server::default_turn_bound())
+        .map_err(|source| ConfigFileError::InvalidPolicy { preset, source })
 }
 
 fn resolve_gateway(raw: RawGatewayConfig) -> Result<GatewayConfig, ConfigFileError> {
