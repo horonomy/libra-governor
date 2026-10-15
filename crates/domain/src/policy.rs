@@ -152,6 +152,53 @@ pub struct RenewalBound {
     pub max_renewals: u32,
 }
 
+/// A turn-scoped resource ceiling, separate from and additive to the
+/// task's own lifetime [`ResourceBound`] (HORO-1727 Decision B).
+///
+/// # Why a second, separate bound rather than reshaping the lifetime one
+///
+/// The lifetime `ResourceBound` enforces `used() + reserved() + requested
+/// <= hard_limit` over a task's *whole life*, frozen into a reservation at
+/// first preflight and separately re-enforced by the gateway (ADR-0003).
+/// That promise is load-bearing for other callers and is explicitly out
+/// of scope to weaken here. A single real Claude Code turn (one
+/// Stop-to-Stop receipt window) can still blow through a sane *per-turn*
+/// amount while the task's lifetime envelope has plenty of room left —
+/// nothing in the lifetime check catches that, because it only ever sees
+/// the running total. `TurnBound` is a second, independent gate checked
+/// only at preflight against this one turn's own projected request, never
+/// against committed lifetime spend.
+///
+/// # Fields
+///
+/// `cold_start_request` is what [`Policy::turn_fallback_request`] returns
+/// in place of `resource.target` when no local estimate history exists
+/// yet (mirrors `resource.target`'s own role as the policy's one
+/// always-available resource figure). `ceiling` is the hard limit this
+/// turn's own projected request may never exceed — see
+/// [`Policy::evaluate_turn`]. There is deliberately no elastic band and no
+/// `ApprovalRequired` outcome: a turn either fits under the ceiling or it
+/// does not, because by the time a single turn is projected to exceed a
+/// sane per-turn ceiling, the real problem (an unbounded loop, a runaway
+/// tool-call chain) is not one more unit of pre-authorized spend would
+/// fix — see `docs/adr/0021-turn-scoped-resource-ceiling.md` for why a
+/// ceiling that reuses the per-class p80 estimate was rejected (it could
+/// never produce a `Deny` at all).
+///
+/// Both amounts must share [`ResourceBound::target`]'s own
+/// [`ResourceKind`] — validated by [`Policy::with_turn_bound`]
+/// ([`PolicyValidationError::TurnColdStartKindMismatch`],
+/// [`PolicyValidationError::TurnCeilingKindMismatch`]) — and `ceiling`
+/// must be `>= cold_start_request`
+/// ([`PolicyValidationError::TurnCeilingBelowColdStartRequest`]): a cold
+/// start that could never itself be admitted would make every
+/// never-before-seen task's very first preflight a guaranteed `Deny`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TurnBound {
+    pub cold_start_request: ResourceAmount,
+    pub ceiling: ResourceAmount,
+}
+
 /// The pre-authorized wall-clock envelope for a policy (HORO-1137).
 ///
 /// `hard_ceiling_secs` is optional (unlike [`ResourceBound::hard_ceiling`]):
@@ -243,6 +290,18 @@ pub struct Policy {
     /// default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub renewal: Option<RenewalBound>,
+    /// The optional turn-scoped ceiling (HORO-1727 Decision B) — see
+    /// [`TurnBound`] docs for why this is a second, separate gate rather
+    /// than a reshaping of [`Self::resource`]. `None` — the default, and
+    /// the value every existing `Policy` gets via `#[serde(default)]` for
+    /// any `policy_json` serialized before this field existed — disables
+    /// the turn check entirely: [`Policy::evaluate_turn`] always returns
+    /// [`ConstraintOutcome::Admit`] and [`Self::turn_fallback_request`]
+    /// falls back to [`ResourceBound::target`], both byte-identical to
+    /// this policy's pre-HORO-1727 behavior. Attach one via
+    /// [`Self::with_turn_bound`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<TurnBound>,
 }
 
 /// Why a candidate [`Policy`] configuration was rejected (HORO-1137).
@@ -337,6 +396,35 @@ pub enum PolicyValidationError {
         "renewal is not supported for resource kind {kind:?} (QuotaPercent saturates at 100.0)"
     )]
     RenewalUnsupportedForResourceKind { kind: ResourceKind },
+    /// (HORO-1727 Decision B.) `TurnBound::cold_start_request`'s
+    /// [`ResourceKind`] does not match the policy's own resource kind.
+    #[error(
+        "turn bound cold_start_request kind {cold_start_kind:?} does not match resource kind \
+         {resource_kind:?}"
+    )]
+    TurnColdStartKindMismatch {
+        resource_kind: ResourceKind,
+        cold_start_kind: ResourceKind,
+    },
+    /// (HORO-1727 Decision B.) `TurnBound::ceiling`'s [`ResourceKind`]
+    /// does not match the policy's own resource kind.
+    #[error(
+        "turn bound ceiling kind {ceiling_kind:?} does not match resource kind {resource_kind:?}"
+    )]
+    TurnCeilingKindMismatch {
+        resource_kind: ResourceKind,
+        ceiling_kind: ResourceKind,
+    },
+    /// (HORO-1727 Decision B.) A `ceiling` below `cold_start_request`
+    /// would make a never-before-seen task's very first preflight a
+    /// guaranteed `Deny` — see [`TurnBound`] docs.
+    #[error(
+        "turn bound ceiling {ceiling:?} is below its own cold_start_request {cold_start_request:?}"
+    )]
+    TurnCeilingBelowColdStartRequest {
+        cold_start_request: ResourceAmount,
+        ceiling: ResourceAmount,
+    },
 }
 
 impl Policy {
@@ -390,6 +478,7 @@ impl Policy {
             min_confidence,
             autonomy,
             renewal: None,
+            turn: None,
         })
     }
 
@@ -436,6 +525,62 @@ impl Policy {
             );
         }
         Ok(())
+    }
+
+    /// Attaches a [`TurnBound`] to an already-validated policy (HORO-1727
+    /// Decision B), opt-in and separate from [`Self::validated`]/
+    /// [`Self::validated_at`] so every existing construction call site
+    /// (including every preset) is unaffected and keeps `turn: None`
+    /// unless it explicitly calls this.
+    pub fn with_turn_bound(mut self, turn: TurnBound) -> Result<Self, PolicyValidationError> {
+        Self::validate_turn(&self.resource, &turn)?;
+        self.turn = Some(turn);
+        Ok(self)
+    }
+
+    /// Validates a candidate [`TurnBound`] against the policy's own
+    /// [`ResourceBound`]: both of `turn`'s amounts share
+    /// [`ResourceBound::target`]'s [`ResourceKind`], and `ceiling >=
+    /// cold_start_request`.
+    fn validate_turn(
+        resource: &ResourceBound,
+        turn: &TurnBound,
+    ) -> Result<(), PolicyValidationError> {
+        let resource_kind = resource.target.kind();
+        let cold_start_kind = turn.cold_start_request.kind();
+        if cold_start_kind != resource_kind {
+            return Err(PolicyValidationError::TurnColdStartKindMismatch {
+                resource_kind,
+                cold_start_kind,
+            });
+        }
+        let ceiling_kind = turn.ceiling.kind();
+        if ceiling_kind != resource_kind {
+            return Err(PolicyValidationError::TurnCeilingKindMismatch {
+                resource_kind,
+                ceiling_kind,
+            });
+        }
+        if turn.ceiling.as_f64() < turn.cold_start_request.as_f64() {
+            return Err(PolicyValidationError::TurnCeilingBelowColdStartRequest {
+                cold_start_request: turn.cold_start_request,
+                ceiling: turn.ceiling,
+            });
+        }
+        Ok(())
+    }
+
+    /// The per-turn amount to request in place of a real estimate quantile
+    /// when none is available yet (HORO-1727 Decision B) — the turn-scoped
+    /// analogue of [`ResourceBound::target`]'s own "always-available
+    /// figure" role. Returns [`TurnBound::cold_start_request`] when a turn
+    /// bound is configured, else falls back to [`ResourceBound::target`] —
+    /// byte-identical to every call site's pre-HORO-1727 behavior when
+    /// `self.turn` is `None`.
+    pub fn turn_fallback_request(&self) -> ResourceAmount {
+        self.turn
+            .map(|t| t.cold_start_request)
+            .unwrap_or(self.resource.target)
     }
 
     fn validate_resource(resource: &ResourceBound) -> Result<(), PolicyValidationError> {
@@ -653,6 +798,15 @@ pub enum DenyReason {
     /// regression test, which pins that old serialized `admission_json`
     /// rows (predating this variant) still deserialize.
     ExternalPolicyRejected { provider_id: String, reason: String },
+    /// This turn's own projected request exceeded the policy's
+    /// [`TurnBound::ceiling`] (HORO-1727 Decision B). Additive variant,
+    /// same deserialization-compatibility discipline as
+    /// [`Self::ExternalPolicyRejected`] — see
+    /// `resource_exceeds_turn_ceiling_is_additive_and_old_deny_reason_json_still_deserializes`.
+    ResourceExceedsTurnCeiling {
+        projected: ResourceAmount,
+        turn_ceiling: ResourceAmount,
+    },
 }
 
 /// The aggregate admission verdict across every constraint (HORO-1137).
@@ -686,6 +840,19 @@ pub struct PolicyDecision {
     /// [`Policy::evaluate`] docs for why this can never be a trimmed
     /// subset.
     pub protected_criteria: Vec<CompletionCriterion>,
+    /// The outcome of the turn-scoped ceiling check (HORO-1727 Decision
+    /// B), if any — `None` when the policy carries no [`TurnBound`]
+    /// (`Policy::turn: None`), which is every policy before this field
+    /// existed and every policy that never opts in via
+    /// [`Policy::with_turn_bound`]. `#[serde(default)]` so a
+    /// `PolicyDecision` serialized before this field existed still
+    /// deserializes. Folded into [`Self::admission`] by
+    /// [`Self::with_turn_outcome`] — this field is the raw per-constraint
+    /// outcome (mirroring [`Self::resource_outcome`]/
+    /// [`Self::time_outcome`]), kept for rendering/explain surfaces that
+    /// want to show the turn check on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_outcome: Option<ConstraintOutcome>,
 }
 
 impl Policy {
@@ -754,6 +921,7 @@ impl Policy {
             time_outcome,
             confidence_ok,
             protected_criteria: self.quality_floor.required_criteria().cloned().collect(),
+            turn_outcome: None,
         })
     }
 
@@ -906,6 +1074,72 @@ impl Policy {
             }
         };
         Ok(outcome)
+    }
+
+    /// Evaluates the turn-scoped ceiling alone (HORO-1727 Decision B),
+    /// independent of the lifetime resource/time/confidence check —
+    /// `projected_turn` must be THIS turn's own projected request, never
+    /// committed lifetime spend (see `crates/daemon/src/server.rs`'s
+    /// `requested` local — not `projected`, which adds committed spend on
+    /// top).
+    ///
+    /// `Admit` when no [`TurnBound`] is configured at all (`self.turn ==
+    /// None`) — the turn check is fully opt-in. There is no elastic band
+    /// and no [`ConstraintOutcome::ApprovalRequired`] here — see
+    /// [`TurnBound`] docs for why.
+    pub fn evaluate_turn(
+        &self,
+        projected_turn: ResourceAmount,
+    ) -> Result<ConstraintOutcome, PolicyEvaluationError> {
+        let Some(turn) = self.turn else {
+            return Ok(ConstraintOutcome::Admit);
+        };
+        let turn_kind = turn.ceiling.kind();
+        if projected_turn.kind() != turn_kind {
+            return Err(PolicyEvaluationError::ProjectedResourceKindMismatch {
+                policy_kind: turn_kind,
+                projected_kind: projected_turn.kind(),
+            });
+        }
+        if projected_turn.as_f64() > turn.ceiling.as_f64() {
+            Ok(ConstraintOutcome::Deny(
+                DenyReason::ResourceExceedsTurnCeiling {
+                    projected: projected_turn,
+                    turn_ceiling: turn.ceiling,
+                },
+            ))
+        } else {
+            Ok(ConstraintOutcome::Admit)
+        }
+    }
+}
+
+impl PolicyDecision {
+    /// Folds a turn-scoped [`ConstraintOutcome`] (from
+    /// [`Policy::evaluate_turn`]) into this already-computed decision
+    /// (HORO-1727 Decision B).
+    ///
+    /// A turn `Deny` always wins: it turns an `Admit` or
+    /// `ApprovalRequired` admission into `Deny`, and appends its reason
+    /// onto an existing `Deny` rather than replacing it (so the lifetime
+    /// check's own reasons are never silently dropped). A turn `Admit`
+    /// leaves `self.admission` completely untouched — it can never
+    /// upgrade an existing `ApprovalRequired`/`Deny` into `Admit`. There is
+    /// no `ApprovalRequired` turn outcome to fold (see [`TurnBound`] docs).
+    /// [`Self::turn_outcome`] is set to `Some(outcome)` unconditionally, so
+    /// a rendering surface can always show what the turn check itself
+    /// decided, independent of how it was folded.
+    pub fn with_turn_outcome(mut self, outcome: ConstraintOutcome) -> Self {
+        if let ConstraintOutcome::Deny(ref reason) = outcome {
+            match &mut self.admission {
+                Admission::Deny(reasons) => reasons.push(reason.clone()),
+                Admission::Admit | Admission::ApprovalRequired(_) => {
+                    self.admission = Admission::Deny(vec![reason.clone()]);
+                }
+            }
+        }
+        self.turn_outcome = Some(outcome);
+        self
     }
 }
 
@@ -1604,6 +1838,7 @@ mod tests {
                 min_confidence: Confidence::Low,
                 autonomy: AutonomyBoundary::AskOnApproval,
                 renewal: None,
+                turn: None,
             },
             "balanced must compile to exactly this concrete Policy value, no hidden logic"
         );
@@ -2269,5 +2504,427 @@ mod tests {
                 max_renewals: 3,
             })
         );
+    }
+
+    // -- HORO-1727 Decision B: turn-scoped resource ceiling --------------
+
+    /// A realistic turn-scoped policy, at the actual magnitude the real
+    /// default ships at (not a token-sized toy): cold-start request
+    /// 120,000, ceiling 400,000, on top of a resource target large enough
+    /// that the lifetime check never interferes with what these tests are
+    /// about.
+    fn turn_scoped_policy() -> Policy {
+        Policy::validated(
+            "test-turn-scoped",
+            ResourceBound {
+                mode: ConstraintMode::Hard,
+                target: ResourceAmount::Tokens(1_000_000),
+                elastic_ceiling: None,
+                hard_ceiling: ResourceAmount::Tokens(1_000_000),
+            },
+            TimeBound {
+                mode: ConstraintMode::Hard,
+                target_secs: 3600,
+                elastic_ceiling_secs: None,
+                hard_ceiling_secs: Some(3600),
+                deadline: None,
+            },
+            quality_floor(),
+            Confidence::Low,
+            AutonomyBoundary::AskOnApproval,
+        )
+        .expect("valid policy")
+        .with_turn_bound(TurnBound {
+            cold_start_request: ResourceAmount::Tokens(120_000),
+            ceiling: ResourceAmount::Tokens(400_000),
+        })
+        .expect("valid turn bound")
+    }
+
+    #[test]
+    fn no_turn_bound_configured_evaluate_turn_always_admits() {
+        // `Policy::turn: None` — every policy before this ticket, and
+        // every policy that never opts in — must behave exactly as
+        // before: the turn check is fully opt-in.
+        let policy = hard_resource_policy();
+        assert!(policy.turn.is_none());
+        let outcome = policy
+            .evaluate_turn(ResourceAmount::UsdCents(1_000_000_000))
+            .expect("compatible kind");
+        assert_eq!(outcome, ConstraintOutcome::Admit);
+    }
+
+    #[test]
+    fn no_turn_bound_configured_turn_fallback_request_is_resource_target() {
+        let policy = hard_resource_policy();
+        assert_eq!(policy.turn_fallback_request(), policy.resource.target);
+    }
+
+    #[test]
+    fn turn_fallback_request_prefers_cold_start_request_when_configured() {
+        let policy = turn_scoped_policy();
+        assert_eq!(
+            policy.turn_fallback_request(),
+            ResourceAmount::Tokens(120_000)
+        );
+        assert_ne!(policy.turn_fallback_request(), policy.resource.target);
+    }
+
+    /// AC5 (cold-start): with no estimate history, a fresh task's
+    /// `requested` figure is `turn_fallback_request()` —
+    /// `cold_start_request` — and that figure admits under the turn
+    /// ceiling.
+    #[test]
+    fn ac5_cold_start_request_admits_under_the_turn_ceiling() {
+        let policy = turn_scoped_policy();
+        let cold_start_requested = policy.turn_fallback_request();
+        let outcome = policy
+            .evaluate_turn(cold_start_requested)
+            .expect("compatible kind");
+        assert_eq!(
+            outcome,
+            ConstraintOutcome::Admit,
+            "a cold-start task's very first preflight must admit under the turn ceiling"
+        );
+    }
+
+    /// AC3: a task whose measured per-turn history sits at the documented
+    /// p80 (120,700 fresh tokens, per docs/adr/0021) is admitted.
+    #[test]
+    fn ac3_a_measured_p80_projection_admits_under_the_turn_ceiling() {
+        let policy = turn_scoped_policy();
+        let measured_p80 = ResourceAmount::Tokens(120_700);
+        let outcome = policy.evaluate_turn(measured_p80).expect("compatible kind");
+        assert_eq!(outcome, ConstraintOutcome::Admit);
+    }
+
+    /// AC4: a projection that genuinely exceeds the ceiling denies, with
+    /// an exact boundary: the ceiling itself still admits, one unit past
+    /// it denies.
+    #[test]
+    fn ac4_boundary_exactly_at_ceiling_admits_one_past_denies() {
+        let policy = turn_scoped_policy();
+
+        let at_ceiling = policy
+            .evaluate_turn(ResourceAmount::Tokens(400_000))
+            .expect("compatible kind");
+        assert_eq!(
+            at_ceiling,
+            ConstraintOutcome::Admit,
+            "the ceiling itself is still admitted, not denied"
+        );
+
+        let one_past = policy
+            .evaluate_turn(ResourceAmount::Tokens(400_001))
+            .expect("compatible kind");
+        assert_eq!(
+            one_past,
+            ConstraintOutcome::Deny(DenyReason::ResourceExceedsTurnCeiling {
+                projected: ResourceAmount::Tokens(400_001),
+                turn_ceiling: ResourceAmount::Tokens(400_000),
+            })
+        );
+
+        let far_past = policy
+            .evaluate_turn(ResourceAmount::Tokens(5_000_000))
+            .expect("compatible kind");
+        assert!(matches!(
+            far_past,
+            ConstraintOutcome::Deny(DenyReason::ResourceExceedsTurnCeiling { .. })
+        ));
+    }
+
+    #[test]
+    fn evaluate_turn_rejects_mismatched_resource_kind() {
+        let policy = turn_scoped_policy();
+        let err = policy
+            .evaluate_turn(ResourceAmount::UsdCents(1))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            PolicyEvaluationError::ProjectedResourceKindMismatch {
+                policy_kind: ResourceKind::Tokens,
+                projected_kind: ResourceKind::Usd,
+            }
+        );
+    }
+
+    #[test]
+    fn with_turn_bound_rejects_cold_start_kind_mismatch() {
+        let policy = hard_resource_policy();
+        let err = policy
+            .with_turn_bound(TurnBound {
+                cold_start_request: ResourceAmount::Tokens(1_000),
+                ceiling: ResourceAmount::UsdCents(2_000),
+            })
+            .unwrap_err();
+        assert_eq!(
+            err,
+            PolicyValidationError::TurnColdStartKindMismatch {
+                resource_kind: ResourceKind::Usd,
+                cold_start_kind: ResourceKind::Tokens,
+            }
+        );
+    }
+
+    #[test]
+    fn with_turn_bound_rejects_ceiling_kind_mismatch() {
+        let policy = hard_resource_policy();
+        let err = policy
+            .with_turn_bound(TurnBound {
+                cold_start_request: ResourceAmount::UsdCents(500),
+                ceiling: ResourceAmount::Tokens(2_000),
+            })
+            .unwrap_err();
+        assert_eq!(
+            err,
+            PolicyValidationError::TurnCeilingKindMismatch {
+                resource_kind: ResourceKind::Usd,
+                ceiling_kind: ResourceKind::Tokens,
+            }
+        );
+    }
+
+    #[test]
+    fn with_turn_bound_rejects_ceiling_below_cold_start_request() {
+        let policy = hard_resource_policy();
+        let err = policy
+            .with_turn_bound(TurnBound {
+                cold_start_request: ResourceAmount::UsdCents(2_000),
+                ceiling: ResourceAmount::UsdCents(1_000),
+            })
+            .unwrap_err();
+        assert_eq!(
+            err,
+            PolicyValidationError::TurnCeilingBelowColdStartRequest {
+                cold_start_request: ResourceAmount::UsdCents(2_000),
+                ceiling: ResourceAmount::UsdCents(1_000),
+            }
+        );
+    }
+
+    #[test]
+    fn with_turn_bound_accepts_ceiling_equal_to_cold_start_request() {
+        // No band requirement here, unlike the lifetime elastic bound:
+        // ceiling == cold_start_request is a valid (if maximally strict)
+        // turn bound.
+        let policy = hard_resource_policy()
+            .with_turn_bound(TurnBound {
+                cold_start_request: ResourceAmount::UsdCents(1_000),
+                ceiling: ResourceAmount::UsdCents(1_000),
+            })
+            .expect("ceiling == cold_start_request must be accepted");
+        assert_eq!(
+            policy.turn,
+            Some(TurnBound {
+                cold_start_request: ResourceAmount::UsdCents(1_000),
+                ceiling: ResourceAmount::UsdCents(1_000),
+            })
+        );
+    }
+
+    // -- fold logic: PolicyDecision::with_turn_outcome --------------------
+
+    #[test]
+    fn fold_turn_deny_wins_over_lifetime_admit() {
+        let policy = hard_resource_policy();
+        let decision = policy
+            .evaluate(ResourceAmount::UsdCents(1), 1, Confidence::Medium)
+            .expect("compatible kind");
+        assert_eq!(decision.admission, Admission::Admit);
+
+        let turn_deny = ConstraintOutcome::Deny(DenyReason::ResourceExceedsTurnCeiling {
+            projected: ResourceAmount::UsdCents(999_999),
+            turn_ceiling: ResourceAmount::UsdCents(1_000),
+        });
+        let folded = decision.with_turn_outcome(turn_deny.clone());
+        assert_eq!(
+            folded.admission,
+            Admission::Deny(vec![DenyReason::ResourceExceedsTurnCeiling {
+                projected: ResourceAmount::UsdCents(999_999),
+                turn_ceiling: ResourceAmount::UsdCents(1_000),
+            }])
+        );
+        assert_eq!(folded.turn_outcome, Some(turn_deny));
+    }
+
+    #[test]
+    fn fold_turn_deny_wins_over_lifetime_approval_required() {
+        let policy = elastic_resource_policy();
+        let decision = policy
+            .evaluate(ResourceAmount::UsdCents(1501), 901, Confidence::Medium)
+            .expect("compatible kind");
+        assert!(matches!(decision.admission, Admission::ApprovalRequired(_)));
+
+        let turn_deny_reason = DenyReason::ResourceExceedsTurnCeiling {
+            projected: ResourceAmount::UsdCents(50_000),
+            turn_ceiling: ResourceAmount::UsdCents(10_000),
+        };
+        let folded = decision.with_turn_outcome(ConstraintOutcome::Deny(turn_deny_reason.clone()));
+        assert_eq!(folded.admission, Admission::Deny(vec![turn_deny_reason]));
+    }
+
+    #[test]
+    fn fold_turn_deny_appends_onto_an_existing_lifetime_deny_rather_than_replacing_it() {
+        let policy = hard_resource_policy();
+        let decision = policy
+            .evaluate(ResourceAmount::UsdCents(1001), 601, Confidence::Medium)
+            .expect("compatible kind");
+        let lifetime_reasons = match &decision.admission {
+            Admission::Deny(reasons) => reasons.clone(),
+            other => panic!("expected Deny, got {other:?}"),
+        };
+        assert_eq!(lifetime_reasons.len(), 2, "resource and time both denied");
+
+        let turn_deny_reason = DenyReason::ResourceExceedsTurnCeiling {
+            projected: ResourceAmount::UsdCents(50_000),
+            turn_ceiling: ResourceAmount::UsdCents(10_000),
+        };
+        let folded = decision.with_turn_outcome(ConstraintOutcome::Deny(turn_deny_reason.clone()));
+        match folded.admission {
+            Admission::Deny(reasons) => {
+                assert_eq!(
+                    reasons.len(),
+                    3,
+                    "the turn reason must be appended, not replace the lifetime reasons: {reasons:?}"
+                );
+                assert!(reasons.contains(&turn_deny_reason));
+                for reason in lifetime_reasons {
+                    assert!(
+                        reasons.contains(&reason),
+                        "an existing lifetime deny reason was dropped: {reason:?}"
+                    );
+                }
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fold_turn_admit_leaves_an_existing_lifetime_deny_as_deny() {
+        let policy = hard_resource_policy();
+        let decision = policy
+            .evaluate(ResourceAmount::UsdCents(1001), 601, Confidence::Medium)
+            .expect("compatible kind");
+        assert!(matches!(decision.admission, Admission::Deny(_)));
+        let before = decision.admission.clone();
+
+        let folded = decision.with_turn_outcome(ConstraintOutcome::Admit);
+        assert_eq!(
+            folded.admission, before,
+            "a turn Admit must never change an existing Deny's reasons"
+        );
+        assert_eq!(folded.turn_outcome, Some(ConstraintOutcome::Admit));
+    }
+
+    #[test]
+    fn fold_turn_admit_leaves_lifetime_admit_as_admit() {
+        // No turn bound configured at all (`turn: None` behavior, the
+        // common case today): `evaluate_turn` itself returns `Admit`, and
+        // folding that in must leave the decision completely unchanged
+        // from today's pre-HORO-1727 behavior.
+        let policy = hard_resource_policy();
+        let decision = policy
+            .evaluate(ResourceAmount::UsdCents(1), 1, Confidence::Medium)
+            .expect("compatible kind");
+        assert_eq!(decision.admission, Admission::Admit);
+
+        let turn_outcome = policy
+            .evaluate_turn(ResourceAmount::UsdCents(1))
+            .expect("compatible kind");
+        assert_eq!(turn_outcome, ConstraintOutcome::Admit);
+        let folded = decision.clone().with_turn_outcome(turn_outcome);
+        assert_eq!(folded.admission, decision.admission);
+        assert_eq!(folded.turn_outcome, Some(ConstraintOutcome::Admit));
+    }
+
+    // -- backward compatibility -------------------------------------------
+
+    #[test]
+    fn policy_without_turn_serializes_byte_identically_to_before() {
+        // Mirrors `policy_json_with_no_renewal_set_serializes_with_no_renewal_key`:
+        // a `Policy` with no turn bound must not serialize a `turn` key at
+        // all, so every existing persisted `policy_json` stays
+        // byte-identical.
+        let policy = hard_resource_policy();
+        assert!(policy.turn.is_none());
+        let json = serde_json::to_value(&policy).expect("serializes");
+        assert!(
+            json.get("turn").is_none(),
+            "a policy with no turn bound must not serialize a `turn` key at all: got {json}"
+        );
+    }
+
+    #[test]
+    fn old_policy_json_with_no_turn_field_still_deserializes() {
+        // A `policy_json` row persisted before this field existed has no
+        // `turn` key at all — `#[serde(default)]` must fill in `None`.
+        let json = serde_json::json!({
+            "policy_schema_version": POLICY_SCHEMA_VERSION,
+            "name": "pre-turn-ticket",
+            "resource": {
+                "mode": "hard",
+                "target": {"kind": "usd_cents", "amount": 1000},
+                "elastic_ceiling": null,
+                "hard_ceiling": {"kind": "usd_cents", "amount": 1000}
+            },
+            "time": {
+                "mode": "hard",
+                "target_secs": 600,
+                "elastic_ceiling_secs": null,
+                "hard_ceiling_secs": 600,
+                "deadline": null
+            },
+            "quality_floor": {
+                "revision": 1,
+                "criteria": [{"description": "tests pass", "required": true}]
+            },
+            "min_confidence": "medium",
+            "autonomy": "ask_on_approval"
+        });
+        let policy: Policy = serde_json::from_value(json).expect("deserializes structurally");
+        assert!(policy.turn.is_none());
+        assert_eq!(policy.turn_fallback_request(), policy.resource.target);
+    }
+
+    #[test]
+    fn old_policy_decision_json_with_no_turn_outcome_still_deserializes() {
+        let policy = hard_resource_policy();
+        let decision = policy
+            .evaluate(ResourceAmount::UsdCents(1), 1, Confidence::Medium)
+            .expect("compatible kind");
+        let mut json = serde_json::to_value(&decision).expect("serializes");
+        // Simulate a pre-this-ticket `PolicyDecision` row: no `turn_outcome`
+        // key at all.
+        json.as_object_mut().unwrap().remove("turn_outcome");
+        let reparsed: PolicyDecision = serde_json::from_value(json).expect("deserializes");
+        assert!(reparsed.turn_outcome.is_none());
+        assert_eq!(reparsed.admission, decision.admission);
+    }
+
+    #[test]
+    fn resource_exceeds_turn_ceiling_is_additive_and_old_deny_reason_json_still_deserializes() {
+        // Mirrors `external_approval.rs`'s own
+        // `deny_reason_deserializes_the_old_variants_after_the_additive_change`:
+        // the new variant must not disturb deserialization of an old,
+        // pre-existing `DenyReason` JSON shape.
+        let old = r#"{"ResourceExceedsHardCeiling":{"projected":{"kind":"tokens","amount":5000},"hard_ceiling":{"kind":"tokens","amount":2000}}}"#;
+        let parsed: DenyReason = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            parsed,
+            DenyReason::ResourceExceedsHardCeiling {
+                projected: ResourceAmount::Tokens(5000),
+                hard_ceiling: ResourceAmount::Tokens(2000),
+            }
+        );
+
+        // And the new variant itself round-trips.
+        let new = DenyReason::ResourceExceedsTurnCeiling {
+            projected: ResourceAmount::Tokens(400_001),
+            turn_ceiling: ResourceAmount::Tokens(400_000),
+        };
+        let json = serde_json::to_string(&new).unwrap();
+        let round_tripped: DenyReason = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped, new);
     }
 }

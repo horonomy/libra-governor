@@ -259,6 +259,82 @@ pub(crate) fn prepare_execution_extensions(config: &DaemonConfig) {
     let _ = extension_runtime(config);
 }
 
+/// The default per-turn cold-start request (HORO-1727 Decision B) — see
+/// [`default_turn_bound`] for the full derivation.
+///
+/// # Derivation
+///
+/// Directly recomputed from this machine's real local Claude Code
+/// transcripts under `~/.claude/projects`, using the NOW-CORRECTED
+/// HORO-1882 usage scanning (dedup by `message.id`, per-field max — see
+/// `crates/daemon/src/usage.rs`), not from the stale pre-fix 487,836/
+/// 552,391 figures the original architecture investigation measured, and
+/// not from a `/2.2` correction-factor estimate: real local transcripts
+/// were available, so this is ground truth under the fixed scanner rather
+/// than an approximation of it.
+///
+/// Method: every `*.jsonl` transcript under `~/.claude/projects` (4,795
+/// files at time of measurement) was scanned; each file's assistant
+/// `message.usage` records were deduplicated by `message.id` (per-field
+/// maximum across repeats — the exact HORO-1882 rule), segmented into
+/// "turns" at each real (non-tool-result) user message — approximating
+/// one Stop-to-Stop receipt window — and each turn's fresh-token total
+/// (`input + cache_creation + output`, excluding cache reads, matching
+/// [`crate::usage::TurnUsage::fresh_tokens`]) was recorded. Over 16,554
+/// such turns: p50 ~16,268, **p80 ~120,700**, p90 ~236,740, **p95
+/// ~385,407**, max ~13,991,391 (one extreme outlier — a long batch/looped
+/// session, not representative of a single real turn).
+///
+/// `120_000` is chosen just under the measured p80 (120,700) and,
+/// deliberately, just under [`default_admission_policy`]'s own `balanced`
+/// elastic ceiling (125,000 = 100,000 × 1.25): a cold-start turn request
+/// at or above that elastic ceiling would make every brand-new task's
+/// very first preflight trip the *lifetime* elastic band before the turn
+/// ceiling is ever reached, which is a behavior change to the lifetime
+/// check this ticket must not make (Decision B is additive-only). See
+/// `docs/adr/0021-turn-scoped-resource-ceiling.md` for the full
+/// cold-start-regression analysis this constant was picked to avoid.
+pub const DEFAULT_TURN_COLD_START_REQUEST_TOKENS: u64 = 120_000;
+
+/// The default per-turn ceiling (HORO-1727 Decision B) — the hard limit a
+/// single turn's own projected request may never exceed, independent of
+/// the task's lifetime envelope. See [`DEFAULT_TURN_COLD_START_REQUEST_TOKENS`]
+/// for the measurement this is derived from.
+///
+/// `400_000` sits above the measured p95 (~385,407) — rounded up to a
+/// clean number for headroom above typical heavy turns (a large refactor,
+/// a wide multi-file search) — while remaining far below the ~13.99M
+/// outlier turn, which this ceiling is specifically meant to catch (an
+/// unbounded loop or runaway tool-call chain, not legitimate single-turn
+/// work).
+///
+/// # Scope and the cache-read exclusion caveat
+///
+/// This ceiling is checked **only at preflight**, against one turn's own
+/// projected request — never against committed lifetime spend (that stays
+/// `config.policy.resource`'s job, untouched by this ticket). The amount
+/// it is measured in is **fresh tokens only** (input + cache-creation +
+/// output): a cache *read* that re-presents an already-ingested,
+/// already-paid-for prefix is excluded by construction (see
+/// `crates/daemon/src/usage.rs` module docs), so this ceiling is not a
+/// guarantee of this turn's total upstream billing cost — a turn with a
+/// huge cache-read volume but modest fresh-token volume can legitimately
+/// bill far more than this ceiling's own number while still admitting
+/// cleanly, because that re-read spend is not what this check measures.
+pub const DEFAULT_TURN_CEILING_TOKENS: u64 = 400_000;
+
+/// Compiles [`DEFAULT_TURN_COLD_START_REQUEST_TOKENS`]/
+/// [`DEFAULT_TURN_CEILING_TOKENS`] into a [`libra_governor_domain::TurnBound`]
+/// — the default every deployment with no explicit `[policy]` override in
+/// `config.json` gets attached to its admission policy (HORO-1727
+/// Decision B). See the two constants' own docs for the full derivation.
+pub fn default_turn_bound() -> libra_governor_domain::TurnBound {
+    libra_governor_domain::TurnBound {
+        cold_start_request: ResourceAmount::Tokens(DEFAULT_TURN_COLD_START_REQUEST_TOKENS),
+        ceiling: ResourceAmount::Tokens(DEFAULT_TURN_CEILING_TOKENS),
+    }
+}
+
 /// The default admission [`Policy`] every task's budget is initialized
 /// from when no per-task policy override exists yet (no such override
 /// surface exists as of HORO-1141 — every task uses this one policy).
@@ -269,7 +345,8 @@ pub(crate) fn prepare_execution_extensions(config: &DaemonConfig) {
 /// in USD would fabricate a conversion nothing here can back up.
 ///
 /// Constructed from fixed, known-valid inputs, so the `Policy::balanced`
-/// validation this calls can never actually fail in practice — `.expect`
+/// validation this calls (and the `with_turn_bound` attached on top, per
+/// HORO-1727 Decision B) can never actually fail in practice — `.expect`
 /// documents that invariant rather than propagating a `Result` that has
 /// no real failure mode for a caller to handle.
 pub fn default_admission_policy() -> Policy {
@@ -281,6 +358,8 @@ pub fn default_admission_policy() -> Policy {
         )]),
     })
     .expect("default_admission_policy's hardcoded inputs are always valid")
+    .with_turn_bound(default_turn_bound())
+    .expect("default_turn_bound's hardcoded constants are always valid against this policy")
 }
 
 /// Binds `socket_path`, handling the stale-vs-live detection documented
@@ -1085,7 +1164,7 @@ pub(crate) fn handle_preflight_prepared(
     let requested = estimate
         .resource_p80
         .filter(|amount| amount.kind() == budget.resource_kind)
-        .unwrap_or(config.policy.resource.target);
+        .unwrap_or(config.policy.turn_fallback_request());
     // `committed` is read directly from the budget snapshot's own
     // `used()`/`reserved()` (HORO-1727), never derived by subtracting
     // `available`'s headroom from a ceiling — a formula that silently
@@ -1124,6 +1203,15 @@ pub(crate) fn handle_preflight_prepared(
     admission_policy.resource = admission_policy.resource.extended_by(granted);
     let mut decision =
         admission_policy.evaluate(projected, projected_duration_secs, estimate.confidence)?;
+
+    // Turn-scoped ceiling (HORO-1727 Decision B): a second, independent
+    // gate checked against THIS turn's own projected request (`requested`
+    // — never `projected`, which adds committed lifetime spend on top).
+    // Folded in immediately, before the Policy Webhook below, so a turn
+    // Deny issues zero webhook calls and can never be overridden by an
+    // external Approve — see `PolicyDecision::with_turn_outcome` docs.
+    let turn_outcome = admission_policy.evaluate_turn(requested)?;
+    decision = decision.with_turn_outcome(turn_outcome);
 
     // Policy Webhook (HORO-1174): only ever called when the projected
     // admission is ApprovalRequired — a hard-ceiling Deny issues ZERO
@@ -1673,11 +1761,17 @@ pub(crate) fn handle_tool_invoked(
         }
 
         if let Some(budget) = ledger.task_budget(task_id)? {
+            // Same fallback as `handle_preflight_prepared`'s own
+            // `requested` (HORO-1727 Decision B) — this replan path does
+            // not re-evaluate policy at all (`was_not_admitted` carries
+            // the prior plan's admission forward instead), so no turn
+            // gate is added here; only the fallback-request figure
+            // changes.
             let requested = remaining
                 .estimate
                 .resource_p80
                 .filter(|amount| amount.kind() == budget.resource_kind)
-                .unwrap_or(config.policy.resource.target);
+                .unwrap_or(config.policy.turn_fallback_request());
             let work_envelope_value =
                 (requested.as_f64() - reserve_estimate.amount.as_f64()).max(0.0);
             let work_envelope =
