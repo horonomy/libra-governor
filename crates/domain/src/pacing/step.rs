@@ -1053,11 +1053,26 @@ mod tests {
     /// test in `pacing-gate` already covers) so a future edit to either
     /// list is caught here, at the source, regardless of whether any
     /// particular fixture happens to exercise it.
+    ///
+    /// Every preserved/cleared field is driven genuinely non-default
+    /// before the reset, with an explicit precondition assert per field —
+    /// an earlier version of this test left `active`, `spend_so_far`, and
+    /// `revised_estimates` at their already-empty default the whole time,
+    /// so its own equality/emptiness assertions on those three fields
+    /// passed whether or not `restart_reset` did anything to them (an
+    /// independent review caught this: PR #164). Three tasks under
+    /// SUSTAIN (fanout cap 1) drive it: task 1 completes with an overrun
+    /// (`backoff_x100`, `usage_log`); task 2 is admitted once the spacing
+    /// floor clears and receives a within-hold `Spend` so it stays
+    /// `active` with a `spend_so_far` entry; task 3 stays ready-but-
+    /// unadmitted (the fanout cap keeps it out while task 2 is active)
+    /// and receives an `EstimateRevised`, populating `revised_estimates`.
     #[test]
     fn restart_reset_keeps_ground_truth_and_clears_ephemeral_scheduling_state() {
         let tasks = TaskSet::validated(vec![
             task_with_tokens(1, 100, 60),
             task_with_tokens(2, 100, 60),
+            task_with_tokens(3, 100, 60),
         ])
         .unwrap();
         let w = window(1000, 21_600);
@@ -1073,9 +1088,6 @@ mod tests {
         };
         let t0 = OffsetDateTime::UNIX_EPOCH;
 
-        // Drive task 1 to completion (with an overrun, so `backoff_x100`
-        // is populated) and task 2 into `active`, so every field this
-        // test cares about is non-default before the reset.
         let (state, _) = step(
             &PacerState::default(),
             &PacingEvent::ModeChanged { at: t0, seq: 0 },
@@ -1103,6 +1115,76 @@ mod tests {
             &policy(),
             &scenario,
         );
+        // Task 2's spacing floor (ceil(100 * 21600 / 1000) = 2160s from
+        // task 1's start) hasn't cleared yet — task 2 is not admitted by
+        // an early-completing task 1 alone (see
+        // `sustain_spacing_is_enforced_even_when_a_slot_frees_up_early`).
+        assert_eq!(
+            state.active_count(),
+            0,
+            "precondition: task 2 must not yet be active before its spacing floor clears"
+        );
+
+        // A no-op `ModeChanged` at the spacing floor just re-triggers
+        // `try_admit`, admitting task 2.
+        let (state, _) = step(
+            &state,
+            &PacingEvent::ModeChanged {
+                at: t0 + time::Duration::seconds(2160),
+                seq: 3,
+            },
+            &policy(),
+            &scenario,
+        );
+        assert!(
+            state.active_holds().any(|(id, _)| id == SimTaskId(2)),
+            "precondition: task 2 must be active once its spacing floor clears"
+        );
+
+        // A within-hold `Spend` for task 2 — no overrun, task 2 stays
+        // active with a `spend_so_far` entry rather than completing.
+        let (state, _) = step(
+            &state,
+            &PacingEvent::Spend {
+                at: t0 + time::Duration::seconds(2170),
+                seq: 4,
+                task: SimTaskId(2),
+                amount: QuotaAmount::new(QuotaUnit::Tokens, 50),
+            },
+            &policy(),
+            &scenario,
+        );
+        assert_eq!(
+            state.spend_so_far_for(SimTaskId(2)),
+            Some(50),
+            "precondition: task 2's reported spend must be recorded while it is still active"
+        );
+
+        // Task 3 is ready (no deps) but the fanout cap (1 under SUSTAIN)
+        // keeps it out while task 2 is active — an `EstimateRevised` for
+        // it populates `revised_estimates` without ever admitting it.
+        let mut revised = test_estimate();
+        revised.confidence = Confidence::High;
+        revised.resource = RemainingResource::Quantiles {
+            kind: ResourceKind::Tokens,
+            p50: ResourceAmount::Tokens(42),
+            p80: ResourceAmount::Tokens(42),
+            p90: ResourceAmount::Tokens(42),
+            conditional_n: 20,
+            weakest_truth: crate::economic_event::TruthStrength::Metered,
+        };
+        let (state, _) = step(
+            &state,
+            &PacingEvent::EstimateRevised {
+                at: t0 + time::Duration::seconds(2171),
+                seq: 5,
+                task: SimTaskId(3),
+                estimate: Box::new(revised),
+            },
+            &policy(),
+            &scenario,
+        );
+
         assert!(state.completed.contains(&SimTaskId(1)));
         assert!(
             !state.usage_log.is_empty(),
@@ -1113,6 +1195,18 @@ mod tests {
             "precondition: the overrun must have set a backoff ratio"
         );
         assert!(state.last_start.is_some());
+        assert!(
+            !state.active.is_empty(),
+            "precondition: task 2 must still be active before the reset"
+        );
+        assert!(
+            !state.spend_so_far.is_empty(),
+            "precondition: task 2's spend-so-far entry must be present before the reset"
+        );
+        assert!(
+            !state.revised_estimates.is_empty(),
+            "precondition: task 3's revised estimate must be present before the reset"
+        );
 
         let reset = state.restart_reset();
 
