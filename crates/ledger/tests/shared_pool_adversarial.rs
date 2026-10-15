@@ -48,15 +48,31 @@
 //!    100-year bound (mirroring `quota_window::MAX_SLIDING_LENGTH_SECS`'s
 //!    precedent) so `checked_add` never needs the unsafe fallback.
 //!
-//! Every test in this file passes except one: HORO-1768 PR-B added
-//! [`stale_out_of_order_snapshot_incorrectly_overwrites_a_newer_more_restrictive_reading`],
-//! a disclosed, deliberately-deferred `#[ignore]`d finding (same
-//! legitimate pattern as the HORO-1779 findings above before they were
-//! fixed) — `ingest_pool_provider_snapshot`'s upsert has no `observed_at`
-//! ordering check, so a stale out-of-order snapshot can overwrite a
-//! newer, more-restrictive reading. See that test's own doc comment and
-//! HORO-1880 for detail; not fixed here (no live caller currently
-//! triggers it, so exposure is nil today).
+//! # observed_at ordering (HORO-1880, fixed)
+//!
+//! HORO-1768 PR-B added
+//! [`stale_out_of_order_snapshot_incorrectly_overwrites_a_newer_more_restrictive_reading`]
+//! as a disclosed, deliberately-deferred `#[ignore]`d finding:
+//! `ingest_pool_provider_snapshot`'s upsert had no `observed_at` ordering
+//! check, so a stale out-of-order snapshot could overwrite a newer,
+//! more-restrictive reading and silently reopen capacity that is still
+//! really spent externally. Fixed for HORO-1880 by comparing the new
+//! row's `observed_at` against the stored row's before upserting — a
+//! strictly older incoming `observed_at` is now a safe no-op instead of
+//! an overwrite; an exact tie or a strictly newer `observed_at` still
+//! replaces, matching the pre-existing last-write-wins discipline
+//! [`overlapping_provider_snapshots_reflect_only_the_latest_value_never_summed`]
+//! already exercises. All tests in this file now pass unignored. A new
+//! `observed_at > now` ingest-time guard (rejected outright, never
+//! stored) prevents the ordering check itself from becoming a sticky
+//! fail-open on a single future-dated/clock-skewed reading. See
+//! [`equal_observed_at_tie_break_still_replaces_the_stored_reading`],
+//! [`a_later_observed_at_with_a_lower_used_value_is_a_legitimate_update_not_a_stale_overwrite`],
+//! [`strictly_older_observed_at_is_a_no_op_even_across_a_reopened_store`],
+//! [`future_dated_observed_at_is_rejected_outright_not_stored_as_a_sticky_poison_row`],
+//! and
+//! [`concurrent_racing_ingests_never_let_a_stale_reading_win_the_ordering_check`]
+//! for the additional adversarial coverage added alongside the fix.
 
 use std::sync::{Arc, Barrier};
 
@@ -774,14 +790,16 @@ fn overlapping_provider_snapshots_reflect_only_the_latest_value_never_summed() {
     );
 }
 
-/// HORO-1768 PR-B finding: `ingest_pool_provider_snapshot` is an
+/// HORO-1880 regression test (originally filed from HORO-1768 PR-B as a
+/// disclosed, deliberately-deferred `#[ignore]`d finding; fixed and
+/// unignored for HORO-1880). `ingest_pool_provider_snapshot` was an
 /// unconditional `ON CONFLICT(pool_id) DO UPDATE` upsert
 /// (`shared_pool.rs`'s own schema keeps exactly one snapshot row per
 /// `pool_id`) with no comparison of the newly-ingested row's own
 /// `observed_at` against the row it is about to replace. Every existing
 /// overlapping-snapshot test above only ever ingests snapshots in
 /// correct wall-clock AND `observed_at` order (same instant, or strictly
-/// later `observed_at`) — none exercises a snapshot that arrives LATER
+/// later `observed_at`) — none exercised a snapshot that arrives LATER
 /// in wall-clock time but carries an OLDER `observed_at` than the row
 /// already stored (a reordered/retried delivery of a provider poll,
 /// which `response.rs`'s acquisition boundary has no way to prevent
@@ -793,26 +811,16 @@ fn overlapping_provider_snapshots_reflect_only_the_latest_value_never_summed() {
 ///    is 9, remaining is 1 — correctly conservative.
 /// 2. A STALE snapshot observed at `t0 - 60s` (i.e. it was actually
 ///    taken BEFORE the one already stored) arrives afterward and is
-///    ingested with `used = 2`. Because the upsert has no `observed_at`
-///    ordering check, it unconditionally overwrites the stored row.
+///    ingested with `used = 2`. `ingest_pool_provider_snapshot` now
+///    compares the new row's `observed_at` against the stored row's
+///    before upserting and rejects this one as a no-op.
 ///
-/// If this bug is live, overhang drops to 2 and remaining incorrectly
-/// jumps back up to 8 — not because real external usage actually
-/// decreased, but purely because a stale, out-of-order reading arrived
-/// second. A correct implementation must keep the row reflecting the
-/// snapshot with the LATER `observed_at` (9, not 2) regardless of
-/// ingestion order. See HORO-1768's ticket text (the Jira ticket number
-/// in this test's `#[ignore]` reason is filed from that investigation)
-/// for the disclosure; this is a deliberately-deferred, disclosed
-/// finding, not a bypassed test that should currently pass — verified by
-/// grep (`rg ingest_pool_provider_snapshot`): no non-test caller of
-/// `ingest_pool_provider_snapshot` exists anywhere in this workspace
-/// today (every call site is either this file or `shared_pool.rs`'s own
-/// `#[cfg(test)]` module), so production exposure is nil today.
+/// Confirms overhang stays at 9 and remaining stays at 1 — not because
+/// real external usage actually decreased, but purely because a stale,
+/// out-of-order reading arrived second, the correct implementation keeps
+/// the row reflecting the snapshot with the LATER `observed_at` (9, not
+/// 2) regardless of ingestion order.
 #[test]
-#[ignore = "HORO-1880 finding: ingest_pool_provider_snapshot has no observed_at ordering \
-            check, so a stale out-of-order snapshot can overwrite a newer, more-restrictive \
-            reading and silently reopen capacity that is still really spent externally"]
 fn stale_out_of_order_snapshot_incorrectly_overwrites_a_newer_more_restrictive_reading() {
     let mut store = LedgerStore::open_in_memory().unwrap();
     store
@@ -871,6 +879,370 @@ fn stale_out_of_order_snapshot_incorrectly_overwrites_a_newer_more_restrictive_r
         "remaining must stay at 1 (the true, still-real external usage never decreased) — a \
          jump back up to 8 is the oversubscription-reopening failure mode this test documents"
     );
+}
+
+/// Edge case the HORO-1880 fix itself must resolve one way or the other,
+/// not leave ambiguous: two snapshots sharing the EXACT SAME `observed_at`
+/// (e.g. two near-simultaneous polls, or a retried delivery of the same
+/// poll with a revised figure). Neither can be shown to be "more current"
+/// than the other, so the fix's `<` (strictly-older-is-rejected) check
+/// must let an equal `observed_at` through — this is also exactly what
+/// [`overlapping_provider_snapshots_reflect_only_the_latest_value_never_summed`]
+/// already asserts for same-instant re-ingests; this test pins the same
+/// contract explicitly against the new ordering guard so a future change
+/// to `<` vs `<=` is caught here too.
+#[test]
+fn equal_observed_at_tie_break_still_replaces_the_stored_reading() {
+    let mut store = LedgerStore::open_in_memory().unwrap();
+    store
+        .ensure_pool(&pool_id(), &QuotaUnit::Tokens, 10, now())
+        .unwrap();
+
+    let shared_observed_at = now();
+    store
+        .ingest_pool_provider_snapshot(
+            &pool_id(),
+            shared_observed_at,
+            Some(shared_observed_at + time::Duration::seconds(3600)),
+            &GaugeReading::Used {
+                used: QuotaAmount::new(QuotaUnit::Tokens, 9),
+                limit: Some(10),
+            },
+            Confidence::High,
+            now(),
+        )
+        .unwrap();
+
+    // A second reading at the IDENTICAL observed_at, with a different
+    // value, arrives next (e.g. a corrected re-delivery of the same
+    // poll). It must win the tie, not be rejected as "not strictly
+    // newer".
+    store
+        .ingest_pool_provider_snapshot(
+            &pool_id(),
+            shared_observed_at,
+            Some(shared_observed_at + time::Duration::seconds(3600)),
+            &GaugeReading::Used {
+                used: QuotaAmount::new(QuotaUnit::Tokens, 5),
+                limit: Some(10),
+            },
+            Confidence::High,
+            now(),
+        )
+        .unwrap();
+
+    let admission = store.pool_admission(&pool_id(), now()).unwrap().unwrap();
+    assert_eq!(
+        admission.external_overhang, 5,
+        "an exact observed_at tie must still replace the stored reading (last write wins), not \
+         be refused as if it were strictly older"
+    );
+}
+
+/// The ordering guard must not be mistaken for "never let `used` go
+/// down" — a legitimately NEWER snapshot (quota window rollover, a
+/// provider-side reset, or simply real usage dropping) must still be
+/// accepted even though its `used` value is lower than what is currently
+/// stored. Only an `observed_at` that is strictly OLDER than the stored
+/// row is rejected; a strictly newer `observed_at` always replaces,
+/// regardless of which direction `used` moved. This guards against a
+/// sloppy fix that keyed off `used_value` instead of `observed_at` (which
+/// would wrongly treat a real reset as "stale" and leave the pool
+/// permanently overhang-locked on an old high-water mark).
+#[test]
+fn a_later_observed_at_with_a_lower_used_value_is_a_legitimate_update_not_a_stale_overwrite() {
+    let mut store = LedgerStore::open_in_memory().unwrap();
+    store
+        .ensure_pool(&pool_id(), &QuotaUnit::Tokens, 10, now())
+        .unwrap();
+
+    let t0 = now();
+    store
+        .ingest_pool_provider_snapshot(
+            &pool_id(),
+            t0,
+            Some(t0 + time::Duration::seconds(3600)),
+            &GaugeReading::Used {
+                used: QuotaAmount::new(QuotaUnit::Tokens, 9),
+                limit: Some(10),
+            },
+            Confidence::High,
+            t0,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .pool_admission(&pool_id(), t0)
+            .unwrap()
+            .unwrap()
+            .external_overhang,
+        9
+    );
+
+    // A genuinely LATER observed_at (not stale/out-of-order) reports a
+    // real drop in usage — a de-facto reset. This must be accepted.
+    let t1 = t0 + time::Duration::seconds(60);
+    store
+        .ingest_pool_provider_snapshot(
+            &pool_id(),
+            t1,
+            Some(t1 + time::Duration::seconds(3600)),
+            &GaugeReading::Used {
+                used: QuotaAmount::new(QuotaUnit::Tokens, 0),
+                limit: Some(10),
+            },
+            Confidence::High,
+            t1,
+        )
+        .unwrap();
+    let admission = store.pool_admission(&pool_id(), t1).unwrap().unwrap();
+    assert_eq!(
+        admission.external_overhang, 0,
+        "a strictly newer observed_at reporting a real usage reset must be accepted, never \
+         refused merely because the used value went down — the ordering guard keys off \
+         observed_at, not the direction used moved"
+    );
+    assert_eq!(admission.remaining(), 10);
+}
+
+/// The no-op path taken for a stale, out-of-order snapshot must actually
+/// persist nothing durable beyond the correctly-stored row — reopen a
+/// fresh `LedgerStore` against the same on-disk file after the rejected
+/// stale ingest and confirm the surviving row is still the newer,
+/// more-restrictive one. Guards against an implementation that only
+/// "skips" in memory (e.g. an early return that forgot to commit/rollback
+/// correctly) while actually leaving a partially-written row behind.
+#[test]
+fn strictly_older_observed_at_is_a_no_op_even_across_a_reopened_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite3");
+
+    let t0 = now();
+    let stale_observed_at = t0 - time::Duration::seconds(60);
+    {
+        let mut store = LedgerStore::open(&path).unwrap();
+        store
+            .ensure_pool(&pool_id(), &QuotaUnit::Tokens, 10, now())
+            .unwrap();
+        store
+            .ingest_pool_provider_snapshot(
+                &pool_id(),
+                t0,
+                Some(t0 + time::Duration::seconds(3600)),
+                &GaugeReading::Used {
+                    used: QuotaAmount::new(QuotaUnit::Tokens, 9),
+                    limit: Some(10),
+                },
+                Confidence::High,
+                t0,
+            )
+            .unwrap();
+        // Stale, out-of-order delivery: rejected as a no-op.
+        store
+            .ingest_pool_provider_snapshot(
+                &pool_id(),
+                stale_observed_at,
+                Some(stale_observed_at + time::Duration::seconds(3600)),
+                &GaugeReading::Used {
+                    used: QuotaAmount::new(QuotaUnit::Tokens, 2),
+                    limit: Some(10),
+                },
+                Confidence::High,
+                t0,
+            )
+            .unwrap();
+    }
+
+    let reopened = LedgerStore::open(&path).unwrap();
+    let admission = reopened.pool_admission(&pool_id(), t0).unwrap().unwrap();
+    assert_eq!(
+        admission.external_overhang, 9,
+        "the stale, out-of-order snapshot must not have persisted any change at all, including \
+         across a fresh store reopen against the same file"
+    );
+    assert_eq!(admission.remaining(), 1);
+}
+
+/// The new ordering guard itself must not create a WORSE failure mode
+/// than the one it fixes: a single future-dated `observed_at` (provider
+/// clock skew, a seconds-vs-milliseconds unit bug, a malformed
+/// timestamp) must not win every subsequent ordering comparison forever,
+/// permanently refusing every correct, genuinely-current reading as
+/// "stale" and — once the poisoned row's own `valid_until` passes —
+/// silently fail-open to zero overhang. `ingest_pool_provider_snapshot`
+/// rejects `observed_at > now` outright (`Err`) rather than storing it,
+/// so the poisoned reading in this test is never persisted in the first
+/// place and the correct reading that follows is accepted normally.
+#[test]
+fn future_dated_observed_at_is_rejected_outright_not_stored_as_a_sticky_poison_row() {
+    let mut store = LedgerStore::open_in_memory().unwrap();
+    store
+        .ensure_pool(&pool_id(), &QuotaUnit::Tokens, 10, now())
+        .unwrap();
+
+    let t0 = now();
+    let far_future = t0 + time::Duration::days(365);
+    let poisoned = store.ingest_pool_provider_snapshot(
+        &pool_id(),
+        far_future,
+        Some(far_future + time::Duration::seconds(3600)),
+        &GaugeReading::Used {
+            used: QuotaAmount::new(QuotaUnit::Tokens, 0),
+            limit: Some(10),
+        },
+        Confidence::High,
+        t0,
+    );
+    assert!(
+        poisoned.is_err(),
+        "an observed_at strictly after now must be rejected outright, got {poisoned:?}"
+    );
+    // Confirms it was never persisted: a pool with no stored snapshot at
+    // all reports zero overhang, same as this one must right now.
+    assert_eq!(
+        store
+            .pool_admission(&pool_id(), t0)
+            .unwrap()
+            .unwrap()
+            .external_overhang,
+        0
+    );
+
+    // A correct, genuinely-current reading arriving afterward must be
+    // accepted normally — it must not be permanently blocked by the
+    // rejected (never-stored) future-dated attempt.
+    let t1 = t0 + time::Duration::seconds(60);
+    store
+        .ingest_pool_provider_snapshot(
+            &pool_id(),
+            t1,
+            Some(t1 + time::Duration::seconds(3600)),
+            &GaugeReading::Used {
+                used: QuotaAmount::new(QuotaUnit::Tokens, 9),
+                limit: Some(10),
+            },
+            Confidence::High,
+            t1,
+        )
+        .unwrap();
+    let admission = store.pool_admission(&pool_id(), t1).unwrap().unwrap();
+    assert_eq!(
+        admission.external_overhang, 9,
+        "a correct, genuinely-current reading must be accepted after a rejected future-dated \
+         attempt — it must never have been stored to begin with"
+    );
+    assert_eq!(admission.remaining(), 1);
+}
+
+/// A real multi-thread, multi-connection race stress-checking that the
+/// read-compare-write ordering check stays serialized by the existing
+/// `TransactionBehavior::Immediate` write lock, not just correct when run
+/// sequentially: many iterations, each spawning two threads against a
+/// fresh on-disk store — one ingesting the correct, newer-`observed_at`
+/// reading, the other ingesting a stale, older-`observed_at` reading —
+/// with a `Barrier` so both threads actually race to ingest at the same
+/// instant.
+///
+/// A bare `Barrier` alone is not enough to discriminate the bug: the
+/// thread that reaches the barrier LAST proceeds immediately, so which
+/// thread's `BEGIN IMMEDIATE` actually commits second (and thus matters
+/// for the ordering check) would otherwise depend entirely on
+/// unpredictable OS scheduling — a run could pass even without the fix
+/// if the correct reading happened to commit second every time. To
+/// actually exercise the case the bug lives in — the stale reading's
+/// `ingest_pool_provider_snapshot` call committing AFTER the correct
+/// one — alternating iterations add a tiny sleep to whichever thread
+/// should arrive at its own `BEGIN IMMEDIATE` first, biasing (not
+/// guaranteeing, since this is still real OS scheduling) each ordering
+/// to occur across the 50 iterations. Regardless of which thread's
+/// transaction actually commits second, the final stored reading must
+/// always be the one with the later `observed_at` (overhang = 9), never
+/// the stale one (overhang = 2) — a time-of-check/time-of-use gap
+/// between the read-existing and the write would show up here as a
+/// flaky overhang of 2 on some iterations.
+#[test]
+fn concurrent_racing_ingests_never_let_a_stale_reading_win_the_ordering_check() {
+    for iteration in 0..50 {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.sqlite3");
+        let t0 = now();
+        let stale_observed_at = t0 - time::Duration::seconds(60);
+        {
+            let mut store = LedgerStore::open(&path).unwrap();
+            store
+                .ensure_pool(&pool_id(), &QuotaUnit::Tokens, 10, now())
+                .unwrap();
+        }
+
+        let barrier = Arc::new(Barrier::new(2));
+        // Alternate which thread gets a tiny head-start delay after the
+        // barrier releases both threads, so across 50 iterations both
+        // "correct commits first" and "correct commits last" orderings
+        // actually occur — not just whichever the OS scheduler happens
+        // to prefer every time.
+        let delay_the_correct_thread = iteration % 2 == 0;
+
+        let correct_path = path.clone();
+        let correct_barrier = Arc::clone(&barrier);
+        let correct_handle = std::thread::spawn(move || {
+            let mut store = LedgerStore::open(&correct_path).unwrap();
+            correct_barrier.wait();
+            if delay_the_correct_thread {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            store
+                .ingest_pool_provider_snapshot(
+                    &pool_id(),
+                    t0,
+                    Some(t0 + time::Duration::seconds(3600)),
+                    &GaugeReading::Used {
+                        used: QuotaAmount::new(QuotaUnit::Tokens, 9),
+                        limit: Some(10),
+                    },
+                    Confidence::High,
+                    t0,
+                )
+                .unwrap();
+        });
+
+        let stale_path = path.clone();
+        let stale_barrier = Arc::clone(&barrier);
+        let stale_handle = std::thread::spawn(move || {
+            let mut store = LedgerStore::open(&stale_path).unwrap();
+            stale_barrier.wait();
+            if !delay_the_correct_thread {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            store
+                .ingest_pool_provider_snapshot(
+                    &pool_id(),
+                    stale_observed_at,
+                    Some(stale_observed_at + time::Duration::seconds(3600)),
+                    &GaugeReading::Used {
+                        used: QuotaAmount::new(QuotaUnit::Tokens, 2),
+                        limit: Some(10),
+                    },
+                    Confidence::High,
+                    t0,
+                )
+                .unwrap();
+        });
+
+        correct_handle.join().unwrap();
+        stale_handle.join().unwrap();
+
+        let store = LedgerStore::open(&path).unwrap();
+        let admission = store.pool_admission(&pool_id(), t0).unwrap().unwrap();
+        assert_eq!(
+            admission.external_overhang,
+            9,
+            "iteration {iteration} (delay_the_correct_thread={delay_the_correct_thread}): the \
+             stale, older-observed_at reading must never win the race regardless of which \
+             thread's transaction commits second — got overhang={} (remaining={})",
+            admission.external_overhang,
+            admission.remaining()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------
