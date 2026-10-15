@@ -83,25 +83,24 @@ fn paced_completes_every_task_on_t4_delayed_settlement() {
     }
 }
 
-/// Documents (does not fix) a THIRD, distinct desync this session found
-/// and decided not to chase down, per the "never modifies pacing/*"
-/// invariant `lib.rs` already states for this crate: `Paced::on_restart`
-/// resets to `PacerState::default()`, which wipes `completed` along with
-/// the genuinely-ephemeral fields (`active`/`backoff_x100`/
-/// `pending_timer`) — but `completed` is a durable ground-truth fact a
-/// real daemon would reload from its ledger, not in-memory scheduling
-/// state a crash would actually lose. After t5's restart, `Paced`
-/// believes task 1 (already real-world-complete) is still eligible and
-/// re-proposes starting it; the driver correctly refuses (logged as
-/// `DriveLogEntry::Offered { rejected: [1], .. }`), but that refusal
-/// consumes the strategy's one Sustain-mode fanout slot forever — task 2
-/// is never reconsidered again. Fixing this correctly needs a
-/// `domain::pacing::step::PacerState` constructor/method this crate
-/// cannot add (`domain/src/pacing` is out of scope here). Filed as
-/// HORO-1881, per the ticket brief's own "lean toward a new ticket"
-/// guidance for this finding.
+/// HORO-1881: a daemon restart must not permanently strand a task whose
+/// dependency already really completed before the restart. Formerly
+/// `Paced::on_restart` reset to `PacerState::default()`, which wiped
+/// `completed` along with the genuinely-ephemeral fields
+/// (`active`/`backoff_x100`/`pending_timer`) — `completed` is durable
+/// ground truth a real daemon would reload from its ledger, not runtime
+/// state a crash would lose. `Paced` would then believe task 1 (already
+/// real-world-complete) was still eligible, re-propose starting it, have
+/// that re-proposal correctly refused by the driver (ground truth
+/// disagreed), and have that one refusal consume the strategy's only
+/// Sustain-mode fanout slot — permanently stranding task 2, which
+/// depends on task 1. Fixed via `PacerState::restart_reset`, which keeps
+/// `completed` (see that method's own docs for the full field-by-field
+/// reasoning). This test replaces the former
+/// `paced_currently_strands_a_dependent_task_after_a_restart_on_t5`,
+/// which documented the bug rather than the fix.
 #[test]
-fn paced_currently_strands_a_dependent_task_after_a_restart_on_t5() {
+fn paced_completes_the_dependent_task_after_a_restart_on_t5() {
     use libra_governor_pacing_gate::drive::DriveLogEntry;
 
     let spec = fixtures::load("t5_daemon_restart").unwrap();
@@ -113,10 +112,8 @@ fn paced_currently_strands_a_dependent_task_after_a_restart_on_t5() {
         "task 1 completes before the restart regardless"
     );
     assert!(
-        !outcome.world.is_completed(2),
-        "this test documents CURRENT (buggy) behavior — task 2 must currently NOT complete; \
-         if this now fails, the restart-recovery gap above has been fixed and this test (and \
-         its doc comment) should be deleted, not adjusted"
+        outcome.world.is_completed(2),
+        "task 2 must complete after the restart now that `Paced` keeps `completed` across it"
     );
     let rejected_task1_post_restart = outcome.log.iter().any(|(_, entry)| {
         matches!(
@@ -125,8 +122,88 @@ fn paced_currently_strands_a_dependent_task_after_a_restart_on_t5() {
         )
     });
     assert!(
-        rejected_task1_post_restart,
-        "expected the driver to log a rejected re-proposal of task 1 after the restart"
+        !rejected_task1_post_restart,
+        "the driver must never again see a rejected re-proposal of task 1 after the restart — \
+         that specific re-proposal was the mechanism that stranded task 2"
+    );
+}
+
+/// Adversarial case the ticket calls out explicitly: a restart that
+/// happens while a task is still genuinely running (not yet completed).
+/// This is a REAL, remaining restart-recovery gap this ticket's fix does
+/// not close, found empirically while writing this test (confirmed via
+/// the driver's own log, reproduced below):
+///
+/// `restart_reset` correctly clears `active` (per AC1 — it is genuinely
+/// ephemeral in-process state; reconstructing "what is really still
+/// running" from the ledger is exactly the live-wiring work HORO-1727
+/// gates, out of scope here). But `domain::pacing::step`'s own
+/// `TaskCompleted` handler only ever records a task into `completed` when
+/// it finds that task in `active` (see `step`'s `TaskCompleted` match arm:
+/// `if let Some(active) = next.active.remove(task) { next.completed.insert(...) }`).
+/// If a restart wipes `active` *before* that task's real completion event
+/// arrives, the later `TaskCompleted` notification becomes a silent no-op:
+/// `Paced` never learns the task completed at all. It then keeps
+/// re-proposing that task forever (neither completed nor active, so it
+/// never leaves its own `ready_order`), and because the real `World`
+/// rejects every one of those re-proposals (ground truth already knows it
+/// is done), each rejection consumes Sustain's one fanout slot — exactly
+/// the same stranding mechanism HORO-1881 fixes for the "restart after
+/// completion" case, but via a different trigger this ticket's minimal
+/// `restart_reset` does not close. Reproduced empirically:
+/// `Offered { ready: [2], started: [], rejected: [1] }` recurs forever
+/// after the restart, and task 2 never completes.
+///
+/// This is flagged here, not fixed: closing it needs `PacerState` (or
+/// `step`) to treat a `TaskCompleted` for an unknown-but-not-yet-completed
+/// task as a completion anyway (today's "unknown task id is a no-op"
+/// convention — see `EstimateRevised`'s own comment on the same
+/// convention — is exactly what makes this silent), which is a real
+/// domain-level design change beyond this ticket's scoped fix. Per the
+/// founder's instruction this session ("do not assume a ticket
+/// non-blocking if it can invalidate recovery"), this should be raised as
+/// a new follow-up ticket, not silently left for a future session to
+/// rediscover.
+#[test]
+fn paced_restart_mid_task_can_still_permanently_strand_a_dependent_task() {
+    // Two independent (no shared dependency) tasks on the same
+    // principal/window as t5, but the restart lands at offset 15 —
+    // strictly before task 1's own 30s duration elapses — so task 1 is
+    // still active, not completed, at the moment of restart.
+    let mut spec = fixtures::load("t5_daemon_restart").unwrap();
+    spec.tasks[1].depends_on = Vec::new();
+    spec.events =
+        vec![libra_governor_pacing_gate::trace::ExogenousEvent::DaemonRestart { offset_secs: 15 }];
+
+    let strategy = Paced::new(&spec.tasks, &spec.windows, &spec.initial_preference);
+    let outcome = run_trace(&spec, Box::new(strategy)).unwrap();
+
+    assert!(
+        outcome.world.is_completed(1),
+        "task 1 does eventually complete once its real duration elapses, regardless of Paced's \
+         own internal belief"
+    );
+    assert!(
+        !outcome.world.is_completed(2),
+        "documents the known residual gap: a restart mid-task (before the strategy ever \
+         re-admits the still-running task in its own belief) means `Paced` never learns that \
+         task completed either, permanently stranding task 2 — see this test's own doc comment \
+         for the exact mechanism and why it is flagged, not fixed, here"
+    );
+    let rejected_task1_recurs = outcome
+        .log
+        .iter()
+        .filter(|(_, entry)| {
+            matches!(
+                entry,
+                libra_governor_pacing_gate::drive::DriveLogEntry::Offered { rejected, .. }
+                    if rejected.contains(&1)
+            )
+        })
+        .count();
+    assert!(
+        rejected_task1_recurs >= 1,
+        "expected at least one rejected re-proposal of task 1 confirming the strand mechanism"
     );
 }
 
