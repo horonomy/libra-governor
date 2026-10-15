@@ -87,12 +87,15 @@ pub trait Strategy {
     fn notify(&mut self, _event: &DriveEvent) {}
 
     /// The daemon process restarted: every strategy wipes its own
-    /// in-memory belief. Default: no-op (a strategy with no state has
-    /// nothing to lose). `StaticBudget` overrides nothing here (its only
-    /// state is "which tasks are active", which the driver itself tracks
-    /// via the world, not the strategy) — `Paced` does, since its
-    /// `PacerState` is real in-memory scheduling state a restart must
-    /// discard (t5's scenario).
+    /// *ephemeral* in-memory belief, while preserving whatever it tracks
+    /// that is really durable ground truth (reloadable from a real
+    /// daemon's ledger, not lost by a crash). Default: no-op (a strategy
+    /// with no state has nothing to lose). `StaticBudget` overrides
+    /// nothing here (its only state is "which tasks are active", which
+    /// the driver itself tracks via the world, not the strategy) —
+    /// `Paced` does, via `PacerState::restart_reset` (HORO-1881), which
+    /// keeps durable fields like `completed` and clears genuinely
+    /// ephemeral ones like `active`/`backoff_x100` (t5's scenario).
     fn on_restart(&mut self) {}
 
     /// The next instant at which this strategy's own admission decision
@@ -119,12 +122,13 @@ pub trait Strategy {
     /// `tests/world_consistency.rs`'s dedicated regression test. This
     /// method plus `crate::drive::run_trace`'s new poll-scheduling make
     /// that wake instant visible to the driver without changing
-    /// `Strategy::decide`'s signature or any other PR-A behavior. (Two
-    /// further, distinct desyncs this same investigation found —
-    /// `notify` discarding `Proposal::Start`, and `on_restart` wiping
-    /// `completed` — are documented at `drain_pending_starts` and at
-    /// `tests/world_consistency.rs`'s t5 test, respectively; `next_wake`
-    /// alone does not fix either.)
+    /// `Strategy::decide`'s signature or any other PR-A behavior. (A
+    /// further, distinct desync this same investigation found —
+    /// `notify` discarding `Proposal::Start` — is documented at
+    /// `drain_pending_starts`; `next_wake` alone does not fix it. A third
+    /// desync this investigation found, `on_restart` wiping `completed`,
+    /// was fixed separately under HORO-1881 — see
+    /// `PacerState::restart_reset`'s docs and `on_restart` below.)
     fn next_wake(&self, _now: OffsetDateTime) -> Option<OffsetDateTime> {
         None
     }
@@ -161,8 +165,9 @@ pub trait Strategy {
     /// "throttle (never cancel)" is, in this strategy's actual observed
     /// behavior, a permanent cancel in practice — see
     /// `tests/verify_fixture_claims.rs`'s own doc comment for detail and
-    /// disclosure status (not fixed here; same `domain::pacing`
-    /// out-of-scope reasoning as `on_restart`'s `completed`-wipe above).
+    /// disclosure status (not fixed here — unlike `on_restart`'s former
+    /// `completed`-wipe, HORO-1881 scoped only that one finding; this t6
+    /// finding remains open and undisclosed-by-fix).
     fn drain_pending_starts(&mut self) -> Vec<u32> {
         Vec::new()
     }
@@ -380,12 +385,20 @@ impl Strategy for Paced {
     }
 
     fn on_restart(&mut self) {
-        // The t5 scenario: a daemon restart wipes `PacerState` exactly as
-        // it would wipe a real in-memory scheduler — every active hold,
-        // backoff ratio, and pending timer is gone. `scenario_tasks`/
-        // `windows`/`policy` survive (they are the frozen scenario
-        // definition, read from durable config, not runtime state).
-        self.state = PacerState::default();
+        // The t5 scenario: a daemon restart wipes every active hold,
+        // backoff ratio, and pending timer — genuinely ephemeral
+        // in-process scheduling state — but keeps `completed` and the
+        // other durable ground truth `PacerState::restart_reset`
+        // preserves (HORO-1881; see that method's own docs for the full
+        // field-by-field reasoning). Using `PacerState::default()` here
+        // instead used to also wipe `completed`, which permanently
+        // stranded any task whose dependency had already really
+        // completed before the restart — see `restart_reset`'s docs and
+        // `tests/world_consistency.rs`'s t5 coverage.
+        // `scenario_tasks`/`windows`/`policy` survive untouched (they are
+        // the frozen scenario definition, read from durable config, not
+        // runtime state).
+        self.state = self.state.restart_reset();
         self.seq = 0;
     }
 

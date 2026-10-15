@@ -63,9 +63,9 @@ fn paced_incompleteness_on_x0_is_a_real_quota_cutoff_not_a_false_throttle() {
 /// INSTANT: the world's own ground truth confirms capacity was
 /// available, and the strategy declined anyway.
 ///
-/// PR-B finding, NOT fixed here (same `domain::pacing` out-of-scope
-/// reasoning as `Strategy::on_restart`'s `completed`-wipe —
-/// `world_consistency.rs`'s own t5 test): t6's fixture description
+/// PR-B finding, NOT fixed here (unlike `Strategy::on_restart`'s former
+/// `completed`-wipe, which HORO-1881 fixed via `PacerState::restart_reset`
+/// — see `world_consistency.rs`'s t5 coverage): t6's fixture description
 /// itself says a pacing-aware strategy is "expected to throttle (never
 /// cancel)" the overrunning principal's later starts. The driver's own
 /// log (confirmed empirically) shows no further `Offered` entry for task
@@ -76,8 +76,8 @@ fn paced_incompleteness_on_x0_is_a_real_quota_cutoff_not_a_false_throttle() {
 /// throttle (not a hard-limit violation, not quota exhaustion), this
 /// test does NOT claim t6's overall behavior matches its own fixture
 /// description's "never cancel" promise. Recommended follow-up, same as
-/// `on_restart`'s: a human should decide whether this becomes a new
-/// Jira ticket or stays PR-body text.
+/// the `on_restart` finding that became HORO-1881: a human should decide
+/// whether this becomes a new Jira ticket or stays PR-body text.
 #[test]
 fn paced_holding_task2_on_t6_is_a_real_but_never_revisited_ac1_false_throttle() {
     let spec = fixtures::load("t6_overrun_backoff").unwrap();

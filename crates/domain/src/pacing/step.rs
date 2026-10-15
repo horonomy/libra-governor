@@ -162,6 +162,69 @@ impl PacerState {
     pub(super) fn usage_log(&self) -> &[QuotaUsage] {
         &self.usage_log
     }
+
+    /// The restart-safe reset a real daemon's own restart path should
+    /// use instead of [`PacerState::default`] (HORO-1881). A crash or
+    /// restart genuinely loses in-process scheduling state, but it does
+    /// not lose ground truth a daemon would reload from its ledger —
+    /// conflating the two let a restart silently and permanently strand
+    /// any task whose dependency was already real-world-complete: `Paced`
+    /// forgot that task was done, re-proposed starting it, the driver
+    /// correctly refused the re-proposal (ground truth disagreed), but
+    /// that refusal consumed the one Sustain-mode fanout slot the
+    /// dependent task needed and it was never reconsidered again (see
+    /// `crates/pacing-gate/tests/world_consistency.rs`'s former
+    /// `paced_currently_strands_a_dependent_task_after_a_restart_on_t5`).
+    ///
+    /// Kept (durable ground truth, reloadable from the ledger on a real
+    /// restart):
+    /// - `completed` — which tasks are really done; the exact fact the
+    ///   bug above wiped.
+    /// - `usage_log` — settled per-task spend. `step`'s own
+    ///   `TaskCompleted` arm always writes `completed` and `usage_log`
+    ///   together (see that match arm below), so "completed but no
+    ///   settlement record" is a state no sequence of `step()` calls can
+    ///   otherwise produce. Dropping it here would also understate every
+    ///   window's cumulative usage after a restart, letting a strategy
+    ///   over-admit against quota it has already really spent.
+    /// - `revised_estimates` — the latest known remaining-work estimate
+    ///   for a task that is neither active nor completed; this mirrors a
+    ///   forecast an estimator service would hand back again, not
+    ///   runtime scheduling state a crash would lose.
+    ///
+    /// Cleared (genuinely ephemeral in-process scheduling state):
+    /// - `active` — which tasks this process currently believes it
+    ///   started; a real restart has no way to know this on its own
+    ///   (reconstructing it is exactly the live-wiring work HORO-1727
+    ///   gates, out of scope here).
+    /// - `backoff_x100` — a per-principal throttle ratio derived purely
+    ///   from in-flight overruns this process observed.
+    /// - `spend_so_far` — keyed only by currently-active tasks; with
+    ///   `active` cleared these entries would just be orphaned.
+    /// - `pending_timer` — always recomputed by the next `step()` call
+    ///   (`step` unconditionally resets it to `None` before calling
+    ///   `try_admit`); carrying over a stale value here would be dead
+    ///   weight, never a correctness issue either way.
+    ///
+    /// Deliberately **not** cleared, though it is in-process state:
+    /// `last_start` — SUSTAIN's minimum-spacing floor between starts.
+    /// Wiping it would let a restart bypass spacing entirely (a
+    /// newly-ready task could start immediately after a restart even
+    /// though the real-world last start was moments ago), which is
+    /// exactly the kind of pacing violation this module exists to
+    /// prevent.
+    pub fn restart_reset(&self) -> Self {
+        Self {
+            completed: self.completed.clone(),
+            active: BTreeMap::new(),
+            backoff_x100: BTreeMap::new(),
+            last_start: self.last_start,
+            pending_timer: None,
+            usage_log: self.usage_log.clone(),
+            spend_so_far: BTreeMap::new(),
+            revised_estimates: self.revised_estimates.clone(),
+        }
+    }
 }
 
 /// Derives a [`ReservationId`] unique per `(window, task)` pair — a
@@ -980,6 +1043,169 @@ mod tests {
             t0 + time::Duration::seconds(2160),
             "task 2 must wait the full spacing interval from task 1's start, \
              not start the instant task 1 completes and frees a slot"
+        );
+    }
+
+    /// HORO-1881: `restart_reset` must preserve every field this module
+    /// considers durable ground truth and clear every field it considers
+    /// genuinely ephemeral scheduling state — asserted field-by-field
+    /// (not just "task 2 eventually completes", which the integration
+    /// test in `pacing-gate` already covers) so a future edit to either
+    /// list is caught here, at the source, regardless of whether any
+    /// particular fixture happens to exercise it.
+    #[test]
+    fn restart_reset_keeps_ground_truth_and_clears_ephemeral_scheduling_state() {
+        let tasks = TaskSet::validated(vec![
+            task_with_tokens(1, 100, 60),
+            task_with_tokens(2, 100, 60),
+        ])
+        .unwrap();
+        let w = window(1000, 21_600);
+        let scenario = Scenario {
+            tasks: &tasks,
+            windows: std::slice::from_ref(&w),
+            contract: None,
+            preference: PacingPreference::Sustain {
+                horizon_secs: 21_600,
+                working_hours: None,
+                continuity_reserve_bp: 0,
+            },
+        };
+        let t0 = OffsetDateTime::UNIX_EPOCH;
+
+        // Drive task 1 to completion (with an overrun, so `backoff_x100`
+        // is populated) and task 2 into `active`, so every field this
+        // test cares about is non-default before the reset.
+        let (state, _) = step(
+            &PacerState::default(),
+            &PacingEvent::ModeChanged { at: t0, seq: 0 },
+            &policy(),
+            &scenario,
+        );
+        let (state, _) = step(
+            &state,
+            &PacingEvent::Spend {
+                at: t0 + time::Duration::seconds(10),
+                seq: 1,
+                task: SimTaskId(1),
+                amount: QuotaAmount::new(QuotaUnit::Tokens, 500),
+            },
+            &policy(),
+            &scenario,
+        );
+        let (state, _) = step(
+            &state,
+            &PacingEvent::TaskCompleted {
+                at: t0 + time::Duration::seconds(60),
+                seq: 2,
+                task: SimTaskId(1),
+            },
+            &policy(),
+            &scenario,
+        );
+        assert!(state.completed.contains(&SimTaskId(1)));
+        assert!(
+            !state.usage_log.is_empty(),
+            "precondition: task 1's completion must have settled some usage"
+        );
+        assert!(
+            !state.backoff_x100.is_empty(),
+            "precondition: the overrun must have set a backoff ratio"
+        );
+        assert!(state.last_start.is_some());
+
+        let reset = state.restart_reset();
+
+        // Ground truth: preserved exactly.
+        assert_eq!(
+            reset.completed, state.completed,
+            "completed tasks must survive a restart"
+        );
+        assert_eq!(
+            reset.usage_log, state.usage_log,
+            "settled usage history must survive a restart"
+        );
+        assert_eq!(
+            reset.revised_estimates, state.revised_estimates,
+            "revised estimates must survive a restart"
+        );
+        assert_eq!(
+            reset.last_start, state.last_start,
+            "SUSTAIN's spacing floor must survive a restart — wiping it \
+             would let a restart bypass minimum spacing between starts"
+        );
+
+        // Ephemeral scheduling state: cleared.
+        assert!(
+            reset.active.is_empty(),
+            "in-process belief about which tasks are active must not survive a restart"
+        );
+        assert!(
+            reset.backoff_x100.is_empty(),
+            "a per-principal backoff ratio is in-process throttle state, not ground truth"
+        );
+        assert!(
+            reset.spend_so_far.is_empty(),
+            "spend-so-far is keyed only by active tasks and must not outlive them"
+        );
+        assert_eq!(
+            reset.pending_timer, None,
+            "pending_timer is always recomputed by the next step() call"
+        );
+    }
+
+    /// A first-ever restart (no completed tasks, no settled usage, no
+    /// backoff) must be a no-op — `restart_reset` on a freshly-default
+    /// state stays default. Guards against a field being cleared to
+    /// something other than its `Default` value.
+    #[test]
+    fn restart_reset_on_a_fresh_state_is_a_no_op() {
+        let state = PacerState::default();
+        assert_eq!(state.restart_reset(), PacerState::default());
+    }
+
+    /// Multiple sequential restarts with no intervening activity must be
+    /// idempotent: resetting an already-reset state changes nothing
+    /// further. This is the "multiple sequential restarts" case the
+    /// ticket asks for — covered as an equivalence check here rather than
+    /// a third near-identical fixture replay.
+    #[test]
+    fn restart_reset_is_idempotent() {
+        let tasks = TaskSet::validated(vec![task_with_tokens(1, 100, 60)]).unwrap();
+        let w = window(1000, 21_600);
+        let scenario = Scenario {
+            tasks: &tasks,
+            windows: std::slice::from_ref(&w),
+            contract: None,
+            preference: PacingPreference::Sustain {
+                horizon_secs: 21_600,
+                working_hours: None,
+                continuity_reserve_bp: 0,
+            },
+        };
+        let t0 = OffsetDateTime::UNIX_EPOCH;
+        let (state, _) = step(
+            &PacerState::default(),
+            &PacingEvent::ModeChanged { at: t0, seq: 0 },
+            &policy(),
+            &scenario,
+        );
+        let (state, _) = step(
+            &state,
+            &PacingEvent::TaskCompleted {
+                at: t0 + time::Duration::seconds(60),
+                seq: 1,
+                task: SimTaskId(1),
+            },
+            &policy(),
+            &scenario,
+        );
+
+        let once = state.restart_reset();
+        let twice = once.restart_reset();
+        assert_eq!(
+            once, twice,
+            "resetting an already-reset state must be a no-op (idempotent)"
         );
     }
 }
