@@ -540,6 +540,23 @@ fn remove_locked(path: &Path) -> Result<Removed, SettingsError> {
                         matchers_to_drop.push(idx);
                     }
                 }
+                // Unlike `codex_hooks_file::remove_locked` (HORO-1876),
+                // this unconditional `Vec::remove` is intentional, not a
+                // bug: Claude Code's hook trust is not keyed by array
+                // position. Trust is granted at a folder/session scope
+                // (a workspace-trust dialog gates hooks from every
+                // settings file for that folder, including the
+                // user-level `~/.claude/settings.json` this module edits,
+                // in interactive sessions) — there is no documented or
+                // observed `(event, group_idx, handler_idx)`-keyed trust state for
+                // Claude Code to invalidate by shifting a later foreign
+                // group's index, the way Codex's `[hooks.state]` has
+                // (HORO-1877 investigation: official Claude Code hooks
+                // docs describe file/workspace-scoped trust only, and a
+                // local `~/.claude.json` has no per-hook-entry state —
+                // only aggregate duration metrics). Do not port Codex's
+                // tail-check/tombstone fix here without new evidence that
+                // this has changed.
                 for idx in matchers_to_drop.into_iter().rev() {
                     entries_arr.remove(idx);
                 }

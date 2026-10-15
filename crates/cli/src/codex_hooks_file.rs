@@ -466,10 +466,14 @@ pub struct Removed {
 /// Removes only Governor-owned hook groups from `path["hooks"]` —
 /// pruning empty matchers/event-arrays only when our removal is what
 /// emptied them, and pruning the `"hooks"` key itself only when doing so
-/// leaves it empty, mirroring `claude_settings::remove`'s discipline
-/// exactly. Every other key (including `description`), and every
-/// foreign entry inside an event's array, is left exactly as it was. A
-/// missing file is a safe no-op.
+/// leaves it empty, mirroring `claude_settings::remove`'s discipline for
+/// everything except the index-shift tombstone behavior below, which is
+/// Codex-specific (HORO-1877: Claude Code's hook trust is not keyed by
+/// array position the way Codex's is, so `claude_settings::remove` uses
+/// a plain unconditional `Vec::remove` — see that function's docs).
+/// Every other key (including `description`), and every foreign entry
+/// inside an event's array, is left exactly as it was. A missing file is
+/// a safe no-op.
 pub fn remove(path: &Path) -> Result<Removed, CodexHooksError> {
     with_write_lock(path, || remove_locked(path))
 }
