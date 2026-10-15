@@ -38,3 +38,8 @@ trusted-principal = ["libra-governor-daemon/trusted-principal"]
 
 [dev-dependencies]
 tempfile.workspace = true
+# Test-only (HORO-1768 PR-C): cross-checks the real launch gate's observed
+# admission/occupancy against `pacing-gate`'s independent simulation
+# harness in `tests/launch_live_occupancy_consistency.rs`. Never used from
+# `src/` — see that test file's own module docs.
+libra-governor-pacing-gate = { path = "../pacing-gate" }

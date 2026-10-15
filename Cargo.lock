@@ -703,6 +703,7 @@ dependencies = [
  "libra-governor-extension",
  "libra-governor-gateway",
  "libra-governor-ledger",
+ "libra-governor-pacing-gate",
  "libra-governor-protocol",
  "libra-governor-quota-observation",
  "libra-governor-quota-source",
