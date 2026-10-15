@@ -41,7 +41,11 @@
 //!   measured over two real local transcripts, per-turn totals were p50
 //!   ~370k-510k including cache creation but ~7.7M-11.3M once cache reads
 //!   were added — a ~25x inflation that describes caching mechanics
-//!   rather than work performed.
+//!   rather than work performed. (These absolute figures predate the
+//!   per-content-block dedup added for HORO-1882 below and are very
+//!   likely inflated by that separate, now-fixed double-count; the ~25x
+//!   *ratio* between the two totals is unaffected, since both sides of
+//!   it carried the same double-count.)
 //!
 //! All four raw counts are read and summed into [`TurnUsage`] regardless,
 //! so the choice above is auditable, and changing it later needs no
@@ -102,13 +106,50 @@
 //! or carry a synthetic total-only figure after a context-window fill),
 //! so they are never counted alongside the records.
 //!
+//! # Claude Code duplicate lines per turn (HORO-1882)
+//!
+//! Claude Code writes one `assistant` transcript line per *content
+//! block* of a turn (text, `tool_use`, …), not one line per turn. Every
+//! line belonging to the same logical turn repeats the identical
+//! `message.usage` object and shares the same `message.id`. Summing every
+//! line therefore summed the same usage once per content block, not once
+//! per turn. Checked across every local Claude Code transcript (18
+//! files, 959,855 lines): 86,281 `message.id`s appeared on more than one
+//! line, and every one of them carried byte-identical usage on each
+//! repeat — zero divergence observed. An earlier, smaller sample (4
+//! transcripts) estimated the resulting inflation of `fresh_tokens()` at
+//! roughly 2.14x-2.39x; that figure predates this fix and most likely
+//! carries the same double-count itself, so treat it as an order of
+//! magnitude, not a precise before/after ratio.
+//!
+//! This is fixed by deduplicating on `message.id`: each id is counted
+//! once, taking the per-field **maximum** across its repeated lines
+//! rather than assuming they are always byte-identical (a safety margin,
+//! not an expectation of divergence). A line with no `message.id` is
+//! summed exactly as before — this preserves behavior for any
+//! transcript shape (e.g. Codex's) that does not carry one. The id is
+//! used only as an in-memory dedup key for the duration of one scan; it
+//! is never retained, logged, or returned.
+//!
+//! Dedup is scoped to a single [`observe_transcript_window`] call, not
+//! across calls: if a turn's content-block lines straddle a window
+//! boundary (an earlier line settled by a previous receipt, a later line
+//! falling in the next window), each window counts that id once, so the
+//! turn can still be counted twice in total. This residual is strictly
+//! smaller than the prior bug, which double- or triple-counted it inside
+//! a single window too, and closing it needs a boundary concept this
+//! module doesn't have today — out of scope here.
+//!
 //! # Privacy
 //!
 //! The transcript is the single most sensitive local artifact this
 //! product can see: it holds prompts, file contents and tool output. This
-//! module reads it and extracts **only** the four integer counts above.
-//! Parsing goes through the narrow [`TranscriptRecord`] and
-//! [`CodexUsageRecord`] structs rather than a `serde_json::Value`, so message content is skipped during
+//! module reads it and extracts **only** the four integer counts above,
+//! plus — for a Claude Code `assistant` line — `message.id`, an opaque
+//! dedup key (see the duplicate-lines section above) that is held only
+//! in a local scan-scoped map and dropped when the scan returns. Parsing
+//! goes through the narrow [`TranscriptRecord`] and [`CodexUsageRecord`]
+//! structs rather than a `serde_json::Value`, so message content is skipped during
 //! deserialization instead of being materialized into an owned tree. No
 //! text is retained, returned, logged, or included in any error: the
 //! error type carries a reason code, never a line, a path excerpt, or a
@@ -167,7 +208,10 @@ pub struct TurnUsage {
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
     pub output_tokens: u64,
-    /// How many usage records contributed. Zero means the window
+    /// How many *distinct* turns contributed: one per unique
+    /// `message.id` (HORO-1882 dedup) plus one per id-less line. Not a
+    /// raw transcript-line count — a turn written as several
+    /// content-block lines still counts once. Zero means the window
     /// contained no usage-bearing record at all, which is reported as
     /// [`UsageUnavailable::NoUsageInWindow`] rather than as a measured
     /// zero — see that variant's docs.
@@ -283,6 +327,17 @@ struct TranscriptRecord {
 
 #[derive(Deserialize)]
 struct TranscriptMessage {
+    /// Shared by every content-block line of the same logical turn
+    /// (HORO-1882) — the dedup key `scan` groups repeated lines by.
+    /// Absent or explicit `null` gives `None`, and such a line is summed
+    /// rather than deduplicated, exactly as every line was before this
+    /// fix. A `message.id` that is present but not a string would fail
+    /// this whole record's parse (losing its usage and its timestamp),
+    /// not fall back to `None` — verified against every local Claude
+    /// Code transcript (959,855 lines across 18 files) that `message.id`
+    /// is always absent or a string, never another JSON type.
+    #[serde(default)]
+    id: Option<String>,
     usage: Option<RawUsage>,
 }
 
@@ -481,11 +536,19 @@ fn scan(
     scan_cap_bytes: u64,
 ) -> Result<TurnUsage, UsageUnavailable> {
     let mut usage = TurnUsage::default();
+    // Claude Code writes one line per content block of a turn, repeating
+    // the same `message.id` and identical usage on each (HORO-1882). Keyed
+    // lines are grouped here and folded into `usage` — once per id, by
+    // per-field maximum — only after the scan finishes; id-less lines
+    // (any other transcript shape, e.g. Codex's) go straight into `usage`
+    // exactly as before. The map lives only for this call and is dropped
+    // when it returns — the id itself never leaves this function.
+    let mut by_id: std::collections::HashMap<String, RawUsage> = std::collections::HashMap::new();
     let end = scan_lines_backward(path, scan_cap_bytes, |line| {
         match consider_line(line, window_start) {
             LineVerdict::Older => ControlFlow::Break(()),
             LineVerdict::Skip => ControlFlow::Continue(()),
-            LineVerdict::Counted(raw) => {
+            LineVerdict::Counted(None, raw) => {
                 usage.input_tokens = usage
                     .input_tokens
                     .saturating_add(raw.input_tokens.unwrap_or(0));
@@ -501,8 +564,56 @@ fn scan(
                 usage.records += 1;
                 ControlFlow::Continue(())
             }
+            LineVerdict::Counted(Some(id), raw) => {
+                let entry = by_id.entry(id).or_insert(RawUsage {
+                    input_tokens: Some(0),
+                    cache_creation_input_tokens: Some(0),
+                    cache_read_input_tokens: Some(0),
+                    output_tokens: Some(0),
+                });
+                entry.input_tokens = Some(
+                    entry
+                        .input_tokens
+                        .unwrap_or(0)
+                        .max(raw.input_tokens.unwrap_or(0)),
+                );
+                entry.cache_creation_input_tokens = Some(
+                    entry
+                        .cache_creation_input_tokens
+                        .unwrap_or(0)
+                        .max(raw.cache_creation_input_tokens.unwrap_or(0)),
+                );
+                entry.cache_read_input_tokens = Some(
+                    entry
+                        .cache_read_input_tokens
+                        .unwrap_or(0)
+                        .max(raw.cache_read_input_tokens.unwrap_or(0)),
+                );
+                entry.output_tokens = Some(
+                    entry
+                        .output_tokens
+                        .unwrap_or(0)
+                        .max(raw.output_tokens.unwrap_or(0)),
+                );
+                ControlFlow::Continue(())
+            }
         }
     })?;
+    for (_, raw) in by_id {
+        usage.input_tokens = usage
+            .input_tokens
+            .saturating_add(raw.input_tokens.unwrap_or(0));
+        usage.cache_creation_input_tokens = usage
+            .cache_creation_input_tokens
+            .saturating_add(raw.cache_creation_input_tokens.unwrap_or(0));
+        usage.cache_read_input_tokens = usage
+            .cache_read_input_tokens
+            .saturating_add(raw.cache_read_input_tokens.unwrap_or(0));
+        usage.output_tokens = usage
+            .output_tokens
+            .saturating_add(raw.output_tokens.unwrap_or(0));
+        usage.records += 1;
+    }
     match end {
         // A record older than the window, or the start of the file: either
         // way the window has been read in full.
@@ -516,7 +627,11 @@ enum LineVerdict {
     Skip,
     /// Older than the window: the backwards scan is done.
     Older,
-    Counted(RawUsage),
+    /// A usage-bearing record. `Some(id)` is a Claude Code `message.id`
+    /// used to deduplicate repeated content-block lines of the same turn
+    /// (HORO-1882); `None` means this record carries no such key and is
+    /// summed unconditionally, as every record was before this fix.
+    Counted(Option<String>, RawUsage),
 }
 
 fn consider_line(line: &[u8], window_start: OffsetDateTime) -> LineVerdict {
@@ -540,8 +655,11 @@ fn consider_line(line: &[u8], window_start: OffsetDateTime) -> LineVerdict {
         }
     }
     match record.kind.as_deref() {
-        Some("assistant") => match record.message.and_then(|m| m.usage) {
-            Some(raw) => LineVerdict::Counted(raw),
+        Some("assistant") => match record.message {
+            Some(message) => match message.usage {
+                Some(raw) => LineVerdict::Counted(message.id, raw),
+                None => LineVerdict::Skip,
+            },
             None => LineVerdict::Skip,
         },
         // Parsed a second time, narrowly, only once the tag matches: a
@@ -549,7 +667,7 @@ fn consider_line(line: &[u8], window_start: OffsetDateTime) -> LineVerdict {
         // make every line whose payload has another shape fail to parse,
         // losing its timestamp and with it the window boundary.
         Some(CODEX_USAGE_RECORD) => match serde_json::from_slice::<CodexUsageRecord>(line) {
-            Ok(record) => LineVerdict::Counted(record.payload.usage.into_disjoint()),
+            Ok(record) => LineVerdict::Counted(None, record.payload.usage.into_disjoint()),
             Err(_) => LineVerdict::Skip,
         },
         _ => LineVerdict::Skip,
@@ -580,6 +698,22 @@ mod tests {
         )
     }
 
+    /// Mirrors a real Claude Code `assistant` transcript line, which
+    /// carries `message.id` alongside `message.usage` (HORO-1882). Claude
+    /// Code writes one such line per content block of a turn, repeating
+    /// the same id and usage on each.
+    fn assistant_with_id(secs: i64, id: &str, input: u64, cc: u64, cr: u64, out: u64) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"{}","message":{{"id":"{}","usage":{{"input_tokens":{},"cache_creation_input_tokens":{},"cache_read_input_tokens":{},"output_tokens":{}}}}}}}"#,
+            rfc(secs),
+            id,
+            input,
+            cc,
+            cr,
+            out
+        )
+    }
+
     fn write_transcript(lines: &[String]) -> tempfile::NamedTempFile {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         for line in lines {
@@ -599,6 +733,141 @@ mod tests {
         assert_eq!(usage.cache_creation_input_tokens, 22);
         assert_eq!(usage.cache_read_input_tokens, 33);
         assert_eq!(usage.output_tokens, 44);
+    }
+
+    #[test]
+    fn repeated_message_id_with_identical_usage_counts_once() {
+        // Three content-block lines of the same turn: text, tool_use,
+        // tool_use — same `message.id`, identical usage on each, the
+        // exact shape Claude Code writes (HORO-1882).
+        let f = write_transcript(&[
+            assistant_with_id(100, "msg_dup", 10, 20, 30, 40),
+            assistant_with_id(100, "msg_dup", 10, 20, 30, 40),
+            assistant_with_id(100, "msg_dup", 10, 20, 30, 40),
+        ]);
+        let observed = observe_transcript_window(f.path(), epoch_plus(50), DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().expect("the turn is in the window");
+        assert_eq!(
+            usage.records, 1,
+            "three lines of the same turn must count as one measurement, not three"
+        );
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.cache_creation_input_tokens, 20);
+        assert_eq!(usage.cache_read_input_tokens, 30);
+        assert_eq!(usage.output_tokens, 40);
+    }
+
+    #[test]
+    fn distinct_message_ids_each_count_independently() {
+        let f = write_transcript(&[
+            assistant_with_id(100, "msg_a", 10, 0, 0, 10),
+            assistant_with_id(200, "msg_b", 5, 0, 0, 5),
+        ]);
+        let observed = observe_transcript_window(f.path(), epoch_plus(50), DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().expect("both turns are in the window");
+        assert_eq!(usage.records, 2);
+        assert_eq!(usage.input_tokens, 15);
+        assert_eq!(usage.output_tokens, 15);
+    }
+
+    #[test]
+    fn a_line_with_no_message_id_is_summed_exactly_as_before() {
+        // No regression for a transcript shape (or fixture) that carries
+        // no `message.id` at all: every line is still summed.
+        let f = write_transcript(&[assistant(100, 10, 0, 0, 10), assistant(100, 10, 0, 0, 10)]);
+        let observed = observe_transcript_window(f.path(), epoch_plus(50), DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed
+            .measured()
+            .expect("both id-less lines are in the window");
+        assert_eq!(
+            usage.records, 2,
+            "id-less lines have no dedup key available and must be summed, same as before HORO-1882"
+        );
+        assert_eq!(usage.input_tokens, 20);
+        assert_eq!(usage.output_tokens, 20);
+    }
+
+    #[test]
+    fn repeated_message_id_with_divergent_usage_takes_the_per_field_maximum() {
+        // Not the normal case (repeated lines are identical in practice),
+        // but the rule must be pinned so a future change cannot quietly
+        // become "first wins" or "last wins" for a genuinely divergent
+        // report.
+        let f = write_transcript(&[
+            assistant_with_id(100, "msg_dup", 10, 5, 100, 1),
+            assistant_with_id(100, "msg_dup", 3, 20, 2, 40),
+        ]);
+        let observed = observe_transcript_window(f.path(), epoch_plus(50), DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().expect("the turn is in the window");
+        assert_eq!(usage.records, 1);
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.cache_creation_input_tokens, 20);
+        assert_eq!(usage.cache_read_input_tokens, 100);
+        assert_eq!(usage.output_tokens, 40);
+    }
+
+    #[test]
+    fn a_deduped_turn_and_an_id_less_line_both_contribute() {
+        let f = write_transcript(&[
+            assistant_with_id(100, "msg_dup", 10, 0, 0, 10),
+            assistant_with_id(100, "msg_dup", 10, 0, 0, 10),
+            assistant(200, 1, 0, 0, 1),
+        ]);
+        let observed = observe_transcript_window(f.path(), epoch_plus(50), DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().expect("both are in the window");
+        assert_eq!(usage.records, 2, "one deduped turn plus one id-less line");
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.output_tokens, 11);
+    }
+
+    /// A realistic multi-turn fixture: each turn has 2-4 content-block
+    /// lines sharing one `message.id` and identical usage, interleaved
+    /// with `user`/tool-result lines that carry no usage at all — the
+    /// shape a real Claude Code transcript has (HORO-1882 AC4).
+    #[test]
+    fn realistic_multi_turn_fixture_shows_deduped_not_summed_total() {
+        let lines = vec![
+            r#"{"type":"user","timestamp":"1970-01-01T00:01:40Z","message":{"content":"do the thing"}}"#.to_string(),
+            assistant_with_id(101, "msg_test_1", 1000, 200, 0, 50),
+            assistant_with_id(102, "msg_test_1", 1000, 200, 0, 50),
+            r#"{"type":"user","timestamp":"1970-01-01T00:01:43Z","message":{"content":"tool_result"}}"#.to_string(),
+            assistant_with_id(104, "msg_test_1", 1000, 200, 0, 50),
+            assistant_with_id(105, "msg_test_2", 500, 1300, 0, 30),
+            assistant_with_id(106, "msg_test_2", 500, 1300, 0, 30),
+            assistant_with_id(107, "msg_test_2", 500, 1300, 0, 30),
+            assistant_with_id(108, "msg_test_2", 500, 1300, 0, 30),
+        ];
+        let f = write_transcript(&lines);
+        let observed = observe_transcript_window(f.path(), epoch_plus(50), DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().expect("both turns are in the window");
+
+        assert_eq!(
+            usage.records, 2,
+            "two logical turns, however many content-block lines each wrote"
+        );
+        let deduped_fresh = usage.fresh_tokens();
+        assert_eq!(deduped_fresh, (1000 + 200 + 50) + (500 + 1300 + 30));
+
+        // Naive per-line sum: 3 lines for turn 1, 4 lines for turn 2, each
+        // repeating its turn's identical fresh-token total.
+        let naive_summed_fresh: u64 = 3 * (1000 + 200 + 50) + 4 * (500 + 1300 + 30);
+        assert!(
+            deduped_fresh < naive_summed_fresh,
+            "deduplicated total must be smaller than the naive per-line sum"
+        );
+        // This fixture's own inflation factor (~3.59x, driven by its 3-
+        // and 4-line turns) is a separate figure from the 2.14x-2.39x
+        // measured directly on real transcripts for HORO-1882 — the two
+        // are not expected to match, since real turns vary in how many
+        // content blocks they write. What this fixture pins down is only
+        // that summing instead of deduplicating inflates the total at
+        // all, and by more than a rounding amount.
+        let inflation_factor = naive_summed_fresh as f64 / deduped_fresh as f64;
+        assert!(
+            inflation_factor > 1.5,
+            "this fixture's repeated-line shape should produce a clearly inflated naive sum; \
+             got {inflation_factor}x"
+        );
     }
 
     #[test]
