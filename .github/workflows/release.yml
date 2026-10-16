@@ -70,10 +70,16 @@ jobs:
             os: ubuntu-latest
             runnable: true
     runs-on: ${{ matrix.os }}
+    # No id-token/attestations:write here deliberately: this job runs
+    # `cargo build` over third-party dependency source (build.rs/proc-macro
+    # code executes during compilation). Granting attestation-signing
+    # permission to a job that compiles untrusted code is a known
+    # privilege-escalation vector — a malicious build script could misuse
+    # the OIDC token to forge an attestation for arbitrary content, not
+    # just this binary. Attestation happens in the separate `attest` job
+    # below, which never builds anything.
     permissions:
       contents: read
-      id-token: write
-      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -126,19 +132,6 @@ jobs:
           tar -czf "dist/${{ env.RELEASE_BIN }}-${{ matrix.target }}.tar.gz" -C dist "${{ env.RELEASE_BIN }}-${{ matrix.target }}"
           shasum -a 256 "dist/${{ env.RELEASE_BIN }}-${{ matrix.target }}.tar.gz" > "dist/${{ env.RELEASE_BIN }}-${{ matrix.target }}.tar.gz.sha256"
 
-      # Attested here, in the same job and on the same runner that produced
-      # the tarball — not after a round-trip through actions/upload-artifact
-      # in a separate job. Attesting a copy fetched back from artifact
-      # storage would open a window between "built" and "attested" where a
-      # substituted file could be signed instead of the real one; attesting
-      # the in-place file closes that window entirely. Safe on a fork PR or
-      # a Dependabot bump too: id-token/attestations:write are never granted
-      # to those tokens, so this step fails closed there rather than
-      # silently skipping, without blocking the rest of that PR's CI.
-      - uses: actions/attest-build-provenance@bd77c077858b8d561b7a36cbe48ef4cc642ca39d # v2.2.2
-        with:
-          subject-path: "dist/${{ env.RELEASE_BIN }}-${{ matrix.target }}.tar.gz"
-
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ env.RELEASE_BIN }}-${{ matrix.target }}
@@ -148,12 +141,44 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
+  # Deliberately a separate job from `build`, not a step inside it: this
+  # job never runs `cargo build` or any other third-party code, so it is
+  # safe to grant it id-token/attestations:write — there is nothing here
+  # that untrusted dependency code could run to misuse that permission.
+  # It only downloads the already-built tarball and signs its digest.
+  # Fork-PR/Dependabot runs never reach id-token/attestations:write at
+  # all (those tokens don't carry it), so this job's attestation step
+  # fails closed there without blocking the rest of that PR's CI.
+  attest:
+    name: attest provenance (${{ matrix.target }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+          - x86_64-unknown-linux-gnu
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ env.RELEASE_BIN }}-${{ matrix.target }}
+          path: dist
+      - uses: actions/attest-build-provenance@bd77c077858b8d561b7a36cbe48ef4cc642ca39d # v2.2.2
+        with:
+          subject-path: "dist/${{ env.RELEASE_BIN }}-${{ matrix.target }}.tar.gz"
+
   # Only reachable on an actual `v*` tag push. Not authorized to run yet
   # per HORO-1857 comment 27544 — implemented so the file is complete and
   # reviewable, never exercised without a separately authorized tag push.
   create-release:
     name: publish GitHub Release
-    needs: build
+    needs: [build, attest]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
