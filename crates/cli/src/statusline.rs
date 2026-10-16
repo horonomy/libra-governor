@@ -138,6 +138,7 @@ mod tests {
             task_budget: None,
             task_budget_amounts: None,
             configured_budget: None,
+            task_budget_freshness: None,
         }
     }
 
@@ -182,9 +183,49 @@ mod tests {
                 task_budget: Some(posture),
                 task_budget_amounts: None,
                 configured_budget: None,
+                task_budget_freshness: None,
             });
             assert_eq!(line, baseline, "{posture:?} changed the legacy line");
             assert!(!line.contains('%'));
+        }
+    }
+
+    /// HORO-1904 put a *freshness* reading on the same reply. Same legacy
+    /// surface, same rule: the founder's grep-based wrapper reads this
+    /// line, and a stale/unknown reading changing it would break that
+    /// wrapper just as silently as a budget share would have.
+    #[test]
+    fn the_parsed_compatibility_line_is_unaffected_by_ledger_freshness() {
+        use libra_governor_protocol::LedgerFreshness;
+
+        let task = sample_task(ReplanState::Stable);
+        let baseline = format_status(&status_for(Some(task.clone())));
+        for freshness in [
+            None,
+            Some(LedgerFreshness::Fresh { age_secs: 5 }),
+            Some(LedgerFreshness::Stale { age_secs: 10_000 }),
+            Some(LedgerFreshness::Unknown {
+                reason: libra_governor_protocol::LedgerFreshnessUnknown::NoTimestamp,
+            }),
+            Some(LedgerFreshness::Unknown {
+                reason: libra_governor_protocol::LedgerFreshnessUnknown::TimestampInFuture,
+            }),
+        ] {
+            let line = format_status(&StatusResult {
+                scope: libra_governor_protocol::StatusScope::HostLatestObservation,
+                current_task: Some(task.clone()),
+                task_budget: Some(BudgetPosture::Remaining {
+                    fraction_left: 0.38,
+                }),
+                task_budget_amounts: None,
+                configured_budget: None,
+                task_budget_freshness: freshness,
+            });
+            assert_eq!(line, baseline, "{freshness:?} changed the legacy line");
+            assert!(!line.contains('%'));
+            assert!(
+                !line.contains("stale") && !line.contains("fresh") && !line.contains("unknown")
+            );
         }
     }
 
@@ -220,6 +261,9 @@ mod tests {
             )),
             configured_budget: Some(ConfiguredBudget {
                 ceiling: ResourceAmount::Tokens(150_000),
+            }),
+            task_budget_freshness: Some(libra_governor_protocol::LedgerFreshness::Fresh {
+                age_secs: 5,
             }),
         });
         assert_eq!(line, baseline, "budget amounts changed the legacy line");
