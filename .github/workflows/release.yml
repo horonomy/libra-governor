@@ -24,12 +24,20 @@ on:
       - ".github/workflows/release.yml"
       - "Cargo.toml"
       - "Cargo.lock"
+      # Every crate libra-governor-cli transitively depends on (verified via
+      # `cargo tree -p libra-governor-cli -e normal`), so a PR touching any
+      # of them actually triggers this build-only validation.
       - "crates/cli/**"
       - "crates/daemon/**"
       - "crates/domain/**"
       - "crates/protocol/**"
       - "crates/ledger/**"
       - "crates/estimator/**"
+      - "crates/evidence-adapter/**"
+      - "crates/extension/**"
+      - "crates/gateway/**"
+      - "crates/quota-observation/**"
+      - "crates/quota-source/**"
   workflow_dispatch: {}
   push:
     tags:
@@ -89,7 +97,7 @@ jobs:
           # synthetic merge ref that doesn't exist on any branch.
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch @ 2026-09-18
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch, pinned (reused from ci.yml)
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
@@ -130,7 +138,12 @@ jobs:
           # does not preserve the executable bit, so an unpacked download
           # would need a chmod the real distribution path won't have.
           tar -czf "dist/${{ env.RELEASE_BIN }}-${{ matrix.target }}.tar.gz" -C dist "${{ env.RELEASE_BIN }}-${{ matrix.target }}"
-          shasum -a 256 "dist/${{ env.RELEASE_BIN }}-${{ matrix.target }}.tar.gz" > "dist/${{ env.RELEASE_BIN }}-${{ matrix.target }}.tar.gz.sha256"
+          # cd into dist first: shasum records whatever path it's given
+          # inside the .sha256 file, and a consumer who downloads both
+          # release assets into one directory and runs `shasum -c` expects
+          # a bare filename there, not a dist/-prefixed path that won't
+          # resolve relative to their own cwd.
+          (cd dist && shasum -a 256 "${{ env.RELEASE_BIN }}-${{ matrix.target }}.tar.gz" > "${{ env.RELEASE_BIN }}-${{ matrix.target }}.tar.gz.sha256")
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -152,6 +165,13 @@ jobs:
   attest:
     name: attest provenance (${{ matrix.target }})
     needs: build
+    # Skipped on pull_request: attestation writes a permanent, public
+    # Sigstore Rekor transparency-log entry. That's an irreversible public
+    # side effect that shouldn't happen on every routine PR build of a
+    # not-yet-authorized release artifact. workflow_dispatch and the real
+    # tag-push path still run it, which is enough to validate the mechanism
+    # and to attest anything that actually becomes a release.
+    if: github.event_name != 'pull_request'
     strategy:
       fail-fast: false
       matrix:
@@ -176,10 +196,17 @@ jobs:
   # Only reachable on an actual `v*` tag push. Not authorized to run yet
   # per HORO-1857 comment 27544 — implemented so the file is complete and
   # reviewable, never exercised without a separately authorized tag push.
+  #
+  # The event_name check matters as much as the ref check: workflow_dispatch
+  # can be run against any existing ref, including a pre-existing `v*` tag
+  # (this repo already has v0.0.1/v0.0.2) — a dispatch against such a tag
+  # would set github.ref to refs/tags/v0.0.1 and satisfy a ref-only check,
+  # publishing a release without a real tag push ever happening. Requiring
+  # github.event_name == 'push' closes that.
   create-release:
     name: publish GitHub Release
     needs: [build, attest]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
