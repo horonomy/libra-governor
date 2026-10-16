@@ -305,9 +305,16 @@ fn resolve_trust(matches: &[&RemoteHookEntry]) -> HookTrust {
         [entry] => resolve_single_entry(entry),
         many => {
             let first = &many[0];
-            let all_agree = many.iter().all(|e| {
-                e.trust_status == first.trust_status && e.current_hash == first.current_hash
-            });
+            // Every field this function's trust decision depends on must
+            // agree, not just trust_status/current_hash — a security
+            // review (HORO-1906) found that comparing only those two
+            // fields let a second matching entry's `enabled: false` or
+            // non-empty `source_errors` be silently dropped whenever
+            // `first` happened to be the clean/enabled one, which could
+            // report Trusted on conflicting evidence. Compare the whole
+            // entry (`RemoteHookEntry` derives `PartialEq`) so any
+            // disagreement on any field is conflicting evidence.
+            let all_agree = many.iter().all(|e| e == first);
             if all_agree {
                 resolve_single_entry(first)
             } else {
@@ -332,11 +339,21 @@ fn resolve_single_entry(entry: &RemoteHookEntry) -> HookTrust {
             ),
         };
     }
-    if entry.enabled == Some(false) {
+    // Fail closed: trusted requires an explicit `enabled: true`, not
+    // merely the absence of `enabled: false`. A security review
+    // (HORO-1906) found that a missing `enabled` field (schema drift, or
+    // a non-standard responder) fell through to the trust_status check
+    // below and could report Trusted with enabled-ness genuinely
+    // unknown — this treats "unknown" the same as "disabled" here,
+    // matching the module's own doc claim that schema drift degrades to
+    // Unknown.
+    if entry.enabled != Some(true) {
         return HookTrust::Unknown {
-            reason: "Codex reports this hook as disabled (enabled: false) — even if trusted by \
-                     hash, Codex will not run it"
-                .to_string(),
+            reason: format!(
+                "Codex did not report this hook as enabled (enabled: {:?}) — even if trusted by \
+                 hash, an entry that is not confirmed enabled may not actually run",
+                entry.enabled
+            ),
         };
     }
     match (&entry.trust_status, &entry.current_hash) {
@@ -628,6 +645,25 @@ mod tests {
         assert!(matches!(trust, HookTrust::Unknown { .. }));
     }
 
+    // Regression test (security review, HORO-1906): agreement across
+    // duplicate matches must be checked on the WHOLE entry, not just
+    // trust_status/current_hash — otherwise a second matching entry's
+    // `enabled: false` could be silently dropped whenever the first
+    // matched entry happened to be the clean/enabled one.
+    #[test]
+    fn resolve_trust_duplicates_agreeing_on_hash_but_disagreeing_on_enabled_is_unknown() {
+        let a = entry("stop", "/bin/x stop", "/x/hooks.json", "trusted", "h1");
+        let mut b = entry("stop", "/bin/x stop", "/x/hooks.json", "trusted", "h1");
+        b.enabled = Some(false);
+        let trust = resolve_trust(&[&a, &b]);
+        assert!(matches!(trust, HookTrust::Unknown { .. }), "{trust:?}");
+        assert!(!trust.is_trusted());
+        // Order must not matter — putting the disabled entry first must
+        // not accidentally "win" either.
+        let trust_reordered = resolve_trust(&[&b, &a]);
+        assert!(matches!(trust_reordered, HookTrust::Unknown { .. }));
+    }
+
     #[test]
     fn resolve_trust_agreeing_duplicate_matches_is_trusted() {
         let a = entry("stop", "/bin/x stop", "/x/hooks.json", "trusted", "h1");
@@ -641,6 +677,20 @@ mod tests {
         e.enabled = Some(false);
         let trust = resolve_trust(&[&e]);
         assert!(matches!(trust, HookTrust::Unknown { .. }));
+        assert!(!trust.is_trusted());
+    }
+
+    // Regression test (security review, HORO-1906): a *missing*
+    // `enabled` field (schema drift, or a non-standard responder) must
+    // degrade to Unknown just like `enabled: false` does — trusted
+    // requires an explicit `enabled: true`, not merely the absence of
+    // `enabled: false`.
+    #[test]
+    fn resolve_trust_missing_enabled_field_is_unknown_even_if_trusted() {
+        let mut e = entry("stop", "/bin/x stop", "/x/hooks.json", "trusted", "h1");
+        e.enabled = None;
+        let trust = resolve_trust(&[&e]);
+        assert!(matches!(trust, HookTrust::Unknown { .. }), "{trust:?}");
         assert!(!trust.is_trusted());
     }
 

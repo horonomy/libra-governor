@@ -38,11 +38,20 @@
 //! client is dropped — a verify-trust command must never leave an
 //! orphaned `app-server` running after it exits, success or failure.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Caps how many bytes a single `read_line` call will consume before a
+/// `\n` is found — see the "Why a reader thread" module docs and
+/// `AppServerClient::spawn`'s reader-thread loop. Generous for any real
+/// JSON-RPC frame this protocol actually sends (Codex's own `hooks/list`
+/// response for a handful of hooks is a few KB at most), but finite, so
+/// a hostile or badly-behaved process that writes bytes with no
+/// terminator cannot make this thread buffer without bound.
+const MAX_LINE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// One line of app-server stdout, as seen by the reader thread.
 enum ReaderEvent {
@@ -130,9 +139,28 @@ impl AppServerClient {
             let mut reader = BufReader::new(stdout);
             loop {
                 let mut line = String::new();
-                match reader.read_line(&mut line) {
+                // Bounded per line (security review, HORO-1906): a
+                // hostile or badly-behaved app-server that writes bytes
+                // with no `\n` would otherwise make `read_line` grow
+                // `line` without bound, independent of the caller's
+                // `call()` deadline (which only bounds how long the
+                // *channel recv* waits, not how much this thread buffers
+                // before ever posting anything). `Take` caps how many
+                // bytes this one `read_line` call will consume; a fresh
+                // `Take` is created each iteration so the cap applies
+                // per line, not cumulatively across the connection's
+                // whole lifetime.
+                let mut limited = (&mut reader).take(MAX_LINE_BYTES);
+                match limited.read_line(&mut line) {
                     Ok(0) => {
                         let _ = tx.send(ReaderEvent::Eof);
+                        break;
+                    }
+                    Ok(_) if !line.ends_with('\n') && line.len() as u64 >= MAX_LINE_BYTES => {
+                        let _ = tx.send(ReaderEvent::Io(format!(
+                            "a single line exceeded the {MAX_LINE_BYTES}-byte cap without a \
+                             newline"
+                        )));
                         break;
                     }
                     Ok(_) => {
@@ -389,6 +417,45 @@ printf '{"id":1,"error":{"code":-32601,"message":"method not found"}}\n'
             .call("hooks/list", serde_json::json!({}), Duration::from_secs(5))
             .unwrap_err();
         assert!(matches!(err, AppServerError::RpcError("hooks/list", _)));
+    }
+
+    // Regression test (security review, HORO-1906): a line with no
+    // terminating newline must not make the reader thread buffer
+    // without bound — it must be reported as an error (`UnexpectedEof`
+    // or `Io`, depending on exactly when the cap trips relative to the
+    // child's own exit) promptly, not hang, and not consume unbounded
+    // memory.
+    #[test]
+    fn a_line_with_no_terminator_past_the_cap_is_reported_not_hung_or_unbounded() {
+        let dir = tempfile::tempdir().unwrap();
+        // Writes well past MAX_LINE_BYTES with NO newline at all, then
+        // exits — `dd ... | tr '\0' 'x'` produces an exact, bounded byte
+        // count of the single byte 'x' repeated, fast and
+        // newline-free (unlike `yes`, which emits a `\n` after every
+        // short line and would never actually exercise the cap).
+        let script = fixture_script(
+            dir.path(),
+            "read -r _req1\n/bin/dd if=/dev/zero bs=1000000 count=9 2>/dev/null | /usr/bin/tr \
+             '\\0' 'x'\n",
+        );
+        let (mut client, _spawn_dur) =
+            AppServerClient::spawn(script.to_str().unwrap(), &[], &[]).unwrap();
+        let start = Instant::now();
+        let err = client
+            .call("hooks/list", serde_json::json!({}), Duration::from_secs(10))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AppServerError::Io(_) | AppServerError::UnexpectedEof(_)
+            ),
+            "{err:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "must not hang waiting for the full write to complete"
+        );
+        client.kill();
     }
 
     #[test]
