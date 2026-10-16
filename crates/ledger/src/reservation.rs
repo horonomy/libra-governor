@@ -606,9 +606,39 @@ impl LedgerStore {
     /// — a display-side variant of the accounting rule is how a
     /// statusline starts disagreeing with an admission decision.
     pub fn budget_snapshot(&self, task_id: TaskId) -> Result<Option<BudgetSnapshot>, LedgerError> {
+        self.budget_snapshot_with_last_touch(task_id)
+            .map(|o| o.map(|(snapshot, _)| snapshot))
+    }
+
+    /// Same read as [`Self::budget_snapshot`], plus the envelope's own
+    /// last-touch instant (HORO-1904) read inside the same transaction —
+    /// `None` only when every timestamp this envelope could be read from
+    /// (`task_budgets.updated_at` and every `reservations` row's
+    /// `created_at`/`settled_at`/`released_at`) fails to parse, which
+    /// this ledger never itself writes but a caller must still answer
+    /// honestly rather than treat as the snapshot being unreadable: see
+    /// `libra_governor_domain::ledger_freshness`'s own
+    /// `LedgerFreshnessUnknown::NoTimestamp` arm.
+    ///
+    /// Deliberately a *separate* method rather than a parameter added to
+    /// [`Self::budget_snapshot`] — every existing caller of that method
+    /// keeps its exact current signature and behavior, and this new
+    /// column is additive, read by the one caller (the daemon's `Status`/
+    /// owner-`Query` read paths) that needs it for HORO-1904's freshness
+    /// report.
+    ///
+    /// This reads the envelope's last write; it never classifies it.
+    /// Classification against a staleness threshold is
+    /// `libra_governor_domain::ledger_freshness`, called by the daemon
+    /// with its own `now` — never here, so this method stays a pure
+    /// read with no notion of "now" or "stale" at all.
+    pub fn budget_snapshot_with_last_touch(
+        &self,
+        task_id: TaskId,
+    ) -> Result<Option<(BudgetSnapshot, Option<OffsetDateTime>)>, LedgerError> {
         // Reuse an enclosing transaction's snapshot when called from an
         // owner transaction. Standalone callers still get a dedicated
-        // read transaction spanning all four statements.
+        // read transaction spanning all statements.
         let tx = if self.conn.is_autocommit() {
             Some(self.conn.unchecked_transaction()?)
         } else {
@@ -616,15 +646,15 @@ impl LedgerStore {
         };
         let conn: &rusqlite::Connection = tx.as_ref().map_or(&self.conn, |tx| tx);
         let id = task_id.to_string();
-        let budget: Option<(String, f64, f64)> = conn
+        let budget: Option<(String, f64, f64, String)> = conn
             .query_row(
-                "SELECT resource_kind, hard_limit, completion_reserve
+                "SELECT resource_kind, hard_limit, completion_reserve, updated_at
                  FROM task_budgets WHERE task_id = ?1",
                 [&id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
-        let Some((kind, hard_limit, completion_reserve)) = budget else {
+        let Some((kind, hard_limit, completion_reserve, budget_updated_at)) = budget else {
             if let Some(tx) = tx {
                 tx.commit()?;
             }
@@ -654,7 +684,28 @@ impl LedgerStore {
             [&id],
             |row| row.get(0),
         )?;
-        // Read inside the same snapshot as the four statements above
+        // HORO-1904: the latest write touching ANY reservation row for
+        // this task, in the same read snapshot as every statement above.
+        // `created_at` covers an Active row (never refreshed in place —
+        // see `Reservation::last_touched_at`'s own docs); `settled_at`/
+        // `released_at` cover a terminal one. SQLite's MAX() over TEXT
+        // compares lexicographically, which is correct here because
+        // every writer in this module formats timestamps as RFC3339 UTC
+        // via this file's own `rfc3339` helper — a fixed-offset, fixed-
+        // format encoding where lexicographic and chronological order
+        // agree.
+        let latest_reservation_touch: Option<String> = conn.query_row(
+            "SELECT MAX(touch) FROM (
+                 SELECT created_at AS touch FROM reservations WHERE task_id = ?1
+                 UNION ALL
+                 SELECT settled_at AS touch FROM reservations WHERE task_id = ?1
+                 UNION ALL
+                 SELECT released_at AS touch FROM reservations WHERE task_id = ?1
+             )",
+            [&id],
+            |row| row.get(0),
+        )?;
+        // Read inside the same snapshot as the statements above
         // (HORO-1727) — a renewal grant between this read and the ones
         // above would otherwise produce a `granted` figure from a
         // different instant than `settled`/`active`, the exact
@@ -663,14 +714,36 @@ impl LedgerStore {
         if let Some(tx) = tx {
             tx.commit()?;
         }
-        Ok(Some(BudgetSnapshot::new_with_granted(
-            kind_from_str(&kind)?,
-            hard_limit,
-            granted,
-            completion_reserve,
-            settled,
-            active,
-            reservation_count,
+
+        // A malformed timestamp must never turn a readable snapshot into
+        // `Unreadable` (today's `BudgetPosture` has no notion of that for
+        // a snapshot that otherwise read fine) — so a parse failure on
+        // either side collapses to `None` ("no timestamp to classify
+        // from"), handled by `ledger_freshness` as `NoTimestamp`, rather
+        // than propagating a `LedgerError` that would fail this whole
+        // read.
+        let budget_updated_at = parse_time(&budget_updated_at).ok();
+        let latest_reservation_touch = latest_reservation_touch
+            .as_deref()
+            .and_then(|s| parse_time(s).ok());
+        let last_touched_at = match (budget_updated_at, latest_reservation_touch) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+
+        Ok(Some((
+            BudgetSnapshot::new_with_granted(
+                kind_from_str(&kind)?,
+                hard_limit,
+                granted,
+                completion_reserve,
+                settled,
+                active,
+                reservation_count,
+            ),
+            last_touched_at,
         )))
     }
 
@@ -1601,6 +1674,294 @@ mod tests {
     fn a_task_with_no_budget_row_has_no_snapshot_rather_than_an_empty_one() {
         let store = LedgerStore::open_in_memory().unwrap();
         assert_eq!(store.budget_snapshot(TaskId::new()).unwrap(), None);
+    }
+
+    // --- HORO-1904: budget_snapshot_with_last_touch ----------------------
+
+    fn at(secs: i64) -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(secs)
+    }
+
+    #[test]
+    fn last_touch_is_the_initialization_instant_with_no_reservations() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = TaskId::new();
+        let identity = libra_governor_domain::TaskIdentity {
+            id: task_id,
+            external_ref: None,
+        };
+        store.insert_task(&identity, at(0)).unwrap();
+        store
+            .initialize_task_budget(
+                task_id,
+                &thousand_token_policy(),
+                &fixed_reserve(200),
+                at(0),
+            )
+            .unwrap();
+
+        let (snapshot, last_touch) = store
+            .budget_snapshot_with_last_touch(task_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(last_touch, Some(at(0)));
+        assert_eq!(snapshot, store.budget_snapshot(task_id).unwrap().unwrap());
+    }
+
+    /// Kills the mutant that reads only `task_budgets.updated_at`: a
+    /// settle that restores nothing to the Completion Reserve never
+    /// touches that column (see `settle`'s own `if restore > 0.0`
+    /// guard), but it always stamps `settled_at` — so last touch must
+    /// still advance past the reserve-time instant.
+    #[test]
+    fn a_zero_restore_settle_still_advances_last_touch() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let ReserveOutcome::Granted(reservation) = store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(300),
+                idempotency_key: "key-1",
+                now: at(10),
+                ttl_secs: 900,
+            })
+            .unwrap()
+        else {
+            panic!("expected Granted");
+        };
+
+        // OptionalWork never draws from the reserve, so settling it at
+        // its full reserved amount restores exactly 0 — `restore > 0.0`
+        // is false and `task_budgets.updated_at` is left at the reserve
+        // instant.
+        store.settle(reservation.id, None, at(20)).unwrap();
+
+        let budget = store.task_budget(task_id).unwrap().unwrap();
+        assert_eq!(
+            budget.updated_at,
+            at(10),
+            "fixture precondition: updated_at must NOT have advanced on this settle"
+        );
+
+        let (_, last_touch) = store
+            .budget_snapshot_with_last_touch(task_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            last_touch,
+            Some(at(20)),
+            "last touch must come from settled_at, not fall back to the stale updated_at"
+        );
+    }
+
+    #[test]
+    fn release_and_expire_each_advance_last_touch() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+
+        let ReserveOutcome::Granted(released) = store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(100),
+                idempotency_key: "key-released",
+                now: at(10),
+                ttl_secs: 5,
+            })
+            .unwrap()
+        else {
+            panic!("expected Granted");
+        };
+        store.release(released.id, at(30)).unwrap();
+        let (_, last_touch) = store
+            .budget_snapshot_with_last_touch(task_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(last_touch, Some(at(30)));
+
+        let ReserveOutcome::Granted(_expiring) = store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(100),
+                idempotency_key: "key-expiring",
+                now: at(40),
+                ttl_secs: 5,
+            })
+            .unwrap()
+        else {
+            panic!("expected Granted");
+        };
+        store.expire_stale_reservations(at(100)).unwrap();
+        let (_, last_touch) = store
+            .budget_snapshot_with_last_touch(task_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(last_touch, Some(at(100)));
+    }
+
+    /// Pins the SQL `MAX` to the domain's own per-row definition: the
+    /// envelope's last touch is the max, over every reservation row, of
+    /// that row's own `Reservation::last_touched_at()` — not a
+    /// re-derivation that could silently disagree with it.
+    #[test]
+    fn last_touch_matches_the_oracle_derived_from_domain_reservations() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+
+        let ReserveOutcome::Granted(a) = store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(100),
+                idempotency_key: "key-a",
+                now: at(5),
+                ttl_secs: 900,
+            })
+            .unwrap()
+        else {
+            panic!("expected Granted");
+        };
+        store
+            .settle(a.id, Some(ResourceAmount::Tokens(50)), at(15))
+            .unwrap();
+
+        let ReserveOutcome::Granted(_b) = store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(100),
+                idempotency_key: "key-b",
+                now: at(25),
+                ttl_secs: 900,
+            })
+            .unwrap()
+        else {
+            panic!("expected Granted");
+        };
+
+        let budget = store.task_budget(task_id).unwrap().unwrap();
+        let reservations = store.reservations_for_task(task_id).unwrap();
+        let oracle = reservations
+            .iter()
+            .map(|r| r.last_touched_at())
+            .chain(std::iter::once(budget.updated_at))
+            .max()
+            .unwrap();
+
+        let (_, last_touch) = store
+            .budget_snapshot_with_last_touch(task_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(last_touch, Some(oracle));
+    }
+
+    /// Staleness is observation-only (HORO-1904): reading the envelope's
+    /// last touch, however old, must never itself expire, release, or
+    /// otherwise mutate a live reservation or its task's budget row.
+    #[test]
+    fn reading_last_touch_never_mutates_an_active_reservation() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let ReserveOutcome::Granted(reservation) = store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(100),
+                idempotency_key: "key-1",
+                // A TTL far in the future: this reservation is not due
+                // to expire for a long time, yet its last touch (its
+                // `created_at`) is already far in the past relative to
+                // the "evaluation instant" used below.
+                now: at(0),
+                ttl_secs: 1_000_000,
+            })
+            .unwrap()
+        else {
+            panic!("expected Granted");
+        };
+
+        let before_reservations = store.reservations_for_task(task_id).unwrap();
+        let before_budget = store.task_budget(task_id).unwrap().unwrap();
+
+        let eval_now = at(10_000);
+        let (_, last_touch) = store
+            .budget_snapshot_with_last_touch(task_id)
+            .unwrap()
+            .unwrap();
+        let freshness = libra_governor_domain::ledger_freshness(last_touch, eval_now, 900);
+        assert_eq!(
+            freshness,
+            libra_governor_domain::LedgerFreshness::Stale { age_secs: 10_000 },
+            "fixture precondition: this reading must classify as stale"
+        );
+
+        // Nothing moved: no mutation, and `expire_stale_reservations` at
+        // the same instant finds nothing to reclaim (the TTL has not
+        // elapsed), proving staleness is independent of TTL expiry.
+        let after_reservations = store.reservations_for_task(task_id).unwrap();
+        let after_budget = store.task_budget(task_id).unwrap().unwrap();
+        assert_eq!(before_reservations, after_reservations);
+        assert_eq!(before_budget, after_budget);
+        assert_eq!(after_reservations[0].state, ReservationState::Active);
+
+        let expired = store.expire_stale_reservations(eval_now).unwrap();
+        assert!(
+            expired.is_empty(),
+            "TTL has not elapsed — staleness must not have reclaimed it"
+        );
+        assert_eq!(reservation.state, ReservationState::Active);
+    }
+
+    #[test]
+    fn a_malformed_updated_at_reports_no_timestamp_but_still_reads_the_snapshot() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        store
+            .conn
+            .execute(
+                "UPDATE task_budgets SET updated_at = 'not-a-timestamp' WHERE task_id = ?1",
+                [task_id.to_string()],
+            )
+            .unwrap();
+
+        let (snapshot, last_touch) = store
+            .budget_snapshot_with_last_touch(task_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            last_touch, None,
+            "no reservations exist, and the only timestamp present is unparseable"
+        );
+        assert_eq!(
+            snapshot,
+            store.budget_snapshot(task_id).unwrap().unwrap(),
+            "a malformed timestamp must not turn a readable snapshot into Unreadable"
+        );
+    }
+
+    #[test]
+    fn a_task_with_no_budget_row_has_no_last_touch_snapshot_either() {
+        let store = LedgerStore::open_in_memory().unwrap();
+        assert_eq!(
+            store
+                .budget_snapshot_with_last_touch(TaskId::new())
+                .unwrap(),
+            None
+        );
     }
 
     // --- Basic reserve/settle/release round trips -------------------
