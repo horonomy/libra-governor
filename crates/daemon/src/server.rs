@@ -627,22 +627,29 @@ pub(crate) fn dispatch(
             // this into a posture read and an amounts read would let the
             // percentage and the amounts in the same reply describe
             // different instants.
-            let (task_budget, task_budget_amounts) = match current_task.as_ref() {
-                Some(task) => {
-                    let (posture, amounts) = budget_reading(ledger, task.task_id);
-                    (Some(posture), amounts)
-                }
-                // No current task: a share of a budget that was never
-                // admitted is not zero, it is absent — and so are its
-                // amounts. What the reply still carries is
-                // `configured_budget`, which is a different scope and
-                // labelled as one.
-                None => (None, None),
-            };
+            let (task_budget, task_budget_amounts, task_budget_freshness) =
+                match current_task.as_ref() {
+                    Some(task) => {
+                        let (posture, amounts, freshness) = budget_reading(
+                            ledger,
+                            task.task_id,
+                            config.reservation_ttl_secs,
+                            time::OffsetDateTime::now_utc,
+                        );
+                        (Some(posture), amounts, freshness)
+                    }
+                    // No current task: a share of a budget that was never
+                    // admitted is not zero, it is absent — and so are its
+                    // amounts. What the reply still carries is
+                    // `configured_budget`, which is a different scope and
+                    // labelled as one.
+                    None => (None, None, None),
+                };
             Response::Status(Box::new(StatusResult {
                 scope: libra_governor_protocol::StatusScope::HostLatestObservation,
                 task_budget,
                 task_budget_amounts,
+                task_budget_freshness,
                 configured_budget: configured_budget(config),
                 current_task: current_task.clone(),
             }))
@@ -901,16 +908,45 @@ fn replan_state_for_summary(
 /// A ledger error becomes [`BudgetPosture::Unreadable`] with no amounts
 /// rather than failing the whole `Status`: a budget that could not be
 /// read must not cost the user the task state that could.
+///
+/// # Freshness (HORO-1904)
+///
+/// Also reports whether the envelope's own last-write instant is recent
+/// enough to trust, via `libra_governor_domain::ledger_freshness` —
+/// observational only, and entirely independent of this function's
+/// posture classification above: a `Stale` reading never changes
+/// `BudgetPosture`, `BudgetSnapshot`, or anything else about what gets
+/// reported, only whether the caller is told to trust it.
+///
+/// `now` is a closure rather than a plain `OffsetDateTime` so the caller
+/// can defer sampling the clock until after the ledger read returns —
+/// see the call site's own comment on why that ordering matters under
+/// this ledger's one-connection-per-`LedgerStore` design.
 fn budget_reading(
     ledger: &LedgerStore,
     task_id: libra_governor_domain::TaskId,
-) -> (BudgetPosture, Option<BudgetSnapshot>) {
-    match ledger.budget_snapshot(task_id) {
-        Ok(Some(snapshot)) => (BudgetPosture::from_snapshot(&snapshot), Some(snapshot)),
+    max_staleness_secs: u64,
+    now: impl FnOnce() -> time::OffsetDateTime,
+) -> (
+    BudgetPosture,
+    Option<BudgetSnapshot>,
+    Option<libra_governor_domain::LedgerFreshness>,
+) {
+    match ledger.budget_snapshot_with_last_touch(task_id) {
+        Ok(Some((snapshot, last_touched_at))) => {
+            let freshness =
+                libra_governor_domain::ledger_freshness(last_touched_at, now(), max_staleness_secs);
+            (
+                BudgetPosture::from_snapshot(&snapshot),
+                Some(snapshot),
+                Some(freshness),
+            )
+        }
         // No budget row: there is no envelope to report amounts of, so
-        // the amounts are absent rather than zero.
-        Ok(None) => (BudgetPosture::NotEstablished, None),
-        Err(_) => (BudgetPosture::Unreadable, None),
+        // the amounts are absent rather than zero — and there is nothing
+        // to report freshness of either.
+        Ok(None) => (BudgetPosture::NotEstablished, None, None),
+        Err(_) => (BudgetPosture::Unreadable, None, None),
     }
 }
 
@@ -3180,8 +3216,13 @@ mod tests {
             .unwrap();
         hold(&mut ledger, 45_000, "held");
 
-        let (posture, amounts) = budget_reading(&ledger, task_id);
+        let (posture, amounts, freshness) =
+            budget_reading(&ledger, task_id, 900, time::OffsetDateTime::now_utc);
         let amounts = amounts.expect("an initialized envelope has amounts");
+        assert!(matches!(
+            freshness,
+            Some(libra_governor_domain::LedgerFreshness::Fresh { .. })
+        ));
 
         assert_eq!(amounts.kind(), ResourceKind::Tokens);
         assert_eq!(amounts.total(), ResourceAmount::Tokens(150_000));
@@ -3246,8 +3287,144 @@ mod tests {
         let config = test_daemon_config(dir.path());
         let ledger = LedgerStore::open(&config.ledger_path).unwrap();
 
-        let (posture, amounts) = budget_reading(&ledger, TaskId::new());
+        let (posture, amounts, freshness) =
+            budget_reading(&ledger, TaskId::new(), 900, time::OffsetDateTime::now_utc);
         assert_eq!(posture, BudgetPosture::NotEstablished);
         assert!(amounts.is_none());
+        assert!(
+            freshness.is_none(),
+            "task_budget_freshness is None exactly when task_budget_amounts is None"
+        );
+    }
+
+    // --- HORO-1904: budget_reading / Status freshness --------------------
+
+    /// Positive and negative injected-`now` controls (HORO-1904): the
+    /// same envelope classifies `Fresh` just inside the threshold and
+    /// `Stale` just past it, with posture and amounts identical either
+    /// way — staleness must never alter what gets reported, only whether
+    /// it is reported as trustworthy.
+    #[test]
+    fn budget_reading_freshness_is_independent_of_posture_and_amounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_daemon_config(dir.path());
+        let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
+        let task_id = TaskId::new();
+        let identity = libra_governor_domain::TaskIdentity {
+            id: task_id,
+            external_ref: None,
+        };
+        let written_at = time::OffsetDateTime::now_utc() - time::Duration::hours(3);
+        ledger.insert_task(&identity, written_at).unwrap();
+        ledger
+            .initialize_task_budget(
+                task_id,
+                &config.policy,
+                &libra_governor_domain::completion_reserve_for(
+                    &config.policy.quality_floor,
+                    None,
+                    &config.policy,
+                ),
+                written_at,
+            )
+            .unwrap();
+
+        let ttl = config.reservation_ttl_secs;
+        let (fresh_posture, fresh_amounts, fresh_freshness) =
+            budget_reading(&ledger, task_id, ttl, || {
+                written_at + time::Duration::seconds(60)
+            });
+        let (stale_posture, stale_amounts, stale_freshness) =
+            budget_reading(&ledger, task_id, ttl, || {
+                written_at + time::Duration::seconds(ttl as i64 + 1)
+            });
+
+        assert!(matches!(
+            fresh_freshness,
+            Some(libra_governor_domain::LedgerFreshness::Fresh { .. })
+        ));
+        assert!(matches!(
+            stale_freshness,
+            Some(libra_governor_domain::LedgerFreshness::Stale { .. })
+        ));
+        assert_eq!(fresh_posture, stale_posture);
+        assert_eq!(fresh_amounts, stale_amounts);
+    }
+
+    /// The full `Status` round trip (HORO-1904): a budget row written
+    /// long enough ago that `now_utc()` classifies it `Stale`, without
+    /// any mutation to the underlying reservation. Proves the wire field
+    /// is wired end-to-end through `dispatch`, not only through
+    /// `budget_reading` in isolation.
+    #[test]
+    fn status_reports_stale_task_budget_freshness_without_mutating_the_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_daemon_config(dir.path());
+        let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
+        let task_id = TaskId::new();
+        let identity = libra_governor_domain::TaskIdentity {
+            id: task_id,
+            external_ref: None,
+        };
+        let written_at = time::OffsetDateTime::now_utc()
+            - time::Duration::seconds(config.reservation_ttl_secs as i64 + 3_600);
+        ledger.insert_task(&identity, written_at).unwrap();
+        ledger
+            .initialize_task_budget(
+                task_id,
+                &config.policy,
+                &libra_governor_domain::completion_reserve_for(
+                    &config.policy.quality_floor,
+                    None,
+                    &config.policy,
+                ),
+                written_at,
+            )
+            .unwrap();
+        let ReserveOutcome::Granted(reservation) = ledger
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-horo-1904-status",
+                plan_id: None,
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(10),
+                idempotency_key: "key-1",
+                now: written_at,
+                // Far beyond the staleness threshold, but not due to
+                // expire — proving staleness here is reported
+                // independent of TTL expiry.
+                ttl_secs: 10_000_000,
+            })
+            .unwrap()
+        else {
+            panic!("expected Granted");
+        };
+
+        // `current_task` is set directly (not via `dispatch(Preflight,
+        // ..)`), because a real preflight would itself write a fresh
+        // reservation and defeat this fixture's aged timestamp.
+        let mut current_task = Some(TaskSummary {
+            task_id,
+            confidence: libra_governor_domain::Confidence::Low,
+            recon_cost_seconds: 0.0,
+            plan_id: PlanId::new(),
+            remaining_estimate: Estimate::cold_start(),
+            replan_state: ReplanState::Stable,
+        });
+
+        let result = status_reply(&mut ledger, &mut current_task, &config);
+        assert!(matches!(
+            result.task_budget_freshness,
+            Some(libra_governor_domain::LedgerFreshness::Stale { .. })
+        ));
+
+        let reservations = ledger.reservations_for_task(task_id).unwrap();
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(reservations[0].id, reservation.id);
+        assert_eq!(reservations[0].state, ReservationState::Active);
+        assert!(ledger
+            .expire_stale_reservations(time::OffsetDateTime::now_utc())
+            .unwrap()
+            .is_empty());
     }
 }

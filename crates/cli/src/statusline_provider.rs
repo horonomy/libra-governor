@@ -730,8 +730,13 @@ fn span_figure(amount: f64) -> Option<String> {
 /// "held" rather than "reserved" for the reserved figure: it is four
 /// characters shorter in a 48-character budget, and "reserved" beside
 /// "used" invites reading the two as a sum, which the ticket forbids.
-fn budget_label(percent: u32, amounts: Option<&BudgetSnapshot>, display: BudgetDisplay) -> String {
-    let base = format!("{percent}% budget left");
+fn budget_label(
+    percent: u32,
+    amounts: Option<&BudgetSnapshot>,
+    display: BudgetDisplay,
+    suffix: &str,
+) -> String {
+    let base = format!("{percent}% budget left{suffix}");
     let (Some(amounts), true) = (
         amounts,
         display == BudgetDisplay::UsedRemainingAndTotal || display == BudgetDisplay::Full,
@@ -751,10 +756,10 @@ fn budget_label(percent: u32, amounts: Option<&BudgetSnapshot>, display: BudgetD
     let mut candidates = Vec::new();
     if display == BudgetDisplay::Full {
         if let Some(held) = span_figure(amounts.reserved().as_f64()) {
-            candidates.push(format!("{percent}% left, {used} used, {held} held"));
+            candidates.push(format!("{percent}% left, {used} used, {held} held{suffix}"));
         }
     }
-    candidates.push(format!("{percent}% left, {used} used"));
+    candidates.push(format!("{percent}% left, {used} used{suffix}"));
     // Bytes, not chars, because that is what the host measures and these
     // candidates are pure ASCII — digits, commas, spaces and two English
     // words — so the two counts are equal and the byte one cannot be the
@@ -794,7 +799,34 @@ fn amount_field(segment: &mut Value, key: &str, amount: f64) {
 /// organisation's — and the ticket's standing requirement is that they
 /// are never conflated. A figure that cannot say which one it is a
 /// figure of is not economic truth.
-fn budget_amount_fields(segment: &mut Value, amounts: &BudgetSnapshot) {
+fn budget_amount_fields(
+    segment: &mut Value,
+    amounts: &BudgetSnapshot,
+    freshness: Option<libra_governor_protocol::LedgerFreshness>,
+) {
+    use libra_governor_protocol::{LedgerFreshness, LedgerFreshnessUnknown};
+    // HORO-1904: emitted whenever amounts are present, same rule as every
+    // other field in this function — the host contract ignores fields it
+    // does not know, so this costs nothing today and is ready the moment
+    // a renderer wants it. `None` (no freshness reading at all, e.g. a
+    // daemon too old to send one) reports as `"unknown"`, never as
+    // `"fresh"` — see this ticket's own "never silently present stale
+    // ledger values as current" contract.
+    let (freshness_str, age_secs) = match freshness {
+        Some(LedgerFreshness::Fresh { age_secs }) => ("fresh", Some(age_secs)),
+        Some(LedgerFreshness::Stale { age_secs }) => ("stale", Some(age_secs)),
+        Some(LedgerFreshness::Unknown { .. }) | None => ("unknown", None),
+    };
+    segment["ledger_freshness"] = json!(freshness_str);
+    if let Some(age_secs) = age_secs {
+        segment["ledger_age_seconds"] = json!(age_secs);
+    }
+    if let Some(LedgerFreshness::Unknown { reason }) = freshness {
+        segment["ledger_freshness_reason"] = json!(match reason {
+            LedgerFreshnessUnknown::NoTimestamp => "no_timestamp",
+            LedgerFreshnessUnknown::TimestampInFuture => "timestamp_in_future",
+        });
+    }
     segment["budget_scope"] = json!("active_task");
     if let Some(unit) = unit_noun(amounts.kind()) {
         segment["budget_unit"] = json!(unit);
@@ -922,13 +954,41 @@ fn budget_segment(
     posture: BudgetPosture,
     amounts: Option<&BudgetSnapshot>,
     display: BudgetDisplay,
+    freshness: Option<libra_governor_protocol::LedgerFreshness>,
 ) -> Value {
+    use libra_governor_protocol::LedgerFreshness;
+    // HORO-1904: staleness qualifies only the `Remaining` posture's
+    // "neutral" reading — a reader comparing "38% left" against "38%
+    // left (stale)" needs to be told the second one is not current. The
+    // other postures (Exhausted/Uncommitted/NotEstablished/Unreadable)
+    // keep their existing label/state/reason_code unconditionally: none
+    // of them describe a live measured share in the first place, so a
+    // staleness qualifier on top would not add information a reader
+    // could act on, and adding one would risk silently changing an
+    // already-shipped reason_code's meaning.
+    let (fresh_suffix, stale_as_unknown) = match freshness {
+        None | Some(LedgerFreshness::Fresh { .. }) => ("", false),
+        Some(LedgerFreshness::Stale { .. }) => (" (stale)", true),
+        Some(LedgerFreshness::Unknown { .. }) => (" (freshness unknown)", true),
+    };
     let (state, label, reason_code, clear_role) = match posture {
         BudgetPosture::Remaining { fraction_left } => {
             match percent_left(share_to_display(fraction_left, amounts)) {
+                Some(percent) if stale_as_unknown => (
+                    "unknown",
+                    budget_label(percent, amounts, display, fresh_suffix),
+                    Some(
+                        if matches!(freshness, Some(LedgerFreshness::Stale { .. })) {
+                            "budget_ledger_stale"
+                        } else {
+                            "budget_ledger_freshness_unknown"
+                        },
+                    ),
+                    "vital",
+                ),
                 Some(percent) => (
                     "neutral",
-                    budget_label(percent, amounts, display),
+                    budget_label(percent, amounts, display, ""),
                     None,
                     "vital",
                 ),
@@ -994,7 +1054,7 @@ fn budget_segment(
         segment["reason_code"] = json!(reason_code);
     }
     if let Some(amounts) = amounts {
-        budget_amount_fields(&mut segment, amounts);
+        budget_amount_fields(&mut segment, amounts, freshness);
         budget_count_fields(&mut segment, amounts, display);
     }
     segment
@@ -1219,11 +1279,14 @@ pub fn reading(
         // Clear and Detail cannot disagree about it and no second round trip
         // was spent. A task without a budget field yields no segment rather
         // than a guessed one.
-        segments.extend(
-            status.task_budget.map(|posture| {
-                budget_segment(posture, status.task_budget_amounts.as_ref(), display)
-            }),
-        );
+        segments.extend(status.task_budget.map(|posture| {
+            budget_segment(
+                posture,
+                status.task_budget_amounts.as_ref(),
+                display,
+                status.task_budget_freshness,
+            )
+        }));
     } else {
         segments.extend(
             status
@@ -1376,6 +1439,37 @@ fn budget_posture_prose(
              \x20                  is a missing reading rather than an absent budget"
                 .to_string()
         }
+    }
+}
+
+/// Prose for `status.task_budget_freshness` (HORO-1904), at `explain`
+/// length — a different axis from [`budget_posture_prose`], and worded
+/// as one: the share above can be a perfectly good number and still be
+/// read from a ledger row nothing has touched in a while, and this line
+/// is the one place that says so plainly, independent of the posture
+/// itself.
+fn ledger_freshness_prose(freshness: Option<libra_governor_protocol::LedgerFreshness>) -> String {
+    use libra_governor_protocol::{LedgerFreshness, LedgerFreshnessUnknown};
+    match freshness {
+        Some(LedgerFreshness::Fresh { age_secs }) => {
+            format!("fresh — last touched {age_secs}s ago")
+        }
+        Some(LedgerFreshness::Stale { age_secs }) => {
+            format!(
+                "stale — last touched {age_secs}s ago, past this daemon's own \
+                 staleness threshold; the figures above are the last ones recorded, \
+                 not a current reading"
+            )
+        }
+        Some(LedgerFreshness::Unknown {
+            reason: LedgerFreshnessUnknown::NoTimestamp,
+        }) => "unknown — no readable last-touch timestamp on this envelope".to_string(),
+        Some(LedgerFreshness::Unknown {
+            reason: LedgerFreshnessUnknown::TimestampInFuture,
+        }) => "unknown — this envelope's last-touch timestamp is ahead of the \
+               daemon's own clock"
+            .to_string(),
+        None => "not reported — this daemon did not answer with a freshness reading".to_string(),
     }
 }
 
@@ -1597,6 +1691,10 @@ pub fn explain_text(status: &StatusResult, doctor: Option<&DoctorResult>) -> Str
             // of it.
             if let Some(amounts) = status.task_budget_amounts.as_ref() {
                 out.push_str(&budget_amounts_prose(amounts));
+                out.push_str(&format!(
+                    "  ledger as-of     {}\n",
+                    ledger_freshness_prose(status.task_budget_freshness)
+                ));
             }
         }
     }
@@ -1760,6 +1858,9 @@ mod tests {
             task_budget: Some(BUDGET_LEFT),
             task_budget_amounts: Some(BUDGET_LEFT_AMOUNTS),
             configured_budget: Some(CONFIGURED),
+            task_budget_freshness: Some(libra_governor_protocol::LedgerFreshness::Fresh {
+                age_secs: 30,
+            }),
         }
     }
 
@@ -1865,6 +1966,16 @@ mod tests {
         status.task_budget = posture;
     }
 
+    /// Sets only the freshness half of a fixture reply (HORO-1904) — kept
+    /// separate from [`set_budget`] because freshness is an independent
+    /// axis from posture/amounts, never derived from them.
+    fn set_freshness(
+        status: &mut StatusResult,
+        freshness: Option<libra_governor_protocol::LedgerFreshness>,
+    ) {
+        status.task_budget_freshness = freshness;
+    }
+
     /// Every budget shape the daemon can report, plus the absence of the
     /// field.
     ///
@@ -1899,6 +2010,7 @@ mod tests {
             task_budget: None,
             task_budget_amounts: None,
             configured_budget: Some(CONFIGURED),
+            task_budget_freshness: None,
         }
     }
 
@@ -2449,6 +2561,135 @@ mod tests {
             budget.get("count").is_none() && budget.get("total").is_none(),
             "a share is not a counter; counters are dropped at Clear depth"
         );
+    }
+
+    // -------------------------------------------------- HORO-1904: freshness
+
+    fn with_budget_and_freshness(
+        posture: Option<BudgetPosture>,
+        freshness: Option<libra_governor_protocol::LedgerFreshness>,
+    ) -> Value {
+        let mut status = status_with(ReplanState::Stable);
+        set_budget(&mut status, posture);
+        set_freshness(&mut status, freshness);
+        reading(&status, None, now())
+    }
+
+    fn budget_segment_value(document: &Value) -> Value {
+        segments(document)
+            .iter()
+            .find(|s| s["key"] == json!("budget"))
+            .expect("an active task's envelope is a reading, not a detail")
+            .clone()
+    }
+
+    #[test]
+    fn a_stale_remaining_share_is_qualified_not_silently_presented_as_current() {
+        let document = with_budget_and_freshness(
+            Some(BUDGET_LEFT),
+            Some(libra_governor_protocol::LedgerFreshness::Stale { age_secs: 1_000 }),
+        );
+        let budget = budget_segment_value(&document);
+        assert_eq!(budget["state"], json!("unknown"));
+        assert_eq!(budget["reason_code"], json!("budget_ledger_stale"));
+        let label = budget["label"].as_str().unwrap();
+        assert!(label.ends_with(" (stale)"), "{label:?}");
+        assert!(label.len() <= MAX_LABEL_CHARS, "{label:?}");
+        assert_eq!(budget["ledger_freshness"], json!("stale"));
+        assert_eq!(budget["ledger_age_seconds"], json!(1_000));
+    }
+
+    #[test]
+    fn a_fresh_remaining_share_is_byte_identical_to_before_this_field_existed() {
+        let fresh = with_budget_and_freshness(
+            Some(BUDGET_LEFT),
+            Some(libra_governor_protocol::LedgerFreshness::Fresh { age_secs: 5 }),
+        );
+        let without_reading = with_budget_and_freshness(Some(BUDGET_LEFT), None);
+        for document in [&fresh, &without_reading] {
+            let budget = budget_segment_value(document);
+            assert_eq!(budget["state"], json!("neutral"));
+            assert_eq!(budget["label"], json!("38% budget left"));
+            assert!(budget.get("reason_code").is_none());
+        }
+        // The only thing that may differ between the two is the new
+        // structured field itself.
+        assert_eq!(
+            budget_segment_value(&fresh)["ledger_freshness"],
+            json!("fresh")
+        );
+        assert_eq!(
+            budget_segment_value(&without_reading)["ledger_freshness"],
+            json!("unknown"),
+            "no reading at all must never be reported as fresh"
+        );
+    }
+
+    #[test]
+    fn an_unknown_freshness_is_never_reported_as_neutral() {
+        for reason in [
+            libra_governor_protocol::LedgerFreshnessUnknown::NoTimestamp,
+            libra_governor_protocol::LedgerFreshnessUnknown::TimestampInFuture,
+        ] {
+            let document = with_budget_and_freshness(
+                Some(BUDGET_LEFT),
+                Some(libra_governor_protocol::LedgerFreshness::Unknown { reason }),
+            );
+            let budget = budget_segment_value(&document);
+            assert_ne!(budget["state"], json!("neutral"));
+            assert_eq!(
+                budget["reason_code"],
+                json!("budget_ledger_freshness_unknown")
+            );
+            let label = budget["label"].as_str().unwrap();
+            assert!(label.ends_with(" (freshness unknown)"), "{label:?}");
+        }
+    }
+
+    #[test]
+    fn an_exhausted_budget_label_is_unchanged_while_stale() {
+        // Exhausted already describes the one actionable fact (the next
+        // reservation will be refused); a staleness suffix on top would
+        // not add information a reader could act on, per this function's
+        // own module docs.
+        let fresh = with_budget_and_freshness(
+            Some(BudgetPosture::Exhausted),
+            Some(libra_governor_protocol::LedgerFreshness::Fresh { age_secs: 5 }),
+        );
+        let stale = with_budget_and_freshness(
+            Some(BudgetPosture::Exhausted),
+            Some(libra_governor_protocol::LedgerFreshness::Stale { age_secs: 10_000 }),
+        );
+        assert_eq!(
+            budget_segment_value(&fresh)["label"],
+            budget_segment_value(&stale)["label"]
+        );
+        assert_eq!(
+            budget_segment_value(&fresh)["state"],
+            budget_segment_value(&stale)["state"]
+        );
+        assert_eq!(
+            budget_segment_value(&fresh)["reason_code"],
+            budget_segment_value(&stale)["reason_code"]
+        );
+        // The structured field still carries the real reading, even
+        // though the label does not change.
+        assert_eq!(
+            budget_segment_value(&stale)["ledger_freshness"],
+            json!("stale")
+        );
+    }
+
+    #[test]
+    fn explain_reports_the_ledgers_own_as_of_age() {
+        let mut status = status_with(ReplanState::Stable);
+        set_freshness(
+            &mut status,
+            Some(libra_governor_protocol::LedgerFreshness::Stale { age_secs: 4_200 }),
+        );
+        let prose = ledger_freshness_prose(status.task_budget_freshness);
+        assert!(prose.starts_with("stale — "), "{prose}");
+        assert!(prose.contains("4200s"), "{prose}");
     }
 
     #[test]
@@ -3164,13 +3405,13 @@ mod tests {
         // each one gives way is the whole behaviour. At thirteen digits
         // apiece the three-figure phrase is exactly as wide as the host
         // will take.
-        let widest = super::budget_label(38, Some(&HUGE_AMOUNTS), BudgetDisplay::Full);
+        let widest = super::budget_label(38, Some(&HUGE_AMOUNTS), BudgetDisplay::Full, "");
         assert_eq!(widest.len(), MAX_LABEL_CHARS, "{widest}");
 
         // One digit more and the held figure is dropped, not the document.
         let wider = BudgetSnapshot::new(ResourceKind::Tokens, 4e10, 0.0, 1.48e10, 1e10, 9);
         assert_eq!(
-            super::budget_label(38, Some(&wider), BudgetDisplay::Full),
+            super::budget_label(38, Some(&wider), BudgetDisplay::Full, ""),
             "38% left, 14,800,000,000 used"
         );
 

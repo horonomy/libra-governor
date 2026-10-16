@@ -211,9 +211,11 @@ fn same_session_agents_and_providers_never_share_tasks_or_finalize_siblings() {
             Outcome::Resolved {
                 target: actual,
                 budget,
+                budget_freshness,
             } => {
                 assert_eq!(actual, target);
                 assert!(budget.is_some());
+                assert!(budget_freshness.is_some());
             }
             other => panic!("sibling unavailable: {other:?}"),
         }
@@ -487,9 +489,11 @@ fn concurrent_connections_commit_one_prompt_and_preserve_all_other_lanes() {
                     Outcome::Resolved {
                         target: selected,
                         budget,
+                        budget_freshness,
                     } => {
                         assert_eq!(selected, target);
                         assert!(budget.is_some());
+                        assert!(budget_freshness.is_some());
                     }
                     other => panic!("cross-session query: {other:?}"),
                 },
@@ -703,9 +707,11 @@ fn configured_unsupported_effects_do_not_disable_exact_queries() {
         Outcome::Resolved {
             target: selected,
             budget,
+            budget_freshness,
         } => {
             assert_eq!(selected, target);
             assert!(budget.is_some());
+            assert!(budget_freshness.is_some());
         }
         other => panic!("exact query became unavailable: {other:?}"),
     }

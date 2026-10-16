@@ -205,6 +205,8 @@ ticket, and it will not happen silently.
 | An amount was asked for and the phrase is still a bare percentage | Either the envelope is unmeasured, or the longer phrase would not fit the host's 48-character label | `statusline explain` shows the whole envelope regardless of either |
 | The budget says usage unknown | Nothing has been attributed to this task yet — which is not the same as nothing having been spent | Expected: reporting it as `100% budget left` would be a measurement nobody made |
 | The amount is in tokens where a cost was expected | The envelope is denominated in tokens, and a currency is never assumed because a number exists | Nothing to fix; `statusline explain` names the unit it used |
+| The budget label ends `(stale)` | The envelope's own ledger row has not been touched recently enough to trust (HORO-1904) — independent of whether the task is still being worked | `statusline explain` shows the exact age; the figures beside it are the last ones recorded, not a current reading |
+| The budget label ends `(freshness unknown)` | The daemon could not read or trust the envelope's last-touch timestamp (e.g. none was recorded, or it is ahead of the daemon's own clock) | Expected on a row with no readable timestamp; never resolves to "fresh" by itself |
 | The segment carries no colour | Colour is the shared renderer's, from the `semantic_state` the provider sends; text is authoritative on its own | The host's documentation covers palette and `NO_COLOR` |
 
 For anything about the slot itself — who owns it, what a drift report means, how

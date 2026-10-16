@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use libra_governor_domain::{
     BudgetSnapshot, BusinessContextSummary, CompletionContract, Confidence,
-    EnforcementCapabilities, Estimate, ExecutionOutcome, ExecutionReceipt, PlanId, PolicyDecision,
-    ResourceAmount, TaskId,
+    EnforcementCapabilities, Estimate, ExecutionOutcome, ExecutionReceipt, LedgerFreshness, PlanId,
+    PolicyDecision, ResourceAmount, TaskId,
 };
 use libra_governor_estimator::{
     AdmissionOutcome, AdmissionPolicy, CoverageReport, RegimeCalibrationReport,
@@ -326,6 +326,21 @@ pub struct StatusResult {
     /// nonetheless never present it as consumption: see
     /// [`BudgetScope::ConfiguredDefault`].
     pub configured_budget: Option<ConfiguredBudget>,
+    /// Whether the ledger row(s) behind `task_budget`/`task_budget_amounts`
+    /// have been touched recently enough to trust (HORO-1904) —
+    /// independent of reservation TTL expiry and independent of upstream
+    /// provider quota-snapshot freshness (`BudgetPosture`/`BudgetSnapshot`
+    /// never themselves carry this: a stale reading is still arithmetically
+    /// the same snapshot, so a renderer must consult this field alongside
+    /// them rather than infer staleness from the posture).
+    ///
+    /// `Some` exactly when `task_budget_amounts` is `Some` — there is no
+    /// freshness to report about a snapshot that was never read. Reporting
+    /// `Stale`/`Unknown` here never itself changes `task_budget` or
+    /// `task_budget_amounts`: this field is purely observational, per
+    /// HORO-1904's own contract — see
+    /// `libra_governor_domain::ledger_freshness`.
+    pub task_budget_freshness: Option<LedgerFreshness>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1357,6 +1372,7 @@ mod tests {
                 configured_budget: Some(ConfiguredBudget {
                     ceiling: ResourceAmount::Tokens(150_000),
                 }),
+                task_budget_freshness: Some(LedgerFreshness::Fresh { age_secs: 30 }),
             })),
         };
         let json = serde_json::to_string(&envelope).unwrap();
@@ -1474,10 +1490,12 @@ mod tests {
             configured_budget: Some(ConfiguredBudget {
                 ceiling: ResourceAmount::Tokens(150_000),
             }),
+            task_budget_freshness: None,
         };
         let value = serde_json::to_value(&idle).unwrap();
         assert!(value["task_budget"].is_null());
         assert!(value["task_budget_amounts"].is_null());
+        assert!(value["task_budget_freshness"].is_null());
         assert_eq!(value["configured_budget"]["ceiling"]["amount"], 150_000);
         let configured = value["configured_budget"].as_object().unwrap();
         assert_eq!(

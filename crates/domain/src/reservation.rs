@@ -188,7 +188,102 @@ pub struct Reservation {
     pub legacy_pre_0011: bool,
 }
 
+/// HORO-1904: whether a `task_budgets`/`reservations` row's own
+/// last-write timestamp is recent enough to trust, independent of
+/// [`ReservationState::Expired`] (TTL expiry, a lifecycle mutation) and
+/// independent of upstream provider quota-snapshot freshness
+/// (`libra_governor_domain::quota_window::GaugeFreshness`, a different
+/// axis entirely — see that type's module docs). A row can be
+/// `ReservationState::Active` and simultaneously report `Stale` here:
+/// this type is purely observational and must never itself cause a
+/// state transition, settlement, release, or reassignment — see
+/// [`ledger_freshness`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "freshness", rename_all = "snake_case")]
+pub enum LedgerFreshness {
+    Fresh { age_secs: u64 },
+    Stale { age_secs: u64 },
+    Unknown { reason: LedgerFreshnessUnknown },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LedgerFreshnessUnknown {
+    /// No last-touch timestamp was available to classify against (e.g.
+    /// an unparseable `updated_at`/`created_at` value read back from
+    /// storage).
+    NoTimestamp,
+    /// The last-touch timestamp is later than `now` — a clock-skew
+    /// condition that must never be reported as `Fresh` by clamping its
+    /// implied age to zero.
+    TimestampInFuture,
+}
+
+/// Classifies a single last-touch timestamp as of `now` against
+/// `max_staleness_secs` (HORO-1904).
+///
+/// Pure: no I/O, no mutation, callable identically from the domain's own
+/// tests and from a real `LedgerStore` read. Deliberately does not reuse
+/// `quota_window::evaluate::GaugeFreshness` — that type answers "is the
+/// upstream provider's reported quota number itself stale", this answers
+/// "has Libra's own ledger row for this envelope been touched recently
+/// enough to trust" — two different questions about two different kinds
+/// of staleness that must stay independently reportable.
+///
+/// `last_touched_at > now` is reported as
+/// [`LedgerFreshnessUnknown::TimestampInFuture`] rather than clamped to
+/// an age of zero (which `quota_window`'s own gauge-age computation
+/// does via `.max(0)`) — a last-touch timestamp from the future is
+/// itself evidence the reading cannot be trusted, and silently reporting
+/// it `Fresh` would be exactly the "silently present stale ledger values
+/// as current" failure this function exists to prevent.
+///
+/// Age is floored to whole seconds; a row aged exactly
+/// `max_staleness_secs` reports `Fresh` (mirrors `evaluate_gauge`'s own
+/// `age_secs > max_staleness_secs` — strictly-greater is what trips
+/// staleness, not greater-or-equal).
+pub fn ledger_freshness(
+    last_touched_at: Option<OffsetDateTime>,
+    now: OffsetDateTime,
+    max_staleness_secs: u64,
+) -> LedgerFreshness {
+    let Some(last_touched_at) = last_touched_at else {
+        return LedgerFreshness::Unknown {
+            reason: LedgerFreshnessUnknown::NoTimestamp,
+        };
+    };
+    if last_touched_at > now {
+        return LedgerFreshness::Unknown {
+            reason: LedgerFreshnessUnknown::TimestampInFuture,
+        };
+    }
+    let age_secs = (now - last_touched_at).whole_seconds() as u64;
+    if age_secs > max_staleness_secs {
+        LedgerFreshness::Stale { age_secs }
+    } else {
+        LedgerFreshness::Fresh { age_secs }
+    }
+}
+
 impl Reservation {
+    /// The last instant this row was written, independent of
+    /// [`Self::state`] (HORO-1904). An `Active` row is never refreshed in
+    /// place today (see `libra_governor_ledger::reservation`'s own
+    /// module docs on `UPDATE reservations SET` call sites), so its last
+    /// touch is exactly [`Self::created_at`]; a terminal row's last touch
+    /// is whichever of [`Self::settled_at`]/[`Self::released_at`] is set
+    /// (and the later of the two for a late settlement recorded after
+    /// cascade expiry already set `released_at` —
+    /// [`Self::settled_after_expiry`]).
+    pub fn last_touched_at(&self) -> OffsetDateTime {
+        self.settled_at
+            .into_iter()
+            .chain(self.released_at)
+            .chain(std::iter::once(self.created_at))
+            .max()
+            .unwrap_or(self.created_at)
+    }
+
     /// `settled_amount - amount` when the actual cost exceeded what was
     /// reserved. Derived, never stored, so the two numbers can never
     /// disagree.
@@ -789,6 +884,189 @@ mod tests {
         reservation.settled_amount = Some(ResourceAmount::Tokens(300));
         assert_eq!(reservation.overrun(), None);
         assert_eq!(reservation.refunded(), Some(ResourceAmount::Tokens(200)));
+    }
+
+    // -- HORO-1904: ledger_freshness / last_touched_at --------------------
+
+    fn reservation_at(created_at: OffsetDateTime) -> Reservation {
+        Reservation {
+            id: ReservationId::new(),
+            task_id: TaskId::new(),
+            session_id: "sess-1".to_string(),
+            plan_id: None,
+            class: ReservationClass::RequiredWork,
+            amount: ResourceAmount::Tokens(500),
+            drawn_from_reserve: ResourceAmount::Tokens(0),
+            state: ReservationState::Active,
+            settled_amount: None,
+            usage_known: None,
+            idempotency_key: "key-1".to_string(),
+            created_at,
+            expires_at: created_at,
+            settled_at: None,
+            released_at: None,
+            account_id: AccountId::for_task(TaskId::new()),
+            grants_account: None,
+            lease_kind: LeaseKind::WorkHold,
+            settled_after_expiry: false,
+            legacy_pre_0011: false,
+        }
+    }
+
+    const MAX_STALENESS_SECS: u64 = 900;
+
+    #[test]
+    fn ledger_freshness_fresh_positive_control() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(10_000);
+        let touched = now - time::Duration::seconds(60);
+        assert_eq!(
+            ledger_freshness(Some(touched), now, MAX_STALENESS_SECS),
+            LedgerFreshness::Fresh { age_secs: 60 }
+        );
+    }
+
+    #[test]
+    fn ledger_freshness_stale_negative_control() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(10_000);
+        let touched = now - time::Duration::seconds(MAX_STALENESS_SECS as i64 + 1);
+        assert_eq!(
+            ledger_freshness(Some(touched), now, MAX_STALENESS_SECS),
+            LedgerFreshness::Stale {
+                age_secs: MAX_STALENESS_SECS + 1
+            }
+        );
+    }
+
+    #[test]
+    fn ledger_freshness_threshold_boundary() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(10_000);
+
+        let exactly_at_max = now - time::Duration::seconds(MAX_STALENESS_SECS as i64);
+        assert_eq!(
+            ledger_freshness(Some(exactly_at_max), now, MAX_STALENESS_SECS),
+            LedgerFreshness::Fresh {
+                age_secs: MAX_STALENESS_SECS
+            },
+            "age == max_staleness_secs must still report Fresh"
+        );
+
+        let just_under_plus_one_sec =
+            now - time::Duration::milliseconds(MAX_STALENESS_SECS as i64 * 1000 + 999);
+        assert_eq!(
+            ledger_freshness(Some(just_under_plus_one_sec), now, MAX_STALENESS_SECS),
+            LedgerFreshness::Fresh {
+                age_secs: MAX_STALENESS_SECS
+            },
+            "age is floored to whole seconds"
+        );
+
+        let one_sec_past_max = now - time::Duration::seconds(MAX_STALENESS_SECS as i64 + 1);
+        assert_eq!(
+            ledger_freshness(Some(one_sec_past_max), now, MAX_STALENESS_SECS),
+            LedgerFreshness::Stale {
+                age_secs: MAX_STALENESS_SECS + 1
+            }
+        );
+    }
+
+    #[test]
+    fn ledger_freshness_missing_timestamp_is_unknown() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        assert_eq!(
+            ledger_freshness(None, now, MAX_STALENESS_SECS),
+            LedgerFreshness::Unknown {
+                reason: LedgerFreshnessUnknown::NoTimestamp
+            }
+        );
+    }
+
+    #[test]
+    fn ledger_freshness_clock_skew_is_unknown_not_fresh() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(10_000);
+
+        assert_eq!(
+            ledger_freshness(
+                Some(now + time::Duration::milliseconds(1)),
+                now,
+                MAX_STALENESS_SECS
+            ),
+            LedgerFreshness::Unknown {
+                reason: LedgerFreshnessUnknown::TimestampInFuture
+            },
+            "a last-touch 1ms in the future must never be clamped to age 0 / Fresh"
+        );
+
+        assert_eq!(
+            ledger_freshness(
+                Some(now + time::Duration::hours(1)),
+                now,
+                MAX_STALENESS_SECS
+            ),
+            LedgerFreshness::Unknown {
+                reason: LedgerFreshnessUnknown::TimestampInFuture
+            }
+        );
+
+        assert_eq!(
+            ledger_freshness(Some(now), now, MAX_STALENESS_SECS),
+            LedgerFreshness::Fresh { age_secs: 0 },
+            "last_touched_at == now is age zero, not future"
+        );
+    }
+
+    #[test]
+    fn last_touched_at_tracks_the_relevant_timestamp_per_state() {
+        let created = OffsetDateTime::UNIX_EPOCH;
+        let settled_at = created + time::Duration::seconds(100);
+        let released_at = created + time::Duration::seconds(200);
+
+        let active = reservation_at(created);
+        assert_eq!(active.last_touched_at(), created);
+
+        let mut settled = reservation_at(created);
+        settled.state = ReservationState::Settled;
+        settled.settled_at = Some(settled_at);
+        assert_eq!(settled.last_touched_at(), settled_at);
+
+        let mut released = reservation_at(created);
+        released.state = ReservationState::Released;
+        released.released_at = Some(released_at);
+        assert_eq!(released.last_touched_at(), released_at);
+
+        let mut expired = reservation_at(created);
+        expired.state = ReservationState::Expired;
+        expired.released_at = Some(released_at);
+        assert_eq!(expired.last_touched_at(), released_at);
+
+        // Settled after a cascade expiry already stamped `released_at`:
+        // the later of the two wins, never the earlier.
+        let mut settled_after_expiry = reservation_at(created);
+        settled_after_expiry.state = ReservationState::Settled;
+        settled_after_expiry.released_at = Some(released_at);
+        settled_after_expiry.settled_at = Some(settled_at);
+        settled_after_expiry.settled_after_expiry = true;
+        assert_eq!(settled_after_expiry.last_touched_at(), released_at);
+    }
+
+    #[test]
+    fn ledger_freshness_serde_wire_shape_is_pinned() {
+        let stale = LedgerFreshness::Stale { age_secs: 42 };
+        let json = serde_json::to_value(stale).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"freshness": "stale", "age_secs": 42})
+        );
+        let roundtripped: LedgerFreshness = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtripped, stale);
+
+        let unknown = LedgerFreshness::Unknown {
+            reason: LedgerFreshnessUnknown::NoTimestamp,
+        };
+        let json = serde_json::to_value(unknown).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"freshness": "unknown", "reason": "no_timestamp"})
+        );
     }
 }
 
