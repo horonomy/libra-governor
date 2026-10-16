@@ -617,12 +617,99 @@ pub fn inspect(path: &Path) -> Inspection {
     }
 }
 
+/// Like [`inspect`], but returns the actual Governor-owned `command`
+/// string wired for each event (`None` if that event has no
+/// Governor-owned entry), rather than just a boolean. HORO-1906's
+/// `codex_verify_trust_cmd` uses this to correlate against Codex's own
+/// `hooks/list` RPC response by the *real* command text this file was
+/// last written with — not a reconstruction from the currently-running
+/// binary's own path, which can differ from what's on disk (e.g. the
+/// binary moved since `install` last ran; see `doctor`'s own
+/// `wired_command_matches_current_binary` check for that exact case).
+/// If a Governor-owned event has more than one matching command (not
+/// expected in practice — `apply` is idempotent and never duplicates —
+/// but not structurally impossible for a hand-edited file), the first
+/// one found is returned; this is a read-only best-effort lookup, not a
+/// validator.
+pub fn wired_commands(path: &Path) -> [Option<String>; 3] {
+    let mut out: [Option<String>; 3] = Default::default();
+    let Ok((Some(root), _)) = read_object(path) else {
+        return out;
+    };
+    let Some(hooks_obj) = root.get(HOOKS_KEY).and_then(Value::as_object) else {
+        return out;
+    };
+    for (idx, event) in HOOK_EVENTS.iter().enumerate() {
+        out[idx] = hooks_obj
+            .get(*event)
+            .and_then(Value::as_array)
+            .and_then(|entries| {
+                entries.iter().find_map(|matcher| {
+                    matcher
+                        .get("hooks")
+                        .and_then(Value::as_array)
+                        .and_then(|inner| {
+                            inner.iter().find_map(|h| {
+                                h.get("command")
+                                    .and_then(Value::as_str)
+                                    .filter(|c| command_is_ours(c))
+                                    .map(str::to_string)
+                            })
+                        })
+                })
+            });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn binary() -> PathBuf {
         PathBuf::from("/opt/libra/bin/libra-governor")
+    }
+
+    #[test]
+    fn wired_commands_returns_the_real_command_text_per_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        apply(&path, &binary()).unwrap();
+
+        let commands = wired_commands(&path);
+        assert_eq!(
+            commands[0].as_deref(),
+            Some("/opt/libra/bin/libra-governor codex-hook user-prompt-submit")
+        );
+        assert_eq!(
+            commands[1].as_deref(),
+            Some("/opt/libra/bin/libra-governor codex-hook post-tool-use")
+        );
+        assert_eq!(
+            commands[2].as_deref(),
+            Some("/opt/libra/bin/libra-governor codex-hook stop")
+        );
+    }
+
+    #[test]
+    fn wired_commands_is_none_for_an_unwired_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        // Only write Stop, leave the others unwired.
+        let seed = serde_json::json!({
+            "hooks": {
+                "Stop": [{ "hooks": [{ "type": "command", "command": "/opt/libra/bin/libra-governor codex-hook stop" }] }]
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+
+        let commands = wired_commands(&path);
+        assert!(commands[0].is_none());
+        assert!(commands[1].is_none());
+        assert_eq!(
+            commands[2].as_deref(),
+            Some("/opt/libra/bin/libra-governor codex-hook stop")
+        );
     }
 
     #[test]
