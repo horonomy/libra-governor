@@ -2,7 +2,9 @@
 //! acquisition. Socket permissions are the authority boundary; an adapter's
 //! diagnostic or externally normalized claim is not native authentication.
 use crate::{BudgetSnapshot, FinalizeOutcome, PreflightResult};
-use libra_governor_domain::{AssociationUnavailable, ExecutionIdentity, ExecutionTarget};
+use libra_governor_domain::{
+    AssociationUnavailable, ExecutionIdentity, ExecutionTarget, LedgerFreshness,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -60,6 +62,12 @@ pub enum ExecutionOwnerOutcome {
     Resolved {
         target: ExecutionTarget,
         budget: Option<BudgetSnapshot>,
+        /// Whether `budget`'s ledger row was touched recently enough to
+        /// trust (HORO-1904) — `Some` exactly when `budget` is `Some`.
+        /// See `StatusResult::task_budget_freshness` for the full
+        /// contract; this is the same report on the owner-route read
+        /// path.
+        budget_freshness: Option<LedgerFreshness>,
     },
     Applied {
         target: ExecutionTarget,

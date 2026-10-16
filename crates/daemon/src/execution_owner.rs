@@ -148,10 +148,35 @@ pub(crate) fn handle(
         }
         if let ExecutionOperation::Query {} = operation {
             return match resolved {
-                ExecutionLookup::Found(target) => Ok(Outcome::Resolved {
-                    budget: ledger.budget_snapshot(target.task_id)?,
-                    target,
-                }),
+                ExecutionLookup::Found(target) => {
+                    let read = ledger.budget_snapshot_with_last_touch(target.task_id)?;
+                    // HORO-1904: `now` is sampled after the read, not
+                    // before — this ledger opens its own connection per
+                    // `LedgerStore`, so a write from a concurrent
+                    // connection could otherwise commit between an
+                    // earlier `now` and this read, making a perfectly
+                    // fresh row look like it was touched in the future.
+                    // Reading inside WAL fixes the snapshot at the first
+                    // statement, so sampling the clock afterward rules
+                    // this out under a monotonic clock.
+                    let now = time::OffsetDateTime::now_utc();
+                    let (budget, freshness) = match read {
+                        Some((snapshot, last_touched_at)) => (
+                            Some(snapshot),
+                            Some(libra_governor_domain::ledger_freshness(
+                                last_touched_at,
+                                now,
+                                config.reservation_ttl_secs,
+                            )),
+                        ),
+                        None => (None, None),
+                    };
+                    Ok(Outcome::Resolved {
+                        budget,
+                        budget_freshness: freshness,
+                        target,
+                    })
+                }
                 ExecutionLookup::Unavailable(reason) => Ok(unavailable(reason)),
             };
         }

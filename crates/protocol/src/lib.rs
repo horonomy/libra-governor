@@ -40,9 +40,9 @@ pub use host_event::{
 pub use libra_governor_domain::Estimate;
 pub use libra_governor_domain::{
     BudgetSnapshot, BusinessContextSummary, Confidence, CredentialCustody, EnforcementCapabilities,
-    EnforcementTier, ExecutionOutcome, Headroom, MonetaryEnforcement, NoMonetaryCap, PlanId,
-    PolicyDecision, ReservationState, ResourceAmount, ResourceKind, SharedPoolReservationId,
-    TaskId, UsageAccounting,
+    EnforcementTier, ExecutionOutcome, Headroom, LedgerFreshness, LedgerFreshnessUnknown,
+    MonetaryEnforcement, NoMonetaryCap, PlanId, PolicyDecision, ReservationState, ResourceAmount,
+    ResourceKind, SharedPoolReservationId, TaskId, UsageAccounting,
 };
 pub use libra_governor_estimator::{
     AdmissionOutcome, AdmissionPolicy, AdmissionStats, CoverageReport, QuantileCoverage, Stratum,
@@ -195,4 +195,14 @@ pub use messages::{
 /// not_enabled }`) — but the shape itself is new wire data, so the bump
 /// follows every earlier precedent: a long-lived v15 daemon must be
 /// restarted after upgrading before launch-gate traffic is reachable.
-pub const PROTOCOL_VERSION: u32 = 16;
+///
+/// Bumped 16 -> 17 for HORO-1904's task-budget ledger freshness report:
+/// `StatusResult` gained `task_budget_freshness` and
+/// `ExecutionOwnerOutcome::Resolved` gained `budget_freshness`, both
+/// `Option<LedgerFreshness>`. Same precedent as the 10 -> 11 bump above
+/// (HORO-1709): an `Option` field would not fail a v16 peer's decode on
+/// its own, but silently defaulting to `None` would misreport a
+/// genuinely stale ledger reading as merely absent — the version check
+/// rejects that exchange instead of letting it happen quietly. A
+/// long-lived v16 daemon must be restarted after upgrading.
+pub const PROTOCOL_VERSION: u32 = 17;
