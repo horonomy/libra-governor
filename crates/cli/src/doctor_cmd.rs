@@ -654,8 +654,9 @@ fn codex_trust_state(config_toml_path: &Path) -> CodexTrustState {
         .any(|line| line.trim() == "[hooks.state]" || line.trim().starts_with("[hooks.state."))
     {
         return CodexTrustState::Unknown(
-            "a [hooks.state] section exists but its exact key shape was not verified — verify \
-             manually with `/hooks` inside Codex"
+            "a [hooks.state] section exists but its exact key shape was not verified from this \
+             local file alone — run `libra-governor doctor --verify-trust` for Codex's own \
+             authoritative answer (HORO-1906), or verify manually with `/hooks` inside Codex"
                 .to_string(),
         );
     }
