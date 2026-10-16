@@ -70,6 +70,10 @@ jobs:
             os: ubuntu-latest
             runnable: true
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -122,6 +126,19 @@ jobs:
           tar -czf "dist/${{ env.RELEASE_BIN }}-${{ matrix.target }}.tar.gz" -C dist "${{ env.RELEASE_BIN }}-${{ matrix.target }}"
           shasum -a 256 "dist/${{ env.RELEASE_BIN }}-${{ matrix.target }}.tar.gz" > "dist/${{ env.RELEASE_BIN }}-${{ matrix.target }}.tar.gz.sha256"
 
+      # Attested here, in the same job and on the same runner that produced
+      # the tarball — not after a round-trip through actions/upload-artifact
+      # in a separate job. Attesting a copy fetched back from artifact
+      # storage would open a window between "built" and "attested" where a
+      # substituted file could be signed instead of the real one; attesting
+      # the in-place file closes that window entirely. Safe on a fork PR or
+      # a Dependabot bump too: id-token/attestations:write are never granted
+      # to those tokens, so this step fails closed there rather than
+      # silently skipping, without blocking the rest of that PR's CI.
+      - uses: actions/attest-build-provenance@bd77c077858b8d561b7a36cbe48ef4cc642ca39d # v2.2.2
+        with:
+          subject-path: "dist/${{ env.RELEASE_BIN }}-${{ matrix.target }}.tar.gz"
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ env.RELEASE_BIN }}-${{ matrix.target }}
@@ -131,51 +148,38 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
-  # Attests build provenance for every artifact built above, regardless of
-  # trigger. Safe on pull_request from a fork too: attest-build-provenance
-  # requires id-token/attestations write, which a fork PR's GITHUB_TOKEN
-  # never has, so the step fails closed rather than silently skipping.
-  # Dependabot PR runs hit this same read-only-token path and are expected
-  # to no-op/fail here without blocking the ordinary dependency-bump CI.
-  attest:
-    name: attest provenance (${{ matrix.target }})
-    needs: build
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - aarch64-apple-darwin
-          - x86_64-apple-darwin
-          - x86_64-unknown-linux-gnu
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
-    steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: libra-governor-${{ matrix.target }}
-          path: dist
-      - uses: actions/attest-build-provenance@bd77c077858b8d561b7a36cbe48ef4cc642ca39d # v2.2.2
-        with:
-          subject-path: "dist/libra-governor-${{ matrix.target }}.tar.gz"
-
   # Only reachable on an actual `v*` tag push. Not authorized to run yet
   # per HORO-1857 comment 27544 — implemented so the file is complete and
   # reviewable, never exercised without a separately authorized tag push.
   create-release:
     name: publish GitHub Release
-    needs: [build, attest]
+    needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      attestations: read
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
+
+      # Re-verify each tarball's attestation against this exact repo before
+      # ever publishing it. The attest step above ran once per matrix leg,
+      # right after that leg's own build; this is the one place all three
+      # results are checked together, immediately before the artifacts
+      # become public, so a provenance gap can never reach a GitHub Release
+      # unnoticed.
+      - name: verify provenance before publishing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for f in dist/*.tar.gz; do
+            gh attestation verify "$f" --repo "${{ github.repository }}"
+          done
+
       - uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
         with:
           files: |
