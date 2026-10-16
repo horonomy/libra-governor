@@ -1,0 +1,184 @@
+name: Release
+
+# Three triggers, deliberately kept separate:
+#
+# - pull_request: build-only validation of this workflow itself. Uploads a
+#   *workflow artifact* (private to repo collaborators, auto-expires) via
+#   actions/upload-artifact — never a public GitHub Release. This is how the
+#   workflow definition gets tested before it is trusted to run on a tag.
+# - workflow_dispatch: same build-only path, runnable on-demand against any
+#   ref once this file is merged to main. Used to produce a verifiable
+#   artifact from an exact merge-commit SHA for local/offline verification
+#   (e.g. an isolated preview install test) without creating a tag.
+# - push tags v*: the only trigger that creates a public GitHub Release.
+#
+# HORO-1857 decision packet (Jira comment 27544): this workflow may be
+# implemented and tested, but pushing a `v*` tag and therefore exercising
+# the release-creation path is NOT authorized by that packet. The
+# create-release job below is gated on the tag trigger by construction —
+# it does not run from pull_request or workflow_dispatch.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/release.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/cli/**"
+      - "crates/daemon/**"
+      - "crates/domain/**"
+      - "crates/protocol/**"
+      - "crates/ledger/**"
+      - "crates/estimator/**"
+  workflow_dispatch: {}
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  # The one binary this workflow ships. lg-fake-server/lg-raw-client (in
+  # crates/two-principal-harness) are test-only fixtures, never released.
+  RELEASE_BIN: libra-governor
+
+# Least privilege by default; the release job elevates only what it needs.
+permissions:
+  contents: read
+
+jobs:
+  # Builds and smoke-tests the release binary on every target this workflow
+  # claims to support. Runs on pull_request, workflow_dispatch, and tag push
+  # alike — the tag-push run reuses this job's artifacts rather than
+  # rebuilding, so the exact bytes that were validated are the exact bytes
+  # released.
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            runnable: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            # Cross-compiled on an arm64 runner; not executed here. The
+            # smoke-test step below is skipped for this target and the
+            # provenance record discloses it as build-only, not run-verified.
+            runnable: false
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            runnable: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # On pull_request this checks out the ephemeral merge commit by
+          # default. Pin explicitly to the PR head SHA so the provenance
+          # record below names a real, citable commit instead of a
+          # synthetic merge ref that doesn't exist on any branch.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch @ 2026-09-18
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: build release binary
+        run: cargo build --release --locked --package libra-governor-cli --bin ${{ env.RELEASE_BIN }} --target ${{ matrix.target }}
+
+      - name: smoke-test the binary (native targets only)
+        if: matrix.runnable
+        run: ./target/${{ matrix.target }}/release/${{ env.RELEASE_BIN }} --version
+
+      - name: assemble artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="dist/${{ env.RELEASE_BIN }}-${{ matrix.target }}"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/${{ env.RELEASE_BIN }}" "$stage/"
+          chmod +x "$stage/${{ env.RELEASE_BIN }}"
+
+          resolved_sha="${{ github.event.pull_request.head.sha || github.sha }}"
+          {
+            echo "binary: ${{ env.RELEASE_BIN }}"
+            echo "target: ${{ matrix.target }}"
+            echo "source_sha: $resolved_sha"
+            echo "run_executed_version_check: ${{ matrix.runnable }}"
+            echo "runner_image: ${{ matrix.os }}"
+            echo "rustc: $(rustc -Vv | tr '\n' ';')"
+            echo "cargo: $(cargo -V)"
+            echo "built_at_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "$stage/PROVENANCE.txt"
+
+          # tar before upload-artifact: upload-artifact zips its input and
+          # does not preserve the executable bit, so an unpacked download
+          # would need a chmod the real distribution path won't have.
+          tar -czf "dist/${{ env.RELEASE_BIN }}-${{ matrix.target }}.tar.gz" -C dist "${{ env.RELEASE_BIN }}-${{ matrix.target }}"
+          shasum -a 256 "dist/${{ env.RELEASE_BIN }}-${{ matrix.target }}.tar.gz" > "dist/${{ env.RELEASE_BIN }}-${{ matrix.target }}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ env.RELEASE_BIN }}-${{ matrix.target }}
+          path: |
+            dist/${{ env.RELEASE_BIN }}-${{ matrix.target }}.tar.gz
+            dist/${{ env.RELEASE_BIN }}-${{ matrix.target }}.tar.gz.sha256
+          retention-days: 14
+          if-no-files-found: error
+
+  # Attests build provenance for every artifact built above, regardless of
+  # trigger. Safe on pull_request from a fork too: attest-build-provenance
+  # requires id-token/attestations write, which a fork PR's GITHUB_TOKEN
+  # never has, so the step fails closed rather than silently skipping.
+  # Dependabot PR runs hit this same read-only-token path and are expected
+  # to no-op/fail here without blocking the ordinary dependency-bump CI.
+  attest:
+    name: attest provenance (${{ matrix.target }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+          - x86_64-unknown-linux-gnu
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: libra-governor-${{ matrix.target }}
+          path: dist
+      - uses: actions/attest-build-provenance@bd77c077858b8d561b7a36cbe48ef4cc642ca39d # v2.2.2
+        with:
+          subject-path: "dist/libra-governor-${{ matrix.target }}.tar.gz"
+
+  # Only reachable on an actual `v*` tag push. Not authorized to run yet
+  # per HORO-1857 comment 27544 — implemented so the file is complete and
+  # reviewable, never exercised without a separately authorized tag push.
+  create-release:
+    name: publish GitHub Release
+    needs: [build, attest]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          generate_release_notes: true
