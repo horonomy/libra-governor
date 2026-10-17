@@ -134,6 +134,7 @@ mod hook_post_tool_use;
 mod hook_stop;
 mod install_cmd;
 mod launch_cmd;
+mod metered_pool_cmd;
 mod outcome_cmd;
 mod presentation;
 mod quota_cmd;
@@ -186,6 +187,10 @@ Usage:
   libra-governor quota-observation inspect <registration-id> [--constraint-ids <id1,id2,...>]
   libra-governor run --pool <alias> [--max-wait <secs>] -- <command> [args...]
   libra-governor launch status
+  libra-governor metered-pool reserve --owner <owner> --pool <alias> --unit usd_cents|tokens|requests --amount <n> --session <session-id> --key <idempotency-key> [--session-cap <n>]
+  libra-governor metered-pool settle --reservation <uuid> --owner <owner> --session <session-id> [--actual <n>]
+  libra-governor metered-pool release --reservation <uuid> --owner <owner> --session <session-id>
+  libra-governor metered-pool status --owner <owner> --pool <alias>
 
 Global options:
   -h, --help     Print this help and exit
@@ -268,6 +273,7 @@ fn main() {
         ["quota-observation", ..] => std::process::exit(quota_observation_cmd::run(&args[1..])),
         ["run", ..] => std::process::exit(run_cmd::run(&args[1..])),
         ["launch", "status"] => std::process::exit(launch_cmd::status()),
+        ["metered-pool", ..] => std::process::exit(metered_pool_cmd::run(&args[1..])),
         ["economics", "explain", sel, value]
             if matches!(
                 *sel,
