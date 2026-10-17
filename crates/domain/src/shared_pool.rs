@@ -48,7 +48,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::economic_attribution::PrincipalId;
-use crate::quota_window::{GaugeReading, PoolId, QuotaUnit};
+use crate::quota_window::{is_valid_slug, GaugeReading, PoolId, QuotaUnit};
 use crate::reservation::ReservationState;
 use crate::Confidence;
 
@@ -227,6 +227,135 @@ pub struct PoolProviderSnapshot {
     pub confidence: Confidence,
 }
 
+/// Namespace prefix for a [`MeteredPoolKey`]'s [`PoolId`] encoding
+/// (HORO-1915). Disjoint at the first byte from `crates/daemon`'s
+/// `launch:<alias>` pools — the two pool kinds are never confusable, and a
+/// metered handler refusing anything outside this prefix (see
+/// `libra_governor_daemon::metered_pool`) is what keeps a launch-slot hold
+/// from ever being settled/released through the metered path or vice
+/// versa.
+pub const METERED_POOL_PREFIX: &str = "metered:";
+
+/// A validated `metered:<owner>/<alias>` pool identifier (HORO-1915).
+/// Deliberately a distinct type from the opaque [`PoolId`] launch pools
+/// use directly — construction always validates both slugs, so a
+/// malformed owner/alias can never reach the ledger as a pool id.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MeteredPoolKey {
+    owner: PrincipalId,
+    alias: String,
+}
+
+/// Errors constructing a [`MeteredPoolKey`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MeteredPoolKeyError {
+    #[error("metered pool owner is not a valid slug: {0:?}")]
+    InvalidOwner(String),
+    #[error("metered pool alias is not a valid slug: {0:?}")]
+    InvalidAlias(String),
+}
+
+impl MeteredPoolKey {
+    /// Validates `owner` and `alias` against the same slug grammar
+    /// [`crate::quota_window::CreditNamespace`] uses
+    /// (`^[a-z][a-z0-9_-]{0,31}$`) — which already excludes `/` and `:`,
+    /// so the `metered:<owner>/<alias>` encoding this type produces is an
+    /// injective, unambiguous round trip (see [`Self::parse`]).
+    pub fn new(owner: &PrincipalId, alias: &str) -> Result<Self, MeteredPoolKeyError> {
+        if !is_valid_slug(&owner.0) {
+            return Err(MeteredPoolKeyError::InvalidOwner(owner.0.clone()));
+        }
+        if !is_valid_slug(alias) {
+            return Err(MeteredPoolKeyError::InvalidAlias(alias.to_string()));
+        }
+        Ok(Self {
+            owner: owner.clone(),
+            alias: alias.to_string(),
+        })
+    }
+
+    /// The exact inverse of [`Self::pool_id`]. Returns `None` for any
+    /// [`PoolId`] that is not a well-formed `metered:<owner>/<alias>`
+    /// encoding (including a `launch:` pool id, or a malformed metered
+    /// one) — callers use this to refuse cross-kind operations rather
+    /// than guessing.
+    pub fn parse(pool_id: &PoolId) -> Option<Self> {
+        let rest = pool_id.0.strip_prefix(METERED_POOL_PREFIX)?;
+        let (owner, alias) = rest.split_once('/')?;
+        Self::new(&PrincipalId(owner.to_string()), alias).ok()
+    }
+
+    pub fn pool_id(&self) -> PoolId {
+        PoolId(format!(
+            "{METERED_POOL_PREFIX}{}/{}",
+            self.owner.0, self.alias
+        ))
+    }
+
+    pub fn owner(&self) -> &PrincipalId {
+        &self.owner
+    }
+
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
+/// Whether `unit` is one of the provider-denominated units a metered pool
+/// may be created in (HORO-1915). Opaque launch-slot credit and
+/// basis-point percentages are refused — a metered pool always holds a
+/// unit a provider snapshot can be compared against directly, with no
+/// conversion.
+pub fn is_metered_unit(unit: &QuotaUnit) -> bool {
+    matches!(
+        unit,
+        QuotaUnit::UsdCents | QuotaUnit::Tokens | QuotaUnit::Requests
+    )
+}
+
+/// Why a [`PoolProviderSnapshot`] could not supply a trusted declared
+/// limit for a metered-pool admission decision (HORO-1915). Each variant
+/// is a distinct, named reason a caller can report — never collapsed into
+/// a single opaque "unavailable".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotUnusable {
+    /// No snapshot has ever been ingested for this pool.
+    Missing,
+    /// The most recent snapshot is [`GaugeReading::Undisclosed`].
+    Undisclosed,
+    /// The snapshot never declared a `valid_until` — an unbounded
+    /// trust window is never accepted for admission (see
+    /// `libra_governor_ledger::shared_pool::external_overhang_tx`, which
+    /// applies the same discipline to overhang).
+    NoValidUntil,
+    /// `valid_until` is at or before the evaluation instant.
+    Stale,
+    /// The reading is [`GaugeReading::Used`] but declared no `limit`.
+    LimitMissing,
+}
+
+/// The single definition of "is this pool's most recent provider snapshot
+/// usable for a metered-pool admission decision", shared by the ledger's
+/// reservation gate and by status reporting (HORO-1915) — evaluated in
+/// this fixed order so both callers always agree.
+pub fn metered_snapshot_limit(
+    snapshot: Option<&PoolProviderSnapshot>,
+    now: OffsetDateTime,
+) -> Result<u64, SnapshotUnusable> {
+    let snapshot = snapshot.ok_or(SnapshotUnusable::Missing)?;
+    let GaugeReading::Used { limit, .. } = &snapshot.reading else {
+        return Err(SnapshotUnusable::Undisclosed);
+    };
+    let Some(valid_until) = snapshot.valid_until else {
+        return Err(SnapshotUnusable::NoValidUntil);
+    };
+    if valid_until <= now {
+        return Err(SnapshotUnusable::Stale);
+    }
+    limit.ok_or(SnapshotUnusable::LimitMissing)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,6 +440,132 @@ mod tests {
         };
         assert_eq!(admission.remaining(), -3);
         assert!(!admission.admits(0));
+    }
+
+    #[test]
+    fn metered_pool_key_round_trips_through_pool_id() {
+        let key = MeteredPoolKey::new(&PrincipalId("acme".to_string()), "usd-2026-10").unwrap();
+        let pool_id = key.pool_id();
+        assert_eq!(pool_id.0, "metered:acme/usd-2026-10");
+        let parsed = MeteredPoolKey::parse(&pool_id).unwrap();
+        assert_eq!(parsed, key);
+    }
+
+    #[test]
+    fn metered_pool_key_refuses_invalid_slugs() {
+        assert!(MeteredPoolKey::new(&PrincipalId("ACME".to_string()), "usd-2026-10").is_err());
+        assert!(MeteredPoolKey::new(&PrincipalId("acme".to_string()), "has/slash").is_err());
+    }
+
+    #[test]
+    fn metered_pool_key_parse_refuses_non_metered_pool_ids() {
+        assert!(MeteredPoolKey::parse(&PoolId("launch:default".to_string())).is_none());
+        assert!(MeteredPoolKey::parse(&PoolId("metered:no-alias".to_string())).is_none());
+    }
+
+    #[test]
+    fn is_metered_unit_accepts_only_provider_denominated_units() {
+        assert!(is_metered_unit(&QuotaUnit::UsdCents));
+        assert!(is_metered_unit(&QuotaUnit::Tokens));
+        assert!(is_metered_unit(&QuotaUnit::Requests));
+        assert!(!is_metered_unit(&QuotaUnit::Percent));
+        assert!(!is_metered_unit(&QuotaUnit::OpaqueCredit(
+            crate::quota_window::CreditNamespace::new("libra-launch-slot").unwrap()
+        )));
+    }
+
+    fn base_snapshot(
+        reading: GaugeReading,
+        valid_until: Option<OffsetDateTime>,
+    ) -> PoolProviderSnapshot {
+        PoolProviderSnapshot {
+            pool_id: PoolId("metered:acme/usd-2026-10".to_string()),
+            observed_at: OffsetDateTime::UNIX_EPOCH,
+            valid_until,
+            reading,
+            confidence: Confidence::Medium,
+        }
+    }
+
+    #[test]
+    fn metered_snapshot_limit_missing_when_no_snapshot() {
+        assert_eq!(
+            metered_snapshot_limit(None, OffsetDateTime::UNIX_EPOCH),
+            Err(SnapshotUnusable::Missing)
+        );
+    }
+
+    #[test]
+    fn metered_snapshot_limit_undisclosed() {
+        let snap = base_snapshot(
+            GaugeReading::Undisclosed,
+            Some(OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1)),
+        );
+        assert_eq!(
+            metered_snapshot_limit(Some(&snap), OffsetDateTime::UNIX_EPOCH),
+            Err(SnapshotUnusable::Undisclosed)
+        );
+    }
+
+    #[test]
+    fn metered_snapshot_limit_no_valid_until() {
+        let snap = base_snapshot(
+            GaugeReading::Used {
+                used: crate::quota_window::QuotaAmount::new(QuotaUnit::UsdCents, 0),
+                limit: Some(50_000),
+            },
+            None,
+        );
+        assert_eq!(
+            metered_snapshot_limit(Some(&snap), OffsetDateTime::UNIX_EPOCH),
+            Err(SnapshotUnusable::NoValidUntil)
+        );
+    }
+
+    #[test]
+    fn metered_snapshot_limit_stale() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::hours(2);
+        let snap = base_snapshot(
+            GaugeReading::Used {
+                used: crate::quota_window::QuotaAmount::new(QuotaUnit::UsdCents, 0),
+                limit: Some(50_000),
+            },
+            Some(OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1)),
+        );
+        assert_eq!(
+            metered_snapshot_limit(Some(&snap), now),
+            Err(SnapshotUnusable::Stale)
+        );
+    }
+
+    #[test]
+    fn metered_snapshot_limit_missing_limit() {
+        let snap = base_snapshot(
+            GaugeReading::Used {
+                used: crate::quota_window::QuotaAmount::new(QuotaUnit::UsdCents, 0),
+                limit: None,
+            },
+            Some(OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1)),
+        );
+        assert_eq!(
+            metered_snapshot_limit(Some(&snap), OffsetDateTime::UNIX_EPOCH),
+            Err(SnapshotUnusable::LimitMissing)
+        );
+    }
+
+    #[test]
+    fn metered_snapshot_limit_ok_when_fresh_and_disclosed() {
+        let snap = base_snapshot(
+            GaugeReading::Used {
+                used: crate::quota_window::QuotaAmount::new(QuotaUnit::UsdCents, 12_000),
+                limit: Some(50_000),
+            },
+            Some(OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1)),
+        );
+        assert_eq!(
+            metered_snapshot_limit(Some(&snap), OffsetDateTime::UNIX_EPOCH),
+            Ok(50_000)
+        );
     }
 
     #[test]

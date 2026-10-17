@@ -117,6 +117,11 @@ pub(crate) fn strip_agent_named_paths(request: &mut Request) {
         // filesystem path) — see `crates/protocol/src/launch.rs`. No
         // sink exists here to strip.
         Request::Launch { .. } => {}
+        // `MeteredPoolRequest`'s variants carry only `owner`/`alias`/
+        // `session_id`/`idempotency_key` (opaque identifiers) and a
+        // `reservation_id` — see `crates/protocol/src/metered_pool.rs`.
+        // No filesystem-path field exists here to strip.
+        Request::MeteredPool { .. } => {}
     }
 }
 

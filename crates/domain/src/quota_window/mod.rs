@@ -131,7 +131,7 @@ impl From<CreditNamespace> for String {
     }
 }
 
-fn is_valid_slug(slug: &str) -> bool {
+pub(crate) fn is_valid_slug(slug: &str) -> bool {
     let mut chars = slug.chars();
     let Some(first) = chars.next() else {
         return false;
