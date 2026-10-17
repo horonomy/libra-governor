@@ -161,7 +161,38 @@ adding one). It reports exactly three states, deliberately conservative:
 
 `doctor` **never** reports "trusted" — that would require parsing
 `[hooks.state]`'s real shape, which was not verified during HORO-1157.
-Verify trust yourself with `/hooks` inside Codex.
+Verify trust yourself with `/hooks` inside Codex, or use the
+authoritative command below.
+
+## `doctor --verify-trust` — Codex's own authoritative answer (HORO-1906)
+
+`libra-governor doctor --verify-trust [--json]` replaces the local,
+conservative hedge above with Codex's **own** live answer, per ADR-0015
+(`horonomy/internal-docs`,
+`docs/engineering/adr-0015-cross-product-host-trust-resolution.md`,
+Option A). Unlike plain `doctor`, this
+command is an explicit, operator-invoked action that starts Codex's
+`app-server` process (against your real `$CODEX_HOME`, never a synthetic
+one), calls its `hooks/list` RPC, and reports each installed hook's real
+`currentHash`/`trustStatus` straight from Codex — not a guess.
+
+It is never reachable from `--help`, plain `doctor`, or any other
+passive/inspection surface; starting `app-server` only ever happens when
+you type this exact subcommand.
+
+Fail-closed: if `app-server` is unreachable, the RPC times out, the
+response is malformed, or a hook wired in `hooks.json` is absent from
+Codex's response (orphaned entry), that hook is reported `unknown` —
+never silently reported as trusted.
+
+Known side effect, not introduced by this command: starting Codex's
+`app-server` performs Codex's own first-run initialization (SQLite state
+files, an `installation_id`) the very first time it runs against a given
+`$CODEX_HOME`. On an already-initialized `~/.codex` (the normal case for
+anyone who has used Codex before), repeated runs were observed to touch
+only an internal operational log file — not `auth.json` — across ten
+consecutive real local round trips measured during this ticket's own
+evidence-gathering.
 
 ## Capability tiers
 

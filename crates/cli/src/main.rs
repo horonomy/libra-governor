@@ -50,6 +50,17 @@
 //!   statusline wiring, gateway configuration and capability tier, and
 //!   `config.json` validity (HORO-1150). Never spawns the daemon, never
 //!   prints a secret.
+//! - `doctor --verify-trust [--json]` — HORO-1906, ADR-0015 Option A.
+//!   The one explicit, operator-invoked command that starts Codex's own
+//!   `app-server` process and asks its authoritative `hooks/list` RPC
+//!   for each installed Libra hook's real `currentHash`/`trustStatus`,
+//!   replacing the local, conservative `[hooks.state]` text-scan hedge
+//!   with Codex's own live answer. Fails closed: app-server unreachable,
+//!   an RPC timeout, a malformed response, or a hook wired locally but
+//!   absent from Codex's response (orphaned entry) all report
+//!   `unknown`, never `trusted`. Never reachable from plain `doctor`,
+//!   `--help`, or any other passive surface — see
+//!   `codex_verify_trust_cmd` module docs.
 //! - `install [--hooks-only] [--agent codex]` — wires this binary's hooks (and,
 //!   for Claude Code by default, statusline) into `~/.claude/settings.json` or
 //!   `~/.codex/hooks.json`, preserving every other key (HORO-1150,
@@ -108,8 +119,10 @@ mod bucket_prose;
 mod calibration_cmd;
 mod claude_settings;
 mod client;
+mod codex_app_server_client;
 mod codex_hook;
 mod codex_hooks_file;
+mod codex_verify_trust_cmd;
 mod daemon_cmd;
 mod doctor_cmd;
 mod dogfood_evidence_cmd;
@@ -152,6 +165,7 @@ Usage:
   libra-governor gateway token
   libra-governor gateway status
   libra-governor doctor [--json]
+  libra-governor doctor --verify-trust [--json]
   libra-governor install [--hooks-only]
   libra-governor install --agent codex
   libra-governor uninstall [--agent codex] [--yes]
@@ -233,6 +247,10 @@ fn main() {
         ["gateway", "status"] => gateway_cmd::run_status(),
         ["doctor"] => doctor_cmd::run(false),
         ["doctor", "--json"] => doctor_cmd::run(true),
+        ["doctor", "--verify-trust"] => std::process::exit(codex_verify_trust_cmd::run(false)),
+        ["doctor", "--verify-trust", "--json"] => {
+            std::process::exit(codex_verify_trust_cmd::run(true))
+        }
         ["install"] => install_cmd::run(),
         ["install", "--hooks-only"] => install_cmd::run_hooks_only(),
         ["install", "--agent", "codex"] => install_cmd::run_codex(),
