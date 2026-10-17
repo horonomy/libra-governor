@@ -21,6 +21,7 @@
 pub mod execution_owner;
 pub mod host_event;
 pub mod launch;
+pub mod metered_pool;
 pub use execution_owner::{
     ExecutionEffect, ExecutionOperation, ExecutionOwnerOutcome, ExecutionOwnerRequest,
     NativeExecutionContext,
@@ -28,6 +29,10 @@ pub use execution_owner::{
 pub use launch::{
     LaunchOutcome, LaunchRequest, PoolStatus, UnavailableReason, WaitReason,
     LAUNCH_GATE_ENFORCEMENT_SCOPE,
+};
+pub use metered_pool::{
+    MeteredPoolOutcome, MeteredPoolRequest, MeteredPoolSessionUsage, MeteredPoolSnapshotStatus,
+    MeteredPoolStatus, MeteredRefusal, METERED_POOL_ENFORCEMENT_SCOPE,
 };
 mod messages;
 pub mod wire;
@@ -205,4 +210,15 @@ pub use messages::{
 /// genuinely stale ledger reading as merely absent — the version check
 /// rejects that exchange instead of letting it happen quietly. A
 /// long-lived v16 daemon must be restarted after upgrading.
-pub const PROTOCOL_VERSION: u32 = 17;
+///
+/// Bumped 17 -> 18 for HORO-1915's metered shared-pool IPC: `Request`
+/// gained `MeteredPool` and `Response` gained the matching `MeteredPool`
+/// variant, which a v17 peer's `deny_unknown_fields`-enforced decoder
+/// cannot parse. Structurally independent of HORO-1766's `Launch`
+/// variant (same precedent as the 15 -> 16 bump): a metered pool is a
+/// distinct, separately-namespaced pool kind, and this phase has no
+/// production feed provisioning one (see `crate::metered_pool` module
+/// docs) — but the shape itself is new wire data, so the bump follows
+/// every earlier precedent: a long-lived v17 daemon must be restarted
+/// after upgrading before metered-pool traffic is reachable.
+pub const PROTOCOL_VERSION: u32 = 18;
