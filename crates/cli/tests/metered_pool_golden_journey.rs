@@ -81,7 +81,7 @@ impl Sandbox {
         let output = child.wait_with_output().unwrap();
         assert!(
             output.status.success(),
-            "establish_session({session_id}) failed: {}",
+            "establish_session failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
