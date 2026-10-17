@@ -767,6 +767,62 @@ pub(crate) fn dispatch(
                 }
             }
         }
+        Request::MeteredPool { metered_pool } => {
+            let now = time::OffsetDateTime::now_utc();
+            let outcome = match metered_pool {
+                libra_governor_protocol::MeteredPoolRequest::Reserve {
+                    owner,
+                    alias,
+                    unit,
+                    amount,
+                    session_id,
+                    idempotency_key,
+                    session_cap,
+                } => crate::metered_pool::handle_reserve(
+                    ledger,
+                    crate::metered_pool::MeteredReserveArgs {
+                        owner: &owner,
+                        alias: &alias,
+                        unit,
+                        amount,
+                        session_id: &session_id,
+                        idempotency_key: &idempotency_key,
+                        session_cap,
+                    },
+                    now,
+                ),
+                libra_governor_protocol::MeteredPoolRequest::Settle {
+                    reservation_id,
+                    owner,
+                    session_id,
+                    actual,
+                } => crate::metered_pool::handle_settle(
+                    ledger,
+                    reservation_id,
+                    &owner,
+                    &session_id,
+                    actual,
+                    now,
+                ),
+                libra_governor_protocol::MeteredPoolRequest::Release {
+                    reservation_id,
+                    owner,
+                    session_id,
+                } => crate::metered_pool::handle_release(ledger, reservation_id, &owner, &session_id, now),
+                libra_governor_protocol::MeteredPoolRequest::Status { owner, alias } => {
+                    crate::metered_pool::handle_status(ledger, &owner, &alias, now)
+                }
+            };
+            match outcome {
+                Ok(outcome) => Response::MeteredPool(Box::new(outcome)),
+                Err(e) => {
+                    log::append_line(&config.log_path, &format!("metered pool error: {e}"));
+                    Response::Error {
+                        message: "internal error handling metered pool request".to_string(),
+                    }
+                }
+            }
+        }
     }
 }
 
