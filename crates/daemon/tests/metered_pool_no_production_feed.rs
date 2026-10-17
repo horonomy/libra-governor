@@ -94,10 +94,7 @@ fn no_production_call_site_provisions_or_feeds_a_metered_pool() {
 
 #[test]
 fn metered_pool_module_never_references_quota_observation_or_quota_source() {
-    for path in [
-        "src/metered_pool.rs",
-        "../cli/src/metered_pool_cmd.rs",
-    ] {
+    for path in ["src/metered_pool.rs", "../cli/src/metered_pool_cmd.rs"] {
         let content = read_src(path);
         assert!(
             !content.contains("quota_observation") && !content.contains("quota-observation"),

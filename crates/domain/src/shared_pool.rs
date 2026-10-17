@@ -286,7 +286,10 @@ impl MeteredPoolKey {
     }
 
     pub fn pool_id(&self) -> PoolId {
-        PoolId(format!("{METERED_POOL_PREFIX}{}/{}", self.owner.0, self.alias))
+        PoolId(format!(
+            "{METERED_POOL_PREFIX}{}/{}",
+            self.owner.0, self.alias
+        ))
     }
 
     pub fn owner(&self) -> &PrincipalId {
@@ -304,7 +307,10 @@ impl MeteredPoolKey {
 /// unit a provider snapshot can be compared against directly, with no
 /// conversion.
 pub fn is_metered_unit(unit: &QuotaUnit) -> bool {
-    matches!(unit, QuotaUnit::UsdCents | QuotaUnit::Tokens | QuotaUnit::Requests)
+    matches!(
+        unit,
+        QuotaUnit::UsdCents | QuotaUnit::Tokens | QuotaUnit::Requests
+    )
 }
 
 /// Why a [`PoolProviderSnapshot`] could not supply a trusted declared
@@ -468,7 +474,10 @@ mod tests {
         )));
     }
 
-    fn base_snapshot(reading: GaugeReading, valid_until: Option<OffsetDateTime>) -> PoolProviderSnapshot {
+    fn base_snapshot(
+        reading: GaugeReading,
+        valid_until: Option<OffsetDateTime>,
+    ) -> PoolProviderSnapshot {
         PoolProviderSnapshot {
             pool_id: PoolId("metered:acme/usd-2026-10".to_string()),
             observed_at: OffsetDateTime::UNIX_EPOCH,
@@ -488,7 +497,10 @@ mod tests {
 
     #[test]
     fn metered_snapshot_limit_undisclosed() {
-        let snap = base_snapshot(GaugeReading::Undisclosed, Some(OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1)));
+        let snap = base_snapshot(
+            GaugeReading::Undisclosed,
+            Some(OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1)),
+        );
         assert_eq!(
             metered_snapshot_limit(Some(&snap), OffsetDateTime::UNIX_EPOCH),
             Err(SnapshotUnusable::Undisclosed)
@@ -520,7 +532,10 @@ mod tests {
             },
             Some(OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1)),
         );
-        assert_eq!(metered_snapshot_limit(Some(&snap), now), Err(SnapshotUnusable::Stale));
+        assert_eq!(
+            metered_snapshot_limit(Some(&snap), now),
+            Err(SnapshotUnusable::Stale)
+        );
     }
 
     #[test]
@@ -547,7 +562,10 @@ mod tests {
             },
             Some(OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1)),
         );
-        assert_eq!(metered_snapshot_limit(Some(&snap), OffsetDateTime::UNIX_EPOCH), Ok(50_000));
+        assert_eq!(
+            metered_snapshot_limit(Some(&snap), OffsetDateTime::UNIX_EPOCH),
+            Ok(50_000)
+        );
     }
 
     #[test]

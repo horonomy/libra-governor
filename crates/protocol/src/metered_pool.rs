@@ -23,7 +23,9 @@
 //! not-yet-authorized trust-boundary decision.
 use serde::{Deserialize, Serialize};
 
-use libra_governor_domain::{QuotaUnit, ReservationState, SharedPoolReservationId, SnapshotUnusable, TaskId};
+use libra_governor_domain::{
+    QuotaUnit, ReservationState, SharedPoolReservationId, SnapshotUnusable, TaskId,
+};
 
 /// The fixed scope every [`MeteredPoolStatus`] reports: this ledger only
 /// ever enforces holds *this host's* daemon reserved against its own

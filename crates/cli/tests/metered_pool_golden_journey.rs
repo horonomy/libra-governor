@@ -86,7 +86,13 @@ impl Sandbox {
         );
     }
 
-    fn provision(&self, owner: &str, alias: &str, unit: libra_governor_domain::QuotaUnit, capacity: u64) -> SyntheticMeteredFeed {
+    fn provision(
+        &self,
+        owner: &str,
+        alias: &str,
+        unit: libra_governor_domain::QuotaUnit,
+        capacity: u64,
+    ) -> SyntheticMeteredFeed {
         SyntheticMeteredFeed::provision(self.state.path(), owner, alias, unit, capacity)
     }
 
@@ -111,10 +117,28 @@ impl Sandbox {
         (code, value)
     }
 
-    fn reserve(&self, owner: &str, alias: &str, session: &str, amount: u64, key: &str) -> (i32, serde_json::Value) {
+    fn reserve(
+        &self,
+        owner: &str,
+        alias: &str,
+        session: &str,
+        amount: u64,
+        key: &str,
+    ) -> (i32, serde_json::Value) {
         self.metered_pool(&[
-            "reserve", "--owner", owner, "--pool", alias, "--unit", "usd_cents", "--amount",
-            &amount.to_string(), "--session", session, "--key", key,
+            "reserve",
+            "--owner",
+            owner,
+            "--pool",
+            alias,
+            "--unit",
+            "usd_cents",
+            "--amount",
+            &amount.to_string(),
+            "--session",
+            session,
+            "--key",
+            key,
         ])
     }
 
@@ -128,14 +152,40 @@ impl Sandbox {
         cap: u64,
     ) -> (i32, serde_json::Value) {
         self.metered_pool(&[
-            "reserve", "--owner", owner, "--pool", alias, "--unit", "usd_cents", "--amount",
-            &amount.to_string(), "--session", session, "--key", key, "--session-cap",
+            "reserve",
+            "--owner",
+            owner,
+            "--pool",
+            alias,
+            "--unit",
+            "usd_cents",
+            "--amount",
+            &amount.to_string(),
+            "--session",
+            session,
+            "--key",
+            key,
+            "--session-cap",
             &cap.to_string(),
         ])
     }
 
-    fn settle(&self, reservation_id: &str, owner: &str, session: &str, actual: Option<u64>) -> (i32, serde_json::Value) {
-        let mut args = vec!["settle", "--reservation", reservation_id, "--owner", owner, "--session", session];
+    fn settle(
+        &self,
+        reservation_id: &str,
+        owner: &str,
+        session: &str,
+        actual: Option<u64>,
+    ) -> (i32, serde_json::Value) {
+        let mut args = vec![
+            "settle",
+            "--reservation",
+            reservation_id,
+            "--owner",
+            owner,
+            "--session",
+            session,
+        ];
         let actual_str;
         if let Some(a) = actual {
             actual_str = a.to_string();
@@ -145,8 +195,21 @@ impl Sandbox {
         self.metered_pool(&args)
     }
 
-    fn release(&self, reservation_id: &str, owner: &str, session: &str) -> (i32, serde_json::Value) {
-        self.metered_pool(&["release", "--reservation", reservation_id, "--owner", owner, "--session", session])
+    fn release(
+        &self,
+        reservation_id: &str,
+        owner: &str,
+        session: &str,
+    ) -> (i32, serde_json::Value) {
+        self.metered_pool(&[
+            "release",
+            "--reservation",
+            reservation_id,
+            "--owner",
+            owner,
+            "--session",
+            session,
+        ])
     }
 
     fn status(&self, owner: &str, alias: &str) -> (i32, serde_json::Value) {
@@ -170,7 +233,12 @@ fn shared_pool_is_not_duplicated_per_session() {
     let sandbox = Sandbox::new();
     sandbox.establish_session("sess-a");
     sandbox.establish_session("sess-b");
-    let _feed = sandbox.provision("acme", "usd-2026-10", libra_governor_domain::QuotaUnit::UsdCents, 50_000);
+    let _feed = sandbox.provision(
+        "acme",
+        "usd-2026-10",
+        libra_governor_domain::QuotaUnit::UsdCents,
+        50_000,
+    );
     {
         let feed = SyntheticMeteredFeed::provision(
             sandbox.state.path(),
@@ -186,7 +254,10 @@ fn shared_pool_is_not_duplicated_per_session() {
     assert_eq!(code_a, 0, "{a}");
     let (code_b, b) = sandbox.reserve("acme", "usd-2026-10", "sess-b", 20_000, "b1");
     assert_eq!(code_b, 0, "{b}");
-    assert_eq!(a["pool_id"], b["pool_id"], "both sessions must share one pool id");
+    assert_eq!(
+        a["pool_id"], b["pool_id"],
+        "both sessions must share one pool id"
+    );
 
     let (_, status) = sandbox.status("acme", "usd-2026-10");
     assert_eq!(status["active"], 40_000);
@@ -207,7 +278,12 @@ fn partial_settle_release_and_gauge_receipts_do_not_double_count() {
     let sandbox = Sandbox::new();
     sandbox.establish_session("sess-a");
     sandbox.establish_session("sess-b");
-    let feed = sandbox.provision("acme", "usd-2026-10", libra_governor_domain::QuotaUnit::UsdCents, 50_000);
+    let feed = sandbox.provision(
+        "acme",
+        "usd-2026-10",
+        libra_governor_domain::QuotaUnit::UsdCents,
+        50_000,
+    );
     feed.publish_used(0, Some(50_000), OffsetDateTime::now_utc());
 
     let (_, a) = sandbox.reserve("acme", "usd-2026-10", "sess-a", 20_000, "a1");
@@ -239,7 +315,10 @@ fn partial_settle_release_and_gauge_receipts_do_not_double_count() {
     // must not subtract it a second time.
     feed.publish_used(12_000, Some(50_000), OffsetDateTime::now_utc());
     let (_, status) = sandbox.status("acme", "usd-2026-10");
-    assert_eq!(status["remaining"], 38_000, "settled amount must not be double-counted via the gauge");
+    assert_eq!(
+        status["remaining"], 38_000,
+        "settled amount must not be double-counted via the gauge"
+    );
 
     // A reading ABOVE what Libra knows about is genuine external overhang
     // and must reduce remaining further.
@@ -261,14 +340,24 @@ fn partial_settle_release_and_gauge_receipts_do_not_double_count() {
 fn cross_principal_pools_and_identity_are_isolated() {
     let sandbox = Sandbox::new();
     sandbox.establish_session("sess-a");
-    let acme_feed = sandbox.provision("acme", "usd-2026-10", libra_governor_domain::QuotaUnit::UsdCents, 50_000);
+    let acme_feed = sandbox.provision(
+        "acme",
+        "usd-2026-10",
+        libra_governor_domain::QuotaUnit::UsdCents,
+        50_000,
+    );
     acme_feed.publish_used(0, Some(50_000), OffsetDateTime::now_utc());
 
     let (code, refused) = sandbox.status("globex", "usd-2026-10");
     assert_eq!(code, 3, "{refused}");
     assert_eq!(refused["reason"]["reason"], "no_pool");
 
-    let globex_feed = sandbox.provision("globex", "usd-2026-10", libra_governor_domain::QuotaUnit::UsdCents, 10_000);
+    let globex_feed = sandbox.provision(
+        "globex",
+        "usd-2026-10",
+        libra_governor_domain::QuotaUnit::UsdCents,
+        10_000,
+    );
     globex_feed.publish_used(0, Some(10_000), OffsetDateTime::now_utc());
 
     let (code, a) = sandbox.reserve("acme", "usd-2026-10", "sess-a", 20_000, "a1");
@@ -276,14 +365,20 @@ fn cross_principal_pools_and_identity_are_isolated() {
     let a_id = reservation_id(&a);
 
     let (_, acme_status) = sandbox.status("acme", "usd-2026-10");
-    assert_eq!(acme_status["active"], 20_000, "globex's pool must not affect acme's");
+    assert_eq!(
+        acme_status["active"], 20_000,
+        "globex's pool must not affect acme's"
+    );
 
     let (code, wrong_owner) = sandbox.settle(&a_id, "globex", "sess-a", None);
     assert_eq!(code, 3, "{wrong_owner}");
     assert_eq!(wrong_owner["reason"]["reason"], "not_holder");
 
     let (_, acme_status_after) = sandbox.status("acme", "usd-2026-10");
-    assert_eq!(acme_status_after["active"], 20_000, "a refused settle must never mutate the hold");
+    assert_eq!(
+        acme_status_after["active"], 20_000,
+        "a refused settle must never mutate the hold"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -295,7 +390,12 @@ fn restart_leaves_no_phantom_free_capacity() {
     let sandbox = Sandbox::new();
     sandbox.establish_session("sess-a");
     sandbox.establish_session("sess-b");
-    let feed = sandbox.provision("acme", "usd-2026-10", libra_governor_domain::QuotaUnit::UsdCents, 50_000);
+    let feed = sandbox.provision(
+        "acme",
+        "usd-2026-10",
+        libra_governor_domain::QuotaUnit::UsdCents,
+        50_000,
+    );
     feed.publish_used(0, Some(50_000), OffsetDateTime::now_utc());
 
     let (code, a) = sandbox.reserve("acme", "usd-2026-10", "sess-a", 30_000, "a1");
@@ -305,7 +405,10 @@ fn restart_leaves_no_phantom_free_capacity() {
     std::thread::sleep(Duration::from_millis(200));
 
     let (code, b) = sandbox.reserve("acme", "usd-2026-10", "sess-b", 25_000, "b1");
-    assert_eq!(code, 3, "a freshly auto-spawned daemon must not forget acme's 30_000 hold: {b}");
+    assert_eq!(
+        code, 3,
+        "a freshly auto-spawned daemon must not forget acme's 30_000 hold: {b}"
+    );
     assert_eq!(b["reason"]["reason"], "insufficient");
 
     let (_, status) = sandbox.status("acme", "usd-2026-10");
@@ -320,7 +423,12 @@ fn restart_leaves_no_phantom_free_capacity() {
 fn missing_snapshot_fails_closed() {
     let sandbox = Sandbox::new();
     sandbox.establish_session("sess-a");
-    sandbox.provision("acme", "usd-2026-10", libra_governor_domain::QuotaUnit::UsdCents, 50_000);
+    sandbox.provision(
+        "acme",
+        "usd-2026-10",
+        libra_governor_domain::QuotaUnit::UsdCents,
+        50_000,
+    );
     let (code, refused) = sandbox.reserve("acme", "usd-2026-10", "sess-a", 100, "a1");
     assert_eq!(code, 3, "{refused}");
     assert_eq!(refused["reason"]["reason"], "snapshot");
@@ -334,7 +442,12 @@ fn missing_snapshot_fails_closed() {
 fn undisclosed_snapshot_fails_closed() {
     let sandbox = Sandbox::new();
     sandbox.establish_session("sess-a");
-    let feed = sandbox.provision("acme", "usd-2026-10", libra_governor_domain::QuotaUnit::UsdCents, 50_000);
+    let feed = sandbox.provision(
+        "acme",
+        "usd-2026-10",
+        libra_governor_domain::QuotaUnit::UsdCents,
+        50_000,
+    );
     feed.publish_undisclosed(OffsetDateTime::now_utc());
     let (code, refused) = sandbox.reserve("acme", "usd-2026-10", "sess-a", 100, "a1");
     assert_eq!(code, 3, "{refused}");
@@ -345,7 +458,12 @@ fn undisclosed_snapshot_fails_closed() {
 fn stale_snapshot_fails_closed() {
     let sandbox = Sandbox::new();
     sandbox.establish_session("sess-a");
-    let feed = sandbox.provision("acme", "usd-2026-10", libra_governor_domain::QuotaUnit::UsdCents, 50_000);
+    let feed = sandbox.provision(
+        "acme",
+        "usd-2026-10",
+        libra_governor_domain::QuotaUnit::UsdCents,
+        50_000,
+    );
     feed.publish_stale(OffsetDateTime::now_utc());
     let (code, refused) = sandbox.reserve("acme", "usd-2026-10", "sess-a", 100, "a1");
     assert_eq!(code, 3, "{refused}");
@@ -356,7 +474,12 @@ fn stale_snapshot_fails_closed() {
 fn a_declared_limit_below_capacity_lowers_effective_capacity() {
     let sandbox = Sandbox::new();
     sandbox.establish_session("sess-a");
-    let feed = sandbox.provision("acme", "usd-2026-10", libra_governor_domain::QuotaUnit::UsdCents, 50_000);
+    let feed = sandbox.provision(
+        "acme",
+        "usd-2026-10",
+        libra_governor_domain::QuotaUnit::UsdCents,
+        50_000,
+    );
     feed.publish_used(0, Some(30_000), OffsetDateTime::now_utc());
 
     let (code, over) = sandbox.reserve("acme", "usd-2026-10", "sess-a", 30_001, "a1");
@@ -375,7 +498,12 @@ fn a_declared_limit_below_capacity_lowers_effective_capacity() {
 #[test]
 fn reserve_refuses_an_unestablished_session() {
     let sandbox = Sandbox::new();
-    let feed = sandbox.provision("acme", "usd-2026-10", libra_governor_domain::QuotaUnit::UsdCents, 50_000);
+    let feed = sandbox.provision(
+        "acme",
+        "usd-2026-10",
+        libra_governor_domain::QuotaUnit::UsdCents,
+        50_000,
+    );
     feed.publish_used(0, Some(50_000), OffsetDateTime::now_utc());
     let (code, refused) = sandbox.reserve("acme", "usd-2026-10", "never-established", 100, "a1");
     assert_eq!(code, 3, "{refused}");
@@ -387,7 +515,12 @@ fn two_sessions_reusing_the_same_literal_key_get_distinct_holds() {
     let sandbox = Sandbox::new();
     sandbox.establish_session("sess-a");
     sandbox.establish_session("sess-b");
-    let feed = sandbox.provision("acme", "usd-2026-10", libra_governor_domain::QuotaUnit::UsdCents, 50_000);
+    let feed = sandbox.provision(
+        "acme",
+        "usd-2026-10",
+        libra_governor_domain::QuotaUnit::UsdCents,
+        50_000,
+    );
     feed.publish_used(0, Some(50_000), OffsetDateTime::now_utc());
 
     let (_, a) = sandbox.reserve("acme", "usd-2026-10", "sess-a", 1_000, "shared-key");
@@ -403,12 +536,28 @@ fn two_sessions_reusing_the_same_literal_key_get_distinct_holds() {
 fn unit_mismatch_against_an_existing_pool_is_refused() {
     let sandbox = Sandbox::new();
     sandbox.establish_session("sess-a");
-    let feed = sandbox.provision("acme", "usd-2026-10", libra_governor_domain::QuotaUnit::UsdCents, 50_000);
+    let feed = sandbox.provision(
+        "acme",
+        "usd-2026-10",
+        libra_governor_domain::QuotaUnit::UsdCents,
+        50_000,
+    );
     feed.publish_used(0, Some(50_000), OffsetDateTime::now_utc());
 
     let (code, refused) = sandbox.metered_pool(&[
-        "reserve", "--owner", "acme", "--pool", "usd-2026-10", "--unit", "tokens", "--amount",
-        "100", "--session", "sess-a", "--key", "a1",
+        "reserve",
+        "--owner",
+        "acme",
+        "--pool",
+        "usd-2026-10",
+        "--unit",
+        "tokens",
+        "--amount",
+        "100",
+        "--session",
+        "sess-a",
+        "--key",
+        "a1",
     ]);
     assert_eq!(code, 3, "{refused}");
     assert_eq!(refused["reason"]["reason"], "unit_mismatch");
@@ -432,7 +581,12 @@ fn session_cap_is_a_cooperative_constraint_independent_of_other_sessions() {
     let sandbox = Sandbox::new();
     sandbox.establish_session("sess-a");
     sandbox.establish_session("sess-b");
-    let feed = sandbox.provision("acme", "usd-2026-10", libra_governor_domain::QuotaUnit::UsdCents, 50_000);
+    let feed = sandbox.provision(
+        "acme",
+        "usd-2026-10",
+        libra_governor_domain::QuotaUnit::UsdCents,
+        50_000,
+    );
     feed.publish_used(0, Some(50_000), OffsetDateTime::now_utc());
 
     let (code, a1) = sandbox.reserve_capped("acme", "usd-2026-10", "sess-a", 20_000, "a1", 25_000);
@@ -443,13 +597,19 @@ fn session_cap_is_a_cooperative_constraint_independent_of_other_sessions() {
     assert_eq!(a2["reason"]["committed"], 20_000);
 
     let (code, b1) = sandbox.reserve_capped("acme", "usd-2026-10", "sess-b", 6_000, "b1", 25_000);
-    assert_eq!(code, 0, "sess-b's own cap must be unaffected by sess-a's: {b1}");
+    assert_eq!(
+        code, 0,
+        "sess-b's own cap must be unaffected by sess-a's: {b1}"
+    );
 
     let a1_id = reservation_id(&a1);
     let (code, settled) = sandbox.settle(&a1_id, "acme", "sess-a", Some(12_000));
     assert_eq!(code, 0, "{settled}");
     let (code, a3) = sandbox.reserve_capped("acme", "usd-2026-10", "sess-a", 13_000, "a3", 25_000);
-    assert_eq!(code, 0, "12_000 settled + 13_000 requested == cap 25_000: {a3}");
+    assert_eq!(
+        code, 0,
+        "12_000 settled + 13_000 requested == cap 25_000: {a3}"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -462,15 +622,25 @@ fn concurrent_reserves_never_collectively_oversubscribe_the_pool() {
     for i in 0..12 {
         sandbox.establish_session(&format!("sess-{i}"));
     }
-    let feed = sandbox.provision("acme", "usd-2026-10", libra_governor_domain::QuotaUnit::UsdCents, 50_000);
+    let feed = sandbox.provision(
+        "acme",
+        "usd-2026-10",
+        libra_governor_domain::QuotaUnit::UsdCents,
+        50_000,
+    );
     feed.publish_used(0, Some(50_000), OffsetDateTime::now_utc());
 
     let handles: Vec<_> = (0..12)
         .map(|i| {
             let sandbox = std::sync::Arc::clone(&sandbox);
             std::thread::spawn(move || {
-                let (code, outcome) =
-                    sandbox.reserve("acme", "usd-2026-10", &format!("sess-{i}"), 5_000, &format!("k{i}"));
+                let (code, outcome) = sandbox.reserve(
+                    "acme",
+                    "usd-2026-10",
+                    &format!("sess-{i}"),
+                    5_000,
+                    &format!("k{i}"),
+                );
                 (code == 0, outcome)
             })
         })
@@ -483,7 +653,10 @@ fn concurrent_reserves_never_collectively_oversubscribe_the_pool() {
             granted += 1;
         }
     }
-    assert_eq!(granted, 10, "exactly 10 of 12 five-thousand-cent requests against a 50_000 pool must be granted");
+    assert_eq!(
+        granted, 10,
+        "exactly 10 of 12 five-thousand-cent requests against a 50_000 pool must be granted"
+    );
 
     let (_, status) = sandbox.status("acme", "usd-2026-10");
     assert_eq!(status["active"], 50_000);

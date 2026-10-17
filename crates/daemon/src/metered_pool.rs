@@ -211,8 +211,7 @@ fn require_metered_holder(
     reservation_id: SharedPoolReservationId,
     owner: &str,
     session_id: &str,
-) -> Result<Result<libra_governor_domain::SharedPoolReservation, MeteredPoolOutcome>, LedgerError>
-{
+) -> Result<Result<libra_governor_domain::SharedPoolReservation, MeteredPoolOutcome>, LedgerError> {
     let Some(reservation) = ledger.get_shared_reservation(reservation_id)? else {
         return Ok(Err(MeteredPoolOutcome::Refused {
             reason: MeteredRefusal::NotFound,
@@ -327,10 +326,13 @@ pub fn handle_status(
                     capacity: effective,
                     ..admission
                 };
-                let snapshot = snapshot.expect("Ok(..) from metered_snapshot_limit implies a snapshot was read");
+                let snapshot = snapshot
+                    .expect("Ok(..) from metered_snapshot_limit implies a snapshot was read");
                 let libra_governor_domain::GaugeReading::Used { used, .. } = &snapshot.reading
                 else {
-                    unreachable!("Ok(..) from metered_snapshot_limit implies a disclosed Used reading")
+                    unreachable!(
+                        "Ok(..) from metered_snapshot_limit implies a disclosed Used reading"
+                    )
                 };
                 (
                     Some(effective),
@@ -386,13 +388,21 @@ mod tests {
         OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap()
     }
 
-    fn establish_session(ledger: &mut LedgerStore, session_id: &str) -> libra_governor_domain::TaskId {
+    fn establish_session(
+        ledger: &mut LedgerStore,
+        session_id: &str,
+    ) -> libra_governor_domain::TaskId {
         ledger
             .resolve_or_create_task_for_session(session_id, now())
             .unwrap()
     }
 
-    fn reserve_args<'a>(owner: &'a str, alias: &'a str, session_id: &'a str, key: &'a str) -> MeteredReserveArgs<'a> {
+    fn reserve_args<'a>(
+        owner: &'a str,
+        alias: &'a str,
+        session_id: &'a str,
+        key: &'a str,
+    ) -> MeteredReserveArgs<'a> {
         MeteredReserveArgs {
             owner,
             alias,
@@ -460,7 +470,12 @@ mod tests {
         establish_session(&mut ledger, "s1");
         let outcome = handle_reserve(
             &mut ledger,
-            reserve_args(crate::launch_gate::LAUNCH_PRINCIPAL, "usd-2026-10", "s1", "k1"),
+            reserve_args(
+                crate::launch_gate::LAUNCH_PRINCIPAL,
+                "usd-2026-10",
+                "s1",
+                "k1",
+            ),
             now(),
         )
         .unwrap();
@@ -476,7 +491,12 @@ mod tests {
     fn reserve_refuses_no_pool_then_succeeds_once_fixture_provisions_and_feeds_it() {
         let mut ledger = LedgerStore::open_in_memory().unwrap();
         let task_id = establish_session(&mut ledger, "s1");
-        let outcome = handle_reserve(&mut ledger, reserve_args("acme", "usd-2026-10", "s1", "k1"), now()).unwrap();
+        let outcome = handle_reserve(
+            &mut ledger,
+            reserve_args("acme", "usd-2026-10", "s1", "k1"),
+            now(),
+        )
+        .unwrap();
         assert!(matches!(
             outcome,
             MeteredPoolOutcome::Refused {
@@ -493,9 +513,17 @@ mod tests {
             .unwrap();
         ingest(&mut ledger, &pool_id, 0, Some(50_000));
 
-        match handle_reserve(&mut ledger, reserve_args("acme", "usd-2026-10", "s1", "k1"), now()).unwrap() {
+        match handle_reserve(
+            &mut ledger,
+            reserve_args("acme", "usd-2026-10", "s1", "k1"),
+            now(),
+        )
+        .unwrap()
+        {
             MeteredPoolOutcome::Reserved {
-                amount, task_id: got, ..
+                amount,
+                task_id: got,
+                ..
             } => {
                 assert_eq!(amount, 20_000);
                 assert_eq!(got, task_id);
@@ -514,12 +542,26 @@ mod tests {
             .unwrap();
         ingest(&mut ledger, &pool_id, 0, Some(50_000));
 
-        let first = handle_reserve(&mut ledger, reserve_args("acme", "usd-2026-10", "s1", "k1"), now()).unwrap();
-        let second = handle_reserve(&mut ledger, reserve_args("acme", "usd-2026-10", "s1", "k1"), now()).unwrap();
+        let first = handle_reserve(
+            &mut ledger,
+            reserve_args("acme", "usd-2026-10", "s1", "k1"),
+            now(),
+        )
+        .unwrap();
+        let second = handle_reserve(
+            &mut ledger,
+            reserve_args("acme", "usd-2026-10", "s1", "k1"),
+            now(),
+        )
+        .unwrap();
         match (first, second) {
             (
-                MeteredPoolOutcome::Reserved { reservation_id: a, .. },
-                MeteredPoolOutcome::Reserved { reservation_id: b, .. },
+                MeteredPoolOutcome::Reserved {
+                    reservation_id: a, ..
+                },
+                MeteredPoolOutcome::Reserved {
+                    reservation_id: b, ..
+                },
             ) => assert_eq!(a, b),
             other => panic!("expected both to be Reserved with the same id, got {other:?}"),
         }
@@ -538,12 +580,26 @@ mod tests {
             .unwrap();
         ingest(&mut ledger, &pool_id, 0, Some(50_000));
 
-        let a = handle_reserve(&mut ledger, reserve_args("acme", "usd-2026-10", "s1", "k1"), now()).unwrap();
-        let b = handle_reserve(&mut ledger, reserve_args("acme", "usd-2026-10", "s2", "k1"), now()).unwrap();
+        let a = handle_reserve(
+            &mut ledger,
+            reserve_args("acme", "usd-2026-10", "s1", "k1"),
+            now(),
+        )
+        .unwrap();
+        let b = handle_reserve(
+            &mut ledger,
+            reserve_args("acme", "usd-2026-10", "s2", "k1"),
+            now(),
+        )
+        .unwrap();
         match (a, b) {
             (
-                MeteredPoolOutcome::Reserved { reservation_id: a, .. },
-                MeteredPoolOutcome::Reserved { reservation_id: b, .. },
+                MeteredPoolOutcome::Reserved {
+                    reservation_id: a, ..
+                },
+                MeteredPoolOutcome::Reserved {
+                    reservation_id: b, ..
+                },
             ) => assert_ne!(a, b),
             other => panic!("expected both Reserved with distinct ids, got {other:?}"),
         }
@@ -558,20 +614,25 @@ mod tests {
             .ensure_pool(&pool_id, &QuotaUnit::UsdCents, 50_000, now())
             .unwrap();
         ingest(&mut ledger, &pool_id, 0, Some(50_000));
-        let MeteredPoolOutcome::Reserved { reservation_id, .. } =
-            handle_reserve(&mut ledger, reserve_args("acme", "usd-2026-10", "s1", "k1"), now()).unwrap()
-        else {
+        let MeteredPoolOutcome::Reserved { reservation_id, .. } = handle_reserve(
+            &mut ledger,
+            reserve_args("acme", "usd-2026-10", "s1", "k1"),
+            now(),
+        )
+        .unwrap() else {
             panic!("expected Reserved");
         };
 
-        let wrong_owner = handle_settle(&mut ledger, reservation_id, "globex", "s1", None, now()).unwrap();
+        let wrong_owner =
+            handle_settle(&mut ledger, reservation_id, "globex", "s1", None, now()).unwrap();
         assert!(matches!(
             wrong_owner,
             MeteredPoolOutcome::Refused {
                 reason: MeteredRefusal::NotHolder
             }
         ));
-        let wrong_session = handle_settle(&mut ledger, reservation_id, "acme", "s2", None, now()).unwrap();
+        let wrong_session =
+            handle_settle(&mut ledger, reservation_id, "acme", "s2", None, now()).unwrap();
         assert!(matches!(
             wrong_session,
             MeteredPoolOutcome::Refused {
@@ -579,7 +640,15 @@ mod tests {
             }
         ));
 
-        let ok = handle_settle(&mut ledger, reservation_id, "acme", "s1", Some(12_000), now()).unwrap();
+        let ok = handle_settle(
+            &mut ledger,
+            reservation_id,
+            "acme",
+            "s1",
+            Some(12_000),
+            now(),
+        )
+        .unwrap();
         match ok {
             MeteredPoolOutcome::Settled {
                 settled_amount,

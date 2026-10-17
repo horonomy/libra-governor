@@ -202,7 +202,10 @@ fn run_reserve(args: &[String]) -> i32 {
     };
     let session_cap = match flags
         .optional("session-cap")
-        .map(|v| v.parse::<u64>().map_err(|_| format!("--session-cap must be a non-negative integer, got {v:?}")))
+        .map(|v| {
+            v.parse::<u64>()
+                .map_err(|_| format!("--session-cap must be a non-negative integer, got {v:?}"))
+        })
         .transpose()
     {
         Ok(v) => v,
@@ -230,7 +233,9 @@ fn run_settle(args: &[String]) -> i32 {
         Err(e) => return usage_error(&e),
     };
     let Some(reservation_id) = parse_reservation_id(reservation_id) else {
-        return usage_error(&format!("--reservation must be a UUID, got {reservation_id:?}"));
+        return usage_error(&format!(
+            "--reservation must be a UUID, got {reservation_id:?}"
+        ));
     };
     let owner = match flags.require("owner") {
         Ok(v) => v,
@@ -242,7 +247,10 @@ fn run_settle(args: &[String]) -> i32 {
     };
     let actual = match flags
         .optional("actual")
-        .map(|v| v.parse::<u64>().map_err(|_| format!("--actual must be a non-negative integer, got {v:?}")))
+        .map(|v| {
+            v.parse::<u64>()
+                .map_err(|_| format!("--actual must be a non-negative integer, got {v:?}"))
+        })
         .transpose()
     {
         Ok(v) => v,
@@ -267,7 +275,9 @@ fn run_release(args: &[String]) -> i32 {
         Err(e) => return usage_error(&e),
     };
     let Some(reservation_id) = parse_reservation_id(reservation_id) else {
-        return usage_error(&format!("--reservation must be a UUID, got {reservation_id:?}"));
+        return usage_error(&format!(
+            "--reservation must be a UUID, got {reservation_id:?}"
+        ));
     };
     let owner = match flags.require("owner") {
         Ok(v) => v,
@@ -340,8 +350,18 @@ mod tests {
     #[test]
     fn reserve_rejects_an_invalid_unit() {
         let args: Vec<String> = [
-            "--owner", "acme", "--pool", "usd-2026-10", "--unit", "euros", "--amount", "100",
-            "--session", "s1", "--key", "k1",
+            "--owner",
+            "acme",
+            "--pool",
+            "usd-2026-10",
+            "--unit",
+            "euros",
+            "--amount",
+            "100",
+            "--session",
+            "s1",
+            "--key",
+            "k1",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -352,7 +372,12 @@ mod tests {
     #[test]
     fn settle_rejects_a_non_uuid_reservation_id() {
         let args: Vec<String> = [
-            "--reservation", "not-a-uuid", "--owner", "acme", "--session", "s1",
+            "--reservation",
+            "not-a-uuid",
+            "--owner",
+            "acme",
+            "--session",
+            "s1",
         ]
         .iter()
         .map(|s| s.to_string())

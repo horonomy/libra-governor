@@ -808,7 +808,13 @@ pub(crate) fn dispatch(
                     reservation_id,
                     owner,
                     session_id,
-                } => crate::metered_pool::handle_release(ledger, reservation_id, &owner, &session_id, now),
+                } => crate::metered_pool::handle_release(
+                    ledger,
+                    reservation_id,
+                    &owner,
+                    &session_id,
+                    now,
+                ),
                 libra_governor_protocol::MeteredPoolRequest::Status { owner, alias } => {
                     crate::metered_pool::handle_status(ledger, &owner, &alias, now)
                 }

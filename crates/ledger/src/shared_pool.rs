@@ -576,7 +576,14 @@ impl LedgerStore {
         unit: &QuotaUnit,
     ) -> Result<Option<PoolProviderSnapshot>, LedgerError> {
         #[allow(clippy::type_complexity)]
-        let row: Option<(String, Option<String>, i64, Option<i64>, Option<i64>, String)> = tx
+        let row: Option<(
+            String,
+            Option<String>,
+            i64,
+            Option<i64>,
+            Option<i64>,
+            String,
+        )> = tx
             .query_row(
                 "SELECT observed_at, valid_until, disclosed, used_value, declared_limit, confidence
                  FROM shared_pool_provider_snapshots WHERE pool_id = ?1",
@@ -598,7 +605,8 @@ impl LedgerStore {
         else {
             return Ok(None);
         };
-        let confidence: Confidence = serde_json::from_str(&confidence_str).map_err(|_| invalid())?;
+        let confidence: Confidence =
+            serde_json::from_str(&confidence_str).map_err(|_| invalid())?;
         let reading = if disclosed == 0 {
             GaugeReading::Undisclosed
         } else {
@@ -717,7 +725,9 @@ impl LedgerStore {
     ) -> Result<SharedPoolReserveOutcome, LedgerError> {
         match self.reserve_shared_core(req, None)? {
             CoreReserveOutcome::Granted(r) => Ok(SharedPoolReserveOutcome::Granted(r)),
-            CoreReserveOutcome::AlreadyGranted(r) => Ok(SharedPoolReserveOutcome::AlreadyGranted(r)),
+            CoreReserveOutcome::AlreadyGranted(r) => {
+                Ok(SharedPoolReserveOutcome::AlreadyGranted(r))
+            }
             CoreReserveOutcome::Insufficient {
                 admission,
                 requested,
@@ -726,7 +736,8 @@ impl LedgerStore {
                 requested,
             }),
             CoreReserveOutcome::NoPool => Ok(SharedPoolReserveOutcome::NoPool),
-            CoreReserveOutcome::SnapshotUnusable(_) | CoreReserveOutcome::SessionCapExceeded { .. } => {
+            CoreReserveOutcome::SnapshotUnusable(_)
+            | CoreReserveOutcome::SessionCapExceeded { .. } => {
                 unreachable!(
                     "reserve_shared_core only produces metered-only outcomes when a metered \
                      gate is passed, and reserve_shared never passes one"
@@ -808,9 +819,9 @@ impl LedgerStore {
             .optional()?;
         if let Some(row) = existing {
             tx.commit()?;
-            return Ok(CoreReserveOutcome::AlreadyGranted(Box::new(row_to_reservation(
-                row,
-            )?)));
+            return Ok(CoreReserveOutcome::AlreadyGranted(Box::new(
+                row_to_reservation(row)?,
+            )));
         }
 
         let pool_row: Option<PoolRow> = tx
@@ -2428,7 +2439,12 @@ mod tests {
             store
                 .ensure_pool(&metered_pool_id(), &QuotaUnit::UsdCents, 50_000, now())
                 .unwrap();
-            ingest_used(&mut store, 0, Some(50_000), Some(now() - time::Duration::seconds(1)));
+            ingest_used(
+                &mut store,
+                0,
+                Some(50_000),
+                Some(now() - time::Duration::seconds(1)),
+            );
             match metered_reserve(&mut store, "s1", 100, "k1", None) {
                 MeteredReserveOutcome::SnapshotUnusable(SnapshotUnusable::Stale) => {}
                 other => panic!("expected SnapshotUnusable(Stale), got {other:?}"),
@@ -2456,7 +2472,12 @@ mod tests {
                 .unwrap();
             // Declared limit (30_000) is below the pool's stored capacity
             // (50_000) — effective capacity must be the smaller value.
-            ingest_used(&mut store, 0, Some(30_000), Some(now() + time::Duration::hours(1)));
+            ingest_used(
+                &mut store,
+                0,
+                Some(30_000),
+                Some(now() + time::Duration::hours(1)),
+            );
             assert!(matches!(
                 metered_reserve(&mut store, "s1", 30_000, "k1", None),
                 MeteredReserveOutcome::Granted(_)
@@ -2476,7 +2497,12 @@ mod tests {
             store
                 .ensure_pool(&metered_pool_id(), &QuotaUnit::UsdCents, 50_000, now())
                 .unwrap();
-            ingest_used(&mut store, 0, Some(50_000), Some(now() + time::Duration::hours(1)));
+            ingest_used(
+                &mut store,
+                0,
+                Some(50_000),
+                Some(now() + time::Duration::hours(1)),
+            );
             assert!(matches!(
                 metered_reserve(&mut store, "s1", 50_000, "k1", None),
                 MeteredReserveOutcome::Granted(_)
@@ -2489,14 +2515,21 @@ mod tests {
             store
                 .ensure_pool(&metered_pool_id(), &QuotaUnit::UsdCents, 50_000, now())
                 .unwrap();
-            ingest_used(&mut store, 0, Some(50_000), Some(now() + time::Duration::hours(1)));
+            ingest_used(
+                &mut store,
+                0,
+                Some(50_000),
+                Some(now() + time::Duration::hours(1)),
+            );
             assert!(matches!(
                 metered_reserve(&mut store, "s1", 20_000, "k1", Some(25_000)),
                 MeteredReserveOutcome::Granted(_)
             ));
             match metered_reserve(&mut store, "s1", 6_000, "k2", Some(25_000)) {
                 MeteredReserveOutcome::SessionCapExceeded {
-                    committed, cap, requested,
+                    committed,
+                    cap,
+                    requested,
                 } => {
                     assert_eq!(committed, 20_000);
                     assert_eq!(cap, 25_000);
@@ -2518,7 +2551,12 @@ mod tests {
             store
                 .ensure_pool(&metered_pool_id(), &QuotaUnit::UsdCents, 50_000, now())
                 .unwrap();
-            ingest_used(&mut store, 0, Some(50_000), Some(now() + time::Duration::hours(1)));
+            ingest_used(
+                &mut store,
+                0,
+                Some(50_000),
+                Some(now() + time::Duration::hours(1)),
+            );
             let MeteredReserveOutcome::Granted(reservation) =
                 metered_reserve(&mut store, "s1", 20_000, "k1", Some(25_000))
             else {
@@ -2654,7 +2692,12 @@ mod tests {
             store
                 .ensure_pool(&metered_pool_id(), &QuotaUnit::UsdCents, 50_000, now())
                 .unwrap();
-            ingest_used(&mut store, 0, Some(50_000), Some(now() + time::Duration::hours(1)));
+            ingest_used(
+                &mut store,
+                0,
+                Some(50_000),
+                Some(now() + time::Duration::hours(1)),
+            );
             let MeteredReserveOutcome::Granted(r1) =
                 metered_reserve(&mut store, "s1", 10_000, "k1", None)
             else {
@@ -2687,7 +2730,12 @@ mod tests {
                 .pool_provider_snapshot(&metered_pool_id())
                 .unwrap()
                 .is_none());
-            ingest_used(&mut store, 12_000, Some(50_000), Some(now() + time::Duration::hours(1)));
+            ingest_used(
+                &mut store,
+                12_000,
+                Some(50_000),
+                Some(now() + time::Duration::hours(1)),
+            );
             let snapshot = store
                 .pool_provider_snapshot(&metered_pool_id())
                 .unwrap()
