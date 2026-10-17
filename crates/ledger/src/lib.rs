@@ -57,8 +57,9 @@ pub use resource_account::{
     RecordedShadowDecision,
 };
 pub use shared_pool::{
-    SharedPoolReleaseOutcome, SharedPoolRenewOutcome, SharedPoolReserveOutcome,
-    SharedPoolReserveRequest, SharedPoolSettleOutcome,
+    MeteredReserveOutcome, MeteredReserveRequest, SharedPoolReleaseOutcome, SharedPoolRenewOutcome,
+    SharedPoolReserveOutcome, SharedPoolReserveRequest, SharedPoolSessionUsage,
+    SharedPoolSettleOutcome,
 };
 pub use store::{LedgerStore, APPEND_ONLY_TRIGGERS};
 pub use write::DOGFOOD_PROFILE_ENV_VAR;
@@ -104,4 +105,9 @@ pub enum LedgerError {
         expected: libra_governor_domain::QuotaUnit,
         actual: libra_governor_domain::QuotaUnit,
     },
+    /// An ingest targeted a pool id with no `quota_pools` row
+    /// (HORO-1915) — `ingest_pool_provider_snapshot` never implicitly
+    /// creates one; see that method's own docs.
+    #[error("no quota pool exists for pool id {pool_id:?}")]
+    NoSuchPool { pool_id: String },
 }

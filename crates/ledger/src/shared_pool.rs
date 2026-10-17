@@ -51,9 +51,9 @@
 //! [`LedgerStore::pool_admission`].
 
 use libra_governor_domain::{
-    Confidence, GaugeReading, PoolAdmission, PoolId, PrincipalId, QuotaPool, QuotaUnit,
-    ReservationState, SharedPoolReservation, SharedPoolReservationId,
-    SHARED_POOL_RESERVATION_SCHEMA_VERSION,
+    metered_snapshot_limit, Confidence, GaugeReading, PoolAdmission, PoolId, PoolProviderSnapshot,
+    PrincipalId, QuotaAmount, QuotaPool, QuotaUnit, ReservationState, SharedPoolReservation,
+    SharedPoolReservationId, SnapshotUnusable, SHARED_POOL_RESERVATION_SCHEMA_VERSION,
 };
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use time::format_description::well_known::Rfc3339;
@@ -235,6 +235,78 @@ pub enum SharedPoolReserveOutcome {
     /// No `quota_pools` row exists for this pool — [`LedgerStore::ensure_pool`]
     /// was never called for it.
     NoPool,
+}
+
+/// Request to reserve against a metered (provider-denominated) pool
+/// (HORO-1915) — the same base reserve request, plus an optional
+/// cooperative per-session cap. See [`LedgerStore::reserve_shared_metered`].
+pub struct MeteredReserveRequest<'a> {
+    pub base: SharedPoolReserveRequest<'a>,
+    /// When `Some`, refuses a reserve that would push this
+    /// `(pool_id, principal_id, session_id)`'s combined active+settled
+    /// total above `cap` — an additional constraint layered on top of the
+    /// pool's own capacity, never a required allocation (a session with no
+    /// cap is bounded only by the pool).
+    pub session_cap: Option<u64>,
+}
+
+/// The outcome of [`LedgerStore::reserve_shared_metered`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum MeteredReserveOutcome {
+    Granted(Box<SharedPoolReservation>),
+    AlreadyGranted(Box<SharedPoolReservation>),
+    /// `admission.capacity` is the *effective* capacity (`min(pool
+    /// capacity, declared snapshot limit)`), not necessarily the pool's
+    /// raw stored capacity.
+    Insufficient {
+        admission: PoolAdmission,
+        requested: u64,
+    },
+    NoPool,
+    /// The pool's provider snapshot could not supply a trusted declared
+    /// limit — refused rather than treating "unknown" as "unlimited".
+    SnapshotUnusable(SnapshotUnusable),
+    SessionCapExceeded {
+        committed: u64,
+        cap: u64,
+        requested: u64,
+    },
+}
+
+/// One session's combined active+settled total against a pool (HORO-1915).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedPoolSessionUsage {
+    pub principal_id: PrincipalId,
+    pub session_id: String,
+    pub active: u64,
+    pub settled: u64,
+}
+
+/// The outcome of [`LedgerStore::reserve_shared_core`] — a superset of
+/// both [`SharedPoolReserveOutcome`] and [`MeteredReserveOutcome`]; each
+/// public entry point maps it down to its own narrower type.
+enum CoreReserveOutcome {
+    Granted(Box<SharedPoolReservation>),
+    AlreadyGranted(Box<SharedPoolReservation>),
+    Insufficient {
+        admission: PoolAdmission,
+        requested: u64,
+    },
+    NoPool,
+    SnapshotUnusable(SnapshotUnusable),
+    SessionCapExceeded {
+        committed: u64,
+        cap: u64,
+        requested: u64,
+    },
+}
+
+/// Metered-pool-only admission constraints threaded through
+/// [`LedgerStore::reserve_shared_core`]. `None` at the call site
+/// (`reserve_shared`) means none of this gate's checks run at all — the
+/// plain launch-slot path is byte-for-byte unchanged.
+struct MeteredGate {
+    session_cap: Option<u64>,
 }
 
 /// The outcome of [`LedgerStore::settle_shared`].
@@ -492,6 +564,126 @@ impl LedgerStore {
         Ok(used_value.saturating_sub(settled_before))
     }
 
+    /// Reads `pool_id`'s most recent ingested [`PoolProviderSnapshot`]
+    /// inside the caller's transaction/connection, if any was ever
+    /// recorded via [`Self::ingest_pool_provider_snapshot`]. `unit` is the
+    /// pool's own declared unit — the snapshot row stores a bare integer
+    /// `used_value`/`declared_limit`, not a tagged [`QuotaUnit`], so the
+    /// caller (who has already looked up the pool) supplies it.
+    fn pool_provider_snapshot_tx(
+        tx: &rusqlite::Connection,
+        pool_id: &PoolId,
+        unit: &QuotaUnit,
+    ) -> Result<Option<PoolProviderSnapshot>, LedgerError> {
+        #[allow(clippy::type_complexity)]
+        let row: Option<(String, Option<String>, i64, Option<i64>, Option<i64>, String)> = tx
+            .query_row(
+                "SELECT observed_at, valid_until, disclosed, used_value, declared_limit, confidence
+                 FROM shared_pool_provider_snapshots WHERE pool_id = ?1",
+                [&pool_id.0],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((observed_at, valid_until, disclosed, used_value, declared_limit, confidence_str)) =
+            row
+        else {
+            return Ok(None);
+        };
+        let confidence: Confidence = serde_json::from_str(&confidence_str).map_err(|_| invalid())?;
+        let reading = if disclosed == 0 {
+            GaugeReading::Undisclosed
+        } else {
+            GaugeReading::Used {
+                used: QuotaAmount::new(unit.clone(), used_value.unwrap_or(0).max(0) as u64),
+                limit: declared_limit.map(|l| l.max(0) as u64),
+            }
+        };
+        Ok(Some(PoolProviderSnapshot {
+            pool_id: pool_id.clone(),
+            observed_at: parse_time(&observed_at)?,
+            valid_until: valid_until.map(|s| parse_time(&s)).transpose()?,
+            reading,
+            confidence,
+        }))
+    }
+
+    /// Reads `pool_id`'s most recent ingested [`PoolProviderSnapshot`],
+    /// outside any transaction. `Ok(None)` when no pool exists, or no
+    /// snapshot has ever been ingested for it.
+    pub fn pool_provider_snapshot(
+        &self,
+        pool_id: &PoolId,
+    ) -> Result<Option<PoolProviderSnapshot>, LedgerError> {
+        let Some(pool) = self.quota_pool(pool_id)? else {
+            return Ok(None);
+        };
+        Self::pool_provider_snapshot_tx(&self.conn, pool_id, &pool.unit)
+    }
+
+    /// One `(principal_id, session_id)`'s combined active+settled total
+    /// against `pool_id`, inside the caller's transaction — the
+    /// accounting [`Self::reserve_shared_core`]'s optional session-cap
+    /// gate checks against. Released and expired holds contribute
+    /// nothing, matching [`SharedPoolReservation::outstanding`]'s own
+    /// state accounting.
+    fn session_committed_tx(
+        tx: &rusqlite::Connection,
+        pool_id: &PoolId,
+        principal_id: &PrincipalId,
+        session_id: &str,
+    ) -> Result<u64, LedgerError> {
+        let active: i64 = tx.query_row(
+            "SELECT COALESCE(SUM(amount), 0) FROM shared_pool_reservations
+             WHERE pool_id = ?1 AND principal_id = ?2 AND session_id = ?3 AND state = 'active'",
+            rusqlite::params![pool_id.0, principal_id.0, session_id],
+            |row| row.get(0),
+        )?;
+        let settled: i64 = tx.query_row(
+            "SELECT COALESCE(SUM(settled_amount), 0) FROM shared_pool_reservations
+             WHERE pool_id = ?1 AND principal_id = ?2 AND session_id = ?3 AND state = 'settled'",
+            rusqlite::params![pool_id.0, principal_id.0, session_id],
+            |row| row.get(0),
+        )?;
+        Ok((active.max(0) as u64).saturating_add(settled.max(0) as u64))
+    }
+
+    /// Every distinct `(principal_id, session_id)`'s combined active and
+    /// settled totals against `pool_id` (HORO-1915) — the per-session
+    /// breakdown a metered-pool status report shows.
+    pub fn shared_pool_session_usage(
+        &self,
+        pool_id: &PoolId,
+    ) -> Result<Vec<SharedPoolSessionUsage>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT principal_id, session_id,
+                    COALESCE(SUM(CASE WHEN state = 'active' THEN amount ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN state = 'settled' THEN settled_amount ELSE 0 END), 0)
+             FROM shared_pool_reservations WHERE pool_id = ?1
+             GROUP BY principal_id, session_id",
+        )?;
+        let rows = stmt.query_map([&pool_id.0], |row| {
+            let active: i64 = row.get(2)?;
+            let settled: i64 = row.get(3)?;
+            Ok(SharedPoolSessionUsage {
+                principal_id: PrincipalId(row.get(0)?),
+                session_id: row.get(1)?,
+                active: active.max(0) as u64,
+                settled: settled.max(0) as u64,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(LedgerError::Sqlite)
+    }
+
     /// Computes [`PoolAdmission`] for `pool_id` as of `now`, inside the
     /// caller's own transaction/connection. `Ok(None)` when no pool has
     /// been created.
@@ -516,10 +708,82 @@ impl LedgerStore {
     /// Atomically reserves `req.amount` of a shared pool's capacity. See
     /// module docs for the transaction/idempotency guarantees that make
     /// AC1 (no combined oversubscription under concurrency) hold.
+    ///
+    /// Thin wrapper over [`Self::reserve_shared_core`] with no metered
+    /// gate — behavior and signature are unchanged from before HORO-1915.
     pub fn reserve_shared(
         &mut self,
         req: SharedPoolReserveRequest<'_>,
     ) -> Result<SharedPoolReserveOutcome, LedgerError> {
+        match self.reserve_shared_core(req, None)? {
+            CoreReserveOutcome::Granted(r) => Ok(SharedPoolReserveOutcome::Granted(r)),
+            CoreReserveOutcome::AlreadyGranted(r) => Ok(SharedPoolReserveOutcome::AlreadyGranted(r)),
+            CoreReserveOutcome::Insufficient {
+                admission,
+                requested,
+            } => Ok(SharedPoolReserveOutcome::Insufficient {
+                admission,
+                requested,
+            }),
+            CoreReserveOutcome::NoPool => Ok(SharedPoolReserveOutcome::NoPool),
+            CoreReserveOutcome::SnapshotUnusable(_) | CoreReserveOutcome::SessionCapExceeded { .. } => {
+                unreachable!(
+                    "reserve_shared_core only produces metered-only outcomes when a metered \
+                     gate is passed, and reserve_shared never passes one"
+                )
+            }
+        }
+    }
+
+    /// Atomically reserves `req.base.amount` against a metered
+    /// (provider-denominated) pool (HORO-1915): identical admission
+    /// mechanics to [`Self::reserve_shared`], plus a fail-closed gate on
+    /// the pool's most recent provider snapshot (an effective capacity of
+    /// `min(pool capacity, declared snapshot limit)`, refusing outright
+    /// when the snapshot is missing/undisclosed/unbounded/stale/without a
+    /// limit — see [`libra_governor_domain::metered_snapshot_limit`]) and
+    /// an optional cooperative per-session cap.
+    pub fn reserve_shared_metered(
+        &mut self,
+        req: MeteredReserveRequest<'_>,
+    ) -> Result<MeteredReserveOutcome, LedgerError> {
+        let MeteredReserveRequest { base, session_cap } = req;
+        let gate = MeteredGate { session_cap };
+        match self.reserve_shared_core(base, Some(&gate))? {
+            CoreReserveOutcome::Granted(r) => Ok(MeteredReserveOutcome::Granted(r)),
+            CoreReserveOutcome::AlreadyGranted(r) => Ok(MeteredReserveOutcome::AlreadyGranted(r)),
+            CoreReserveOutcome::Insufficient {
+                admission,
+                requested,
+            } => Ok(MeteredReserveOutcome::Insufficient {
+                admission,
+                requested,
+            }),
+            CoreReserveOutcome::NoPool => Ok(MeteredReserveOutcome::NoPool),
+            CoreReserveOutcome::SnapshotUnusable(reason) => {
+                Ok(MeteredReserveOutcome::SnapshotUnusable(reason))
+            }
+            CoreReserveOutcome::SessionCapExceeded {
+                committed,
+                cap,
+                requested,
+            } => Ok(MeteredReserveOutcome::SessionCapExceeded {
+                committed,
+                cap,
+                requested,
+            }),
+        }
+    }
+
+    /// Shared reserve mechanics for both [`Self::reserve_shared`] (no
+    /// `metered` gate) and [`Self::reserve_shared_metered`] (`Some` gate).
+    /// See module docs for the transaction/idempotency guarantees that
+    /// make AC1 (no combined oversubscription under concurrency) hold.
+    fn reserve_shared_core(
+        &mut self,
+        req: SharedPoolReserveRequest<'_>,
+        metered: Option<&MeteredGate>,
+    ) -> Result<CoreReserveOutcome, LedgerError> {
         let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
 
         // Scoped to (pool_id, principal_id, idempotency_key) — an
@@ -544,9 +808,9 @@ impl LedgerStore {
             .optional()?;
         if let Some(row) = existing {
             tx.commit()?;
-            return Ok(SharedPoolReserveOutcome::AlreadyGranted(Box::new(
-                row_to_reservation(row)?,
-            )));
+            return Ok(CoreReserveOutcome::AlreadyGranted(Box::new(row_to_reservation(
+                row,
+            )?)));
         }
 
         let pool_row: Option<PoolRow> = tx
@@ -568,7 +832,7 @@ impl LedgerStore {
             .optional()?;
         let Some(pool_row) = pool_row else {
             tx.commit()?;
-            return Ok(SharedPoolReserveOutcome::NoPool);
+            return Ok(CoreReserveOutcome::NoPool);
         };
         let pool = row_to_pool(req.pool_id.clone(), pool_row)?;
 
@@ -579,10 +843,48 @@ impl LedgerStore {
             });
         }
 
+        // Metered-only: the pool's effective capacity is clamped to the
+        // provider's own most recent declared limit, and a missing/
+        // undisclosed/unbounded/stale/limit-less snapshot refuses the
+        // reserve outright rather than treating "unknown" as "unlimited"
+        // — see `libra_governor_domain::metered_snapshot_limit`'s own
+        // docs for the exact rule order.
+        let mut effective_capacity = pool.capacity;
+        if metered.is_some() {
+            let snapshot = Self::pool_provider_snapshot_tx(&tx, req.pool_id, &pool.unit)?;
+            match metered_snapshot_limit(snapshot.as_ref(), req.now) {
+                Ok(declared_limit) => {
+                    effective_capacity = pool.capacity.min(declared_limit);
+                }
+                Err(reason) => {
+                    tx.commit()?;
+                    return Ok(CoreReserveOutcome::SnapshotUnusable(reason));
+                }
+            }
+        }
+
+        // Metered-only: an optional cooperative per-session cap, checked
+        // before the pool-wide admission so a caller sees the more
+        // specific refusal reason first.
+        if let Some(gate) = metered {
+            if let Some(cap) = gate.session_cap {
+                let committed =
+                    Self::session_committed_tx(&tx, req.pool_id, req.principal_id, req.session_id)?;
+                if committed.saturating_add(req.amount) > cap {
+                    tx.commit()?;
+                    return Ok(CoreReserveOutcome::SessionCapExceeded {
+                        committed,
+                        cap,
+                        requested: req.amount,
+                    });
+                }
+            }
+        }
+
         let (settled, active) = Self::settled_and_active_tx(&tx, req.pool_id)?;
         let external_overhang = Self::external_overhang_tx(&tx, req.pool_id, req.now)?;
         let admission = PoolAdmission {
-            capacity: pool.capacity,
+            capacity: effective_capacity,
             settled,
             active,
             external_overhang,
@@ -590,7 +892,7 @@ impl LedgerStore {
 
         if !admission.admits(req.amount) {
             tx.commit()?;
-            return Ok(SharedPoolReserveOutcome::Insufficient {
+            return Ok(CoreReserveOutcome::Insufficient {
                 admission,
                 requested: req.amount,
             });
@@ -640,7 +942,7 @@ impl LedgerStore {
         )?;
         tx.commit()?;
 
-        Ok(SharedPoolReserveOutcome::Granted(Box::new(
+        Ok(CoreReserveOutcome::Granted(Box::new(
             SharedPoolReservation {
                 id,
                 pool_id: req.pool_id.clone(),
@@ -997,6 +1299,43 @@ impl LedgerStore {
             LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
         })?;
         let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
+
+        // No pool, no ingest: this method never implicitly creates a
+        // pool, and a snapshot's declared unit must match the pool's own
+        // — the same discipline `reserve_shared_core` enforces on the
+        // reserve side.
+        let pool_row: Option<PoolRow> = tx
+            .query_row(
+                "SELECT unit_json, capacity, schema_version, created_at, updated_at
+                 FROM quota_pools WHERE pool_id = ?1",
+                [&pool_id.0],
+                |row| {
+                    let capacity: i64 = row.get(1)?;
+                    Ok((
+                        row.get(0)?,
+                        capacity as u64,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some(pool_row) = pool_row else {
+            tx.commit()?;
+            return Err(LedgerError::NoSuchPool {
+                pool_id: pool_id.0.clone(),
+            });
+        };
+        let pool = row_to_pool(pool_id.clone(), pool_row)?;
+        if let GaugeReading::Used { used, .. } = reading {
+            if used.unit != pool.unit {
+                return Err(LedgerError::QuotaUnitMismatch {
+                    expected: pool.unit,
+                    actual: used.unit.clone(),
+                });
+            }
+        }
 
         let existing_observed_at: Option<String> = tx
             .query_row(
@@ -1981,5 +2320,385 @@ mod tests {
         let admission = store.pool_admission(&pool_id(), now()).unwrap().unwrap();
         assert_eq!(admission.active, 10);
         assert_eq!(admission.remaining(), 0);
+    }
+
+    mod metered {
+        use super::*;
+        use libra_governor_domain::{QuotaAmount, SnapshotUnusable};
+
+        fn metered_pool_id() -> PoolId {
+            PoolId("metered:acme/usd-2026-10".to_string())
+        }
+
+        fn metered_reserve(
+            store: &mut LedgerStore,
+            session_id: &str,
+            amount: u64,
+            idempotency_key: &str,
+            session_cap: Option<u64>,
+        ) -> MeteredReserveOutcome {
+            store
+                .reserve_shared_metered(MeteredReserveRequest {
+                    base: SharedPoolReserveRequest {
+                        pool_id: &metered_pool_id(),
+                        principal_id: &principal(1),
+                        session_id,
+                        amount,
+                        unit: &QuotaUnit::UsdCents,
+                        idempotency_key,
+                        now: now(),
+                        ttl_secs: 3600,
+                    },
+                    session_cap,
+                })
+                .unwrap()
+        }
+
+        fn ingest_used(
+            store: &mut LedgerStore,
+            used: u64,
+            limit: Option<u64>,
+            valid_until: Option<OffsetDateTime>,
+        ) {
+            store
+                .ingest_pool_provider_snapshot(
+                    &metered_pool_id(),
+                    now(),
+                    valid_until,
+                    &GaugeReading::Used {
+                        used: QuotaAmount::new(QuotaUnit::UsdCents, used),
+                        limit,
+                    },
+                    Confidence::Medium,
+                    now(),
+                )
+                .unwrap();
+        }
+
+        #[test]
+        fn reserve_with_no_snapshot_is_refused_as_missing() {
+            let mut store = LedgerStore::open_in_memory().unwrap();
+            store
+                .ensure_pool(&metered_pool_id(), &QuotaUnit::UsdCents, 50_000, now())
+                .unwrap();
+            match metered_reserve(&mut store, "s1", 100, "k1", None) {
+                MeteredReserveOutcome::SnapshotUnusable(SnapshotUnusable::Missing) => {}
+                other => panic!("expected SnapshotUnusable(Missing), got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn reserve_with_undisclosed_snapshot_is_refused() {
+            let mut store = LedgerStore::open_in_memory().unwrap();
+            store
+                .ensure_pool(&metered_pool_id(), &QuotaUnit::UsdCents, 50_000, now())
+                .unwrap();
+            store
+                .ingest_pool_provider_snapshot(
+                    &metered_pool_id(),
+                    now(),
+                    Some(now() + time::Duration::hours(1)),
+                    &GaugeReading::Undisclosed,
+                    Confidence::Medium,
+                    now(),
+                )
+                .unwrap();
+            match metered_reserve(&mut store, "s1", 100, "k1", None) {
+                MeteredReserveOutcome::SnapshotUnusable(SnapshotUnusable::Undisclosed) => {}
+                other => panic!("expected SnapshotUnusable(Undisclosed), got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn reserve_with_no_valid_until_is_refused() {
+            let mut store = LedgerStore::open_in_memory().unwrap();
+            store
+                .ensure_pool(&metered_pool_id(), &QuotaUnit::UsdCents, 50_000, now())
+                .unwrap();
+            ingest_used(&mut store, 0, Some(50_000), None);
+            match metered_reserve(&mut store, "s1", 100, "k1", None) {
+                MeteredReserveOutcome::SnapshotUnusable(SnapshotUnusable::NoValidUntil) => {}
+                other => panic!("expected SnapshotUnusable(NoValidUntil), got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn reserve_with_stale_snapshot_is_refused() {
+            let mut store = LedgerStore::open_in_memory().unwrap();
+            store
+                .ensure_pool(&metered_pool_id(), &QuotaUnit::UsdCents, 50_000, now())
+                .unwrap();
+            ingest_used(&mut store, 0, Some(50_000), Some(now() - time::Duration::seconds(1)));
+            match metered_reserve(&mut store, "s1", 100, "k1", None) {
+                MeteredReserveOutcome::SnapshotUnusable(SnapshotUnusable::Stale) => {}
+                other => panic!("expected SnapshotUnusable(Stale), got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn reserve_with_missing_limit_is_refused() {
+            let mut store = LedgerStore::open_in_memory().unwrap();
+            store
+                .ensure_pool(&metered_pool_id(), &QuotaUnit::UsdCents, 50_000, now())
+                .unwrap();
+            ingest_used(&mut store, 0, None, Some(now() + time::Duration::hours(1)));
+            match metered_reserve(&mut store, "s1", 100, "k1", None) {
+                MeteredReserveOutcome::SnapshotUnusable(SnapshotUnusable::LimitMissing) => {}
+                other => panic!("expected SnapshotUnusable(LimitMissing), got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn effective_capacity_is_min_of_pool_capacity_and_declared_limit() {
+            let mut store = LedgerStore::open_in_memory().unwrap();
+            store
+                .ensure_pool(&metered_pool_id(), &QuotaUnit::UsdCents, 50_000, now())
+                .unwrap();
+            // Declared limit (30_000) is below the pool's stored capacity
+            // (50_000) — effective capacity must be the smaller value.
+            ingest_used(&mut store, 0, Some(30_000), Some(now() + time::Duration::hours(1)));
+            assert!(matches!(
+                metered_reserve(&mut store, "s1", 30_000, "k1", None),
+                MeteredReserveOutcome::Granted(_)
+            ));
+            match metered_reserve(&mut store, "s2", 1, "k2", None) {
+                MeteredReserveOutcome::Insufficient { admission, .. } => {
+                    assert_eq!(admission.capacity, 30_000);
+                    assert_eq!(admission.remaining(), 0);
+                }
+                other => panic!("expected Insufficient, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn fresh_usable_snapshot_grants_up_to_effective_capacity() {
+            let mut store = LedgerStore::open_in_memory().unwrap();
+            store
+                .ensure_pool(&metered_pool_id(), &QuotaUnit::UsdCents, 50_000, now())
+                .unwrap();
+            ingest_used(&mut store, 0, Some(50_000), Some(now() + time::Duration::hours(1)));
+            assert!(matches!(
+                metered_reserve(&mut store, "s1", 50_000, "k1", None),
+                MeteredReserveOutcome::Granted(_)
+            ));
+        }
+
+        #[test]
+        fn session_cap_refuses_before_pool_wide_capacity_is_exhausted() {
+            let mut store = LedgerStore::open_in_memory().unwrap();
+            store
+                .ensure_pool(&metered_pool_id(), &QuotaUnit::UsdCents, 50_000, now())
+                .unwrap();
+            ingest_used(&mut store, 0, Some(50_000), Some(now() + time::Duration::hours(1)));
+            assert!(matches!(
+                metered_reserve(&mut store, "s1", 20_000, "k1", Some(25_000)),
+                MeteredReserveOutcome::Granted(_)
+            ));
+            match metered_reserve(&mut store, "s1", 6_000, "k2", Some(25_000)) {
+                MeteredReserveOutcome::SessionCapExceeded {
+                    committed, cap, requested,
+                } => {
+                    assert_eq!(committed, 20_000);
+                    assert_eq!(cap, 25_000);
+                    assert_eq!(requested, 6_000);
+                }
+                other => panic!("expected SessionCapExceeded, got {other:?}"),
+            }
+            // A different session under the same pool is unaffected by
+            // s1's cap.
+            assert!(matches!(
+                metered_reserve(&mut store, "s2", 6_000, "k3", Some(25_000)),
+                MeteredReserveOutcome::Granted(_)
+            ));
+        }
+
+        #[test]
+        fn session_cap_counts_settled_amount_not_original_reserved_amount() {
+            let mut store = LedgerStore::open_in_memory().unwrap();
+            store
+                .ensure_pool(&metered_pool_id(), &QuotaUnit::UsdCents, 50_000, now())
+                .unwrap();
+            ingest_used(&mut store, 0, Some(50_000), Some(now() + time::Duration::hours(1)));
+            let MeteredReserveOutcome::Granted(reservation) =
+                metered_reserve(&mut store, "s1", 20_000, "k1", Some(25_000))
+            else {
+                panic!("expected Granted");
+            };
+            // Settle at 12_000 (8_000 refunded) — the cap accounting must
+            // reflect the settled amount, not the original 20_000 reserve.
+            store
+                .settle_shared(reservation.id, Some(12_000), now())
+                .unwrap();
+            match metered_reserve(&mut store, "s1", 13_000, "k2", Some(25_000)) {
+                MeteredReserveOutcome::Granted(_) => {}
+                other => panic!(
+                    "expected Granted (12_000 settled + 13_000 requested = 25_000 == cap), got {other:?}"
+                ),
+            }
+        }
+
+        #[test]
+        fn ingest_refuses_unit_mismatch() {
+            let mut store = LedgerStore::open_in_memory().unwrap();
+            store
+                .ensure_pool(&metered_pool_id(), &QuotaUnit::UsdCents, 50_000, now())
+                .unwrap();
+            let err = store
+                .ingest_pool_provider_snapshot(
+                    &metered_pool_id(),
+                    now(),
+                    Some(now() + time::Duration::hours(1)),
+                    &GaugeReading::Used {
+                        used: QuotaAmount::new(QuotaUnit::Tokens, 0),
+                        limit: Some(50_000),
+                    },
+                    Confidence::Medium,
+                    now(),
+                )
+                .unwrap_err();
+            assert!(matches!(err, LedgerError::QuotaUnitMismatch { .. }));
+        }
+
+        #[test]
+        fn ingest_refuses_when_no_pool_exists() {
+            let mut store = LedgerStore::open_in_memory().unwrap();
+            let err = store
+                .ingest_pool_provider_snapshot(
+                    &metered_pool_id(),
+                    now(),
+                    Some(now() + time::Duration::hours(1)),
+                    &GaugeReading::Used {
+                        used: QuotaAmount::new(QuotaUnit::UsdCents, 0),
+                        limit: Some(50_000),
+                    },
+                    Confidence::Medium,
+                    now(),
+                )
+                .unwrap_err();
+            assert!(matches!(err, LedgerError::NoSuchPool { .. }));
+        }
+
+        #[test]
+        fn reserve_shared_unmetered_path_is_unaffected_by_missing_snapshot() {
+            // AC: the plain launch-slot path (no metered gate) must never
+            // consult the snapshot gate at all — a pool with no snapshot
+            // still admits normally through `reserve_shared`.
+            let mut store = LedgerStore::open_in_memory().unwrap();
+            store
+                .ensure_pool(&pool_id(), &QuotaUnit::Tokens, 10, now())
+                .unwrap();
+            assert!(matches!(
+                reserve(&mut store, "s1", 10, "k1"),
+                SharedPoolReserveOutcome::Granted(_)
+            ));
+        }
+
+        #[test]
+        fn snapshot_gate_is_read_inside_the_reserve_transaction() {
+            // A concurrent writer commits a stale/undisclosed snapshot
+            // between test setup and the reserve call — but because the
+            // gate re-reads the snapshot inside `reserve_shared_core`'s
+            // own IMMEDIATE transaction (not from a value captured
+            // earlier), the reserve sees the up-to-date row, not a stale
+            // in-memory copy.
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ledger.sqlite3");
+            {
+                let mut store = LedgerStore::open(&path).unwrap();
+                store
+                    .ensure_pool(&metered_pool_id(), &QuotaUnit::UsdCents, 50_000, now())
+                    .unwrap();
+                store
+                    .ingest_pool_provider_snapshot(
+                        &metered_pool_id(),
+                        now(),
+                        Some(now() + time::Duration::hours(1)),
+                        &GaugeReading::Used {
+                            used: QuotaAmount::new(QuotaUnit::UsdCents, 0),
+                            limit: Some(50_000),
+                        },
+                        Confidence::Medium,
+                        now(),
+                    )
+                    .unwrap();
+            }
+            // A second connection against the same file, simulating a
+            // separate writer process, replaces the snapshot with an
+            // undisclosed reading before this process's reserve call.
+            {
+                let mut writer = LedgerStore::open(&path).unwrap();
+                writer
+                    .ingest_pool_provider_snapshot(
+                        &metered_pool_id(),
+                        now() + time::Duration::seconds(1),
+                        Some(now() + time::Duration::hours(2)),
+                        &GaugeReading::Undisclosed,
+                        Confidence::Medium,
+                        now() + time::Duration::seconds(1),
+                    )
+                    .unwrap();
+            }
+            let mut store = LedgerStore::open(&path).unwrap();
+            match metered_reserve(&mut store, "s1", 100, "k1", None) {
+                MeteredReserveOutcome::SnapshotUnusable(SnapshotUnusable::Undisclosed) => {}
+                other => panic!(
+                    "expected the reserve to observe the concurrently-committed undisclosed \
+                     snapshot, got {other:?}"
+                ),
+            }
+        }
+
+        #[test]
+        fn shared_pool_session_usage_reports_per_session_active_and_settled() {
+            let mut store = LedgerStore::open_in_memory().unwrap();
+            store
+                .ensure_pool(&metered_pool_id(), &QuotaUnit::UsdCents, 50_000, now())
+                .unwrap();
+            ingest_used(&mut store, 0, Some(50_000), Some(now() + time::Duration::hours(1)));
+            let MeteredReserveOutcome::Granted(r1) =
+                metered_reserve(&mut store, "s1", 10_000, "k1", None)
+            else {
+                panic!("expected Granted");
+            };
+            store.settle_shared(r1.id, Some(6_000), now()).unwrap();
+            assert!(matches!(
+                metered_reserve(&mut store, "s2", 4_000, "k2", None),
+                MeteredReserveOutcome::Granted(_)
+            ));
+
+            let mut usage = store.shared_pool_session_usage(&metered_pool_id()).unwrap();
+            usage.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+            assert_eq!(usage.len(), 2);
+            assert_eq!(usage[0].session_id, "s1");
+            assert_eq!(usage[0].active, 0);
+            assert_eq!(usage[0].settled, 6_000);
+            assert_eq!(usage[1].session_id, "s2");
+            assert_eq!(usage[1].active, 4_000);
+            assert_eq!(usage[1].settled, 0);
+        }
+
+        #[test]
+        fn pool_provider_snapshot_returns_the_most_recently_ingested_reading() {
+            let mut store = LedgerStore::open_in_memory().unwrap();
+            store
+                .ensure_pool(&metered_pool_id(), &QuotaUnit::UsdCents, 50_000, now())
+                .unwrap();
+            assert!(store
+                .pool_provider_snapshot(&metered_pool_id())
+                .unwrap()
+                .is_none());
+            ingest_used(&mut store, 12_000, Some(50_000), Some(now() + time::Duration::hours(1)));
+            let snapshot = store
+                .pool_provider_snapshot(&metered_pool_id())
+                .unwrap()
+                .unwrap();
+            match snapshot.reading {
+                GaugeReading::Used { used, limit } => {
+                    assert_eq!(used.value, 12_000);
+                    assert_eq!(limit, Some(50_000));
+                }
+                other => panic!("expected Used, got {other:?}"),
+            }
+        }
     }
 }
