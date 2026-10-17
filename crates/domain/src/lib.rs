@@ -177,8 +177,9 @@ pub use resource_account::{
 };
 pub use resource_amount::{Headroom, ResourceAmount, ResourceKind};
 pub use shared_pool::{
-    PoolAdmission, PoolProviderSnapshot, QuotaPool, SharedPoolReservation, SharedPoolReservationId,
-    SHARED_POOL_RESERVATION_SCHEMA_VERSION,
+    is_metered_unit, metered_snapshot_limit, MeteredPoolKey, MeteredPoolKeyError, PoolAdmission,
+    PoolProviderSnapshot, QuotaPool, SharedPoolReservation, SharedPoolReservationId,
+    SnapshotUnusable, METERED_POOL_PREFIX, SHARED_POOL_RESERVATION_SCHEMA_VERSION,
 };
 pub use task_features::{BucketTier, BuildTopology, TaskFeatures, FEATURE_SCHEMA_VERSION};
 pub use task_identity::{ExternalRef, TaskId, TaskIdentity};
