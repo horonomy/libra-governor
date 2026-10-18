@@ -978,6 +978,39 @@ mod tests {
     }
 
     #[test]
+    fn an_extreme_sublease_ttl_is_clamped_to_the_ceiling_instead_of_wrapping() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let task_account = AccountId::for_task(task_id);
+        let session = store
+            .ensure_child_account(task_account, AccountLevel::Session, "sess-1", now())
+            .unwrap()
+            .unwrap()
+            .account;
+
+        let outcome = store
+            .grant_sublease(GrantSubleaseRequest {
+                parent_account_id: task_account,
+                child_account_id: session.account_id,
+                child_natural_key: "sess-1",
+                amount: ResourceAmount::Tokens(100),
+                idempotency_key: "fund-session",
+                now: now(),
+                ttl_secs: u64::MAX,
+            })
+            .unwrap()
+            .unwrap();
+
+        let GrantSubleaseOutcome::Granted(lease) = outcome else {
+            panic!("expected a granted sublease");
+        };
+        assert_eq!(
+            lease.expires_at,
+            now() + time::Duration::seconds(crate::shared_pool::MAX_TTL_SECS as i64)
+        );
+    }
+
+    #[test]
     fn ensure_task_account_is_idempotent_and_deterministic() {
         let mut store = LedgerStore::open_in_memory().unwrap();
         // `initialize_task_budget` (inside `setup`) already provisions the
