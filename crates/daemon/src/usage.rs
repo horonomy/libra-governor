@@ -115,7 +115,9 @@ pub struct TurnUsage {
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
     pub output_tokens: u64,
-    /// How many assistant records contributed. Zero means the window
+    /// How many *distinct* turns contributed: one per unique
+    /// `message.id` (HORO-1882 dedup) plus one per id-less line. Not a
+    /// raw transcript-line count. Zero means the window
     /// contained no usage-bearing record at all, which is reported as
     /// [`UsageUnavailable::NoUsageInWindow`] rather than as a measured
     /// zero — see that variant's docs.
@@ -209,6 +211,13 @@ struct TranscriptRecord {
 
 #[derive(Deserialize)]
 struct TranscriptMessage {
+    /// Shared by every content-block line of the same logical turn
+    /// (HORO-1882) — the dedup key `scan` groups repeated lines by.
+    /// Absent or explicit `null` gives `None`, and such a line is summed
+    /// rather than deduplicated, exactly as every line was before this
+    /// fix.
+    #[serde(default)]
+    id: Option<String>,
     usage: Option<RawUsage>,
 }
 
@@ -262,6 +271,13 @@ fn scan(
         .map_err(|_| UsageUnavailable::Unreadable)?;
 
     let mut usage = TurnUsage::default();
+    // Claude Code writes one line per content block of a turn, repeating
+    // the same `message.id` and identical usage on each (HORO-1882). Keyed
+    // lines are grouped here and folded into `usage` — once per id, by
+    // per-field maximum — only when the scan ends; id-less lines go
+    // straight into `usage`. The map lives only for this call, so the id
+    // never leaves this function.
+    let mut by_id: std::collections::HashMap<String, RawUsage> = std::collections::HashMap::new();
     // Bytes belonging to a line whose beginning lies in an
     // earlier (not-yet-read) chunk.
     let mut partial_head: Vec<u8> = Vec::new();
@@ -300,9 +316,44 @@ fn scan(
 
         for line in lines.iter().rev() {
             match consider_line(line, window_start) {
-                LineVerdict::Older => return Ok(usage),
+                LineVerdict::Older => {
+                    fold_deduplicated(&mut usage, by_id);
+                    return Ok(usage);
+                }
                 LineVerdict::Skip => {}
-                LineVerdict::Counted(raw) => {
+                LineVerdict::Counted(Some(id), raw) => {
+                    let entry = by_id.entry(id).or_insert(RawUsage {
+                        input_tokens: Some(0),
+                        cache_creation_input_tokens: Some(0),
+                        cache_read_input_tokens: Some(0),
+                        output_tokens: Some(0),
+                    });
+                    entry.input_tokens = Some(
+                        entry
+                            .input_tokens
+                            .unwrap_or(0)
+                            .max(raw.input_tokens.unwrap_or(0)),
+                    );
+                    entry.cache_creation_input_tokens = Some(
+                        entry
+                            .cache_creation_input_tokens
+                            .unwrap_or(0)
+                            .max(raw.cache_creation_input_tokens.unwrap_or(0)),
+                    );
+                    entry.cache_read_input_tokens = Some(
+                        entry
+                            .cache_read_input_tokens
+                            .unwrap_or(0)
+                            .max(raw.cache_read_input_tokens.unwrap_or(0)),
+                    );
+                    entry.output_tokens = Some(
+                        entry
+                            .output_tokens
+                            .unwrap_or(0)
+                            .max(raw.output_tokens.unwrap_or(0)),
+                    );
+                }
+                LineVerdict::Counted(None, raw) => {
                     usage.input_tokens = usage
                         .input_tokens
                         .saturating_add(raw.input_tokens.unwrap_or(0));
@@ -324,7 +375,28 @@ fn scan(
     // Reached the start of the file without finding anything older than
     // the window: the window covers the whole transcript, so the total is
     // complete.
+    fold_deduplicated(&mut usage, by_id);
     Ok(usage)
+}
+
+/// Adds each deduplicated turn (one `RawUsage` per `message.id`) to
+/// `usage` and counts it as one record.
+fn fold_deduplicated(usage: &mut TurnUsage, by_id: std::collections::HashMap<String, RawUsage>) {
+    for (_, raw) in by_id {
+        usage.input_tokens = usage
+            .input_tokens
+            .saturating_add(raw.input_tokens.unwrap_or(0));
+        usage.cache_creation_input_tokens = usage
+            .cache_creation_input_tokens
+            .saturating_add(raw.cache_creation_input_tokens.unwrap_or(0));
+        usage.cache_read_input_tokens = usage
+            .cache_read_input_tokens
+            .saturating_add(raw.cache_read_input_tokens.unwrap_or(0));
+        usage.output_tokens = usage
+            .output_tokens
+            .saturating_add(raw.output_tokens.unwrap_or(0));
+        usage.records += 1;
+    }
 }
 
 enum LineVerdict {
@@ -332,7 +404,11 @@ enum LineVerdict {
     Skip,
     /// Older than the window: the backwards scan is done.
     Older,
-    Counted(RawUsage),
+    /// A usage-bearing record. `Some(id)` is a Claude Code `message.id`
+    /// used to deduplicate repeated content-block lines of the same turn
+    /// (HORO-1882); `None` means this record carries no such key and is
+    /// summed unconditionally, as every record was before this fix.
+    Counted(Option<String>, RawUsage),
 }
 
 fn consider_line(line: &[u8], window_start: OffsetDateTime) -> LineVerdict {
@@ -358,8 +434,11 @@ fn consider_line(line: &[u8], window_start: OffsetDateTime) -> LineVerdict {
     if record.kind.as_deref() != Some("assistant") {
         return LineVerdict::Skip;
     }
-    match record.message.and_then(|m| m.usage) {
-        Some(raw) => LineVerdict::Counted(raw),
+    match record.message {
+        Some(message) => match message.usage {
+            Some(raw) => LineVerdict::Counted(message.id, raw),
+            None => LineVerdict::Skip,
+        },
         None => LineVerdict::Skip,
     }
 }
