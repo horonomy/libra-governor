@@ -776,4 +776,15 @@ mod tests {
         assert_eq!(usage.records, 2);
         assert_eq!(usage.input_tokens, 2);
     }
+
+    #[test]
+    fn a_truncated_scan_of_keyed_lines_is_unavailable_not_a_partial_dedup() {
+        let f = write_transcript(&vec![assistant_with_id(100, "msg_a", 10, 10, 10, 10); 200]);
+        let observed = observe_transcript_window(f.path(), epoch_plus(50), 64);
+        assert_eq!(
+            observed,
+            UsageObservation::Unavailable(UsageUnavailable::ScanCapReached),
+            "a capped scan must not report the ids it happened to read as a total"
+        );
+    }
 }
