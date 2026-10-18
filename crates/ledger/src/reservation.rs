@@ -2710,4 +2710,30 @@ mod tests {
         assert!(matches!(outcome, AdjustOutcome::Insufficient { .. }));
         assert_budget_invariant(&store, task_id);
     }
+
+    #[test]
+    fn an_extreme_ttl_is_clamped_to_the_ceiling_instead_of_wrapping() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let ReserveOutcome::Granted(reservation) = store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(100),
+                idempotency_key: "key-extreme-ttl",
+                now: at(0),
+                ttl_secs: u64::MAX,
+            })
+            .unwrap()
+        else {
+            panic!("expected Granted");
+        };
+        assert_eq!(
+            reservation.expires_at,
+            at(0) + time::Duration::seconds(crate::shared_pool::MAX_TTL_SECS as i64),
+            "an oversized ttl must clamp to the 100-year ceiling, not wrap negative"
+        );
+    }
 }
