@@ -695,4 +695,16 @@ mod tests {
         assert_eq!(usage.input_tokens, 11);
         assert_eq!(usage.output_tokens, 44);
     }
+
+    #[test]
+    fn a_divergent_repeat_takes_the_per_field_maximum() {
+        let f = write_transcript(&[
+            assistant_with_id(100, "msg_a", 10, 20, 30, 5),
+            assistant_with_id(101, "msg_a", 10, 20, 30, 40),
+        ]);
+        let observed = observe_transcript_window(f.path(), epoch_plus(50), DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().expect("the turn is in the window");
+        assert_eq!(usage.records, 1);
+        assert_eq!(usage.output_tokens, 40);
+    }
 }
