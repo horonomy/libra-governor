@@ -2736,4 +2736,24 @@ mod tests {
             "an oversized ttl must clamp to the 100-year ceiling, not wrap negative"
         );
     }
+
+    #[test]
+    fn an_unrepresentable_expiry_is_refused_not_a_panic() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let result = store.reserve(ReserveRequest {
+            task_id,
+            session_id: "sess-1",
+            plan_id: None,
+            class: ReservationClass::OptionalWork,
+            amount: ResourceAmount::Tokens(100),
+            idempotency_key: "key-overflow-expiry",
+            now: OffsetDateTime::new_utc(time::Date::MAX, time::Time::MAX),
+            ttl_secs: 3600,
+        });
+        assert!(
+            result.is_err(),
+            "expiry past the representable range must be an error"
+        );
+    }
 }
