@@ -724,4 +724,19 @@ mod tests {
         );
         assert_eq!(usage.input_tokens, 12);
     }
+
+    #[test]
+    fn deduplication_survives_the_scan_stopping_at_an_older_record() {
+        // The backwards scan returns early at the first record older than
+        // the window; keyed lines gathered before that must still be folded.
+        let f = write_transcript(&[
+            assistant_with_id(10, "msg_old", 999, 999, 999, 999),
+            assistant_with_id(100, "msg_a", 10, 20, 30, 40),
+            assistant_with_id(101, "msg_a", 10, 20, 30, 40),
+        ]);
+        let observed = observe_transcript_window(f.path(), epoch_plus(50), DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().expect("the in-window turn is counted");
+        assert_eq!(usage.records, 1);
+        assert_eq!(usage.input_tokens, 10);
+    }
 }
