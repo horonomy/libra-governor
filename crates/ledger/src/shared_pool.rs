@@ -80,7 +80,7 @@ fn invalid() -> LedgerError {
 /// realistic operator-configured TTL approaches this, so clamping to it
 /// means the expiry-instant arithmetic in [`LedgerStore::reserve_shared`]
 /// never needs an "expires immediately" fallback for an oversized TTL.
-const MAX_TTL_SECS: u64 = 100 * 365 * 24 * 3600;
+pub(crate) const MAX_TTL_SECS: u64 = 100 * 365 * 24 * 3600;
 
 /// SQLite's `INTEGER` column is a signed 64-bit value; every amount this
 /// module persists originates as a caller-supplied `u64`. A bare `as i64`
