@@ -392,7 +392,12 @@ impl LedgerStore {
             [req.parent_account_id.to_string()],
             |row| row.get(0),
         )?;
-        let requested_expires_at = req.now + time::Duration::seconds(req.ttl_secs as i64);
+        let ttl_seconds =
+            i64::try_from(req.ttl_secs.min(crate::shared_pool::MAX_TTL_SECS)).unwrap_or(i64::MAX);
+        let requested_expires_at = req
+            .now
+            .checked_add(time::Duration::seconds(ttl_seconds))
+            .ok_or(LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
         if let Some(funding_id) = parent_funding_lease_id {
             let funding_expires_at: String = tx.query_row(
                 "SELECT expires_at FROM reservations WHERE id = ?1",
