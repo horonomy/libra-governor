@@ -467,6 +467,21 @@ mod tests {
         )
     }
 
+    /// A Claude Code `assistant` line carrying `message.id` (HORO-1882):
+    /// the host writes one such line per content block of a turn, all
+    /// repeating the same id and usage.
+    fn assistant_with_id(secs: i64, id: &str, input: u64, cc: u64, cr: u64, out: u64) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"{}","message":{{"id":"{}","usage":{{"input_tokens":{},"cache_creation_input_tokens":{},"cache_read_input_tokens":{},"output_tokens":{}}}}}}}"#,
+            rfc(secs),
+            id,
+            input,
+            cc,
+            cr,
+            out
+        )
+    }
+
     fn write_transcript(lines: &[String]) -> tempfile::NamedTempFile {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         for line in lines {
@@ -649,5 +664,21 @@ mod tests {
                 "a reason code is a fixed vocabulary, never a channel for file content: {label:?}"
             );
         }
+    }
+
+    #[test]
+    fn content_block_lines_of_one_turn_are_counted_once() {
+        let f = write_transcript(&[
+            assistant_with_id(100, "msg_a", 10, 20, 30, 40),
+            assistant_with_id(101, "msg_a", 10, 20, 30, 40),
+            assistant_with_id(102, "msg_a", 10, 20, 30, 40),
+        ]);
+        let observed = observe_transcript_window(f.path(), epoch_plus(50), DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().expect("the turn is in the window");
+        assert_eq!(usage.records, 1);
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.cache_creation_input_tokens, 20);
+        assert_eq!(usage.cache_read_input_tokens, 30);
+        assert_eq!(usage.output_tokens, 40);
     }
 }
