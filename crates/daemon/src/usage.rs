@@ -681,4 +681,18 @@ mod tests {
         assert_eq!(usage.cache_read_input_tokens, 30);
         assert_eq!(usage.output_tokens, 40);
     }
+
+    #[test]
+    fn distinct_message_ids_are_counted_independently() {
+        let f = write_transcript(&[
+            assistant_with_id(100, "msg_a", 10, 20, 30, 40),
+            assistant_with_id(101, "msg_a", 10, 20, 30, 40),
+            assistant_with_id(200, "msg_b", 1, 2, 3, 4),
+        ]);
+        let observed = observe_transcript_window(f.path(), epoch_plus(50), DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().expect("both turns are in the window");
+        assert_eq!(usage.records, 2);
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.output_tokens, 44);
+    }
 }
