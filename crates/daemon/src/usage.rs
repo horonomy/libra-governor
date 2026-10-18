@@ -41,7 +41,22 @@
 //!   measured over two real local transcripts, per-turn totals were p50
 //!   ~370k-510k including cache creation but ~7.7M-11.3M once cache reads
 //!   were added — a ~25x inflation that describes caching mechanics
-//!   rather than work performed.
+//!   rather than work performed. (These absolute figures predate the
+//!   per-content-block dedup added for HORO-1882 below and are very
+//!   likely inflated by that separate double-count; the ~25x *ratio*
+//!   between the two totals is unaffected, since both sides carried it.)
+//!
+//! # Claude Code duplicate lines per turn (HORO-1882)
+//!
+//! Claude Code writes one `assistant` line per *content block* of a turn,
+//! each repeating the same `message.id` and identical `message.usage`.
+//! Summing every line counted one turn once per content block. Lines are
+//! now deduplicated on `message.id`: each id counts once (per-field
+//! maximum across repeats) and increments `records` once; lines without
+//! an id are summed as before. The id is an opaque key held only in a
+//! scan-scoped map and dropped when the scan returns. Dedup is per
+//! [`observe_transcript_window`] call, so a turn whose lines straddle a
+//! window boundary can still be counted once in each window.
 //!
 //! All four raw counts are read and summed into [`TurnUsage`] regardless,
 //! so the choice above is auditable, and changing it later needs no
@@ -107,8 +122,9 @@ pub const DEFAULT_SCAN_CAP_BYTES: u64 = 8 * 1024 * 1024;
 /// Read granularity for the backwards scan.
 const CHUNK_BYTES: usize = 256 * 1024;
 
-/// The four raw per-turn counts the host reports, summed over every
-/// assistant record inside the measured window.
+/// The four raw per-turn counts the host reports, summed over each
+/// distinct assistant turn inside the measured window (HORO-1882: lines
+/// sharing a `message.id` count once).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TurnUsage {
     pub input_tokens: u64,
@@ -215,7 +231,12 @@ struct TranscriptMessage {
     /// (HORO-1882) — the dedup key `scan` groups repeated lines by.
     /// Absent or explicit `null` gives `None`, and such a line is summed
     /// rather than deduplicated, exactly as every line was before this
-    /// fix.
+    /// fix. A `message.id` that is present but not a string would fail
+    /// this whole record's parse (losing its usage and its timestamp),
+    /// not fall back to `None`; the main-branch fix (PR #153) verified
+    /// against 959,855 local Claude Code transcript lines (18 files) that
+    /// it is always absent or a string. That verification is inherited,
+    /// not repeated for this backport.
     #[serde(default)]
     id: Option<String>,
     usage: Option<RawUsage>,
@@ -232,8 +253,9 @@ struct RawUsage {
     output_tokens: Option<u64>,
 }
 
-/// Sums host-reported usage over every assistant record in `path` whose
-/// timestamp is at or after `window_start`.
+/// Sums host-reported usage over each distinct assistant turn in `path`
+/// whose timestamp is at or after `window_start` (HORO-1882: lines
+/// sharing a `message.id` count once; id-less lines are summed).
 ///
 /// `window_start` must be the end of the last already-accounted window —
 /// the previous receipt's `recorded_at` for this task, falling back to the
