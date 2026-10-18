@@ -707,4 +707,21 @@ mod tests {
         assert_eq!(usage.records, 1);
         assert_eq!(usage.output_tokens, 40);
     }
+
+    #[test]
+    fn an_id_less_line_is_still_summed_alongside_a_deduplicated_turn() {
+        let f = write_transcript(&[
+            assistant_with_id(100, "msg_a", 10, 20, 30, 40),
+            assistant_with_id(101, "msg_a", 10, 20, 30, 40),
+            assistant(200, 1, 2, 3, 4),
+            assistant(201, 1, 2, 3, 4),
+        ]);
+        let observed = observe_transcript_window(f.path(), epoch_plus(50), DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().expect("all lines are in the window");
+        assert_eq!(
+            usage.records, 3,
+            "one deduplicated turn plus two id-less lines"
+        );
+        assert_eq!(usage.input_tokens, 12);
+    }
 }
