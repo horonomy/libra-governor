@@ -9,9 +9,9 @@ name: CodeQL
 
 on:
   push:
-    branches: [main]
+    branches: [main, "release/**"]
   pull_request:
-    branches: [main]
+    branches: [main, "release/**"]
   schedule:
     # Weekly, matching the cadence GitHub's default setup uses.
     - cron: "27 4 * * 1"
