@@ -761,4 +761,19 @@ mod tests {
         assert_eq!(usage.records, 1);
         assert_eq!(usage.input_tokens, 10);
     }
+
+    #[test]
+    fn an_explicit_null_message_id_is_summed_like_an_id_less_line() {
+        let line = |secs: i64| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"{}","message":{{"id":null,"usage":{{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}}}}}"#,
+                rfc(secs)
+            )
+        };
+        let f = write_transcript(&[line(100), line(101)]);
+        let observed = observe_transcript_window(f.path(), epoch_plus(50), DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().expect("both lines are in the window");
+        assert_eq!(usage.records, 2);
+        assert_eq!(usage.input_tokens, 2);
+    }
 }
