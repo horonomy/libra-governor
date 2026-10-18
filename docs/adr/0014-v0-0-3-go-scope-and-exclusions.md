@@ -106,3 +106,35 @@ affecting the excluded items' already-latent status.
   HORO-1690 (model/provider instrumentation, open, non-blocking),
   HORO-1693 (shadow-decision gap, open, tracked by this ADR),
   HORO-1694 (custody-tree latent status, open, tracked by this ADR).
+
+## Addendum 1 — release candidate with the HORO-1882 usage-dedup backport
+
+- **Date**: 2026-10-18
+- **Trigger**: the original baseline `629689837bd78e022fb2d24298ecddd7e05a106c`
+  (merge of PR #88) sums Claude Code transcript usage once per transcript
+  *line*. Claude Code writes one line per content block of a turn, each
+  repeating the same `message.id` and `message.usage`, so a turn was counted
+  once per content block. That figure becomes receipt `actual_usage`, which
+  feeds the estimator's `resource_p80` and therefore admission reservation
+  size — inside the promoted *admission* and *flat resource accounting* scope.
+  The earlier GO packet (HORO-1689 comment 27809) wrongly stated that no fix
+  touching the promoted scope existed after the baseline; it was corrected in
+  comment 27821.
+- **Founder decision**: Option B (HORO-1689 comment 27821) — a revised release
+  candidate on the baseline plus only the independently reviewed HORO-1882
+  fix. A GO recorded against the old SHA is **not** a GO on this candidate.
+- **Change carried**: the `message.id` deduplication of `crates/daemon/src/usage.rs`
+  (main PR #153), ported by hand because `main`'s file also contains unrelated
+  Codex reader commits (HORO-1714) that stay out of v0.0.3. Per-field maximum
+  across repeats; id-less lines are summed as before; `records` now counts
+  distinct turns.
+- **Scope unchanged**: the promoted and excluded scopes above are unchanged.
+  No other v0.0.4 functionality is included.
+- **Known limits, disclosed**: (1) receipts already persisted by an older
+  daemon keep their inflated `actual_usage`; this change does not migrate
+  them (tracked on HORO-1882). (2) A turn whose content-block lines straddle
+  a receipt-window boundary can still be counted in two windows.
+- **Evidence**: tied to the candidate commit recorded in the new-SHA GO/NO-GO
+  packet on HORO-1689. A document cannot name the SHA of the commit that
+  contains it, so the packet records the final candidate SHA and the
+  validation run against it.
