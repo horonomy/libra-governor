@@ -858,7 +858,17 @@ impl LedgerStore {
         )?;
 
         let id = ReservationId::new();
-        let expires_at = req.now + time::Duration::seconds(req.ttl_secs as i64);
+        // A bare `ttl_secs as i64` wraps for a caller-supplied value above
+        // `i64::MAX`, and `OffsetDateTime + Duration` panics when the sum
+        // leaves the representable range (HORO-1785). Clamp to the same
+        // 100-year ceiling `reserve_shared` uses, and refuse rather than
+        // panic if even the clamped expiry is unrepresentable.
+        let ttl_seconds =
+            i64::try_from(req.ttl_secs.min(crate::shared_pool::MAX_TTL_SECS)).unwrap_or(i64::MAX);
+        let expires_at = req
+            .now
+            .checked_add(time::Duration::seconds(ttl_seconds))
+            .ok_or(LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
         let account_id = AccountId::for_task(req.task_id);
         tx.execute(
             "INSERT INTO reservations (
