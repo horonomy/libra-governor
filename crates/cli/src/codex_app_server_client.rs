@@ -534,6 +534,9 @@ printf '{"id":1,"error":{"code":-32601,"message":"method not found"}}\n'
         let out: Result<(), AppServerError> =
             retry_while_text_file_busy_with(3, Duration::ZERO, || {
                 calls += 1;
+                // A loop that lost its bound would spin forever; fail fast
+                // and say why instead of hanging the whole test binary.
+                assert!(calls <= 50, "retry loop ignored its bound: {calls} calls");
                 Err(AppServerError::Spawn(
                     "fixture.sh".to_owned(),
                     "Text file busy (os error 26)".to_owned(),
