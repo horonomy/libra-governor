@@ -527,4 +527,19 @@ printf '{"id":1,"error":{"code":-32601,"message":"method not found"}}\n'
         assert!(matches!(out, Err(AppServerError::Spawn(_, _))));
         assert_eq!(calls, 1);
     }
+
+    #[test]
+    fn a_permanently_busy_spawn_gives_up_after_the_retry_bound() {
+        let mut calls = 0;
+        let out: Result<(), AppServerError> =
+            retry_while_text_file_busy_with(3, Duration::ZERO, || {
+                calls += 1;
+                Err(AppServerError::Spawn(
+                    "fixture.sh".to_owned(),
+                    "Text file busy (os error 26)".to_owned(),
+                ))
+            });
+        assert!(matches!(out, Err(AppServerError::Spawn(_, _))));
+        assert_eq!(calls, 4, "one attempt plus exactly three retries");
+    }
 }
