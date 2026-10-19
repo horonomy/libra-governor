@@ -264,6 +264,13 @@ impl LedgerStore {
             None => None,
         };
 
+        // Current contract metadata explains the count without recomputing stored reserves.
+        let required_criteria_count = match account.task_id {
+            Some(task_id) => self
+                .latest_contract(task_id)?
+                .map_or(0, |contract| contract.required_criteria().count()),
+            None => 0,
+        };
         let completion_reserve = CompletionReservePosture {
             protected: task_budget.as_ref().map(|b| ScopedAmount {
                 kind: b.resource_kind,
@@ -273,7 +280,7 @@ impl LedgerStore {
             }),
             outstanding_draw: None,
             basis: task_budget.as_ref().map(|b| b.completion_reserve_basis),
-            required_criteria_count: 0,
+            required_criteria_count,
         };
 
         let allocation = Allocation {
