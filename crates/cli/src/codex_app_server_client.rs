@@ -304,6 +304,42 @@ mod tests {
         path
     }
 
+    /// Runs `op`, retrying while it fails with `ETXTBSY`. Another test
+    /// thread's `fork` can inherit the still-open write descriptor of a
+    /// script this test just created and hold it until that child `exec`s,
+    /// so executing the script in that window fails with "Text file busy"
+    /// (os error 26) on Linux. The window is microseconds long, so a short
+    /// bounded retry removes the race without hiding any other spawn error.
+    fn retry_while_text_file_busy<T>(
+        op: impl FnMut() -> Result<T, AppServerError>,
+    ) -> Result<T, AppServerError> {
+        retry_while_text_file_busy_with(100, Duration::from_millis(20), op)
+    }
+
+    fn retry_while_text_file_busy_with<T>(
+        max_retries: u32,
+        delay: Duration,
+        mut op: impl FnMut() -> Result<T, AppServerError>,
+    ) -> Result<T, AppServerError> {
+        let mut retries = 0;
+        loop {
+            match op() {
+                Err(AppServerError::Spawn(_, msg))
+                    if msg.contains("os error 26") && retries < max_retries =>
+                {
+                    retries += 1;
+                    std::thread::sleep(delay);
+                }
+                other => return other,
+            }
+        }
+    }
+
+    fn spawn_fixture(script: &std::path::Path) -> (AppServerClient, Duration) {
+        retry_while_text_file_busy(|| AppServerClient::spawn(script.to_str().unwrap(), &[], &[]))
+            .unwrap()
+    }
+
     #[test]
     fn happy_path_call_returns_the_matching_response_skipping_notifications() {
         let dir = tempfile::tempdir().unwrap();
@@ -315,8 +351,7 @@ printf '{"method":"remoteControl/status/changed","params":{}}\n'
 printf '{"id":1,"result":{"ok":true}}\n'
 "#,
         );
-        let (mut client, _spawn_dur) =
-            AppServerClient::spawn(script.to_str().unwrap(), &[], &[]).unwrap();
+        let (mut client, _spawn_dur) = spawn_fixture(&script);
         let (result, _call_dur) = client
             .call("initialize", serde_json::json!({}), Duration::from_secs(5))
             .unwrap();
@@ -336,8 +371,7 @@ printf '{"id":1,"result":{"ok":true}}\n'
         // Never writes a response at all — the request line is read and
         // discarded, then the script sleeps well past our deadline.
         let script = fixture_script(dir.path(), "read -r _req1\nsleep 30\n");
-        let (mut client, _spawn_dur) =
-            AppServerClient::spawn(script.to_str().unwrap(), &[], &[]).unwrap();
+        let (mut client, _spawn_dur) = spawn_fixture(&script);
         let start = Instant::now();
         let err = client
             .call(
@@ -358,8 +392,7 @@ printf '{"id":1,"result":{"ok":true}}\n'
     fn malformed_json_line_is_reported_not_panicked_on() {
         let dir = tempfile::tempdir().unwrap();
         let script = fixture_script(dir.path(), "read -r _req1\nprintf 'not-json-at-all\\n'\n");
-        let (mut client, _spawn_dur) =
-            AppServerClient::spawn(script.to_str().unwrap(), &[], &[]).unwrap();
+        let (mut client, _spawn_dur) = spawn_fixture(&script);
         let err = client
             .call("hooks/list", serde_json::json!({}), Duration::from_secs(5))
             .unwrap_err();
@@ -379,8 +412,7 @@ printf '{"id":1,"result":{"ok":true}}\n'
         // closes stdout with *zero* bytes written exercises
         // UnexpectedEof instead (see the next test).
         let script = fixture_script(dir.path(), "read -r _req1\nprintf '{\"id\":1,\"resul'\n");
-        let (mut client, _spawn_dur) =
-            AppServerClient::spawn(script.to_str().unwrap(), &[], &[]).unwrap();
+        let (mut client, _spawn_dur) = spawn_fixture(&script);
         let err = client
             .call("hooks/list", serde_json::json!({}), Duration::from_secs(5))
             .unwrap_err();
@@ -394,8 +426,7 @@ printf '{"id":1,"result":{"ok":true}}\n'
     fn process_exiting_with_no_output_is_unexpected_eof() {
         let dir = tempfile::tempdir().unwrap();
         let script = fixture_script(dir.path(), "read -r _req1\nexit 0\n");
-        let (mut client, _spawn_dur) =
-            AppServerClient::spawn(script.to_str().unwrap(), &[], &[]).unwrap();
+        let (mut client, _spawn_dur) = spawn_fixture(&script);
         let err = client
             .call("hooks/list", serde_json::json!({}), Duration::from_secs(5))
             .unwrap_err();
@@ -411,8 +442,7 @@ printf '{"id":1,"result":{"ok":true}}\n'
 printf '{"id":1,"error":{"code":-32601,"message":"method not found"}}\n'
 "#,
         );
-        let (mut client, _spawn_dur) =
-            AppServerClient::spawn(script.to_str().unwrap(), &[], &[]).unwrap();
+        let (mut client, _spawn_dur) = spawn_fixture(&script);
         let err = client
             .call("hooks/list", serde_json::json!({}), Duration::from_secs(5))
             .unwrap_err();
@@ -438,8 +468,7 @@ printf '{"id":1,"error":{"code":-32601,"message":"method not found"}}\n'
             "read -r _req1\n/bin/dd if=/dev/zero bs=1000000 count=9 2>/dev/null | /usr/bin/tr \
              '\\0' 'x'\n",
         );
-        let (mut client, _spawn_dur) =
-            AppServerClient::spawn(script.to_str().unwrap(), &[], &[]).unwrap();
+        let (mut client, _spawn_dur) = spawn_fixture(&script);
         let start = Instant::now();
         let err = client
             .call("hooks/list", serde_json::json!({}), Duration::from_secs(10))
@@ -462,10 +491,58 @@ printf '{"id":1,"error":{"code":-32601,"message":"method not found"}}\n'
     fn kill_is_idempotent_and_drop_does_not_panic() {
         let dir = tempfile::tempdir().unwrap();
         let script = fixture_script(dir.path(), "read -r _req1\nsleep 30\n");
-        let (mut client, _spawn_dur) =
-            AppServerClient::spawn(script.to_str().unwrap(), &[], &[]).unwrap();
+        let (mut client, _spawn_dur) = spawn_fixture(&script);
         client.kill();
         client.kill(); // idempotent, must not panic
         drop(client); // Drop's own kill() must also be a safe no-op here
+    }
+
+    #[test]
+    fn a_text_file_busy_spawn_is_retried_until_it_succeeds() {
+        let mut calls = 0;
+        let out = retry_while_text_file_busy(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(AppServerError::Spawn(
+                    "fixture.sh".to_owned(),
+                    "Text file busy (os error 26)".to_owned(),
+                ))
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(out.unwrap(), 3);
+    }
+
+    #[test]
+    fn a_spawn_error_other_than_text_file_busy_is_returned_without_retry() {
+        let mut calls = 0;
+        let out: Result<(), AppServerError> = retry_while_text_file_busy(|| {
+            calls += 1;
+            Err(AppServerError::Spawn(
+                "fixture.sh".to_owned(),
+                "No such file or directory (os error 2)".to_owned(),
+            ))
+        });
+        assert!(matches!(out, Err(AppServerError::Spawn(_, _))));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn a_permanently_busy_spawn_gives_up_after_the_retry_bound() {
+        let mut calls = 0;
+        let out: Result<(), AppServerError> =
+            retry_while_text_file_busy_with(3, Duration::ZERO, || {
+                calls += 1;
+                // A loop that lost its bound would spin forever; fail fast
+                // and say why instead of hanging the whole test binary.
+                assert!(calls <= 50, "retry loop ignored its bound: {calls} calls");
+                Err(AppServerError::Spawn(
+                    "fixture.sh".to_owned(),
+                    "Text file busy (os error 26)".to_owned(),
+                ))
+            });
+        assert!(matches!(out, Err(AppServerError::Spawn(_, _))));
+        assert_eq!(calls, 4, "one attempt plus exactly three retries");
     }
 }
