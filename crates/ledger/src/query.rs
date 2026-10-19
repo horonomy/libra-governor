@@ -1629,4 +1629,15 @@ mod usage_basis_tests {
                 .unwrap();
         }
     }
+
+    #[test]
+    fn a_marked_receipt_keeps_its_usage_for_calibration() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        seed_usage_receipt(&mut store, vec![ResourceAmount::Tokens(500)], 30, false);
+
+        let history = store.receipts_for_estimation().unwrap();
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].1.actual_usage, vec![ResourceAmount::Tokens(500)]);
+    }
 }
