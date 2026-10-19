@@ -2741,6 +2741,7 @@ mod tests {
     fn an_unrepresentable_expiry_is_refused_not_a_panic() {
         let mut store = LedgerStore::open_in_memory().unwrap();
         let task_id = setup(&mut store, 200);
+        let before = store.task_budget(task_id).unwrap();
         let result = store.reserve(ReserveRequest {
             task_id,
             session_id: "sess-1",
@@ -2755,5 +2756,11 @@ mod tests {
             result.is_err(),
             "expiry past the representable range must be an error"
         );
+        assert_eq!(
+            store.task_budget(task_id).unwrap(),
+            before,
+            "a refused reservation must leave the task budget untouched"
+        );
+        assert_budget_invariant(&store, task_id);
     }
 }
