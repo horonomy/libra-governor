@@ -157,6 +157,12 @@ fn render_human(truth: &EconomicTruth) -> String {
         );
         let _ = writeln!(
             out,
+            "  completion reserve: protected={:?} required_criteria={}",
+            categories.completion_reserve.protected,
+            categories.completion_reserve.required_criteria_count,
+        );
+        let _ = writeln!(
+            out,
             "  totals: exclusive={:?} inclusive={:?}",
             categories.totals.exclusive, categories.totals.inclusive
         );
@@ -212,5 +218,54 @@ mod tests {
         );
         let rendered = render_human(&truth);
         assert!(rendered.contains("no economic basis"));
+    }
+
+    #[test]
+    fn render_human_shows_the_required_criteria_from_the_canonical_truth() {
+        use libra_governor_domain::{
+            CompletionContract, CompletionCriterion, ResourceKind, TaskId, TaskIdentity,
+        };
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = TaskId::new();
+        store
+            .insert_task(
+                &TaskIdentity {
+                    id: task_id,
+                    external_ref: None,
+                },
+                now,
+            )
+            .unwrap();
+        store
+            .ensure_task_account(task_id, ResourceKind::Tokens, now)
+            .unwrap();
+        store
+            .insert_contract(
+                task_id,
+                &CompletionContract::first(vec![
+                    CompletionCriterion::required("verify"),
+                    CompletionCriterion::optional("polish"),
+                ]),
+                now,
+            )
+            .unwrap();
+        let truth = store.economic_truth_for_task(task_id).unwrap();
+        let canonical = truth
+            .categories
+            .as_ref()
+            .unwrap()
+            .completion_reserve
+            .required_criteria_count;
+        assert_eq!(canonical, 1);
+        let rendered = render_human(&truth);
+        let line = rendered
+            .lines()
+            .find(|l| l.contains("completion reserve:"))
+            .expect("the completion reserve line is rendered");
+        assert!(
+            line.ends_with(&format!("required_criteria={canonical}")),
+            "the rendered count must match the canonical count"
+        );
     }
 }
