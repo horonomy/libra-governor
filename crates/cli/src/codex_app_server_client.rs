@@ -505,4 +505,18 @@ printf '{"id":1,"error":{"code":-32601,"message":"method not found"}}\n'
         });
         assert_eq!(out.unwrap(), 3);
     }
+
+    #[test]
+    fn a_spawn_error_other_than_text_file_busy_is_returned_without_retry() {
+        let mut calls = 0;
+        let out: Result<(), AppServerError> = retry_while_text_file_busy(|| {
+            calls += 1;
+            Err(AppServerError::Spawn(
+                "fixture.sh".to_owned(),
+                "No such file or directory (os error 2)".to_owned(),
+            ))
+        });
+        assert!(matches!(out, Err(AppServerError::Spawn(_, _))));
+        assert_eq!(calls, 1);
+    }
 }
