@@ -1640,4 +1640,16 @@ mod usage_basis_tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].1.actual_usage, vec![ResourceAmount::Tokens(500)]);
     }
+
+    #[test]
+    fn an_unmarked_receipt_withholds_usage_but_keeps_duration() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        seed_usage_receipt(&mut store, vec![ResourceAmount::Tokens(1_000_000)], 90, true);
+
+        let history = store.receipts_for_estimation().unwrap();
+
+        assert_eq!(history.len(), 1);
+        assert!(history[0].1.actual_usage.is_empty());
+        assert_eq!(history[0].1.actual_duration_secs, 90);
+    }
 }
