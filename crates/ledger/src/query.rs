@@ -1664,4 +1664,20 @@ mod usage_basis_tests {
         assert!(history[0].1.actual_usage.is_empty());
         assert_eq!(history[0].1.actual_duration_secs, 90);
     }
+
+    #[test]
+    fn a_receipt_with_an_unknown_basis_withholds_usage_too() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        seed_usage_receipt(&mut store, vec![ResourceAmount::Tokens(700)], 45, false);
+        store
+            .conn
+            .execute("UPDATE receipts SET usage_basis = 'other_v2'", [])
+            .unwrap();
+
+        let history = store.receipts_for_estimation().unwrap();
+
+        assert_eq!(history.len(), 1);
+        assert!(history[0].1.actual_usage.is_empty());
+        assert_eq!(history[0].1.actual_duration_secs, 45);
+    }
 }
