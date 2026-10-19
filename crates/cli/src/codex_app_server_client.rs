@@ -311,16 +311,24 @@ mod tests {
     /// (os error 26) on Linux. The window is microseconds long, so a short
     /// bounded retry removes the race without hiding any other spawn error.
     fn retry_while_text_file_busy<T>(
+        op: impl FnMut() -> Result<T, AppServerError>,
+    ) -> Result<T, AppServerError> {
+        retry_while_text_file_busy_with(100, Duration::from_millis(20), op)
+    }
+
+    fn retry_while_text_file_busy_with<T>(
+        max_retries: u32,
+        delay: Duration,
         mut op: impl FnMut() -> Result<T, AppServerError>,
     ) -> Result<T, AppServerError> {
-        let mut attempts = 0;
+        let mut retries = 0;
         loop {
             match op() {
                 Err(AppServerError::Spawn(_, msg))
-                    if msg.contains("os error 26") && attempts < 100 =>
+                    if msg.contains("os error 26") && retries < max_retries =>
                 {
-                    attempts += 1;
-                    std::thread::sleep(Duration::from_millis(20));
+                    retries += 1;
+                    std::thread::sleep(delay);
                 }
                 other => return other,
             }
