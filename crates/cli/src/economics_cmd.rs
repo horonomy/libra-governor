@@ -157,6 +157,12 @@ fn render_human(truth: &EconomicTruth) -> String {
         );
         let _ = writeln!(
             out,
+            "  completion reserve: protected={:?} required_criteria={}",
+            categories.completion_reserve.protected,
+            categories.completion_reserve.required_criteria_count,
+        );
+        let _ = writeln!(
+            out,
             "  totals: exclusive={:?} inclusive={:?}",
             categories.totals.exclusive, categories.totals.inclusive
         );
