@@ -618,7 +618,7 @@ impl LedgerStore {
         let mut stmt = self.conn.prepare(
             "SELECT task_id, plan_id, contract_revision, actual_duration_secs,
                     actual_usage_json, outcome_json, recorded_at, tool_call_count, model, provider,
-                    task_features_json, reservation_evidence_json, regime_json
+                    task_features_json, reservation_evidence_json, regime_json, usage_basis
              FROM receipts ORDER BY recorded_at ASC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -635,6 +635,7 @@ impl LedgerStore {
             let task_features_json: Option<String> = row.get(10)?;
             let reservation_evidence_json: Option<String> = row.get(11)?;
             let regime_json: Option<String> = row.get(12)?;
+            let usage_basis: Option<String> = row.get(13)?;
             Ok((
                 task_id,
                 plan_id,
@@ -649,6 +650,7 @@ impl LedgerStore {
                 task_features_json,
                 reservation_evidence_json,
                 regime_json,
+                usage_basis,
             ))
         })?;
 
@@ -668,6 +670,7 @@ impl LedgerStore {
                 task_features_json,
                 reservation_evidence_json,
                 regime_json,
+                usage_basis,
             ) = row?;
             let task_id = Uuid::parse_str(&task_id)
                 .map(TaskId)
@@ -675,8 +678,15 @@ impl LedgerStore {
             let plan_id = Uuid::parse_str(&plan_id)
                 .map(PlanId)
                 .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
-            let actual_usage: Vec<ResourceAmount> = serde_json::from_str(&usage_json)
+            let mut actual_usage: Vec<ResourceAmount> = serde_json::from_str(&usage_json)
                 .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
+            // HORO-1727: usage recorded without a known denomination
+            // (pre-dedup, ~2.15x inflated) is not comparable to today's
+            // fresh-token figures. Withhold it from calibration instead of
+            // rescaling it; the receipt still contributes its duration.
+            if usage_basis.as_deref() != Some(crate::USAGE_BASIS_FRESH_DEDUP_V1) {
+                actual_usage.clear();
+            }
             let outcome: ExecutionOutcome = serde_json::from_str(&outcome_json)
                 .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
             let task_features = parse_task_features(task_features_json)?;

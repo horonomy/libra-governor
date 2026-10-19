@@ -331,8 +331,8 @@ impl LedgerStore {
                                     actual_usage_json, outcome_json, recorded_at,
                                     tool_call_count, model, provider, task_features_json,
                                     reservation_evidence_json, dogfood_event_id, dogfood_origin_profile,
-                                    regime_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                                    regime_json, usage_basis)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             rusqlite::params![
                 receipt.task_id.to_string(),
                 receipt.plan_id.0.to_string(),
@@ -349,6 +349,7 @@ impl LedgerStore {
                 dogfood_event_id,
                 dogfood_origin_profile,
                 regime_json,
+                crate::USAGE_BASIS_FRESH_DEDUP_V1,
             ],
         )?;
 
