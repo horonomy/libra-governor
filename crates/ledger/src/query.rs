@@ -1592,3 +1592,41 @@ mod plan_lineage_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod usage_basis_tests {
+    use super::*;
+    use libra_governor_domain::{CompletionCriterion, ResourceAmount, TaskIdentity};
+
+    fn now() -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH
+    }
+
+    /// Records one receipt with `usage` and `secs` duration. When
+    /// `legacy` is true the row is rewritten to the pre-0019 shape
+    /// (`usage_basis` NULL), as a receipt written before the marker existed.
+    fn seed_usage_receipt(store: &mut LedgerStore, usage: Vec<ResourceAmount>, secs: u64, legacy: bool) {
+        let identity = TaskIdentity::new(None);
+        store.insert_task(&identity, now()).unwrap();
+        let contract = CompletionContract::first(vec![CompletionCriterion::required("c")]);
+        store.insert_contract(identity.id, &contract, now()).unwrap();
+        let plan = ExecutionPlan::new(identity.id, contract.revision, None, now());
+        store.insert_plan(&plan).unwrap();
+        let receipt = ExecutionReceipt::new(
+            identity.id,
+            contract.revision,
+            plan.id,
+            secs,
+            usage,
+            ExecutionOutcome::Unknown,
+            now(),
+        );
+        store.insert_receipt(&receipt).unwrap();
+        if legacy {
+            store
+                .conn
+                .execute("UPDATE receipts SET usage_basis = NULL", [])
+                .unwrap();
+        }
+    }
+}
