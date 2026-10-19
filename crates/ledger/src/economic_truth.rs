@@ -975,6 +975,60 @@ mod tests {
             .is_none());
     }
 
+    #[test]
+    fn completion_reserve_counts_contract_without_a_budget_and_ignores_unbound_account() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = TaskId::new();
+        store
+            .insert_task(
+                &TaskIdentity {
+                    id: task_id,
+                    external_ref: None,
+                },
+                now(),
+            )
+            .unwrap();
+        store
+            .ensure_task_account(task_id, libra_governor_domain::ResourceKind::Tokens, now())
+            .unwrap();
+        store
+            .insert_contract(
+                task_id,
+                &CompletionContract::first(vec![CompletionCriterion::required("verify")]),
+                now(),
+            )
+            .unwrap();
+        let truth = store.economic_truth_for_task(task_id).unwrap();
+        assert!(truth.task_budget.is_none());
+        assert_eq!(
+            truth
+                .categories
+                .unwrap()
+                .completion_reserve
+                .required_criteria_count,
+            1
+        );
+        // The reader also accepts persisted accounts without a task binding.
+        store
+            .conn
+            .execute(
+                "UPDATE resource_accounts SET task_id = NULL WHERE account_id = ?1",
+                [AccountId::for_task(task_id).to_string()],
+            )
+            .unwrap();
+        let truth = store
+            .economic_truth_for_account_str(&AccountId::for_task(task_id).to_string())
+            .unwrap();
+        assert_eq!(
+            truth
+                .categories
+                .unwrap()
+                .completion_reserve
+                .required_criteria_count,
+            0
+        );
+    }
+
     // --- SubtreeAdditivity: documents production shape, does not fabricate --
 
     #[test]
