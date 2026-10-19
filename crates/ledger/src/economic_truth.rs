@@ -1029,6 +1029,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn completion_reserve_contract_read_errors_are_not_reported_as_zero() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup_task(&mut store, 200);
+        store
+            .insert_contract(
+                task_id,
+                &CompletionContract::first(vec![CompletionCriterion::required("verify")]),
+                now(),
+            )
+            .unwrap();
+        store
+            .conn
+            .execute("DROP TABLE contract_criteria", [])
+            .unwrap();
+        assert!(store.economic_truth_for_task(task_id).is_err());
+    }
+
     // --- SubtreeAdditivity: documents production shape, does not fabricate --
 
     #[test]
