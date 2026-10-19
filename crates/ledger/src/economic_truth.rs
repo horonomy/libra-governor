@@ -870,6 +870,46 @@ mod tests {
             .outcome
     }
 
+    #[test]
+    fn completion_reserve_counts_only_latest_required_criteria() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup_task(&mut store, 200);
+        let before = store.economic_truth_for_task(task_id).unwrap();
+        assert_eq!(
+            before
+                .categories
+                .as_ref()
+                .unwrap()
+                .completion_reserve
+                .required_criteria_count,
+            0
+        );
+        let mut contract = CompletionContract::first(Vec::new());
+        for (index, expected) in [2, 1, 3, 0].into_iter().enumerate() {
+            let mut criteria: Vec<_> = (0..expected)
+                .map(|_| CompletionCriterion::required("required verification"))
+                .collect();
+            criteria.push(CompletionCriterion::optional("optional polish"));
+            contract = if index == 0 {
+                CompletionContract::first(criteria)
+            } else {
+                contract.next_revision(criteria)
+            };
+            store.insert_contract(task_id, &contract, now()).unwrap();
+            let truth = store.economic_truth_for_task(task_id).unwrap();
+            let mut expected_categories =
+                serde_json::to_value(before.categories.as_ref().unwrap()).unwrap();
+            expected_categories["completion_reserve"]["required_criteria_count"] = expected.into();
+            assert_eq!(
+                serde_json::to_value(truth.categories.as_ref().unwrap()).unwrap(),
+                expected_categories,
+                "only current required-criterion count may change"
+            );
+            assert_eq!(truth.provenance, before.provenance);
+            assert_eq!(truth.schema_version, before.schema_version);
+        }
+    }
+
     // --- SubtreeAdditivity: documents production shape, does not fabricate --
 
     #[test]
