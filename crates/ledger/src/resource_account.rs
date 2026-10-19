@@ -1048,6 +1048,43 @@ mod tests {
     }
 
     #[test]
+    fn an_unrepresentable_sublease_expiry_is_refused_and_writes_nothing() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let task_account = AccountId::for_task(task_id);
+        let session = store
+            .ensure_child_account(task_account, AccountLevel::Session, "sess-1", now())
+            .unwrap()
+            .unwrap()
+            .account;
+
+        let result = store.grant_sublease(GrantSubleaseRequest {
+            parent_account_id: task_account,
+            child_account_id: session.account_id,
+            child_natural_key: "sess-1",
+            amount: ResourceAmount::Tokens(100),
+            idempotency_key: "fund-session",
+            now: time::OffsetDateTime::new_utc(time::Date::MAX, time::Time::MAX),
+            ttl_secs: 3600,
+        });
+
+        assert!(result.is_err());
+        let retry = store
+            .grant_sublease(GrantSubleaseRequest {
+                parent_account_id: task_account,
+                child_account_id: session.account_id,
+                child_natural_key: "sess-1",
+                amount: ResourceAmount::Tokens(100),
+                idempotency_key: "fund-session",
+                now: now(),
+                ttl_secs: 3600,
+            })
+            .unwrap()
+            .unwrap();
+        assert!(matches!(retry, GrantSubleaseOutcome::Granted(_)));
+    }
+
+    #[test]
     fn ensure_task_account_is_idempotent_and_deterministic() {
         let mut store = LedgerStore::open_in_memory().unwrap();
         // `initialize_task_budget` (inside `setup`) already provisions the
