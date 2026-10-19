@@ -910,6 +910,71 @@ mod tests {
         }
     }
 
+    #[test]
+    fn completion_reserve_criteria_agree_across_selectors_and_do_not_leak_between_tasks() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup_task(&mut store, 200);
+        let unrelated = setup_task(&mut store, 100);
+        store
+            .insert_contract(
+                task_id,
+                &CompletionContract::first(vec![
+                    CompletionCriterion::required("tests pass"),
+                    CompletionCriterion::optional("polish"),
+                ]),
+                now(),
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO session_tasks (session_id, task_id, created_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    "criteria-session",
+                    task_id.to_string(),
+                    "1970-01-01T00:00:00Z"
+                ],
+            )
+            .unwrap();
+        let by_task = store.economic_truth_for_task(task_id).unwrap();
+        let by_session = store
+            .economic_truth_for_session("criteria-session")
+            .unwrap();
+        let by_account = store
+            .economic_truth_for_account_str(&AccountId::for_task(task_id).to_string())
+            .unwrap();
+        for truth in [&by_task, &by_session, &by_account] {
+            assert_eq!(
+                truth
+                    .categories
+                    .as_ref()
+                    .unwrap()
+                    .completion_reserve
+                    .required_criteria_count,
+                1
+            );
+        }
+        assert_eq!(by_task.selector.selector, "task");
+        assert_eq!(by_session.selector.selector, "session");
+        assert_eq!(by_session.selector.value, "criteria-session");
+        assert_eq!(by_account.selector.selector, "account");
+        assert_eq!(
+            store
+                .economic_truth_for_task(unrelated)
+                .unwrap()
+                .categories
+                .unwrap()
+                .completion_reserve
+                .required_criteria_count,
+            0
+        );
+        assert!(store
+            .economic_truth_for_session("absent-session")
+            .unwrap()
+            .categories
+            .is_none());
+    }
+
     // --- SubtreeAdditivity: documents production shape, does not fabricate --
 
     #[test]
