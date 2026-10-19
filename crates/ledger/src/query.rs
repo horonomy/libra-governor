@@ -1605,11 +1605,18 @@ mod usage_basis_tests {
     /// Records one receipt with `usage` and `secs` duration. When
     /// `legacy` is true the row is rewritten to the pre-0019 shape
     /// (`usage_basis` NULL), as a receipt written before the marker existed.
-    fn seed_usage_receipt(store: &mut LedgerStore, usage: Vec<ResourceAmount>, secs: u64, legacy: bool) {
+    fn seed_usage_receipt(
+        store: &mut LedgerStore,
+        usage: Vec<ResourceAmount>,
+        secs: u64,
+        legacy: bool,
+    ) {
         let identity = TaskIdentity::new(None);
         store.insert_task(&identity, now()).unwrap();
         let contract = CompletionContract::first(vec![CompletionCriterion::required("c")]);
-        store.insert_contract(identity.id, &contract, now()).unwrap();
+        store
+            .insert_contract(identity.id, &contract, now())
+            .unwrap();
         let plan = ExecutionPlan::new(identity.id, contract.revision, None, now());
         store.insert_plan(&plan).unwrap();
         let receipt = ExecutionReceipt::new(
@@ -1644,7 +1651,12 @@ mod usage_basis_tests {
     #[test]
     fn an_unmarked_receipt_withholds_usage_but_keeps_duration() {
         let mut store = LedgerStore::open_in_memory().unwrap();
-        seed_usage_receipt(&mut store, vec![ResourceAmount::Tokens(1_000_000)], 90, true);
+        seed_usage_receipt(
+            &mut store,
+            vec![ResourceAmount::Tokens(1_000_000)],
+            90,
+            true,
+        );
 
         let history = store.receipts_for_estimation().unwrap();
 
