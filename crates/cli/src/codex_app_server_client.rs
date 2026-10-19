@@ -488,4 +488,21 @@ printf '{"id":1,"error":{"code":-32601,"message":"method not found"}}\n'
         client.kill(); // idempotent, must not panic
         drop(client); // Drop's own kill() must also be a safe no-op here
     }
+
+    #[test]
+    fn a_text_file_busy_spawn_is_retried_until_it_succeeds() {
+        let mut calls = 0;
+        let out = retry_while_text_file_busy(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(AppServerError::Spawn(
+                    "fixture.sh".to_owned(),
+                    "Text file busy (os error 26)".to_owned(),
+                ))
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(out.unwrap(), 3);
+    }
 }
