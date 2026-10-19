@@ -8,12 +8,12 @@ name: First-class providers CI
 # phase0-ci.yml is, so unrelated changes never trigger this job.
 on:
   push:
-    branches: [main]
+    branches: [main, "release/**"]
     paths:
       - "providers/**"
       - ".github/workflows/providers-ci.yml"
   pull_request:
-    branches: [main]
+    branches: [main, "release/**"]
     paths:
       - "providers/**"
       - ".github/workflows/providers-ci.yml"

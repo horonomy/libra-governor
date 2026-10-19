@@ -264,6 +264,13 @@ impl LedgerStore {
             None => None,
         };
 
+        // Current contract metadata explains the count without recomputing stored reserves.
+        let required_criteria_count = match account.task_id {
+            Some(task_id) => self
+                .latest_contract(task_id)?
+                .map_or(0, |contract| contract.required_criteria().count()),
+            None => 0,
+        };
         let completion_reserve = CompletionReservePosture {
             protected: task_budget.as_ref().map(|b| ScopedAmount {
                 kind: b.resource_kind,
@@ -273,7 +280,7 @@ impl LedgerStore {
             }),
             outstanding_draw: None,
             basis: task_budget.as_ref().map(|b| b.completion_reserve_basis),
-            required_criteria_count: 0,
+            required_criteria_count,
         };
 
         let allocation = Allocation {
@@ -861,6 +868,187 @@ mod tests {
             .find(|c| c.check == id)
             .expect("every check id must appear exactly once")
             .outcome
+    }
+
+    #[test]
+    fn completion_reserve_counts_only_latest_required_criteria() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup_task(&mut store, 200);
+        let before = store.economic_truth_for_task(task_id).unwrap();
+        assert_eq!(
+            before
+                .categories
+                .as_ref()
+                .unwrap()
+                .completion_reserve
+                .required_criteria_count,
+            0
+        );
+        let mut contract = CompletionContract::first(Vec::new());
+        for (index, expected) in [2, 1, 3, 0].into_iter().enumerate() {
+            let mut criteria: Vec<_> = (0..expected)
+                .map(|_| CompletionCriterion::required("required verification"))
+                .collect();
+            criteria.push(CompletionCriterion::optional("optional polish"));
+            contract = if index == 0 {
+                CompletionContract::first(criteria)
+            } else {
+                contract.next_revision(criteria)
+            };
+            store.insert_contract(task_id, &contract, now()).unwrap();
+            let truth = store.economic_truth_for_task(task_id).unwrap();
+            let mut expected_categories =
+                serde_json::to_value(before.categories.as_ref().unwrap()).unwrap();
+            expected_categories["completion_reserve"]["required_criteria_count"] = expected.into();
+            assert_eq!(
+                serde_json::to_value(truth.categories.as_ref().unwrap()).unwrap(),
+                expected_categories,
+                "only current required-criterion count may change"
+            );
+            assert_eq!(truth.provenance, before.provenance);
+            assert_eq!(truth.schema_version, before.schema_version);
+        }
+    }
+
+    #[test]
+    fn completion_reserve_criteria_agree_across_selectors_and_do_not_leak_between_tasks() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup_task(&mut store, 200);
+        let unrelated = setup_task(&mut store, 100);
+        store
+            .insert_contract(
+                task_id,
+                &CompletionContract::first(vec![
+                    CompletionCriterion::required("tests pass"),
+                    CompletionCriterion::optional("polish"),
+                ]),
+                now(),
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO session_tasks (session_id, task_id, created_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    "criteria-session",
+                    task_id.to_string(),
+                    "1970-01-01T00:00:00Z"
+                ],
+            )
+            .unwrap();
+        let by_task = store.economic_truth_for_task(task_id).unwrap();
+        let by_session = store
+            .economic_truth_for_session("criteria-session")
+            .unwrap();
+        let by_account = store
+            .economic_truth_for_account_str(&AccountId::for_task(task_id).to_string())
+            .unwrap();
+        for truth in [&by_task, &by_session, &by_account] {
+            assert_eq!(
+                truth
+                    .categories
+                    .as_ref()
+                    .unwrap()
+                    .completion_reserve
+                    .required_criteria_count,
+                1
+            );
+        }
+        assert_eq!(by_task.selector.selector, "task");
+        assert_eq!(by_session.selector.selector, "session");
+        assert_eq!(by_session.selector.value, "criteria-session");
+        assert_eq!(by_account.selector.selector, "account");
+        assert_eq!(
+            store
+                .economic_truth_for_task(unrelated)
+                .unwrap()
+                .categories
+                .unwrap()
+                .completion_reserve
+                .required_criteria_count,
+            0
+        );
+        assert!(store
+            .economic_truth_for_session("absent-session")
+            .unwrap()
+            .categories
+            .is_none());
+    }
+
+    #[test]
+    fn completion_reserve_counts_contract_without_a_budget_and_ignores_unbound_account() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = TaskId::new();
+        store
+            .insert_task(
+                &TaskIdentity {
+                    id: task_id,
+                    external_ref: None,
+                },
+                now(),
+            )
+            .unwrap();
+        store
+            .ensure_task_account(task_id, libra_governor_domain::ResourceKind::Tokens, now())
+            .unwrap();
+        store
+            .insert_contract(
+                task_id,
+                &CompletionContract::first(vec![CompletionCriterion::required("verify")]),
+                now(),
+            )
+            .unwrap();
+        let truth = store.economic_truth_for_task(task_id).unwrap();
+        assert!(truth.task_budget.is_none());
+        assert_eq!(
+            truth
+                .categories
+                .unwrap()
+                .completion_reserve
+                .required_criteria_count,
+            1
+        );
+        // The reader also accepts persisted accounts without a task binding.
+        store
+            .conn
+            .execute(
+                "UPDATE resource_accounts SET task_id = NULL WHERE account_id = ?1",
+                [AccountId::for_task(task_id).to_string()],
+            )
+            .unwrap();
+        let truth = store
+            .economic_truth_for_account_str(&AccountId::for_task(task_id).to_string())
+            .unwrap();
+        assert_eq!(
+            truth
+                .categories
+                .unwrap()
+                .completion_reserve
+                .required_criteria_count,
+            0
+        );
+    }
+
+    #[test]
+    fn completion_reserve_contract_read_errors_are_not_reported_as_zero() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup_task(&mut store, 200);
+        store
+            .insert_contract(
+                task_id,
+                &CompletionContract::first(vec![CompletionCriterion::required("verify")]),
+                now(),
+            )
+            .unwrap();
+        store
+            .conn
+            // Renamed, not removed: the evidence-adapter eviction guard scans ledger src.
+            .execute(
+                "ALTER TABLE contract_criteria RENAME TO contract_criteria_gone",
+                [],
+            )
+            .unwrap();
+        assert!(store.economic_truth_for_task(task_id).is_err());
     }
 
     // --- SubtreeAdditivity: documents production shape, does not fabricate --
