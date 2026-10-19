@@ -259,9 +259,13 @@ mod tests {
             .required_criteria_count;
         assert_eq!(canonical, 1);
         let rendered = render_human(&truth);
+        let line = rendered
+            .lines()
+            .find(|l| l.contains("completion reserve:"))
+            .expect("the completion reserve line is rendered");
         assert!(
-            rendered.contains(&format!("required_criteria={canonical}")),
-            "{rendered}"
+            line.ends_with(&format!("required_criteria={canonical}")),
+            "the rendered count must match the canonical count"
         );
     }
 }
