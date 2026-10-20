@@ -239,6 +239,19 @@ pub struct ConfigOverrides {
     pub launcher: Option<crate::launch_gate::LaunchGateConfig>,
 }
 
+impl ConfigOverrides {
+    /// What the daemon runs with when `config.json` is present but
+    /// rejected. A rejected config must stay lifetime-bounded, so it names
+    /// [`crate::server::legacy_bounded_policy`] explicitly instead of
+    /// taking the no-config path, whose default HORO-1727 S4 may change.
+    pub fn rejected_fallback() -> Self {
+        Self {
+            policy: Some(crate::server::legacy_bounded_policy()),
+            ..Self::default()
+        }
+    }
+}
+
 /// Reads and parses `<state_dir>/config.json`, if it exists, into the
 /// [`ConfigOverrides`] `daemon_cmd::run` should use in place of its own
 /// hardcoded defaults. Every field defaults to `None` when the file is
@@ -432,6 +445,16 @@ mod tests {
         let legacy = crate::server::legacy_bounded_policy();
         assert_eq!(policy.resource, legacy.resource);
         assert_eq!(policy.time, legacy.time);
+    }
+
+    #[test]
+    fn a_rejected_config_falls_back_to_the_legacy_bounded_policy() {
+        let overrides = ConfigOverrides::rejected_fallback();
+        assert_eq!(
+            overrides.policy,
+            Some(crate::server::legacy_bounded_policy())
+        );
+        assert!(overrides.gateway.is_none());
     }
 
     #[test]
