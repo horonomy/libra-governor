@@ -41,7 +41,22 @@
 //!   measured over two real local transcripts, per-turn totals were p50
 //!   ~370k-510k including cache creation but ~7.7M-11.3M once cache reads
 //!   were added — a ~25x inflation that describes caching mechanics
-//!   rather than work performed.
+//!   rather than work performed. (These absolute figures predate the
+//!   per-content-block dedup added for HORO-1882 below and are very
+//!   likely inflated by that separate double-count; the ~25x *ratio*
+//!   between the two totals is unaffected, since both sides carried it.)
+//!
+//! # Claude Code duplicate lines per turn (HORO-1882)
+//!
+//! Claude Code writes one `assistant` line per *content block* of a turn,
+//! each repeating the same `message.id` and identical `message.usage`.
+//! Summing every line counted one turn once per content block. Lines are
+//! now deduplicated on `message.id`: each id counts once (per-field
+//! maximum across repeats) and increments `records` once; lines without
+//! an id are summed as before. The id is an opaque key held only in a
+//! scan-scoped map and dropped when the scan returns. Dedup is per
+//! [`observe_transcript_window`] call, so a turn whose lines straddle a
+//! window boundary can still be counted once in each window.
 //!
 //! All four raw counts are read and summed into [`TurnUsage`] regardless,
 //! so the choice above is auditable, and changing it later needs no
@@ -107,15 +122,18 @@ pub const DEFAULT_SCAN_CAP_BYTES: u64 = 8 * 1024 * 1024;
 /// Read granularity for the backwards scan.
 const CHUNK_BYTES: usize = 256 * 1024;
 
-/// The four raw per-turn counts the host reports, summed over every
-/// assistant record inside the measured window.
+/// The four raw per-turn counts the host reports, summed over each
+/// distinct assistant turn inside the measured window (HORO-1882: lines
+/// sharing a `message.id` count once).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TurnUsage {
     pub input_tokens: u64,
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
     pub output_tokens: u64,
-    /// How many assistant records contributed. Zero means the window
+    /// How many *distinct* turns contributed: one per unique
+    /// `message.id` (HORO-1882 dedup) plus one per id-less line. Not a
+    /// raw transcript-line count. Zero means the window
     /// contained no usage-bearing record at all, which is reported as
     /// [`UsageUnavailable::NoUsageInWindow`] rather than as a measured
     /// zero — see that variant's docs.
@@ -209,6 +227,18 @@ struct TranscriptRecord {
 
 #[derive(Deserialize)]
 struct TranscriptMessage {
+    /// Shared by every content-block line of the same logical turn
+    /// (HORO-1882) — the dedup key `scan` groups repeated lines by.
+    /// Absent or explicit `null` gives `None`, and such a line is summed
+    /// rather than deduplicated, exactly as every line was before this
+    /// fix. A `message.id` that is present but not a string would fail
+    /// this whole record's parse (losing its usage and its timestamp),
+    /// not fall back to `None`; the main-branch fix (PR #153) verified
+    /// against 959,855 local Claude Code transcript lines (18 files) that
+    /// it is always absent or a string. That verification is inherited,
+    /// not repeated for this backport.
+    #[serde(default)]
+    id: Option<String>,
     usage: Option<RawUsage>,
 }
 
@@ -223,8 +253,9 @@ struct RawUsage {
     output_tokens: Option<u64>,
 }
 
-/// Sums host-reported usage over every assistant record in `path` whose
-/// timestamp is at or after `window_start`.
+/// Sums host-reported usage over each distinct assistant turn in `path`
+/// whose timestamp is at or after `window_start` (HORO-1882: lines
+/// sharing a `message.id` count once; id-less lines are summed).
 ///
 /// `window_start` must be the end of the last already-accounted window —
 /// the previous receipt's `recorded_at` for this task, falling back to the
@@ -262,6 +293,13 @@ fn scan(
         .map_err(|_| UsageUnavailable::Unreadable)?;
 
     let mut usage = TurnUsage::default();
+    // Claude Code writes one line per content block of a turn, repeating
+    // the same `message.id` and identical usage on each (HORO-1882). Keyed
+    // lines are grouped here and folded into `usage` — once per id, by
+    // per-field maximum — only when the scan ends; id-less lines go
+    // straight into `usage`. The map lives only for this call, so the id
+    // never leaves this function.
+    let mut by_id: std::collections::HashMap<String, RawUsage> = std::collections::HashMap::new();
     // Bytes belonging to a line whose beginning lies in an
     // earlier (not-yet-read) chunk.
     let mut partial_head: Vec<u8> = Vec::new();
@@ -300,9 +338,44 @@ fn scan(
 
         for line in lines.iter().rev() {
             match consider_line(line, window_start) {
-                LineVerdict::Older => return Ok(usage),
+                LineVerdict::Older => {
+                    fold_deduplicated(&mut usage, by_id);
+                    return Ok(usage);
+                }
                 LineVerdict::Skip => {}
-                LineVerdict::Counted(raw) => {
+                LineVerdict::Counted(Some(id), raw) => {
+                    let entry = by_id.entry(id).or_insert(RawUsage {
+                        input_tokens: Some(0),
+                        cache_creation_input_tokens: Some(0),
+                        cache_read_input_tokens: Some(0),
+                        output_tokens: Some(0),
+                    });
+                    entry.input_tokens = Some(
+                        entry
+                            .input_tokens
+                            .unwrap_or(0)
+                            .max(raw.input_tokens.unwrap_or(0)),
+                    );
+                    entry.cache_creation_input_tokens = Some(
+                        entry
+                            .cache_creation_input_tokens
+                            .unwrap_or(0)
+                            .max(raw.cache_creation_input_tokens.unwrap_or(0)),
+                    );
+                    entry.cache_read_input_tokens = Some(
+                        entry
+                            .cache_read_input_tokens
+                            .unwrap_or(0)
+                            .max(raw.cache_read_input_tokens.unwrap_or(0)),
+                    );
+                    entry.output_tokens = Some(
+                        entry
+                            .output_tokens
+                            .unwrap_or(0)
+                            .max(raw.output_tokens.unwrap_or(0)),
+                    );
+                }
+                LineVerdict::Counted(None, raw) => {
                     usage.input_tokens = usage
                         .input_tokens
                         .saturating_add(raw.input_tokens.unwrap_or(0));
@@ -324,7 +397,28 @@ fn scan(
     // Reached the start of the file without finding anything older than
     // the window: the window covers the whole transcript, so the total is
     // complete.
+    fold_deduplicated(&mut usage, by_id);
     Ok(usage)
+}
+
+/// Adds each deduplicated turn (one `RawUsage` per `message.id`) to
+/// `usage` and counts it as one record.
+fn fold_deduplicated(usage: &mut TurnUsage, by_id: std::collections::HashMap<String, RawUsage>) {
+    for (_, raw) in by_id {
+        usage.input_tokens = usage
+            .input_tokens
+            .saturating_add(raw.input_tokens.unwrap_or(0));
+        usage.cache_creation_input_tokens = usage
+            .cache_creation_input_tokens
+            .saturating_add(raw.cache_creation_input_tokens.unwrap_or(0));
+        usage.cache_read_input_tokens = usage
+            .cache_read_input_tokens
+            .saturating_add(raw.cache_read_input_tokens.unwrap_or(0));
+        usage.output_tokens = usage
+            .output_tokens
+            .saturating_add(raw.output_tokens.unwrap_or(0));
+        usage.records += 1;
+    }
 }
 
 enum LineVerdict {
@@ -332,7 +426,11 @@ enum LineVerdict {
     Skip,
     /// Older than the window: the backwards scan is done.
     Older,
-    Counted(RawUsage),
+    /// A usage-bearing record. `Some(id)` is a Claude Code `message.id`
+    /// used to deduplicate repeated content-block lines of the same turn
+    /// (HORO-1882); `None` means this record carries no such key and is
+    /// summed unconditionally, as every record was before this fix.
+    Counted(Option<String>, RawUsage),
 }
 
 fn consider_line(line: &[u8], window_start: OffsetDateTime) -> LineVerdict {
@@ -358,8 +456,11 @@ fn consider_line(line: &[u8], window_start: OffsetDateTime) -> LineVerdict {
     if record.kind.as_deref() != Some("assistant") {
         return LineVerdict::Skip;
     }
-    match record.message.and_then(|m| m.usage) {
-        Some(raw) => LineVerdict::Counted(raw),
+    match record.message {
+        Some(message) => match message.usage {
+            Some(raw) => LineVerdict::Counted(message.id, raw),
+            None => LineVerdict::Skip,
+        },
         None => LineVerdict::Skip,
     }
 }
@@ -381,6 +482,21 @@ mod tests {
         format!(
             r#"{{"type":"assistant","timestamp":"{}","message":{{"usage":{{"input_tokens":{},"cache_creation_input_tokens":{},"cache_read_input_tokens":{},"output_tokens":{}}}}}}}"#,
             rfc(secs),
+            input,
+            cc,
+            cr,
+            out
+        )
+    }
+
+    /// A Claude Code `assistant` line carrying `message.id` (HORO-1882):
+    /// the host writes one such line per content block of a turn, all
+    /// repeating the same id and usage.
+    fn assistant_with_id(secs: i64, id: &str, input: u64, cc: u64, cr: u64, out: u64) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"{}","message":{{"id":"{}","usage":{{"input_tokens":{},"cache_creation_input_tokens":{},"cache_read_input_tokens":{},"output_tokens":{}}}}}}}"#,
+            rfc(secs),
+            id,
             input,
             cc,
             cr,
@@ -570,5 +686,105 @@ mod tests {
                 "a reason code is a fixed vocabulary, never a channel for file content: {label:?}"
             );
         }
+    }
+
+    #[test]
+    fn content_block_lines_of_one_turn_are_counted_once() {
+        let f = write_transcript(&[
+            assistant_with_id(100, "msg_a", 10, 20, 30, 40),
+            assistant_with_id(101, "msg_a", 10, 20, 30, 40),
+            assistant_with_id(102, "msg_a", 10, 20, 30, 40),
+        ]);
+        let observed = observe_transcript_window(f.path(), epoch_plus(50), DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().expect("the turn is in the window");
+        assert_eq!(usage.records, 1);
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.cache_creation_input_tokens, 20);
+        assert_eq!(usage.cache_read_input_tokens, 30);
+        assert_eq!(usage.output_tokens, 40);
+    }
+
+    #[test]
+    fn distinct_message_ids_are_counted_independently() {
+        let f = write_transcript(&[
+            assistant_with_id(100, "msg_a", 10, 20, 30, 40),
+            assistant_with_id(101, "msg_a", 10, 20, 30, 40),
+            assistant_with_id(200, "msg_b", 1, 2, 3, 4),
+        ]);
+        let observed = observe_transcript_window(f.path(), epoch_plus(50), DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().expect("both turns are in the window");
+        assert_eq!(usage.records, 2);
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.output_tokens, 44);
+    }
+
+    #[test]
+    fn a_divergent_repeat_takes_the_per_field_maximum() {
+        let f = write_transcript(&[
+            assistant_with_id(100, "msg_a", 10, 20, 30, 5),
+            assistant_with_id(101, "msg_a", 10, 20, 30, 40),
+        ]);
+        let observed = observe_transcript_window(f.path(), epoch_plus(50), DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().expect("the turn is in the window");
+        assert_eq!(usage.records, 1);
+        assert_eq!(usage.output_tokens, 40);
+    }
+
+    #[test]
+    fn an_id_less_line_is_still_summed_alongside_a_deduplicated_turn() {
+        let f = write_transcript(&[
+            assistant_with_id(100, "msg_a", 10, 20, 30, 40),
+            assistant_with_id(101, "msg_a", 10, 20, 30, 40),
+            assistant(200, 1, 2, 3, 4),
+            assistant(201, 1, 2, 3, 4),
+        ]);
+        let observed = observe_transcript_window(f.path(), epoch_plus(50), DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().expect("all lines are in the window");
+        assert_eq!(
+            usage.records, 3,
+            "one deduplicated turn plus two id-less lines"
+        );
+        assert_eq!(usage.input_tokens, 12);
+    }
+
+    #[test]
+    fn deduplication_survives_the_scan_stopping_at_an_older_record() {
+        // The backwards scan returns early at the first record older than
+        // the window; keyed lines gathered before that must still be folded.
+        let f = write_transcript(&[
+            assistant_with_id(10, "msg_old", 999, 999, 999, 999),
+            assistant_with_id(100, "msg_a", 10, 20, 30, 40),
+            assistant_with_id(101, "msg_a", 10, 20, 30, 40),
+        ]);
+        let observed = observe_transcript_window(f.path(), epoch_plus(50), DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().expect("the in-window turn is counted");
+        assert_eq!(usage.records, 1);
+        assert_eq!(usage.input_tokens, 10);
+    }
+
+    #[test]
+    fn an_explicit_null_message_id_is_summed_like_an_id_less_line() {
+        let line = |secs: i64| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"{}","message":{{"id":null,"usage":{{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}}}}}"#,
+                rfc(secs)
+            )
+        };
+        let f = write_transcript(&[line(100), line(101)]);
+        let observed = observe_transcript_window(f.path(), epoch_plus(50), DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().expect("both lines are in the window");
+        assert_eq!(usage.records, 2);
+        assert_eq!(usage.input_tokens, 2);
+    }
+
+    #[test]
+    fn a_truncated_scan_of_keyed_lines_is_unavailable_not_a_partial_dedup() {
+        let f = write_transcript(&vec![assistant_with_id(100, "msg_a", 10, 10, 10, 10); 200]);
+        let observed = observe_transcript_window(f.path(), epoch_plus(50), 64);
+        assert_eq!(
+            observed,
+            UsageObservation::Unavailable(UsageUnavailable::ScanCapReached),
+            "a capped scan must not report the ids it happened to read as a total"
+        );
     }
 }
