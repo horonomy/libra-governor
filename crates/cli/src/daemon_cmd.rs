@@ -68,7 +68,7 @@ pub fn run() {
                     libra_governor_daemon::config_file::CONFIG_FILE_NAME
                 ),
             );
-            libra_governor_daemon::config_file::ConfigOverrides::default()
+            libra_governor_daemon::config_file::ConfigOverrides::rejected_fallback()
         }
     };
 
