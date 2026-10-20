@@ -350,6 +350,14 @@ pub fn default_turn_bound() -> libra_governor_domain::TurnBound {
 /// documents that invariant rather than propagating a `Result` that has
 /// no real failure mode for a caller to handle.
 pub fn default_admission_policy() -> Policy {
+    legacy_bounded_policy()
+}
+
+/// The lifetime-bounded admission policy (HORO-1727 S2): `balanced`, a
+/// 100k-token target and the turn bound. It is named so every site that
+/// must stay bounded regardless of the no-config default (HORO-1727 S4)
+/// can say so; [`default_admission_policy`] is the single seam S4 edits.
+pub fn legacy_bounded_policy() -> Policy {
     Policy::balanced(PolicyPresetInputs {
         resource_target: ResourceAmount::Tokens(100_000),
         time_target_secs: 3600,
@@ -357,7 +365,7 @@ pub fn default_admission_policy() -> Policy {
             "required verification (tests/build/lint) passes",
         )]),
     })
-    .expect("default_admission_policy's hardcoded inputs are always valid")
+    .expect("legacy_bounded_policy's hardcoded inputs are always valid")
     .with_turn_bound(default_turn_bound())
     .expect("default_turn_bound's hardcoded constants are always valid against this policy")
 }
@@ -2789,6 +2797,16 @@ fn handle_doctor(ledger: &LedgerStore, config: &DaemonConfig) -> DoctorResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_bounded_policy_serializes_to_the_pinned_balanced_100k_policy() {
+        let pinned = r#"{"policy_schema_version":"policy-v1","name":"balanced","resource":{"mode":"elastic","target":{"kind":"tokens","amount":100000},"elastic_ceiling":{"kind":"tokens","amount":125000},"hard_ceiling":{"kind":"tokens","amount":150000}},"time":{"mode":"elastic","target_secs":3600,"elastic_ceiling_secs":4500,"hard_ceiling_secs":5400,"deadline":null},"quality_floor":{"revision":1,"criteria":[{"description":"required verification (tests/build/lint) passes","required":true}]},"min_confidence":"low","autonomy":"ask_on_approval","turn":{"cold_start_request":{"kind":"tokens","amount":120000},"ceiling":{"kind":"tokens","amount":400000}}}"#;
+        assert_eq!(
+            serde_json::to_string(&legacy_bounded_policy()).unwrap(),
+            pinned
+        );
+        assert_eq!(default_admission_policy(), legacy_bounded_policy());
+    }
 
     #[test]
     fn bind_or_detect_running_succeeds_on_fresh_path() {

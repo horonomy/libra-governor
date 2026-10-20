@@ -28,8 +28,8 @@ pub mod trusted_principal;
 pub mod usage;
 
 pub use server::{
-    bind_or_detect_running, default_admission_policy, handle_connection, serve, DaemonConfig,
-    DaemonError, DEFAULT_PROGRESSIVE_INTERVAL_SECS,
+    bind_or_detect_running, default_admission_policy, handle_connection, legacy_bounded_policy,
+    serve, DaemonConfig, DaemonError, DEFAULT_PROGRESSIVE_INTERVAL_SECS,
 };
 
 pub mod write_lock;
