@@ -1542,6 +1542,45 @@ mod tests {
         );
     }
 
+    /// Negative control: S3 only records the scope. Flipping the stored
+    /// value must change nothing about admission or the effective limit;
+    /// S4 is expected to change this test on purpose when it starts
+    /// honoring the field.
+    #[test]
+    fn the_stored_lifetime_scope_is_not_yet_honored_by_admission() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let limit_before = store
+            .task_budget(task_id)
+            .unwrap()
+            .unwrap()
+            .effective_hard_limit();
+        let available_before = store
+            .available(task_id, ReservationClass::RequiredWork)
+            .unwrap();
+
+        store
+            .conn
+            .execute(
+                "UPDATE task_budgets SET lifetime_bounded = 0 WHERE task_id = ?1",
+                [task_id.to_string()],
+            )
+            .unwrap();
+
+        let budget = store.task_budget(task_id).unwrap().unwrap();
+        assert_eq!(
+            budget.lifetime_scope,
+            libra_governor_domain::LifetimeScope::TurnScoped
+        );
+        assert_eq!(budget.effective_hard_limit(), limit_before);
+        assert_eq!(
+            store
+                .available(task_id, ReservationClass::RequiredWork)
+                .unwrap(),
+            available_before
+        );
+    }
+
     // --- budget_snapshot: one read, every display figure (HORO-1709) ---
 
     /// The contract the statusline depends on: the snapshot's own
