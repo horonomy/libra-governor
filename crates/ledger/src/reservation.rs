@@ -188,7 +188,7 @@ fn row_to_budget(task_id: TaskId, row: BudgetRow, granted: f64) -> Result<TaskBu
 
 /// The one place `task_budgets` is read and assembled into a
 /// [`TaskBudget`], folding in [`granted_capacity`] (HORO-1727). Every
-/// call site that used to run its own copy of this 10-column `SELECT`
+/// call site that used to run its own copy of this 11-column `SELECT`
 /// (`task_budget`, `reserve`, `adjust_completion_reserve`) now goes
 /// through here instead — a renewal-aware read a future caller adds can
 /// no longer miss `granted` by copy-pasting an older version of the
