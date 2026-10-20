@@ -168,6 +168,7 @@ fn row_to_budget(task_id: TaskId, row: BudgetRow, granted: f64) -> Result<TaskBu
         ),
         completion_reserve: ResourceAmount::from_kind_f64(resource_kind, completion_reserve),
         completion_reserve_basis: basis_from_str(&basis)?,
+        lifetime_scope: libra_governor_domain::LifetimeScope::default(),
         policy,
         reservation_schema_version,
         created_at: parse_time(&created_at)?,

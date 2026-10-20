@@ -351,6 +351,28 @@ pub enum CompletionReserveBasis {
     PolicyTarget,
 }
 
+/// Whether a task's resource budget is a lifetime bound on the whole task
+/// or is scoped to a single turn (HORO-1727 S3). Only
+/// [`Self::LifetimeBounded`] is written by any build today; the variant
+/// exists so S4 can introduce turn-scoped budgets without a schema change.
+/// Nothing in admission or reservation reads it yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifetimeScope {
+    #[default]
+    LifetimeBounded,
+    TurnScoped,
+}
+
+impl LifetimeScope {
+    /// `serde` skip predicate: the default scope is not serialized, so a
+    /// `TaskBudget` that is lifetime-bounded serializes byte-identically
+    /// to one written before this field existed.
+    pub fn is_lifetime_bounded(&self) -> bool {
+        matches!(self, Self::LifetimeBounded)
+    }
+}
+
 /// The persisted per-task resource envelope: the hard limit, settled/
 /// active spend implied by the ledger, and the live protected Completion
 /// Reserve (HORO-1141).
@@ -377,6 +399,9 @@ pub struct TaskBudget {
     /// against it; restored on refund/release/expiry.
     pub completion_reserve: ResourceAmount,
     pub completion_reserve_basis: CompletionReserveBasis,
+    /// Whether the resource bound is lifetime or per-turn (HORO-1727 S3).
+    #[serde(default, skip_serializing_if = "LifetimeScope::is_lifetime_bounded")]
+    pub lifetime_scope: LifetimeScope,
     /// The exact [`Policy`] in force at admission, persisted so an
     /// admission decision stays reproducible and reconciliation after a
     /// restart knows the limit without re-reading daemon configuration.
@@ -1236,5 +1261,21 @@ mod budget_snapshot_tests {
         );
         let utilization = renewed.utilization().unwrap();
         assert!((utilization - 88_000.0 / 190_000.0).abs() < 1e-12);
+    }
+}
+
+#[cfg(test)]
+mod lifetime_scope_tests {
+    use super::LifetimeScope;
+
+    #[test]
+    fn the_default_scope_is_lifetime_bounded_and_serializes_as_snake_case() {
+        assert_eq!(LifetimeScope::default(), LifetimeScope::LifetimeBounded);
+        assert!(LifetimeScope::default().is_lifetime_bounded());
+        assert!(!LifetimeScope::TurnScoped.is_lifetime_bounded());
+        assert_eq!(
+            serde_json::to_string(&LifetimeScope::TurnScoped).unwrap(),
+            "\"turn_scoped\""
+        );
     }
 }
