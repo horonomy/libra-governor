@@ -392,7 +392,12 @@ impl LedgerStore {
             [req.parent_account_id.to_string()],
             |row| row.get(0),
         )?;
-        let requested_expires_at = req.now + time::Duration::seconds(req.ttl_secs as i64);
+        let ttl_seconds =
+            i64::try_from(req.ttl_secs.min(crate::shared_pool::MAX_TTL_SECS)).unwrap_or(i64::MAX);
+        let requested_expires_at = req
+            .now
+            .checked_add(time::Duration::seconds(ttl_seconds))
+            .ok_or(LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
         if let Some(funding_id) = parent_funding_lease_id {
             let funding_expires_at: String = tx.query_row(
                 "SELECT expires_at FROM reservations WHERE id = ?1",
@@ -970,6 +975,113 @@ mod tests {
             .initialize_task_budget(task_id, &policy, &reserve, now())
             .unwrap();
         task_id
+    }
+
+    #[test]
+    fn an_extreme_sublease_ttl_is_clamped_to_the_ceiling_instead_of_wrapping() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let task_account = AccountId::for_task(task_id);
+        let session = store
+            .ensure_child_account(task_account, AccountLevel::Session, "sess-1", now())
+            .unwrap()
+            .unwrap()
+            .account;
+
+        let outcome = store
+            .grant_sublease(GrantSubleaseRequest {
+                parent_account_id: task_account,
+                child_account_id: session.account_id,
+                child_natural_key: "sess-1",
+                amount: ResourceAmount::Tokens(100),
+                idempotency_key: "fund-session",
+                now: now(),
+                ttl_secs: u64::MAX,
+            })
+            .unwrap()
+            .unwrap();
+
+        let GrantSubleaseOutcome::Granted(lease) = outcome else {
+            panic!("expected a granted sublease");
+        };
+        assert_eq!(
+            lease.expires_at,
+            now() + time::Duration::seconds(crate::shared_pool::MAX_TTL_SECS as i64)
+        );
+    }
+
+    #[test]
+    fn a_sublease_ttl_at_and_just_above_the_ceiling_expire_identically() {
+        let ceiling = crate::shared_pool::MAX_TTL_SECS;
+        let expiry_for = |ttl_secs: u64| {
+            let mut store = LedgerStore::open_in_memory().unwrap();
+            let task_id = setup(&mut store, 200);
+            let task_account = AccountId::for_task(task_id);
+            let session = store
+                .ensure_child_account(task_account, AccountLevel::Session, "sess-1", now())
+                .unwrap()
+                .unwrap()
+                .account;
+            let outcome = store
+                .grant_sublease(GrantSubleaseRequest {
+                    parent_account_id: task_account,
+                    child_account_id: session.account_id,
+                    child_natural_key: "sess-1",
+                    amount: ResourceAmount::Tokens(100),
+                    idempotency_key: "fund-session",
+                    now: now(),
+                    ttl_secs,
+                })
+                .unwrap()
+                .unwrap();
+            let GrantSubleaseOutcome::Granted(lease) = outcome else {
+                panic!("expected a granted sublease");
+            };
+            lease.expires_at
+        };
+
+        assert_eq!(expiry_for(ceiling), expiry_for(ceiling + 1));
+        assert_eq!(
+            expiry_for(ceiling),
+            now() + time::Duration::seconds(ceiling as i64)
+        );
+    }
+
+    #[test]
+    fn an_unrepresentable_sublease_expiry_is_refused_and_writes_nothing() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let task_account = AccountId::for_task(task_id);
+        let session = store
+            .ensure_child_account(task_account, AccountLevel::Session, "sess-1", now())
+            .unwrap()
+            .unwrap()
+            .account;
+
+        let result = store.grant_sublease(GrantSubleaseRequest {
+            parent_account_id: task_account,
+            child_account_id: session.account_id,
+            child_natural_key: "sess-1",
+            amount: ResourceAmount::Tokens(100),
+            idempotency_key: "fund-session",
+            now: time::OffsetDateTime::new_utc(time::Date::MAX, time::Time::MAX),
+            ttl_secs: 3600,
+        });
+
+        assert!(result.is_err());
+        let retry = store
+            .grant_sublease(GrantSubleaseRequest {
+                parent_account_id: task_account,
+                child_account_id: session.account_id,
+                child_natural_key: "sess-1",
+                amount: ResourceAmount::Tokens(100),
+                idempotency_key: "fund-session",
+                now: now(),
+                ttl_secs: 3600,
+            })
+            .unwrap()
+            .unwrap();
+        assert!(matches!(retry, GrantSubleaseOutcome::Granted(_)));
     }
 
     #[test]

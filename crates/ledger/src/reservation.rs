@@ -858,7 +858,17 @@ impl LedgerStore {
         )?;
 
         let id = ReservationId::new();
-        let expires_at = req.now + time::Duration::seconds(req.ttl_secs as i64);
+        // A bare `ttl_secs as i64` wraps for a caller-supplied value above
+        // `i64::MAX`, and `OffsetDateTime + Duration` panics when the sum
+        // leaves the representable range (HORO-1785). Clamp to the same
+        // 100-year ceiling `reserve_shared` uses, and refuse rather than
+        // panic if even the clamped expiry is unrepresentable.
+        let ttl_seconds =
+            i64::try_from(req.ttl_secs.min(crate::shared_pool::MAX_TTL_SECS)).unwrap_or(i64::MAX);
+        let expires_at = req
+            .now
+            .checked_add(time::Duration::seconds(ttl_seconds))
+            .ok_or(LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
         let account_id = AccountId::for_task(req.task_id);
         tx.execute(
             "INSERT INTO reservations (
@@ -2698,6 +2708,59 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(outcome, AdjustOutcome::Insufficient { .. }));
+        assert_budget_invariant(&store, task_id);
+    }
+
+    #[test]
+    fn an_extreme_ttl_is_clamped_to_the_ceiling_instead_of_wrapping() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let ReserveOutcome::Granted(reservation) = store
+            .reserve(ReserveRequest {
+                task_id,
+                session_id: "sess-1",
+                plan_id: None,
+                class: ReservationClass::OptionalWork,
+                amount: ResourceAmount::Tokens(100),
+                idempotency_key: "key-extreme-ttl",
+                now: at(0),
+                ttl_secs: u64::MAX,
+            })
+            .unwrap()
+        else {
+            panic!("expected Granted");
+        };
+        assert_eq!(
+            reservation.expires_at,
+            at(0) + time::Duration::seconds(crate::shared_pool::MAX_TTL_SECS as i64),
+            "an oversized ttl must clamp to the 100-year ceiling, not wrap negative"
+        );
+    }
+
+    #[test]
+    fn an_unrepresentable_expiry_is_refused_not_a_panic() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let before = store.task_budget(task_id).unwrap();
+        let result = store.reserve(ReserveRequest {
+            task_id,
+            session_id: "sess-1",
+            plan_id: None,
+            class: ReservationClass::OptionalWork,
+            amount: ResourceAmount::Tokens(100),
+            idempotency_key: "key-overflow-expiry",
+            now: OffsetDateTime::new_utc(time::Date::MAX, time::Time::MAX),
+            ttl_secs: 3600,
+        });
+        assert!(
+            result.is_err(),
+            "expiry past the representable range must be an error"
+        );
+        assert_eq!(
+            store.task_budget(task_id).unwrap(),
+            before,
+            "a refused reservation must leave the task budget untouched"
+        );
         assert_budget_invariant(&store, task_id);
     }
 }
