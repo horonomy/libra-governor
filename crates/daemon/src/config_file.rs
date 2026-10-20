@@ -40,6 +40,7 @@
 //! the daemon's core function" doctrine `crates/daemon/src/server.rs`'s
 //! `start_gateway` already applies to a bad `[gateway]` table.
 
+use crate::server::{DEFAULT_RESOURCE_TARGET_TOKENS, DEFAULT_TIME_TARGET_SECS};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -54,13 +55,6 @@ use serde::Deserialize;
 /// The file name resolved under the daemon's state directory (see
 /// `crates/daemon/src/paths.rs`). Not itself TOML — see module docs.
 pub const CONFIG_FILE_NAME: &str = "config.json";
-
-/// Same resource/time targets `crates/daemon::default_admission_policy`
-/// hardcodes, reused here as this config surface's own defaults so a
-/// `[policy]` table that names only `preset` still produces a sensible
-/// policy.
-const DEFAULT_RESOURCE_TARGET_TOKENS: u64 = 100_000;
-const DEFAULT_TIME_TARGET_SECS: u64 = 3600;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigFileError {
@@ -423,6 +417,21 @@ mod tests {
         let policy = policy.expect("policy override must be present");
         assert_eq!(policy.name, "deadline_first");
         assert!(gateway.is_none());
+    }
+
+    #[test]
+    fn a_bare_balanced_preset_uses_the_legacy_bounded_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE_NAME),
+            r#"{"policy": {"preset": "balanced"}}"#,
+        )
+        .unwrap();
+
+        let policy = load_overrides(dir.path()).unwrap().policy.unwrap();
+        let legacy = crate::server::legacy_bounded_policy();
+        assert_eq!(policy.resource, legacy.resource);
+        assert_eq!(policy.time, legacy.time);
     }
 
     #[test]

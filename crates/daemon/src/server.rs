@@ -335,6 +335,12 @@ pub fn default_turn_bound() -> libra_governor_domain::TurnBound {
     }
 }
 
+/// The resource target (tokens) and time target (seconds) of
+/// [`legacy_bounded_policy`], shared with `config_file` so a `[policy]`
+/// table that names only `preset` cannot drift from the built-in default.
+pub const DEFAULT_RESOURCE_TARGET_TOKENS: u64 = 100_000;
+pub const DEFAULT_TIME_TARGET_SECS: u64 = 3600;
+
 /// The default admission [`Policy`] every task's budget is initialized
 /// from when no per-task policy override exists yet (no such override
 /// surface exists as of HORO-1141 — every task uses this one policy).
@@ -359,8 +365,8 @@ pub fn default_admission_policy() -> Policy {
 /// can say so; [`default_admission_policy`] is the single seam S4 edits.
 pub fn legacy_bounded_policy() -> Policy {
     Policy::balanced(PolicyPresetInputs {
-        resource_target: ResourceAmount::Tokens(100_000),
-        time_target_secs: 3600,
+        resource_target: ResourceAmount::Tokens(DEFAULT_RESOURCE_TARGET_TOKENS),
+        time_target_secs: DEFAULT_TIME_TARGET_SECS,
         quality_floor: CompletionContract::first(vec![CompletionCriterion::required(
             "required verification (tests/build/lint) passes",
         )]),
