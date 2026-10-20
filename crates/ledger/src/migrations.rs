@@ -95,6 +95,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 19,
         sql: include_str!("../migrations/0019_receipt_usage_basis.sql"),
     },
+    Migration {
+        version: 20,
+        sql: include_str!("../migrations/0020_task_budget_lifetime_scope.sql"),
+    },
 ];
 
 /// The highest migration version this build of the crate knows about
@@ -244,6 +248,42 @@ mod tests {
     }
 
     #[test]
+    fn migration_20_marks_every_existing_task_budget_lifetime_bounded() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        apply_known_through(&mut conn, 19);
+        conn.execute(
+            "INSERT INTO tasks (task_id, external_ref_kind, external_ref_value, created_at, last_event_at)
+             VALUES ('00000000-0000-7000-8000-000000000020', NULL, NULL, '2026-10-20T00:00:00Z', '2026-10-20T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_budgets (
+                task_id, resource_kind, hard_limit, initial_completion_reserve,
+                completion_reserve, completion_reserve_basis, policy_json,
+                policy_schema_version, reservation_schema_version, created_at, updated_at
+             ) VALUES ('00000000-0000-7000-8000-000000000020', 'tokens', 150000.0, 10.0, 10.0,
+                       'policy_target', '{}', 'policy-v1', 'r1', '2026-10-20T00:00:00Z',
+                       '2026-10-20T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        apply_all(&mut conn).unwrap();
+
+        let (bounded, hard_limit): (i64, f64) = conn
+            .query_row(
+                "SELECT lifetime_bounded, hard_limit FROM task_budgets",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(bounded, 1);
+        assert_eq!(hard_limit, 150000.0);
+    }
+
+    #[test]
     fn migration_15_preserves_legacy_state_and_does_not_guess_execution_owners() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", true).unwrap();
@@ -340,7 +380,10 @@ mod tests {
         // one nullable `usage_basis` column so pre-dedup usage can be told
         // apart from corrected usage. Additive only: existing rows keep
         // their values and read as unmarked (NULL).
-        let approved_evolved_tables = ["outcome_attestations", "receipts"];
+        // Approved exception (HORO-1727 S3, migration 20): `task_budgets` gains
+        // one `lifetime_bounded` column defaulting to 1, so every existing row
+        // stays lifetime-bounded. Additive only; no row value changes.
+        let approved_evolved_tables = ["outcome_attestations", "receipts", "task_budgets"];
         for definition in &schema_before {
             if approved_evolved_tables.contains(&definition.2.as_str()) {
                 assert!(
