@@ -1547,6 +1547,25 @@ mod tests {
     /// S4 is expected to change this test on purpose when it starts
     /// honoring the field.
     #[test]
+    fn a_lifetime_bounded_budget_serializes_without_the_scope() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let budget = store.task_budget(task_id).unwrap().unwrap();
+
+        let mut json = serde_json::to_value(&budget).unwrap();
+        assert!(json.get("lifetime_scope").is_none());
+        let round_trip: TaskBudget = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(round_trip, budget);
+
+        json["lifetime_scope"] = serde_json::json!("turn_scoped");
+        let turn_scoped: TaskBudget = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            turn_scoped.lifetime_scope,
+            libra_governor_domain::LifetimeScope::TurnScoped
+        );
+    }
+
+    #[test]
     fn the_stored_lifetime_scope_is_not_yet_honored_by_admission() {
         let mut store = LedgerStore::open_in_memory().unwrap();
         let task_id = setup(&mut store, 200);
