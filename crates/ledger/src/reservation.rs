@@ -107,6 +107,14 @@ fn basis_from_str(s: &str) -> Result<CompletionReserveBasis, LedgerError> {
     }
 }
 
+fn scope_from_int(v: i64) -> Result<libra_governor_domain::LifetimeScope, LedgerError> {
+    match v {
+        1 => Ok(libra_governor_domain::LifetimeScope::LifetimeBounded),
+        0 => Ok(libra_governor_domain::LifetimeScope::TurnScoped),
+        _ => Err(LedgerError::Sqlite(rusqlite::Error::InvalidQuery)),
+    }
+}
+
 /// Raw `task_budgets` row shape.
 type BudgetRow = (
     String, // resource_kind
@@ -119,6 +127,7 @@ type BudgetRow = (
     String, // reservation_schema_version
     String, // created_at
     String, // updated_at
+    i64,    // lifetime_bounded
 );
 
 /// Sums every renewal grant against `task_id` (HORO-1727) —
@@ -153,6 +162,7 @@ fn row_to_budget(task_id: TaskId, row: BudgetRow, granted: f64) -> Result<TaskBu
         reservation_schema_version,
         created_at,
         updated_at,
+        lifetime_bounded,
     ) = row;
     let resource_kind = kind_from_str(&resource_kind)?;
     let policy: Policy = serde_json::from_str(&policy_json)
@@ -168,7 +178,7 @@ fn row_to_budget(task_id: TaskId, row: BudgetRow, granted: f64) -> Result<TaskBu
         ),
         completion_reserve: ResourceAmount::from_kind_f64(resource_kind, completion_reserve),
         completion_reserve_basis: basis_from_str(&basis)?,
-        lifetime_scope: libra_governor_domain::LifetimeScope::default(),
+        lifetime_scope: scope_from_int(lifetime_bounded)?,
         policy,
         reservation_schema_version,
         created_at: parse_time(&created_at)?,
@@ -195,7 +205,7 @@ pub(crate) fn read_task_budget_tx(
         .query_row(
             "SELECT resource_kind, hard_limit, initial_completion_reserve, completion_reserve,
                     completion_reserve_basis, policy_json, policy_schema_version,
-                    reservation_schema_version, created_at, updated_at
+                    reservation_schema_version, created_at, updated_at, lifetime_bounded
              FROM task_budgets WHERE task_id = ?1",
             [task_id.to_string()],
             |row| {
@@ -210,6 +220,7 @@ pub(crate) fn read_task_budget_tx(
                     row.get(7)?,
                     row.get(8)?,
                     row.get(9)?,
+                    row.get(10)?,
                 ))
             },
         )
@@ -462,8 +473,9 @@ impl LedgerStore {
             "INSERT INTO task_budgets (
                 task_id, resource_kind, hard_limit, initial_completion_reserve,
                 completion_reserve, completion_reserve_basis, policy_json,
-                policy_schema_version, reservation_schema_version, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                policy_schema_version, reservation_schema_version, created_at, updated_at,
+                lifetime_bounded
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)
              ON CONFLICT(task_id) DO NOTHING",
             rusqlite::params![
                 task_id.to_string(),
@@ -505,7 +517,7 @@ impl LedgerStore {
         let row: BudgetRow = tx.query_row(
             "SELECT resource_kind, hard_limit, initial_completion_reserve, completion_reserve,
                     completion_reserve_basis, policy_json, policy_schema_version,
-                    reservation_schema_version, created_at, updated_at
+                    reservation_schema_version, created_at, updated_at, lifetime_bounded
              FROM task_budgets WHERE task_id = ?1",
             [task_id.to_string()],
             |row| {
@@ -520,6 +532,7 @@ impl LedgerStore {
                     row.get(7)?,
                     row.get(8)?,
                     row.get(9)?,
+                    row.get(10)?,
                 ))
             },
         )?;
@@ -1516,6 +1529,17 @@ mod tests {
             .initialize_task_budget(task_id, &policy, &reserve, now())
             .unwrap();
         task_id
+    }
+
+    #[test]
+    fn a_fresh_budget_reads_back_as_lifetime_bounded() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let budget = store.task_budget(task_id).unwrap().unwrap();
+        assert_eq!(
+            budget.lifetime_scope,
+            libra_governor_domain::LifetimeScope::LifetimeBounded
+        );
     }
 
     // --- budget_snapshot: one read, every display figure (HORO-1709) ---
