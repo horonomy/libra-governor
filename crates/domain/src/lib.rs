@@ -166,8 +166,8 @@ pub use replay::{
 };
 pub use reservation::{
     completion_reserve_for, ledger_freshness, BudgetSnapshot, CompletionReserveBasis,
-    CompletionReserveEstimate, LeaseKind, LedgerFreshness, LedgerFreshnessUnknown, Reservation,
-    ReservationClass, ReservationId, ReservationState, TaskBudget,
+    CompletionReserveEstimate, LeaseKind, LedgerFreshness, LedgerFreshnessUnknown, LifetimeScope,
+    Reservation, ReservationClass, ReservationId, ReservationState, TaskBudget,
     COMPLETION_RESERVE_BASE_FRACTION, COMPLETION_RESERVE_MAX_FRACTION,
     COMPLETION_RESERVE_PER_REQUIRED_CRITERION, RESERVATION_SCHEMA_VERSION,
 };

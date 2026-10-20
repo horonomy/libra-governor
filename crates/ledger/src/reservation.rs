@@ -107,6 +107,14 @@ fn basis_from_str(s: &str) -> Result<CompletionReserveBasis, LedgerError> {
     }
 }
 
+fn scope_from_int(v: i64) -> Result<libra_governor_domain::LifetimeScope, LedgerError> {
+    match v {
+        1 => Ok(libra_governor_domain::LifetimeScope::LifetimeBounded),
+        0 => Ok(libra_governor_domain::LifetimeScope::TurnScoped),
+        _ => Err(LedgerError::Sqlite(rusqlite::Error::InvalidQuery)),
+    }
+}
+
 /// Raw `task_budgets` row shape.
 type BudgetRow = (
     String, // resource_kind
@@ -119,6 +127,7 @@ type BudgetRow = (
     String, // reservation_schema_version
     String, // created_at
     String, // updated_at
+    i64,    // lifetime_bounded
 );
 
 /// Sums every renewal grant against `task_id` (HORO-1727) —
@@ -153,6 +162,7 @@ fn row_to_budget(task_id: TaskId, row: BudgetRow, granted: f64) -> Result<TaskBu
         reservation_schema_version,
         created_at,
         updated_at,
+        lifetime_bounded,
     ) = row;
     let resource_kind = kind_from_str(&resource_kind)?;
     let policy: Policy = serde_json::from_str(&policy_json)
@@ -168,6 +178,7 @@ fn row_to_budget(task_id: TaskId, row: BudgetRow, granted: f64) -> Result<TaskBu
         ),
         completion_reserve: ResourceAmount::from_kind_f64(resource_kind, completion_reserve),
         completion_reserve_basis: basis_from_str(&basis)?,
+        lifetime_scope: scope_from_int(lifetime_bounded)?,
         policy,
         reservation_schema_version,
         created_at: parse_time(&created_at)?,
@@ -177,7 +188,7 @@ fn row_to_budget(task_id: TaskId, row: BudgetRow, granted: f64) -> Result<TaskBu
 
 /// The one place `task_budgets` is read and assembled into a
 /// [`TaskBudget`], folding in [`granted_capacity`] (HORO-1727). Every
-/// call site that used to run its own copy of this 10-column `SELECT`
+/// call site that used to run its own copy of this 11-column `SELECT`
 /// (`task_budget`, `reserve`, `adjust_completion_reserve`) now goes
 /// through here instead — a renewal-aware read a future caller adds can
 /// no longer miss `granted` by copy-pasting an older version of the
@@ -194,7 +205,7 @@ pub(crate) fn read_task_budget_tx(
         .query_row(
             "SELECT resource_kind, hard_limit, initial_completion_reserve, completion_reserve,
                     completion_reserve_basis, policy_json, policy_schema_version,
-                    reservation_schema_version, created_at, updated_at
+                    reservation_schema_version, created_at, updated_at, lifetime_bounded
              FROM task_budgets WHERE task_id = ?1",
             [task_id.to_string()],
             |row| {
@@ -209,6 +220,7 @@ pub(crate) fn read_task_budget_tx(
                     row.get(7)?,
                     row.get(8)?,
                     row.get(9)?,
+                    row.get(10)?,
                 ))
             },
         )
@@ -461,8 +473,9 @@ impl LedgerStore {
             "INSERT INTO task_budgets (
                 task_id, resource_kind, hard_limit, initial_completion_reserve,
                 completion_reserve, completion_reserve_basis, policy_json,
-                policy_schema_version, reservation_schema_version, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                policy_schema_version, reservation_schema_version, created_at, updated_at,
+                lifetime_bounded
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)
              ON CONFLICT(task_id) DO NOTHING",
             rusqlite::params![
                 task_id.to_string(),
@@ -504,7 +517,7 @@ impl LedgerStore {
         let row: BudgetRow = tx.query_row(
             "SELECT resource_kind, hard_limit, initial_completion_reserve, completion_reserve,
                     completion_reserve_basis, policy_json, policy_schema_version,
-                    reservation_schema_version, created_at, updated_at
+                    reservation_schema_version, created_at, updated_at, lifetime_bounded
              FROM task_budgets WHERE task_id = ?1",
             [task_id.to_string()],
             |row| {
@@ -519,6 +532,7 @@ impl LedgerStore {
                     row.get(7)?,
                     row.get(8)?,
                     row.get(9)?,
+                    row.get(10)?,
                 ))
             },
         )?;
@@ -1515,6 +1529,75 @@ mod tests {
             .initialize_task_budget(task_id, &policy, &reserve, now())
             .unwrap();
         task_id
+    }
+
+    #[test]
+    fn a_fresh_budget_reads_back_as_lifetime_bounded() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let budget = store.task_budget(task_id).unwrap().unwrap();
+        assert_eq!(
+            budget.lifetime_scope,
+            libra_governor_domain::LifetimeScope::LifetimeBounded
+        );
+    }
+
+    /// Negative control: S3 only records the scope. Flipping the stored
+    /// value must change nothing about admission or the effective limit;
+    /// S4 is expected to change this test on purpose when it starts
+    /// honoring the field.
+    #[test]
+    fn a_lifetime_bounded_budget_serializes_without_the_scope() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let budget = store.task_budget(task_id).unwrap().unwrap();
+
+        let mut json = serde_json::to_value(&budget).unwrap();
+        assert!(json.get("lifetime_scope").is_none());
+        let round_trip: TaskBudget = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(round_trip, budget);
+
+        json["lifetime_scope"] = serde_json::json!("turn_scoped");
+        let turn_scoped: TaskBudget = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            turn_scoped.lifetime_scope,
+            libra_governor_domain::LifetimeScope::TurnScoped
+        );
+    }
+
+    #[test]
+    fn the_stored_lifetime_scope_is_not_yet_honored_by_admission() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let limit_before = store
+            .task_budget(task_id)
+            .unwrap()
+            .unwrap()
+            .effective_hard_limit();
+        let available_before = store
+            .available(task_id, ReservationClass::RequiredWork)
+            .unwrap();
+
+        store
+            .conn
+            .execute(
+                "UPDATE task_budgets SET lifetime_bounded = 0 WHERE task_id = ?1",
+                [task_id.to_string()],
+            )
+            .unwrap();
+
+        let budget = store.task_budget(task_id).unwrap().unwrap();
+        assert_eq!(
+            budget.lifetime_scope,
+            libra_governor_domain::LifetimeScope::TurnScoped
+        );
+        assert_eq!(budget.effective_hard_limit(), limit_before);
+        assert_eq!(
+            store
+                .available(task_id, ReservationClass::RequiredWork)
+                .unwrap(),
+            available_before
+        );
     }
 
     // --- budget_snapshot: one read, every display figure (HORO-1709) ---
