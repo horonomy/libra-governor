@@ -91,6 +91,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 18,
         sql: include_str!("../migrations/0018_outcome_attestation_revision.sql"),
     },
+    Migration {
+        version: 19,
+        sql: include_str!("../migrations/0019_receipt_usage_basis.sql"),
+    },
 ];
 
 /// The highest migration version this build of the crate knows about
@@ -332,7 +336,11 @@ mod tests {
         // silent regression — the table itself, and every pre-existing
         // row this test inserted, must still be intact; only its exact
         // `CREATE TABLE` text is allowed to differ.
-        let approved_evolved_tables = ["outcome_attestations"];
+        // Approved exception (HORO-1727 S1, migration 19): `receipts` gains
+        // one nullable `usage_basis` column so pre-dedup usage can be told
+        // apart from corrected usage. Additive only: existing rows keep
+        // their values and read as unmarked (NULL).
+        let approved_evolved_tables = ["outcome_attestations", "receipts"];
         for definition in &schema_before {
             if approved_evolved_tables.contains(&definition.2.as_str()) {
                 assert!(

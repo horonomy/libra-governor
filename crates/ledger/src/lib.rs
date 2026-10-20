@@ -45,6 +45,12 @@ pub use extension::{
 };
 pub use gateway::{GatewayRequestClose, GatewayRequestOpen};
 pub use migrations::latest_known_version;
+
+/// Denomination marker stored in `receipts.usage_basis` for usage measured
+/// as deduplicated fresh tokens (input + cache_creation + output, no
+/// cache_read) -- see migration `0019`. Receipts without it are not
+/// comparable and are withheld from resource calibration.
+pub const USAGE_BASIS_FRESH_DEDUP_V1: &str = "fresh_dedup_v1";
 pub use query::{
     CalibrationPair, DogfoodPlanRecord, DogfoodReceiptRecord, EvidenceAggregates, TaskTrajectory,
 };

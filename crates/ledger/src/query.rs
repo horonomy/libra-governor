@@ -618,7 +618,7 @@ impl LedgerStore {
         let mut stmt = self.conn.prepare(
             "SELECT task_id, plan_id, contract_revision, actual_duration_secs,
                     actual_usage_json, outcome_json, recorded_at, tool_call_count, model, provider,
-                    task_features_json, reservation_evidence_json, regime_json
+                    task_features_json, reservation_evidence_json, regime_json, usage_basis
              FROM receipts ORDER BY recorded_at ASC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -635,6 +635,7 @@ impl LedgerStore {
             let task_features_json: Option<String> = row.get(10)?;
             let reservation_evidence_json: Option<String> = row.get(11)?;
             let regime_json: Option<String> = row.get(12)?;
+            let usage_basis: Option<String> = row.get(13)?;
             Ok((
                 task_id,
                 plan_id,
@@ -649,6 +650,7 @@ impl LedgerStore {
                 task_features_json,
                 reservation_evidence_json,
                 regime_json,
+                usage_basis,
             ))
         })?;
 
@@ -668,6 +670,7 @@ impl LedgerStore {
                 task_features_json,
                 reservation_evidence_json,
                 regime_json,
+                usage_basis,
             ) = row?;
             let task_id = Uuid::parse_str(&task_id)
                 .map(TaskId)
@@ -675,8 +678,15 @@ impl LedgerStore {
             let plan_id = Uuid::parse_str(&plan_id)
                 .map(PlanId)
                 .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
-            let actual_usage: Vec<ResourceAmount> = serde_json::from_str(&usage_json)
+            let mut actual_usage: Vec<ResourceAmount> = serde_json::from_str(&usage_json)
                 .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
+            // HORO-1727: usage recorded without a known denomination
+            // (pre-dedup, ~2.15x inflated) is not comparable to today's
+            // fresh-token figures. Withhold it from calibration instead of
+            // rescaling it; the receipt still contributes its duration.
+            if usage_basis.as_deref() != Some(crate::USAGE_BASIS_FRESH_DEDUP_V1) {
+                actual_usage.clear();
+            }
             let outcome: ExecutionOutcome = serde_json::from_str(&outcome_json)
                 .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
             let task_features = parse_task_features(task_features_json)?;
@@ -1580,5 +1590,94 @@ mod plan_lineage_tests {
             anchor == at(100) || anchor == at(101),
             "the bounded walk must return one of the two plans in the cycle, got {anchor}"
         );
+    }
+}
+
+#[cfg(test)]
+mod usage_basis_tests {
+    use super::*;
+    use libra_governor_domain::{CompletionCriterion, ResourceAmount, TaskIdentity};
+
+    fn now() -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH
+    }
+
+    /// Records one receipt with `usage` and `secs` duration. When
+    /// `legacy` is true the row is rewritten to the pre-0019 shape
+    /// (`usage_basis` NULL), as a receipt written before the marker existed.
+    fn seed_usage_receipt(
+        store: &mut LedgerStore,
+        usage: Vec<ResourceAmount>,
+        secs: u64,
+        legacy: bool,
+    ) {
+        let identity = TaskIdentity::new(None);
+        store.insert_task(&identity, now()).unwrap();
+        let contract = CompletionContract::first(vec![CompletionCriterion::required("c")]);
+        store
+            .insert_contract(identity.id, &contract, now())
+            .unwrap();
+        let plan = ExecutionPlan::new(identity.id, contract.revision, None, now());
+        store.insert_plan(&plan).unwrap();
+        let receipt = ExecutionReceipt::new(
+            identity.id,
+            contract.revision,
+            plan.id,
+            secs,
+            usage,
+            ExecutionOutcome::Unknown,
+            now(),
+        );
+        store.insert_receipt(&receipt).unwrap();
+        if legacy {
+            store
+                .conn
+                .execute("UPDATE receipts SET usage_basis = NULL", [])
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_marked_receipt_keeps_its_usage_for_calibration() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        seed_usage_receipt(&mut store, vec![ResourceAmount::Tokens(500)], 30, false);
+
+        let history = store.receipts_for_estimation().unwrap();
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].1.actual_usage, vec![ResourceAmount::Tokens(500)]);
+    }
+
+    #[test]
+    fn an_unmarked_receipt_withholds_usage_but_keeps_duration() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        seed_usage_receipt(
+            &mut store,
+            vec![ResourceAmount::Tokens(1_000_000)],
+            90,
+            true,
+        );
+
+        let history = store.receipts_for_estimation().unwrap();
+
+        assert_eq!(history.len(), 1);
+        assert!(history[0].1.actual_usage.is_empty());
+        assert_eq!(history[0].1.actual_duration_secs, 90);
+    }
+
+    #[test]
+    fn a_receipt_with_an_unknown_basis_withholds_usage_too() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        seed_usage_receipt(&mut store, vec![ResourceAmount::Tokens(700)], 45, false);
+        store
+            .conn
+            .execute("UPDATE receipts SET usage_basis = 'other_v2'", [])
+            .unwrap();
+
+        let history = store.receipts_for_estimation().unwrap();
+
+        assert_eq!(history.len(), 1);
+        assert!(history[0].1.actual_usage.is_empty());
+        assert_eq!(history[0].1.actual_duration_secs, 45);
     }
 }
