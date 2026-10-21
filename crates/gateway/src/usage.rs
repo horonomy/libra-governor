@@ -54,12 +54,18 @@ pub struct ObservedUsage {
 }
 
 impl ObservedUsage {
-    /// Every reported token, regardless of tier — the figure a
-    /// token-denominated budget settles against.
-    pub fn total_tokens(&self) -> u64 {
+    /// The fresh tokens a token-denominated budget settles against:
+    /// input + cache-creation + output. `cache_read_input_tokens` is
+    /// **excluded**: a cache read re-presents context already paid for, so
+    /// counting it would charge a lifetime or turn token bound for the same
+    /// context on every request. This is the same denomination as
+    /// `crates/daemon/src/usage.rs` (`TurnUsage::fresh_tokens`) and the
+    /// `fresh_dedup_v1` receipt basis (HORO-1727 D4). The cache-read count
+    /// stays available on the field itself and in `gateway_requests`, and a
+    /// USD budget still prices it separately (`cost::exact_usd`).
+    pub fn fresh_tokens(&self) -> u64 {
         self.input_tokens
             .saturating_add(self.cache_creation_input_tokens)
-            .saturating_add(self.cache_read_input_tokens)
             .saturating_add(self.output_tokens)
     }
 }
@@ -384,13 +390,13 @@ mod tests {
     }
 
     #[test]
-    fn total_tokens_sums_every_tier() {
+    fn fresh_tokens_excludes_cache_reads() {
         let usage = ObservedUsage {
             input_tokens: 1,
             cache_creation_input_tokens: 2,
             cache_read_input_tokens: 4,
             output_tokens: 8,
         };
-        assert_eq!(usage.total_tokens(), 15);
+        assert_eq!(usage.fresh_tokens(), 11);
     }
 }
