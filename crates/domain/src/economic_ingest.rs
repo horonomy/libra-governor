@@ -144,6 +144,10 @@ fn attribution_for(
 /// | `GatewayObservedQuota` | `true` | none (not provider-authoritative) | `ProviderReportedActual` |
 /// | any | `false` | `LibraReservationHold` (conservative fallback) | none |
 ///
+/// The USD fact is built from `settled_amount`, which is in the row's own
+/// resource kind: a non-USD (e.g. Tokens) row emits no USD fact, and for it only the
+/// `false` row's hold fallback survives, in that kind (HORO-2042).
+///
 /// `execution`, when supplied, is used only to prove `EconomicScope::Session`
 /// — it is never derived from the gateway row itself.
 pub fn events_from_gateway_request(
@@ -164,10 +168,27 @@ pub fn events_from_gateway_request(
         (_, false) => Some(ResourceBasis::LibraReservationHold),
         (EnforcementTier::HooksOnly, true) => None,
     };
-    if let (Some(basis), Some(settled_amount)) = (usd_basis, observation.settled_amount) {
-        let amount = ResourceAmount::from_kind_f64(ResourceKind::Usd, settled_amount);
-        let id =
-            EconomicEventId::deterministic(&format!("{}:usd", observation.gateway_request_id.0));
+    // `settled_amount` is denominated in the budget's own resource kind
+    // (HORO-2042). A USD row keeps its USD fact. A Tokens (or other non-USD)
+    // row's measured figure is the token fact built from the tier columns
+    // below, so only the conservative hold fallback is emitted for it, and in
+    // the row's own unit - never its count labeled as USD cents.
+    let settled_kind = observation.resource_kind.unwrap_or(ResourceKind::Usd);
+    let settled_fact = match (settled_kind, usd_basis) {
+        (ResourceKind::Usd, Some(basis)) => Some((basis, "usd")),
+        (_, Some(ResourceBasis::LibraReservationHold)) => {
+            Some((ResourceBasis::LibraReservationHold, "hold"))
+        }
+        _ => None,
+    };
+    if let (Some((basis, id_suffix)), Some(settled_amount)) =
+        (settled_fact, observation.settled_amount)
+    {
+        let amount = ResourceAmount::from_kind_f64(settled_kind, settled_amount);
+        let id = EconomicEventId::deterministic(&format!(
+            "{}:{id_suffix}",
+            observation.gateway_request_id.0
+        ));
         if let Ok(event) = EconomicEvent::validated(
             id,
             observation.occurred_at,
@@ -444,6 +465,44 @@ mod tests {
         cache_only.output_tokens = None;
         cache_only.cache_read_input_tokens = Some(5_000);
         assert_eq!(token_amounts(&cache_only), vec![ResourceAmount::Tokens(0)]);
+    }
+
+    #[test]
+    fn a_tokens_budget_row_emits_no_usd_fact_for_its_settled_amount() {
+        let facts = |observation: &GatewayRequestObservation| {
+            events_from_gateway_request(observation, None)
+                .iter()
+                .map(|e| (e.fact().amount.kind(), e.fact().basis))
+                .collect::<Vec<_>>()
+        };
+
+        // Measured usage: only the token fact built from the tier columns.
+        let mut tokens_row = observation(EnforcementTier::GatewayMetered, true);
+        tokens_row.resource_kind = Some(ResourceKind::Tokens);
+        tokens_row.settled_amount = Some(150.0);
+        assert_eq!(
+            facts(&tokens_row),
+            vec![(ResourceKind::Tokens, ResourceBasis::GatewayMeteredActual)]
+        );
+
+        // Unknown usage: the conservative hold survives, in tokens - not
+        // dropped, and not labeled as USD.
+        let mut unknown = observation(EnforcementTier::GatewayMetered, false);
+        unknown.resource_kind = Some(ResourceKind::Tokens);
+        unknown.settled_amount = Some(150.0);
+        let hold = events_from_gateway_request(&unknown, None);
+        assert_eq!(hold.len(), 1);
+        assert_eq!(hold[0].fact().amount, ResourceAmount::Tokens(150));
+        assert_eq!(hold[0].fact().basis, ResourceBasis::LibraReservationHold);
+
+        // Control: a USD-denominated row still emits both facts.
+        assert_eq!(
+            facts(&observation(EnforcementTier::GatewayMetered, true)),
+            vec![
+                (ResourceKind::Usd, ResourceBasis::GatewayMeteredActual),
+                (ResourceKind::Tokens, ResourceBasis::GatewayMeteredActual),
+            ]
+        );
     }
 
     #[test]
