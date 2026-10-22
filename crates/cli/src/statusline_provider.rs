@@ -1591,6 +1591,25 @@ fn grouped_f64(value: f64) -> String {
 /// under-report what the task has.
 fn budget_amounts_prose(amounts: &BudgetSnapshot) -> String {
     let unit = unit_noun(amounts.kind()).unwrap_or("percent of quota");
+    if let Some(ceiling) = amounts.turn_ceiling() {
+        // A turn-scoped task has no lifetime envelope (HORO-1727 S5): the
+        // stored lifetime figure is not a limit, so it is never printed.
+        let mut out = format!(
+            "  budget limit     none for the task's lifetime — each turn is limited to\n\
+             \x20                  {} {unit}, and active holds may not exceed that\n",
+            grouped_f64(ceiling.as_f64()),
+        );
+        if amounts.is_observed() {
+            out.push_str(&format!(
+                "  budget used      {} {unit} — settled across turns; informational, no\n\
+                 \x20                  lifetime cap applies\n\
+                 \x20 budget held      {} {unit} — reserved by active reservations\n",
+                grouped_f64(amounts.used().as_f64()),
+                grouped_f64(amounts.reserved().as_f64()),
+            ));
+        }
+        return out;
+    }
     let mut out = format!(
         "  budget limit     {} {} — this task's envelope, fixed when it was\n\
          \x20                  admitted and never amended since\n",
@@ -2168,6 +2187,19 @@ mod tests {
             None,
         );
         assert_eq!(exhausted["reason_code"], "budget_hard_limit_reached");
+    }
+
+    #[test]
+    fn explain_never_prints_the_stored_lifetime_figure_for_a_turn_scoped_task() {
+        let scoped = amounts_for(BudgetPosture::TurnScoped).unwrap();
+        let prose = budget_amounts_prose(&scoped);
+        assert!(!prose.contains("150,000"), "{prose}");
+        assert!(prose.contains("400,000"), "{prose}");
+
+        // Control: the same stored figure on a lifetime-bounded task is its limit.
+        let bounded =
+            BudgetSnapshot::new(ResourceKind::Tokens, 150_000.0, 30_000.0, 20_000.0, 0.0, 2);
+        assert!(budget_amounts_prose(&bounded).contains("150,000"));
     }
 
     fn doctor_with(preset: &str, matches_disk: bool) -> DoctorResult {
