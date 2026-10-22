@@ -1047,8 +1047,22 @@ fn budget_reading(
 /// a future policy shape with no resource bound should degrade to "not
 /// reported" rather than to a fabricated ceiling.
 fn configured_budget(config: &DaemonConfig) -> Option<ConfiguredBudget> {
-    Some(ConfiguredBudget {
-        ceiling: config.policy.resource.hard_ceiling,
+    // A turn-scoped daemon (HORO-1727 S5) configures no lifetime cap for a
+    // new task: reporting the stored 150,000 would state a limit admission
+    // does not enforce. The scope only takes effect with a turn bound, the
+    // same rule the ledger gate applies, so the two cannot disagree.
+    let turn_scoped = config.lifetime_scope == libra_governor_domain::LifetimeScope::TurnScoped
+        && config.policy.turn.is_some();
+    Some(if turn_scoped {
+        ConfiguredBudget {
+            ceiling: None,
+            turn_ceiling: config.policy.turn.as_ref().map(|turn| turn.ceiling),
+        }
+    } else {
+        ConfiguredBudget {
+            ceiling: Some(config.policy.resource.hard_ceiling),
+            turn_ceiling: None,
+        }
     })
 }
 
@@ -2807,6 +2821,7 @@ fn handle_doctor(ledger: &LedgerStore, config: &DaemonConfig) -> DoctorResult {
         schema_version_known,
         schema_ahead_of_binary: schema_version_applied > schema_version_known,
         policy_preset: config.policy.name.clone(),
+        lifetime_scope: config.lifetime_scope,
         config_file_present,
         config_file_valid,
         config_file_error,
@@ -3179,7 +3194,8 @@ mod tests {
         assert_eq!(
             result.configured_budget,
             Some(ConfiguredBudget {
-                ceiling: config.policy.resource.hard_ceiling
+                ceiling: Some(config.policy.resource.hard_ceiling),
+                turn_ceiling: None,
             }),
             "the next task's ceiling is a fact an idle daemon knows"
         );
@@ -3203,7 +3219,7 @@ mod tests {
 
         assert_eq!(
             result.configured_budget.unwrap().ceiling,
-            ResourceAmount::Tokens(777_000)
+            Some(ResourceAmount::Tokens(777_000))
         );
     }
 
@@ -3385,7 +3401,7 @@ mod tests {
         );
         assert_eq!(
             result.configured_budget.unwrap().ceiling,
-            ResourceAmount::Tokens(900_000),
+            Some(ResourceAmount::Tokens(900_000)),
             "the next task would get the new ceiling"
         );
         assert_ne!(admitted_ceiling, ResourceAmount::Tokens(900_000));

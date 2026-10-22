@@ -1029,6 +1029,15 @@ fn budget_segment(
             Some("no_commitment_against_envelope"),
             "vital",
         ),
+        // A turn-scoped task has no lifetime remainder to show: neutral,
+        // never a pressure band, and never "Budget exhausted" for lifetime
+        // spend (HORO-1727 S5).
+        BudgetPosture::TurnScoped => (
+            "neutral",
+            "No lifetime cap".to_string(),
+            Some("budget_turn_scoped"),
+            "vital",
+        ),
         BudgetPosture::NotEstablished => (
             "unknown",
             "Budget not established".to_string(),
@@ -1092,7 +1101,7 @@ fn configured_budget_segment(
     if display == BudgetDisplay::Percent {
         return None;
     }
-    let ceiling = configured.ceiling;
+    let ceiling = configured.ceiling?;
     let unit = unit_noun(ceiling.kind())?;
     let count = count_value(ceiling.as_f64())?;
     Some(json!({
@@ -1429,6 +1438,11 @@ fn budget_posture_prose(
              not\n\x20                  stopped, because Libra's hooks are advisory"
                 .to_string()
         }
+        Some(BudgetPosture::TurnScoped) => {
+            "no lifetime cap — this task is gated per turn, not on a\n\
+             \x20                  lifetime limit"
+                .to_string()
+        }
         Some(BudgetPosture::NotEstablished) | None => {
             "none — this task was admitted without a resource envelope, which\n\
              \x20                  is not the same as having spent one"
@@ -1709,15 +1723,32 @@ pub fn explain_text(status: &StatusResult, doctor: Option<&DoctorResult>) -> Str
     // comparing them needs to be told which is which rather than left to
     // guess that the bigger number is the real one.
     if let Some(configured) = status.configured_budget.as_ref() {
-        let ceiling = configured.ceiling;
-        out.push_str(&format!(
-            "\n  configured limit {} {} — the ceiling a new task would be\n\
-             \x20                  admitted to, from the policy now in force. Not a\n\
-             \x20                  remaining balance, and not the envelope of any task\n\
-             \x20                  already running.\n",
-            grouped_f64(ceiling.as_f64()),
-            unit_noun(ceiling.kind()).unwrap_or("percent of quota"),
-        ));
+        if let Some(ceiling) = configured.ceiling {
+            out.push_str(&format!(
+                "\n  configured limit {} {} — the ceiling a new task would be\n\
+                 \x20                  admitted to, from the policy now in force. Not a\n\
+                 \x20                  remaining balance, and not the envelope of any task\n\
+                 \x20                  already running.\n",
+                grouped_f64(ceiling.as_f64()),
+                unit_noun(ceiling.kind()).unwrap_or("percent of quota"),
+            ));
+        } else {
+            // Turn-scoped daemon (HORO-1727 S5): there is no lifetime
+            // ceiling to print, and the stored 150,000 is not enforced.
+            let per_turn = configured
+                .turn_ceiling
+                .map(|turn| {
+                    format!(
+                        "; each turn is limited to {} {}",
+                        grouped_f64(turn.as_f64()),
+                        unit_noun(turn.kind()).unwrap_or("percent of quota"),
+                    )
+                })
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "\n  configured limit none — a new task has no lifetime cap{per_turn}.\n"
+            ));
+        }
     }
     // And the one envelope with no local source at all. Said out loud
     // rather than omitted: a reader who has been shown two envelopes will
@@ -1893,7 +1924,8 @@ mod tests {
     /// [`BUDGET_LEFT_AMOUNTS`]'s ceiling so a test cannot pass by
     /// accidentally reading one for the other.
     const CONFIGURED: ConfiguredBudget = ConfiguredBudget {
-        ceiling: ResourceAmount::Tokens(200_000),
+        ceiling: Some(ResourceAmount::Tokens(200_000)),
+        turn_ceiling: None,
     };
 
     /// A quota envelope: 100 "percent of quota", 62 of it committed.
@@ -1948,6 +1980,10 @@ mod tests {
             }
             BudgetPosture::Exhausted => {
                 BudgetSnapshot::new(ResourceKind::Tokens, 150_000.0, 30_000.0, 150_000.0, 0.0, 4)
+            }
+            BudgetPosture::TurnScoped => {
+                BudgetSnapshot::new(ResourceKind::Tokens, 150_000.0, 30_000.0, 200_000.0, 0.0, 2)
+                    .with_turn_ceiling(Some(400_000.0))
             }
             BudgetPosture::NotEstablished | BudgetPosture::Unreadable => return None,
         })
@@ -2046,6 +2082,7 @@ mod tests {
         DoctorResult {
             daemon_version: "0.0.2".to_string(),
             protocol_version: 8,
+            lifetime_scope: libra_governor_domain::LifetimeScope::LifetimeBounded,
             schema_version_applied: 9,
             schema_version_known: 9,
             schema_ahead_of_binary: false,
@@ -3604,7 +3641,7 @@ mod tests {
         // fixtures use different numbers so a surface that read one for
         // the other is caught.
         assert_ne!(
-            CONFIGURED.ceiling.as_f64(),
+            CONFIGURED.ceiling.unwrap().as_f64(),
             BUDGET_LEFT_AMOUNTS.total().as_f64(),
             "premise"
         );

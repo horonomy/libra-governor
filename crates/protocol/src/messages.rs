@@ -404,7 +404,15 @@ pub struct ConfiguredBudget {
     /// than from disk. A daemon whose `config.json` has been edited since
     /// it started reports what it is running; the `profile` segment is
     /// what says the edit has not taken effect yet.
-    pub ceiling: ResourceAmount,
+    ///
+    /// `None` when the daemon runs turn-scoped (HORO-1727 S5): no lifetime
+    /// cap is configured for a new task, and showing the stored 150,000
+    /// would state a limit that admission does not enforce.
+    pub ceiling: Option<ResourceAmount>,
+    /// The per-turn ceiling a new task would be gated on when the daemon
+    /// runs turn-scoped; `None` for a lifetime-bounded daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_ceiling: Option<ResourceAmount>,
 }
 
 /// What remains of a governed task's resource envelope (HORO-1634).
@@ -489,6 +497,11 @@ pub enum BudgetPosture {
     /// reached or passed the hard limit, so the ledger will refuse the
     /// next reservation.
     Exhausted,
+    /// The task is gated per turn, not on a lifetime limit (HORO-1727 S5):
+    /// there is no lifetime remainder to report, so no share and no
+    /// exhaustion-by-spend. Reaching the turn ceiling with concurrent
+    /// holds is [`BudgetPosture::Exhausted`], not this.
+    TurnScoped,
     /// The task has no budget row, so there is no envelope to report a
     /// share of. Distinct from `Exhausted`: nothing has been spent, the
     /// task was never admitted to a budget in the first place. Distinct
@@ -537,6 +550,18 @@ impl BudgetPosture {
     /// for "nothing happened" would start lying the first time a
     /// settlement rounded back to the limit.
     pub fn from_snapshot(snapshot: &BudgetSnapshot) -> Self {
+        // A turn-scoped task is gated on its turn ceiling, never on the
+        // stored lifetime figure, so lifetime spend can neither exhaust it
+        // nor give it a share (HORO-1727 S5). The one way it is exhausted
+        // is concurrent holds at the turn ceiling, the exact condition
+        // under which the ledger refuses the next reservation.
+        if let Some(turn_ceiling) = snapshot.turn_ceiling() {
+            return if snapshot.reserved().as_f64() >= turn_ceiling.as_f64() {
+                BudgetPosture::Exhausted
+            } else {
+                BudgetPosture::TurnScoped
+            };
+        }
         if snapshot.remaining().is_exhausted() {
             return BudgetPosture::Exhausted;
         }
@@ -761,6 +786,11 @@ pub struct DoctorResult {
     /// preset currently in effect (`"balanced"` unless a valid
     /// `config.json` `[policy]` table selected another one).
     pub policy_preset: String,
+    /// The lifetime scope this daemon creates new task budgets with
+    /// (HORO-1727 S5). `#[serde(default)]` reads a reply that predates the
+    /// field as lifetime-bounded.
+    #[serde(default)]
+    pub lifetime_scope: libra_governor_domain::LifetimeScope,
     /// `true` if `<state_dir>/config.json` exists at all.
     pub config_file_present: bool,
     /// `true` if `config.json` exists and parsed/validated successfully.
@@ -938,6 +968,35 @@ pub enum Response {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_turn_scoped_snapshot_past_its_lifetime_figure_is_turn_scoped_not_exhausted() {
+        use libra_governor_domain::ResourceKind;
+        // 180k settled against a stored 150k lifetime figure.
+        let scoped =
+            BudgetSnapshot::new(ResourceKind::Tokens, 150_000.0, 36_000.0, 180_000.0, 0.0, 2)
+                .with_turn_ceiling(Some(400_000.0));
+        assert_eq!(
+            BudgetPosture::from_snapshot(&scoped),
+            BudgetPosture::TurnScoped
+        );
+
+        // Controls: the same figures on a lifetime-bounded task are exhausted,
+        // and a turn-scoped task is exhausted only by holds at the turn ceiling.
+        let bounded =
+            BudgetSnapshot::new(ResourceKind::Tokens, 150_000.0, 36_000.0, 180_000.0, 0.0, 2);
+        assert_eq!(
+            BudgetPosture::from_snapshot(&bounded),
+            BudgetPosture::Exhausted
+        );
+        let held =
+            BudgetSnapshot::new(ResourceKind::Tokens, 150_000.0, 36_000.0, 0.0, 400_000.0, 2)
+                .with_turn_ceiling(Some(400_000.0));
+        assert_eq!(
+            BudgetPosture::from_snapshot(&held),
+            BudgetPosture::Exhausted
+        );
+    }
+
     use super::*;
     use crate::PROTOCOL_VERSION;
     use libra_governor_domain::EnforcementTier;
@@ -960,6 +1019,7 @@ mod tests {
                 schema_version_applied: 9,
                 schema_version_known: 9,
                 schema_ahead_of_binary: false,
+                lifetime_scope: libra_governor_domain::LifetimeScope::LifetimeBounded,
                 policy_preset: "balanced".to_string(),
                 config_file_present: false,
                 config_file_valid: true,
@@ -1382,7 +1442,8 @@ mod tests {
                 task_budget: Some(BudgetPosture::from_snapshot(&half_spent)),
                 task_budget_amounts: Some(half_spent),
                 configured_budget: Some(ConfiguredBudget {
-                    ceiling: ResourceAmount::Tokens(150_000),
+                    ceiling: Some(ResourceAmount::Tokens(150_000)),
+                    turn_ceiling: None,
                 }),
                 task_budget_freshness: Some(LedgerFreshness::Fresh { age_secs: 30 }),
             })),
@@ -1500,7 +1561,8 @@ mod tests {
             task_budget: None,
             task_budget_amounts: None,
             configured_budget: Some(ConfiguredBudget {
-                ceiling: ResourceAmount::Tokens(150_000),
+                ceiling: Some(ResourceAmount::Tokens(150_000)),
+                turn_ceiling: None,
             }),
             task_budget_freshness: None,
         };
