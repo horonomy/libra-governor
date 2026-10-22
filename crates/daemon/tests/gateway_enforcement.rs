@@ -167,8 +167,21 @@ struct Fixture {
 }
 
 fn preflighted(policy: Policy, with_gateway: bool) -> Fixture {
+    preflighted_scoped(
+        policy,
+        with_gateway,
+        libra_governor_domain::LifetimeScope::LifetimeBounded,
+    )
+}
+
+fn preflighted_scoped(
+    policy: Policy,
+    with_gateway: bool,
+    scope: libra_governor_domain::LifetimeScope,
+) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let daemon_config = config(dir.path(), policy, with_gateway);
+    let mut daemon_config = config(dir.path(), policy, with_gateway);
+    daemon_config.lifetime_scope = scope;
     let listener = UnixListener::bind(&daemon_config.socket_path).unwrap();
     let mut ledger = LedgerStore::open(&daemon_config.ledger_path).unwrap();
     let mut current_task = None;
@@ -194,6 +207,45 @@ fn preflighted(policy: Policy, with_gateway: bool) -> Fixture {
         gateway_ledger,
         _dir: dir,
         session_id,
+    }
+}
+
+/// HORO-1727 S6: the gateway reads the persisted policy and still gates a
+/// turn-scoped task on its lifetime bound, so it denies where preflight would
+/// admit (fail closed; reachable only when a `[gateway]` config is added to a
+/// task created under a no-config daemon). Whether the gateway should honour
+/// the persisted scope is an open founder decision recorded in ADR-0024; if it
+/// is decided, this test changes on purpose.
+#[test]
+fn the_gateway_still_denies_a_turn_scoped_task_past_its_lifetime_bound() {
+    for scope in [
+        libra_governor_domain::LifetimeScope::TurnScoped,
+        libra_governor_domain::LifetimeScope::LifetimeBounded,
+    ] {
+        let fixture = preflighted_scoped(
+            libra_governor_daemon::default_admission_policy(),
+            true,
+            scope,
+        );
+        let context = fixture
+            .authority
+            .budget_context(&fixture.session_id)
+            .unwrap()
+            .expect("the preflighted session resolves to a task with a budget");
+        let decision = fixture
+            .authority
+            .authorize(SpendRequest {
+                task_id: context.task_id,
+                session_id: &fixture.session_id,
+                amount: ResourceAmount::Tokens(160_000),
+                idempotency_key: "gw:past-lifetime",
+                ttl_secs: 600,
+            })
+            .unwrap();
+        assert!(
+            matches!(decision, SpendDecision::Denied(_)),
+            "{scope:?}: a 160k request is past the persisted 150k bound"
+        );
     }
 }
 
