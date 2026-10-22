@@ -105,6 +105,12 @@ pub struct DaemonConfig {
     /// daemon). See [`default_admission_policy`] for the shipped
     /// default.
     pub policy: Policy,
+    /// Whether the budgets this daemon initializes are bounded for the
+    /// task's lifetime or only per turn (HORO-1727 S4). Held here, not on
+    /// [`Policy`], so `policy_json` stays the single record of the limits;
+    /// the scope is persisted per task in `task_budgets.lifetime_bounded`
+    /// and honored from there.
+    pub lifetime_scope: libra_governor_domain::LifetimeScope,
     /// How long a reservation may stay `Active` before startup/opportunistic
     /// reconciliation reclaims it (HORO-1141) — see
     /// [`reconcile_stale_reservations`].
@@ -1244,7 +1250,13 @@ pub(crate) fn handle_preflight_prepared(
     // task (a new prompt in the same session, or a replan) recomputes
     // and adjusts the reserve against the freshest evidence.
     let reserve_estimate = completion_reserve_for(&contract, Some(&estimate), &config.policy);
-    let budget = ledger.initialize_task_budget(task_id, &config.policy, &reserve_estimate, now)?;
+    let budget = ledger.initialize_task_budget_scoped(
+        task_id,
+        &config.policy,
+        &reserve_estimate,
+        config.lifetime_scope,
+        now,
+    )?;
     if had_existing_budget {
         match ledger.adjust_completion_reserve(
             task_id,
@@ -2959,6 +2971,7 @@ mod tests {
     /// config's paths (caller keeps the `tempfile::TempDir` alive).
     fn test_daemon_config(dir: &std::path::Path) -> DaemonConfig {
         DaemonConfig {
+            lifetime_scope: libra_governor_domain::LifetimeScope::LifetimeBounded,
             socket_path: dir.join("d.sock"),
             ledger_path: dir.join("ledger.sqlite3"),
             log_path: dir.join("daemon.log"),

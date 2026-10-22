@@ -152,6 +152,7 @@ fn shadow_decision_policy_and_pins(ledger_path: &Path) -> (Option<String>, Optio
 fn cadence_only_shadow_decision_never_mutates_existing_ledger_state() {
     let dir = tempfile::tempdir().unwrap();
     let config = DaemonConfig {
+        lifetime_scope: libra_governor_domain::LifetimeScope::LifetimeBounded,
         socket_path: dir.path().join("d.sock"),
         ledger_path: dir.path().join("ledger.sqlite3"),
         log_path: dir.path().join("daemon.log"),

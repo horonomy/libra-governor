@@ -143,6 +143,7 @@ impl Harness {
     fn new(replan_hysteresis: ReplanHysteresisConfig) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let config = DaemonConfig {
+            lifetime_scope: libra_governor_domain::LifetimeScope::LifetimeBounded,
             socket_path: dir.path().join("d.sock"),
             ledger_path: dir.path().join("ledger.sqlite3"),
             log_path: dir.path().join("daemon.log"),

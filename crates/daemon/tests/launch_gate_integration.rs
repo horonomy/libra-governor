@@ -457,6 +457,7 @@ fn status_report_carries_the_fixed_enforcement_scope() {
 fn launch_admit_round_trips_over_the_real_socket() {
     let dir = tempfile::tempdir().unwrap();
     let config = libra_governor_daemon::DaemonConfig {
+        lifetime_scope: libra_governor_domain::LifetimeScope::LifetimeBounded,
         socket_path: dir.path().join("d.sock"),
         ledger_path: dir.path().join("ledger.sqlite3"),
         log_path: dir.path().join("daemon.log"),
