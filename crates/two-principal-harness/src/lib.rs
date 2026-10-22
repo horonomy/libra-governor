@@ -377,20 +377,8 @@ impl LedgerSnapshot {
             .unwrap_or_else(|e| panic!("stat {main:?}: {e}"))
             .ino();
 
-        let scratch = tempfile_dir();
+        let scratch = copy_ledger_when_schema_complete(state_dir);
         let scratch_db = scratch.join("ledger.sqlite3");
-        for ext in ["", "-wal", "-shm"] {
-            let src = state_dir.join(format!("ledger.sqlite3{ext}"));
-            if src.exists() {
-                std::fs::copy(&src, scratch.join(format!("ledger.sqlite3{ext}")))
-                    .unwrap_or_else(|e| panic!("copy {src:?}: {e}"));
-            }
-        }
-
-        // Checkpoint the copy (not the live file) so the hash and row
-        // counts reflect everything committed to the WAL, not just the
-        // main file's on-disk bytes.
-        sqlite3_exec(&scratch_db, "PRAGMA wal_checkpoint(TRUNCATE);");
 
         let sha256 = sha256_file(&scratch_db);
 
@@ -424,6 +412,81 @@ impl LedgerSnapshot {
     }
 }
 
+/// How long [`copy_ledger_when_schema_complete`] waits for the daemon's
+/// migrations: 100 attempts, 50 ms apart.
+const SCHEMA_WAIT_ATTEMPTS: u32 = 100;
+const SCHEMA_WAIT_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The tables [`LedgerSnapshot::capture`] counts rows in. A copy missing
+/// either one was taken before the daemon finished migrating.
+const SNAPSHOT_TABLES: [&str; 2] = ["outcome_attestations", "task_budget_renewals"];
+
+/// Copies the ledger (and its `-wal`/`-shm` sidecars) at `state_dir` to a
+/// scratch directory, checkpoints the copy, and returns the directory once
+/// the copy holds every table the snapshot counts.
+///
+/// The daemon creates `ledger.sqlite3` before its migrations finish, so a
+/// copy taken in that window has no `outcome_attestations` or
+/// `task_budget_renewals` table and the later counts fail with
+/// `no such table`. The probe here never panics on a half-written copy: it
+/// retries a bounded number of times and only then fails, naming the cause.
+fn copy_ledger_when_schema_complete(state_dir: &Path) -> PathBuf {
+    for attempt in 1..=SCHEMA_WAIT_ATTEMPTS {
+        let scratch = tempfile_dir();
+        let scratch_db = scratch.join("ledger.sqlite3");
+        for ext in ["", "-wal", "-shm"] {
+            let src = state_dir.join(format!("ledger.sqlite3{ext}"));
+            if src.exists() {
+                // A sidecar can vanish between `exists` and `copy` while the
+                // daemon checkpoints; treat that as "not ready yet".
+                let _ = std::fs::copy(&src, scratch.join(format!("ledger.sqlite3{ext}")));
+            }
+        }
+
+        // Checkpoint the copy (not the live file) so the hash and row
+        // counts reflect everything committed to the WAL, not just the
+        // main file's on-disk bytes.
+        let checkpointed = Command::new("sqlite3")
+            .arg(&scratch_db)
+            .arg("PRAGMA wal_checkpoint(TRUNCATE);")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        let tables_present = checkpointed
+            && Command::new("sqlite3")
+                .arg("-readonly")
+                .arg(&scratch_db)
+                .arg(format!(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ({});",
+                    SNAPSHOT_TABLES
+                        .iter()
+                        .map(|t| format!("'{t}'"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ))
+                .output()
+                .ok()
+                .and_then(|out| {
+                    String::from_utf8_lossy(&out.stdout)
+                        .trim()
+                        .parse::<usize>()
+                        .ok()
+                })
+                == Some(SNAPSHOT_TABLES.len());
+        if tables_present {
+            return scratch;
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+        if attempt < SCHEMA_WAIT_ATTEMPTS {
+            std::thread::sleep(SCHEMA_WAIT_INTERVAL);
+        }
+    }
+    panic!(
+        "the ledger at {state_dir:?} never reached a complete schema (missing one of \
+         {SNAPSHOT_TABLES:?}) after {SCHEMA_WAIT_ATTEMPTS} attempts of {SCHEMA_WAIT_INTERVAL:?}"
+    );
+}
+
 fn tempfile_dir() -> PathBuf {
     let dir = PathBuf::from(format!(
         "/tmp/two-principal-harness-snapshot-{}-{}",
@@ -437,6 +500,7 @@ fn tempfile_dir() -> PathBuf {
     dir
 }
 
+#[cfg(test)]
 fn sqlite3_exec(db: &Path, sql: &str) {
     let out = Command::new("sqlite3")
         .arg(db)
@@ -986,5 +1050,52 @@ pub fn query_live(state_dir: &str, sql: &str) -> Vec<String> {
             return Vec::new();
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    /// The daemon creates the ledger file before its migrations finish. A
+    /// snapshot taken in that window must wait for the schema instead of
+    /// failing with `no such table`.
+    #[test]
+    fn a_snapshot_waits_for_the_schema_a_late_migration_creates() {
+        let dir = std::env::temp_dir().join(format!(
+            "tp-harness-schema-wait-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("ledger.sqlite3");
+        // The file exists but holds only an unrelated table, as it does
+        // before the migrations that create the counted tables have run.
+        sqlite3_exec(&db, "CREATE TABLE schema_migrations (version INTEGER);");
+
+        let late = db.clone();
+        let migrator = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            sqlite3_exec(
+                &late,
+                "CREATE TABLE outcome_attestations (id INTEGER); \
+                 CREATE TABLE task_budget_renewals (id INTEGER);",
+            );
+        });
+
+        let scratch = copy_ledger_when_schema_complete(&dir);
+        migrator.join().unwrap();
+
+        let tables = sqlite3_query(
+            &scratch.join("ledger.sqlite3"),
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;",
+        );
+        assert!(tables.contains(&"outcome_attestations".to_string()));
+        assert!(tables.contains(&"task_budget_renewals".to_string()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
