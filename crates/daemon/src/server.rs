@@ -1312,7 +1312,7 @@ pub(crate) fn handle_preflight_prepared(
     let projected_duration_secs = estimate.duration_p80_secs.unwrap_or(0);
     // `effective_policy`, not `config.policy` — the one deliberate lever
     // business context has on admission (HORO-1174): deadline narrowing
-    // only. `initialize_task_budget`/`adjust_completion_reserve` above
+    // only. `initialize_task_budget_scoped`/`adjust_completion_reserve` above
     // still used `config.policy` unconditionally.
     //
     // The resource bound evaluated against is `effective_policy.resource`
