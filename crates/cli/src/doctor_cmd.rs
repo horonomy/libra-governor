@@ -703,6 +703,21 @@ fn fetch_daemon_doctor() -> Option<Result<DoctorResult, String>> {
     })
 }
 
+/// The `policy_preset` finding's text, naming the lifetime scope when the
+/// daemon is turn-scoped (HORO-1727 S5) so the preset name alone is not read
+/// as a lifetime cap.
+fn policy_preset_message(preset: &str, scope: libra_governor_domain::LifetimeScope) -> String {
+    match scope {
+        libra_governor_domain::LifetimeScope::TurnScoped => format!(
+            "admission policy preset: {preset}; lifetime scope: turn-scoped (no lifetime \
+             cap, per-turn ceiling only)"
+        ),
+        libra_governor_domain::LifetimeScope::LifetimeBounded => {
+            format!("admission policy preset: {preset}")
+        }
+    }
+}
+
 fn daemon_findings(daemon: &Option<Result<DoctorResult, String>>) -> Vec<Finding> {
     let mut findings = Vec::new();
     match daemon {
@@ -771,7 +786,7 @@ fn daemon_findings(daemon: &Option<Result<DoctorResult, String>>) -> Vec<Finding
             findings.push(Finding {
                 id: "policy_preset",
                 severity: Severity::Ok,
-                message: format!("admission policy preset: {}", result.policy_preset),
+                message: policy_preset_message(&result.policy_preset, result.lifetime_scope),
             });
             if !result.running_config_matches_disk {
                 findings.push(Finding {
@@ -876,6 +891,20 @@ mod tests {
             severity: Severity::Error,
             message: "broken".to_string(),
         }
+    }
+
+    #[test]
+    fn the_policy_preset_finding_names_a_turn_scoped_daemon() {
+        use libra_governor_domain::LifetimeScope;
+        let scoped = policy_preset_message("balanced", LifetimeScope::TurnScoped);
+        assert!(
+            scoped.contains("balanced") && scoped.contains("turn-scoped"),
+            "{scoped}"
+        );
+        assert_eq!(
+            policy_preset_message("balanced", LifetimeScope::LifetimeBounded),
+            "admission policy preset: balanced"
+        );
     }
 
     #[test]
