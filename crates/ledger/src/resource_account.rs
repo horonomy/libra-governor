@@ -977,6 +977,66 @@ mod tests {
         task_id
     }
 
+    /// HORO-1727 S6: `grant_sublease` still caps a child lease at the task
+    /// account's lifetime `hard_limit` for a turn-scoped task, exactly like
+    /// its lifetime-bounded twin (fail closed; nothing calls it in production
+    /// and changing the capacity view would need a migration). Recorded in
+    /// ADR-0024.
+    #[test]
+    fn a_turn_scoped_task_account_cannot_fund_a_sublease_past_its_lifetime_limit() {
+        use libra_governor_domain::{LifetimeScope, TaskIdentity, TurnBound};
+        let turn = TurnBound {
+            cold_start_request: ResourceAmount::Tokens(200),
+            ceiling: ResourceAmount::Tokens(5_000),
+        };
+        let policy = crate::reservation::test_support::thousand_token_policy()
+            .with_turn_bound(turn)
+            .unwrap();
+        let mut outcomes = Vec::new();
+        for scope in [LifetimeScope::TurnScoped, LifetimeScope::LifetimeBounded] {
+            let mut store = LedgerStore::open_in_memory().unwrap();
+            let task_id = TaskId::new();
+            store
+                .insert_task(
+                    &TaskIdentity {
+                        id: task_id,
+                        external_ref: None,
+                    },
+                    now(),
+                )
+                .unwrap();
+            store
+                .initialize_task_budget_scoped(
+                    task_id,
+                    &policy,
+                    &crate::reservation::test_support::fixed_reserve(200),
+                    scope,
+                    now(),
+                )
+                .unwrap();
+            let task_account = AccountId::for_task(task_id);
+            let session = store
+                .ensure_child_account(task_account, AccountLevel::Session, "sess-1", now())
+                .unwrap()
+                .unwrap()
+                .account;
+            let outcome = store
+                .grant_sublease(GrantSubleaseRequest {
+                    parent_account_id: task_account,
+                    child_account_id: session.account_id,
+                    child_natural_key: "sess-1",
+                    amount: ResourceAmount::Tokens(1_200),
+                    idempotency_key: "fund-session",
+                    now: now(),
+                    ttl_secs: 900,
+                })
+                .unwrap()
+                .unwrap();
+            outcomes.push(matches!(outcome, GrantSubleaseOutcome::Insufficient { .. }));
+        }
+        assert_eq!(outcomes, vec![true, true]);
+    }
+
     #[test]
     fn an_extreme_sublease_ttl_is_clamped_to_the_ceiling_instead_of_wrapping() {
         let mut store = LedgerStore::open_in_memory().unwrap();
