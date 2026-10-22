@@ -1325,8 +1325,20 @@ pub(crate) fn handle_preflight_prepared(
     // `extended_by(0)` is a no-op in any case for every task today.
     let mut admission_policy = effective_policy.clone();
     admission_policy.resource = admission_policy.resource.extended_by(granted);
-    let mut decision =
-        admission_policy.evaluate(projected, projected_duration_secs, estimate.confidence)?;
+    // Honor the scope persisted with the task, not the daemon's current
+    // configuration: a turn-scoped task is not evaluated against the
+    // lifetime resource bound, and `evaluate_turn` below is its resource
+    // bound (HORO-1727 S4).
+    let mut decision = if budget.lifetime_scope == libra_governor_domain::LifetimeScope::TurnScoped
+    {
+        admission_policy.evaluate_without_lifetime_resource(
+            projected,
+            projected_duration_secs,
+            estimate.confidence,
+        )?
+    } else {
+        admission_policy.evaluate(projected, projected_duration_secs, estimate.confidence)?
+    };
 
     // Turn-scoped ceiling (HORO-1727 Decision B): a second, independent
     // gate checked against THIS turn's own projected request (`requested`
