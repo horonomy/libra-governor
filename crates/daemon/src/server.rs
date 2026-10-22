@@ -2719,6 +2719,7 @@ fn handle_doctor(ledger: &LedgerStore, config: &DaemonConfig) -> DoctorResult {
                 } else {
                     match crate::config_file::load_overrides(dir) {
                         Ok(crate::config_file::ConfigOverrides {
+                            config_file_present: _,
                             policy: policy_on_disk,
                             gateway: gateway_on_disk,
                             extensions: _extensions_on_disk,
