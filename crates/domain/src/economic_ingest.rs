@@ -164,7 +164,14 @@ pub fn events_from_gateway_request(
         (_, false) => Some(ResourceBasis::LibraReservationHold),
         (EnforcementTier::HooksOnly, true) => None,
     };
-    if let (Some(basis), Some(settled_amount)) = (usd_basis, observation.settled_amount) {
+    // `settled_amount` is denominated in the budget's own resource kind. A
+    // Tokens (or other non-USD) row would otherwise emit its token count as
+    // USD cents (HORO-2042); its token fact comes from the tier columns.
+    let usd_denominated =
+        !matches!(observation.resource_kind, Some(kind) if kind != ResourceKind::Usd);
+    if let (Some(basis), Some(settled_amount), true) =
+        (usd_basis, observation.settled_amount, usd_denominated)
+    {
         let amount = ResourceAmount::from_kind_f64(ResourceKind::Usd, settled_amount);
         let id =
             EconomicEventId::deterministic(&format!("{}:usd", observation.gateway_request_id.0));
@@ -444,6 +451,27 @@ mod tests {
         cache_only.output_tokens = None;
         cache_only.cache_read_input_tokens = Some(5_000);
         assert_eq!(token_amounts(&cache_only), vec![ResourceAmount::Tokens(0)]);
+    }
+
+    #[test]
+    fn a_tokens_budget_row_emits_no_usd_fact_for_its_settled_amount() {
+        let kinds = |observation: &GatewayRequestObservation| {
+            events_from_gateway_request(observation, None)
+                .iter()
+                .map(|e| e.fact().amount.kind())
+                .collect::<Vec<_>>()
+        };
+
+        let mut tokens_row = observation(EnforcementTier::GatewayMetered, true);
+        tokens_row.resource_kind = Some(ResourceKind::Tokens);
+        tokens_row.settled_amount = Some(150.0);
+        assert_eq!(kinds(&tokens_row), vec![ResourceKind::Tokens]);
+
+        // Control: a USD-denominated row still emits both facts.
+        assert_eq!(
+            kinds(&observation(EnforcementTier::GatewayMetered, true)),
+            vec![ResourceKind::Usd, ResourceKind::Tokens]
+        );
     }
 
     #[test]
