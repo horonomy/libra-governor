@@ -352,10 +352,12 @@ pub enum CompletionReserveBasis {
 }
 
 /// Whether a task's resource budget is a lifetime bound on the whole task
-/// or is scoped to a single turn (HORO-1727 S3). Only
-/// [`Self::LifetimeBounded`] is written by any build today; the variant
-/// exists so S4 can introduce turn-scoped budgets without a schema change.
-/// Nothing in admission or reservation reads it yet.
+/// or is scoped to a single turn (HORO-1727 S3). A daemon with no
+/// `config.json` writes [`Self::TurnScoped`] (S4); every other configuration
+/// writes [`Self::LifetimeBounded`]. Ledger reservations, preflight and the
+/// budget displays read the persisted value (see
+/// [`TaskBudget::turn_ceiling_if_scoped`]); a turn-scoped budget with no turn
+/// bound falls back to the lifetime formula. See ADR-0024.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LifetimeScope {
