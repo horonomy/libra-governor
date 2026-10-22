@@ -2,9 +2,9 @@
 
 ## Status
 
-Accepted for v0.0.4 (the slices S1-S4 and D4 are merged on `main`; S5-S8 are in
-progress). Founder decisions: HORO-1727 Jira comment 28055 (D1-D5) and the
-decision packet in comment 28296 (F2, F3). Amends
+Accepted for v0.0.4 (S1-S5, D4 and the HORO-2042 USD-fact fix are merged on
+`main`; the S6 pin tests and S8 real-daemon DogFood are in review). Founder decisions: HORO-1727 Jira comment 28055 (D1-D5) and the
+decision packet in comment 28296 (F2, F3), both since decided by the founder (see Consequences). Amends
 [ADR-0021](0021-turn-scoped-resource-ceiling.md). **Not part of v0.0.3**:
 `release/v0.0.3` keeps the lifetime-bounded default and migrations 0001-0015
 unchanged.
@@ -49,7 +49,7 @@ roughly one real task even though no individual turn was out of bounds.
 
 ## Consequences
 
-- **S5 gates the v0.0.4 release (F3, recommended YES).** Until the display is
+- **S5 is mandatory for the v0.0.4 release (F3, founder: YES).** Until the display is
   scope-aware, statusline/doctor/explain would present a 150k lifetime budget
   for a turn-scoped task and show "exhausted" past 150k while admission admits.
   S5 adds `turn_ceiling` to the budget snapshot, a turn-scoped posture, an
@@ -59,7 +59,7 @@ roughly one real task even though no individual turn was out of bounds.
   and by concurrent active holds (400k). Settled overruns are not capped.
   Operators who want a lifetime cap add a `config.json`, which governs tasks
   created afterwards.
-- **Rollback (F2).** Reverting the seam changes only new tasks; existing
+- **Rollback (F2, founder: do not mutate persisted scopes).** Reverting the seam changes only new tasks; existing
   `lifetime_bounded=0` rows stay turn-scoped for their remaining life. A
   downgraded binary reads the column but ignores it, so those rows are bounded
   at the stored 150k. No repair `UPDATE` is shipped (it would add a mutating
