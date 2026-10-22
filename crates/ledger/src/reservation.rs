@@ -763,8 +763,9 @@ impl LedgerStore {
         // Only the scope and the policy are read here, not the whole budget
         // row: a malformed timestamp must not make an otherwise readable
         // snapshot unreadable (see below), and `read_task_budget_tx` parses
-        // them strictly. An unreadable policy yields no turn ceiling, and
-        // admission refuses such a row anyway.
+        // them strictly. An unreadable scope or policy IS an error here, as
+        // it is at the admission gate: showing such a row as lifetime-bounded
+        // would disagree with admission, which refuses it.
         let scope_row: Option<(i64, String)> = conn
             .query_row(
                 "SELECT lifetime_bounded, policy_json FROM task_budgets WHERE task_id = ?1",
@@ -772,13 +773,15 @@ impl LedgerStore {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        let turn_ceiling = scope_row
-            .and_then(|(bounded, policy_json)| {
-                let scope = scope_from_int(bounded).ok()?;
-                let policy: Policy = serde_json::from_str(&policy_json).ok()?;
-                scope.turn_ceiling(&policy)
-            })
-            .map(|ceiling| ceiling.as_f64());
+        let turn_ceiling = match scope_row {
+            Some((bounded, policy_json)) => {
+                let scope = scope_from_int(bounded)?;
+                let policy: Policy = serde_json::from_str(&policy_json)
+                    .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))?;
+                scope.turn_ceiling(&policy).map(|ceiling| ceiling.as_f64())
+            }
+            None => None,
+        };
         if let Some(tx) = tx {
             tx.commit()?;
         }
@@ -1601,6 +1604,25 @@ mod tests {
     /// gate. A turn-scoped budget keeps reserving after settled spend
     /// crosses the lifetime hard limit; its lifetime-bounded twin is
     /// refused. `available` keeps the lifetime arithmetic for both.
+    #[test]
+    fn a_corrupt_policy_makes_the_snapshot_unreadable_instead_of_lifetime_bounded() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        assert!(store.budget_snapshot(task_id).unwrap().is_some());
+
+        store
+            .conn
+            .execute(
+                "UPDATE task_budgets SET policy_json = 'not json' WHERE task_id = ?1",
+                [task_id.to_string()],
+            )
+            .unwrap();
+        assert!(
+            store.budget_snapshot(task_id).is_err(),
+            "admission refuses this row, so the display must not present it as a lifetime budget"
+        );
+    }
+
     #[test]
     fn a_turn_scoped_snapshot_reports_the_turn_ceiling_and_a_bounded_one_does_not() {
         let mut store = LedgerStore::open_in_memory().unwrap();
