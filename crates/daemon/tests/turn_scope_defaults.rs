@@ -36,3 +36,12 @@ fn a_fresh_turn_scoped_install_admits_past_the_legacy_150k_and_a_cold_start() {
         .unwrap();
     assert_ne!(bounded.admission, Admission::Admit);
 }
+
+#[test]
+fn a_turn_scoped_install_still_refuses_a_single_turn_above_the_400k_ceiling() {
+    assert_eq!(turn_scoped_admission(400_000, 400_000), Admission::Admit);
+    assert!(matches!(
+        turn_scoped_admission(400_001, 400_001),
+        Admission::Deny(_)
+    ));
+}
