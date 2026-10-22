@@ -860,7 +860,7 @@ impl LedgerStore {
         // `effective_hard_limit`, not raw `hard_limit` (HORO-1727) — see
         // `LedgerStore::available`'s doc comment for why this is a no-op
         // change for every task with no renewal ever granted.
-        let general = budget.effective_hard_limit().as_f64() - settled - active;
+        let general = budget.gate_headroom(settled, active);
         let reserve = budget.completion_reserve.as_f64();
         let optional_headroom = general - reserve;
         let requested = req.amount.as_f64();
@@ -1326,8 +1326,7 @@ impl LedgerStore {
                 |row| row.get(0),
             )?;
             // `effective_hard_limit`, not raw `hard_limit` (HORO-1727).
-            let optional_headroom =
-                budget.effective_hard_limit().as_f64() - settled - active - current;
+            let optional_headroom = budget.gate_headroom(settled, active) - current;
             if delta > optional_headroom {
                 tx.commit()?;
                 return Ok(AdjustOutcome::Insufficient {
@@ -1540,8 +1539,9 @@ mod tests {
             .map(|o| o.as_f64())
             .sum();
         assert!(
-            settled + active + budget.completion_reserve.as_f64()
-                <= budget.effective_hard_limit().as_f64() + overrun + 1e-6,
+            budget.lifetime_scope != libra_governor_domain::LifetimeScope::LifetimeBounded
+                || settled + active + budget.completion_reserve.as_f64()
+                    <= budget.effective_hard_limit().as_f64() + overrun + 1e-6,
             "settled + active + reserve must not exceed the effective hard limit beyond a real \
              overrun"
         );
@@ -1573,62 +1573,62 @@ mod tests {
         );
     }
 
-    /// Negative control: S3 only records the scope. Flipping the stored
-    /// value must change nothing about admission or the effective limit;
-    /// S4 is expected to change this test on purpose when it starts
-    /// honoring the field.
+    /// HORO-1727 S4: the stored scope is now honored at the reservation
+    /// gate. A turn-scoped budget keeps reserving after settled spend
+    /// crosses the lifetime hard limit; its lifetime-bounded twin is
+    /// refused. `available` keeps the lifetime arithmetic for both.
     #[test]
-    fn a_lifetime_bounded_budget_serializes_without_the_scope() {
+    fn a_turn_scoped_budget_reserves_past_its_lifetime_hard_limit() {
         let mut store = LedgerStore::open_in_memory().unwrap();
-        let task_id = setup(&mut store, 200);
-        let budget = store.task_budget(task_id).unwrap().unwrap();
-
-        let mut json = serde_json::to_value(&budget).unwrap();
-        assert!(json.get("lifetime_scope").is_none());
-        let round_trip: TaskBudget = serde_json::from_value(json.clone()).unwrap();
-        assert_eq!(round_trip, budget);
-
-        json["lifetime_scope"] = serde_json::json!("turn_scoped");
-        let turn_scoped: TaskBudget = serde_json::from_value(json).unwrap();
-        assert_eq!(
-            turn_scoped.lifetime_scope,
-            libra_governor_domain::LifetimeScope::TurnScoped
-        );
-    }
-
-    #[test]
-    fn the_stored_lifetime_scope_is_not_yet_honored_by_admission() {
-        let mut store = LedgerStore::open_in_memory().unwrap();
-        let task_id = setup(&mut store, 200);
-        let limit_before = store
-            .task_budget(task_id)
-            .unwrap()
-            .unwrap()
-            .effective_hard_limit();
-        let available_before = store
-            .available(task_id, ReservationClass::RequiredWork)
-            .unwrap();
-
-        store
-            .conn
-            .execute(
-                "UPDATE task_budgets SET lifetime_bounded = 0 WHERE task_id = ?1",
-                [task_id.to_string()],
-            )
-            .unwrap();
-
-        let budget = store.task_budget(task_id).unwrap().unwrap();
-        assert_eq!(
-            budget.lifetime_scope,
-            libra_governor_domain::LifetimeScope::TurnScoped
-        );
-        assert_eq!(budget.effective_hard_limit(), limit_before);
-        assert_eq!(
+        let turn = libra_governor_domain::TurnBound {
+            cold_start_request: ResourceAmount::Tokens(200),
+            ceiling: ResourceAmount::Tokens(5_000),
+        };
+        let policy = thousand_token_policy().with_turn_bound(turn).unwrap();
+        let mut outcomes = Vec::new();
+        for scope in [
+            libra_governor_domain::LifetimeScope::TurnScoped,
+            libra_governor_domain::LifetimeScope::LifetimeBounded,
+        ] {
+            let task_id = TaskId::new();
+            let identity = libra_governor_domain::TaskIdentity {
+                id: task_id,
+                external_ref: None,
+            };
+            store.insert_task(&identity, now()).unwrap();
             store
+                .initialize_task_budget_scoped(task_id, &policy, &fixed_reserve(200), scope, now())
+                .unwrap();
+            let spend = |store: &mut LedgerStore, amount: u64, key: &str| {
+                store
+                    .reserve(ReserveRequest {
+                        task_id,
+                        session_id: "sess-1",
+                        plan_id: None,
+                        class: ReservationClass::RequiredWork,
+                        amount: ResourceAmount::Tokens(amount),
+                        idempotency_key: key,
+                        now: now(),
+                        ttl_secs: 900,
+                    })
+                    .unwrap()
+            };
+            let ReserveOutcome::Granted(first) = spend(&mut store, 800, "first") else {
+                panic!("the first reservation fits under both scopes");
+            };
+            store
+                .settle(first.id, Some(ResourceAmount::Tokens(800)), now())
+                .unwrap();
+            let available = store
                 .available(task_id, ReservationClass::RequiredWork)
-                .unwrap(),
-            available_before
-        );
+                .unwrap()
+                .unwrap()
+                .value;
+            assert_eq!(available, 200.0, "available keeps the lifetime arithmetic");
+            let second = spend(&mut store, 500, "second");
+            outcomes.push(matches!(second, ReserveOutcome::Granted(_)));
+        }
+        assert_eq!(outcomes, vec![true, false]);
     }
 
     #[test]
