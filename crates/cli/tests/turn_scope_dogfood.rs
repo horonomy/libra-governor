@@ -123,6 +123,17 @@ fn a_malformed_config_keeps_the_task_lifetime_bounded() {
     assert_lifetime_bounded(&budget_segment(state_dir.path()));
 }
 
+/// An empty config file is still a config file: only a daemon with no
+/// `config.json` at all is turn-scoped (ADR-0024).
+#[test]
+fn an_empty_config_file_keeps_the_task_lifetime_bounded() {
+    let state_dir = support::DaemonState::new();
+    std::fs::write(state_dir.path().join("config.json"), b"{}").unwrap();
+    let repo = repo();
+    admit(state_dir.path(), repo.path());
+    assert_lifetime_bounded(&budget_segment(state_dir.path()));
+}
+
 /// The scope is persisted with the task, so a config file written after the
 /// task was created changes nothing for it.
 #[test]
