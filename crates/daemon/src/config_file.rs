@@ -240,6 +240,22 @@ pub struct ConfigOverrides {
 }
 
 impl ConfigOverrides {
+    /// The lifetime scope the daemon runs with (HORO-1727 S4). Only a daemon
+    /// with no configuration at all - no policy, gateway, extensions or
+    /// launcher - is turn-scoped; any configuration, and a rejected one
+    /// (see [`Self::rejected_fallback`]), stays lifetime-bounded.
+    pub fn lifetime_scope(&self) -> libra_governor_domain::LifetimeScope {
+        if self.policy.is_none()
+            && self.gateway.is_none()
+            && self.extensions.is_none()
+            && self.launcher.is_none()
+        {
+            libra_governor_domain::LifetimeScope::TurnScoped
+        } else {
+            libra_governor_domain::LifetimeScope::LifetimeBounded
+        }
+    }
+
     /// What the daemon runs with when `config.json` is present but
     /// rejected. A rejected config must stay lifetime-bounded, so it names
     /// [`crate::server::legacy_bounded_policy`] explicitly instead of
@@ -455,6 +471,27 @@ mod tests {
             Some(crate::server::legacy_bounded_policy())
         );
         assert!(overrides.gateway.is_none());
+    }
+
+    #[test]
+    fn only_a_daemon_with_no_configuration_at_all_is_turn_scoped() {
+        use libra_governor_domain::LifetimeScope;
+        assert_eq!(
+            ConfigOverrides::default().lifetime_scope(),
+            LifetimeScope::TurnScoped
+        );
+        let named_preset = ConfigOverrides {
+            policy: Some(crate::server::legacy_bounded_policy()),
+            ..ConfigOverrides::default()
+        };
+        assert_eq!(
+            named_preset.lifetime_scope(),
+            LifetimeScope::LifetimeBounded
+        );
+        assert_eq!(
+            ConfigOverrides::rejected_fallback().lifetime_scope(),
+            LifetimeScope::LifetimeBounded
+        );
     }
 
     #[test]

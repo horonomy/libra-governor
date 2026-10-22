@@ -72,6 +72,7 @@ pub fn run() {
         }
     };
 
+    let lifetime_scope = overrides.lifetime_scope();
     let config = daemon_config(
         state_dir.join("daemon.sock"),
         state_dir.join("ledger.sqlite3"),
@@ -79,7 +80,7 @@ pub fn run() {
         overrides
             .policy
             .unwrap_or_else(libra_governor_daemon::default_admission_policy),
-        libra_governor_domain::LifetimeScope::LifetimeBounded,
+        lifetime_scope,
         overrides.gateway,
         overrides.extensions,
         overrides.launcher,
@@ -225,7 +226,7 @@ pub fn run_trusted(config_path: &Path) -> i32 {
         cfg.socket_path(),
         cfg.ledger_path(),
         cfg.log_path(),
-        libra_governor_daemon::default_admission_policy(),
+        libra_governor_daemon::legacy_bounded_policy(),
         libra_governor_domain::LifetimeScope::LifetimeBounded,
         None,
         None,
