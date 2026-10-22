@@ -13,10 +13,11 @@ unchanged.
 
 ADR-0021 added a turn-scoped resource ceiling next to the lifetime envelope of
 the one built-in policy (`balanced`: 100k target, 125k elastic, 150k hard) and
-left the lifetime envelope as the binding limit. Measured real turns cost about
-5x the shipped lifetime default, so a fresh install stopped working after a
-fraction of one real task even though each turn was well inside the turn
-ceiling (400k).
+left the lifetime envelope as the binding limit. ADR-0021 measured real per-turn
+fresh-token cost at p80 ~120,700 and p95 ~385,407, so two ordinary turns
+already exceed the 150k lifetime hard ceiling, while each single turn sits
+inside the 400k turn ceiling. A fresh install therefore stopped working after
+roughly one real task even though no individual turn was out of bounds.
 
 ## Decision
 
