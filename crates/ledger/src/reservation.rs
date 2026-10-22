@@ -1578,6 +1578,52 @@ mod tests {
     /// crosses the lifetime hard limit; its lifetime-bounded twin is
     /// refused. `available` keeps the lifetime arithmetic for both.
     #[test]
+    fn a_turn_scoped_budget_still_caps_concurrent_holds_at_the_turn_ceiling() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let turn = libra_governor_domain::TurnBound {
+            cold_start_request: ResourceAmount::Tokens(200),
+            ceiling: ResourceAmount::Tokens(5_000),
+        };
+        let policy = thousand_token_policy().with_turn_bound(turn).unwrap();
+        let task_id = TaskId::new();
+        let identity = libra_governor_domain::TaskIdentity {
+            id: task_id,
+            external_ref: None,
+        };
+        store.insert_task(&identity, now()).unwrap();
+        store
+            .initialize_task_budget_scoped(
+                task_id,
+                &policy,
+                &fixed_reserve(200),
+                libra_governor_domain::LifetimeScope::TurnScoped,
+                now(),
+            )
+            .unwrap();
+        let mut reserve = |amount: u64, key: &str| {
+            store
+                .reserve(ReserveRequest {
+                    task_id,
+                    session_id: "sess-1",
+                    plan_id: None,
+                    class: ReservationClass::RequiredWork,
+                    amount: ResourceAmount::Tokens(amount),
+                    idempotency_key: key,
+                    now: now(),
+                    ttl_secs: 900,
+                })
+                .unwrap()
+        };
+        assert!(matches!(reserve(4_000, "held"), ReserveOutcome::Granted(_)));
+        // 4,000 held + 1,500 requested is past the 5,000 turn ceiling.
+        assert!(matches!(
+            reserve(1_500, "too-much"),
+            ReserveOutcome::Insufficient { .. }
+        ));
+        assert!(matches!(reserve(1_000, "fits"), ReserveOutcome::Granted(_)));
+    }
+
+    #[test]
     fn a_turn_scoped_budget_reserves_past_its_lifetime_hard_limit() {
         let mut store = LedgerStore::open_in_memory().unwrap();
         let turn = libra_governor_domain::TurnBound {
