@@ -3025,6 +3025,27 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_scoped_daemon_configures_no_lifetime_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_for_doctor_tests(dir.path());
+        let bounded = configured_budget(&config).unwrap();
+        assert_eq!(
+            bounded.ceiling,
+            Some(config.policy.resource.hard_ceiling),
+            "control: a lifetime-bounded daemon reports its lifetime ceiling"
+        );
+        assert_eq!(bounded.turn_ceiling, None);
+
+        config.lifetime_scope = libra_governor_domain::LifetimeScope::TurnScoped;
+        let scoped = configured_budget(&config).unwrap();
+        assert_eq!(scoped.ceiling, None);
+        assert_eq!(
+            scoped.turn_ceiling,
+            config.policy.turn.as_ref().map(|turn| turn.ceiling)
+        );
+    }
+
+    #[test]
     fn doctor_reports_healthy_state_with_no_config_file_and_matching_schema() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_for_doctor_tests(dir.path());
