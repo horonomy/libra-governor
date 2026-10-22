@@ -756,6 +756,29 @@ impl LedgerStore {
         // different instant than `settled`/`active`, the exact
         // single-instant guarantee this method's own docs promise.
         let granted = granted_capacity(conn, task_id)?;
+        // The scope is read from the same row, in the same snapshot, through
+        // the predicate admission itself uses (HORO-1727 S5), so the
+        // displayed ceiling cannot disagree with the gated one.
+        //
+        // Only the scope and the policy are read here, not the whole budget
+        // row: a malformed timestamp must not make an otherwise readable
+        // snapshot unreadable (see below), and `read_task_budget_tx` parses
+        // them strictly. An unreadable policy yields no turn ceiling, and
+        // admission refuses such a row anyway.
+        let scope_row: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT lifetime_bounded, policy_json FROM task_budgets WHERE task_id = ?1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let turn_ceiling = scope_row
+            .and_then(|(bounded, policy_json)| {
+                let scope = scope_from_int(bounded).ok()?;
+                let policy: Policy = serde_json::from_str(&policy_json).ok()?;
+                scope.turn_ceiling(&policy)
+            })
+            .map(|ceiling| ceiling.as_f64());
         if let Some(tx) = tx {
             tx.commit()?;
         }
@@ -787,7 +810,8 @@ impl LedgerStore {
                 settled,
                 active,
                 reservation_count,
-            ),
+            )
+            .with_turn_ceiling(turn_ceiling),
             last_touched_at,
         )))
     }
@@ -1577,6 +1601,39 @@ mod tests {
     /// gate. A turn-scoped budget keeps reserving after settled spend
     /// crosses the lifetime hard limit; its lifetime-bounded twin is
     /// refused. `available` keeps the lifetime arithmetic for both.
+    #[test]
+    fn a_turn_scoped_snapshot_reports_the_turn_ceiling_and_a_bounded_one_does_not() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let turn = libra_governor_domain::TurnBound {
+            cold_start_request: ResourceAmount::Tokens(200),
+            ceiling: ResourceAmount::Tokens(5_000),
+        };
+        let policy = thousand_token_policy().with_turn_bound(turn).unwrap();
+        let mut ceilings = Vec::new();
+        for scope in [
+            libra_governor_domain::LifetimeScope::TurnScoped,
+            libra_governor_domain::LifetimeScope::LifetimeBounded,
+        ] {
+            let task_id = TaskId::new();
+            let identity = libra_governor_domain::TaskIdentity {
+                id: task_id,
+                external_ref: None,
+            };
+            store.insert_task(&identity, now()).unwrap();
+            store
+                .initialize_task_budget_scoped(task_id, &policy, &fixed_reserve(200), scope, now())
+                .unwrap();
+            ceilings.push(
+                store
+                    .budget_snapshot(task_id)
+                    .unwrap()
+                    .unwrap()
+                    .turn_ceiling(),
+            );
+        }
+        assert_eq!(ceilings, vec![Some(ResourceAmount::Tokens(5_000)), None]);
+    }
+
     #[test]
     fn a_turn_scoped_budget_still_caps_concurrent_holds_at_the_turn_ceiling() {
         let mut store = LedgerStore::open_in_memory().unwrap();
