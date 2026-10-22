@@ -971,6 +971,10 @@ fn budget_segment(
         Some(LedgerFreshness::Stale { .. }) => (" (stale)", true),
         Some(LedgerFreshness::Unknown { .. }) => (" (freshness unknown)", true),
     };
+    // A turn-scoped task is gated on its turn ceiling (HORO-1727 S5): its
+    // snapshot carries one, and no lifetime figure may be presented as a
+    // limit or a remainder.
+    let turn_ceiling = amounts.and_then(|a| a.turn_ceiling());
     let (state, label, reason_code, clear_role) = match posture {
         BudgetPosture::Remaining { fraction_left } => {
             match percent_left(share_to_display(fraction_left, amounts)) {
@@ -1012,6 +1016,12 @@ fn budget_segment(
         // advisory-only, so an exhausted envelope means the ledger will
         // refuse the next reservation, not that work has stopped. `critical`
         // would claim the latter.
+        BudgetPosture::Exhausted if turn_ceiling.is_some() => (
+            "warn",
+            "Turn ceiling reached".to_string(),
+            Some("budget_turn_ceiling_reached"),
+            "exception",
+        ),
         BudgetPosture::Exhausted => (
             "warn",
             "Budget exhausted".to_string(),
@@ -1034,7 +1044,15 @@ fn budget_segment(
         // spend (HORO-1727 S5).
         BudgetPosture::TurnScoped => (
             "neutral",
-            "No lifetime cap".to_string(),
+            match turn_ceiling {
+                Some(ceiling) => {
+                    format!(
+                        "No lifetime cap, {} per turn",
+                        grouped_f64(ceiling.as_f64())
+                    )
+                }
+                None => "No lifetime cap".to_string(),
+            },
             Some("budget_turn_scoped"),
             "vital",
         ),
@@ -1064,7 +1082,25 @@ fn budget_segment(
     }
     if let Some(amounts) = amounts {
         budget_amount_fields(&mut segment, amounts, freshness);
-        budget_count_fields(&mut segment, amounts, display);
+        if let Some(ceiling) = turn_ceiling {
+            // Withhold every field that presents the stored lifetime figure
+            // as a limit or a remainder: with spend above 1 they would
+            // render red for a task that is not over anything.
+            if let Some(fields) = segment.as_object_mut() {
+                for key in [
+                    "budget_total",
+                    "budget_remaining",
+                    "budget_pressure_percent",
+                    "semantic_state",
+                ] {
+                    fields.remove(key);
+                }
+            }
+            segment["budget_lifetime_scope"] = json!("turn_scoped");
+            amount_field(&mut segment, "budget_turn_ceiling", ceiling.as_f64());
+        } else {
+            budget_count_fields(&mut segment, amounts, display);
+        }
     }
     segment
 }
@@ -1101,7 +1137,24 @@ fn configured_budget_segment(
     if display == BudgetDisplay::Percent {
         return None;
     }
-    let ceiling = configured.ceiling?;
+    let Some(ceiling) = configured.ceiling else {
+        // Turn-scoped daemon: a new task has no lifetime ceiling, and a
+        // `budget_total` here would be read as one (HORO-1727 S5).
+        let turn_ceiling = configured.turn_ceiling?;
+        let unit = unit_noun(turn_ceiling.kind())?;
+        return Some(json!({
+            "key": "budget_configured",
+            "state": "neutral",
+            "label": "No lifetime cap for a new task",
+            "budget_scope": "configured_default",
+            "budget_lifetime_scope": "turn_scoped",
+            "budget_unit": unit,
+            "budget_turn_ceiling": turn_ceiling.as_f64(),
+            "explain_key": "libra.budget",
+            "order_hint": 26,
+            "clear_role": "supporting",
+        }));
+    };
     let unit = unit_noun(ceiling.kind())?;
     let count = count_value(ceiling.as_f64())?;
     Some(json!({
@@ -2076,6 +2129,45 @@ mod tests {
                 "{posture:?} has no snapshot behind it by construction"
             );
         }
+    }
+
+    #[test]
+    fn a_turn_scoped_budget_segment_shows_no_lifetime_total_and_is_not_exhausted() {
+        let amounts = amounts_for(BudgetPosture::TurnScoped).unwrap();
+        let segment = budget_segment(
+            BudgetPosture::from_snapshot(&amounts),
+            Some(&amounts),
+            BudgetDisplay::Full,
+            None,
+        );
+        assert_eq!(segment["state"], "neutral");
+        assert_eq!(segment["reason_code"], "budget_turn_scoped");
+        assert_eq!(segment["label"], "No lifetime cap, 400,000 per turn");
+        assert_eq!(segment["budget_lifetime_scope"], "turn_scoped");
+        assert_eq!(segment["budget_turn_ceiling"], 400_000.0);
+        for withheld in [
+            "budget_total",
+            "budget_remaining",
+            "budget_pressure_percent",
+            "semantic_state",
+            "count",
+            "total",
+        ] {
+            assert!(
+                segment.get(withheld).is_none(),
+                "{withheld} must be withheld"
+            );
+        }
+        // Control: the same spend on a lifetime-bounded task is exhausted.
+        let bounded =
+            BudgetSnapshot::new(ResourceKind::Tokens, 150_000.0, 30_000.0, 200_000.0, 0.0, 2);
+        let exhausted = budget_segment(
+            BudgetPosture::from_snapshot(&bounded),
+            Some(&bounded),
+            BudgetDisplay::Full,
+            None,
+        );
+        assert_eq!(exhausted["reason_code"], "budget_hard_limit_reached");
     }
 
     fn doctor_with(preset: &str, matches_disk: bool) -> DoctorResult {
