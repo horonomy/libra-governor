@@ -365,6 +365,20 @@ pub enum LifetimeScope {
 }
 
 impl LifetimeScope {
+    /// The turn ceiling that gates a budget of this scope under `policy`
+    /// (HORO-1727 S5): `Some` only for [`Self::TurnScoped`] with a policy
+    /// that carries a turn bound. Callable from the persisted scope and
+    /// policy alone, so a reader that must not parse the whole budget row
+    /// (the snapshot, which tolerates a malformed timestamp) uses the same
+    /// rule as [`TaskBudget::turn_ceiling_if_scoped`].
+    pub fn turn_ceiling(self, policy: &Policy) -> Option<ResourceAmount> {
+        if self == Self::TurnScoped {
+            policy.turn.as_ref().map(|turn| turn.ceiling)
+        } else {
+            None
+        }
+    }
+
     /// `serde` skip predicate: the default scope is not serialized, so a
     /// `TaskBudget` that is lifetime-bounded serializes byte-identically
     /// to one written before this field existed.
@@ -437,12 +451,21 @@ impl TaskBudget {
     /// to the lifetime formula and fails closed. `effective_hard_limit`,
     /// `available` and the snapshot keep their lifetime arithmetic.
     pub fn gate_headroom(&self, settled: f64, active: f64) -> f64 {
-        if self.lifetime_scope == LifetimeScope::TurnScoped {
-            if let Some(turn) = &self.policy.turn {
-                return turn.ceiling.as_f64() - active;
-            }
+        if let Some(ceiling) = self.turn_ceiling_if_scoped() {
+            return ceiling.as_f64() - active;
         }
         self.effective_hard_limit().as_f64() - settled - active
+    }
+
+    /// The turn ceiling that gates this budget, or `None` when the budget is
+    /// gated on its lifetime limit (HORO-1727 S5). `Some` only for a
+    /// [`LifetimeScope::TurnScoped`] budget whose policy carries a turn
+    /// bound; a turn-scoped budget with no turn bound falls back to the
+    /// lifetime formula (fail closed), so it is `None` here too. The one
+    /// predicate [`Self::gate_headroom`] and every display surface share,
+    /// so what is shown can never disagree with what is admitted.
+    pub fn turn_ceiling_if_scoped(&self) -> Option<ResourceAmount> {
+        self.lifetime_scope.turn_ceiling(&self.policy)
     }
 }
 
@@ -496,6 +519,13 @@ pub struct BudgetSnapshot {
     settled: f64,
     active: f64,
     reservation_count: u64,
+    /// The per-turn ceiling that gates a turn-scoped task (HORO-1727 S5),
+    /// `None` for a lifetime-bounded task. When `Some`, `hard_limit` is
+    /// still the stored lifetime figure but is not what admission gates on.
+    /// Skipped when `None`, so a lifetime-bounded snapshot serializes
+    /// exactly as it did before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turn_ceiling: Option<f64>,
 }
 
 impl BudgetSnapshot {
@@ -524,6 +554,7 @@ impl BudgetSnapshot {
             settled,
             active,
             reservation_count,
+            turn_ceiling: None,
         }
     }
 
@@ -551,6 +582,7 @@ impl BudgetSnapshot {
             settled,
             active,
             reservation_count,
+            turn_ceiling: None,
         }
     }
 
@@ -559,6 +591,21 @@ impl BudgetSnapshot {
     /// one unit per envelope and no figure here can be a sum of two.
     pub fn kind(&self) -> crate::resource_amount::ResourceKind {
         self.kind
+    }
+
+    /// Marks this snapshot as belonging to a turn-scoped task gated on
+    /// `ceiling` per turn (HORO-1727 S5). A separate builder rather than a
+    /// parameter on [`Self::new`], which has roughly three dozen call sites.
+    pub const fn with_turn_ceiling(mut self, ceiling: Option<f64>) -> Self {
+        self.turn_ceiling = ceiling;
+        self
+    }
+
+    /// The per-turn ceiling gating this task, or `None` for a
+    /// lifetime-bounded task, which is gated on [`Self::total`].
+    pub fn turn_ceiling(&self) -> Option<ResourceAmount> {
+        self.turn_ceiling
+            .map(|ceiling| ResourceAmount::from_kind_f64(self.kind, ceiling))
     }
 
     /// The task's *original*, immutable ceiling as configured at
@@ -1295,6 +1342,31 @@ mod lifetime_scope_tests {
         assert_eq!(
             serde_json::to_string(&LifetimeScope::TurnScoped).unwrap(),
             "\"turn_scoped\""
+        );
+    }
+}
+
+#[cfg(test)]
+mod turn_ceiling_tests {
+    use super::*;
+    use crate::resource_amount::ResourceKind;
+
+    #[test]
+    fn a_lifetime_bounded_snapshot_serializes_without_a_turn_ceiling() {
+        let bounded = BudgetSnapshot::new(ResourceKind::Tokens, 150_000.0, 36_000.0, 0.0, 0.0, 0);
+        let json = serde_json::to_value(bounded).unwrap();
+        assert!(json.get("turn_ceiling").is_none());
+        let round_trip: BudgetSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(round_trip, bounded);
+        assert_eq!(round_trip.turn_ceiling(), None);
+
+        let scoped = bounded.with_turn_ceiling(Some(400_000.0));
+        let json = serde_json::to_value(scoped).unwrap();
+        assert_eq!(json["turn_ceiling"], 400_000.0);
+        let round_trip: BudgetSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            round_trip.turn_ceiling(),
+            Some(ResourceAmount::Tokens(400_000))
         );
     }
 }
