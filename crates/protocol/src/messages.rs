@@ -533,6 +533,14 @@ impl BudgetPosture {
     ///
     /// # Why the branches are in this order
     ///
+    /// Turn scope before everything. A turn-scoped task is gated on its turn
+    /// ceiling (HORO-1727 S5), so the lifetime exhaustion and share tests
+    /// below do not apply to it at all; it is `TurnScoped`, or `Exhausted`
+    /// only when active holds reach the turn ceiling. It is `TurnScoped`
+    /// even while headroom is smaller than the next cold-start request:
+    /// `Exhausted` means every reservation is refused, which is the same
+    /// meaning it has for a lifetime budget.
+    ///
     /// Exhaustion first. It is the only posture that changes what the
     /// user should do next, and it is a fact about the ledger's own
     /// refusal threshold rather than about the share — an exhausted
