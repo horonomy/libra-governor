@@ -462,6 +462,36 @@ impl LedgerStore {
         reserve: &CompletionReserveEstimate,
         now: OffsetDateTime,
     ) -> Result<TaskBudget, LedgerError> {
+        self.initialize_task_budget_scoped(
+            task_id,
+            policy,
+            reserve,
+            libra_governor_domain::LifetimeScope::LifetimeBounded,
+            now,
+        )
+    }
+
+    /// [`Self::initialize_task_budget`] with an explicit lifetime scope
+    /// (HORO-1727 S4). `hard_limit` is stored identically for both scopes
+    /// (`policy.resource.hard_ceiling`), so a binary that ignores the scope
+    /// column still enforces it. A policy with no turn bound can never be
+    /// turn-scoped: with nothing else bounding spend, the scope is stored
+    /// as `LifetimeBounded`. `ON CONFLICT DO NOTHING` means an existing
+    /// task is never re-scoped.
+    pub fn initialize_task_budget_scoped(
+        &mut self,
+        task_id: TaskId,
+        policy: &Policy,
+        reserve: &CompletionReserveEstimate,
+        scope: libra_governor_domain::LifetimeScope,
+        now: OffsetDateTime,
+    ) -> Result<TaskBudget, LedgerError> {
+        let lifetime_bounded: i64 =
+            if scope == libra_governor_domain::LifetimeScope::TurnScoped && policy.turn.is_some() {
+                0
+            } else {
+                1
+            };
         let resource_kind = policy.resource.target.kind();
         let policy_json = serde_json::to_string(policy).map_err(|e| {
             LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
@@ -475,7 +505,7 @@ impl LedgerStore {
                 completion_reserve, completion_reserve_basis, policy_json,
                 policy_schema_version, reservation_schema_version, created_at, updated_at,
                 lifetime_bounded
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(task_id) DO NOTHING",
             rusqlite::params![
                 task_id.to_string(),
@@ -489,6 +519,7 @@ impl LedgerStore {
                 RESERVATION_SCHEMA_VERSION,
                 now_str,
                 now_str,
+                lifetime_bounded,
             ],
         )?;
         // The task-level resource account (HORO-1668): deterministic id
@@ -1597,6 +1628,59 @@ mod tests {
                 .available(task_id, ReservationClass::RequiredWork)
                 .unwrap(),
             available_before
+        );
+    }
+
+    #[test]
+    fn a_turn_scoped_initialization_stores_the_scope_and_keeps_the_hard_limit() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let turn = libra_governor_domain::TurnBound {
+            cold_start_request: ResourceAmount::Tokens(200),
+            ceiling: ResourceAmount::Tokens(5_000),
+        };
+        let turn_policy = thousand_token_policy().with_turn_bound(turn).unwrap();
+        let scoped = TaskId::new();
+        let no_turn_bound = TaskId::new();
+        for id in [scoped, no_turn_bound] {
+            let identity = libra_governor_domain::TaskIdentity {
+                id,
+                external_ref: None,
+            };
+            store.insert_task(&identity, now()).unwrap();
+        }
+        store
+            .initialize_task_budget_scoped(
+                scoped,
+                &turn_policy,
+                &fixed_reserve(200),
+                libra_governor_domain::LifetimeScope::TurnScoped,
+                now(),
+            )
+            .unwrap();
+        // A policy with no turn bound can never be turn-scoped.
+        store
+            .initialize_task_budget_scoped(
+                no_turn_bound,
+                &thousand_token_policy(),
+                &fixed_reserve(200),
+                libra_governor_domain::LifetimeScope::TurnScoped,
+                now(),
+            )
+            .unwrap();
+
+        let scoped_budget = store.task_budget(scoped).unwrap().unwrap();
+        assert_eq!(
+            scoped_budget.lifetime_scope,
+            libra_governor_domain::LifetimeScope::TurnScoped
+        );
+        assert_eq!(scoped_budget.hard_limit, ResourceAmount::Tokens(1_000));
+        assert_eq!(
+            store
+                .task_budget(no_turn_bound)
+                .unwrap()
+                .unwrap()
+                .lifetime_scope,
+            libra_governor_domain::LifetimeScope::LifetimeBounded
         );
     }
 
