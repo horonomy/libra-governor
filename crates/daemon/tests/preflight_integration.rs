@@ -31,6 +31,7 @@ fn preflight_returns_sane_result_within_recon_budget() {
         ..ReconBudget::default()
     };
     let config = DaemonConfig {
+        lifetime_scope: libra_governor_domain::LifetimeScope::LifetimeBounded,
         socket_path: dir.path().join("d.sock"),
         ledger_path: dir.path().join("ledger.sqlite3"),
         log_path: dir.path().join("daemon.log"),
@@ -131,6 +132,7 @@ fn preflight_returns_sane_result_within_recon_budget() {
 fn second_preflight_for_same_session_supersedes_the_first() {
     let dir = tempfile::tempdir().unwrap();
     let config = DaemonConfig {
+        lifetime_scope: libra_governor_domain::LifetimeScope::LifetimeBounded,
         socket_path: dir.path().join("d.sock"),
         ledger_path: dir.path().join("ledger.sqlite3"),
         log_path: dir.path().join("daemon.log"),
@@ -285,6 +287,7 @@ fn preflight_selects_a_bucketed_tier_once_same_repo_history_exists() {
     }
 
     let config = DaemonConfig {
+        lifetime_scope: libra_governor_domain::LifetimeScope::LifetimeBounded,
         socket_path: dir.path().join("d.sock"),
         ledger_path,
         log_path: dir.path().join("daemon.log"),

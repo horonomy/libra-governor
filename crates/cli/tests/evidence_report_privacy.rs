@@ -103,6 +103,7 @@ impl Sandbox {
     fn seed_one_real_preflight_with_marker(&self, marker: &str) {
         std::fs::create_dir_all(&self.state_dir).unwrap();
         let config = DaemonConfig {
+            lifetime_scope: libra_governor_domain::LifetimeScope::LifetimeBounded,
             socket_path: self.state_dir.join("seed.sock"),
             ledger_path: self.state_dir.join("ledger.sqlite3"),
             log_path: self.state_dir.join("daemon.log"),

@@ -61,6 +61,7 @@ fn send(
 
 fn config(dir: &Path, policy: Policy, with_gateway: bool) -> DaemonConfig {
     DaemonConfig {
+        lifetime_scope: libra_governor_domain::LifetimeScope::LifetimeBounded,
         socket_path: dir.join("d.sock"),
         ledger_path: dir.join("ledger.sqlite3"),
         log_path: dir.join("daemon.log"),

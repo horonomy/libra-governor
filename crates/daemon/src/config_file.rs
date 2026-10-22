@@ -229,6 +229,11 @@ fn resolve_extensions(raw: RawExtensionsConfig) -> libra_governor_extension::Ext
 /// ambiguity a named struct exists to avoid.
 #[derive(Debug, Default)]
 pub struct ConfigOverrides {
+    /// `true` when a `config.json` exists, even if it is empty, names no
+    /// recognized key, or was rejected. Only a daemon with no configuration
+    /// file at all is turn-scoped (HORO-1727 S4), so a misspelled or
+    /// partial file can never silently drop the lifetime bound.
+    pub config_file_present: bool,
     pub policy: Option<Policy>,
     pub gateway: Option<GatewayConfig>,
     pub extensions: Option<libra_governor_extension::ExtensionConfig>,
@@ -240,12 +245,30 @@ pub struct ConfigOverrides {
 }
 
 impl ConfigOverrides {
+    /// The lifetime scope the daemon runs with (HORO-1727 S4). Only a daemon
+    /// with no `config.json` at all is turn-scoped; any config file - even
+    /// an empty or misspelled one - and a rejected one (see
+    /// [`Self::rejected_fallback`]) stays lifetime-bounded.
+    pub fn lifetime_scope(&self) -> libra_governor_domain::LifetimeScope {
+        if !self.config_file_present
+            && self.policy.is_none()
+            && self.gateway.is_none()
+            && self.extensions.is_none()
+            && self.launcher.is_none()
+        {
+            libra_governor_domain::LifetimeScope::TurnScoped
+        } else {
+            libra_governor_domain::LifetimeScope::LifetimeBounded
+        }
+    }
+
     /// What the daemon runs with when `config.json` is present but
     /// rejected. A rejected config must stay lifetime-bounded, so it names
     /// [`crate::server::legacy_bounded_policy`] explicitly instead of
     /// taking the no-config path, whose default HORO-1727 S4 may change.
     pub fn rejected_fallback() -> Self {
         Self {
+            config_file_present: true,
             policy: Some(crate::server::legacy_bounded_policy()),
             ..Self::default()
         }
@@ -277,6 +300,7 @@ pub fn load_overrides(state_dir: &Path) -> Result<ConfigOverrides, ConfigFileErr
     let extensions = raw.extensions.map(resolve_extensions);
     let launcher = raw.launcher.map(resolve_launcher).transpose()?;
     Ok(ConfigOverrides {
+        config_file_present: true,
         policy,
         gateway,
         extensions,
@@ -455,6 +479,52 @@ mod tests {
             Some(crate::server::legacy_bounded_policy())
         );
         assert!(overrides.gateway.is_none());
+    }
+
+    #[test]
+    fn only_a_daemon_with_no_configuration_at_all_is_turn_scoped() {
+        use libra_governor_domain::LifetimeScope;
+        assert_eq!(
+            ConfigOverrides::default().lifetime_scope(),
+            LifetimeScope::TurnScoped
+        );
+        let named_preset = ConfigOverrides {
+            policy: Some(crate::server::legacy_bounded_policy()),
+            ..ConfigOverrides::default()
+        };
+        assert_eq!(
+            named_preset.lifetime_scope(),
+            LifetimeScope::LifetimeBounded
+        );
+        assert_eq!(
+            ConfigOverrides::rejected_fallback().lifetime_scope(),
+            LifetimeScope::LifetimeBounded
+        );
+    }
+
+    #[test]
+    fn an_empty_or_misspelled_config_file_stays_lifetime_bounded() {
+        use libra_governor_domain::LifetimeScope;
+        for body in [
+            "{}",
+            r#"{"polcy": {"preset": "balanced"}}"#,
+            r#"{"policy": null}"#,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(CONFIG_FILE_NAME), body).unwrap();
+            let overrides = load_overrides(dir.path()).unwrap();
+            assert_eq!(
+                overrides.lifetime_scope(),
+                LifetimeScope::LifetimeBounded,
+                "config body {body} must not drop the lifetime bound"
+            );
+        }
+        // No file at all is the one turn-scoped case.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            load_overrides(dir.path()).unwrap().lifetime_scope(),
+            LifetimeScope::TurnScoped
+        );
     }
 
     #[test]

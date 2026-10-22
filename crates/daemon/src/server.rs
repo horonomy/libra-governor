@@ -105,6 +105,12 @@ pub struct DaemonConfig {
     /// daemon). See [`default_admission_policy`] for the shipped
     /// default.
     pub policy: Policy,
+    /// Whether the budgets this daemon initializes are bounded for the
+    /// task's lifetime or only per turn (HORO-1727 S4). Held here, not on
+    /// [`Policy`], so `policy_json` stays the single record of the limits;
+    /// the scope is persisted per task in `task_budgets.lifetime_bounded`
+    /// and honored from there.
+    pub lifetime_scope: libra_governor_domain::LifetimeScope,
     /// How long a reservation may stay `Active` before startup/opportunistic
     /// reconciliation reclaims it (HORO-1141) — see
     /// [`reconcile_stale_reservations`].
@@ -1244,7 +1250,13 @@ pub(crate) fn handle_preflight_prepared(
     // task (a new prompt in the same session, or a replan) recomputes
     // and adjusts the reserve against the freshest evidence.
     let reserve_estimate = completion_reserve_for(&contract, Some(&estimate), &config.policy);
-    let budget = ledger.initialize_task_budget(task_id, &config.policy, &reserve_estimate, now)?;
+    let budget = ledger.initialize_task_budget_scoped(
+        task_id,
+        &config.policy,
+        &reserve_estimate,
+        config.lifetime_scope,
+        now,
+    )?;
     if had_existing_budget {
         match ledger.adjust_completion_reserve(
             task_id,
@@ -1300,7 +1312,7 @@ pub(crate) fn handle_preflight_prepared(
     let projected_duration_secs = estimate.duration_p80_secs.unwrap_or(0);
     // `effective_policy`, not `config.policy` — the one deliberate lever
     // business context has on admission (HORO-1174): deadline narrowing
-    // only. `initialize_task_budget`/`adjust_completion_reserve` above
+    // only. `initialize_task_budget_scoped`/`adjust_completion_reserve` above
     // still used `config.policy` unconditionally.
     //
     // The resource bound evaluated against is `effective_policy.resource`
@@ -1313,8 +1325,20 @@ pub(crate) fn handle_preflight_prepared(
     // `extended_by(0)` is a no-op in any case for every task today.
     let mut admission_policy = effective_policy.clone();
     admission_policy.resource = admission_policy.resource.extended_by(granted);
-    let mut decision =
-        admission_policy.evaluate(projected, projected_duration_secs, estimate.confidence)?;
+    // Honor the scope persisted with the task, not the daemon's current
+    // configuration: a turn-scoped task is not evaluated against the
+    // lifetime resource bound, and `evaluate_turn` below is its resource
+    // bound (HORO-1727 S4).
+    let mut decision = if budget.lifetime_scope == libra_governor_domain::LifetimeScope::TurnScoped
+    {
+        admission_policy.evaluate_without_lifetime_resource(
+            projected,
+            projected_duration_secs,
+            estimate.confidence,
+        )?
+    } else {
+        admission_policy.evaluate(projected, projected_duration_secs, estimate.confidence)?
+    };
 
     // Turn-scoped ceiling (HORO-1727 Decision B): a second, independent
     // gate checked against THIS turn's own projected request (`requested`
@@ -2695,6 +2719,7 @@ fn handle_doctor(ledger: &LedgerStore, config: &DaemonConfig) -> DoctorResult {
                 } else {
                     match crate::config_file::load_overrides(dir) {
                         Ok(crate::config_file::ConfigOverrides {
+                            config_file_present: _,
                             policy: policy_on_disk,
                             gateway: gateway_on_disk,
                             extensions: _extensions_on_disk,
@@ -2959,6 +2984,7 @@ mod tests {
     /// config's paths (caller keeps the `tempfile::TempDir` alive).
     fn test_daemon_config(dir: &std::path::Path) -> DaemonConfig {
         DaemonConfig {
+            lifetime_scope: libra_governor_domain::LifetimeScope::LifetimeBounded,
             socket_path: dir.join("d.sock"),
             ledger_path: dir.join("ledger.sqlite3"),
             log_path: dir.join("daemon.log"),

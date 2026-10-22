@@ -72,13 +72,17 @@ pub fn run() {
         }
     };
 
+    let lifetime_scope = overrides.lifetime_scope();
     let config = daemon_config(
         state_dir.join("daemon.sock"),
         state_dir.join("ledger.sqlite3"),
         log_path,
-        overrides
-            .policy
-            .unwrap_or_else(libra_governor_daemon::default_admission_policy),
+        (
+            overrides
+                .policy
+                .unwrap_or_else(libra_governor_daemon::default_admission_policy),
+            lifetime_scope,
+        ),
         overrides.gateway,
         overrides.extensions,
         overrides.launcher,
@@ -149,7 +153,7 @@ fn daemon_config(
     socket_path: PathBuf,
     ledger_path: PathBuf,
     log_path: PathBuf,
-    policy: Policy,
+    admission: (Policy, libra_governor_domain::LifetimeScope),
     gateway: Option<libra_governor_gateway::config::GatewayConfig>,
     extensions: Option<libra_governor_extension::ExtensionConfig>,
     launch_gate: Option<libra_governor_daemon::launch_gate::LaunchGateConfig>,
@@ -160,7 +164,8 @@ fn daemon_config(
         log_path,
         recon_budget: ReconBudget::default(),
         replan_hysteresis: ReplanHysteresisConfig::default(),
-        policy,
+        policy: admission.0,
+        lifetime_scope: admission.1,
         reservation_ttl_secs: DEFAULT_RESERVATION_TTL_SECS,
         gateway,
         gateway_stats: std::sync::Arc::new(Default::default()),
@@ -222,7 +227,10 @@ pub fn run_trusted(config_path: &Path) -> i32 {
         cfg.socket_path(),
         cfg.ledger_path(),
         cfg.log_path(),
-        libra_governor_daemon::default_admission_policy(),
+        (
+            libra_governor_daemon::legacy_bounded_policy(),
+            libra_governor_domain::LifetimeScope::LifetimeBounded,
+        ),
         None,
         None,
         None,

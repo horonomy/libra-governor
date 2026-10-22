@@ -876,6 +876,41 @@ impl Policy {
         projected_duration_secs: u64,
         estimate_confidence: Confidence,
     ) -> Result<PolicyDecision, PolicyEvaluationError> {
+        self.evaluate_with(
+            projected_resource,
+            projected_duration_secs,
+            estimate_confidence,
+            true,
+        )
+    }
+
+    /// [`Self::evaluate`] without the lifetime resource constraint
+    /// (HORO-1727 S4), for a turn-scoped budget: the lifetime target,
+    /// elastic and hard ceilings are not evaluated, so the resource outcome
+    /// is `Admit`. The time and confidence constraints, and the
+    /// resource-kind check, are unchanged; the resource bound is then
+    /// [`Self::evaluate_turn`] alone.
+    pub fn evaluate_without_lifetime_resource(
+        &self,
+        projected_resource: ResourceAmount,
+        projected_duration_secs: u64,
+        estimate_confidence: Confidence,
+    ) -> Result<PolicyDecision, PolicyEvaluationError> {
+        self.evaluate_with(
+            projected_resource,
+            projected_duration_secs,
+            estimate_confidence,
+            false,
+        )
+    }
+
+    fn evaluate_with(
+        &self,
+        projected_resource: ResourceAmount,
+        projected_duration_secs: u64,
+        estimate_confidence: Confidence,
+        lifetime_resource: bool,
+    ) -> Result<PolicyDecision, PolicyEvaluationError> {
         let policy_kind = self.resource.target.kind();
         if projected_resource.kind() != policy_kind {
             return Err(PolicyEvaluationError::ProjectedResourceKindMismatch {
@@ -884,7 +919,11 @@ impl Policy {
             });
         }
 
-        let resource_outcome = Self::evaluate_resource(&self.resource, projected_resource)?;
+        let resource_outcome = if lifetime_resource {
+            Self::evaluate_resource(&self.resource, projected_resource)?
+        } else {
+            ConstraintOutcome::Admit
+        };
         let time_outcome = Self::evaluate_time(&self.time, projected_duration_secs)?;
         let confidence_ok = estimate_confidence >= self.min_confidence;
 
@@ -1354,6 +1393,43 @@ impl PolicyPresetInputs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_turn_scoped_evaluation_ignores_the_lifetime_resource_bound_only() {
+        let policy = Policy::balanced(PolicyPresetInputs {
+            resource_target: ResourceAmount::Tokens(100_000),
+            time_target_secs: 3600,
+            quality_floor: CompletionContract::first(vec![CompletionCriterion::required("x")]),
+        })
+        .unwrap();
+        for projected in [130_000, 200_000] {
+            let projected = ResourceAmount::Tokens(projected);
+            assert_ne!(
+                policy
+                    .evaluate(projected, 0, Confidence::High)
+                    .unwrap()
+                    .admission,
+                Admission::Admit,
+                "the lifetime bound refuses or escalates this projection"
+            );
+            assert_eq!(
+                policy
+                    .evaluate_without_lifetime_resource(projected, 0, Confidence::High)
+                    .unwrap()
+                    .admission,
+                Admission::Admit
+            );
+        }
+        // Negative control: the time bound is still enforced.
+        let past_time_ceiling = policy
+            .evaluate_without_lifetime_resource(
+                ResourceAmount::Tokens(1),
+                100_000,
+                Confidence::High,
+            )
+            .unwrap();
+        assert!(matches!(past_time_ceiling.admission, Admission::Deny(_)));
+    }
+
     use super::*;
 
     fn quality_floor() -> CompletionContract {

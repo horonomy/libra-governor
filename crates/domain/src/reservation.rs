@@ -425,6 +425,25 @@ impl TaskBudget {
             self.hard_limit.as_f64() + self.renewed_capacity.as_f64(),
         )
     }
+
+    /// The headroom a reservation or reserve increase is gated against,
+    /// before the completion reserve is considered (HORO-1727 S4).
+    ///
+    /// A [`LifetimeScope::LifetimeBounded`] budget is gated on the lifetime
+    /// limit: `effective_hard_limit - settled - active`. A
+    /// [`LifetimeScope::TurnScoped`] budget with a turn bound is gated on
+    /// the turn ceiling less what is currently held, so settled lifetime
+    /// spend no longer counts against it; one with no turn bound falls back
+    /// to the lifetime formula and fails closed. `effective_hard_limit`,
+    /// `available` and the snapshot keep their lifetime arithmetic.
+    pub fn gate_headroom(&self, settled: f64, active: f64) -> f64 {
+        if self.lifetime_scope == LifetimeScope::TurnScoped {
+            if let Some(turn) = &self.policy.turn {
+                return turn.ceiling.as_f64() - active;
+            }
+        }
+        self.effective_hard_limit().as_f64() - settled - active
+    }
 }
 
 /// Every economic figure about one task's envelope, read in one go

@@ -157,6 +157,7 @@ fn status_task_summary(
 fn tool_call_count_material_deviation_triggers_a_replan_visible_in_status() {
     let dir = tempfile::tempdir().unwrap();
     let config = DaemonConfig {
+        lifetime_scope: libra_governor_domain::LifetimeScope::LifetimeBounded,
         socket_path: dir.path().join("d.sock"),
         ledger_path: dir.path().join("ledger.sqlite3"),
         log_path: dir.path().join("daemon.log"),
@@ -309,6 +310,7 @@ fn tool_call_count_material_deviation_triggers_a_replan_visible_in_status() {
 fn possible_tool_loop_streak_triggers_a_replan_before_the_count_threshold() {
     let dir = tempfile::tempdir().unwrap();
     let config = DaemonConfig {
+        lifetime_scope: libra_governor_domain::LifetimeScope::LifetimeBounded,
         socket_path: dir.path().join("d.sock"),
         ledger_path: dir.path().join("ledger.sqlite3"),
         log_path: dir.path().join("daemon.log"),
@@ -386,6 +388,7 @@ fn possible_tool_loop_streak_triggers_a_replan_before_the_count_threshold() {
 fn exhausting_the_auto_replan_budget_escalates_instead_of_replanning_again() {
     let dir = tempfile::tempdir().unwrap();
     let config = DaemonConfig {
+        lifetime_scope: libra_governor_domain::LifetimeScope::LifetimeBounded,
         socket_path: dir.path().join("d.sock"),
         ledger_path: dir.path().join("ledger.sqlite3"),
         log_path: dir.path().join("daemon.log"),
