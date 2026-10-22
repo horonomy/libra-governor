@@ -971,6 +971,10 @@ fn budget_segment(
         Some(LedgerFreshness::Stale { .. }) => (" (stale)", true),
         Some(LedgerFreshness::Unknown { .. }) => (" (freshness unknown)", true),
     };
+    // A turn-scoped task is gated on its turn ceiling (HORO-1727 S5): its
+    // snapshot carries one, and no lifetime figure may be presented as a
+    // limit or a remainder.
+    let turn_ceiling = amounts.and_then(|a| a.turn_ceiling());
     let (state, label, reason_code, clear_role) = match posture {
         BudgetPosture::Remaining { fraction_left } => {
             match percent_left(share_to_display(fraction_left, amounts)) {
@@ -1012,6 +1016,12 @@ fn budget_segment(
         // advisory-only, so an exhausted envelope means the ledger will
         // refuse the next reservation, not that work has stopped. `critical`
         // would claim the latter.
+        BudgetPosture::Exhausted if turn_ceiling.is_some() => (
+            "warn",
+            "Turn ceiling reached".to_string(),
+            Some("budget_turn_ceiling_reached"),
+            "exception",
+        ),
         BudgetPosture::Exhausted => (
             "warn",
             "Budget exhausted".to_string(),
@@ -1027,6 +1037,23 @@ fn budget_segment(
             "unknown",
             "Budget usage unknown".to_string(),
             Some("no_commitment_against_envelope"),
+            "vital",
+        ),
+        // A turn-scoped task has no lifetime remainder to show: neutral,
+        // never a pressure band, and never "Budget exhausted" for lifetime
+        // spend (HORO-1727 S5).
+        BudgetPosture::TurnScoped => (
+            "neutral",
+            match turn_ceiling {
+                Some(ceiling) => {
+                    format!(
+                        "No lifetime cap, {} per turn",
+                        grouped_f64(ceiling.as_f64())
+                    )
+                }
+                None => "No lifetime cap".to_string(),
+            },
+            Some("budget_turn_scoped"),
             "vital",
         ),
         BudgetPosture::NotEstablished => (
@@ -1055,7 +1082,25 @@ fn budget_segment(
     }
     if let Some(amounts) = amounts {
         budget_amount_fields(&mut segment, amounts, freshness);
-        budget_count_fields(&mut segment, amounts, display);
+        if let Some(ceiling) = turn_ceiling {
+            // Withhold every field that presents the stored lifetime figure
+            // as a limit or a remainder: with spend above 1 they would
+            // render red for a task that is not over anything.
+            if let Some(fields) = segment.as_object_mut() {
+                for key in [
+                    "budget_total",
+                    "budget_remaining",
+                    "budget_pressure_percent",
+                    "semantic_state",
+                ] {
+                    fields.remove(key);
+                }
+            }
+            segment["budget_lifetime_scope"] = json!("turn_scoped");
+            amount_field(&mut segment, "budget_turn_ceiling", ceiling.as_f64());
+        } else {
+            budget_count_fields(&mut segment, amounts, display);
+        }
     }
     segment
 }
@@ -1092,7 +1137,24 @@ fn configured_budget_segment(
     if display == BudgetDisplay::Percent {
         return None;
     }
-    let ceiling = configured.ceiling;
+    let Some(ceiling) = configured.ceiling else {
+        // Turn-scoped daemon: a new task has no lifetime ceiling, and a
+        // `budget_total` here would be read as one (HORO-1727 S5).
+        let turn_ceiling = configured.turn_ceiling?;
+        let unit = unit_noun(turn_ceiling.kind())?;
+        return Some(json!({
+            "key": "budget_configured",
+            "state": "neutral",
+            "label": "No lifetime cap for a new task",
+            "budget_scope": "configured_default",
+            "budget_lifetime_scope": "turn_scoped",
+            "budget_unit": unit,
+            "budget_turn_ceiling": turn_ceiling.as_f64(),
+            "explain_key": "libra.budget",
+            "order_hint": 26,
+            "clear_role": "supporting",
+        }));
+    };
     let unit = unit_noun(ceiling.kind())?;
     let count = count_value(ceiling.as_f64())?;
     Some(json!({
@@ -1429,6 +1491,11 @@ fn budget_posture_prose(
              not\n\x20                  stopped, because Libra's hooks are advisory"
                 .to_string()
         }
+        Some(BudgetPosture::TurnScoped) => {
+            "no lifetime cap — this task is gated per turn, not on a\n\
+             \x20                  lifetime limit"
+                .to_string()
+        }
         Some(BudgetPosture::NotEstablished) | None => {
             "none — this task was admitted without a resource envelope, which\n\
              \x20                  is not the same as having spent one"
@@ -1524,6 +1591,25 @@ fn grouped_f64(value: f64) -> String {
 /// under-report what the task has.
 fn budget_amounts_prose(amounts: &BudgetSnapshot) -> String {
     let unit = unit_noun(amounts.kind()).unwrap_or("percent of quota");
+    if let Some(ceiling) = amounts.turn_ceiling() {
+        // A turn-scoped task has no lifetime envelope (HORO-1727 S5): the
+        // stored lifetime figure is not a limit, so it is never printed.
+        let mut out = format!(
+            "  budget limit     none for the task's lifetime — each turn is limited to\n\
+             \x20                  {} {unit}, and active holds may not exceed that\n",
+            grouped_f64(ceiling.as_f64()),
+        );
+        if amounts.is_observed() {
+            out.push_str(&format!(
+                "  budget used      {} {unit} — settled across turns; informational, no\n\
+                 \x20                  lifetime cap applies\n\
+                 \x20 budget held      {} {unit} — reserved by active reservations\n",
+                grouped_f64(amounts.used().as_f64()),
+                grouped_f64(amounts.reserved().as_f64()),
+            ));
+        }
+        return out;
+    }
     let mut out = format!(
         "  budget limit     {} {} — this task's envelope, fixed when it was\n\
          \x20                  admitted and never amended since\n",
@@ -1709,15 +1795,32 @@ pub fn explain_text(status: &StatusResult, doctor: Option<&DoctorResult>) -> Str
     // comparing them needs to be told which is which rather than left to
     // guess that the bigger number is the real one.
     if let Some(configured) = status.configured_budget.as_ref() {
-        let ceiling = configured.ceiling;
-        out.push_str(&format!(
-            "\n  configured limit {} {} — the ceiling a new task would be\n\
-             \x20                  admitted to, from the policy now in force. Not a\n\
-             \x20                  remaining balance, and not the envelope of any task\n\
-             \x20                  already running.\n",
-            grouped_f64(ceiling.as_f64()),
-            unit_noun(ceiling.kind()).unwrap_or("percent of quota"),
-        ));
+        if let Some(ceiling) = configured.ceiling {
+            out.push_str(&format!(
+                "\n  configured limit {} {} — the ceiling a new task would be\n\
+                 \x20                  admitted to, from the policy now in force. Not a\n\
+                 \x20                  remaining balance, and not the envelope of any task\n\
+                 \x20                  already running.\n",
+                grouped_f64(ceiling.as_f64()),
+                unit_noun(ceiling.kind()).unwrap_or("percent of quota"),
+            ));
+        } else {
+            // Turn-scoped daemon (HORO-1727 S5): there is no lifetime
+            // ceiling to print, and the stored 150,000 is not enforced.
+            let per_turn = configured
+                .turn_ceiling
+                .map(|turn| {
+                    format!(
+                        "; each turn is limited to {} {}",
+                        grouped_f64(turn.as_f64()),
+                        unit_noun(turn.kind()).unwrap_or("percent of quota"),
+                    )
+                })
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "\n  configured limit none — a new task has no lifetime cap{per_turn}.\n"
+            ));
+        }
     }
     // And the one envelope with no local source at all. Said out loud
     // rather than omitted: a reader who has been shown two envelopes will
@@ -1893,7 +1996,8 @@ mod tests {
     /// [`BUDGET_LEFT_AMOUNTS`]'s ceiling so a test cannot pass by
     /// accidentally reading one for the other.
     const CONFIGURED: ConfiguredBudget = ConfiguredBudget {
-        ceiling: ResourceAmount::Tokens(200_000),
+        ceiling: Some(ResourceAmount::Tokens(200_000)),
+        turn_ceiling: None,
     };
 
     /// A quota envelope: 100 "percent of quota", 62 of it committed.
@@ -1948,6 +2052,10 @@ mod tests {
             }
             BudgetPosture::Exhausted => {
                 BudgetSnapshot::new(ResourceKind::Tokens, 150_000.0, 30_000.0, 150_000.0, 0.0, 4)
+            }
+            BudgetPosture::TurnScoped => {
+                BudgetSnapshot::new(ResourceKind::Tokens, 150_000.0, 30_000.0, 200_000.0, 0.0, 2)
+                    .with_turn_ceiling(Some(400_000.0))
             }
             BudgetPosture::NotEstablished | BudgetPosture::Unreadable => return None,
         })
@@ -2042,10 +2150,63 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_turn_scoped_budget_segment_shows_no_lifetime_total_and_is_not_exhausted() {
+        let amounts = amounts_for(BudgetPosture::TurnScoped).unwrap();
+        let segment = budget_segment(
+            BudgetPosture::from_snapshot(&amounts),
+            Some(&amounts),
+            BudgetDisplay::Full,
+            None,
+        );
+        assert_eq!(segment["state"], "neutral");
+        assert_eq!(segment["reason_code"], "budget_turn_scoped");
+        assert_eq!(segment["label"], "No lifetime cap, 400,000 per turn");
+        assert_eq!(segment["budget_lifetime_scope"], "turn_scoped");
+        assert_eq!(segment["budget_turn_ceiling"], 400_000.0);
+        for withheld in [
+            "budget_total",
+            "budget_remaining",
+            "budget_pressure_percent",
+            "semantic_state",
+            "count",
+            "total",
+        ] {
+            assert!(
+                segment.get(withheld).is_none(),
+                "{withheld} must be withheld"
+            );
+        }
+        // Control: the same spend on a lifetime-bounded task is exhausted.
+        let bounded =
+            BudgetSnapshot::new(ResourceKind::Tokens, 150_000.0, 30_000.0, 200_000.0, 0.0, 2);
+        let exhausted = budget_segment(
+            BudgetPosture::from_snapshot(&bounded),
+            Some(&bounded),
+            BudgetDisplay::Full,
+            None,
+        );
+        assert_eq!(exhausted["reason_code"], "budget_hard_limit_reached");
+    }
+
+    #[test]
+    fn explain_never_prints_the_stored_lifetime_figure_for_a_turn_scoped_task() {
+        let scoped = amounts_for(BudgetPosture::TurnScoped).unwrap();
+        let prose = budget_amounts_prose(&scoped);
+        assert!(!prose.contains("150,000"), "{prose}");
+        assert!(prose.contains("400,000"), "{prose}");
+
+        // Control: the same stored figure on a lifetime-bounded task is its limit.
+        let bounded =
+            BudgetSnapshot::new(ResourceKind::Tokens, 150_000.0, 30_000.0, 20_000.0, 0.0, 2);
+        assert!(budget_amounts_prose(&bounded).contains("150,000"));
+    }
+
     fn doctor_with(preset: &str, matches_disk: bool) -> DoctorResult {
         DoctorResult {
             daemon_version: "0.0.2".to_string(),
             protocol_version: 8,
+            lifetime_scope: libra_governor_domain::LifetimeScope::LifetimeBounded,
             schema_version_applied: 9,
             schema_version_known: 9,
             schema_ahead_of_binary: false,
@@ -3604,7 +3765,7 @@ mod tests {
         // fixtures use different numbers so a surface that read one for
         // the other is caught.
         assert_ne!(
-            CONFIGURED.ceiling.as_f64(),
+            CONFIGURED.ceiling.unwrap().as_f64(),
             BUDGET_LEFT_AMOUNTS.total().as_f64(),
             "premise"
         );

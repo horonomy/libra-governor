@@ -145,6 +145,14 @@ fn an_unknown_spelling_is_refused_without_changing_the_record() {
 #[test]
 fn the_recorded_preference_reaches_the_real_statusline_provider() {
     let state_dir = support::DaemonState::new();
+    // This test is about the wording of a lifetime *share*. A daemon with no
+    // config.json is turn-scoped (HORO-1727 S4) and has no share, so pin it
+    // to the lifetime-bounded default with an explicit config.
+    std::fs::write(
+        state_dir.path().join("config.json"),
+        r#"{"policy": {"preset": "balanced"}}"#,
+    )
+    .unwrap();
     let repo = tempfile::tempdir().unwrap();
     std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
 

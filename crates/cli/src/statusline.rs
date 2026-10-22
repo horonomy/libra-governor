@@ -260,7 +260,8 @@ mod tests {
                 2,
             )),
             configured_budget: Some(ConfiguredBudget {
-                ceiling: ResourceAmount::Tokens(150_000),
+                ceiling: Some(ResourceAmount::Tokens(150_000)),
+                turn_ceiling: None,
             }),
             task_budget_freshness: Some(libra_governor_protocol::LedgerFreshness::Fresh {
                 age_secs: 5,

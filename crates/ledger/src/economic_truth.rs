@@ -283,15 +283,27 @@ impl LedgerStore {
             required_criteria_count,
         };
 
+        // A turn-scoped task has no lifetime allocation: the stored
+        // `hard_limit` the capacity view reports is not what admission gates
+        // on, so presenting it as granted capacity would state a limit that
+        // is not enforced (HORO-1727 S5). Display layer only; no check reads
+        // `granted_capacity`.
+        let turn_scoped = task_budget
+            .as_ref()
+            .is_some_and(|b| b.turn_ceiling_if_scoped().is_some());
         let allocation = Allocation {
-            granted_capacity: self.account_capacity(account_id)?.and_then(|cap| {
-                cap.granted_capacity.map(|amount| ScopedAmount {
-                    kind: cap.resource_kind,
-                    value: amount.as_f64(),
-                    basis: ResourceBasis::ImportedAllocationSnapshot,
-                    scope: AmountScope::OwnAccountExclusive,
+            granted_capacity: if turn_scoped {
+                None
+            } else {
+                self.account_capacity(account_id)?.and_then(|cap| {
+                    cap.granted_capacity.map(|amount| ScopedAmount {
+                        kind: cap.resource_kind,
+                        value: amount.as_f64(),
+                        basis: ResourceBasis::ImportedAllocationSnapshot,
+                        scope: AmountScope::OwnAccountExclusive,
+                    })
                 })
-            }),
+            },
             authority: account.authority_source,
             enforcement_scope: account.enforcement_scope,
             funding_lease: funding_lease_id,
@@ -832,6 +844,45 @@ mod tests {
             )
             .unwrap();
         task_id
+    }
+
+    #[test]
+    fn a_turn_scoped_task_reports_no_lifetime_allocation() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let turn = libra_governor_domain::TurnBound {
+            cold_start_request: ResourceAmount::Tokens(200),
+            ceiling: ResourceAmount::Tokens(5_000),
+        };
+        let policy = thousand_token_policy().with_turn_bound(turn).unwrap();
+        let mut allocations = Vec::new();
+        for scope in [
+            libra_governor_domain::LifetimeScope::TurnScoped,
+            libra_governor_domain::LifetimeScope::LifetimeBounded,
+        ] {
+            let task_id = TaskId::new();
+            store
+                .insert_task(
+                    &TaskIdentity {
+                        id: task_id,
+                        external_ref: None,
+                    },
+                    now(),
+                )
+                .unwrap();
+            store
+                .initialize_task_budget_scoped(task_id, &policy, &fixed_reserve(200), scope, now())
+                .unwrap();
+            let truth = store.economic_truth_for_task(task_id).unwrap();
+            allocations.push(
+                truth
+                    .categories
+                    .unwrap()
+                    .allocation
+                    .granted_capacity
+                    .is_some(),
+            );
+        }
+        assert_eq!(allocations, vec![false, true]);
     }
 
     fn spend_so_far_kind(s: &SpendSoFar) -> &'static str {

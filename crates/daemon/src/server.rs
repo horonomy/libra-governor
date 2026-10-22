@@ -1047,8 +1047,22 @@ fn budget_reading(
 /// a future policy shape with no resource bound should degrade to "not
 /// reported" rather than to a fabricated ceiling.
 fn configured_budget(config: &DaemonConfig) -> Option<ConfiguredBudget> {
-    Some(ConfiguredBudget {
-        ceiling: config.policy.resource.hard_ceiling,
+    // A turn-scoped daemon (HORO-1727 S5) configures no lifetime cap for a
+    // new task: reporting the stored 150,000 would state a limit admission
+    // does not enforce. The scope only takes effect with a turn bound, the
+    // same rule the ledger gate applies, so the two cannot disagree.
+    let turn_scoped = config.lifetime_scope == libra_governor_domain::LifetimeScope::TurnScoped
+        && config.policy.turn.is_some();
+    Some(if turn_scoped {
+        ConfiguredBudget {
+            ceiling: None,
+            turn_ceiling: config.policy.turn.as_ref().map(|turn| turn.ceiling),
+        }
+    } else {
+        ConfiguredBudget {
+            ceiling: Some(config.policy.resource.hard_ceiling),
+            turn_ceiling: None,
+        }
     })
 }
 
@@ -2754,6 +2768,16 @@ fn handle_doctor(ledger: &LedgerStore, config: &DaemonConfig) -> DoctorResult {
             None => (false, true, None, true),
         };
 
+    // A turn-scoped daemon runs because no config.json existed at start.
+    // Any config.json that exists now - valid or rejected, even `{}` -
+    // would make the next start lifetime-bounded, so the running daemon
+    // no longer matches disk (HORO-1727 S5). The reverse (a lifetime-bounded
+    // daemon whose file was deleted) is not flagged: trusted-principal mode
+    // shares this dispatch and never has a config.json.
+    let running_config_matches_disk = running_config_matches_disk
+        && !(config_file_present
+            && config.lifetime_scope == libra_governor_domain::LifetimeScope::TurnScoped);
+
     let schema_version_applied = ledger.schema_version().unwrap_or(0);
     let schema_version_known = libra_governor_ledger::latest_known_version();
 
@@ -2807,6 +2831,7 @@ fn handle_doctor(ledger: &LedgerStore, config: &DaemonConfig) -> DoctorResult {
         schema_version_known,
         schema_ahead_of_binary: schema_version_applied > schema_version_known,
         policy_preset: config.policy.name.clone(),
+        lifetime_scope: config.lifetime_scope,
         config_file_present,
         config_file_valid,
         config_file_error,
@@ -3010,6 +3035,27 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_scoped_daemon_configures_no_lifetime_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_for_doctor_tests(dir.path());
+        let bounded = configured_budget(&config).unwrap();
+        assert_eq!(
+            bounded.ceiling,
+            Some(config.policy.resource.hard_ceiling),
+            "control: a lifetime-bounded daemon reports its lifetime ceiling"
+        );
+        assert_eq!(bounded.turn_ceiling, None);
+
+        config.lifetime_scope = libra_governor_domain::LifetimeScope::TurnScoped;
+        let scoped = configured_budget(&config).unwrap();
+        assert_eq!(scoped.ceiling, None);
+        assert_eq!(
+            scoped.turn_ceiling,
+            config.policy.turn.as_ref().map(|turn| turn.ceiling)
+        );
+    }
+
+    #[test]
     fn doctor_reports_healthy_state_with_no_config_file_and_matching_schema() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_for_doctor_tests(dir.path());
@@ -3049,6 +3095,29 @@ mod tests {
         assert!(
             result.running_config_matches_disk,
             "an invalid file changes nothing about the running config, so there is no drift to report"
+        );
+    }
+
+    #[test]
+    fn doctor_flags_a_config_file_added_under_a_turn_scoped_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), "{}").unwrap();
+        let mut config = config_for_doctor_tests(dir.path());
+        let ledger = LedgerStore::open(&config.ledger_path).unwrap();
+
+        // Control: a lifetime-bounded daemon is unaffected by an empty file.
+        assert!(handle_doctor(&ledger, &config).running_config_matches_disk);
+
+        config.lifetime_scope = libra_governor_domain::LifetimeScope::TurnScoped;
+        let result = handle_doctor(&ledger, &config);
+        assert!(result.config_file_valid);
+        assert_eq!(
+            result.lifetime_scope,
+            libra_governor_domain::LifetimeScope::TurnScoped
+        );
+        assert!(
+            !result.running_config_matches_disk,
+            "a config file added under a turn-scoped daemon must be flagged as stale"
         );
     }
 
@@ -3179,7 +3248,8 @@ mod tests {
         assert_eq!(
             result.configured_budget,
             Some(ConfiguredBudget {
-                ceiling: config.policy.resource.hard_ceiling
+                ceiling: Some(config.policy.resource.hard_ceiling),
+                turn_ceiling: None,
             }),
             "the next task's ceiling is a fact an idle daemon knows"
         );
@@ -3203,7 +3273,7 @@ mod tests {
 
         assert_eq!(
             result.configured_budget.unwrap().ceiling,
-            ResourceAmount::Tokens(777_000)
+            Some(ResourceAmount::Tokens(777_000))
         );
     }
 
@@ -3385,7 +3455,7 @@ mod tests {
         );
         assert_eq!(
             result.configured_budget.unwrap().ceiling,
-            ResourceAmount::Tokens(900_000),
+            Some(ResourceAmount::Tokens(900_000)),
             "the next task would get the new ceiling"
         );
         assert_ne!(admitted_ceiling, ResourceAmount::Tokens(900_000));

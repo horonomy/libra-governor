@@ -221,4 +221,13 @@ pub use messages::{
 /// docs) — but the shape itself is new wire data, so the bump follows
 /// every earlier precedent: a long-lived v17 daemon must be restarted
 /// after upgrading before metered-pool traffic is reachable.
-pub const PROTOCOL_VERSION: u32 = 18;
+///
+/// v19 (HORO-1727 S5): the daemon discloses turn scope. `BudgetSnapshot`
+/// gained an optional `turn_ceiling`, `BudgetPosture` gained `TurnScoped`,
+/// `ConfiguredBudget.ceiling` became optional beside a new `turn_ceiling`,
+/// and `DoctorResult` gained `lifetime_scope`. An optional field or a new
+/// variant would be silently dropped or rejected by a v18 peer's
+/// `deny_unknown_fields` decoder and would downgrade a turn-scoped task to
+/// a misleading 150,000 lifetime budget, so the shape change is a bump: a
+/// long-lived v18 daemon must be restarted after upgrading.
+pub const PROTOCOL_VERSION: u32 = 19;
