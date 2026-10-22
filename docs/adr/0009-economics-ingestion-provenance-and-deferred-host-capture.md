@@ -167,3 +167,10 @@ populate), not a filter a caller could bypass.
   `crates/daemon`/`crates/gateway` has a `gateway_requests` row and an
   optional `ExecutionIdentity` to pass in. The differ has no producer
   until the deferred host-capture decision is revisited.
+
+## Token fact denomination (HORO-1727 D4)
+
+The token fact derived from a gateway row is denominated in fresh tokens:
+`cache_read_input_tokens` is excluded, matching the gateway's token
+settlement (ADR-0021). The fact is recomputed from the stored tier columns, so
+historical rows are read in the new denomination without any stored change.

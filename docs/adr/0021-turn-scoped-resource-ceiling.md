@@ -320,3 +320,14 @@ disclosure requirement given the actual code found.
   `[policy].turn_cold_start_request_tokens`/`turn_ceiling_tokens` to
   `RawPolicyConfig` following the existing `resource_target_tokens`
   pattern, if needed).
+
+## Gateway token settlement uses fresh tokens (HORO-1727 D4)
+
+A token-denominated gateway budget now settles on fresh tokens (input +
+cache-creation + output), the same denomination as the turn ceiling above and
+the `fresh_dedup_v1` receipt basis. Cache reads stay recorded separately in
+`gateway_requests` and a USD budget still prices them. Rows settled before
+this change keep their cache-inclusive amounts; no row is re-credited, so an
+in-flight task that already settled cache-inclusive tokens is over-counted and
+fails closed, never under-counted. Settlement still cannot exceed the
+worst-case reservation.

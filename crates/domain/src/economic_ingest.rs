@@ -61,17 +61,27 @@ pub struct GatewayRequestObservation {
     pub session_id: Option<String>,
 }
 
+/// The token fact for one row, in fresh tokens: input + cache-creation +
+/// output, with `cache_read_input_tokens` excluded (HORO-1727 D4; the same
+/// denomination as the gateway's token settlement and `fresh_dedup_v1`
+/// receipts). A row that reports only a cache read still yields a zero
+/// fact rather than `None`, so its presence is not silently lost.
 fn total_tokens(observation: &GatewayRequestObservation) -> Option<u64> {
-    let fields = [
+    let all_tiers = [
         observation.input_tokens,
         observation.cache_creation_input_tokens,
         observation.cache_read_input_tokens,
         observation.output_tokens,
     ];
-    if fields.iter().all(Option::is_none) {
+    if all_tiers.iter().all(Option::is_none) {
         return None;
     }
-    Some(fields.iter().filter_map(|f| *f).sum())
+    let fresh = [
+        observation.input_tokens,
+        observation.cache_creation_input_tokens,
+        observation.output_tokens,
+    ];
+    Some(fresh.iter().filter_map(|f| *f).sum())
 }
 
 /// Builds the attribution for one gateway request, per the ticket's
@@ -408,6 +418,32 @@ mod tests {
             .iter()
             .any(|e| e.fact().basis == ResourceBasis::GatewayMeteredActual
                 && e.fact().amount.kind() == ResourceKind::Tokens));
+    }
+
+    #[test]
+    fn token_fact_excludes_cache_reads() {
+        let token_amounts = |observation: &GatewayRequestObservation| {
+            events_from_gateway_request(observation, None)
+                .iter()
+                .filter(|e| e.fact().amount.kind() == ResourceKind::Tokens)
+                .map(|e| e.fact().amount)
+                .collect::<Vec<_>>()
+        };
+
+        let mut heavy_cache = observation(EnforcementTier::GatewayMetered, true);
+        heavy_cache.cache_read_input_tokens = Some(5_000);
+        assert_eq!(
+            token_amounts(&heavy_cache),
+            vec![ResourceAmount::Tokens(150)]
+        );
+
+        // Negative control: a row reporting only a cache read keeps a
+        // (zero) token fact instead of dropping it.
+        let mut cache_only = observation(EnforcementTier::GatewayMetered, true);
+        cache_only.input_tokens = None;
+        cache_only.output_tokens = None;
+        cache_only.cache_read_input_tokens = Some(5_000);
+        assert_eq!(token_amounts(&cache_only), vec![ResourceAmount::Tokens(0)]);
     }
 
     #[test]

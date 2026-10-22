@@ -133,7 +133,7 @@ pub fn settled_cost(
     pricing: &PricingTable,
 ) -> Result<ResourceAmount, EnforcementGap> {
     match kind {
-        ResourceKind::Tokens => Ok(ResourceAmount::Tokens(usage.total_tokens())),
+        ResourceKind::Tokens => Ok(ResourceAmount::Tokens(usage.fresh_tokens())),
         ResourceKind::Usd => {
             let Some(model_pricing) = pricing.lookup(model) else {
                 return Err(EnforcementGap::UnpricedModel {
@@ -197,6 +197,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reserved, ResourceAmount::Tokens(1_000 + 1_000));
+    }
+
+    #[test]
+    fn token_settlement_excludes_cache_reads_and_stays_within_reservation() {
+        let heavy_cache = usage(1_000, 0, 100_000, 800);
+        let settled = settled_cost(
+            ResourceKind::Tokens,
+            &heavy_cache,
+            "claude-sonnet-4-5",
+            &PricingTable::pinned(),
+        )
+        .unwrap();
+        assert_eq!(settled, ResourceAmount::Tokens(1_800));
+
+        let reserved = worst_case_reservation(
+            ResourceKind::Tokens,
+            3_000,
+            Some(1_000),
+            "claude-sonnet-4-5",
+            &PricingTable::pinned(),
+        )
+        .unwrap();
+        assert!(settled.as_f64() <= reserved.as_f64());
+
+        // Negative control: a USD budget still prices the cache reads.
+        let usd = |usage: &ObservedUsage| {
+            settled_cost(
+                ResourceKind::Usd,
+                usage,
+                "claude-sonnet-4-5",
+                &PricingTable::pinned(),
+            )
+            .unwrap()
+            .as_f64()
+        };
+        assert!(usd(&heavy_cache) > usd(&usage(1_000, 0, 0, 800)));
     }
 
     #[test]
@@ -339,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn token_settlement_sums_every_reported_tier() {
+    fn token_settlement_sums_the_fresh_tiers() {
         let settled = settled_cost(
             ResourceKind::Tokens,
             &usage(10, 20, 30, 40),
@@ -347,7 +383,7 @@ mod tests {
             &PricingTable::pinned(),
         )
         .unwrap();
-        assert_eq!(settled, ResourceAmount::Tokens(100));
+        assert_eq!(settled, ResourceAmount::Tokens(70));
     }
 
     #[test]
