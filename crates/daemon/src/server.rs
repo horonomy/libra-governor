@@ -2768,6 +2768,16 @@ fn handle_doctor(ledger: &LedgerStore, config: &DaemonConfig) -> DoctorResult {
             None => (false, true, None, true),
         };
 
+    // A turn-scoped daemon runs because no config.json existed at start.
+    // Any config.json that exists now - valid or rejected, even `{}` -
+    // would make the next start lifetime-bounded, so the running daemon
+    // no longer matches disk (HORO-1727 S5). The reverse (a lifetime-bounded
+    // daemon whose file was deleted) is not flagged: trusted-principal mode
+    // shares this dispatch and never has a config.json.
+    let running_config_matches_disk = running_config_matches_disk
+        && !(config_file_present
+            && config.lifetime_scope == libra_governor_domain::LifetimeScope::TurnScoped);
+
     let schema_version_applied = ledger.schema_version().unwrap_or(0);
     let schema_version_known = libra_governor_ledger::latest_known_version();
 
@@ -3085,6 +3095,29 @@ mod tests {
         assert!(
             result.running_config_matches_disk,
             "an invalid file changes nothing about the running config, so there is no drift to report"
+        );
+    }
+
+    #[test]
+    fn doctor_flags_a_config_file_added_under_a_turn_scoped_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), "{}").unwrap();
+        let mut config = config_for_doctor_tests(dir.path());
+        let ledger = LedgerStore::open(&config.ledger_path).unwrap();
+
+        // Control: a lifetime-bounded daemon is unaffected by an empty file.
+        assert!(handle_doctor(&ledger, &config).running_config_matches_disk);
+
+        config.lifetime_scope = libra_governor_domain::LifetimeScope::TurnScoped;
+        let result = handle_doctor(&ledger, &config);
+        assert!(result.config_file_valid);
+        assert_eq!(
+            result.lifetime_scope,
+            libra_governor_domain::LifetimeScope::TurnScoped
+        );
+        assert!(
+            !result.running_config_matches_disk,
+            "a config file added under a turn-scoped daemon must be flagged as stale"
         );
     }
 
