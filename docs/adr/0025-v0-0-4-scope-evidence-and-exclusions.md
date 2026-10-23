@@ -51,6 +51,34 @@ unless it says so.
    gateway authority should honour the persisted turn scope is an open
    founder decision (HORO-1899).
 
+## Proposed release target: Apple Silicon macOS Preview
+
+**Proposed, pending the founder's decision; this ADR remains Proposed.** The
+narrowest honest v0.0.4 is a *preview for `aarch64-apple-darwin` only*.
+
+| Tier | Content | Status |
+|---|---|---|
+| Claimed (Golden Journey) | Turn-scoped default with fail-closed rollback; metered pool reserve/settle/release; pacing gate with negative controls; hooks as plain clients (`LIBRA_GOVERNOR_NO_AUTOSPAWN`); tag == workspace version. Budget enforcement and data integrity are not relaxed. | `TestOwnedLive` / `Simulation` |
+| Claimed (delivery) | `aarch64-apple-darwin` tarball built from the final SHA, with sha256, attestation and `--version` verified | Publication-time (below) |
+| Not claimed | `x86_64-apple-darwin` and `x86_64-unknown-linux-gnu` installation (built in CI, unsupported-unverified); Windows (unsupported) | Out of Preview scope |
+| Not claimed | Real-model Codex native activation; `ProductionObserved` pacing value; cross-host attribution (HORO-1599/1714/1718) | Out of Preview scope |
+| Not claimed | Governed (daemon-present) behaviour on Codex; the HORO-2160 offline bundle supports isolation QA only | Out of Preview scope |
+
+Release notes for a Preview must say: Apple Silicon only; observation and
+turn-scoped budget enforcement, not active pacing; no cross-host
+attribution claim. Deferring the out-of-scope rows waives no security or
+data-loss risk: they are claims the Preview does not make.
+
+### Publication-time requirements (none performed yet)
+
+1. `main` at the intended SHA; `scripts/check-release-tag.sh vX.Y.Z` passes.
+2. Hosted CI green on that SHA.
+3. Pre-verify with a `workflow_dispatch` run of `release.yml` on that exact SHA. It builds and attests but never publishes. Attestations are public and permanent, so this needs the founder's GO naming the SHA.
+4. Verify tarball sha256, `gh attestation verify`, `--version` equals the tag, and a clean install smoke on Apple Silicon.
+5. Record the artifact manifest (file, size, sha256, source SHA, run URL).
+6. Founder GO for the tag step itself. A `v*` tag push **publishes the GitHub Release immediately and irreversibly**, so it comes only after items 3-5.
+7. **Scope enforcement gap:** `release.yml` builds, attests and publishes all three targets. The Preview does not claim `x86_64-apple-darwin` or `x86_64-unknown-linux-gnu`, so the release notes must label those assets unsupported-unverified, or the founder may choose a separate, reviewed change that restricts the build matrix to `aarch64-apple-darwin`. Neither has been done.
+
 ## Consequence
 
 Until the items in "Explicitly NOT claimed" are closed or the founder
