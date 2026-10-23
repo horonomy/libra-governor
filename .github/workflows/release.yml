@@ -97,6 +97,18 @@ jobs:
           # synthetic merge ref that doesn't exist on any branch.
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
+      # HORO-2162: a pushed `v*` tag must name the version this checkout
+      # builds, or the published artifacts would carry a different
+      # `--version` than the release that announces them. Runs before any
+      # compilation so a mistagged push fails fast and publishes nothing.
+      - name: tag matches workspace version
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          # Via env, never interpolated into the script text: a tag name is
+          # attacker-influenced input.
+          TAG: ${{ github.ref_name }}
+        run: scripts/check-release-tag.sh "$TAG"
+
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch, pinned (reused from ci.yml)
         with:
           toolchain: stable
