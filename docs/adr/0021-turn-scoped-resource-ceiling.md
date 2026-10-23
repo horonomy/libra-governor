@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted.
+Accepted. Amended by [ADR-0024](0024-turn-scoped-default-for-unconfigured-daemons.md):
+the turn-scoped ceiling is now the default for a daemon with no `config.json`.
 
 ## Context
 

@@ -6,8 +6,8 @@
 -- every row written by a build that does not know this column, is
 -- lifetime-bounded: the column default is 1, so no backfill statement is
 -- needed and an older binary inserting into a migrated database fails
--- closed. No code reads this column yet, so applying the migration changes
--- no behavior.
+-- closed. Admission reads this column (HORO-1727 S4); gateway enforcement
+-- and the budget snapshot read the persisted row, not the current config.
 
 ALTER TABLE task_budgets ADD COLUMN lifetime_bounded INTEGER NOT NULL DEFAULT 1
     CHECK (lifetime_bounded IN (0, 1));

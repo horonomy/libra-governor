@@ -2,8 +2,8 @@
 
 ## Status
 
-Accepted for v0.0.4 (S1-S5, D4 and the HORO-2042 USD-fact fix are merged on
-`main`; the S6 pin tests and S8 real-daemon DogFood are in review). Founder decisions: HORO-1727 Jira comment 28055 (D1-D5) and the
+Accepted for v0.0.4 (S1-S8, D4 and the HORO-2042 USD-fact fix are merged on
+`main`). Founder decisions: HORO-1727 Jira comment 28055 (D1-D5) and the
 decision packet in comment 28296 (F2, F3), both since decided by the founder (see Consequences). Amends
 [ADR-0021](0021-turn-scoped-resource-ceiling.md). **Not part of v0.0.3**:
 `release/v0.0.3` keeps the lifetime-bounded default and migrations 0001-0015
