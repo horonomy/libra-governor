@@ -550,7 +550,10 @@ fn multi_process_cli_reserve_race_never_overallocates() {
     std::fs::write(&gate, b"").unwrap();
 
     let (mut granted, mut refused, mut granted_sum) = (0u64, 0u64, 0u64);
-    for child in std::mem::take(&mut reaper.0) {
+    while !reaper.0.is_empty() {
+        // Consume one at a time so unconsumed children stay inside the
+        // guard (and are killed) if an assertion below panics.
+        let child = reaper.0.remove(0);
         let (code, v) = parse_output(child.wait_with_output().unwrap());
         match code {
             0 => {
@@ -678,7 +681,10 @@ fn multi_process_ledger_store_race_on_one_sqlite_file_never_overallocates() {
     std::fs::write(&gate, b"").unwrap();
 
     let (mut granted, mut refused, mut granted_sum) = (0u64, 0u64, 0u64);
-    for child in std::mem::take(&mut reaper.0) {
+    while !reaper.0.is_empty() {
+        // Consume one at a time so unconsumed children stay inside the
+        // guard (and are killed) if an assertion below panics.
+        let child = reaper.0.remove(0);
         let out = child.wait_with_output().unwrap();
         assert!(
             out.status.success(),
