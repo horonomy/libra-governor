@@ -99,6 +99,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 20,
         sql: include_str!("../migrations/0020_task_budget_lifetime_scope.sql"),
     },
+    Migration {
+        version: 21,
+        sql: include_str!("../migrations/0021_shared_pool_executor_attribution.sql"),
+    },
 ];
 
 /// The highest migration version this build of the crate knows about
@@ -281,6 +285,69 @@ mod tests {
             .unwrap();
         assert_eq!(bounded, 1);
         assert_eq!(hard_limit, 150000.0);
+    }
+
+    #[test]
+    fn migration_21_preserves_0020_shared_pool_rows_and_leaves_attribution_null() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        apply_known_through(&mut conn, 20);
+        conn.execute(
+            "INSERT INTO quota_pools (pool_id, unit_json, capacity, schema_version, created_at, updated_at)
+             VALUES ('metered:acme/usd', '\"usd_cents\"', 5000, 'v1', '2026-10-24T00:00:00Z', '2026-10-24T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        for (id, state, settled) in [("a", "active", None), ("b", "settled", Some(700i64))] {
+            conn.execute(
+                "INSERT INTO shared_pool_reservations (
+                    id, pool_id, principal_id, session_id, amount, state, settled_amount,
+                    usage_known, idempotency_key, created_at, expires_at, settled_at,
+                    released_at, schema_version
+                 ) VALUES (?1, 'metered:acme/usd', 'acme', 'sess-1', 900, ?2, ?3, NULL, ?1,
+                           '2026-10-24T00:00:00Z', '2026-10-24T01:00:00Z', NULL, NULL, 'v1')",
+                rusqlite::params![id, state, settled],
+            )
+            .unwrap();
+        }
+
+        apply_all(&mut conn).unwrap();
+
+        let rows: Vec<(String, i64, Option<String>, Option<String>, Option<String>)> = conn
+            .prepare(
+                "SELECT id, amount, agent_id, executor_kind, charge_source
+                 FROM shared_pool_reservations ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("a".to_string(), 900, None, None, None),
+                ("b".to_string(), 900, None, None, None),
+            ],
+            "rows survive with their amounts; attribution is never backfilled"
+        );
+        let settled: i64 = conn
+            .query_row(
+                "SELECT settled_amount FROM shared_pool_reservations WHERE id = 'b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(settled, 700);
+
+        for bad in [
+            "UPDATE shared_pool_reservations SET executor_kind = 'root' WHERE id = 'a'",
+            "UPDATE shared_pool_reservations SET charge_source = 'bogus' WHERE id = 'a'",
+        ] {
+            assert!(conn.execute(bad, []).is_err(), "CHECK must reject: {bad}");
+        }
     }
 
     #[test]

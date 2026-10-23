@@ -63,7 +63,9 @@ pub use resource_account::{
     RecordedShadowDecision,
 };
 pub use shared_pool::{
-    MeteredReserveOutcome, MeteredReserveRequest, SharedPoolReleaseOutcome, SharedPoolRenewOutcome,
+    CapacitySource, ExecutorAttribution, MeteredReserveOutcome, MeteredReserveRequest,
+    SharedPoolChargeOutcome, SharedPoolChargeRequest, SharedPoolExecutorReport,
+    SharedPoolExecutorUsage, SharedPoolReleaseOutcome, SharedPoolRenewOutcome,
     SharedPoolReserveOutcome, SharedPoolReserveRequest, SharedPoolSessionUsage,
     SharedPoolSettleOutcome,
 };

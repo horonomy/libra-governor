@@ -51,9 +51,10 @@
 //! [`LedgerStore::pool_admission`].
 
 use libra_governor_domain::{
-    metered_snapshot_limit, Confidence, GaugeReading, PoolAdmission, PoolId, PoolProviderSnapshot,
-    PrincipalId, QuotaAmount, QuotaPool, QuotaUnit, ReservationState, SharedPoolReservation,
-    SharedPoolReservationId, SnapshotUnusable, SHARED_POOL_RESERVATION_SCHEMA_VERSION,
+    metered_snapshot_limit, ChargeSource, Confidence, ExecutorKind, GaugeReading, PoolAdmission,
+    PoolId, PoolProviderSnapshot, PrincipalId, QuotaAmount, QuotaPool, QuotaUnit, ReservationState,
+    SharedPoolReservation, SharedPoolReservationId, SnapshotUnusable,
+    SHARED_POOL_RESERVATION_SCHEMA_VERSION,
 };
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use time::format_description::well_known::Rfc3339;
@@ -146,11 +147,15 @@ type ReservationRow = (
     Option<String>, // settled_at
     Option<String>, // released_at
     String,         // schema_version
+    Option<String>, // agent_id
+    Option<String>, // executor_kind
+    Option<String>, // charge_source
 );
 
 const RESERVATION_COLUMNS: &str =
     "id, pool_id, principal_id, session_id, amount, state, settled_amount, usage_known,
-     idempotency_key, created_at, expires_at, settled_at, released_at, schema_version";
+     idempotency_key, created_at, expires_at, settled_at, released_at, schema_version,
+     agent_id, executor_kind, charge_source";
 
 fn read_reservation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReservationRow> {
     Ok((
@@ -168,6 +173,9 @@ fn read_reservation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reservation
         row.get(11)?,
         row.get(12)?,
         row.get(13)?,
+        row.get(14)?,
+        row.get(15)?,
+        row.get(16)?,
     ))
 }
 
@@ -187,6 +195,9 @@ fn row_to_reservation(row: ReservationRow) -> Result<SharedPoolReservation, Ledg
         settled_at,
         released_at,
         schema_version,
+        agent_id,
+        executor_kind,
+        charge_source,
     ) = row;
     Ok(SharedPoolReservation {
         id: SharedPoolReservationId(uuid::Uuid::parse_str(&id).map_err(|_| invalid())?),
@@ -203,7 +214,106 @@ fn row_to_reservation(row: ReservationRow) -> Result<SharedPoolReservation, Ledg
         settled_at: settled_at.map(|s| parse_time(&s)).transpose()?,
         released_at: released_at.map(|s| parse_time(&s)).transpose()?,
         schema_version,
+        agent_id,
+        executor_kind: executor_kind
+            .map(|s| ExecutorKind::parse(&s).ok_or_else(invalid))
+            .transpose()?,
+        charge_source: charge_source
+            .map(|s| ChargeSource::parse(&s).ok_or_else(invalid))
+            .transpose()?,
     })
+}
+
+/// Which executor within a session a shared-pool row is attributed to,
+/// and how its spend arrived (HORO-2194). The default attributes nothing
+/// (all columns NULL) so callers that predate attribution are unchanged.
+///
+/// Executor key: `(session_id, agent_id | NULL)`. A missing `agent_id`
+/// with [`ExecutorKind::AgentAbsent`] is the session's main executor --
+/// never a `root` lineage; [`ExecutorKind::Unattributed`] means the
+/// session is known but the agent is not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExecutorAttribution<'a> {
+    pub agent_id: Option<&'a str>,
+    pub executor_kind: Option<ExecutorKind>,
+    pub charge_source: Option<ChargeSource>,
+}
+
+impl<'a> ExecutorAttribution<'a> {
+    /// The session's main executor (no agent id).
+    pub fn main_executor(charge_source: Option<ChargeSource>) -> Self {
+        Self {
+            agent_id: None,
+            executor_kind: Some(ExecutorKind::AgentAbsent),
+            charge_source,
+        }
+    }
+
+    /// A specific agent within the session.
+    pub fn agent(agent_id: &'a str, charge_source: Option<ChargeSource>) -> Self {
+        Self {
+            agent_id: Some(agent_id),
+            executor_kind: Some(ExecutorKind::Agent),
+            charge_source,
+        }
+    }
+
+    /// Session known, agent unknown.
+    pub fn unattributed(charge_source: Option<ChargeSource>) -> Self {
+        Self {
+            agent_id: None,
+            executor_kind: Some(ExecutorKind::Unattributed),
+            charge_source,
+        }
+    }
+
+    /// Validates the `agent_id` / `executor_kind` pairing and resolves it
+    /// to the values persisted. `Agent` requires a non-empty id;
+    /// `AgentAbsent` / `Unattributed` forbid one; a bare `agent_id` with
+    /// no kind is read as `Agent`; neither stays fully NULL.
+    fn resolve(&self) -> Result<ResolvedAttribution, LedgerError> {
+        let agent_id = match self.agent_id {
+            Some("") => return Err(invalid()),
+            other => other,
+        };
+        let executor_kind = match (self.executor_kind, agent_id) {
+            (Some(ExecutorKind::Agent), Some(_)) => Some(ExecutorKind::Agent),
+            (Some(ExecutorKind::Agent), None) => return Err(invalid()),
+            (Some(ExecutorKind::AgentAbsent | ExecutorKind::Unattributed), Some(_)) => {
+                return Err(invalid())
+            }
+            (Some(kind), None) => Some(kind),
+            (None, Some(_)) => Some(ExecutorKind::Agent),
+            (None, None) => None,
+        };
+        Ok(ResolvedAttribution {
+            agent_id: agent_id.map(str::to_string),
+            executor_kind,
+            charge_source: self.charge_source,
+        })
+    }
+}
+
+/// Validated, owned form of [`ExecutorAttribution`].
+struct ResolvedAttribution {
+    agent_id: Option<String>,
+    executor_kind: Option<ExecutorKind>,
+    charge_source: Option<ChargeSource>,
+}
+
+/// Where a metered pool's effective capacity comes from (HORO-2194).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CapacitySource {
+    /// `min(pool capacity, provider-declared snapshot limit)`, failing
+    /// closed on an unusable snapshot -- the HORO-1915 behavior.
+    #[default]
+    ProviderSnapshot,
+    /// An operator-configured cap, in the pool's own unit. The provider
+    /// snapshot limit is not consulted and the stored `quota_pools`
+    /// capacity (fixed at first creation) is not used as a bound: the
+    /// configured cap is the effective capacity, so raising or lowering
+    /// it takes effect on the next admission.
+    LocalConfigured { cap: u64 },
 }
 
 /// Request to reserve shared-pool capacity. See
@@ -218,6 +328,8 @@ pub struct SharedPoolReserveRequest<'a> {
     pub idempotency_key: &'a str,
     pub now: OffsetDateTime,
     pub ttl_secs: u64,
+    /// Executor attribution for the hold; `Default` attributes nothing.
+    pub attribution: ExecutorAttribution<'a>,
 }
 
 /// The outcome of [`LedgerStore::reserve_shared`].
@@ -248,6 +360,9 @@ pub struct MeteredReserveRequest<'a> {
     /// pool's own capacity, never a required allocation (a session with no
     /// cap is bounded only by the pool).
     pub session_cap: Option<u64>,
+    /// Where effective capacity comes from. `Default` is
+    /// [`CapacitySource::ProviderSnapshot`].
+    pub capacity_source: CapacitySource,
 }
 
 /// The outcome of [`LedgerStore::reserve_shared_metered`].
@@ -307,6 +422,69 @@ enum CoreReserveOutcome {
 /// plain launch-slot path is byte-for-byte unchanged.
 struct MeteredGate {
     session_cap: Option<u64>,
+    capacity_source: CapacitySource,
+}
+
+/// Request to record spend that has *already happened* as an
+/// already-settled row (HORO-2194). See [`LedgerStore::charge_shared`].
+pub struct SharedPoolChargeRequest<'a> {
+    pub pool_id: &'a PoolId,
+    pub principal_id: &'a PrincipalId,
+    pub session_id: &'a str,
+    pub amount: u64,
+    pub unit: &'a QuotaUnit,
+    /// Replay key, scoped `(pool_id, principal_id, idempotency_key)` --
+    /// the same key space as reserve.
+    pub idempotency_key: &'a str,
+    pub now: OffsetDateTime,
+    pub attribution: ExecutorAttribution<'a>,
+    /// Only used to report the post-charge [`PoolAdmission`]; a charge is
+    /// never gated on it.
+    pub capacity_source: CapacitySource,
+}
+
+/// The outcome of [`LedgerStore::charge_shared`]. There is deliberately
+/// no `Insufficient` variant: the spend already occurred.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SharedPoolChargeOutcome {
+    Charged {
+        reservation: Box<SharedPoolReservation>,
+        /// Pool accounting immediately after this charge.
+        admission: PoolAdmission,
+        /// `admission.overrun()`: how far committed spend now exceeds
+        /// capacity (0 when within capacity).
+        overrun: u64,
+    },
+    /// Idempotent replay of an identical charge; nothing was written.
+    AlreadyCharged(Box<SharedPoolReservation>),
+    /// The key exists but is not an identical charge (a hold, or a charge
+    /// with a different amount/session). Nothing was written.
+    KeyConflict(Box<SharedPoolReservation>),
+    /// No `quota_pools` row exists for this pool.
+    NoPool,
+}
+
+/// One executor's settled (`used`) and active (`reserved`) amounts
+/// against a pool (HORO-2194).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedPoolExecutorUsage {
+    pub principal_id: PrincipalId,
+    pub session_id: String,
+    pub agent_id: Option<String>,
+    /// Rows with no recorded kind (legacy / omitted attribution) are
+    /// reported as [`ExecutorKind::Unattributed`], never dropped.
+    pub executor_kind: ExecutorKind,
+    pub used: u64,
+    pub reserved: u64,
+}
+
+/// Per-executor usage plus pool totals. `executors` always sums to
+/// `total_used` / `total_reserved`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedPoolExecutorReport {
+    pub executors: Vec<SharedPoolExecutorUsage>,
+    pub total_used: u64,
+    pub total_reserved: u64,
 }
 
 /// The outcome of [`LedgerStore::settle_shared`].
@@ -692,6 +870,219 @@ impl LedgerStore {
             .map_err(LedgerError::Sqlite)
     }
 
+    /// Per-executor used (settled) and reserved (active) amounts against
+    /// `pool_id`, plus the pool totals (HORO-2194). Rows are grouped by
+    /// `(principal_id, session_id, agent_id, executor_kind)`; rows with no
+    /// recorded kind (legacy / attribution omitted) are reported as
+    /// [`ExecutorKind::Unattributed`] so nothing is silently omitted, and
+    /// `sum(executors) == totals` for both figures. Totals come from the
+    /// same queries `pool_admission` uses, read in one snapshot.
+    pub fn shared_pool_executor_usage(
+        &self,
+        pool_id: &PoolId,
+    ) -> Result<SharedPoolExecutorReport, LedgerError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let (total_used, total_reserved) = Self::settled_and_active_tx(&tx, pool_id)?;
+        let executors = {
+            let mut stmt = tx.prepare(
+                "SELECT principal_id, session_id, agent_id,
+                        COALESCE(executor_kind, 'unattributed'),
+                        COALESCE(SUM(CASE WHEN state = 'settled' THEN settled_amount ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN state = 'active' THEN amount ELSE 0 END), 0)
+                 FROM shared_pool_reservations
+                 WHERE pool_id = ?1 AND state IN ('active', 'settled')
+                 GROUP BY principal_id, session_id, agent_id, COALESCE(executor_kind, 'unattributed')
+                 ORDER BY principal_id, session_id, agent_id, 4",
+            )?;
+            let rows = stmt.query_map([&pool_id.0], |row| {
+                let kind: String = row.get(3)?;
+                let used: i64 = row.get(4)?;
+                let reserved: i64 = row.get(5)?;
+                Ok((
+                    PrincipalId(row.get(0)?),
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    kind,
+                    used.max(0) as u64,
+                    reserved.max(0) as u64,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (principal_id, session_id, agent_id, kind, used, reserved) = row?;
+                out.push(SharedPoolExecutorUsage {
+                    principal_id,
+                    session_id,
+                    agent_id,
+                    executor_kind: ExecutorKind::parse(&kind).ok_or_else(invalid)?,
+                    used,
+                    reserved,
+                });
+            }
+            out
+        };
+        Ok(SharedPoolExecutorReport {
+            executors,
+            total_used,
+            total_reserved,
+        })
+    }
+
+    /// Atomically records spend that has *already happened* as an
+    /// already-`settled` row (HORO-2194), e.g. a subagent's transcript
+    /// usage or a gateway-observed charge.
+    ///
+    /// - Idempotent on `(pool_id, principal_id, idempotency_key)`: an
+    ///   identical replay writes nothing and returns
+    ///   [`SharedPoolChargeOutcome::AlreadyCharged`]; the same key naming
+    ///   anything else is a [`SharedPoolChargeOutcome::KeyConflict`].
+    /// - **Never refused for lack of capacity.** The money is already
+    ///   spent, so refusing would only make the ledger lie. If the charge
+    ///   pushes committed spend beyond capacity the excess is reported as
+    ///   overrun -- the same way a late settle past its hold is: nothing
+    ///   is clamped, [`PoolAdmission::remaining`] goes negative,
+    ///   [`PoolAdmission::overrun`] is the excess, and every later
+    ///   `reserve` is refused until capacity is available again.
+    /// - Counts toward `remaining` (`capacity - settled - active`)
+    ///   immediately: it is a `settled` row like any other.
+    ///
+    /// Same `BEGIN IMMEDIATE` discipline as every other mutator here.
+    pub fn charge_shared(
+        &mut self,
+        req: SharedPoolChargeRequest<'_>,
+    ) -> Result<SharedPoolChargeOutcome, LedgerError> {
+        let attribution = req.attribution.resolve()?;
+        let amount_i64 = checked_i64(req.amount)?;
+        let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
+
+        let existing: Option<ReservationRow> = tx
+            .query_row(
+                &format!(
+                    "SELECT {RESERVATION_COLUMNS}
+                     FROM shared_pool_reservations
+                     WHERE pool_id = ?1 AND principal_id = ?2 AND idempotency_key = ?3"
+                ),
+                rusqlite::params![req.pool_id.0, req.principal_id.0, req.idempotency_key],
+                read_reservation_row,
+            )
+            .optional()?;
+        if let Some(row) = existing {
+            tx.commit()?;
+            let existing = row_to_reservation(row)?;
+            let identical = existing.state == ReservationState::Settled
+                && existing.settled_amount == Some(req.amount)
+                && existing.session_id == req.session_id;
+            return Ok(if identical {
+                SharedPoolChargeOutcome::AlreadyCharged(Box::new(existing))
+            } else {
+                SharedPoolChargeOutcome::KeyConflict(Box::new(existing))
+            });
+        }
+
+        let pool_row: Option<PoolRow> = tx
+            .query_row(
+                "SELECT unit_json, capacity, schema_version, created_at, updated_at
+                 FROM quota_pools WHERE pool_id = ?1",
+                [&req.pool_id.0],
+                |row| {
+                    let capacity: i64 = row.get(1)?;
+                    Ok((
+                        row.get(0)?,
+                        capacity as u64,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some(pool_row) = pool_row else {
+            tx.commit()?;
+            return Ok(SharedPoolChargeOutcome::NoPool);
+        };
+        let pool = row_to_pool(req.pool_id.clone(), pool_row)?;
+        if *req.unit != pool.unit {
+            return Err(LedgerError::QuotaUnitMismatch {
+                expected: pool.unit,
+                actual: req.unit.clone(),
+            });
+        }
+
+        let id = SharedPoolReservationId::new();
+        let now_str = rfc3339(req.now)?;
+        tx.execute(
+            "INSERT INTO shared_pool_reservations (
+                id, pool_id, principal_id, session_id, amount, state, settled_amount,
+                usage_known, idempotency_key, created_at, expires_at, settled_at, released_at,
+                schema_version, agent_id, executor_kind, charge_source
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'settled', ?5, 1, ?6, ?7, ?7, ?7, NULL, ?8,
+                       ?9, ?10, ?11)",
+            rusqlite::params![
+                id.0.to_string(),
+                req.pool_id.0,
+                req.principal_id.0,
+                req.session_id,
+                amount_i64,
+                req.idempotency_key,
+                now_str,
+                SHARED_POOL_RESERVATION_SCHEMA_VERSION,
+                attribution.agent_id,
+                attribution.executor_kind.map(ExecutorKind::as_str),
+                attribution.charge_source.map(ChargeSource::as_str),
+            ],
+        )?;
+
+        // Reporting only -- the row is already written. An unusable
+        // provider snapshot falls back to the stored pool capacity.
+        let capacity = Self::effective_capacity_tx(&tx, &pool, req.capacity_source, req.now)?
+            .unwrap_or(pool.capacity);
+        let (settled, active) = Self::settled_and_active_tx(&tx, req.pool_id)?;
+        let external_overhang = Self::external_overhang_tx(&tx, req.pool_id, req.now)?;
+        let admission = PoolAdmission {
+            capacity,
+            settled,
+            active,
+            external_overhang,
+        };
+        let reservation = Self::get_shared_reservation_tx(&tx, id)?
+            .expect("row just inserted in this same transaction");
+        tx.commit()?;
+        Ok(SharedPoolChargeOutcome::Charged {
+            reservation: Box::new(reservation),
+            admission,
+            overrun: admission.overrun(),
+        })
+    }
+
+    /// [`Self::pool_admission`] for a pool whose capacity comes from
+    /// `source` (HORO-2194): with [`CapacitySource::LocalConfigured`] the
+    /// configured cap, otherwise the stored capacity clamped to a usable
+    /// provider snapshot's declared limit (the stored capacity alone when
+    /// the snapshot is unusable -- this is a status read, not an
+    /// admission). `remaining()` is never clamped, so an overrun shows as
+    /// a negative figure and via [`PoolAdmission::overrun`].
+    pub fn pool_admission_for(
+        &self,
+        pool_id: &PoolId,
+        now: OffsetDateTime,
+        source: CapacitySource,
+    ) -> Result<Option<PoolAdmission>, LedgerError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let Some(pool) = self.quota_pool(pool_id)? else {
+            return Ok(None);
+        };
+        let capacity =
+            Self::effective_capacity_tx(&tx, &pool, source, now)?.unwrap_or(pool.capacity);
+        let (settled, active) = Self::settled_and_active_tx(&tx, pool_id)?;
+        let external_overhang = Self::external_overhang_tx(&tx, pool_id, now)?;
+        Ok(Some(PoolAdmission {
+            capacity,
+            settled,
+            active,
+            external_overhang,
+        }))
+    }
+
     /// Computes [`PoolAdmission`] for `pool_id` as of `now`, inside the
     /// caller's own transaction/connection. `Ok(None)` when no pool has
     /// been created.
@@ -758,8 +1149,15 @@ impl LedgerStore {
         &mut self,
         req: MeteredReserveRequest<'_>,
     ) -> Result<MeteredReserveOutcome, LedgerError> {
-        let MeteredReserveRequest { base, session_cap } = req;
-        let gate = MeteredGate { session_cap };
+        let MeteredReserveRequest {
+            base,
+            session_cap,
+            capacity_source,
+        } = req;
+        let gate = MeteredGate {
+            session_cap,
+            capacity_source,
+        };
         match self.reserve_shared_core(base, Some(&gate))? {
             CoreReserveOutcome::Granted(r) => Ok(MeteredReserveOutcome::Granted(r)),
             CoreReserveOutcome::AlreadyGranted(r) => Ok(MeteredReserveOutcome::AlreadyGranted(r)),
@@ -861,12 +1259,9 @@ impl LedgerStore {
         // — see `libra_governor_domain::metered_snapshot_limit`'s own
         // docs for the exact rule order.
         let mut effective_capacity = pool.capacity;
-        if metered.is_some() {
-            let snapshot = Self::pool_provider_snapshot_tx(&tx, req.pool_id, &pool.unit)?;
-            match metered_snapshot_limit(snapshot.as_ref(), req.now) {
-                Ok(declared_limit) => {
-                    effective_capacity = pool.capacity.min(declared_limit);
-                }
+        if let Some(gate) = metered {
+            match Self::effective_capacity_tx(&tx, &pool, gate.capacity_source, req.now)? {
+                Ok(capacity) => effective_capacity = capacity,
                 Err(reason) => {
                     tx.commit()?;
                     return Ok(CoreReserveOutcome::SnapshotUnusable(reason));
@@ -909,6 +1304,7 @@ impl LedgerStore {
             });
         }
 
+        let attribution = req.attribution.resolve()?;
         let id = SharedPoolReservationId::new();
         // `ttl_secs` is caller-supplied; a bare `Duration::seconds(ttl_secs
         // as i64)` followed by `now + duration` can both truncate (a
@@ -937,8 +1333,9 @@ impl LedgerStore {
             "INSERT INTO shared_pool_reservations (
                 id, pool_id, principal_id, session_id, amount, state, settled_amount,
                 usage_known, idempotency_key, created_at, expires_at, settled_at, released_at,
-                schema_version
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', NULL, NULL, ?6, ?7, ?8, NULL, NULL, ?9)",
+                schema_version, agent_id, executor_kind, charge_source
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', NULL, NULL, ?6, ?7, ?8, NULL, NULL, ?9,
+                       ?10, ?11, ?12)",
             rusqlite::params![
                 id.0.to_string(),
                 req.pool_id.0,
@@ -949,6 +1346,9 @@ impl LedgerStore {
                 rfc3339(req.now)?,
                 rfc3339(expires_at)?,
                 SHARED_POOL_RESERVATION_SCHEMA_VERSION,
+                attribution.agent_id,
+                attribution.executor_kind.map(ExecutorKind::as_str),
+                attribution.charge_source.map(ChargeSource::as_str),
             ],
         )?;
         tx.commit()?;
@@ -969,8 +1369,30 @@ impl LedgerStore {
                 settled_at: None,
                 released_at: None,
                 schema_version: SHARED_POOL_RESERVATION_SCHEMA_VERSION.to_string(),
+                agent_id: attribution.agent_id,
+                executor_kind: attribution.executor_kind,
+                charge_source: attribution.charge_source,
             },
         )))
+    }
+
+    /// The effective capacity for `source` inside the caller's
+    /// transaction. `Err(reason)` (inner) only for
+    /// [`CapacitySource::ProviderSnapshot`] with an unusable snapshot.
+    fn effective_capacity_tx(
+        tx: &rusqlite::Connection,
+        pool: &QuotaPool,
+        source: CapacitySource,
+        now: OffsetDateTime,
+    ) -> Result<Result<u64, SnapshotUnusable>, LedgerError> {
+        match source {
+            CapacitySource::LocalConfigured { cap } => Ok(Ok(cap)),
+            CapacitySource::ProviderSnapshot => {
+                let snapshot = Self::pool_provider_snapshot_tx(tx, &pool.pool_id, &pool.unit)?;
+                Ok(metered_snapshot_limit(snapshot.as_ref(), now)
+                    .map(|declared_limit| pool.capacity.min(declared_limit)))
+            }
+        }
     }
 
     fn get_shared_reservation_tx(
@@ -1017,6 +1439,23 @@ impl LedgerStore {
         actual: Option<u64>,
         now: OffsetDateTime,
     ) -> Result<SharedPoolSettleOutcome, LedgerError> {
+        self.settle_shared_attributed(id, actual, now, ExecutorAttribution::default())
+    }
+
+    /// [`Self::settle_shared`] that can also attribute the row at settle
+    /// time (HORO-2194). Attribution recorded at hold time is
+    /// authoritative: `attribution` only fills what the row does not yet
+    /// have -- `agent_id`/`executor_kind` together if the row has no
+    /// kind, and `charge_source` if it has none. It never rewrites an
+    /// existing value.
+    pub fn settle_shared_attributed(
+        &mut self,
+        id: SharedPoolReservationId,
+        actual: Option<u64>,
+        now: OffsetDateTime,
+        attribution: ExecutorAttribution<'_>,
+    ) -> Result<SharedPoolSettleOutcome, LedgerError> {
+        let supplied = attribution.resolve()?;
         let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
         let Some(reservation) = Self::get_shared_reservation_tx(&tx, id)? else {
             tx.commit()?;
@@ -1041,9 +1480,26 @@ impl LedgerStore {
         } else {
             "active"
         };
+        let (agent_id, executor_kind) = if reservation.executor_kind.is_some() {
+            (
+                reservation.agent_id.clone(),
+                reservation.executor_kind.map(ExecutorKind::as_str),
+            )
+        } else {
+            (
+                supplied.agent_id.clone(),
+                supplied.executor_kind.map(ExecutorKind::as_str),
+            )
+        };
+        let charge_source = reservation
+            .charge_source
+            .or(supplied.charge_source)
+            .map(ChargeSource::as_str);
         let updated = tx.execute(
             "UPDATE shared_pool_reservations SET state = 'settled', settled_amount = ?1,
-                                                  usage_known = ?2, settled_at = ?3
+                                                  usage_known = ?2, settled_at = ?3,
+                                                  agent_id = ?6, executor_kind = ?7,
+                                                  charge_source = ?8
              WHERE id = ?4 AND state = ?5",
             rusqlite::params![
                 settled_value_i64,
@@ -1051,6 +1507,9 @@ impl LedgerStore {
                 rfc3339(now)?,
                 id.0.to_string(),
                 expected_prior_state,
+                agent_id,
+                executor_kind,
+                charge_source,
             ],
         )?;
         if updated == 0 {
@@ -1427,6 +1886,7 @@ mod tests {
                 idempotency_key,
                 now: now(),
                 ttl_secs: 900,
+                attribution: Default::default(),
             })
             .unwrap()
     }
@@ -1505,6 +1965,7 @@ mod tests {
                 idempotency_key: "shared-key",
                 now: now(),
                 ttl_secs: 900,
+                attribution: Default::default(),
             })
             .unwrap();
         let from_principal_2 = store
@@ -1517,6 +1978,7 @@ mod tests {
                 idempotency_key: "shared-key",
                 now: now(),
                 ttl_secs: 900,
+                attribution: Default::default(),
             })
             .unwrap();
 
@@ -1552,6 +2014,7 @@ mod tests {
                 idempotency_key: "shared-key",
                 now: now(),
                 ttl_secs: 900,
+                attribution: Default::default(),
             })
             .unwrap();
         match replay_1 {
@@ -1682,6 +2145,7 @@ mod tests {
                 idempotency_key: "k1",
                 now: now(),
                 ttl_secs: 60,
+                attribution: Default::default(),
             })
             .unwrap();
         // Before expiry: no phantom free allowance.
@@ -1704,6 +2168,7 @@ mod tests {
                 idempotency_key: "k2",
                 now: later,
                 ttl_secs: 60,
+                attribution: Default::default(),
             })
             .unwrap()
         {
@@ -1734,6 +2199,7 @@ mod tests {
                     idempotency_key: "k1",
                     now: now(),
                     ttl_secs: 900,
+                    attribution: Default::default(),
                 })
                 .unwrap();
             // Simulated crash: store is dropped here without settling.
@@ -1749,6 +2215,7 @@ mod tests {
                 idempotency_key: "k2",
                 now: now(),
                 ttl_secs: 900,
+                attribution: Default::default(),
             })
             .unwrap()
         {
@@ -1879,6 +2346,7 @@ mod tests {
             idempotency_key: "k1",
             now: now(),
             ttl_secs: 60,
+            attribution: Default::default(),
         });
         assert!(matches!(
             outcome,
@@ -1926,6 +2394,7 @@ mod tests {
                 idempotency_key: "k1",
                 now: now(),
                 ttl_secs: 60,
+                attribution: Default::default(),
             })
             .unwrap();
         assert!(
@@ -2207,6 +2676,7 @@ mod tests {
                 idempotency_key: "k1",
                 now: now(),
                 ttl_secs: 60,
+                attribution: Default::default(),
             })
             .unwrap();
         let later = now() + time::Duration::seconds(120);
@@ -2244,6 +2714,7 @@ mod tests {
                 idempotency_key: "k1",
                 now: now(),
                 ttl_secs: 60,
+                attribution: Default::default(),
             })
             .unwrap()
         else {
@@ -2310,6 +2781,7 @@ mod tests {
                         idempotency_key: &format!("thread-key-{i}"),
                         now: OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
                         ttl_secs: 900,
+                        attribution: Default::default(),
                     })
                     .unwrap();
                 matches!(outcome, SharedPoolReserveOutcome::Granted(_))
@@ -2359,8 +2831,10 @@ mod tests {
                         idempotency_key,
                         now: now(),
                         ttl_secs: 3600,
+                        attribution: Default::default(),
                     },
                     session_cap,
+                    capacity_source: CapacitySource::ProviderSnapshot,
                 })
                 .unwrap()
         }
