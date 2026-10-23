@@ -301,6 +301,19 @@ impl MeteredPoolKey {
     }
 }
 
+/// Owner slug of the local monthly shared budget's pool (ADR-0026). The
+/// pool id is `metered:local-budget/monthly-YYYY-MM`.
+pub const LOCAL_BUDGET_OWNER: &str = "local-budget";
+
+/// The pool alias `monthly-YYYY-MM` for the calendar month that starts at
+/// `period_start`, with year and month read in `tz` (ADR-0026). Pass the
+/// start returned by [`crate::calendar_month_bounds`]; that start is the
+/// first local day, so the label is the month the budget period covers.
+pub fn monthly_pool_alias(period_start: OffsetDateTime, tz: &crate::IanaTimeZone) -> String {
+    let (year, month) = crate::quota_window::local_year_month(period_start, tz);
+    format!("monthly-{year:04}-{month:02}")
+}
+
 /// Whether `unit` is one of the provider-denominated units a metered pool
 /// may be created in (HORO-1915). Opaque launch-slot credit and
 /// basis-point percentages are refused — a metered pool always holds a
@@ -359,6 +372,20 @@ pub fn metered_snapshot_limit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_budget_pool_id_uses_the_period_start_month_in_the_zone() {
+        use time::macros::datetime;
+        let tz = crate::IanaTimeZone::new("America/New_York").unwrap();
+        let (start, _) = crate::calendar_month_bounds(datetime!(2025-01-15 12:00:00 UTC), &tz);
+        // Start is 2025-01-01 05:00Z; the alias reads the local month.
+        let alias = monthly_pool_alias(start, &tz);
+        assert_eq!(alias, "monthly-2025-01");
+        let key = MeteredPoolKey::new(&PrincipalId(LOCAL_BUDGET_OWNER.to_string()), &alias)
+            .expect("local-budget and monthly-YYYY-MM are valid slugs");
+        assert_eq!(key.pool_id().0, "metered:local-budget/monthly-2025-01");
+        assert_eq!(MeteredPoolKey::parse(&key.pool_id()), Some(key));
+    }
 
     fn base_reservation() -> SharedPoolReservation {
         SharedPoolReservation {

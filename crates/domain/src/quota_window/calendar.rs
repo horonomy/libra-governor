@@ -154,6 +154,48 @@ pub(super) fn fixed_aligned_bounds(
     }
 }
 
+/// The half-open `[start, end)` instants of the calendar month containing
+/// `now` in `tz`: `start` is the first day's 00:00 local, `end` the next
+/// month's first-day 00:00 local (ADR-0026). Dates are stepped on the
+/// civil calendar, never by adding seconds, and a midnight that falls in a
+/// DST gap or fold resolves with the same `Compatible` rule as
+/// [`fixed_aligned_bounds`]. Deliberately a free function rather than an
+/// `AlignedPeriod` variant: that enum is a public serde contract.
+pub fn calendar_month_bounds(
+    now: OffsetDateTime,
+    tz: &IanaTimeZone,
+) -> (OffsetDateTime, OffsetDateTime) {
+    let z = zone(tz);
+    let now_ts = to_jiff_timestamp(now);
+    let mut first = now_ts.to_zoned(z.clone()).date().first_of_month();
+    let midnight = WallClockTime::new(0, 0).expect("00:00 is a valid wall-clock time");
+    let mut start_zoned = candidate_instant(first, midnight, &z);
+    // A gap at midnight resolves to a later instant, and `now` can only be
+    // earlier than that if it belongs to the previous civil month.
+    if start_zoned.timestamp() > now_ts {
+        first = first
+            .yesterday()
+            .expect("stepping back one day cannot fail")
+            .first_of_month();
+        start_zoned = candidate_instant(first, midnight, &z);
+    }
+    let next_first = first
+        .last_of_month()
+        .tomorrow()
+        .expect("stepping forward one day cannot fail");
+    let end_zoned = candidate_instant(next_first, midnight, &z);
+    let start = from_jiff_timestamp(start_zoned.timestamp());
+    let end = from_jiff_timestamp(end_zoned.timestamp());
+    debug_assert!(end > start, "monthly boundary must be strictly increasing");
+    (start, end)
+}
+
+/// The civil `(year, month)` of `instant` in `tz`.
+pub(crate) fn local_year_month(instant: OffsetDateTime, tz: &IanaTimeZone) -> (i16, i8) {
+    let date = to_jiff_timestamp(instant).to_zoned(zone(tz)).date();
+    (date.year(), date.month())
+}
+
 /// A daily working-hours window in one timezone, applied every day
 /// (no per-weekday exclusion — see `pacing::PacingPreference::Sustain`'s
 /// own docs for why that is an accepted MVP scope limit, not an
@@ -287,5 +329,127 @@ mod tests {
             WallClockTime::new(9, 0).unwrap(),
         );
         assert!(err.is_err());
+    }
+
+    fn tz(name: &str) -> IanaTimeZone {
+        IanaTimeZone::new(name).unwrap()
+    }
+
+    fn hours(start: OffsetDateTime, end: OffsetDateTime) -> i64 {
+        (end - start).whole_hours()
+    }
+
+    #[test]
+    fn month_bounds_december_rolls_over_into_january() {
+        let (start, end) = calendar_month_bounds(datetime!(2024-12-15 12:00:00 UTC), &tz("UTC"));
+        assert_eq!(start, datetime!(2024-12-01 00:00:00 UTC));
+        assert_eq!(end, datetime!(2025-01-01 00:00:00 UTC));
+    }
+
+    #[test]
+    fn month_bounds_leap_february_is_29_days() {
+        let (start, end) = calendar_month_bounds(datetime!(2024-02-10 00:00:00 UTC), &tz("UTC"));
+        assert_eq!(start, datetime!(2024-02-01 00:00:00 UTC));
+        assert_eq!(end, datetime!(2024-03-01 00:00:00 UTC));
+        assert_eq!(hours(start, end), 29 * 24);
+    }
+
+    #[test]
+    fn month_bounds_non_leap_february_is_28_days() {
+        let (start, end) = calendar_month_bounds(datetime!(2023-02-28 23:59:59 UTC), &tz("UTC"));
+        assert_eq!(hours(start, end), 28 * 24);
+        assert_eq!(end, datetime!(2023-03-01 00:00:00 UTC));
+    }
+
+    #[test]
+    fn month_bounds_exact_boundary_belongs_to_the_new_month() {
+        let utc = tz("UTC");
+        let boundary = datetime!(2025-01-01 00:00:00 UTC);
+        let (start, _) = calendar_month_bounds(boundary, &utc);
+        assert_eq!(start, boundary);
+        let (old_start, old_end) =
+            calendar_month_bounds(boundary - time::Duration::nanoseconds(1), &utc);
+        assert_eq!(old_start, datetime!(2024-12-01 00:00:00 UTC));
+        assert_eq!(old_end, boundary);
+    }
+
+    #[test]
+    fn month_bounds_march_in_a_dst_zone_is_743_hours() {
+        let (start, end) =
+            calendar_month_bounds(datetime!(2024-03-20 12:00:00 UTC), &tz("America/New_York"));
+        assert_eq!(start, datetime!(2024-03-01 05:00:00 UTC));
+        assert_eq!(end, datetime!(2024-04-01 04:00:00 UTC));
+        assert_eq!(hours(start, end), 743);
+    }
+
+    #[test]
+    fn month_bounds_november_in_a_dst_zone_is_721_hours() {
+        let (start, end) =
+            calendar_month_bounds(datetime!(2024-11-20 12:00:00 UTC), &tz("America/New_York"));
+        assert_eq!(hours(start, end), 30 * 24 + 1);
+    }
+
+    #[test]
+    fn month_bounds_plus_14_zone_starts_on_the_previous_utc_day() {
+        let kiritimati = tz("Pacific/Kiritimati");
+        // 2024-12-31T10:00Z is 2025-01-01 00:00 at +14:00.
+        let boundary = datetime!(2024-12-31 10:00:00 UTC);
+        let (start, end) = calendar_month_bounds(boundary, &kiritimati);
+        assert_eq!(start, boundary);
+        assert_eq!(end, datetime!(2025-01-31 10:00:00 UTC));
+        let (prev_start, prev_end) =
+            calendar_month_bounds(boundary - time::Duration::nanoseconds(1), &kiritimati);
+        assert_eq!(prev_start, datetime!(2024-11-30 10:00:00 UTC));
+        assert_eq!(prev_end, boundary);
+    }
+
+    #[test]
+    fn month_bounds_minus_12_zone_starts_twelve_hours_into_the_utc_day() {
+        let (start, end) =
+            calendar_month_bounds(datetime!(2024-12-31 23:00:00 UTC), &tz("Etc/GMT+12"));
+        assert_eq!(start, datetime!(2024-12-01 12:00:00 UTC));
+        assert_eq!(end, datetime!(2025-01-01 12:00:00 UTC));
+    }
+
+    #[test]
+    fn month_bounds_midnight_dst_gap_on_the_first_resolves_compatibly() {
+        // America/Asuncion sprang forward at 2023-10-01 00:00 local, so
+        // local 00:00 on the 1st does not exist; `Compatible` takes the
+        // later valid instant, which is the transition instant itself.
+        let asuncion = tz("America/Asuncion");
+        let transition = datetime!(2023-10-01 04:00:00 UTC);
+        let (sep_start, sep_end) =
+            calendar_month_bounds(datetime!(2023-09-15 12:00:00 UTC), &asuncion);
+        assert_eq!(sep_start, datetime!(2023-09-01 04:00:00 UTC));
+        assert_eq!(sep_end, transition);
+        let (oct_start, oct_end) = calendar_month_bounds(transition, &asuncion);
+        assert_eq!(oct_start, transition);
+        assert_eq!(oct_end, datetime!(2023-11-01 03:00:00 UTC));
+        let (before_start, _) =
+            calendar_month_bounds(transition - time::Duration::nanoseconds(1), &asuncion);
+        assert_eq!(before_start, sep_start);
+    }
+
+    #[test]
+    fn month_bounds_midnight_dst_fold_on_the_first_takes_the_earlier_occurrence() {
+        // America/Havana ends DST at 2026-11-01 01:00 CDT -> 00:00 CST, so
+        // local 00:00 on the 1st occurs twice; `Compatible` takes the first.
+        let havana = tz("America/Havana");
+        let first_midnight = datetime!(2026-11-01 04:00:00 UTC);
+        let second_pass = datetime!(2026-11-01 05:30:00 UTC);
+        let (start, end) = calendar_month_bounds(second_pass, &havana);
+        assert_eq!(start, first_midnight);
+        assert_eq!(end, datetime!(2026-12-01 05:00:00 UTC));
+        let (oct_start, oct_end) =
+            calendar_month_bounds(datetime!(2026-10-15 00:00:00 UTC), &havana);
+        assert_eq!(oct_start, datetime!(2026-10-01 04:00:00 UTC));
+        assert_eq!(oct_end, first_midnight);
+    }
+
+    #[test]
+    fn month_bounds_require_a_known_zone_and_never_default_to_utc() {
+        for bad in ["Not/AZone", "", "utc-ish", "EST5EDT/extra"] {
+            assert!(IanaTimeZone::new(bad).is_err(), "{bad:?} must be rejected");
+        }
     }
 }
