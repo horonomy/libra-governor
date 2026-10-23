@@ -45,7 +45,7 @@ fn local(cap: u64) -> CapacitySource {
 
 fn store_with_pool(stored_capacity: u64) -> (tempfile::TempDir, LedgerStore) {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = LedgerStore::open(&dir.path().join("ledger.sqlite3")).unwrap();
+    let mut store = LedgerStore::open(dir.path().join("ledger.sqlite3")).unwrap();
     store
         .ensure_pool(&pool(), &QuotaUnit::UsdCents, stored_capacity, now())
         .unwrap();
@@ -439,7 +439,7 @@ fn charge_is_idempotent_on_its_key_and_scoped_like_reserve_keys() {
 #[test]
 fn charge_on_a_missing_pool_or_wrong_unit_is_not_silently_recorded() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = LedgerStore::open(&dir.path().join("l.sqlite3")).unwrap();
+    let mut store = LedgerStore::open(dir.path().join("l.sqlite3")).unwrap();
     assert!(matches!(
         charge(&mut store, local(10), "s", 1, "k", Default::default()),
         SharedPoolChargeOutcome::NoPool

@@ -313,7 +313,8 @@ mod tests {
 
         apply_all(&mut conn).unwrap();
 
-        let rows: Vec<(String, i64, Option<String>, Option<String>, Option<String>)> = conn
+        type Row = (String, i64, Option<String>, Option<String>, Option<String>);
+        let rows: Vec<Row> = conn
             .prepare(
                 "SELECT id, amount, agent_id, executor_kind, charge_source
                  FROM shared_pool_reservations ORDER BY id",
