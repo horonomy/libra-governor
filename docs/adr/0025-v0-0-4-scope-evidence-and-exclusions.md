@@ -73,10 +73,11 @@ data-loss risk: they are claims the Preview does not make.
 
 1. `main` at the intended SHA; `scripts/check-release-tag.sh vX.Y.Z` passes.
 2. Hosted CI green on that SHA.
-3. A `workflow_dispatch` or tag run of `release.yml` builds `aarch64-apple-darwin` from that exact SHA. Attestations are public and permanent, so this needs the founder's GO naming the SHA.
+3. Pre-verify with a `workflow_dispatch` run of `release.yml` on that exact SHA. It builds and attests but never publishes. Attestations are public and permanent, so this needs the founder's GO naming the SHA.
 4. Verify tarball sha256, `gh attestation verify`, `--version` equals the tag, and a clean install smoke on Apple Silicon.
 5. Record the artifact manifest (file, size, sha256, source SHA, run URL).
-6. Founder GO for the tag/publish step itself.
+6. Founder GO for the tag step itself. A `v*` tag push **publishes the GitHub Release immediately and irreversibly**, so it comes only after items 3-5.
+7. **Scope enforcement gap:** `release.yml` builds, attests and publishes all three targets. The Preview does not claim `x86_64-apple-darwin` or `x86_64-unknown-linux-gnu`, so the release notes must label those assets unsupported-unverified, or the founder may choose a separate, reviewed change that restricts the build matrix to `aarch64-apple-darwin`. Neither has been done.
 
 ## Consequence
 
