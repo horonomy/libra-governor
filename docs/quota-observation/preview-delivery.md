@@ -46,17 +46,30 @@ exact same value as `executable_sha256` (or the matching
 between whoever published the checksum and your copy of it — treat
 that as a hard stop, not a value to silently reconcile.
 
-## Build provenance — deliberately out of scope here
+## Build provenance and release status
 
-A build-provenance mechanism (for example, GitHub artifact attestations
-over a released executable) is a reasonable future addition, but it is
-a **separately reviewed decision**, not something this doc proposes or
-implements. This doc, and HORO-1857, make **no change to
-`.github/workflows/`** — adding provenance attestation would need its
-own review of what it actually guarantees (e.g. which identity signed
-the build) versus what the approval digest model here already
-guarantees (byte-identity of a specific file), and those are different
-questions worth keeping separate rather than conflating in passing.
+`.github/workflows/release.yml` (HORO-1857) builds the `libra-governor`
+binary for three targets, writes a `.sha256` per tarball, attests each build
+in a separate job that compiles nothing, re-verifies every attestation
+before publishing, and — since HORO-2162 — refuses a `v*` tag that does not
+equal the workspace version. The publish job runs **only on a real tag
+push**; `pull_request` and `workflow_dispatch` runs produce private workflow
+artifacts and never a public release.
+
+**Status: unreleased.** No release has been published and no tag has been
+pushed. The attestation proves where and how a file was built; it does not
+replace the approval digest above, which is byte-identity of one specific
+file. Both checks apply.
+
+| Target | Built in CI | Install tested |
+|---|---|---|
+| `aarch64-apple-darwin` | yes | yes (one manual run, Jira HORO-1857 comment 27560) |
+| `x86_64-apple-darwin` | yes (cross-compiled, not executed) | **UNVERIFIED** |
+| `x86_64-unknown-linux-gnu` | yes | **UNVERIFIED** |
+| Windows | no | unsupported |
+
+See [`release-checklist.md`](release-checklist.md) for the artifact manifest
+and PASS/FAIL/UNVERIFIED matrix an owner completes before any publication.
 
 ## Clean-install procedure
 
