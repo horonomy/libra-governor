@@ -26,7 +26,10 @@
 //! identity envelope (`libra_governor_domain::ExecutionIdentity`) only
 //! when an input actually supplies them. The current Codex schema
 //! documents `turn_id`; both hosts document `agent_id` in subagent
-//! contexts. Missing values remain absent. Neither host documents a
+//! contexts. Missing values remain absent. A payload that is not a JSON
+//! object (e.g. an array, which serde's derived visitors would otherwise
+//! decode positionally) is refused by `normalize` as malformed -- the hook
+//! fails open, no identity is produced. Neither host documents a
 //! `parent_agent_id` field, so captured lineage remains
 //! `LineageStatus::Unknown`; see `crates/cli/src/agent/identity.rs`.
 

@@ -110,7 +110,9 @@ impl Drop for RemoveFileOnDrop {
 /// share an identity (execution-identity contract, "Provider-native id
 /// that is empty or whitespace-only"). Claude Code sends no `turn_id`, so
 /// one found in its payload is not mapped (it is not a turn identity until
-/// the owner decides otherwise); Codex's is. Lineage is always `Unknown`.
+/// the owner decides otherwise); Codex's is. Non-object payloads never reach
+/// here: `normalize` refuses them as malformed (a refusal, not an envelope
+/// with an absent session). Lineage is always `Unknown`.
 pub fn capture(
     host_id: &str,
     agent: AgentKind,

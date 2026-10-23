@@ -17,7 +17,8 @@
 //! is not a mapping, where the reference emits an envelope with an absent
 //! session. Libra fails closed (no session-attributed identity is ever
 //! produced), but making `session_id` optional is a protocol change in a
-//! separate slice. They are pinned as refusals below and run exactly in an
+//! separate slice, tracked as HORO-2197 (it makes `session_id` optional so
+//! these vectors match, then the ignored test is un-ignored). They are pinned as refusals below and run exactly in an
 //! ignored test.
 
 use libra_governor_domain::{AgentKind, ExecutionIdentity, Scope};
@@ -219,7 +220,7 @@ fn refused_normalizer_vectors_fail_closed_and_never_attribute_a_session() {
 }
 
 #[test]
-#[ignore = "known deviation: Libra refuses the whole hook event when session_id is missing/non-string or the payload is not a mapping; session-optional hook pipeline is a separate protocol slice"]
+#[ignore = "known deviation: Libra refuses the whole hook event when session_id is missing/non-string or the payload is not a mapping; session-optional hook pipeline is a separate protocol slice (HORO-2197)"]
 fn deviation_refused_vectors_exact_match() {
     let doc = vectors();
     for vector in normalizers(&doc) {
