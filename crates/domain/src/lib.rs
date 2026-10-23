@@ -131,13 +131,13 @@ pub use progressive::{
     RUNTIME_DECISION_SCHEMA_VERSION,
 };
 pub use quota_window::{
-    decode_provider_snapshot, decode_quota_window, AlignedPeriod, BlockingStatus, BucketState,
-    CreditNamespace, DecodedProviderSnapshot, DecodedQuotaWindow, EntitlementSource,
-    GaugeFreshness, GaugeReading, GaugeState, IanaTimeZone, IndeterminateReason, OutstandingHold,
-    PeriodState, PoolId, ProviderAccount, ProviderSnapshot, QuotaAmount, QuotaEvidence, QuotaScope,
-    QuotaSubject, QuotaUnit, QuotaUsage, QuotaWindow, QuotaWindowError, QuotaWindowId, Relief,
-    ResetWeekday, StaleReason, WallClockTime, WindowEvaluation, WindowKind, WindowState,
-    WorkingHours, WorkingHoursError, QUOTA_WINDOW_SCHEMA_VERSION,
+    calendar_month_bounds, decode_provider_snapshot, decode_quota_window, AlignedPeriod,
+    BlockingStatus, BucketState, CreditNamespace, DecodedProviderSnapshot, DecodedQuotaWindow,
+    EntitlementSource, GaugeFreshness, GaugeReading, GaugeState, IanaTimeZone, IndeterminateReason,
+    OutstandingHold, PeriodState, PoolId, ProviderAccount, ProviderSnapshot, QuotaAmount,
+    QuotaEvidence, QuotaScope, QuotaSubject, QuotaUnit, QuotaUsage, QuotaWindow, QuotaWindowError,
+    QuotaWindowId, Relief, ResetWeekday, StaleReason, WallClockTime, WindowEvaluation, WindowKind,
+    WindowState, WorkingHours, WorkingHoursError, QUOTA_WINDOW_SCHEMA_VERSION,
 };
 pub use regime::{
     CacheClass, DimensionUnavailable, DimensionValue, RegimeBasis, RegimeComparison,
@@ -177,9 +177,10 @@ pub use resource_account::{
 };
 pub use resource_amount::{Headroom, ResourceAmount, ResourceKind};
 pub use shared_pool::{
-    is_metered_unit, metered_snapshot_limit, MeteredPoolKey, MeteredPoolKeyError, PoolAdmission,
-    PoolProviderSnapshot, QuotaPool, SharedPoolReservation, SharedPoolReservationId,
-    SnapshotUnusable, METERED_POOL_PREFIX, SHARED_POOL_RESERVATION_SCHEMA_VERSION,
+    is_metered_unit, metered_snapshot_limit, monthly_pool_alias, MeteredPoolKey,
+    MeteredPoolKeyError, PoolAdmission, PoolProviderSnapshot, QuotaPool, SharedPoolReservation,
+    SharedPoolReservationId, SnapshotUnusable, LOCAL_BUDGET_OWNER, METERED_POOL_PREFIX,
+    SHARED_POOL_RESERVATION_SCHEMA_VERSION,
 };
 pub use task_features::{BucketTier, BuildTopology, TaskFeatures, FEATURE_SCHEMA_VERSION};
 pub use task_identity::{ExternalRef, TaskId, TaskIdentity};
