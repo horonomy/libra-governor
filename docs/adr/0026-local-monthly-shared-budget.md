@@ -9,6 +9,12 @@ Builds on [ADR-0023](0023-metered-shared-pool.md) and amends
 [ADR-0003](0003-gateway-enforcement-boundary.md) for the local budget only.
 Slice S2 delivers this record and `calendar_month_bounds`; later slices wire it.
 
+**Implementation status.** Only `calendar_month_bounds`, `LOCAL_BUDGET_OWNER`
+and `monthly_pool_alias` exist today. Everything else below is **design
+intent, implemented in slices S4-S8** (S4 daemon core, S5 settlement, S6
+hooks, S8 doctor/status) and S11 (gateway `governor_held`); it must not be
+read as shipped behaviour.
+
 ## Context
 
 ADR-0023 shipped a metered shared pool with no production feed, and the
@@ -31,7 +37,7 @@ a local, operator-configured budget as the first real enforceable capacity.
   keeps guarding it). The local cap is written by the local ledger, not
   derived from a provider reading.
 
-### D3: semantics
+### D3: semantics (design intent; implemented in slices S4-S8)
 
 1. **One shared hard budget** per period, held in the pool
    `metered:local-budget/monthly-YYYY-MM` (`LOCAL_BUDGET_OWNER`,
@@ -65,8 +71,8 @@ half-open interval `[day-1 00:00 local, next month's day-1 00:00 local)`.
 
 ### Guarantee label
 
-Hooks-only mode is **admission-bounded (cooperative)**. Admission is a hard
-decision, but in-turn spend is visible only at Stop, so spend can overshoot
+Hooks-only mode is **admission-bounded (cooperative)**. Admission is
+refuse-before-spend at prompt admission (cooperative), but in-turn spend is visible only at Stop, so spend can overshoot
 the hold. A per-request hard cap exists only with the gateway in
 `governor_held` mode, which is follow-up slice S11 and **not part of this
 MVP**. ADR-0003's wording that the gateway is the only enforcement point is
@@ -76,8 +82,28 @@ superseded **for the local budget only**, by cooperative admission.
 
 The unit is **Libra-accounted, list-price-equivalent USD at the pinned
 `PRICING_VERSION`**. It is never the provider's bill, a plan quota, or an
-upstream guarantee. An unpriced model settles at the hold amount with
-`usage_known=false` and is surfaced in `doctor`.
+upstream guarantee.
+
+Unpriced model, by path: hooks-only settlement uses the hold amount with
+`usage_known=false`, surfaced in `doctor` (design intent, S5/S8). The
+gateway's USD budget path instead refuses with `403 unpriced_model`
+(`crates/gateway/src/pricing.rs` module docs; `Decision::UnpricedModel` in
+`crates/gateway/src/proxy.rs`).
+
+#### Known pricing limitations (pricing refresh, PR #208)
+
+The pinned table is list-price-equivalent and **not exact**:
+
+- (a) The 1-hour cache-write tier (2x base input) is not modelled; those
+  tokens are priced at the 5-minute rate, so spend is **under-accounted**.
+- (b) Fast-mode premium and the `inference_geo` multiplier (1.1x, US-only)
+  are not modelled, so spend is **under-accounted** for such requests.
+- (c) Haiku 5.5 prompts under 100k tokens are priced at the over-100k rate,
+  so they are **over-accounted** by about 5x.
+
+The cap is therefore a Libra-accounted estimate that may drift from the
+provider bill in either direction and is never a bill guarantee. The table
+is operator-overridable through `PricingTable::with_overrides`.
 
 ### Evidence class
 
@@ -85,14 +111,14 @@ Captures from the real host binary against a fake upstream are
 `TestOwnedLive`, never `ProductionObserved`. Nothing in this slice is
 `ProductionObserved`.
 
-### Rollover
+### Rollover (design intent; implemented in slices S4-S8)
 
 - A hold belongs to the period it was admitted in.
 - A post-hoc charge goes to the period of its **event time**, falling back to
   the parent session's latest-hold pool.
 - A late settle after expiry is still recorded.
 
-### Identity and non-duplication
+### Identity and non-duplication (design intent; implemented in slices S4-S8)
 
 - Executor key: `(host_id, provider, session_id, agent_id | null)`. A missing
   agent never means root.
@@ -103,12 +129,13 @@ Captures from the real host binary against a fake upstream are
 - Each row is recorded **once**, at the narrowest scope. A session subtree is
   the sum of rows with that session id, the pool is the sum of all rows, and
   "self" is the `agent_absent` rows only.
+  (Design intent; implemented in slices S4-S8.)
 
-### Safe failure policy
+### Safe failure policy (design intent; implemented in slices S4-S8)
 
 | Condition | Result |
 |---|---|
-| No shared-budget file | Pool not consulted; behaviour byte-exact with today |
+| No shared-budget file | Pool not consulted; intended byte-exact with today (to be pinned by a test in slice S6, not yet tested) |
 | File present but invalid (parse, timezone, cap, version) | Deny `config_invalid` |
 | Clock anomaly: newest pool period is later than now's period | Deny `clock_anomaly` |
 | Daemon unreachable, file present | Deny at prompt admission; allow and log at PreToolUse |
@@ -121,7 +148,7 @@ Only `crates/gateway` (upstream allowlist, default `api.anthropic.com`) and
 telemetry and WebFetch are Claude Code's own traffic: `doctor` reports them,
 Libra does not enforce on them.
 
-### Retention and export
+### Retention and export (design intent; implemented in slices S4-S8)
 
 Foundation only: prune closed rows of **ended** periods, with an audit count,
 and a **local-only** export with no upload. Monthly automated remote upload is
@@ -129,8 +156,9 @@ a **separate, versioned workstream and is not delivered** by this ADR.
 
 ## Consequences
 
-- Admission is genuinely enforceable locally for the first time, with an
-  honest "cooperative" label instead of a hard-cap claim.
+- Once slices S4-S8 land (design intent), refusal before spend at prompt
+  admission becomes enforceable locally, with an honest "cooperative" label
+  instead of a hard-cap claim.
 - Overshoot beyond the hold is possible in hooks-only mode and is accepted
   until S11.
 - Tests of the month window pin tzdb behaviour (Asuncion 2023-10 gap, Havana

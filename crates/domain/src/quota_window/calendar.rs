@@ -42,8 +42,8 @@ fn zone(tz: &IanaTimeZone) -> TimeZone {
 }
 
 fn to_jiff_timestamp(value: OffsetDateTime) -> Timestamp {
-    // `value` is already normalized to UTC + whole milliseconds by every
-    // caller in this module (`normalize_utc_ms`).
+    // Offset-independent: unix seconds plus the sub-second nanoseconds is the
+    // exact instant for any `OffsetDateTime`, normalized or not.
     let nanos = (value.unix_timestamp() as i128) * 1_000_000_000 + value.nanosecond() as i128;
     Timestamp::from_nanosecond(nanos)
         .expect("a normalized UTC timestamp is within jiff's representable range")
@@ -161,6 +161,9 @@ pub(super) fn fixed_aligned_bounds(
 /// DST gap or fold resolves with the same `Compatible` rule as
 /// [`fixed_aligned_bounds`]. Deliberately a free function rather than an
 /// `AlignedPeriod` variant: that enum is a public serde contract.
+///
+/// `now` must be within the supported jiff range; the `expect`s below are
+/// unreachable for real clocks.
 pub fn calendar_month_bounds(
     now: OffsetDateTime,
     tz: &IanaTimeZone,
@@ -447,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn month_bounds_require_a_known_zone_and_never_default_to_utc() {
+    fn iana_time_zone_rejects_unknown_names_instead_of_defaulting_to_utc() {
         for bad in ["Not/AZone", "", "utc-ish", "EST5EDT/extra"] {
             assert!(IanaTimeZone::new(bad).is_err(), "{bad:?} must be rejected");
         }
