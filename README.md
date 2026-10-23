@@ -13,14 +13,14 @@ one. See [`PRODUCT.md`](PRODUCT.md) for the full product North Star and
 
 **Product page and hosted docs:** [libra.horonom.com](https://libra.horonom.com) ([docs](https://libra.horonom.com/docs/)) — Developer Preview.
 
-This is the **v0.0.3 feature set** (the `release/v0.0.3` branch; `main` is the v0.0.4 development line and is not yet released): everything from v0.0.2 (the v0.0.1 MVP 3
+**Release status.** The latest *published* release is v0.0.2. `main` is the unreleased **v0.0.4** development line (workspace version 0.0.4); a narrow Apple Silicon-only Preview is proposed in [`docs/adr/0025-v0-0-4-scope-evidence-and-exclusions.md`](docs/adr/0025-v0-0-4-scope-evidence-and-exclusions.md) and nothing is tagged or published. v0.0.3 is a separate line (`release/v0.0.3`, [ADR-0014](docs/adr/0014-v0-0-3-go-scope-and-exclusions.md)). The feature set below is the v0.0.3 baseline that `main` builds on: everything from v0.0.2 (the v0.0.1 MVP 3
 local flow, Codex support, local extension points — see below) plus the
 Agent Execution Economics work (HORO-1666–1673, HORO-1689): hierarchical
 resource accounting, a progressive remaining-cost estimator with shadow
 runtime decisions, counterfactual policy replay, and economic-truth
 reconstruction (`libra-governor economics explain`).
 
-### Capability status (v0.0.3) — what is production-evidenced and what is not
+### Capability status (v0.0.3 baseline; v0.0.4 evidence lives in ADR-0025) — what is production-evidenced and what is not
 
 The founder's v0.0.3 GO verdict is **narrowed to the evidence that actually
 exists.** Full record: [`docs/adr/0014-v0-0-3-go-scope-and-exclusions.md`](docs/adr/0014-v0-0-3-go-scope-and-exclusions.md).
