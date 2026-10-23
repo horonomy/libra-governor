@@ -103,9 +103,14 @@ impl Drop for RemoveFileOnDrop {
     }
 }
 
-/// Builds the [`ExecutionIdentity`] for one hook event. Optional host
-/// IDs are preserved exactly as supplied (see `agent::payload`);
-/// lineage is always `Unknown`.
+/// Builds the [`ExecutionIdentity`] for one hook event. Provider-native
+/// ids are preserved verbatim (padding and unicode included) except that
+/// an empty or whitespace-only value is *absent* -- it cannot name a
+/// session, agent or turn, and keying on it would let unrelated events
+/// share an identity (execution-identity contract, "Provider-native id
+/// that is empty or whitespace-only"). Claude Code sends no `turn_id`, so
+/// one found in its payload is not mapped (it is not a turn identity until
+/// the owner decides otherwise); Codex's is. Lineage is always `Unknown`.
 pub fn capture(
     host_id: &str,
     agent: AgentKind,
@@ -114,14 +119,21 @@ pub fn capture(
     turn_id: Option<&str>,
     now: OffsetDateTime,
 ) -> Result<ExecutionIdentity, ExecutionIdentityError> {
-    let mut builder = ExecutionIdentityBuilder::new(host_id, agent.as_tool_provider())
-        .provider_session_id(provider_session_id);
+    fn native(value: &str) -> Option<&str> {
+        (!value.trim().is_empty()).then_some(value)
+    }
 
-    if let Some(agent_id) = agent_id {
+    let mut builder = ExecutionIdentityBuilder::new(host_id, agent.as_tool_provider());
+    if let Some(session) = native(provider_session_id) {
+        builder = builder.provider_session_id(session);
+    }
+    if let Some(agent_id) = agent_id.and_then(native) {
         builder = builder.agent_id(agent_id);
     }
-    if let Some(turn_id) = turn_id {
-        builder = builder.turn_id(turn_id);
+    if agent == AgentKind::Codex {
+        if let Some(turn_id) = turn_id.and_then(native) {
+            builder = builder.turn_id(turn_id);
+        }
     }
 
     builder.build_at(now)
@@ -234,6 +246,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(identity.agent_id(), None);
+        assert_eq!(identity.turn_id(), None);
+    }
+
+    #[test]
+    fn capture_treats_blank_ids_as_absent_and_keeps_padding_verbatim() {
+        let identity = capture(
+            "host-1",
+            AgentKind::Codex,
+            "  \t",
+            Some(""),
+            Some("   "),
+            OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+        assert_eq!(identity.provider_session_id(), None);
+        assert_eq!(identity.agent_id(), None);
+        assert_eq!(identity.turn_id(), None);
+
+        let padded = capture(
+            "host-1",
+            AgentKind::Codex,
+            " Sess/ID:\u{fc}-1  ",
+            Some(" a "),
+            Some(" t "),
+            OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+        assert_eq!(padded.provider_session_id(), Some(" Sess/ID:\u{fc}-1  "));
+        assert_eq!(padded.agent_id(), Some(" a "));
+        assert_eq!(padded.turn_id(), Some(" t "));
+    }
+
+    #[test]
+    fn capture_does_not_map_a_claude_code_turn_id() {
+        let identity = capture(
+            "host-1",
+            AgentKind::ClaudeCode,
+            "sess-1",
+            Some("sub-1"),
+            Some("turn-1"),
+            OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+        assert_eq!(identity.agent_id(), Some("sub-1"));
         assert_eq!(identity.turn_id(), None);
     }
 }
