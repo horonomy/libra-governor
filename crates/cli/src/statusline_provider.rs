@@ -1858,7 +1858,9 @@ pub fn explain_text(status: &StatusResult, doctor: Option<&DoctorResult>) -> Str
                 None => out.push_str("  running policy   a preset this build does not recognise\n"),
             }
             if doctor.config_file_present && !doctor.config_file_valid {
-                out.push_str("  config.json      cannot be used (see `libra-governor doctor`); the\n");
+                out.push_str(
+                    "  config.json      cannot be used (see `libra-governor doctor`); the\n",
+                );
                 out.push_str("                   policy above is what is actually in force\n");
             } else if doctor.running_config_matches_disk {
                 out.push_str("  config.json      agrees with the running policy\n");
