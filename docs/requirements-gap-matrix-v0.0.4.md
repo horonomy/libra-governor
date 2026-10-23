@@ -58,7 +58,7 @@ Real-host evidence is NONE for every row.
    per-executor threshold inside the pool total. Needs the founder's confirmation of semantics.
 3. **Sub-agent attribution (B).** Needs SubagentStart/Stop hooks and a native parent id. Neither host supplies a
    parent id today; Libra must not invent one. Coordinate identity primitives with Host Integration (HORO-1599
-   family). Until then the rule is: charged once to the nearest known executor, lineage reported Unknown.
+   family). Today (proved by HORO-2185, PR #207): metered-pool spend is keyed only by an opaque `session_id` under the owner; a request with no established session identity is refused and nothing is charged (there is no Unknown bucket); spend is recorded once per session and per-session totals sum to the pool's settled total. There is no agent, sub-agent or parent/child field on reserve or settle, and no self-vs-subtree API, so per-executor attribution below session level does not exist.
 4. **Retention (G).** Smallest slice: configurable age-based prune of closed rows with an explicit audit count.
 5. **Batch upload (I).** Not started; needs a design, a consent and destination decision, and an
    idempotency/integrity protocol. Do not build before the destination and policy are decided.
