@@ -146,6 +146,26 @@ fn hook_handles_malformed_stdin_payload_gracefully() {
 }
 
 #[test]
+fn hook_fails_open_on_payloads_without_a_usable_session_id() {
+    // Array, missing and non-string session_id are all refused as malformed:
+    // exit 0, no block, and no daemon call (so no charge) -- never a
+    // fabricated or positionally decoded session.
+    for payload in [
+        r#"["s-1","/repo","fix it"]"#,
+        r#"{"cwd":"/repo","prompt":"fix it"}"#,
+        r#"{"session_id":123,"cwd":"/repo","prompt":"fix it"}"#,
+    ] {
+        let state_dir = tempfile::tempdir().unwrap();
+        let (output, elapsed) = run_hook(state_dir.path(), payload);
+        assert!(output.status.success(), "{payload}: must exit 0");
+        assert!(elapsed < Duration::from_secs(5), "{payload}");
+        let ctx = additional_context(&output.stdout);
+        assert!(ctx.to_lowercase().contains("malformed"), "{payload}: {ctx}");
+        assert!(!ctx.contains("Cost/time estimate"), "{payload}: charged");
+    }
+}
+
+#[test]
 fn hook_degrades_gracefully_when_the_daemon_cannot_start() {
     // A regular file where the state directory should be: `daemon run`
     // cannot create it, so the spawned daemon exits immediately and no
