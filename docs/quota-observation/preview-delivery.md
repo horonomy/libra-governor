@@ -56,6 +56,11 @@ equal the workspace version. The publish job runs **only on a real tag
 push**; `pull_request` and `workflow_dispatch` runs produce private workflow
 artifacts and never a public release.
 
+Attestations are also created by `workflow_dispatch` runs, and they are
+public and permanent, so dispatch only SHAs you are content to have named.
+The CI `--version` smoke on the Linux runner is a build check, not an
+install test.
+
 **Status: unreleased.** No release has been published and no tag has been
 pushed. The attestation proves where and how a file was built; it does not
 replace the approval digest above, which is byte-identity of one specific
