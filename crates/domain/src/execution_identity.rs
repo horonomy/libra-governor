@@ -470,10 +470,17 @@ impl ExecutionIdentity {
     /// scope's key — see the contract's "Cache keys never widen on their
     /// own".
     pub fn cache_key(&self, scope: Scope) -> Result<Vec<String>, ScopeIdentityMissing> {
+        // An empty string is "no identity", not a value (reference:
+        // Python truthiness; conformance vector `empty-session-id`): it
+        // round-trips on the wire but must never form part of a key.
+        // Whitespace is a present, verbatim value at this layer.
+        fn present(value: &Option<String>) -> Option<&String> {
+            value.as_ref().filter(|v| !v.is_empty())
+        }
         match scope {
             Scope::Host => Ok(vec![self.host_id.clone()]),
             Scope::Session => {
-                let session = self.provider_session_id.as_ref().ok_or_else(|| {
+                let session = present(&self.provider_session_id).ok_or_else(|| {
                     Self::scope_identity_missing("SESSION scope requires provider_session_id")
                 })?;
                 Ok(vec![
@@ -483,16 +490,13 @@ impl ExecutionIdentity {
                 ])
             }
             Scope::Agent => {
-                let session = self.provider_session_id.as_ref().ok_or_else(|| {
+                let missing = || {
                     Self::scope_identity_missing(
                         "AGENT scope requires provider_session_id and agent_id",
                     )
-                })?;
-                let agent = self.agent_id.as_ref().ok_or_else(|| {
-                    Self::scope_identity_missing(
-                        "AGENT scope requires provider_session_id and agent_id",
-                    )
-                })?;
+                };
+                let session = present(&self.provider_session_id).ok_or_else(missing)?;
+                let agent = present(&self.agent_id).ok_or_else(missing)?;
                 Ok(vec![
                     self.host_id.clone(),
                     self.tool_provider.clone(),
@@ -506,9 +510,9 @@ impl ExecutionIdentity {
                         "TURN_TASK scope requires provider_session_id, agent_id, and turn_id",
                     )
                 };
-                let session = self.provider_session_id.as_ref().ok_or_else(missing)?;
-                let agent = self.agent_id.as_ref().ok_or_else(missing)?;
-                let turn = self.turn_id.as_ref().ok_or_else(missing)?;
+                let session = present(&self.provider_session_id).ok_or_else(missing)?;
+                let agent = present(&self.agent_id).ok_or_else(missing)?;
+                let turn = present(&self.turn_id).ok_or_else(missing)?;
                 Ok(vec![
                     self.host_id.clone(),
                     self.tool_provider.clone(),
@@ -518,10 +522,10 @@ impl ExecutionIdentity {
                 ])
             }
             Scope::ProjectWorktree => {
-                if let Some(worktree) = &self.worktree_id {
+                if let Some(worktree) = present(&self.worktree_id) {
                     return Ok(vec![worktree.clone()]);
                 }
-                if let Some(repo) = &self.repo_id {
+                if let Some(repo) = present(&self.repo_id) {
                     return Ok(vec![repo.clone()]);
                 }
                 Err(Self::scope_identity_missing(
@@ -1080,5 +1084,46 @@ mod tests {
         assert_eq!(identity.lineage_status(), LineageStatus::Unknown);
         assert_eq!(identity.agent_id(), None);
         assert_eq!(identity.turn_id(), None);
+    }
+
+    #[test]
+    fn empty_string_ids_never_form_a_cache_key_but_whitespace_does() {
+        let build = |session: &str, agent: &str, turn: &str, repo: &str, wt: &str| {
+            ExecutionIdentityBuilder::new("host-1", "claude_code")
+                .provider_session_id(session)
+                .agent_id(agent)
+                .turn_id(turn)
+                .repo_id(repo)
+                .worktree_id(wt)
+                .build_at(now())
+                .unwrap()
+        };
+        let empty_session = build("", "a", "t", "", "");
+        assert!(empty_session.cache_key(Scope::Session).is_err());
+        assert!(empty_session.cache_key(Scope::Agent).is_err());
+        assert!(empty_session.cache_key(Scope::TurnTask).is_err());
+        assert!(empty_session.cache_key(Scope::ProjectWorktree).is_err());
+        assert!(build("s", "", "t", "", "").cache_key(Scope::Agent).is_err());
+        assert!(build("s", "a", "", "", "")
+            .cache_key(Scope::TurnTask)
+            .is_err());
+        // An empty worktree_id falls through to repo_id, never keys on "".
+        assert_eq!(
+            build("s", "a", "t", "repo-1", "")
+                .cache_key(Scope::ProjectWorktree)
+                .unwrap(),
+            vec!["repo-1".to_string()]
+        );
+        // Whitespace is a present, verbatim value at this layer.
+        assert_eq!(
+            build(" ", "a", "t", "", "")
+                .cache_key(Scope::Session)
+                .unwrap(),
+            vec![
+                "host-1".to_string(),
+                "claude_code".to_string(),
+                " ".to_string()
+            ]
+        );
     }
 }
