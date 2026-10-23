@@ -116,7 +116,11 @@ pub fn connect_only_with_budget(
 /// daemon (HORO-2160). An isolated QA harness sets it so a hook is a plain
 /// short-lived client: it never leaves a descendant process or listener
 /// behind, and a missing daemon is the existing fail-open "daemon
-/// unreachable" outcome. Any non-empty value other than `0` turns it on.
+/// unreachable" outcome. Applies to every caller of
+/// [`ensure_daemon_connection`] (the prompt-submit hooks, `outcome`,
+/// `calibration`, `metered-pool`, `run`), not only hooks. Any non-empty
+/// value other than `0` turns it on, so `false` or `off` also disable
+/// auto-start; unset it to restore the default.
 pub const NO_AUTOSPAWN_ENV: &str = "LIBRA_GOVERNOR_NO_AUTOSPAWN";
 
 fn autospawn_disabled(value: Option<&str>) -> bool {
