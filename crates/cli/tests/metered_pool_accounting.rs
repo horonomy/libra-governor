@@ -18,14 +18,14 @@
 //! distinct opaque session ids (it invents no per-product ids) and proves
 //! what exists. What is absent is listed in the PR body (Host Integration).
 //!
-//! # Parent/child non-duplication rule (asserted at the level that exists)
+//! # Single-scope recording rule (the level that exists)
 //!
-//! Spend is recorded exactly once, at the narrowest known scope (the
-//! settling session). A session's `settled` is its SELF total and never
-//! includes another session's spend. A subtree total, were it ever
-//! reported, would equal self + children's selves; no such API exists, so
-//! the test computes it as arithmetic and asserts the invariant that makes
-//! it well-defined: pool settled == sum of per-session self totals.
+//! No parent/child relation exists, so there is no subtree total to test.
+//! What is asserted: spend is recorded exactly once, at the settling
+//! session; a session's `settled` is its SELF total and never includes
+//! another session's spend; and pool settled == sum of per-session
+//! settled (there is no Unknown bucket, so that term is zero). Any future
+//! subtree = self + children rule needs a parent link first.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -253,7 +253,7 @@ fn sum_sessions(status: &Value, field: &str) -> u64 {
 // ---------------------------------------------------------------------
 
 #[test]
-fn sessions_agents_and_subagents_all_spend_from_one_pool() {
+fn distinct_sessions_spend_from_one_shared_pool() {
     // Opaque, distinct session ids standing in for a lead session, an
     // agent and a sub-agent. They are plain strings: the pool has no
     // notion of which is which.
@@ -261,12 +261,14 @@ fn sessions_agents_and_subagents_all_spend_from_one_pool() {
     let (sb, _feed) = Sandbox::with_pool(10_000, &ids);
 
     let mut pool_ids = Vec::new();
+    let mut reservation_ids = std::collections::HashSet::new();
     let mut spent = 0;
     for (i, s) in ids.iter().enumerate() {
         let amount = 1_000 * (i as u64 + 1);
         let (c, r) = sb.reserve(s, amount, "k");
         assert_eq!(c, 0, "{r}");
         pool_ids.push(r["pool_id"].as_str().unwrap().to_string());
+        reservation_ids.insert(id_of(&r));
         let (c, st) = sb.settle(&id_of(&r), s, Some(amount));
         assert_eq!(c, 0, "{st}");
         spent += amount;
@@ -276,7 +278,14 @@ fn sessions_agents_and_subagents_all_spend_from_one_pool() {
         assert_eq!(status["remaining"], 10_000 - spent as i64);
     }
     assert!(pool_ids.windows(2).all(|w| w[0] == w[1]), "one pool id");
+    // Every session deliberately reused the literal idempotency key "k":
+    // keys are scoped per session, so none was handed another session's
+    // hold as a "replay" and each was charged its own amount.
+    assert_eq!(reservation_ids.len(), 3, "idempotency keys are per-session");
     let status = sb.status();
+    assert_eq!(usage(&status, "lead"), Some((0, 1_000)));
+    assert_eq!(usage(&status, "agent-a"), Some((0, 2_000)));
+    assert_eq!(usage(&status, "subagent-a1"), Some((0, 3_000)));
     assert_eq!(status["sessions"].as_array().unwrap().len(), 3);
     assert_eq!(status["remaining"], 4_000);
 
@@ -393,11 +402,11 @@ fn unknown_identity_is_never_guessed_from_cwd_pid_or_tmux() {
 }
 
 // ---------------------------------------------------------------------
-// 5 & 8. Parent/child non-duplication and exact reconciliation.
+// 5 & 8. Single-scope recording and exact per-session/pool reconciliation.
 // ---------------------------------------------------------------------
 
 #[test]
-fn parent_and_child_spend_is_recorded_once_and_reconciles_with_the_pool() {
+fn per_session_settled_sum_reconciles_with_pool_and_replays_add_nothing() {
     let (sb, feed) = Sandbox::with_pool(100_000, &["parent", "child-1", "child-2"]);
 
     // (session, reserved, settled-or-None-for-release, key)
@@ -435,37 +444,39 @@ fn parent_and_child_spend_is_recorded_once_and_reconciles_with_the_pool() {
     }
 
     let status = sb.status();
-    let parent_self = own["parent"];
-    let children_self = own["child-1"] + own["child-2"];
-    // Self totals: parent's self excludes everything its children spent.
-    assert_eq!(usage(&status, "parent"), Some((0, parent_self)));
-    assert_eq!(parent_self, 9_500);
-    assert_eq!(usage(&status, "child-1"), Some((0, own["child-1"])));
-    assert_eq!(usage(&status, "child-2"), Some((0, own["child-2"])));
-    // Subtree (computed here; no API) is distinct from self.
-    let parent_subtree = parent_self + children_self;
-    assert_ne!(parent_subtree, parent_self);
-    // Recorded once: pool total == sum of self totals (no unknown bucket
-    // exists, so that term is identically zero) == subtree of the root.
-    assert_eq!(
-        sum_sessions(&status, "settled"),
-        status["settled"].as_u64().unwrap()
-    );
-    assert_eq!(status["settled"].as_u64().unwrap(), parent_subtree);
-    assert_eq!(parent_subtree, 9_500 + 2_345 + 2_500 + 7_000 + 1);
+    // "parent" / "child-*" are only labels: the pool has no parent-child
+    // relation, so this asserts per-session SELF totals and that they add
+    // up to the pool total exactly (spend recorded once, no unknown bucket
+    // exists so that term is identically zero).
+    let total: u64 = own.values().sum();
+    assert_eq!(total, 9_500 + 2_345 + 2_500 + 7_000 + 1);
+    for (session, self_total) in &own {
+        assert_eq!(usage(&status, session), Some((0, *self_total)), "{session}");
+    }
+    assert_eq!(own["parent"], 9_500, "parent's self excludes the others'");
+    assert_eq!(sum_sessions(&status, "settled"), total);
+    assert_eq!(status["settled"].as_u64().unwrap(), total);
     assert_eq!(status["active"], 0);
     assert_eq!(sum_sessions(&status, "active"), 0);
-    assert_eq!(status["remaining"], 100_000 - parent_subtree as i64);
+    assert_eq!(status["remaining"], 100_000 - total as i64);
 
-    // Reconciliation survives a provider gauge equal to Libra's own
-    // settled total (no double counting) ...
-    feed.publish_used(parent_subtree, Some(100_000), OffsetDateTime::now_utc());
+    // A provider gauge equal to Libra's own settled total is not
+    // subtracted a second time.
+    feed.publish_used(total, Some(100_000), OffsetDateTime::now_utc());
     let status = sb.status();
-    assert_eq!(status["remaining"], 100_000 - parent_subtree as i64);
+    assert_eq!(status["remaining"], 100_000 - total as i64);
     assert_eq!(
         sum_sessions(&status, "settled"),
         status["settled"].as_u64().unwrap()
     );
+
+    // A gauge GREATER than settled is real external overhang: it lowers
+    // remaining, but never alters the per-session settled attribution.
+    feed.publish_used(total + 1_000, Some(100_000), OffsetDateTime::now_utc());
+    let status = sb.status();
+    assert_eq!(status["external_overhang"], 1_000);
+    assert_eq!(status["remaining"], 100_000 - total as i64 - 1_000);
+    assert_eq!(sum_sessions(&status, "settled"), total);
 }
 
 // ---------------------------------------------------------------------
@@ -478,7 +489,7 @@ fn parent_and_child_spend_is_recorded_once_and_reconciles_with_the_pool() {
 fn spawn_gated(sb: &Sandbox, ready: &Path, gate: &Path, args: &[String]) -> std::process::Child {
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
-        .arg(r#"touch "$READY"; while [ ! -e "$GATE" ]; do :; done; exec "$@""#)
+        .arg(r#"touch "$READY"; i=0; while [ ! -e "$GATE" ]; do i=$((i+1)); [ $i -gt 6000 ] && exit 99; sleep 0.01; done; exec "$@""#)
         .arg("sh")
         .arg(bin())
         .args(args)
@@ -489,6 +500,19 @@ fn spawn_gated(sb: &Sandbox, ready: &Path, gate: &Path, args: &[String]) -> std:
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     cmd.spawn().expect("spawn gated contender")
+}
+
+/// Kills and reaps every child on drop, so a panic or timeout in the parent
+/// can never leave racing/spinning processes behind.
+struct Reaper(Vec<std::process::Child>);
+
+impl Drop for Reaper {
+    fn drop(&mut self) {
+        for child in &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 fn wait_all_exist(paths: &[PathBuf]) {
@@ -513,21 +537,20 @@ fn multi_process_cli_reserve_race_never_overallocates() {
     let readies: Vec<PathBuf> = (0..N)
         .map(|i| gate_dir.path().join(format!("r{i}")))
         .collect();
-    let children: Vec<_> = (0..N)
-        .map(|i| {
-            spawn_gated(
-                &sb,
-                &readies[i],
-                &gate,
-                &reserve_args(&sessions[i], AMOUNT, "k"),
-            )
-        })
-        .collect();
+    let mut reaper = Reaper(Vec::new());
+    for (ready, session) in readies.iter().zip(&sessions) {
+        reaper.0.push(spawn_gated(
+            &sb,
+            ready,
+            &gate,
+            &reserve_args(session, AMOUNT, "k"),
+        ));
+    }
     wait_all_exist(&readies);
     std::fs::write(&gate, b"").unwrap();
 
     let (mut granted, mut refused, mut granted_sum) = (0u64, 0u64, 0u64);
-    for child in children {
+    for child in std::mem::take(&mut reaper.0) {
         let (code, v) = parse_output(child.wait_with_output().unwrap());
         match code {
             0 => {
@@ -571,8 +594,10 @@ fn ledger_race_worker_entrypoint() {
     let (db, ready, gate, idx) = (parts[0], parts[1], parts[2], parts[3]);
     let mut store = LedgerStore::open(Path::new(db)).unwrap();
     std::fs::write(ready, b"").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !Path::new(gate).exists() {
-        std::hint::spin_loop();
+        assert!(Instant::now() < deadline, "gate never opened");
+        std::thread::sleep(Duration::from_millis(1));
     }
     let pool_id = PoolId(format!("metered:{OWNER}/{ALIAS}"));
     let principal = PrincipalId(OWNER.to_string());
@@ -624,8 +649,9 @@ fn multi_process_ledger_store_race_on_one_sqlite_file_never_overallocates() {
         .map(|i| dir.path().join(format!("r{i}")))
         .collect();
     let exe = std::env::current_exe().unwrap();
-    let children: Vec<_> = (0..PROCS)
-        .map(|i| {
+    let mut reaper = Reaper(Vec::new());
+    for (i, ready) in readies.iter().enumerate() {
+        reaper.0.push(
             Command::new(&exe)
                 .args([
                     "--exact",
@@ -638,21 +664,21 @@ fn multi_process_ledger_store_race_on_one_sqlite_file_never_overallocates() {
                     format!(
                         "{}|{}|{}|{i}",
                         db.display(),
-                        readies[i].display(),
+                        ready.display(),
                         gate.display()
                     ),
                 )
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
-                .unwrap()
-        })
-        .collect();
+                .unwrap(),
+        );
+    }
     wait_all_exist(&readies);
     std::fs::write(&gate, b"").unwrap();
 
     let (mut granted, mut refused, mut granted_sum) = (0u64, 0u64, 0u64);
-    for child in children {
+    for child in std::mem::take(&mut reaper.0) {
         let out = child.wait_with_output().unwrap();
         assert!(
             out.status.success(),
@@ -705,11 +731,17 @@ fn multi_process_ledger_store_race_on_one_sqlite_file_never_overallocates() {
 // 7. Crash / restart.
 // ---------------------------------------------------------------------
 
-fn sigkill_daemon(sb: &Sandbox) {
+fn daemon_pid(sb: &Sandbox) -> u32 {
     let record: Value =
         serde_json::from_slice(&std::fs::read(sb.state.path().join("daemon.pid")).unwrap())
             .unwrap();
-    let pid = rustix::process::Pid::from_raw(record["pid"].as_u64().unwrap() as i32).unwrap();
+    record["pid"].as_u64().unwrap() as u32
+}
+
+/// SIGKILLs the daemon and returns its (now dead) pid.
+fn sigkill_daemon(sb: &Sandbox) -> u32 {
+    let raw = daemon_pid(sb);
+    let pid = rustix::process::Pid::from_raw(raw as i32).unwrap();
     rustix::process::kill_process(pid, rustix::process::Signal::KILL).unwrap();
     // Wait until the process is really gone so the next CLI call must
     // spawn a fresh daemon rather than racing the dying one.
@@ -718,6 +750,7 @@ fn sigkill_daemon(sb: &Sandbox) {
         assert!(Instant::now() < deadline, "daemon did not die");
         std::thread::sleep(Duration::from_millis(10));
     }
+    raw
 }
 
 #[test]
@@ -729,7 +762,7 @@ fn sigkilled_daemon_keeps_settled_totals_and_holds_with_no_phantom_capacity() {
     assert_eq!(c, 0);
     let before = sb.status();
 
-    sigkill_daemon(&sb);
+    let dead_pid = sigkill_daemon(&sb);
 
     // A fresh daemon (spawned by the next mutating call) sees identical
     // durable state; the surviving hold still counts against capacity.
@@ -737,6 +770,7 @@ fn sigkilled_daemon_keeps_settled_totals_and_holds_with_no_phantom_capacity() {
     assert_eq!(c, 3, "{over}");
     assert_eq!(over["reason"]["reason"], "insufficient");
     assert_eq!(over["reason"]["remaining"], 11_000);
+    assert_ne!(daemon_pid(&sb), dead_pid, "a new daemon must be serving");
     let after = sb.status();
     assert_eq!(after["settled"], 4_000);
     assert_eq!(after["active"], 5_000);
@@ -750,12 +784,12 @@ fn sigkilled_daemon_keeps_settled_totals_and_holds_with_no_phantom_capacity() {
 }
 
 #[test]
-fn reserve_client_killed_mid_flight_never_double_charges_on_retry() {
+fn idempotent_retry_converges_after_best_effort_mid_flight_client_kills() {
     const ATTEMPTS: usize = 8;
     const AMOUNT: u64 = 1_000;
     let (sb, _feed) = Sandbox::with_pool(100_000, &["victim"]);
     // Warm daemon so the kill lands on the client, not daemon startup.
-    sb.status_or_spawn_for_warmup();
+    sb.spawn_daemon_for_warmup();
 
     for i in 0..ATTEMPTS {
         let mut child = sb
@@ -769,12 +803,15 @@ fn reserve_client_killed_mid_flight_never_double_charges_on_retry() {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        // Vary the kill point; whether the hold landed is intentionally
-        // not assumed.
-        std::thread::sleep(Duration::from_micros(300 * i as u64));
+        // Best-effort kill point (0 to ~10ms after spawn): the timing is not
+        // deterministic, so whether a hold landed is observed, not assumed.
+        std::thread::sleep(Duration::from_micros(1_500 * i as u64));
         let _ = child.kill();
         let _ = child.wait();
     }
+    let landed = sb.status()["active"].as_u64().unwrap() / AMOUNT;
+    eprintln!("mid-flight kills: {landed}/{ATTEMPTS} attempts had a committed hold before retry");
+    assert!(landed <= ATTEMPTS as u64, "never more holds than keys");
     // Retrying every key must converge to exactly one hold per key,
     // whether or not the killed attempt had been committed.
     for i in 0..ATTEMPTS {
@@ -794,9 +831,9 @@ fn reserve_client_killed_mid_flight_never_double_charges_on_retry() {
 }
 
 impl Sandbox {
-    fn status_or_spawn_for_warmup(&self) {
-        // `status` never spawns a daemon; a settle of an unknown id does.
-        let (code, _) = self.run(&[
+    fn spawn_daemon_for_warmup(&self) {
+        // `status` never spawns a daemon; a release of an unknown id does.
+        let (_, refused) = self.run(&[
             "metered-pool",
             "release",
             "--reservation",
@@ -806,7 +843,7 @@ impl Sandbox {
             "--session",
             "victim",
         ]);
-        assert_eq!(code, 3);
+        assert_eq!(refused["reason"]["reason"], "not_found", "{refused}");
     }
 }
 
@@ -819,19 +856,24 @@ fn stale_holds_are_reclaimed_after_daemon_death_and_free_exact_capacity() {
     let (c, r) = sb.reserve("other", 1, "o1");
     assert_eq!(c, 3, "{r}");
 
-    sigkill_daemon(&sb);
+    let dead_pid = sigkill_daemon(&sb);
 
-    // Within the TTL a sweep reclaims nothing (no premature phantom free
-    // capacity); past the TTL it reclaims exactly the dead hold.
+    // The hold's own expiry (from the reserve response) bounds the sweep:
+    // 1s before it nothing is reclaimed (no premature phantom free
+    // capacity); 1s after it exactly the dead hold is reclaimed.
+    let expires_at = OffsetDateTime::parse(
+        held["expires_at"].as_str().unwrap(),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
     let pool_id = PoolId(format!("metered:{OWNER}/{ALIAS}"));
     let mut store = LedgerStore::open(sb.ledger_path()).unwrap();
-    let now = OffsetDateTime::now_utc();
     store
-        .expire_stale_shared_pool_reservations(now + time::Duration::minutes(30))
+        .expire_stale_shared_pool_reservations(expires_at - time::Duration::seconds(1))
         .unwrap();
     assert_eq!(held_total(&store, &pool_id), 30_000);
     store
-        .expire_stale_shared_pool_reservations(now + time::Duration::hours(2))
+        .expire_stale_shared_pool_reservations(expires_at + time::Duration::seconds(1))
         .unwrap();
     assert_eq!(held_total(&store, &pool_id), 0);
     drop(store);
@@ -840,6 +882,7 @@ fn stale_holds_are_reclaimed_after_daemon_death_and_free_exact_capacity() {
     // one cent more than capacity.
     let (c, r) = sb.reserve("other", 30_000, "o2");
     assert_eq!(c, 0, "{r}");
+    assert_ne!(daemon_pid(&sb), dead_pid, "a new daemon must be serving");
     let (c, r) = sb.reserve("other", 1, "o3");
     assert_eq!(c, 3, "{r}");
     let status = sb.status();
