@@ -51,7 +51,7 @@ Real-host evidence is NONE for every row.
 
 ## Material gaps and proposed handling
 
-1. **Metered pool has no production feed (A).** Provisioning a real pool is expressly not authorized (HORO-1915).
+1. **Metered pool has no production feed (A).** Promoting a real snapshot into the pool is a stated non-authorization in HORO-1915 c27743; the smallest production-reachable consumer path may be designed.
    Founder decision needed on source of capacity (configured monthly cap vs provider snapshot) and wiring.
 2. **No monthly cap, no Month window, no soft limits (C, D).** Smallest honest slice: a configured monthly cap as
    the pool capacity (no provider dependency) plus a Month aligned window; soft limits as a warning-only
