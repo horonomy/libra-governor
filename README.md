@@ -73,9 +73,10 @@ product sees repeated use — see HORO-1154.
 
 ## Install
 
-This repository's CI (`.github/workflows/ci.yml`) does not publish a
-release binary anywhere — there is no `curl | sh`-a-prebuilt-binary path
-to offer honestly. The real install path is building from a clone with
+No release binary has been published yet. `.github/workflows/release.yml`
+can build and attest one, but publishes only from a founder-authorized `v*`
+tag (see `docs/quota-observation/preview-delivery.md`) — there is no
+`curl | sh`-a-prebuilt-binary path to offer honestly. The real install path is building from a clone with
 `cargo install`:
 
 ```bash
