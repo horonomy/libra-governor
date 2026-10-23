@@ -31,7 +31,14 @@ use std::collections::BTreeMap;
 /// Identifies this pinned price snapshot. Recorded on every reservation,
 /// settlement, and provenance row. Bump whenever any number in
 /// [`PricingTable::pinned`] changes.
-pub const PRICING_VERSION: &str = "pricing-2026-09-static-v1";
+///
+/// Source: Anthropic official pricing page
+/// <https://platform.claude.com/docs/en/about-claude/pricing> (model ids from
+/// <https://platform.claude.com/docs/en/models/overview>), retrieved
+/// 2026-10-24. Figures are list prices; USD in this crate means
+/// Libra-accounted list-price-equivalent USD at this version, never a
+/// provider bill or quota.
+pub const PRICING_VERSION: &str = "pricing-2026-10-static-v2";
 
 /// Per-million-token USD prices for one model.
 ///
@@ -80,6 +87,125 @@ pub struct PricingTable {
 /// are matched by *prefix* (see [`PricingTable::lookup`]) so a dated
 /// release suffix does not silently fall off the table.
 const PINNED: &[(&str, ModelPricing)] = &[
+    // Current generation (HORO-2192). `cache_creation_input_usd_per_mtok` is
+    // the 5-minute cache-write price; the 1-hour tier (2x base input) is not
+    // modelled by `ModelPricing`. Longest-prefix matching keeps e.g.
+    // `claude-opus-5-5` from falling to `claude-opus-5`.
+    // Fable 5.1 and Opus/Sonnet 5.5 have a discounted cache-read multiplier
+    // (0.025x and 0.05x of base input respectively) per the pricing page.
+    (
+        "claude-fable-5-1",
+        ModelPricing {
+            input_usd_per_mtok: 10.0,
+            cache_creation_input_usd_per_mtok: 12.5,
+            cache_read_input_usd_per_mtok: 0.25,
+            output_usd_per_mtok: 50.0,
+        },
+    ),
+    (
+        "claude-fable-5",
+        ModelPricing {
+            input_usd_per_mtok: 10.0,
+            cache_creation_input_usd_per_mtok: 12.5,
+            cache_read_input_usd_per_mtok: 1.0,
+            output_usd_per_mtok: 50.0,
+        },
+    ),
+    (
+        "claude-opus-5-5",
+        ModelPricing {
+            input_usd_per_mtok: 4.0,
+            cache_creation_input_usd_per_mtok: 5.0,
+            cache_read_input_usd_per_mtok: 0.2,
+            output_usd_per_mtok: 20.0,
+        },
+    ),
+    (
+        "claude-opus-5",
+        ModelPricing {
+            input_usd_per_mtok: 5.0,
+            cache_creation_input_usd_per_mtok: 6.25,
+            cache_read_input_usd_per_mtok: 0.5,
+            output_usd_per_mtok: 25.0,
+        },
+    ),
+    (
+        "claude-opus-4-8",
+        ModelPricing {
+            input_usd_per_mtok: 5.0,
+            cache_creation_input_usd_per_mtok: 6.25,
+            cache_read_input_usd_per_mtok: 0.5,
+            output_usd_per_mtok: 25.0,
+        },
+    ),
+    (
+        "claude-opus-4-7",
+        ModelPricing {
+            input_usd_per_mtok: 5.0,
+            cache_creation_input_usd_per_mtok: 6.25,
+            cache_read_input_usd_per_mtok: 0.5,
+            output_usd_per_mtok: 25.0,
+        },
+    ),
+    (
+        "claude-opus-4-6",
+        ModelPricing {
+            input_usd_per_mtok: 5.0,
+            cache_creation_input_usd_per_mtok: 6.25,
+            cache_read_input_usd_per_mtok: 0.5,
+            output_usd_per_mtok: 25.0,
+        },
+    ),
+    (
+        "claude-opus-4-5",
+        ModelPricing {
+            input_usd_per_mtok: 5.0,
+            cache_creation_input_usd_per_mtok: 6.25,
+            cache_read_input_usd_per_mtok: 0.5,
+            output_usd_per_mtok: 25.0,
+        },
+    ),
+    (
+        "claude-sonnet-5-5",
+        ModelPricing {
+            input_usd_per_mtok: 2.0,
+            cache_creation_input_usd_per_mtok: 2.5,
+            cache_read_input_usd_per_mtok: 0.1,
+            output_usd_per_mtok: 10.0,
+        },
+    ),
+    (
+        "claude-sonnet-5",
+        ModelPricing {
+            input_usd_per_mtok: 2.0,
+            cache_creation_input_usd_per_mtok: 2.5,
+            cache_read_input_usd_per_mtok: 0.2,
+            output_usd_per_mtok: 10.0,
+        },
+    ),
+    (
+        "claude-sonnet-4-6",
+        ModelPricing {
+            input_usd_per_mtok: 3.0,
+            cache_creation_input_usd_per_mtok: 3.75,
+            cache_read_input_usd_per_mtok: 0.3,
+            output_usd_per_mtok: 15.0,
+        },
+    ),
+    // Haiku 5.5 is priced by prompt length on the official page: $0.10 input /
+    // $0.125 cache write / $0.01 cache read / $0.50 output up to 100k prompt
+    // tokens, and 5x that above 100k. `ModelPricing` has one price per tier, so
+    // the over-100k prices are pinned: reservations stay conservative and
+    // short-prompt settlements over-account rather than under-account.
+    (
+        "claude-haiku-5-5",
+        ModelPricing {
+            input_usd_per_mtok: 0.5,
+            cache_creation_input_usd_per_mtok: 0.625,
+            cache_read_input_usd_per_mtok: 0.05,
+            output_usd_per_mtok: 2.5,
+        },
+    ),
     (
         "claude-opus-4-1",
         ModelPricing {
@@ -296,5 +422,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn current_generation_models_are_priced_at_official_list_prices() {
+        // (model id, input, 5m cache write, cache read, output)
+        let expected = [
+            ("claude-fable-5-1", 10.0, 12.5, 0.25, 50.0),
+            ("claude-fable-5", 10.0, 12.5, 1.0, 50.0),
+            ("claude-opus-5-5", 4.0, 5.0, 0.20, 20.0),
+            ("claude-opus-5", 5.0, 6.25, 0.50, 25.0),
+            ("claude-opus-4-8", 5.0, 6.25, 0.50, 25.0),
+            ("claude-opus-4-7", 5.0, 6.25, 0.50, 25.0),
+            ("claude-opus-4-6", 5.0, 6.25, 0.50, 25.0),
+            ("claude-opus-4-5", 5.0, 6.25, 0.50, 25.0),
+            ("claude-sonnet-5-5", 2.0, 2.5, 0.10, 10.0),
+            ("claude-sonnet-5", 2.0, 2.5, 0.20, 10.0),
+            ("claude-sonnet-4-6", 3.0, 3.75, 0.30, 15.0),
+            ("claude-haiku-5-5", 0.50, 0.625, 0.05, 2.50),
+        ];
+        let table = PricingTable::pinned();
+        for (model, input, write, read, output) in expected {
+            for id in [model.to_string(), format!("{model}-20261024")] {
+                let p = table.lookup(&id).unwrap_or_else(|| panic!("{id} unpriced"));
+                assert_eq!(
+                    (
+                        p.input_usd_per_mtok,
+                        p.cache_creation_input_usd_per_mtok,
+                        p.cache_read_input_usd_per_mtok,
+                        p.output_usd_per_mtok
+                    ),
+                    (input, write, read, output),
+                    "{id}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn point_release_prefixes_do_not_fall_to_the_older_generation_entry() {
+        let table = PricingTable::pinned();
+        // `claude-opus-4` ($15/$75) is a prefix of `claude-opus-4-5`.
+        assert_eq!(
+            table.lookup("claude-opus-4-5").unwrap().output_usd_per_mtok,
+            25.0
+        );
+        // `claude-sonnet-5` / `claude-opus-5` are prefixes of the 5.5 ids.
+        assert_eq!(
+            table
+                .lookup("claude-sonnet-5-5")
+                .unwrap()
+                .cache_read_input_usd_per_mtok,
+            0.10
+        );
+        assert_eq!(
+            table.lookup("claude-opus-5-5").unwrap().input_usd_per_mtok,
+            4.0
+        );
+        assert_eq!(
+            table
+                .lookup("claude-fable-5-1")
+                .unwrap()
+                .cache_read_input_usd_per_mtok,
+            0.25
+        );
+    }
+
+    #[test]
+    fn pricing_version_names_this_snapshot() {
+        assert_eq!(PRICING_VERSION, "pricing-2026-10-static-v2");
+    }
+
+    #[test]
+    fn unpriced_models_stay_unpriced_after_the_refresh() {
+        let table = PricingTable::pinned();
+        assert_eq!(table.lookup("claude-unreleased-9"), None);
+        assert_eq!(table.lookup("claude-mythos-5-1"), None);
     }
 }
