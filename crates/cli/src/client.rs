@@ -112,6 +112,17 @@ pub fn connect_only_with_budget(
         .map_err(|e| ClientError::DaemonUnavailable(socket_path.to_path_buf(), e.to_string()))
 }
 
+/// Environment switch that stops [`ensure_daemon_connection`] from starting a
+/// daemon (HORO-2160). An isolated QA harness sets it so a hook is a plain
+/// short-lived client: it never leaves a descendant process or listener
+/// behind, and a missing daemon is the existing fail-open "daemon
+/// unreachable" outcome. Any non-empty value other than `0` turns it on.
+pub const NO_AUTOSPAWN_ENV: &str = "LIBRA_GOVERNOR_NO_AUTOSPAWN";
+
+fn autospawn_disabled(value: Option<&str>) -> bool {
+    matches!(value, Some(v) if !v.is_empty() && v != "0")
+}
+
 /// Connects to the daemon, spawning it (detached, `daemon run`) if a
 /// connection attempt fails, then polling for readiness up to
 /// [`SPAWN_WAIT_BUDGET`]. Used by the `hook` subcommand only.
@@ -122,6 +133,13 @@ pub fn ensure_daemon_connection(socket_path: &Path) -> Result<UnixStream, Client
     }
     if let Ok(stream) = connect_once(socket_path) {
         return Ok(stream);
+    }
+
+    if autospawn_disabled(std::env::var(NO_AUTOSPAWN_ENV).ok().as_deref()) {
+        return Err(ClientError::DaemonUnavailable(
+            socket_path.to_path_buf(),
+            format!("daemon auto-start disabled by {NO_AUTOSPAWN_ENV}"),
+        ));
     }
 
     spawn_daemon_detached().map_err(|e| {
@@ -203,6 +221,15 @@ pub fn roundtrip(stream: &UnixStream, request: Request) -> Result<Response, Clie
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autospawn_is_disabled_only_by_an_explicit_non_zero_value() {
+        assert!(!autospawn_disabled(None));
+        assert!(!autospawn_disabled(Some("")));
+        assert!(!autospawn_disabled(Some("0")));
+        assert!(autospawn_disabled(Some("1")));
+        assert!(autospawn_disabled(Some("true")));
+    }
 
     #[test]
     fn connect_only_fails_fast_when_nothing_is_listening() {
