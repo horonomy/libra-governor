@@ -375,6 +375,33 @@ mod tests {
     }
 
     #[test]
+    fn settlement_of_current_models_uses_four_distinct_list_prices() {
+        let table = PricingTable::pinned();
+        // 1M tokens in every tier: sonnet-5-5 = 2 + 2.5 + 0.10 + 10 = $14.60.
+        let observed = usage(1_000_000, 1_000_000, 1_000_000, 1_000_000);
+        assert_eq!(
+            settled_cost(ResourceKind::Usd, &observed, "claude-sonnet-5-5", &table).unwrap(),
+            ResourceAmount::UsdCents(1_460)
+        );
+        // opus-5-5 = 4 + 5 + 0.20 + 20 = $29.20.
+        assert_eq!(
+            settled_cost(
+                ResourceKind::Usd,
+                &observed,
+                "claude-opus-5-5-20261024",
+                &table
+            )
+            .unwrap(),
+            ResourceAmount::UsdCents(2_920)
+        );
+        // A model the table still does not know settles as an enforcement gap.
+        assert!(matches!(
+            settled_cost(ResourceKind::Usd, &observed, "claude-unreleased-9", &table),
+            Err(EnforcementGap::UnpricedModel { .. })
+        ));
+    }
+
+    #[test]
     fn token_settlement_sums_the_fresh_tiers() {
         let settled = settled_cost(
             ResourceKind::Tokens,
