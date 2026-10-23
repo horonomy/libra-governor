@@ -693,7 +693,7 @@ checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
 
 [[package]]
 name = "libra-governor-cli"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "libc",
  "libra-governor-daemon",
@@ -719,7 +719,7 @@ dependencies = [
 
 [[package]]
 name = "libra-governor-daemon"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "bytes",
  "http-body-util",
@@ -749,7 +749,7 @@ dependencies = [
 
 [[package]]
 name = "libra-governor-domain"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "jiff",
  "serde",
@@ -762,7 +762,7 @@ dependencies = [
 
 [[package]]
 name = "libra-governor-estimator"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "libra-governor-domain",
  "libra-governor-ledger",
@@ -773,7 +773,7 @@ dependencies = [
 
 [[package]]
 name = "libra-governor-evidence-adapter"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "libra-governor-domain",
  "libra-governor-ledger",
@@ -787,7 +787,7 @@ dependencies = [
 
 [[package]]
 name = "libra-governor-extension"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "bytes",
  "hmac",
@@ -807,7 +807,7 @@ dependencies = [
 
 [[package]]
 name = "libra-governor-gateway"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "bytes",
  "http-body-util",
@@ -826,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "libra-governor-ledger"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "libra-governor-domain",
  "rusqlite",
@@ -840,7 +840,7 @@ dependencies = [
 
 [[package]]
 name = "libra-governor-pacing-gate"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "libra-governor-domain",
  "serde",
@@ -852,7 +852,7 @@ dependencies = [
 
 [[package]]
 name = "libra-governor-protocol"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "libra-governor-domain",
  "libra-governor-estimator",
@@ -866,7 +866,7 @@ dependencies = [
 
 [[package]]
 name = "libra-governor-quota-observation"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "rustix",
  "serde",
@@ -879,7 +879,7 @@ dependencies = [
 
 [[package]]
 name = "libra-governor-quota-source"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "libra-governor-domain",
  "serde",
@@ -891,7 +891,7 @@ dependencies = [
 
 [[package]]
 name = "libra-governor-two-principal-harness"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "libc",
  "libra-governor-protocol",
