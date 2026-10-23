@@ -1857,7 +1857,12 @@ pub fn explain_text(status: &StatusResult, doctor: Option<&DoctorResult>) -> Str
                 Some(preset) => out.push_str(&format!("  running policy   {preset}\n")),
                 None => out.push_str("  running policy   a preset this build does not recognise\n"),
             }
-            if doctor.running_config_matches_disk {
+            if doctor.config_file_present && !doctor.config_file_valid {
+                out.push_str(
+                    "  config.json      cannot be used (see `libra-governor doctor`); the\n",
+                );
+                out.push_str("                   policy above is what is actually in force\n");
+            } else if doctor.running_config_matches_disk {
                 out.push_str("  config.json      agrees with the running policy\n");
             } else {
                 out.push_str("  config.json      has been edited since the daemon started; the\n");
@@ -4765,6 +4770,15 @@ mod tests {
             !text.contains("agrees with the running policy"),
             "silence about drift must not read as agreement"
         );
+    }
+
+    #[test]
+    fn explain_does_not_claim_agreement_with_a_rejected_config() {
+        let mut doctor = doctor_with("balanced", true);
+        doctor.config_file_valid = false;
+        let text = explain_text(&status_with(ReplanState::Stable), Some(&doctor));
+        assert!(text.contains("cannot be used"), "{text}");
+        assert!(!text.contains("agrees with the running policy"), "{text}");
     }
 
     #[test]

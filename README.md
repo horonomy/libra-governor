@@ -13,7 +13,7 @@ one. See [`PRODUCT.md`](PRODUCT.md) for the full product North Star and
 
 **Product page and hosted docs:** [libra.horonom.com](https://libra.horonom.com) ([docs](https://libra.horonom.com/docs/)) — Developer Preview.
 
-This is the **v0.0.3 release**: everything from v0.0.2 (the v0.0.1 MVP 3
+This is the **v0.0.3 feature set** (the `release/v0.0.3` branch; `main` is the v0.0.4 development line and is not yet released): everything from v0.0.2 (the v0.0.1 MVP 3
 local flow, Codex support, local extension points — see below) plus the
 Agent Execution Economics work (HORO-1666–1673, HORO-1689): hierarchical
 resource accounting, a progressive remaining-cost estimator with shadow
