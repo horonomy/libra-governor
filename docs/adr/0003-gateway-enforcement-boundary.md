@@ -3,6 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-09-18
 - **Ticket:** HORO-1144
+- **Amended for the local monthly budget only by [ADR-0026](0026-local-monthly-shared-budget.md):** cooperative prompt-time admission; the gateway remains the hard per-request enforcement point.
 
 ## Context
 
