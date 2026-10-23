@@ -67,7 +67,7 @@ pub use shared_pool::{
     SharedPoolChargeOutcome, SharedPoolChargeRequest, SharedPoolExecutorReport,
     SharedPoolExecutorUsage, SharedPoolReleaseOutcome, SharedPoolRenewOutcome,
     SharedPoolReserveOutcome, SharedPoolReserveRequest, SharedPoolSessionUsage,
-    SharedPoolSettleOutcome,
+    SharedPoolSettleOutcome, SourcedAdmission,
 };
 pub use store::{LedgerStore, APPEND_ONLY_TRIGGERS};
 pub use write::DOGFOOD_PROFILE_ENV_VAR;
@@ -118,4 +118,9 @@ pub enum LedgerError {
     /// creates one; see that method's own docs.
     #[error("no quota pool exists for pool id {pool_id:?}")]
     NoSuchPool { pool_id: String },
+    /// A reserve named an idempotency key that already belongs to a
+    /// `charge_shared` row (HORO-2194): that is recorded spend, not a hold,
+    /// so it is refused rather than replayed as `AlreadyGranted`.
+    #[error("idempotency key belongs to a recorded charge, not a hold")]
+    SharedPoolKeyConflict,
 }

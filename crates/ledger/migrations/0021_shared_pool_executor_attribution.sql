@@ -25,3 +25,10 @@ ALTER TABLE shared_pool_reservations ADD COLUMN executor_kind TEXT
     CHECK (executor_kind IS NULL OR executor_kind IN ('agent_absent', 'agent', 'unattributed'));
 ALTER TABLE shared_pool_reservations ADD COLUMN charge_source TEXT
     CHECK (charge_source IS NULL OR charge_source IN ('turn_hold', 'subagent_transcript', 'gateway'));
+
+-- Marks rows written by `charge_shared` (already-settled spend) as opposed
+-- to holds, so a reserve replaying a charge's idempotency key is refused
+-- instead of being handed back as a hold, and a charge replay must match a
+-- prior charge. Legacy rows are holds (0).
+ALTER TABLE shared_pool_reservations ADD COLUMN is_charge INTEGER NOT NULL DEFAULT 0
+    CHECK (is_charge IN (0, 1));

@@ -452,16 +452,45 @@ pub enum SharedPoolChargeOutcome {
         /// Pool accounting immediately after this charge.
         admission: PoolAdmission,
         /// `admission.overrun()`: how far committed spend now exceeds
-        /// capacity (0 when within capacity).
+        /// capacity (0 when within capacity). A lower bound when
+        /// `capacity_known` is false.
         overrun: u64,
+        /// False when `capacity_source` was `ProviderSnapshot` and the
+        /// snapshot was unusable: `admission.capacity` is then only the
+        /// stored pool capacity, NOT an effective capacity, and
+        /// `overrun` / `remaining()` must not be read as authoritative.
+        capacity_known: bool,
     },
     /// Idempotent replay of an identical charge; nothing was written.
     AlreadyCharged(Box<SharedPoolReservation>),
-    /// The key exists but is not an identical charge (a hold, or a charge
-    /// with a different amount/session). Nothing was written.
+    /// The key exists but is not an identical charge (a hold -- including
+    /// a settled one --, or a charge differing in amount, session,
+    /// agent_id, executor_kind or charge_source). Nothing was written, so
+    /// the caller knows its spend was NOT recorded under this key.
+    /// Charge keys and reserve keys must be disjoint.
     KeyConflict(Box<SharedPoolReservation>),
     /// No `quota_pools` row exists for this pool.
     NoPool,
+}
+
+/// A [`PoolAdmission`] status read together with whether its capacity is
+/// an effective one (HORO-2194).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourcedAdmission {
+    pub admission: PoolAdmission,
+    /// False only for `ProviderSnapshot` with an unusable snapshot: then
+    /// `admission.capacity` is just the stored pool capacity, which is NOT
+    /// the effective capacity (admission would refuse outright), so
+    /// `remaining()` / `overrun()` understate the shortfall and must not
+    /// be presented as authoritative.
+    pub capacity_known: bool,
+}
+
+impl std::ops::Deref for SourcedAdmission {
+    type Target = PoolAdmission;
+    fn deref(&self) -> &PoolAdmission {
+        &self.admission
+    }
 }
 
 /// One executor's settled (`used`) and active (`reserved`) amounts
@@ -616,11 +645,6 @@ impl LedgerStore {
         Ok((settled as u64, active as u64))
     }
 
-    /// The freshest ingested provider gauge reading for `pool_id`, if any
-    /// was ever recorded via [`Self::ingest_pool_provider_snapshot`] — read
-    /// inside the caller's own transaction so it observes the same
-    /// instant as the settled/active sums.
-    #[allow(clippy::type_complexity)]
     /// Sums only `settled` reservations whose own `settled_at` is at or
     /// before `observed_at` — i.e. Libra-side activity the snapshot
     /// could structurally already include, because it existed before
@@ -969,9 +993,17 @@ impl LedgerStore {
         if let Some(row) = existing {
             tx.commit()?;
             let existing = row_to_reservation(row)?;
-            let identical = existing.state == ReservationState::Settled
+            // Identical means the same charge, field for field (NULL is its
+            // own value): a settled turn hold, or a charge attributed
+            // differently, must never be mistaken for a replay or the
+            // spend would be silently dropped.
+            let identical = Self::is_charge_row_tx(&self.conn, existing.id)?
+                && existing.state == ReservationState::Settled
                 && existing.settled_amount == Some(req.amount)
-                && existing.session_id == req.session_id;
+                && existing.session_id == req.session_id
+                && existing.agent_id == attribution.agent_id
+                && existing.executor_kind == attribution.executor_kind
+                && existing.charge_source == attribution.charge_source;
             return Ok(if identical {
                 SharedPoolChargeOutcome::AlreadyCharged(Box::new(existing))
             } else {
@@ -1014,9 +1046,9 @@ impl LedgerStore {
             "INSERT INTO shared_pool_reservations (
                 id, pool_id, principal_id, session_id, amount, state, settled_amount,
                 usage_known, idempotency_key, created_at, expires_at, settled_at, released_at,
-                schema_version, agent_id, executor_kind, charge_source
+                schema_version, agent_id, executor_kind, charge_source, is_charge
              ) VALUES (?1, ?2, ?3, ?4, ?5, 'settled', ?5, 1, ?6, ?7, ?7, ?7, NULL, ?8,
-                       ?9, ?10, ?11)",
+                       ?9, ?10, ?11, 1)",
             rusqlite::params![
                 id.0.to_string(),
                 req.pool_id.0,
@@ -1033,11 +1065,14 @@ impl LedgerStore {
         )?;
 
         // Reporting only -- the row is already written. An unusable
-        // provider snapshot falls back to the stored pool capacity.
-        let capacity = Self::effective_capacity_tx(&tx, &pool, req.capacity_source, req.now)?
-            .unwrap_or(pool.capacity);
+        // provider snapshot falls back to the stored pool capacity and is
+        // flagged `capacity_known: false`.
+        let effective = Self::effective_capacity_tx(&tx, &pool, req.capacity_source, req.now)?;
+        let capacity_known = effective.is_ok();
+        let capacity = effective.unwrap_or(pool.capacity);
         let (settled, active) = Self::settled_and_active_tx(&tx, req.pool_id)?;
-        let external_overhang = Self::external_overhang_tx(&tx, req.pool_id, req.now)?;
+        let external_overhang =
+            Self::overhang_for_tx(&tx, req.pool_id, req.capacity_source, req.now)?;
         let admission = PoolAdmission {
             capacity,
             settled,
@@ -1051,6 +1086,7 @@ impl LedgerStore {
             reservation: Box::new(reservation),
             admission,
             overrun: admission.overrun(),
+            capacity_known,
         })
     }
 
@@ -1059,27 +1095,32 @@ impl LedgerStore {
     /// configured cap, otherwise the stored capacity clamped to a usable
     /// provider snapshot's declared limit (the stored capacity alone when
     /// the snapshot is unusable -- this is a status read, not an
-    /// admission). `remaining()` is never clamped, so an overrun shows as
+    /// admission; `capacity_known` is then false). `LocalConfigured`
+    /// ignores any provider snapshot overhang. `remaining()` is never clamped, so an overrun shows as
     /// a negative figure and via [`PoolAdmission::overrun`].
     pub fn pool_admission_for(
         &self,
         pool_id: &PoolId,
         now: OffsetDateTime,
         source: CapacitySource,
-    ) -> Result<Option<PoolAdmission>, LedgerError> {
+    ) -> Result<Option<SourcedAdmission>, LedgerError> {
         let tx = self.conn.unchecked_transaction()?;
         let Some(pool) = self.quota_pool(pool_id)? else {
             return Ok(None);
         };
-        let capacity =
-            Self::effective_capacity_tx(&tx, &pool, source, now)?.unwrap_or(pool.capacity);
+        let effective = Self::effective_capacity_tx(&tx, &pool, source, now)?;
+        let capacity_known = effective.is_ok();
+        let capacity = effective.unwrap_or(pool.capacity);
         let (settled, active) = Self::settled_and_active_tx(&tx, pool_id)?;
-        let external_overhang = Self::external_overhang_tx(&tx, pool_id, now)?;
-        Ok(Some(PoolAdmission {
-            capacity,
-            settled,
-            active,
-            external_overhang,
+        let external_overhang = Self::overhang_for_tx(&tx, pool_id, source, now)?;
+        Ok(Some(SourcedAdmission {
+            admission: PoolAdmission {
+                capacity,
+                settled,
+                active,
+                external_overhang,
+            },
+            capacity_known,
         }))
     }
 
@@ -1193,6 +1234,8 @@ impl LedgerStore {
         req: SharedPoolReserveRequest<'_>,
         metered: Option<&MeteredGate>,
     ) -> Result<CoreReserveOutcome, LedgerError> {
+        // Validated before any admission decision, like `charge_shared`.
+        let attribution = req.attribution.resolve()?;
         let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
 
         // Scoped to (pool_id, principal_id, idempotency_key) — an
@@ -1216,10 +1259,16 @@ impl LedgerStore {
             )
             .optional()?;
         if let Some(row) = existing {
+            let existing = row_to_reservation(row)?;
+            // A row created by `charge_shared` is spend, not a hold: handing
+            // it back as `AlreadyGranted` would make the caller believe it
+            // holds capacity. Charge keys and reserve keys must be disjoint.
+            let is_charge = Self::is_charge_row_tx(&tx, existing.id)?;
             tx.commit()?;
-            return Ok(CoreReserveOutcome::AlreadyGranted(Box::new(
-                row_to_reservation(row)?,
-            )));
+            if is_charge {
+                return Err(LedgerError::SharedPoolKeyConflict);
+            }
+            return Ok(CoreReserveOutcome::AlreadyGranted(Box::new(existing)));
         }
 
         let pool_row: Option<PoolRow> = tx
@@ -1288,7 +1337,10 @@ impl LedgerStore {
         }
 
         let (settled, active) = Self::settled_and_active_tx(&tx, req.pool_id)?;
-        let external_overhang = Self::external_overhang_tx(&tx, req.pool_id, req.now)?;
+        let overhang_source = metered
+            .map(|g| g.capacity_source)
+            .unwrap_or(CapacitySource::ProviderSnapshot);
+        let external_overhang = Self::overhang_for_tx(&tx, req.pool_id, overhang_source, req.now)?;
         let admission = PoolAdmission {
             capacity: effective_capacity,
             settled,
@@ -1304,7 +1356,6 @@ impl LedgerStore {
             });
         }
 
-        let attribution = req.attribution.resolve()?;
         let id = SharedPoolReservationId::new();
         // `ttl_secs` is caller-supplied; a bare `Duration::seconds(ttl_secs
         // as i64)` followed by `now + duration` can both truncate (a
@@ -1376,6 +1427,21 @@ impl LedgerStore {
         )))
     }
 
+    /// Provider-snapshot overhang, except for `LocalConfigured`, whose cap
+    /// is the operator's own and is never shrunk by a (possibly leftover)
+    /// provider snapshot.
+    fn overhang_for_tx(
+        tx: &rusqlite::Connection,
+        pool_id: &PoolId,
+        source: CapacitySource,
+        now: OffsetDateTime,
+    ) -> Result<u64, LedgerError> {
+        match source {
+            CapacitySource::LocalConfigured { .. } => Ok(0),
+            CapacitySource::ProviderSnapshot => Self::external_overhang_tx(tx, pool_id, now),
+        }
+    }
+
     /// The effective capacity for `source` inside the caller's
     /// transaction. `Err(reason)` (inner) only for
     /// [`CapacitySource::ProviderSnapshot`] with an unusable snapshot.
@@ -1393,6 +1459,18 @@ impl LedgerStore {
                     .map(|declared_limit| pool.capacity.min(declared_limit)))
             }
         }
+    }
+
+    fn is_charge_row_tx(
+        tx: &rusqlite::Connection,
+        id: SharedPoolReservationId,
+    ) -> Result<bool, LedgerError> {
+        let flag: i64 = tx.query_row(
+            "SELECT is_charge FROM shared_pool_reservations WHERE id = ?1",
+            [id.0.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(flag != 0)
     }
 
     fn get_shared_reservation_tx(

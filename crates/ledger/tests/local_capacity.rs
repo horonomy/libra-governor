@@ -18,7 +18,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use libra_governor_domain::{
-    ChargeSource, Confidence, ExecutorKind, GaugeReading, PoolId, PrincipalId, QuotaUnit,
+    ChargeSource, Confidence, ExecutorKind, GaugeReading, PoolId, PrincipalId, QuotaAmount,
+    QuotaUnit,
 };
 use libra_governor_ledger::{
     CapacitySource, ExecutorAttribution, LedgerStore, MeteredReserveOutcome, MeteredReserveRequest,
@@ -489,6 +490,7 @@ fn charge_beyond_cap_succeeds_shows_overrun_and_blocks_later_reserves() {
         reservation,
         admission,
         overrun,
+        ..
     } = outcome
     else {
         panic!("a charge must never be refused for capacity: {outcome:?}");
@@ -855,4 +857,265 @@ fn settle_attribution_fills_gaps_but_never_rewrites_hold_time_attribution() {
         ),
         (None, None, None)
     );
+}
+
+// ---------------------------------------------------------------------
+// Review cycle 1 regressions (HORO-2194 M1-M4 + LOW)
+// ---------------------------------------------------------------------
+
+fn ingest_disclosed(store: &mut LedgerStore, used: u64, limit: u64) {
+    store
+        .ingest_pool_provider_snapshot(
+            &pool(),
+            now(),
+            Some(now() + time::Duration::seconds(3600)),
+            &GaugeReading::Used {
+                used: QuotaAmount::new(QuotaUnit::UsdCents, used),
+                limit: Some(limit),
+            },
+            Confidence::High,
+            now(),
+        )
+        .unwrap();
+}
+
+#[test]
+fn local_configured_ignores_provider_snapshot_overhang_provider_snapshot_unchanged() {
+    let (_dir, mut store) = store_with_pool(1_000);
+    // Disclosed snapshot: 800 used externally, no matching Libra rows.
+    ingest_disclosed(&mut store, 800, 1_000);
+
+    let local_status = store
+        .pool_admission_for(&pool(), now(), local(1_000))
+        .unwrap()
+        .unwrap();
+    assert_eq!(local_status.admission.external_overhang, 0);
+    assert_eq!(local_status.admission.remaining(), 1_000);
+
+    let provider_status = store
+        .pool_admission_for(&pool(), now(), CapacitySource::ProviderSnapshot)
+        .unwrap()
+        .unwrap();
+    assert_eq!(provider_status.admission.external_overhang, 800);
+    assert_eq!(provider_status.admission.remaining(), 200);
+
+    // ProviderSnapshot admission still refuses what the overhang forbids.
+    assert!(matches!(
+        reserve(
+            &mut store,
+            CapacitySource::ProviderSnapshot,
+            "s",
+            201,
+            "p",
+            Default::default()
+        ),
+        MeteredReserveOutcome::Insufficient { .. }
+    ));
+    // LocalConfigured admits the full cap, and a charge reports no overhang.
+    granted_id(reserve(
+        &mut store,
+        local(1_000),
+        "s",
+        1_000,
+        "l",
+        Default::default(),
+    ));
+    let SharedPoolChargeOutcome::Charged { admission, .. } =
+        charge(&mut store, local(1_000), "s", 10, "c", Default::default())
+    else {
+        panic!()
+    };
+    assert_eq!(admission.external_overhang, 0);
+}
+
+#[test]
+fn charge_replay_never_swallows_a_settled_hold_or_differently_attributed_charge() {
+    let (_dir, mut store) = store_with_pool(0);
+    let cap = local(1_000);
+    let hold = granted_id(reserve(
+        &mut store,
+        cap,
+        "s",
+        10,
+        "k",
+        ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+    ));
+    store.settle_shared(hold, Some(10), now()).unwrap();
+
+    // Same key, amount and session as the settled turn hold: spend must
+    // not be silently dropped as a "replay".
+    for attribution in [
+        ExecutorAttribution::agent("a1", Some(ChargeSource::SubagentTranscript)),
+        ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+    ] {
+        assert!(matches!(
+            charge(&mut store, cap, "s", 10, "k", attribution),
+            SharedPoolChargeOutcome::KeyConflict(_)
+        ));
+    }
+    assert_eq!(
+        store
+            .shared_pool_executor_usage(&pool())
+            .unwrap()
+            .total_used,
+        10
+    );
+
+    // A true replay is still AlreadyCharged; any attribution difference
+    // (NULL is its own value) is a conflict.
+    let attr = ExecutorAttribution::agent("a1", Some(ChargeSource::SubagentTranscript));
+    assert!(matches!(
+        charge(&mut store, cap, "s", 5, "t", attr),
+        SharedPoolChargeOutcome::Charged { .. }
+    ));
+    assert!(matches!(
+        charge(&mut store, cap, "s", 5, "t", attr),
+        SharedPoolChargeOutcome::AlreadyCharged(_)
+    ));
+    for other in [
+        ExecutorAttribution::agent("a2", Some(ChargeSource::SubagentTranscript)),
+        ExecutorAttribution::agent("a1", Some(ChargeSource::Gateway)),
+        ExecutorAttribution::agent("a1", None),
+        ExecutorAttribution::unattributed(Some(ChargeSource::SubagentTranscript)),
+        Default::default(),
+    ] {
+        assert!(matches!(
+            charge(&mut store, cap, "s", 5, "t", other),
+            SharedPoolChargeOutcome::KeyConflict(_)
+        ));
+    }
+    assert_eq!(
+        store
+            .shared_pool_executor_usage(&pool())
+            .unwrap()
+            .total_used,
+        15
+    );
+}
+
+#[test]
+fn reserve_with_a_charges_key_is_a_conflict_not_a_granted_replay() {
+    let (_dir, mut store) = store_with_pool(0);
+    let cap = local(1_000);
+    charge(&mut store, cap, "s", 10, "c", Default::default());
+    let r = store.reserve_shared_metered(MeteredReserveRequest {
+        base: SharedPoolReserveRequest {
+            pool_id: &pool(),
+            principal_id: &owner(),
+            session_id: "s",
+            amount: 10,
+            unit: &QuotaUnit::UsdCents,
+            idempotency_key: "c",
+            now: now(),
+            ttl_secs: 60,
+            attribution: Default::default(),
+        },
+        session_cap: None,
+        capacity_source: cap,
+    });
+    assert!(matches!(
+        r,
+        Err(libra_governor_ledger::LedgerError::SharedPoolKeyConflict)
+    ));
+    // The plain launch-slot entry point refuses it the same way.
+    let r = store.reserve_shared(SharedPoolReserveRequest {
+        pool_id: &pool(),
+        principal_id: &owner(),
+        session_id: "s",
+        amount: 10,
+        unit: &QuotaUnit::UsdCents,
+        idempotency_key: "c",
+        now: now(),
+        ttl_secs: 60,
+        attribution: Default::default(),
+    });
+    assert!(matches!(
+        r,
+        Err(libra_governor_ledger::LedgerError::SharedPoolKeyConflict)
+    ));
+
+    // Replaying a genuine (even settled) hold key is unchanged.
+    let hold = granted_id(reserve(&mut store, cap, "s", 5, "h", Default::default()));
+    store.settle_shared(hold, Some(5), now()).unwrap();
+    assert!(matches!(
+        reserve(&mut store, cap, "s", 5, "h", Default::default()),
+        MeteredReserveOutcome::AlreadyGranted(_)
+    ));
+}
+
+#[test]
+fn status_flags_capacity_unknown_when_the_provider_snapshot_is_unusable() {
+    let (_dir, mut store) = store_with_pool(1_000);
+    // No snapshot: ProviderSnapshot capacity is unknown, LocalConfigured known.
+    let unknown = store
+        .pool_admission_for(&pool(), now(), CapacitySource::ProviderSnapshot)
+        .unwrap()
+        .unwrap();
+    assert!(!unknown.capacity_known);
+    assert!(
+        store
+            .pool_admission_for(&pool(), now(), local(500))
+            .unwrap()
+            .unwrap()
+            .capacity_known
+    );
+    let SharedPoolChargeOutcome::Charged { capacity_known, .. } = charge(
+        &mut store,
+        CapacitySource::ProviderSnapshot,
+        "s",
+        5,
+        "c1",
+        Default::default(),
+    ) else {
+        panic!()
+    };
+    assert!(
+        !capacity_known,
+        "stored capacity must not read as effective"
+    );
+    let SharedPoolChargeOutcome::Charged { capacity_known, .. } =
+        charge(&mut store, local(500), "s", 5, "c2", Default::default())
+    else {
+        panic!()
+    };
+    assert!(capacity_known);
+
+    // A usable snapshot makes it known again; admission behaviour is the
+    // same as before (still fail-closed above).
+    ingest_disclosed(&mut store, 0, 1_000);
+    assert!(
+        store
+            .pool_admission_for(&pool(), now(), CapacitySource::ProviderSnapshot)
+            .unwrap()
+            .unwrap()
+            .capacity_known
+    );
+}
+
+#[test]
+fn invalid_attribution_is_rejected_even_when_the_pool_is_full() {
+    let (_dir, mut store) = store_with_pool(0);
+    let cap = local(10);
+    charge(&mut store, cap, "s", 10, "fill", Default::default());
+    let bad = ExecutorAttribution {
+        agent_id: None,
+        executor_kind: Some(ExecutorKind::Agent),
+        charge_source: None,
+    };
+    let r = store.reserve_shared_metered(MeteredReserveRequest {
+        base: SharedPoolReserveRequest {
+            pool_id: &pool(),
+            principal_id: &owner(),
+            session_id: "s",
+            amount: 5,
+            unit: &QuotaUnit::UsdCents,
+            idempotency_key: "bad",
+            now: now(),
+            ttl_secs: 60,
+            attribution: bad,
+        },
+        session_cap: None,
+        capacity_source: cap,
+    });
+    assert!(r.is_err(), "must be an error, not Insufficient: {r:?}");
 }
