@@ -59,15 +59,41 @@ pub const SETTINGS_FILE_NAME: &str = "settings.json";
 /// Exact trailing invocation shapes `integrations/claude-code/README.md`
 /// documents. A command string is Governor-owned only if it ends with
 /// one of these *and* contains `libra-governor` — see module docs.
-const OWNED_COMMAND_SUFFIXES: [&str; 5] = [
+const OWNED_COMMAND_SUFFIXES: [&str; 8] = [
     "hook user-prompt-submit",
     "hook post-tool-use",
     "hook stop",
+    "hook pre-tool-use",
+    "hook subagent-stop",
+    "hook session-end",
     "statusline",
     "gateway token",
 ];
 
+/// The three legacy hooks, in the order [`Inspection::hooks_wired`] reports
+/// them. Unchanged so `doctor` and the evidence report keep their meaning.
 const HOOK_EVENTS: [&str; 3] = ["UserPromptSubmit", "PostToolUse", "Stop"];
+
+/// The shared-budget hooks (HORO-2216, ADR-0026 S7), reported separately in
+/// [`Inspection::shared_budget_hooks_wired`]. Each is a no-op unless
+/// `<state_dir>/shared-budget.json` exists.
+const SHARED_BUDGET_HOOK_EVENTS: [&str; 3] = ["PreToolUse", "SubagentStop", "SessionEnd"];
+
+/// Hook subcommand per event, legacy three first, then the shared-budget
+/// three (same order as the two event arrays above).
+const HOOK_SUBCOMMANDS: [(&str, &str); 6] = [
+    ("UserPromptSubmit", "hook user-prompt-submit"),
+    ("PostToolUse", "hook post-tool-use"),
+    ("Stop", "hook stop"),
+    ("PreToolUse", "hook pre-tool-use"),
+    ("SubagentStop", "hook subagent-stop"),
+    ("SessionEnd", "hook session-end"),
+];
+
+/// Seconds Claude Code may let the settlement hooks run. A `SessionEnd` hook
+/// otherwise gets a very short default window, and settling reads a
+/// transcript; the hook itself bounds its own work well inside this.
+const SETTLEMENT_HOOK_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SettingsError {
@@ -384,21 +410,17 @@ fn apply_locked(
 
     let hooks_obj = hooks_object_mut(&mut root, path)?;
 
-    for (event, subcommand) in
-        HOOK_EVENTS
-            .iter()
-            .zip(["hook user-prompt-submit", "hook post-tool-use", "hook stop"])
-    {
+    for (event, subcommand) in HOOK_SUBCOMMANDS {
         let command = format!("{binary} {subcommand}");
         let entries = hooks_obj
-            .entry((*event).to_string())
+            .entry(event.to_string())
             .or_insert_with(|| Value::Array(Vec::new()));
         let entries_arr =
             entries
                 .as_array_mut()
                 .ok_or_else(|| SettingsError::HookEventNotAnArray {
                     path: path.to_path_buf(),
-                    event: (*event).to_string(),
+                    event: event.to_string(),
                 })?;
 
         let already_present = entries_arr.iter().any(|matcher| {
@@ -413,9 +435,11 @@ fn apply_locked(
                 .unwrap_or(false)
         });
         if !already_present {
-            entries_arr.push(serde_json::json!({
-                "hooks": [{ "type": "command", "command": command }]
-            }));
+            let mut hook = serde_json::json!({ "type": "command", "command": command });
+            if matches!(event, "SubagentStop" | "SessionEnd") {
+                hook["timeout"] = serde_json::json!(SETTLEMENT_HOOK_TIMEOUT_SECS);
+            }
+            entries_arr.push(serde_json::json!({ "hooks": [hook] }));
             hooks_added += 1;
         }
     }
@@ -622,6 +646,10 @@ fn remove_locked(path: &Path) -> Result<Removed, SettingsError> {
 pub struct Inspection {
     pub file_present: bool,
     pub hooks_wired: [bool; 3], // [UserPromptSubmit, PostToolUse, Stop]
+    /// [PreToolUse, SubagentStop, SessionEnd] (HORO-2216). Reported apart
+    /// from `hooks_wired` so an install that predates them still reads as
+    /// the legacy three wired.
+    pub shared_budget_hooks_wired: [bool; 3],
     pub statusline_wired: bool,
     pub api_key_helper_wired: bool,
     pub base_url_present: bool,
@@ -642,31 +670,31 @@ pub fn inspect(path: &Path) -> Inspection {
         };
     };
 
-    let mut hooks_wired = [false; 3];
-    if let Some(hooks_obj) = root.get("hooks").and_then(Value::as_object) {
-        for (idx, event) in HOOK_EVENTS.iter().enumerate() {
-            hooks_wired[idx] = hooks_obj
-                .get(*event)
-                .and_then(Value::as_array)
-                .map(|entries| {
-                    entries.iter().any(|matcher| {
-                        matcher
-                            .get("hooks")
-                            .and_then(Value::as_array)
-                            .map(|inner| {
-                                inner.iter().any(|h| {
-                                    h.get("command")
-                                        .and_then(Value::as_str)
-                                        .map(command_is_ours)
-                                        .unwrap_or(false)
-                                })
+    let hooks_obj = root.get("hooks").and_then(Value::as_object);
+    let wired = |event: &str| -> bool {
+        hooks_obj
+            .and_then(|hooks| hooks.get(event))
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries.iter().any(|matcher| {
+                    matcher
+                        .get("hooks")
+                        .and_then(Value::as_array)
+                        .map(|inner| {
+                            inner.iter().any(|h| {
+                                h.get("command")
+                                    .and_then(Value::as_str)
+                                    .map(command_is_ours)
+                                    .unwrap_or(false)
                             })
-                            .unwrap_or(false)
-                    })
+                        })
+                        .unwrap_or(false)
                 })
-                .unwrap_or(false);
-        }
-    }
+            })
+            .unwrap_or(false)
+    };
+    let hooks_wired = HOOK_EVENTS.map(wired);
+    let shared_budget_hooks_wired = SHARED_BUDGET_HOOK_EVENTS.map(wired);
 
     let statusline_wired = root
         .get("statusLine")
@@ -691,6 +719,7 @@ pub fn inspect(path: &Path) -> Inspection {
     Inspection {
         file_present: true,
         hooks_wired,
+        shared_budget_hooks_wired,
         statusline_wired,
         api_key_helper_wired,
         base_url_present,
@@ -712,7 +741,7 @@ mod tests {
         let path = dir.path().join("settings.json");
 
         let applied = apply(&path, &binary()).unwrap();
-        assert_eq!(applied.hooks_added, 3);
+        assert_eq!(applied.hooks_added, 6);
         assert!(applied.statusline_added);
         assert!(applied.backup_path.is_none(), "nothing existed to back up");
 
@@ -784,7 +813,7 @@ mod tests {
         let path = dir.path().join("settings.json");
 
         let applied = apply_hooks_only(&path, &binary()).unwrap();
-        assert_eq!(applied.hooks_added, 3);
+        assert_eq!(applied.hooks_added, 6);
         assert!(!applied.statusline_added);
         assert!(!applied.statusline_conflict);
 
@@ -811,7 +840,7 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&seed).unwrap()).unwrap();
 
         let applied = apply_hooks_only(&path, &binary()).unwrap();
-        assert_eq!(applied.hooks_added, 3);
+        assert_eq!(applied.hooks_added, 6);
         assert!(!applied.statusline_added);
         assert!(!applied.statusline_conflict);
 
@@ -845,7 +874,7 @@ mod tests {
         .unwrap();
 
         let applied = apply_hooks_only(&path, &binary()).unwrap();
-        assert_eq!(applied.hooks_added, 3);
+        assert_eq!(applied.hooks_added, 6);
         assert!(!applied.statusline_added);
         assert!(!applied.statusline_conflict);
 
@@ -859,7 +888,7 @@ mod tests {
         let path = dir.path().join("settings.json");
         apply(&path, &binary()).unwrap();
         let removed = remove(&path).unwrap();
-        assert_eq!(removed.hook_commands_removed, 3);
+        assert_eq!(removed.hook_commands_removed, 6);
         assert!(removed.statusline_removed);
 
         let inspection = inspect(&path);
@@ -1195,5 +1224,182 @@ mod tests {
         assert!(is_loopback_base_url("http://localhost:8787"));
         assert!(!is_loopback_base_url("https://api.example.com"));
         assert!(!is_loopback_base_url("http://10.0.0.5:8787"));
+    }
+
+    fn read_json(path: &Path) -> Value {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    fn commands(value: &Value, event: &str) -> Vec<String> {
+        value["hooks"][event]
+            .as_array()
+            .map(|groups| {
+                groups
+                    .iter()
+                    .flat_map(|g| g["hooks"].as_array().unwrap().iter())
+                    .map(|h| h["command"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn apply_wires_the_shared_budget_hooks_beside_the_legacy_three() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        apply_hooks_only(&path, &binary()).unwrap();
+
+        let value = read_json(&path);
+        for (event, sub) in [
+            ("UserPromptSubmit", "hook user-prompt-submit"),
+            ("PostToolUse", "hook post-tool-use"),
+            ("Stop", "hook stop"),
+            ("PreToolUse", "hook pre-tool-use"),
+            ("SubagentStop", "hook subagent-stop"),
+            ("SessionEnd", "hook session-end"),
+        ] {
+            assert_eq!(
+                commands(&value, event),
+                vec![format!("/opt/libra/bin/libra-governor {sub}")],
+                "{event}"
+            );
+        }
+        // The settlement hooks ask for a window long enough to settle; the
+        // legacy and gate hooks keep their historical entry shape.
+        assert_eq!(value["hooks"]["SubagentStop"][0]["hooks"][0]["timeout"], 10);
+        assert_eq!(value["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 10);
+        for event in ["UserPromptSubmit", "PostToolUse", "Stop", "PreToolUse"] {
+            assert!(value["hooks"][event][0]["hooks"][0]
+                .get("timeout")
+                .is_none());
+        }
+        let inspection = inspect(&path);
+        assert_eq!(inspection.hooks_wired, [true, true, true]);
+        assert_eq!(inspection.shared_budget_hooks_wired, [true, true, true]);
+    }
+
+    #[test]
+    fn apply_is_idempotent_for_the_shared_budget_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        apply_hooks_only(&path, &binary()).unwrap();
+        let first = std::fs::read(&path).unwrap();
+
+        let second = apply_hooks_only(&path, &binary()).unwrap();
+        assert_eq!(second.hooks_added, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), first, "no byte may change");
+        for event in ["PreToolUse", "SubagentStop", "SessionEnd"] {
+            assert_eq!(
+                read_json(&path)["hooks"][event].as_array().unwrap().len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn upgrading_a_legacy_install_adds_only_the_new_hooks_and_keeps_foreign_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let seed = serde_json::json!({
+            "futureSetting": { "kept": [1, 2, 3] },
+            "hooks": {
+                "UserPromptSubmit": [{ "hooks": [
+                    { "type": "command", "command": "/opt/libra/bin/libra-governor hook user-prompt-submit" }
+                ] }],
+                "PostToolUse": [{ "hooks": [
+                    { "type": "command", "command": "/opt/libra/bin/libra-governor hook post-tool-use" }
+                ] }],
+                "Stop": [{ "hooks": [
+                    { "type": "command", "command": "/opt/libra/bin/libra-governor hook stop" }
+                ] }],
+                "PreToolUse": [{ "matcher": "Bash", "hooks": [
+                    { "type": "command", "command": "/usr/local/bin/foreign-guard check", "timeout": 3 }
+                ] }],
+                "SubagentStop": [{ "hooks": [
+                    { "type": "command", "command": "/usr/local/bin/their-session-end hook subagent-stop" }
+                ] }],
+                "FutureEvent": [{ "hooks": [{ "type": "command", "command": "/x/y" }] }]
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec(&seed).unwrap()).unwrap();
+        assert_eq!(
+            inspect(&path).shared_budget_hooks_wired,
+            [false, false, false],
+            "a foreign hook with a lookalike suffix is not ours"
+        );
+
+        let applied = apply_hooks_only(&path, &binary()).unwrap();
+        assert_eq!(applied.hooks_added, 3);
+
+        let value = read_json(&path);
+        assert_eq!(value["futureSetting"], seed["futureSetting"]);
+        assert_eq!(value["hooks"]["FutureEvent"], seed["hooks"]["FutureEvent"]);
+        for event in ["UserPromptSubmit", "PostToolUse", "Stop"] {
+            assert_eq!(value["hooks"][event], seed["hooks"][event], "{event}");
+        }
+        // Foreign groups stay first and byte-equal; ours is appended.
+        assert_eq!(
+            value["hooks"]["PreToolUse"][0],
+            seed["hooks"]["PreToolUse"][0]
+        );
+        assert_eq!(
+            value["hooks"]["SubagentStop"][0],
+            seed["hooks"]["SubagentStop"][0]
+        );
+        assert_eq!(
+            commands(&value, "PreToolUse"),
+            vec![
+                "/usr/local/bin/foreign-guard check".to_string(),
+                "/opt/libra/bin/libra-governor hook pre-tool-use".to_string()
+            ]
+        );
+        assert_eq!(
+            commands(&value, "SubagentStop")[1],
+            "/opt/libra/bin/libra-governor hook subagent-stop"
+        );
+        assert_eq!(inspect(&path).shared_budget_hooks_wired, [true, true, true]);
+    }
+
+    #[test]
+    fn remove_takes_the_shared_budget_hooks_and_leaves_lookalikes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let seed = serde_json::json!({
+            "hooks": {
+                "SessionEnd": [{ "hooks": [
+                    { "type": "command", "command": "/usr/local/bin/other-tool hook session-end" },
+                    { "type": "command", "command": "/opt/libra/bin/libra-governor hook session-end", "timeout": 10 }
+                ] }],
+                "PreToolUse": [{ "hooks": [
+                    { "type": "command", "command": "/usr/local/bin/foreign-guard check" },
+                    { "type": "command", "command": "/opt/libra/bin/libra-governor hook pre-tool-use" }
+                ] }],
+                "SubagentStop": [{ "hooks": [
+                    { "type": "command", "command": "/opt/libra/bin/libra-governor hook subagent-stop", "timeout": 10 }
+                ] }]
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec(&seed).unwrap()).unwrap();
+
+        let removed = remove(&path).unwrap();
+        assert_eq!(removed.hook_commands_removed, 3);
+
+        let value = read_json(&path);
+        assert_eq!(
+            commands(&value, "SessionEnd"),
+            vec!["/usr/local/bin/other-tool hook session-end".to_string()]
+        );
+        assert_eq!(
+            commands(&value, "PreToolUse"),
+            vec!["/usr/local/bin/foreign-guard check".to_string()]
+        );
+        assert!(
+            value["hooks"].get("SubagentStop").is_none(),
+            "an event our removal emptied is dropped"
+        );
+        assert_eq!(
+            inspect(&path).shared_budget_hooks_wired,
+            [false, false, false]
+        );
     }
 }
