@@ -207,6 +207,24 @@ Foundation only: prune closed rows of **ended** periods, with an audit count,
 and a **local-only** export with no upload. Monthly automated remote upload is
 a **separate, versioned workstream and is not delivered** by this ADR.
 
+**Implementation status (S10, HORO-2219).** Implemented:
+`libra-governor shared-budget prune` and `shared-budget export`.
+
+- `prune` is a dry run unless `--apply` is given and requires
+  `--keep-months >= 1` and an explicit `--time-zone`. It deletes closed
+  rows of `local-budget` `monthly-YYYY-MM` pools whose period ended before
+  the last N closed months, one `BEGIN IMMEDIATE` transaction per pool. It
+  never touches the current or a future period, a pool with any `active`
+  row, or an unrecognised alias, and it reports counts only. Pruned periods
+  can no longer be exported.
+- `export --period YYYY-MM` writes a local `0600` file (schema
+  `libra.shared-budget-export.v1`, per-executor aggregates plus pool
+  totals, SHA-256 over the canonical body, no content). Session and agent
+  ids are replaced by short digests unless `--raw-ids` is given.
+
+Upload is **not built**: no transport, retry, resume or de-duplicated
+delivery exists; that remains the separate, versioned workstream above.
+
 ## Consequences
 
 - Once slices S4-S8 land (design intent), refusal before spend at prompt
