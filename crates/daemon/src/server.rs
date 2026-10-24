@@ -2290,12 +2290,11 @@ pub(crate) fn handle_finalize(
     )
 }
 
-/// `lane` is the legacy ledger key whose task and counter are finalized
-/// (see [`crate::legacy_executor`]). The shared-budget settlement above is
-/// keyed by the host's own `session_id` and is deliberately not re-keyed:
-/// a `Stop` that names an agent is that agent's own turn ending (the
-/// `--agent` main thread), and a subagent's transcript is settled by
-/// `SubagentStop`, not here.
+/// `lane` is the lane the request names (see [`crate::legacy_executor`]);
+/// the lane actually finalized is [`resolve_finalize_lane`]'s choice, so a
+/// `Stop` always closes what `Preflight` bound. The shared-budget settlement
+/// above is keyed by the host's own `session_id` and is deliberately not
+/// re-keyed: a subagent's transcript is settled by `SubagentStop`, not here.
 #[allow(clippy::too_many_arguments)]
 fn handle_finalize_for_lane(
     session_id: &str,
@@ -2354,6 +2353,7 @@ fn handle_finalize_for_lane(
             }
         }
     }
+    let lane = resolve_finalize_lane(ledger, session_id, lane)?;
     finalize_with_usage(
         lane,
         model,
@@ -2372,6 +2372,31 @@ fn handle_finalize_for_lane(
             ),
         },
     )
+}
+
+/// The lane a `Finalize` closes: the one `Preflight` actually bound for this
+/// turn. `Stop` is the main thread's hook, but a host may still forward an
+/// `agent_id` on it (or on the tool calls but not the prompt), and a derived
+/// lane that never had a preflight has no task to close -- finalizing it would
+/// answer `NoActiveTask`, write no receipt and leave the reservation held. So
+/// a derived lane with no active task falls back to the session's own lane;
+/// a derived lane that does have one (the `--agent` main thread, whose prompt
+/// carried the same id) is kept. Never the reverse: a request with no agent
+/// does not search the session's agent lanes.
+fn resolve_finalize_lane<'a>(
+    ledger: &LedgerStore,
+    session_id: &'a str,
+    lane: &'a str,
+) -> Result<&'a str, DaemonError> {
+    if lane != session_id && !lane_has_active_task(ledger, lane)? {
+        return Ok(session_id);
+    }
+    Ok(lane)
+}
+
+fn lane_has_active_task(ledger: &LedgerStore, lane: &str) -> Result<bool, DaemonError> {
+    Ok(ledger.task_id_for_session(lane)?.is_some()
+        && ledger.in_flight_plan_for_session(lane)?.is_some())
 }
 
 /// The full finalize-with-usage logic (HORO-1725), split out of
@@ -3212,6 +3237,121 @@ mod tests {
         // The subagent never inherits the parent's task.
         assert_eq!(ledger.task_id_for_session(&agent).unwrap(), None);
         assert_eq!(ledger.task_id_for_session("sess-1").unwrap(), parent_task);
+    }
+
+    fn lane_test_env() -> (tempfile::TempDir, DaemonConfig, LedgerStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_daemon_config(dir.path());
+        let ledger = LedgerStore::open(&config.ledger_path).unwrap();
+        (dir, config, ledger)
+    }
+
+    /// Prompt carried no agent, the tool calls and the Stop did: the Stop must
+    /// still close the parent's turn (receipt written, reservation settled),
+    /// and the receipt must count only the parent's own calls.
+    #[test]
+    fn a_stop_naming_an_agent_still_closes_the_lane_the_prompt_bound() {
+        use crate::legacy_executor::lane_key;
+        let (dir, config, mut ledger) = lane_test_env();
+        let mut current = None;
+        handle_preflight("fix", dir.path(), "s", &mut ledger, &config).unwrap();
+        let agent = lane_key("s", Some("a-1"), Some("claude-code"));
+        handle_tool_invoked_for_lane("s", "s", "Read", &mut ledger, &mut current, &config).unwrap();
+        for _ in 0..4 {
+            handle_tool_invoked_for_lane("s", &agent, "Bash", &mut ledger, &mut current, &config)
+                .unwrap();
+        }
+        let outcome = handle_finalize_for_lane(
+            "s",
+            &agent,
+            None,
+            Some("claude-code".into()),
+            None,
+            &mut ledger,
+            &mut current,
+            &config,
+        )
+        .unwrap();
+        let FinalizeOutcome::Finalized(result) = outcome else {
+            panic!("the parent's turn was left open: {outcome:?}");
+        };
+        assert_eq!(result.receipt.tool_call_count, 1);
+        assert_eq!(ledger.tool_call_count_for_session(&agent).unwrap(), 4);
+    }
+
+    /// The `--agent` main thread: prompt and Stop both name the agent, so its
+    /// own lane (not the session's) is the one closed.
+    #[test]
+    fn a_stop_naming_the_agent_the_prompt_named_closes_that_agents_lane() {
+        use crate::legacy_executor::lane_key;
+        let (dir, config, mut ledger) = lane_test_env();
+        let mut current = None;
+        let agent = lane_key("s", Some("a-1"), Some("claude-code"));
+        handle_preflight_for_lane("fix", dir.path(), "s", &agent, &mut ledger, &config).unwrap();
+        handle_tool_invoked_for_lane("s", &agent, "Bash", &mut ledger, &mut current, &config)
+            .unwrap();
+        let outcome = handle_finalize_for_lane(
+            "s",
+            &agent,
+            None,
+            None,
+            None,
+            &mut ledger,
+            &mut current,
+            &config,
+        )
+        .unwrap();
+        assert!(matches!(outcome, FinalizeOutcome::Finalized(r) if r.receipt.tool_call_count == 1));
+    }
+
+    /// A subagent's tool call can reach the daemon before the parent's
+    /// preflight; it must not create or take the parent's task or counter.
+    #[test]
+    fn a_subagent_call_before_the_parents_preflight_leaves_the_parent_lane_clean() {
+        use crate::legacy_executor::lane_key;
+        let (dir, config, mut ledger) = lane_test_env();
+        let mut current = None;
+        let agent = lane_key("s", Some("a-1"), None);
+        handle_tool_invoked_for_lane("s", &agent, "Bash", &mut ledger, &mut current, &config)
+            .unwrap();
+        assert_eq!(ledger.tool_call_count_for_session("s").unwrap(), 0);
+        assert_eq!(ledger.task_id_for_session("s").unwrap(), None);
+        handle_preflight("fix", dir.path(), "s", &mut ledger, &config).unwrap();
+        handle_tool_invoked_for_lane("s", "s", "Bash", &mut ledger, &mut current, &config).unwrap();
+        let outcome = handle_finalize_for_lane(
+            "s",
+            "s",
+            None,
+            None,
+            None,
+            &mut ledger,
+            &mut current,
+            &config,
+        )
+        .unwrap();
+        assert!(matches!(outcome, FinalizeOutcome::Finalized(r) if r.receipt.tool_call_count == 1));
+    }
+
+    /// Mid-session upgrade: the parent already has raw-session counters from
+    /// before subagent calls carried an agent; later subagent calls must not
+    /// disturb them.
+    #[test]
+    fn subagent_calls_after_existing_parent_counters_keep_the_parents_counters() {
+        use crate::legacy_executor::lane_key;
+        let (dir, config, mut ledger) = lane_test_env();
+        let mut current = None;
+        handle_preflight("fix", dir.path(), "s", &mut ledger, &config).unwrap();
+        for _ in 0..3 {
+            handle_tool_invoked_for_lane("s", "s", "Bash", &mut ledger, &mut current, &config)
+                .unwrap();
+        }
+        let agent = lane_key("s", Some("a-1"), None);
+        for _ in 0..6 {
+            handle_tool_invoked_for_lane("s", &agent, "Bash", &mut ledger, &mut current, &config)
+                .unwrap();
+        }
+        assert_eq!(ledger.tool_call_count_for_session("s").unwrap(), 3);
+        assert_eq!(ledger.tool_call_count_for_session(&agent).unwrap(), 6);
     }
 
     #[test]

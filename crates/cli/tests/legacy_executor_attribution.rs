@@ -300,3 +300,29 @@ fn a_hook_with_no_usable_session_books_nothing_anywhere() {
         [(Lane::Main("present".into()), 1)].into_iter().collect()
     );
 }
+
+/// Prompt carried no agent id; the subagent's tool calls and the `Stop` did.
+/// The Stop must still close the parent's turn (a receipt, not NoActiveTask),
+/// and the receipt must count only the parent's own calls.
+#[test]
+fn a_stop_that_names_an_agent_still_closes_the_parents_turn() {
+    let state = support::DaemonState::new();
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
+    let s = "asymmetric-session";
+
+    prompt(state.path(), repo.path(), s, None);
+    tool(state.path(), s, None, 2);
+    tool(state.path(), s, Some("agent-1"), 3);
+    let seen = wait_for_total(state.path(), 5);
+    assert_eq!(seen.get(&Lane::Main(s.into())), Some(&2));
+
+    let summary = receipt_tool_calls(state.path(), s, Some("agent-1"));
+    assert!(summary.contains("Tool calls: 2"), "{summary}");
+    // Closed exactly once: a second Stop finds nothing open.
+    let again = hook(state.path(), "stop", &json!({"session_id": s}));
+    assert!(
+        !String::from_utf8_lossy(&again.stderr).contains("Execution Receipt"),
+        "the turn was finalized twice"
+    );
+}
