@@ -238,10 +238,20 @@ impl Journey {
         serde_json::from_slice(&out.stdout).unwrap()
     }
 
+    /// The legacy statusline. The budget segment has a 200 ms bound and is
+    /// dropped silently when the machine is slow, so a line without it is
+    /// retried (bounded; each attempt is a fresh process, no sleeps).
     fn statusline(&self) -> String {
-        let out = self.cli(&["statusline"]);
-        assert!(out.status.success());
-        String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+        let mut line = String::new();
+        for _ in 0..20 {
+            let out = self.cli(&["statusline"]);
+            assert!(out.status.success());
+            line = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
+            if line.contains(" | budget ") {
+                break;
+            }
+        }
+        line
     }
 }
 
@@ -378,7 +388,9 @@ fn assert_reconciled(journey: &Journey) {
 const WORKER_ENV: &str = "HORO2217_WORKER";
 const RESULT_PREFIX: &str = "HORO2217_RESULT ";
 
-/// Not a real test: the body of one admitting client process. A no-op
+/// Harness entrypoint, NOT a test: it appears in the test list only because
+/// the parent re-executes this test binary to get real separate client
+/// processes. It is the body of one admitting client process. A no-op
 /// unless the parent re-executes this test binary with `HORO2217_WORKER`
 /// set. spec = "<socket>|<ready file>|<gate file>|<session id>".
 #[test]
@@ -668,7 +680,7 @@ fn an_exhausted_pool_denies_with_the_documented_reason_and_a_raised_cap_hot_relo
     assert!(!is_block(&journey.prompt("e-1")));
     assert!(!is_block(&journey.prompt("e-2")));
     let line = journey.statusline();
-    assert!(line.ends_with("budget $20.00/$20 (100%)"), "{line}");
+    assert!(line.ends_with("budget $20.00/$20 (100%) WARN"), "{line}");
 
     // (d) The third prompt is refused before any spend, with the reason.
     let denied = journey.prompt("e-3");
@@ -721,7 +733,8 @@ fn an_exhausted_pool_denies_with_the_documented_reason_and_a_raised_cap_hot_relo
 }
 
 // =====================================================================
-// (f) Restart and SIGKILL: nothing is lost, dead holds are reclaimed.
+// (f) Restart and SIGKILL: nothing is lost, holds survive; the ledger's
+//     expiry primitive (driven directly) then reclaims them.
 // =====================================================================
 
 fn charge_700(journey: &Journey) -> SharedBudgetOutcome {
@@ -736,7 +749,7 @@ fn charge_700(journey: &Journey) -> SharedBudgetOutcome {
 }
 
 #[test]
-fn a_restarted_and_a_sigkilled_daemon_recover_state_and_reclaim_dead_holds() {
+fn a_restarted_and_a_sigkilled_daemon_recover_state_and_the_ledger_reclaims_dead_holds() {
     let mut journey = Journey::start(&config(10_000, None));
     let h1 = match journey.admit("f-1") {
         SharedBudgetOutcome::Allowed { reservation_id, .. } => reservation_id,
@@ -800,7 +813,12 @@ fn a_restarted_and_a_sigkilled_daemon_recover_state_and_reclaim_dead_holds() {
         "the crash lost nothing and freed nothing early"
     );
 
-    // Dead holds are reclaimed by their own expiry, exactly their share.
+    // Holds survive the SIGKILL. Reclaiming them is exercised through the
+    // ledger's expiry primitive, called directly while the daemon is down:
+    // the hold TTL is not configurable, so a daemon-driven expiry cannot be
+    // reached without waiting it out. Daemon-driven expiry with an injected
+    // clock is covered in-process by `an_abandoned_hold_expires_and_frees_its_capacity`
+    // in crates/daemon/tests/shared_budget_core.rs.
     journey.kill9();
     let mut store = LedgerStore::open(journey.path().join("ledger.sqlite3")).unwrap();
     let latest = [h1, h2]
@@ -1024,11 +1042,9 @@ fn doctor_reports_the_live_budget_and_never_prints_the_host_traffic_value() {
         !String::from_utf8_lossy(&out.stderr).contains(SENTINEL),
         "nor on stderr"
     );
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "warnings do not fail doctor: {text}"
-    );
+    // The isolated HOME has no settings.json, so with a budget file present
+    // the admission and settlement hooks are missing: doctor fails.
+    assert_eq!(out.status.code(), Some(1), "{text}");
 
     let doc: Value = serde_json::from_str(&text).unwrap();
     let finding = |id: &str| -> Value {
@@ -1044,9 +1060,12 @@ fn doctor_reports_the_live_budget_and_never_prints_the_host_traffic_value() {
     assert_eq!(finding("shared_budget_daemon")["severity"], "ok");
     assert_eq!(finding("shared_budget_clock")["severity"], "ok");
     assert_eq!(finding("shared_budget_settlements")["severity"], "ok");
-    // The isolated HOME has no settings.json, so the hooks are not wired.
     let hooks = finding("shared_budget_hooks");
-    assert_eq!(hooks["severity"], "warn");
+    assert_eq!(hooks["severity"], "error");
+    assert!(hooks["message"]
+        .as_str()
+        .unwrap()
+        .contains("nothing is admitted or charged"));
     assert!(hooks["message"].as_str().unwrap().contains("SessionEnd"));
     let limits = finding("shared_budget_limits")["message"]
         .as_str()
@@ -1065,14 +1084,117 @@ fn doctor_reports_the_live_budget_and_never_prints_the_host_traffic_value() {
         .as_str()
         .unwrap()
         .to_string();
-    assert!(
-        traffic.contains("set in this process's environment"),
-        "{traffic}"
-    );
-    assert!(!traffic.contains("not set in this process's environment"));
+    assert!(traffic.contains("process environment has it"), "{traffic}");
+    assert!(!traffic.contains("process environment does not have it"));
 
     // Without the variable it says so.
     let plain = journey.cli(&["doctor", "--json"]);
     let plain_text = String::from_utf8_lossy(&plain.stdout).into_owned();
-    assert!(plain_text.contains("not set in this process's environment"));
+    assert!(plain_text.contains("process environment does not have it"));
+}
+
+#[test]
+fn doctor_flags_an_exhausted_pool_while_status_still_exits_zero() {
+    let journey = Journey::start(&config(2_000, None));
+    assert!(!is_block(&journey.prompt("x-1")));
+    assert!(!is_block(&journey.prompt("x-2")));
+
+    let out = journey.cli(&["doctor", "--json"]);
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let exhausted = doc["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "shared_budget_exhausted")
+        .unwrap_or_else(|| panic!("no exhausted finding in {doc}"));
+    assert_eq!(exhausted["severity"], "warn");
+    assert!(exhausted["message"]
+        .as_str()
+        .unwrap()
+        .contains("every new prompt is denied"));
+    // The operator view agrees and still exits 0 (doctor is the failing check).
+    let status = journey.cli(&["shared-budget", "status"]);
+    assert_eq!(status.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("Remaining: $0.00"));
+}
+
+/// A daemon that answers the legacy `Status` but accepts and then never
+/// answers a shared-budget request: the budget segment must be dropped within
+/// its bound, not stretch the statusline.
+#[test]
+fn a_stalled_shared_budget_answer_drops_the_segment_within_its_bound() {
+    use libra_governor_protocol::{StatusResult, StatusScope};
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let state = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let path = state.path().join("shared-budget.json");
+    std::fs::write(&path, config(50_000, None)).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let listener = UnixListener::bind(state.path().join("daemon.sock")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let halt = stop.clone();
+    let server = std::thread::spawn(move || {
+        let mut held: Vec<UnixStream> = Vec::new();
+        while !halt.load(Ordering::SeqCst) {
+            let Ok((stream, _)) = listener.accept() else {
+                std::thread::sleep(Duration::from_millis(2));
+                continue;
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let Ok(envelope) = wire::read_message::<_, RequestEnvelope>(BufReader::new(
+                stream.try_clone().unwrap(),
+            )) else {
+                continue;
+            };
+            match envelope.request {
+                Request::Status => {
+                    let _ = wire::write_message(
+                        &stream,
+                        &ResponseEnvelope {
+                            protocol_version: PROTOCOL_VERSION,
+                            response: Response::Status(Box::new(StatusResult {
+                                scope: StatusScope::HostLatestObservation,
+                                current_task: None,
+                                task_budget: None,
+                                task_budget_amounts: None,
+                                configured_budget: None,
+                                task_budget_freshness: None,
+                            })),
+                        },
+                    );
+                }
+                _ => held.push(stream), // accept, read, never answer
+            }
+        }
+    });
+
+    let start = Instant::now();
+    let out = Command::new(bin())
+        .arg("statusline")
+        .env("LIBRA_GOVERNOR_STATE_DIR", state.path())
+        .env("HOME", home.path())
+        .env("LIBRA_GOVERNOR_NO_AUTOSPAWN", "1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let elapsed = start.elapsed();
+    stop.store(true, Ordering::SeqCst);
+    server.join().unwrap();
+
+    assert!(out.status.success());
+    let line = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
+    assert_eq!(
+        line, "libra: idle",
+        "the segment is dropped, the line intact"
+    );
+    // 200 ms bound plus process start; far below the 5 s request timeout.
+    assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
 }
