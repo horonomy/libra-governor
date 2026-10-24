@@ -160,6 +160,8 @@ file changed or was just modified), not only at start:
 | Edited, invalid or half-written | `config_invalid` (deny) until it is valid again; existing holds are kept |
 | Deleted | Treated as absent (`not_configured`): deleting the file is read as the operator removing the budget. `Status` shows `config_state: absent` and `config_changed_since_start: true` |
 
+**Trust boundary of the file.** Any process running as the same OS user can edit or delete `shared-budget.json` (or swap it with a same-size file that keeps an older mtime, which the `(mtime, size)` change detector does not notice until the next edit). The cap is therefore cooperative, not tamper-proof, consistent with the same-user boundary in ADR-0023.
+
 **Operator recovery from `clock_anomaly`.** A forward clock jump that created
 a pool for a later month makes every `Admit` and `Check` deny `clock_anomaly`
 until real time reaches that month. `Status` names it in
