@@ -240,7 +240,7 @@ crates/cli --locked && libra-governor install`) from the repository root
 — see the root [`README.md`](../../README.md#install), which does
 exactly the settings.json edit below for you, safely (see
 [`README.md#uninstall`](../../README.md#uninstall) for the guarantees).
-To install only Libra's three hooks without changing `statusLine`, use
+To install only Libra's six hooks without changing `statusLine`, use
 `./scripts/install.sh --hooks-only` or `libra-governor install --hooks-only`.
 That mode preserves `statusLine` exactly as it is, whether it is absent,
 foreign, or an unrecognized JSON value. The manual steps below describe
@@ -287,6 +287,38 @@ Add the following to `.claude/settings.json` (project-level) or
           {
             "type": "command",
             "command": "/absolute/path/to/libra-governor hook stop"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/libra-governor hook pre-tool-use"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/libra-governor hook subagent-stop",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/libra-governor hook session-end",
+            "timeout": 10
           }
         ]
       }
@@ -627,7 +659,7 @@ refuse every metered request rather than mis-attribute one. This is the
 one part of the setup above that a real end-to-end smoke test is needed
 to confirm.
 
-## Local monthly shared budget (HORO-2215, ADR-0026) — cooperative gate
+## Local monthly shared budget (HORO-2215, HORO-2216; ADR-0026) — cooperative gate
 
 If `<state_dir>/shared-budget.json` exists, the hooks consult the daemon's
 local monthly shared budget. If it does not exist, **nothing changes**: the
@@ -642,9 +674,28 @@ budget gate (its hook route is unchanged).
 | `UserPromptSubmit` | present, daemon allows / `not_configured` | unchanged Preflight output; over a soft limit, one short warning line is appended to `additionalContext` (never blocks) |
 | `UserPromptSubmit` | present, `cap_exhausted` / `config_invalid` / `clock_anomaly` / refused identity | `{"decision":"block","reason":"..."}`, exit 0, Preflight is **not** called |
 | `UserPromptSubmit` | present, daemon unreachable (after the existing autospawn attempt, or immediately with `LIBRA_GOVERNOR_NO_AUTOSPAWN=1`) or no answer within the client timeout | block: `budget enforcement unavailable: daemon unreachable` |
-| `PreToolUse` (`hook pre-tool-use`, matcher `*`) | absent | empty output, the daemon is not contacted |
+| `PreToolUse` (`hook pre-tool-use`, no matcher = every tool) | absent | empty output, the daemon is not contacted |
 | `PreToolUse` | present, budget exhausted / `config_invalid` / `clock_anomaly` | `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"..."}}`, exit 0 |
 | `PreToolUse` | present, anything else (available, admitted, `not_configured`, daemon down, error, no answer in 500 ms) | empty output = allow (fail open); never spawns a daemon |
+| `SubagentStop` (`hook subagent-stop`) | absent | nothing is parsed or sent, the daemon is not contacted |
+| `SubagentStop` | present | one `ChargeAgentTranscript` with `session_id`, `agent_id` and `agent_transcript_path` as the host sent them; the daemon reads, binds, prices and de-duplicates. Always silent, exit 0 |
+| `SessionEnd` (`hook session-end`) | absent | nothing is parsed or sent, the daemon is not contacted |
+| `SessionEnd` | present | one `SettleTail` with `session_id` and `transcript_path`; the daemon charges the records no `Stop` counted. Always silent, exit 0 |
+
+The settlement hooks (`SubagentStop`, `SessionEnd`) never block and never
+spawn a daemon: no daemon, no answer within 5 s, a malformed payload, an
+unusable session id or a missing path is a log line and exit 0. A blank id
+is treated as absent and no agent id is ever invented; an `agent_id`
+outside `[A-Za-z0-9_-]` is not forwarded. When the transcript's file name
+is exactly `agent-<id>.jsonl` the hook sends that id (the same one the daemon's
+`Stop` sweep derives), so the hook and the sweep book one family and a file is
+never charged twice or lost; any other file is charged under the payload id,
+else unattributed. stdin is read only once a budget file exists and is capped
+at 1 MiB (oversize or non-UTF-8 input is ignored). Transcript paths are passed through verbatim; only the
+daemon validates and reads them. `libra-governor install` writes both with
+`"timeout": 10` because the host's default window for a `SessionEnd` hook
+is short; whether the host honours that value has not been verified on a
+real host.
 
 What the label means: amounts are **Libra-accounted USD** at the pinned
 price table, never the provider's bill or a plan quota. The guarantee is
@@ -654,10 +705,13 @@ and anything that edits `shared-budget.json` as the same OS user can change
 the cap. A per-request hard cap exists only with the gateway (ADR-0003).
 Every reason text says "Libra-accounted USD, admission-bounded".
 
-Not delivered by this slice: installing the `PreToolUse` hook entry
-(installer, S7), settlement of spend at `Stop` and `SubagentStop` (S5/S7),
-and `status`/`doctor` reporting (S8). No real Claude Code host has run
-this yet.
+The installer (`libra-governor install`, HORO-2216) adds the `PreToolUse`,
+`SubagentStop` and `SessionEnd` entries beside the original three,
+idempotently, and `uninstall` removes exactly those. They are installed
+whether or not a budget file exists; without one each is a cheap no-op.
+Not delivered: `status`/`doctor` reporting of the new hooks (S8; `doctor`
+still judges only the original three). No real Claude Code host has run
+these installed hooks yet; the evidence is `TestOwnedLive`.
 
 ## What this integration intentionally does not do (yet)
 

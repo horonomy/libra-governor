@@ -21,9 +21,14 @@ at `Stop` from priced, session-bound transcript usage, and a subagent's
 transcript is charged by `ChargeAgentTranscript` (see *Settlement delivered
 in S5*). `PROTOCOL_VERSION` is 21. The S6 Claude Code hook gate and the S10
 retention/export commands landed on `main` separately and are recorded in
-their own commits and in *Retention and export* below. Everything else
+their own commits and in *Retention and export* below.
+**S7 (HORO-2216) delivers the installer and the settlement hooks**:
+`libra-governor install` writes `PreToolUse`, `SubagentStop` and `SessionEnd`
+entries beside the original three, and `hook subagent-stop` /
+`hook session-end` send `ChargeAgentTranscript` / `SettleTail` (see
+*Installer and settlement hooks delivered in S7*). Everything else
 below that is not one of those is **design intent implemented in later
-slices** (S7 installer, S8 doctor/status, S11 gateway `governor_held`); it
+slices** (S8 doctor/status, S11 gateway `governor_held`); it
 must not be read as shipped behaviour. No real Claude Code host has
 exercised any of it as an installed hook: S4's and S5's evidence is
 `TestOwnedLive`; S5's transcript field names were confirmed against a real
@@ -401,7 +406,7 @@ the foreign spend is not imported. The fallback counts toward
 already-charged, so a later measurement books only the excess.
 
 **`SettleTail { session_id, transcript_path }`** (for `SessionEnd`, wired by
-S7). Charges the main-transcript records past the lane's watermark that no
+S7, delivered). Charges the main-transcript records past the lane's watermark that no
 `Stop` counted (the final message of a session) as a settled `agent_absent`
 row (`charge_source = turn_hold`, `usage_known = true`) with the same
 binding, de-duplication, future-bound and watermark; idempotent; nothing is
@@ -449,10 +454,60 @@ id, path or content).
   but the hold was already booked (an over-count).
 - The post-`/compact` transcript is unverified.
 
-**Not done in S5:** no installer or `SessionEnd` wiring (S7), no
-`doctor`/status CLI (S8), no gateway path (S11). `Finalize` itself returns
+**Not done in S5** (S7 has since delivered the installer and `SessionEnd`
+wiring): no `doctor`/status CLI (S8), no gateway path (S11). `Finalize` itself returns
 nothing about the settlement; it is observable through `Status`, the ledger
 and the log.
+
+### Installer and settlement hooks delivered in S7
+
+**Implementation status (S7, HORO-2216).** Guarantee label unchanged:
+**admission-bounded (cooperative)**, Libra-accounted USD, never provider
+quota. Evidence class: `TestOwnedLive` (real hook processes against a real
+daemon, synthetic transcripts); **no real Claude Code host has run the
+installed hooks**, so nothing here is `ProductionObserved`.
+
+- *Installer.* `install` / `install --hooks-only` add, idempotently, a
+  `PreToolUse`, `SubagentStop` and `SessionEnd` entry next to
+  `UserPromptSubmit`/`PostToolUse`/`Stop`. Ownership is the existing
+  predicate (command contains `libra-governor` **and** ends with
+  `hook pre-tool-use` / `hook subagent-stop` / `hook session-end`), so
+  `uninstall` removes exactly those and foreign hooks, matcher groups and
+  unknown settings are untouched. The two settlement entries carry
+  `"timeout": 10`; the host's default `SessionEnd` window is short, and
+  whether it honours the per-hook value is **not verified on a real host**.
+  They are installed whether or not `shared-budget.json` exists.
+- *No file, no change.* Both new handlers stat `shared-budget.json` first and
+  return before parsing or connecting; `PreToolUse` already did.
+- *`hook subagent-stop`.* Reads `session_id`, `agent_id`,
+  `agent_transcript_path` and sends `ChargeAgentTranscript`. A blank or
+  non-string id is absent and no id is invented; an `agent_id` outside
+  `[A-Za-z0-9_-]` is dropped (the daemon's sweep uses the same charset). The
+  path is relayed verbatim and the daemon alone validates and reads it.
+  *One family per file.* The daemon books a charge under the agent id, or
+  under a path hash when there is none, while the `Stop` sweep books
+  `<session>/subagents/agent-<id>.jsonl` under the id in its file name. To
+  make both converge, when the path's final component is exactly
+  `agent-<[A-Za-z0-9_-]+>.jsonl` the hook sends that file-name id as the
+  `agent_id` (a string check; nothing is opened, and the id is the
+  host-provided file name, not invented). If the payload carried a different
+  valid id the file-name id wins and the disagreement is logged, so a file is
+  never sent under two families; the existing per-family ledger idempotency
+  then dedupes the hook, the sweep, repeats, `..`, symlinked or aliased paths
+  (`/var` vs `/private/var`) and files in other directories. Any other file
+  name is charged under the payload id when valid, else `unattributed`. A
+  payload without `agent_transcript_path` is not charged by the hook; the next
+  `Stop` sweep (first 64 files) still finds it.
+- *`hook session-end`.* Sends `SettleTail { session_id, transcript_path }`;
+  a session never admitted or settled is refused by the daemon
+  (`no_settled_lane`) and billed nothing.
+- *Fail open.* Neither handler prints, blocks, spawns a daemon or exits
+  nonzero; no daemon, a malformed payload, a reserved or blank session id, or
+  no answer within 5 s is a log line. Only prompt admission denies.
+- *Residuals.* `doctor` still judges only the original three hooks
+  (`Inspection` reports the new ones separately for S8). A session whose
+  `SessionEnd` never fires (a killed host) has its tail left unsettled; no
+  other path settles it.
 
 ### Egress inventory
 
