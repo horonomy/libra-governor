@@ -25,8 +25,10 @@ their own commits and in *Retention and export* below. Everything else
 below that is not one of those is **design intent implemented in later
 slices** (S7 installer, S8 doctor/status, S11 gateway `governor_held`); it
 must not be read as shipped behaviour. No real Claude Code host has
-exercised any of it: S4's and S5's evidence is `TestOwnedLive`, and S5's
-transcripts are synthetic.
+exercised any of it as an installed hook: S4's and S5's evidence is
+`TestOwnedLive`; S5's transcript field names were confirmed against a real
+Claude Code 2.1.306 binary in an isolated harness, and its fixtures mirror
+that shape with synthetic ids.
 
 ## Context
 
@@ -215,14 +217,24 @@ exactly in integer pico-dollars and rounded **up** to a whole cent **once
 per Stop window** (never per record), so the error is below one cent per
 window and never downward. The actual may exceed the hold: the overrun is
 recorded unclamped and later `Admit`s are refused while `remaining < hold`.
-Dedup by `message.id` (HORO-1882) is unchanged; an assistant record with
-all-zero usage is free whatever its model.
+One API message written as several content-block lines (same `message.id`,
+identical `usage`, `apiBlockIndex` 0, 1, ...) is counted once per window and
+across windows (see *Window watermark*); an assistant record with all-zero
+usage is free whatever its model; a counted record with no `message.id` is
+its own message and is reported in `Status.id_less_records`.
 
 **What is not counted.** Records flagged sidechain are excluded from the
 parent window (they belong to the subagent charge). A `usage` object on a
 tool-result line (the Agent tool's `tool_response.usage`) is never read.
 Nothing is measured from the gateway, a provider bill or an inferred
 source. Known pricing limitations above still apply.
+
+**"Fails safe" is conservative only if the hold covers the turn.** Every
+window that cannot be measured settles at the flat hold amount. That is an
+over-count only when `turn_hold_usd_cents` is at least the real cost; an
+expensive turn that is unverified, unpriced, malformed, scan-capped or a
+binding mismatch is **under-counted** by the difference. The cap is an
+estimate; a larger hold is the only lever.
 
 **Session binding (HORO-2190).** Before any window is charged every usage
 record in it must carry the transcript's native per-line session field,
@@ -232,86 +244,164 @@ infer ownership.
 | Window | Result |
 |---|---|
 | all records present and equal | charged |
-| any record present and **different** (session B's hook given A's file) | charge **nothing**, hold left to its TTL, `transcript_binding_mismatches++` (the spend is counted by its true session's own Stop) |
+| any record present and **different** (session B's hook given A's file) | foreign spend is **never imported**; the lane hold is settled at the **hold amount**, `usage_known=false`, reason `binding_mismatch`, the watermark moves to now (so the same file is not judged again by every later Stop), `transcript_binding_mismatches++`. A mismatch is a flagged conservative settle, not an omission; the spend is counted by its true session's own Stop |
 | otherwise any record missing/unreadable field | settle the hold at the **hold amount**, `usage_known=false`, `transcript_unverified++` |
+| a usage count that is not a non-negative integer | `usage_malformed`: the hold amount, `usage_known=false` (never dropped silently) |
 
 One foreign record makes the whole window a mismatch; a window is never
 charged partially.
 
-**Evidence status of the field names: UNCONFIRMED.** The field names live in
-two constants (`TRANSCRIPT_SESSION_FIELD = "sessionId"`,
-`TRANSCRIPT_SIDECHAIN_FIELD = "isSidechain"`, `usage/priced.rs`). This
-repository holds no transcript fixture, characterization document or test
-that evidences them (the Claude Code hook payload's `session_id` is not a
-transcript line); they are the names the public Claude Code JSONL format is
-understood to use, mirrored by synthetic fixtures. Real-host confirmation is
-a later step. A wrong session name fails safe (every window unverifiable,
-settled at the hold amount); a wrong sidechain name would let a parent window
-include subagent records, so the subagent charge must not be relied on until
-it is confirmed.
+**Evidence status of the field names: CONFIRMED on Claude Code 2.1.306
+(2026-10-24)** against a real binary (isolated HOME, fake loopback
+upstream, network-deny sandbox, synthetic prompts only). The constants are
+`TRANSCRIPT_SESSION_FIELD = "sessionId"` and
+`TRANSCRIPT_SIDECHAIN_FIELD = "isSidechain"` (`usage/priced.rs`). Observed:
+main-transcript lines carry `sessionId` equal to the hook `session_id` and
+`isSidechain: false`; subagent lines are in a **separate** file
+`<session-dir>/subagents/agent-<agent_id>.jsonl` (session-dir = the hook's
+`transcript_path` without `.jsonl`) with `isSidechain: true`, `agentId`, and
+the **parent's** `sessionId`; `SubagentStop` carries `agent_id`,
+`agent_type`, `agent_transcript_path` and the parent's `session_id`; each
+subagent file holds only its own agent's lines (it is cumulative for that
+agent, not across agents); `--resume` keeps the same `sessionId` and appends
+to the same file. Hook payload facts: `UserPromptSubmit` has `prompt_id`,
+`permission_mode`, `prompt`; `Stop` has `prompt_id`, `last_assistant_message`,
+`stop_hook_active`, `background_tasks`; `SessionEnd` has `reason`; there is no
+turn id other than `prompt_id`; `agent_id` looks like `a` + hex.
 
-**Window watermark (no migration).** A window is every record **strictly
-after** the lane's watermark: the latest `settled_at` of the lane's settled
-holds, or the oldest hold's `created_at` when none has settled. It is derived
-from existing ledger rows and advances only when a hold settles, so two
-consecutive Stops never count a record twice, and a **crashed turn** (no
-Stop) is measured by the next Stop (its hold expired unsettled; the
-watermark did not move) while the abandoned hold is reclaimed by the
-existing TTL sweep. A late `Stop` after the hold expired still settles in
-the hold's own row and period.
+**Real-host verification checklist** (what must hold on a real host before
+the subagent path is trusted; S8 re-verifies):
+
+1. Main-transcript lines carry `sessionId` equal to the hook `session_id` -
+   **confirmed** (2.1.306).
+2. Resumed session: same `sessionId`, same file - **confirmed**. A
+   post-`/compact` transcript - **NOT yet verified**.
+3. Subagent lines live in `subagents/agent-<id>.jsonl` with the parent's
+   `sessionId`; `SubagentStop.agent_transcript_path` exists; each file holds
+   only its own agent - **confirmed**. Whether the file is complete at
+   `SubagentStop` - **no**, see 4.
+4. Timestamp monotonicity and flush lag - **observed, not monotonic**:
+   millisecond inversions (`.033` then `.032`), timestamp-less lines
+   (`atis-latch`, `last-prompt`, `cost-state`, `mode`), and a systematic
+   flush lag: at `Stop` the turn's final `end_turn` line is often not yet in
+   the file, and at `SubagentStop` a subagent's file may hold no assistant
+   line yet. Multi-second inversions are covered by a ten-minute slack; larger
+   inversions are not measured.
+5. Repeated `message.id` across content blocks - **confirmed**: split lines
+   with identical usage.
+
+**Window watermark (migration 0022, nullable columns, no backfill).** A
+window is every record **strictly after** the lane's watermark: the newest
+record timestamp **actually counted** by an earlier window, persisted on the
+settled row (`watermark_ts`, separate from `settled_at`) together with the
+`message.id`s counted up to it (`watermark_message_ids`, at most 512). Rows
+with no mark (legacy, or windows that counted nothing) fall back to the
+settle time of the latest settled hold, else the oldest hold's creation; a
+window that counts nothing keeps the previous mark. Because the host
+flushes asynchronously, a record stamped before a Stop is routinely written
+after it; a wall-clock watermark would lose it for good, this one counts it
+at the next Stop. Two consecutive Stops never count a record twice, and a
+**crashed turn** (no Stop) is measured by the next Stop while the abandoned
+hold is reclaimed by the existing TTL sweep. A late `Stop` after the hold
+expired still settles in the hold's own row and period.
+
+*Reverse scan.* The scan does not stop at the first old record (a user,
+tool-result or sidechain line with an older stamp would hide newer assistant
+lines above it). It keeps going until records are older than the watermark
+by ten minutes (`REORDER_SLACK`) or the 32 MiB byte bound, which is
+reported as unmeasured (hold amount, flagged), never a partial sum; only
+records strictly newer than the watermark are counted, and timestamp-less
+lines are ignored for the watermark.
+
+*Residuals.* A record stamped at or before an already-counted record but
+flushed later is not recovered. A `message.id` whose blocks straddle the
+watermark is protected by the persisted id set; if an id aged out of that
+bounded set, or a host omits ids, tail blocks may be counted again (an
+over-count, the safe direction). Inversions larger than the slack can hide
+newer records. The last message of a session is lost unless something runs
+after the final Stop: see `SettleTail`.
 
 **Settled at the hold amount, `usage_known=false`, never zero:** no
 transcript path; missing, unreadable, truncated-below-the-watermark or
-rotated transcript (no usage after the watermark); a window over the 32 MiB
-scan cap; a usage record with no timestamp; an unpriced model (named in
-`unpriced_models`); an unverifiable session field; and an invalid
-configuration file at `Stop` (settles the hold in its own pool; overrides
-from an untrusted file are not used). With no hold nothing is written.
-
-**Known limits.** Claude Code writes its transcript asynchronously: a record
-stamped before a `Stop` but flushed after it falls behind the watermark and
-is not counted (the window settled measured-short or at the hold amount).
-`Finalize` carries no idempotency key: a retry before the next `Admit` is a
-no-op, but a duplicate delivered after the next `Admit` would settle the
-new hold, so the hook must not resend. Status telemetry (counters,
-`unpriced_models`) is process memory and restarts at zero; the ledger's
-`usage_known` flag is the durable record.
+rotated transcript (no usage after the watermark); a window over the scan
+cap; a usage record with no timestamp; malformed counts; an unpriced model
+(named in `unpriced_models`); an unverifiable session field; a session
+mismatch; and an invalid configuration file at `Stop` (settles the hold in
+its own pool; overrides from an untrusted file are not used). With no hold
+nothing is written.
 
 **Subagent charge.** `ChargeAgentTranscript { session_id, agent_id,
 agent_transcript_path }` makes the daemon read the subagent's own file
-(32 MiB cap, same binding rule, all records counted) and book only
-`cumulative - already charged` with source `subagent_transcript`, executor
-`agent` (or `unattributed` when no `agent_id`: no id is ever invented, and
-each unattributed transcript path is its own family). "Already charged" is
-the sum of every row under the `(session, agent-or-path)` key prefix across
-periods, so a repeated `SubagentStop` books nothing and a larger file books
-the difference; charges are never refunded. Parent windows exclude
-sidechain records, so parent + subagent never double count (pinned by a
-fixture test asserting the pool total equals the sum of executors).
+(32 MiB cap, same session binding plus the per-line `agentId`, all records
+counted) and book only `cumulative - already charged` with source
+`subagent_transcript`, executor `agent` (or `unattributed` when no
+`agent_id`: no id is ever invented, and each unattributed transcript path is
+its own family). "Already charged" is the sum of every row under the
+`(session, agent-or-path)` key prefix across periods, so a repeated
+`SubagentStop` books nothing and a larger file books the difference;
+charges are never refunded. Parent windows exclude sidechain records, so
+parent + subagent never double count (pinned by fixture tests).
+
+*Stop sweep.* A subagent's file lags its own `SubagentStop`, so every
+`Finalize` also visits `<transcript_path minus .jsonl>/subagents/agent-*.jsonl`
+(at most 64 files, regular files only) and charges each file's delta through
+the same logic. A file with nothing measurable yet is **skipped** by the
+sweep (not billed the fallback); a genuine problem still takes it.
 
 *Unmeasured subagent fallback* (missing/unreadable/relative path, over the
-cap, empty, unpriced model, unverifiable session): never silently omitted;
-`subagent_unmeasured_charge_usd_cents` (else `turn_hold_usd_cents`) is
-charged **once per family** with `usage_known=false` and counted in
-`unmeasured_charges`. It counts toward already-charged, so a later
-measurement books only the excess. A transcript naming another session is
-refused (`transcript_session_mismatch`) and charges nothing, not even the
-fallback.
+cap, empty, unpriced, malformed, unverifiable session, or a **session
+mismatch**): never silently omitted; `subagent_unmeasured_charge_usd_cents`
+(else `turn_hold_usd_cents`) is charged **once per family** with
+`usage_known=false` and counted in `unmeasured_charges`. A mismatch also
+counts in `transcript_binding_mismatches` and is flagged `binding_mismatch`;
+the foreign spend is not imported. The fallback counts toward
+already-charged, so a later measurement books only the excess.
 
-**Retention interaction (S10).** Two S5 values are derived from ledger rows
-and `shared-budget prune` deletes whole closed pools: the lane watermark
-(settled holds) and a subagent family's already-charged sum (charge rows).
-After a pool is pruned, a later repeat of a `SubagentStop` whose earlier
-charges lived only in a pruned period would charge the full cumulative again
-(over-charge, current period), and a lane whose settled history was pruned
-falls back to its oldest remaining hold (records before it are not counted).
-Both need the prune of a period that a still-running session or a
-still-growing subagent file straddles, which `keep_months >= 1` makes an
-edge case; they are not otherwise guarded.
+**`SettleTail { session_id, transcript_path }`** (for `SessionEnd`, wired by
+S7). Charges the main-transcript records past the lane's watermark that no
+`Stop` counted (the final message of a session) as a settled `agent_absent`
+row (`charge_source = turn_hold`, `usage_known = true`) with the same
+binding, de-duplication and watermark; idempotent; nothing is charged when
+nothing is measurable (a tail has no hold to fall back to; the response
+flags `unmeasured`/`binding_mismatch`). `turn_hold` is reused for the source
+because the column's CHECK constraint cannot take a new value without a table
+rebuild; the row is distinguishable as a charge row (`is_charge = 1`) and by
+its `tail:` idempotency key.
 
-**Not done in S5:** no installer (S7), no `doctor`/status
-CLI (S8), no real host evidence, no gateway path (S11). `Finalize` itself
-returns nothing about the settlement; it is observable through `Status`.
+**Telemetry is volatile.** The `Status` counters (`unpriced_models`,
+`transcript_binding_mismatches`, `transcript_unverified`,
+`unmeasured_settlements`, `unmeasured_charges`, `id_less_records`) are daemon
+memory and reset on restart. The durable record is the ledger
+(`usage_known=false` rows) plus a structured log line for every flagged
+event (`lane=<8 hex of sha256(session)>`, reason; never a session id, agent
+id, path or content).
+
+**Known limits (tracked follow-ups, not implemented here).**
+
+- *Duplicate Finalize after the next Admit (M1).* `Finalize` carries no
+  idempotency key. Scenario: Stop #1 settles hold H1; the user prompts and
+  Admit creates H2; a duplicate of Stop #1 arrives and settles H2 early from
+  an empty window (the hold amount), booking a turn that has not happened.
+  Proposed mitigation: key the settlement by hold id / persist the
+  transcript high-water mark on the request so a replayed Stop that carries
+  no new records settles nothing.
+- *S10 prune re-charge (M3).* `shared-budget prune` deletes whole closed
+  pools, including the rows the watermark and the subagent already-charged
+  sum are read from. Scenario: a subagent file charged in a pruned month is
+  swept again in the current month and its full cumulative is charged again
+  (over-charge); a lane whose marks were pruned falls back to its oldest
+  remaining hold. Proposed mitigation: an `event_time` horizon clamp so a
+  charge older than the retained pools is dropped or booked to a fixed
+  archive row, and keeping watermark rows out of the prune.
+- Flush lag still costs a flat hold when an entire Stop window is not yet
+  flushed (it settles at the hold amount); the next Stop recovers the records
+  but the hold was already booked (an over-count).
+- The post-`/compact` transcript is unverified.
+
+**Not done in S5:** no installer or `SessionEnd` wiring (S7), no
+`doctor`/status CLI (S8), no gateway path (S11). `Finalize` itself returns
+nothing about the settlement; it is observable through `Status`, the ledger
+and the log.
 
 ### Egress inventory
 
