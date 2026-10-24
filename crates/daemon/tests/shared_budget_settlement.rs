@@ -943,9 +943,10 @@ fn the_stop_sweep_respects_its_byte_budget_and_skips_unchanged_files() {
         &s(&main),
         10,
     );
-    assert_eq!(n, 0);
+    // The first file is always processed, so progress is guaranteed.
+    assert_eq!((n.charged, n.deferred), (1, 1));
     let st = fx.status();
-    assert_eq!((st.used_usd_cents, st.sweep_deferred_files), (0, 2));
+    assert_eq!((st.used_usd_cents, st.sweep_deferred_files), (300, 1));
 
     // With room, both are charged...
     let n = libra_governor_daemon::shared_budget::sweep_with_budget(
@@ -955,7 +956,7 @@ fn the_stop_sweep_respects_its_byte_budget_and_skips_unchanged_files() {
         &s(&main),
         1 << 30,
     );
-    assert_eq!(n, 2);
+    assert_eq!(n.charged, 1, "only the file not yet swept is charged");
     assert_eq!(fx.status().used_usd_cents, 600);
 
     // ...and an unchanged file is skipped before the budget is even
@@ -967,8 +968,8 @@ fn the_stop_sweep_respects_its_byte_budget_and_skips_unchanged_files() {
         &s(&main),
         10,
     );
-    assert_eq!(n, 0);
-    assert_eq!(fx.status().sweep_deferred_files, 2);
+    assert_eq!((n.charged, n.deferred), (0, 0));
+    assert_eq!(fx.status().sweep_deferred_files, 1);
 }
 // ---------------------------------------------------------------------
 // Unpriced and unmeasurable windows settle conservatively
@@ -1936,4 +1937,258 @@ fn settle_tail_refuses_foreign_and_unmeasurable_transcripts_without_charging() {
         tail(&mut none, "s1", "/x.jsonl"),
         SharedBudgetOutcome::NotConfigured
     );
+}
+
+#[test]
+fn many_files_larger_than_the_budget_drain_over_successive_sweeps() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let sid = "s1";
+    let main = fx.path().join(format!("{sid}.jsonl"));
+    let dir = fx.path().join(sid).join("subagents");
+    std::fs::create_dir_all(&dir).unwrap();
+    write_lines(&main, &[rec(10, "m1", SONNET, mi(1), Some(sid), false)]);
+    for (i, agent) in ["a1", "a2", "a3"].iter().enumerate() {
+        write_lines(
+            &dir.join(format!("agent-{agent}.jsonl")),
+            &[sub_rec(12 + i as i64, &format!("x{i}"), mi(1), sid, agent)],
+        );
+    }
+    // Every file is larger than the 10-byte budget.
+    let mut deferred = Vec::new();
+    for _ in 0..4 {
+        let r = libra_governor_daemon::shared_budget::sweep_with_budget(
+            &mut fx.ledger,
+            &fx.config.shared_budget,
+            sid,
+            &s(&main),
+            10,
+        );
+        deferred.push((r.charged, r.deferred));
+    }
+    assert_eq!(deferred, vec![(1, 2), (1, 1), (1, 0), (0, 0)]);
+    assert_eq!(
+        fx.status().used_usd_cents,
+        900,
+        "all three drained, none starved"
+    );
+}
+
+#[test]
+fn a_file_the_read_cap_truncates_takes_the_fallback_once_in_a_sweep() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let sid = "s1";
+    let main = fx.path().join(format!("{sid}.jsonl"));
+    let dir = fx.path().join(sid).join("subagents");
+    std::fs::create_dir_all(&dir).unwrap();
+    write_lines(&main, &[rec(10, "m1", SONNET, mi(1), Some(sid), false)]);
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(dir.join("agent-big.jsonl")).unwrap();
+        let line = format!("{}\n", "x".repeat(1023));
+        for _ in 0..(33 * 1024) {
+            f.write_all(line.as_bytes()).unwrap();
+        }
+    }
+    let sweep = |fx: &mut Fx| {
+        libra_governor_daemon::shared_budget::sweep_with_budget(
+            &mut fx.ledger,
+            &fx.config.shared_budget,
+            sid,
+            &s(&main),
+            1 << 30,
+        )
+    };
+    assert_eq!(sweep(&mut fx).charged, 1, "not silently skipped");
+    let st = fx.status();
+    assert_eq!(st.unmeasured_charges, 1);
+    assert_eq!(st.used_usd_cents, 1_000);
+    assert_eq!(sweep(&mut fx).charged, 0, "and not charged again");
+    assert_eq!(fx.status().used_usd_cents, 1_000);
+}
+
+#[test]
+fn a_future_stamped_record_beside_in_bound_spend_books_the_priced_amount() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    fx.admit_hold("s1");
+    let tx = fx.path().join("s1.jsonl");
+    // 2 x 600 = 1200 priced in-bound (above the 1000 hold) + one ~2090 line.
+    write_lines(
+        &tx,
+        &[
+            rec(10, "m1", SONNET, mi(2), Some("s1"), false),
+            rec(20, "m2", SONNET, mi(2), Some("s1"), false),
+            rec(2_000_000_000, "future", SONNET, mi(7), Some("s1"), false),
+        ],
+    );
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    let st = fx.status();
+    assert_eq!(
+        totals(&st),
+        (1_200, 0),
+        "the measured in-bound spend, not the flat hold"
+    );
+    assert_eq!(st.unmeasured_settlements, 1, "flagged future_timestamp");
+    let mark = fx
+        .ledger
+        .shared_lane_watermark(
+            &principal(),
+            "s1",
+            None,
+            ExecutorKind::AgentAbsent,
+            OWNER_PREFIX,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        mark.at,
+        Some(at(20)),
+        "never beyond the newest in-bound record"
+    );
+    for id in ["m1", "m2", "future"] {
+        assert!(mark.message_ids.iter().any(|m| m == id), "{id} remembered");
+    }
+
+    // Nothing is recounted; a new record is counted alone.
+    fx.clock.set(at(100));
+    fx.admit_hold("s1");
+    append_lines(&tx, &[rec(110, "m3", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(150));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(totals(&fx.status()), (1_200 + 300, 0));
+}
+
+#[test]
+fn an_oversize_file_costs_the_sweep_no_more_than_one_read_can_scan() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let sid = "s1";
+    let main = fx.path().join(format!("{sid}.jsonl"));
+    let dir = fx.path().join(sid).join("subagents");
+    std::fs::create_dir_all(&dir).unwrap();
+    write_lines(&main, &[rec(10, "m1", SONNET, mi(1), Some(sid), false)]);
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(dir.join("agent-a-big.jsonl")).unwrap();
+        let line = format!("{}\n", "x".repeat(1023));
+        for _ in 0..(33 * 1024) {
+            f.write_all(line.as_bytes()).unwrap();
+        }
+    }
+    write_lines(
+        &dir.join("agent-b-small.jsonl"),
+        &[sub_rec(12, "s", mi(1), sid, "b-small")],
+    );
+    // Room for one full read (32 MiB) plus a little: the big file is charged
+    // at the read cap, not its 33 MiB length, so the small file still fits.
+    let budget = 32 * 1024 * 1024 + 4096;
+    let r = libra_governor_daemon::shared_budget::sweep_with_budget(
+        &mut fx.ledger,
+        &fx.config.shared_budget,
+        sid,
+        &s(&main),
+        budget,
+    );
+    assert_eq!((r.charged, r.deferred), (2, 0));
+}
+
+#[test]
+fn settle_tail_starts_after_the_latest_settlement_when_no_mark_was_ever_written() {
+    // Every earlier settlement was unmeasured (no session field), so the lane
+    // has no mark. The tail must not price the session's whole history.
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    fx.admit_hold("s1");
+    let unverifiable = fx.path().join("u.jsonl");
+    write_lines(&unverifiable, &[rec(10, "u1", SONNET, mi(1), None, false)]);
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&unverifiable)));
+    assert_eq!(totals(&fx.status()), (1_000, 0));
+
+    let tx = fx.path().join("s1.jsonl");
+    write_lines(
+        &tx,
+        &[
+            rec(10, "old1", SONNET, mi(5), Some("s1"), false),
+            rec(20, "old2", SONNET, mi(5), Some("s1"), false),
+            rec(70, "after", SONNET, mi(1), Some("s1"), false),
+        ],
+    );
+    fx.clock.set(at(100));
+    let o = tail(&mut fx, "s1", &s(&tx));
+    assert_eq!(
+        tail_charged(&o),
+        (300, false),
+        "only the record after the settlement"
+    );
+    assert_eq!(totals(&fx.status()), (1_300, 0));
+}
+
+#[test]
+fn settle_tail_with_a_poisoned_mark_falls_back_to_the_latest_settlement() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    fx.admit_hold("s1");
+    let tx = fx.path().join("s1.jsonl");
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    let id = fx.lane("s1")[0].id;
+    fx.ledger
+        .record_shared_watermark(
+            id,
+            &libra_governor_ledger::SettleWatermark {
+                at: Some(at(2_000_000_000)),
+                message_ids: vec![],
+            },
+        )
+        .unwrap();
+    append_lines(&tx, &[rec(70, "m2", SONNET, mi(2), Some("s1"), false)]);
+    fx.clock.set(at(100));
+    // The clamped (ignored) mark falls back to the settle time 60: m1 (ts 10,
+    // already booked) is not charged again.
+    assert_eq!(tail_charged(&tail(&mut fx, "s1", &s(&tx))), (600, false));
+}
+
+#[test]
+fn a_future_only_window_remembers_its_ids_without_a_timestamp_mark() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    fx.admit_hold("s1");
+    let tx = fx.path().join("s1.jsonl");
+    write_lines(
+        &tx,
+        &[rec(
+            2_000_000_000,
+            "future",
+            SONNET,
+            mi(3),
+            Some("s1"),
+            false,
+        )],
+    );
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(totals(&fx.status()), (1_000, 0));
+    let mark = fx
+        .ledger
+        .shared_lane_watermark(
+            &principal(),
+            "s1",
+            None,
+            ExecutorKind::AgentAbsent,
+            OWNER_PREFIX,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        mark.at, None,
+        "no in-bound record: the timestamp stays unset"
+    );
+    assert_eq!(mark.message_ids, vec!["future".to_string()]);
+
+    // The next window counts normal records and is not re-flagged.
+    fx.clock.set(at(100));
+    fx.admit_hold("s1");
+    append_lines(&tx, &[rec(110, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(150));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(totals(&fx.status()), (1_000 + 300, 0));
+    assert_eq!(fx.lane("s1")[1].usage_known, Some(true));
 }

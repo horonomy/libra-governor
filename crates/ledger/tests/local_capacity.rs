@@ -1368,9 +1368,11 @@ fn a_settled_hold_carries_a_watermark_and_the_lane_reads_back_the_newest() {
         )
         .unwrap();
     let got = lane(&store).unwrap();
+    assert_eq!(got.at, Some(at(90)));
     assert_eq!(
-        (got.at, got.message_ids),
-        (Some(at(90)), vec!["z".to_string()])
+        got.message_ids,
+        vec!["m1".to_string(), "m2".to_string(), "z".to_string()],
+        "ids are the union over trustworthy rows"
     );
     // Other lanes and sessions are untouched.
     assert_eq!(

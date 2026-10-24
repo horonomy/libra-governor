@@ -1079,17 +1079,20 @@ fn lane_window(
     session_id: &str,
     holds: &[SharedPoolReservation],
 ) -> Result<Option<(OffsetDateTime, Vec<String>)>, SharedBudgetError> {
-    if let Some(SettleWatermark {
-        at: Some(at),
-        message_ids,
-    }) = ledger.shared_lane_watermark(
+    let mark = ledger.shared_lane_watermark(
         &principal(),
         session_id,
         None,
         ExecutorKind::AgentAbsent,
         OWNER_POOL_PREFIX,
-    )? {
-        return Ok(Some((at, message_ids)));
+    )?;
+    // Ids are remembered even when no timestamp mark exists.
+    let ids = mark
+        .as_ref()
+        .map(|m| m.message_ids.clone())
+        .unwrap_or_default();
+    if let Some(at) = mark.as_ref().and_then(|m| m.at) {
+        return Ok(Some((at, ids)));
     }
     Ok(holds
         .iter()
@@ -1097,7 +1100,7 @@ fn lane_window(
         .filter_map(|h| h.settled_at)
         .max()
         .or_else(|| holds.iter().map(|h| h.created_at).min())
-        .map(|t| (t, Vec::new())))
+        .map(|t| (t, ids)))
 }
 
 fn merged_ids(previous: &[String], counted: &[String]) -> Vec<String> {
@@ -1243,11 +1246,16 @@ pub fn settle_turn(
                     // the hold, the mark advances at most to the newest
                     // in-bound own record, and the offending ids are
                     // remembered so they do not flag every later window.
+                    // The in-bound own records are still measured spend:
+                    // the window books max(priced, hold). Above the hold the
+                    // priced amount is recorded as measured; at or below it
+                    // the hold stands, unmeasured.
                     PricedObservation::FutureTimestamp {
+                        priced_cents,
                         newest_in_bound,
                         message_ids,
                     } => (
-                        None,
+                        priced_cents.filter(|c| *c > target.amount),
                         Some("future_timestamp"),
                         Some(SettleWatermark {
                             at: newest_in_bound.filter(|t| EVENT_YEARS.contains(&t.year())),
@@ -1476,7 +1484,14 @@ fn charge_transcript_inner(
                 },
             )
         }
-        PricedObservation::Unavailable(_) if sweep => return Ok(None),
+        // In a sweep, a file with nothing readable yet is skipped; a file the
+        // read cap truncates is NOT (it would be skipped on every sweep):
+        // it takes the flagged unmeasured fallback once.
+        PricedObservation::Unavailable(
+            UsageUnavailable::NoUsageInWindow
+            | UsageUnavailable::Unreadable
+            | UsageUnavailable::NoTranscriptPath,
+        ) if sweep => return Ok(None),
         PricedObservation::Unavailable(_) => (
             None,
             Flags {
@@ -1609,7 +1624,16 @@ pub fn sweep_subagent_transcripts(
     session_id: &str,
     transcript_path: &str,
 ) -> usize {
-    sweep_with_budget(ledger, rt, session_id, transcript_path, SWEEP_BYTE_BUDGET)
+    sweep_with_budget(ledger, rt, session_id, transcript_path, SWEEP_BYTE_BUDGET).charged
+}
+
+/// What one sweep did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SweepReport {
+    /// Files charged something.
+    pub charged: usize,
+    /// Files left for the next `Stop` because the byte budget was spent.
+    pub deferred: usize,
 }
 
 /// Bytes of subagent files one `Finalize` sweep may read in total. Files
@@ -1625,18 +1649,18 @@ pub fn sweep_with_budget(
     session_id: &str,
     transcript_path: &str,
     byte_budget: u64,
-) -> usize {
+) -> SweepReport {
     use std::os::unix::fs::MetadataExt;
 
     let Some(stem) = transcript_path.strip_suffix(".jsonl") else {
-        return 0;
+        return SweepReport::default();
     };
     if !std::path::Path::new(transcript_path).is_absolute() {
-        return 0;
+        return SweepReport::default();
     }
     let dir = std::path::Path::new(stem).join("subagents");
     let Ok(entries) = std::fs::read_dir(&dir) else {
-        return 0;
+        return SweepReport::default();
     };
     let mut files: Vec<(String, std::path::PathBuf)> = entries
         .filter_map(Result::ok)
@@ -1656,6 +1680,7 @@ pub fn sweep_with_budget(
     let mut charged = 0;
     let mut spent: u64 = 0;
     let mut deferred: u64 = 0;
+    let mut processed_any = false;
     for (agent, path) in files {
         let Some(path) = path.to_str() else { continue };
         let Ok(meta) = std::fs::metadata(path) else {
@@ -1675,11 +1700,17 @@ pub fn sweep_with_budget(
         if unchanged {
             continue;
         }
-        if spent.saturating_add(stamp.0) > byte_budget {
+        // A file is charged against the budget at no more than the most one
+        // read can scan, and the first file of every sweep is always
+        // processed: a file larger than the whole budget must not be
+        // deferred forever.
+        let cost = stamp.0.min(BUDGET_SCAN_CAP_BYTES);
+        if processed_any && spent.saturating_add(cost) > byte_budget {
             deferred += 1;
             continue;
         }
-        spent = spent.saturating_add(stamp.0);
+        processed_any = true;
+        spent = spent.saturating_add(cost);
         match charge_transcript_inner(ledger, rt, session_id, Some(&agent), path, true) {
             Ok(Some(SharedBudgetOutcome::TranscriptCharged {
                 amount_charged_usd_cents,
@@ -1698,7 +1729,10 @@ pub fn sweep_with_budget(
     if deferred > 0 {
         rt.note(|t| t.sweep_deferred_files += deferred);
     }
-    charged
+    SweepReport {
+        charged,
+        deferred: deferred as usize,
+    }
 }
 
 fn remember_swept(rt: &SharedBudgetRuntime, key: (String, String), stamp: (u64, i128)) {
@@ -1764,32 +1798,24 @@ pub fn settle_tail(
     // that was never admitted, or whose holds never settled, has no
     // watermark to continue from, and charging "everything past nothing"
     // would bill its whole transcript history.
-    let persisted = ledger.shared_lane_watermark(
-        &principal(),
-        session_id,
-        None,
-        ExecutorKind::AgentAbsent,
-        OWNER_POOL_PREFIX,
-    )?;
+    let has_mark = ledger
+        .shared_lane_watermark(
+            &principal(),
+            session_id,
+            None,
+            ExecutorKind::AgentAbsent,
+            OWNER_POOL_PREFIX,
+        )?
+        .is_some_and(|m| m.at.is_some());
     let has_settled_hold = holds.iter().any(|h| h.state == ReservationState::Settled);
-    if persisted.is_none() && !has_settled_hold {
+    if !has_mark && !has_settled_hold {
         return Ok(refused(SharedBudgetRefusal::NoSettledLane));
     }
-    // Lower bound: the lane's watermark, else the lane's earliest hold.
-    let (after, previous_ids) = match persisted {
-        Some(SettleWatermark {
-            at: Some(at),
-            message_ids,
-        }) => (at, message_ids),
-        _ => (
-            holds
-                .iter()
-                .map(|h| h.created_at)
-                .min()
-                .ok_or(SharedBudgetError::Internal("a settled lane has no hold"))?,
-            Vec::new(),
-        ),
-    };
+    // The same lower bound a Stop uses (the mark, else the latest settle
+    // time), never the lane's earliest hold: earlier unmeasured settlements
+    // were already booked at the hold amount.
+    let (after, previous_ids) = lane_window(ledger, session_id, &holds)?
+        .ok_or(SharedBudgetError::Internal("a settled lane has no hold"))?;
     let path = std::path::Path::new(transcript_path);
     if !path.is_absolute() {
         return Ok(posture(

@@ -267,7 +267,13 @@ pub enum PricedObservation {
     /// window cannot be trusted. `newest_in_bound` is the newest in-bound
     /// own record seen, and `message_ids` the ids to remember (in-bound and
     /// future) so the same lines do not poison every later window.
+    ///
+    /// `priced_cents` is the cost of the **in-bound own** records alone
+    /// (`None` when there are none, or one of them is unpriced): the caller
+    /// must not discard measured spend just because a future-stamped line
+    /// sits beside it.
     FutureTimestamp {
+        priced_cents: Option<u64>,
         newest_in_bound: Option<OffsetDateTime>,
         message_ids: Vec<String>,
     },
@@ -554,7 +560,14 @@ fn finish(mut acc: Accumulator, table: &PricingTable) -> PricedObservation {
         message_ids.append(&mut acc.future_ids);
         message_ids.sort_unstable();
         message_ids.dedup();
+        for (_, (tiers, model)) in acc.by_id.drain() {
+            acc.per_model.entry(model).or_default().add(tiers);
+        }
+        let priced_cents = (distinct_turns > 0)
+            .then(|| window_cost_cents(&acc.per_model, table).ok())
+            .flatten();
         return PricedObservation::FutureTimestamp {
+            priced_cents,
             newest_in_bound: acc.last_event_time,
             message_ids,
         };
@@ -1078,6 +1091,7 @@ mod tests {
             ),
         ]);
         let PricedObservation::FutureTimestamp {
+            priced_cents,
             newest_in_bound,
             message_ids,
         } = observe_priced(
@@ -1094,6 +1108,11 @@ mod tests {
         else {
             panic!("expected FutureTimestamp");
         };
+        assert_eq!(
+            priced_cents,
+            Some(300),
+            "the in-bound record is still priced"
+        );
         assert_eq!(newest_in_bound, Some(epoch_plus(10)));
         assert_eq!(message_ids, vec!["a".to_string(), "far".to_string()]);
         // Once its id is remembered, the same line no longer flags a window.

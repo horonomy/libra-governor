@@ -1347,7 +1347,8 @@ impl LedgerStore {
              WHERE principal_id = ?1 AND session_id = ?2 AND agent_id IS ?3
                AND COALESCE(executor_kind, 'unattributed') = ?4
                AND substr(pool_id, 1, length(?5)) = ?5
-               AND state = 'settled' AND watermark_ts IS NOT NULL",
+               AND state = 'settled'
+               AND (watermark_ts IS NOT NULL OR watermark_message_ids IS NOT NULL)",
         )?;
         let rows = stmt.query_map(
             rusqlite::params![
@@ -1359,36 +1360,49 @@ impl LedgerStore {
             ],
             |row| {
                 Ok((
-                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(0)?,
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<String>>(2)?,
                 ))
             },
         )?;
-        let mut best: Option<SettleWatermark> = None;
+        // `at` is the newest trustworthy mark. The ids are the union over
+        // every trustworthy row, including rows that carry ids but no
+        // timestamp (a window whose only offending line was future-stamped),
+        // so remembering an id never depends on having a timestamp.
+        let mut best: Option<OffsetDateTime> = None;
+        let mut ids: Vec<String> = Vec::new();
+        let mut any = false;
         for row in rows {
-            let (at, ids, settled_at) = row?;
-            let at = parse_time(&at)?;
+            let (at, row_ids, settled_at) = row?;
+            let at = at.as_deref().map(parse_time).transpose()?;
             // Defence in depth: a mark far ahead of the instant its row
             // settled can only come from a poisoned record (the writer
             // clamps, but an older build or a hand edit might not). Trusting
             // it would hide every later record, so it is ignored.
-            if let Some(settled) = settled_at.as_deref().map(parse_time).transpose()? {
+            if let (Some(at), Some(settled)) =
+                (at, settled_at.as_deref().map(parse_time).transpose()?)
+            {
                 if at > settled + WATERMARK_SLACK {
                     continue;
                 }
             }
-            if best.as_ref().is_none_or(|b| b.at.is_none_or(|t| at > t)) {
-                let message_ids = ids
-                    .and_then(|j| serde_json::from_str::<Vec<String>>(&j).ok())
-                    .unwrap_or_default();
-                best = Some(SettleWatermark {
-                    at: Some(at),
-                    message_ids,
-                });
+            any = true;
+            if let Some(at) = at {
+                best = Some(best.map_or(at, |b| b.max(at)));
+            }
+            if let Some(list) = row_ids.and_then(|j| serde_json::from_str::<Vec<String>>(&j).ok()) {
+                for id in list {
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
             }
         }
-        Ok(best)
+        Ok(any.then_some(SettleWatermark {
+            at: best,
+            message_ids: ids,
+        }))
     }
 
     /// Records a watermark on an already-written settled row (the tail
