@@ -82,6 +82,10 @@ pub use write::DOGFOOD_PROFILE_ENV_VAR;
 pub enum LedgerError {
     #[error("transaction state unconfirmed; retry durable replay lookup")]
     TransactionUnconfirmed,
+    /// A read-only open found a schema version other than this build's
+    /// latest; a read-only handle cannot migrate it.
+    #[error("ledger schema version {found} is not the expected {expected}; open it with the daemon or a writing command first")]
+    SchemaNotCurrent { found: i64, expected: i64 },
     #[error("inconsistent execution association")]
     InvalidExecutionAssociation,
     #[error("sqlite error: {0}")]

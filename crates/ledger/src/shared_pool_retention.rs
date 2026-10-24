@@ -18,6 +18,10 @@
 //!   pruning, so a pool is never deleted out from under accounting that has
 //!   not reached a terminal state.
 //!
+//! A dry run and an export need no write access: callers can serve them
+//! from [`LedgerStore::open_read_only`], which neither migrates nor
+//! checkpoints.
+//!
 //! One transaction per pool keeps every write short, so a prune running
 //! next to a daemon contends only for the SQLite write lock (bounded by the
 //! connection's `busy_timeout`), never for a long hold. The report carries

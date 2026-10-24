@@ -570,3 +570,64 @@ fn export_of_a_missing_pool_is_none() {
         .unwrap()
         .is_none());
 }
+
+#[test]
+fn read_only_open_serves_dry_run_and_export_and_cannot_mutate() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite3");
+    let mut writer = LedgerStore::open(&path).unwrap();
+    seed_closed(&mut writer, "monthly-2026-01");
+    drop(writer);
+    let before = std::fs::read(&path).unwrap();
+
+    let mut ro = LedgerStore::open_read_only(&path).unwrap();
+    let dry = ro
+        .prune_closed_periods(PruneRequest {
+            keep_months: 1,
+            now: now(),
+            time_zone: &utc(),
+            dry_run: true,
+        })
+        .unwrap();
+    assert_eq!(dry.pools_selected, 1);
+    assert_eq!(dry.rows_selected, 3);
+    assert!(ro
+        .shared_pool_export(&pool("monthly-2026-01"))
+        .unwrap()
+        .is_some());
+    // The apply path cannot write through a read-only handle.
+    assert!(ro
+        .prune_closed_periods(PruneRequest {
+            keep_months: 1,
+            now: now(),
+            time_zone: &utc(),
+            dry_run: false,
+        })
+        .is_err());
+    drop(ro);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "main db file untouched"
+    );
+    assert_eq!(
+        row_count(&LedgerStore::open(&path).unwrap(), &pool("monthly-2026-01")),
+        3
+    );
+}
+
+#[test]
+fn read_only_open_refuses_a_schema_that_is_not_current() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite3");
+    drop(LedgerStore::open(&path).unwrap());
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("DELETE FROM schema_migrations WHERE version = (SELECT MAX(version) FROM schema_migrations)", [])
+        .unwrap();
+    drop(conn);
+    let err = LedgerStore::open_read_only(&path).err().unwrap();
+    assert!(matches!(
+        err,
+        libra_governor_ledger::LedgerError::SchemaNotCurrent { .. }
+    ));
+}
