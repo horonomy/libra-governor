@@ -26,6 +26,7 @@ pub mod normalize;
 pub mod payload;
 pub mod render;
 pub mod run;
+pub mod settlement;
 
 /// Which governed coding agent host is calling into this shared layer.
 /// Re-exported from `libra_governor_domain` so the capability matrix

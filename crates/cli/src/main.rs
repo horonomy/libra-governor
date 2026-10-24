@@ -23,6 +23,10 @@
 //!   point: fire-and-forget tool-call counting (HORO-1126).
 //! - `hook stop` — the Claude Code `Stop` hook entry point: finalizes
 //!   the session's task into an Execution Receipt (HORO-1126).
+//! - `hook subagent-stop` / `hook session-end` — the Claude Code
+//!   `SubagentStop` / `SessionEnd` hook entry points: charge a subagent's
+//!   transcript and settle a session's tail against the local shared budget
+//!   (HORO-2216). Silent no-ops unless `shared-budget.json` exists.
 //! - `codex-hook user-prompt-submit` / `post-tool-use` / `stop` — the
 //!   same three hook entry points for the Codex CLI (HORO-1157), sharing
 //!   every byte of translation logic with Claude Code's via
@@ -135,7 +139,9 @@ mod gateway_cmd;
 mod hook;
 mod hook_post_tool_use;
 mod hook_pre_tool_use;
+mod hook_session_end;
 mod hook_stop;
+mod hook_subagent_stop;
 mod install_cmd;
 mod launch_cmd;
 mod metered_pool_cmd;
@@ -160,6 +166,8 @@ Usage:
   libra-governor hook pre-tool-use
   libra-governor hook post-tool-use
   libra-governor hook stop
+  libra-governor hook subagent-stop
+  libra-governor hook session-end
   libra-governor codex-hook user-prompt-submit
   libra-governor codex-hook post-tool-use
   libra-governor codex-hook stop
@@ -246,6 +254,8 @@ fn main() {
         ["hook", "pre-tool-use"] => hook_pre_tool_use::run(),
         ["hook", "post-tool-use"] => hook_post_tool_use::run(),
         ["hook", "stop"] => hook_stop::run(),
+        ["hook", "subagent-stop"] => hook_subagent_stop::run(),
+        ["hook", "session-end"] => hook_session_end::run(),
         ["codex-hook", "user-prompt-submit"] => codex_hook::run_prompt_submit(),
         ["codex-hook", "post-tool-use"] => codex_hook::run_tool_completed(),
         ["codex-hook", "stop"] => codex_hook::run_turn_completed(),
