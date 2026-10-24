@@ -25,6 +25,7 @@ disagree, trust the command.
 | Preflight gate (`UserPromptSubmit`) | Available | Available |
 | Tool observation (`PostToolUse`) | Available | Available |
 | Tool gate (hard pre-call refusal) | Unavailable — MVP 1.0 hooks are advisory; the gateway is the only hard-enforcement point (ADR 0003) | Unavailable — same reason |
+| Shared budget admission gate (`UserPromptSubmit` block, `PreToolUse` deny; ADR-0026) | Available — cooperative, admission-bounded, Libra-accounted USD; only acts when `shared-budget.json` exists | **Unavailable** — not wired by Libra: the Codex hook route never asks the daemon to admit a prompt and has no budget gate |
 | Completion receipt (`Stop`) | Available | Available |
 | Model event observation (token/cost/provider per request) | Unavailable — no hook payload exposes this | Unavailable — same |
 | Model gateway | Available | **Unavailable — incompatible wire format** (`responses` vs. `messages`) |
@@ -45,9 +46,13 @@ is a pure function of agent identity, never a runtime probe.
 
 ## Non-goals shared by both integrations
 
-- No hard tool-call gating from hooks — the gateway is the only
-  pre-spend enforcement point (ADR 0003), and only Claude Code's gateway
-  path is even wire-compatible today.
+- No general hard tool-call gating from hooks — the gateway is the only
+  hard pre-spend enforcement point (ADR 0003), and only Claude Code's
+  gateway path is even wire-compatible today. The one hook-level
+  exception is the local shared budget (ADR-0026, Claude Code only):
+  `UserPromptSubmit` may block and `PreToolUse` may deny, solely on
+  budget state, and the guarantee is cooperative and admission-bounded,
+  never a hard cap.
 - No MCP-based enforcement — `ARCHITECTURE.md` forbids MCP as a security
   or enforcement boundary for any agent.
 - No daemon/protocol/ledger wiring for session or subagent lifecycle
