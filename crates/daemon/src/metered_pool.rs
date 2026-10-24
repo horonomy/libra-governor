@@ -122,8 +122,10 @@ pub fn handle_reserve(
             idempotency_key: &scoped_key,
             now,
             ttl_secs: DEFAULT_METERED_HOLD_TTL_SECS,
+            attribution: Default::default(),
         },
         session_cap: args.session_cap,
+        capacity_source: Default::default(),
     });
 
     let outcome = match outcome {

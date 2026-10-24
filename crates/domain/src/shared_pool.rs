@@ -132,6 +132,82 @@ pub struct SharedPoolReservation {
     pub settled_at: Option<OffsetDateTime>,
     pub released_at: Option<OffsetDateTime>,
     pub schema_version: String,
+    /// The sub-executor within `session_id` this row is attributed to
+    /// (HORO-2194). `None` never means "root lineage": together with
+    /// [`Self::executor_kind`] it distinguishes the session's main
+    /// executor (`AgentAbsent`) from a row whose agent is simply unknown
+    /// (`Unattributed`). Legacy rows written before migration 0021 carry
+    /// `None` here and `None` in `executor_kind`.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// `None` only for rows predating attribution; read as
+    /// [`ExecutorKind::Unattributed`] by usage queries.
+    #[serde(default)]
+    pub executor_kind: Option<ExecutorKind>,
+    /// How the spend reached the ledger, when known.
+    #[serde(default)]
+    pub charge_source: Option<ChargeSource>,
+}
+
+/// Which executor within a session a shared-pool row is attributed to
+/// (HORO-2194). The executor key is `(session_id, agent_id | NULL)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutorKind {
+    /// The session's main executor: no `agent_id` was supplied. Never
+    /// conflated with a subagent and never rewritten to a `root` lineage.
+    AgentAbsent,
+    /// A specific agent within the session; `agent_id` is `Some`.
+    Agent,
+    /// The session is known but the agent is not.
+    Unattributed,
+}
+
+impl ExecutorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AgentAbsent => "agent_absent",
+            Self::Agent => "agent",
+            Self::Unattributed => "unattributed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "agent_absent" => Some(Self::AgentAbsent),
+            "agent" => Some(Self::Agent),
+            "unattributed" => Some(Self::Unattributed),
+            _ => None,
+        }
+    }
+}
+
+/// How a shared-pool row's spend reached the ledger (HORO-2194).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChargeSource {
+    TurnHold,
+    SubagentTranscript,
+    Gateway,
+}
+
+impl ChargeSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TurnHold => "turn_hold",
+            Self::SubagentTranscript => "subagent_transcript",
+            Self::Gateway => "gateway",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "turn_hold" => Some(Self::TurnHold),
+            "subagent_transcript" => Some(Self::SubagentTranscript),
+            "gateway" => Some(Self::Gateway),
+            _ => None,
+        }
+    }
 }
 
 impl SharedPoolReservation {
@@ -209,6 +285,19 @@ impl PoolAdmission {
     /// `u64::MAX` can never wrap into a false `true`.
     pub fn admits(&self, requested: u64) -> bool {
         (requested as i128) <= (self.remaining() as i128)
+    }
+
+    /// How far committed spend (settled + active + external overhang)
+    /// exceeds `capacity`, i.e. `-remaining()` when negative, else 0
+    /// (HORO-2194). The same figure [`Self::remaining`] already exposes as
+    /// a negative number, named so a status report need not re-derive it.
+    pub fn overrun(&self) -> u64 {
+        let remaining = self.remaining() as i128;
+        if remaining < 0 {
+            (-remaining) as u64
+        } else {
+            0
+        }
     }
 }
 
@@ -403,7 +492,29 @@ mod tests {
             settled_at: None,
             released_at: None,
             schema_version: SHARED_POOL_RESERVATION_SCHEMA_VERSION.to_string(),
+            agent_id: None,
+            executor_kind: None,
+            charge_source: None,
         }
+    }
+
+    #[test]
+    fn executor_kind_and_charge_source_round_trip_their_column_spellings() {
+        for k in [
+            ExecutorKind::AgentAbsent,
+            ExecutorKind::Agent,
+            ExecutorKind::Unattributed,
+        ] {
+            assert_eq!(ExecutorKind::parse(k.as_str()), Some(k));
+        }
+        for c in [
+            ChargeSource::TurnHold,
+            ChargeSource::SubagentTranscript,
+            ChargeSource::Gateway,
+        ] {
+            assert_eq!(ChargeSource::parse(c.as_str()), Some(c));
+        }
+        assert_eq!(ExecutorKind::parse("root"), None);
     }
 
     #[test]

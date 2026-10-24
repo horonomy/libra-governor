@@ -191,6 +191,7 @@ pub fn handle_admit(
         idempotency_key: &idempotency_key,
         now,
         ttl_secs: launcher.hold_ttl_secs,
+        attribution: Default::default(),
     })?;
 
     Ok(match reserve_outcome {

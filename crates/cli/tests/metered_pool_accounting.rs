@@ -618,8 +618,10 @@ fn ledger_race_worker_entrypoint() {
                     idempotency_key: &key,
                     now: OffsetDateTime::now_utc(),
                     ttl_secs: 3600,
+                    attribution: Default::default(),
                 },
                 session_cap: None,
+                capacity_source: Default::default(),
             })
             .unwrap();
         let tag = match outcome {
