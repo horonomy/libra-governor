@@ -33,8 +33,10 @@ fn no_production_call_site_provisions_or_feeds_a_metered_pool() {
     // Every `ensure_pool(`/`ingest_pool_provider_snapshot(` call site
     // under `crates/daemon/src` or `crates/cli/src` must be the launch
     // gate's own `ensure_pool` call (the one pre-existing, unrelated
-    // production caller) — never anything metered-pool-shaped, and never
-    // any `ingest_pool_provider_snapshot` call at all.
+    // production caller) or the local shared budget's single pool-creation
+    // helper (founder decision D1, ADR-0026; see the exactly-once test
+    // below) — never anything else metered-pool-shaped, and never any
+    // `ingest_pool_provider_snapshot` call at all.
     let daemon_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let cli_src = daemon_src
         .parent()
@@ -80,7 +82,9 @@ fn no_production_call_site_provisions_or_feeds_a_metered_pool() {
             );
         }
         for (i, line) in production_slice.lines().enumerate() {
-            if line.contains("ensure_pool(") && !file.ends_with("launch_gate.rs") {
+            let allowlisted =
+                file.ends_with("launch_gate.rs") || file.ends_with("shared_budget.rs");
+            if line.contains("ensure_pool(") && !allowlisted {
                 panic!(
                     "{file:?}:{}: unexpected production ensure_pool call site outside \
                      launch_gate.rs — this is the exact production-feed wiring the founder \
@@ -88,6 +92,47 @@ fn no_production_call_site_provisions_or_feeds_a_metered_pool() {
                     i + 1
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn the_local_shared_budget_has_exactly_one_pool_creation_call_site() {
+    // Founder decision D1 / ADR-0026 authorises the locally configured
+    // monthly cap to provision its own pool. That authority is one helper,
+    // not a pattern: a second call site anywhere in the file must be a
+    // reviewed decision, so this pins the count.
+    let content = read_src("src/shared_budget.rs");
+    let production_slice = match content.find("mod tests") {
+        Some(idx) => &content[..idx],
+        None => &content[..],
+    };
+    assert_eq!(
+        production_slice.matches("ensure_pool(").count(),
+        1,
+        "src/shared_budget.rs must contain exactly one pool-creation call"
+    );
+    assert!(
+        production_slice.contains("fn ensure_period_pool"),
+        "the single call site must stay inside the named helper"
+    );
+}
+
+#[test]
+fn the_local_shared_budget_never_reads_quota_observation_or_a_provider_snapshot() {
+    for path in ["src/shared_budget.rs", "src/shared_budget_file.rs"] {
+        let content = read_src(path);
+        for banned in [
+            "quota_observation",
+            "quota-observation",
+            "quota_source",
+            "quota-source",
+            "ingest_pool_provider_snapshot",
+        ] {
+            assert!(
+                !content.contains(banned),
+                "{path} must never reference {banned}"
+            );
         }
     }
 }

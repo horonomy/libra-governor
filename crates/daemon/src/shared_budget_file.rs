@@ -113,9 +113,11 @@ fn parse_inner(bytes: &[u8]) -> Result<SharedBudgetConfig, String> {
     let raw: RawFile = serde_json::from_slice(bytes).map_err(|e| format!("invalid JSON: {e}"))?;
     match raw.schema_version {
         Some(SHARED_BUDGET_SCHEMA_VERSION) => {}
-        Some(other) => return Err(format!(
+        Some(other) => {
+            return Err(format!(
             "unsupported schema_version {other} (this daemon reads {SHARED_BUDGET_SCHEMA_VERSION})"
-        )),
+        ))
+        }
         None => return Err("schema_version is required".to_string()),
     }
     let cap = positive(
