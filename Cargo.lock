@@ -707,6 +707,7 @@ dependencies = [
  "libra-governor-protocol",
  "libra-governor-quota-observation",
  "libra-governor-quota-source",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_json",

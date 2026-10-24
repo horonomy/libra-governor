@@ -627,17 +627,52 @@ refuse every metered request rather than mis-attribute one. This is the
 one part of the setup above that a real end-to-end smoke test is needed
 to confirm.
 
+## Local monthly shared budget (HORO-2215, ADR-0026) — cooperative gate
+
+If `<state_dir>/shared-budget.json` exists, the hooks consult the daemon's
+local monthly shared budget. If it does not exist, **nothing changes**: the
+hooks make no extra connection and print byte-for-byte what they printed
+before this feature (pinned by `crates/cli/tests/shared_budget_hooks.rs`).
+The hooks hold no policy; every decision is the daemon's. Codex has no
+budget gate (its hook route is unchanged).
+
+| Hook | Budget file | Outcome |
+|---|---|---|
+| `UserPromptSubmit` | absent | unchanged |
+| `UserPromptSubmit` | present, daemon allows / `not_configured` | unchanged Preflight output; over a soft limit, one short warning line is appended to `additionalContext` (never blocks) |
+| `UserPromptSubmit` | present, `cap_exhausted` / `config_invalid` / `clock_anomaly` / refused identity | `{"decision":"block","reason":"..."}`, exit 0, Preflight is **not** called |
+| `UserPromptSubmit` | present, daemon unreachable (after the existing autospawn attempt, or immediately with `LIBRA_GOVERNOR_NO_AUTOSPAWN=1`) or no answer within the client timeout | block: `budget enforcement unavailable: daemon unreachable` |
+| `PreToolUse` (`hook pre-tool-use`, matcher `*`) | absent | empty output, the daemon is not contacted |
+| `PreToolUse` | present, budget exhausted / `config_invalid` / `clock_anomaly` | `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"..."}}`, exit 0 |
+| `PreToolUse` | present, anything else (available, admitted, `not_configured`, daemon down, error, no answer in 500 ms) | empty output = allow (fail open); never spawns a daemon |
+
+What the label means: amounts are **Libra-accounted USD** at the pinned
+price table, never the provider's bill or a plan quota. The guarantee is
+**admission-bounded (cooperative)**: a prompt is refused before spend, but
+in-turn spend is only visible afterwards, so spend can overshoot the hold,
+and anything that edits `shared-budget.json` as the same OS user can change
+the cap. A per-request hard cap exists only with the gateway (ADR-0003).
+Every reason text says "Libra-accounted USD, admission-bounded".
+
+Not delivered by this slice: installing the `PreToolUse` hook entry
+(installer, S7), settlement of spend at `Stop` and `SubagentStop` (S5/S7),
+and `status`/`doctor` reporting (S8). No real Claude Code host has run
+this yet.
+
 ## What this integration intentionally does not do (yet)
 
 - No automated Completion Contract verification — `hook stop` always
   records `ExecutionOutcome::Unknown`. MVP 1.0 has no test-running
   integration; a task is never inferred "done" merely because the model
   stopped talking. Future scope.
-- No hard budget enforcement *through the hooks* — the hook path is
-  advisory only, on every hook including `Stop` (no `{"decision":
-  "block", ...}` is ever emitted). Hard enforcement, where it is wanted,
-  is the optional gateway documented above (HORO-1144), not a blocking
-  hook decision.
+- No hard budget enforcement *through the hooks*. The hooks are
+  advisory, with one precisely-scoped exception: the local monthly shared
+  budget (see the next section). Only when `<state_dir>/shared-budget.json`
+  exists may `UserPromptSubmit` emit `{"decision": "block", ...}` and
+  `PreToolUse` emit a `deny`, and only for budget decisions. `PostToolUse`
+  and `Stop` never block, and no hook ever blocks for any other reason.
+  A hard per-request cap, where wanted, is the optional gateway documented
+  above (HORO-1144).
 - No task classification — the estimator's class-bucketed-history tier
   is implemented and unit-tested in `libra-governor-estimator`, but no
   caller supplies a class yet (nothing in the schema classifies tasks).

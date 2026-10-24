@@ -312,11 +312,40 @@ The full pathway table, what is enforced and what is not, is in
 [`docs/egress-inventory.md`](../egress-inventory.md); a static test
 (`crates/cli/tests/egress_static_guard.rs`) enforces the crate boundary.
 
-### Retention and export (design intent; implemented in slices S4-S8)
+### Retention and export (prune and local export implemented in S10; upload not built)
 
 Foundation only: prune closed rows of **ended** periods, with an audit count,
 and a **local-only** export with no upload. Monthly automated remote upload is
 a **separate, versioned workstream and is not delivered** by this ADR.
+
+**Implementation status (S10, HORO-2219).** Implemented:
+`libra-governor shared-budget prune` and `shared-budget export`.
+
+- `prune` is a dry run (deletes nothing) unless `--apply` is given and
+  requires `--keep-months >= 1`. `--time-zone` defaults to the zone in
+  `<state-dir>/shared-budget.json`, must equal it when both are given, and
+  is required when there is no valid file. It deletes closed rows of
+  `local-budget` `monthly-YYYY-MM` pools whose period ended before the last
+  N closed months, one `BEGIN IMMEDIATE` transaction per pool. It never
+  touches the current or a future period, a pool with any `active` row, or
+  an unrecognised alias, and it reports counts only. A dry run and `export`
+  open the ledger read-only (no migration, no WAL checkpoint) and refuse a
+  schema that is not current.
+- **Export before prune.** Pruned periods can no longer be exported, and a
+  pruned period also drops its idempotency-key memory: replaying a charge
+  older than the retention window is treated as new (a backdated charge
+  whose event time falls in a pruned period would recreate the pool and
+  book again). Follow-up, not done here: the daemon should refuse or clamp
+  an `event_time` older than the retention horizon.
+- `export --period YYYY-MM` writes a local `0600` file (schema
+  `libra.shared-budget-export.v1`, per-executor aggregates plus pool
+  totals, SHA-256 over the canonical body, no content). Session and agent
+  ids are **pseudonymised** by default (32-bit unsalted digest; guessable
+  for low-entropy ids; linkable across exports); this is not anonymisation
+  and a redacted export is not safe to publish. `--raw-ids` opts out.
+
+Upload is **not built**: no transport, retry, resume or de-duplicated
+delivery exists; that remains the separate, versioned workstream above.
 
 ## Consequences
 

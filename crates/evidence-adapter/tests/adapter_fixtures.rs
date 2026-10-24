@@ -276,7 +276,26 @@ fn dropped_count_zero_is_provable_no_eviction_path_exists_in_ledger() {
             let Ok(contents) = std::fs::read_to_string(&entry) else {
                 continue;
             };
-            if contents.contains("DELETE FROM") || contents.contains("DROP TABLE") {
+            let normalised = normalise_sql_text(&contents);
+            let targets = delete_targets(&normalised);
+            let drops = normalised.contains("drop table");
+            if entry.file_name().and_then(|n| n.to_str()) == Some("shared_pool_retention.rs") {
+                // HORO-2219: the one deliberate, operator-initiated delete
+                // path (`shared-budget prune --apply`). It is scoped to the
+                // shared-pool tables, which feed no DogFood evidence event,
+                // so it cannot make `dropped_count` untrue. Pinned to those
+                // tables so any other target still fails this guard.
+                assert!(!targets.is_empty(), "stale retention exemption");
+                if drops
+                    || targets
+                        .iter()
+                        .any(|t| !RETENTION_DELETE_TARGETS.contains(&t.as_str()))
+                {
+                    offending.push(entry);
+                }
+                continue;
+            }
+            if !targets.is_empty() || drops {
                 offending.push(entry);
             }
         }
@@ -295,6 +314,54 @@ fn dropped_count_zero_is_provable_no_eviction_path_exists_in_ledger() {
         libra_governor_evidence_adapter::build_events(&store, &config, "0.0.2", "0.0.2").unwrap();
     let summary = summarize(&events);
     assert_eq!(summary.dropped_total, 0);
+}
+
+/// The only tables the retention prune may delete from (HORO-2219).
+const RETENTION_DELETE_TARGETS: [&str; 3] = [
+    "shared_pool_reservations",
+    "shared_pool_provider_snapshots",
+    "quota_pools",
+];
+
+/// Lower-cases and collapses every whitespace run (including newlines) to a
+/// single space, so `DELETE\n  FROM` and `delete  from` match like
+/// `DELETE FROM`.
+fn normalise_sql_text(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// The first word after each `delete from` in already-normalised text.
+fn delete_targets(normalised: &str) -> Vec<String> {
+    normalised
+        .split("delete from ")
+        .skip(1)
+        .map(|rest| {
+            rest.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn eviction_scan_normalises_case_and_whitespace() {
+    for sample in [
+        "delete  from foo",
+        "DELETE\nFROM foo",
+        "Delete\tFrom\n  foo WHERE x",
+    ] {
+        assert_eq!(
+            delete_targets(&normalise_sql_text(sample)),
+            ["foo"],
+            "{sample:?}"
+        );
+    }
+    assert!(normalise_sql_text("DROP\n TABLE x").contains("drop table"));
+    assert!(delete_targets(&normalise_sql_text("select 1")).is_empty());
 }
 
 fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {

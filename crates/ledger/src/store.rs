@@ -81,6 +81,35 @@ impl LedgerStore {
         Ok(Self { conn })
     }
 
+    /// Opens the existing database at `path` read-only (`SQLITE_OPEN_READ_ONLY`):
+    /// no journal-mode change, no migrations, no permission hardening, no
+    /// WAL checkpoint on close. Refuses a database whose applied schema
+    /// version is not exactly this build's latest, so a caller never reads
+    /// tables an older or newer schema may shape differently. Mutating
+    /// calls on the returned store fail at the SQLite layer.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
+        let conn = Connection::open_with_flags(
+            path.as_ref(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.pragma_update(None, "busy_timeout", 5000i64)?;
+        conn.pragma_update(None, "foreign_keys", true)?;
+        let store = Self { conn };
+        let found = store
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0);
+        let expected = migrations::latest_known_version();
+        if found != expected {
+            return Err(LedgerError::SchemaNotCurrent { found, expected });
+        }
+        Ok(store)
+    }
+
     /// Opens an in-memory database (tests / ephemeral usage only — data
     /// does not survive process exit).
     pub fn open_in_memory() -> Result<Self, LedgerError> {

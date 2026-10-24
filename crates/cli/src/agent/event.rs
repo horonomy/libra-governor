@@ -23,6 +23,16 @@ pub enum NormalizedEvent {
         turn_id: Option<String>,
         /// Optional in subagent contexts for both documented hosts.
         agent_id: Option<String>,
+        /// Host prompt identifier when supplied (shared-budget `Admit`
+        /// idempotency); absent otherwise.
+        prompt_id: Option<String>,
+    },
+    /// `PreToolUse` (HORO-2215): a tool call is about to run. Carries only
+    /// the identity the shared-budget check needs.
+    ToolRequested {
+        session_id: String,
+        /// Present only inside a subagent; never invented.
+        agent_id: Option<String>,
     },
     /// `PostToolUse`.
     ToolCompleted {
