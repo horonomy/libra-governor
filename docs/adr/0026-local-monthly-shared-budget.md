@@ -148,6 +148,10 @@ Only `crates/gateway` (upstream allowlist, default `api.anthropic.com`) and
 telemetry and WebFetch are Claude Code's own traffic: `doctor` reports them,
 Libra does not enforce on them.
 
+The full pathway table, what is enforced and what is not, is in
+[`docs/egress-inventory.md`](../egress-inventory.md); a static test
+(`crates/cli/tests/egress_static_guard.rs`) enforces the crate boundary.
+
 ### Retention and export (design intent; implemented in slices S4-S8)
 
 Foundation only: prune closed rows of **ended** periods, with an audit count,
