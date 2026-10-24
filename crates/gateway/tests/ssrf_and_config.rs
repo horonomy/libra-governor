@@ -268,3 +268,89 @@ fn the_configured_upstream_is_the_only_destination_any_request_reaches() {
     assert_eq!(received[0].path, "/v1/messages");
     assert!(received[0].header("x-forwarded-host").is_none());
 }
+
+/// HORO-2218 egress audit: the destination rule holds against host
+/// lookalikes and URL-parsing confusion, not just the obvious
+/// `evil.example.com` case. With the default allowlist (only
+/// `api.anthropic.com`), nothing else may become the upstream.
+#[test]
+fn host_lookalikes_and_url_confusion_never_become_the_upstream() {
+    for upstream in [
+        "https://api.anthropic.com.evil.example.com",
+        "https://evilapi.anthropic.com",
+        "https://api.anthropic.com.",
+        "https://api-anthropic.com",
+        "https://evil.example.com@api.anthropic.com",
+        "https://api.anthropic.com@evil.example.com",
+        "https://api.anthropic.com:443@evil.example.com",
+        "https://evil.example.com#@api.anthropic.com",
+        "https://evil.example.com?@api.anthropic.com",
+        "https://[::1]",
+        "https://127.0.0.1",
+        "https://localhost",
+        "ws://api.anthropic.com",
+        "ftp://api.anthropic.com",
+        "//api.anthropic.com",
+        "api.anthropic.com",
+    ] {
+        assert!(
+            validate(config_for(upstream), ResourceKind::Tokens).is_err(),
+            "{upstream} must not produce a running gateway"
+        );
+    }
+}
+
+/// The plaintext opt-in is a loopback-literal opt-in only: a flagged,
+/// allowlisted non-loopback address of any spelling is still refused, and
+/// a loopback host that is not allowlisted is refused too.
+#[test]
+fn plaintext_upstream_is_refused_for_every_non_loopback_address_even_when_flagged_and_allowlisted()
+{
+    for host in [
+        "10.0.0.5",
+        "169.254.169.254",
+        "0.0.0.0",
+        "8.8.8.8",
+        "[::ffff:8.8.8.8]",
+        "[2001:db8::1]",
+        "[fe80::1]",
+        "example.com",
+    ] {
+        let mut config = config_for(&format!("http://{host}"));
+        config.allow_plaintext_loopback_upstream = true;
+        config.upstream_host_allowlist = vec![host.trim_matches(['[', ']']).to_string()];
+        assert!(
+            validate(config, ResourceKind::Tokens).is_err(),
+            "http://{host} must be refused even when flagged and allowlisted"
+        );
+    }
+
+    // Loopback but not allowlisted: the allowlist still binds.
+    let mut config = config_for("http://127.0.0.1:9");
+    config.allow_plaintext_loopback_upstream = true;
+    assert!(matches!(
+        validate(config, ResourceKind::Tokens).unwrap_err(),
+        ConfigError::UpstreamHostNotAllowed { .. }
+    ));
+
+    // Without the flag, even an allowlisted loopback http upstream is refused.
+    let mut config = config_for("http://127.0.0.1:9");
+    config.upstream_host_allowlist = vec!["127.0.0.1".to_string()];
+    assert!(matches!(
+        validate(config, ResourceKind::Tokens).unwrap_err(),
+        ConfigError::UpstreamSchemeNotHttps { .. }
+    ));
+}
+
+/// Positive control so the refusals above are not vacuous: the one
+/// default destination validates.
+#[test]
+fn the_default_allowlisted_https_upstream_validates() {
+    let validated = validate(
+        config_for("https://api.anthropic.com"),
+        ResourceKind::Tokens,
+    )
+    .expect("default upstream is allowed");
+    assert_eq!(validated.upstream_origin(), "https://api.anthropic.com");
+    assert_eq!(validated.upstream_scheme, "https");
+}
