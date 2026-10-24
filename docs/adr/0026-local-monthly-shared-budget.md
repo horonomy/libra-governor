@@ -9,11 +9,17 @@ Builds on [ADR-0023](0023-metered-shared-pool.md) and amends
 [ADR-0003](0003-gateway-enforcement-boundary.md) for the local budget only.
 Slice S2 delivers this record and `calendar_month_bounds`; later slices wire it.
 
-**Implementation status.** Only `calendar_month_bounds`, `LOCAL_BUDGET_OWNER`
-and `monthly_pool_alias` exist today. Everything else below is **design
-intent, implemented in slices S4-S8** (S4 daemon core, S5 settlement, S6
-hooks, S8 doctor/status) and S11 (gateway `governor_held`); it must not be
-read as shipped behaviour.
+**Implementation status.** `calendar_month_bounds`, `LOCAL_BUDGET_OWNER`,
+`monthly_pool_alias` and the ledger's local-capacity primitives (S2/S3) exist.
+**S4 (HORO-2195) delivers the daemon core**: `shared-budget.json` loading,
+`Request::SharedBudget` (`Admit`, `Check`, `ChargeAgent`, `Status`),
+admission against the locally configured cap, month rollover, the failure
+rows `config_invalid` and `clock_anomaly`, and the tool-event heartbeat.
+`PROTOCOL_VERSION` is 20. Everything else below is **design intent
+implemented in later slices** (S5 settlement from transcripts, S6 hooks and
+the daemon-unreachable behaviour, S7 installer, S8 doctor/status, S11
+gateway `governor_held`); it must not be read as shipped behaviour. No real
+Claude Code host has exercised any of it: S4's evidence is `TestOwnedLive`.
 
 ## Context
 
@@ -135,7 +141,7 @@ Captures from the real host binary against a fake upstream are
 
 | Condition | Result |
 |---|---|
-| No shared-budget file | Pool not consulted; intended byte-exact with today (to be pinned by a test in slice S6, not yet tested) |
+| No shared-budget file | Pool not consulted; `SharedBudget` requests answer `not_configured` and write nothing (pinned at daemon level by `shared_budget_core.rs`; the hook-level byte-exact guarantee is slice S6) |
 | File present but invalid (parse, timezone, cap, version) | Deny `config_invalid` |
 | Clock anomaly: newest pool period is later than now's period | Deny `clock_anomaly` |
 | Daemon unreachable, file present | Deny at prompt admission; allow and log at PreToolUse |
