@@ -67,6 +67,10 @@ fn rfc3339(t: OffsetDateTime) -> Result<String, LedgerError> {
         .map_err(|e| LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))
 }
 
+/// How far past its row's `settled_at` a stored watermark may sit: a
+/// record is stamped by the host's clock a little ahead of the daemon's.
+pub const WATERMARK_SLACK: time::Duration = time::Duration::minutes(10);
+
 fn watermark_columns(
     watermark: Option<&SettleWatermark>,
 ) -> Result<(Option<String>, Option<String>), LedgerError> {
@@ -1029,6 +1033,20 @@ impl LedgerStore {
         &mut self,
         req: SharedPoolChargeRequest<'_>,
     ) -> Result<SharedPoolChargeOutcome, LedgerError> {
+        self.charge_shared_with_watermark(req, None)
+    }
+
+    /// [`Self::charge_shared`] that writes the row and its transcript
+    /// high-water mark in **one** transaction (HORO-2196), so a crash can
+    /// never leave a charge without its mark (which a later window would
+    /// recount). An identical replay whose row has no mark yet adopts the
+    /// supplied one.
+    pub fn charge_shared_with_watermark(
+        &mut self,
+        req: SharedPoolChargeRequest<'_>,
+        watermark: Option<&SettleWatermark>,
+    ) -> Result<SharedPoolChargeOutcome, LedgerError> {
+        let (watermark_text, ids_text) = watermark_columns(watermark)?;
         let attribution = req.attribution.resolve()?;
         let amount_i64 = checked_i64(req.amount)?;
         let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
@@ -1045,13 +1063,12 @@ impl LedgerStore {
             )
             .optional()?;
         if let Some(row) = existing {
-            tx.commit()?;
             let existing = row_to_reservation(row)?;
             // Identical means the same charge, field for field (NULL is its
             // own value): a settled turn hold, or a charge attributed
             // differently, must never be mistaken for a replay or the
             // spend would be silently dropped.
-            let identical = Self::is_charge_row_tx(&self.conn, existing.id)?
+            let identical = Self::is_charge_row_tx(&tx, existing.id)?
                 && existing.state == ReservationState::Settled
                 && existing.settled_amount == Some(req.amount)
                 && existing.usage_known == Some(req.usage_known)
@@ -1059,6 +1076,15 @@ impl LedgerStore {
                 && existing.agent_id == attribution.agent_id
                 && existing.executor_kind == attribution.executor_kind
                 && existing.charge_source == attribution.charge_source;
+            if identical && watermark_text.is_some() {
+                tx.execute(
+                    "UPDATE shared_pool_reservations
+                     SET watermark_ts = ?1, watermark_message_ids = ?2
+                     WHERE id = ?3 AND watermark_ts IS NULL",
+                    rusqlite::params![watermark_text, ids_text, existing.id.0.to_string()],
+                )?;
+            }
+            tx.commit()?;
             return Ok(if identical {
                 SharedPoolChargeOutcome::AlreadyCharged(Box::new(existing))
             } else {
@@ -1101,9 +1127,10 @@ impl LedgerStore {
             "INSERT INTO shared_pool_reservations (
                 id, pool_id, principal_id, session_id, amount, state, settled_amount,
                 usage_known, idempotency_key, created_at, expires_at, settled_at, released_at,
-                schema_version, agent_id, executor_kind, charge_source, is_charge
+                schema_version, agent_id, executor_kind, charge_source, is_charge,
+                watermark_ts, watermark_message_ids
              ) VALUES (?1, ?2, ?3, ?4, ?5, 'settled', ?5, ?12, ?6, ?7, ?7, ?7, NULL, ?8,
-                       ?9, ?10, ?11, 1)",
+                       ?9, ?10, ?11, 1, ?13, ?14)",
             rusqlite::params![
                 id.0.to_string(),
                 req.pool_id.0,
@@ -1117,6 +1144,8 @@ impl LedgerStore {
                 attribution.executor_kind.map(ExecutorKind::as_str),
                 attribution.charge_source.map(ChargeSource::as_str),
                 req.usage_known,
+                watermark_text,
+                ids_text,
             ],
         )?;
 
@@ -1314,7 +1343,7 @@ impl LedgerStore {
         pool_prefix: &str,
     ) -> Result<Option<SettleWatermark>, LedgerError> {
         let mut stmt = self.conn.prepare(
-            "SELECT watermark_ts, watermark_message_ids FROM shared_pool_reservations
+            "SELECT watermark_ts, watermark_message_ids, settled_at FROM shared_pool_reservations
              WHERE principal_id = ?1 AND session_id = ?2 AND agent_id IS ?3
                AND COALESCE(executor_kind, 'unattributed') = ?4
                AND substr(pool_id, 1, length(?5)) = ?5
@@ -1328,12 +1357,27 @@ impl LedgerStore {
                 executor_kind.as_str(),
                 pool_prefix
             ],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
         )?;
         let mut best: Option<SettleWatermark> = None;
         for row in rows {
-            let (at, ids) = row?;
+            let (at, ids, settled_at) = row?;
             let at = parse_time(&at)?;
+            // Defence in depth: a mark far ahead of the instant its row
+            // settled can only come from a poisoned record (the writer
+            // clamps, but an older build or a hand edit might not). Trusting
+            // it would hide every later record, so it is ignored.
+            if let Some(settled) = settled_at.as_deref().map(parse_time).transpose()? {
+                if at > settled + WATERMARK_SLACK {
+                    continue;
+                }
+            }
             if best.as_ref().is_none_or(|b| b.at.is_none_or(|t| at > t)) {
                 let message_ids = ids
                     .and_then(|j| serde_json::from_str::<Vec<String>>(&j).ok())
