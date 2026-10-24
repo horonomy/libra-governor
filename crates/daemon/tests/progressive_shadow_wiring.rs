@@ -171,6 +171,7 @@ fn cadence_only_shadow_decision_never_mutates_existing_ledger_state() {
         // the very first ToolInvoked call.
         progressive_interval_secs: 0,
         launch_gate: None,
+        shared_budget: Default::default(),
     };
 
     let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();

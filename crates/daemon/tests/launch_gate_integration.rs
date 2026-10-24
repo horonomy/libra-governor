@@ -473,6 +473,7 @@ fn launch_admit_round_trips_over_the_real_socket() {
         outcome_authority: None,
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
         launch_gate: Some(one_pool_config("agents", 1)),
+        shared_budget: Default::default(),
     };
 
     let listener = libra_governor_daemon::bind_or_detect_running(&config.socket_path).unwrap();

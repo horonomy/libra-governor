@@ -113,11 +113,9 @@ fn parse_inner(bytes: &[u8]) -> Result<SharedBudgetConfig, String> {
     let raw: RawFile = serde_json::from_slice(bytes).map_err(|e| format!("invalid JSON: {e}"))?;
     match raw.schema_version {
         Some(SHARED_BUDGET_SCHEMA_VERSION) => {}
-        Some(other) => {
-            return Err(format!(
-                "unsupported schema_version {other} (this daemon reads {SHARED_BUDGET_SCHEMA_VERSION})"
-            ))
-        }
+        Some(other) => return Err(format!(
+            "unsupported schema_version {other} (this daemon reads {SHARED_BUDGET_SCHEMA_VERSION})"
+        )),
         None => return Err("schema_version is required".to_string()),
     }
     let cap = positive(
@@ -313,7 +311,8 @@ impl LoadedSharedBudget {
 mod tests {
     use super::*;
 
-    const GOOD: &str = r#"{"schema_version":1,"monthly_cap_usd_cents":50000,"time_zone":"America/New_York"}"#;
+    const GOOD: &str =
+        r#"{"schema_version":1,"monthly_cap_usd_cents":50000,"time_zone":"America/New_York"}"#;
 
     fn invalid(json: &str) -> String {
         match parse(json.as_bytes()) {
@@ -354,8 +353,14 @@ mod tests {
     #[test]
     fn hold_equal_to_cap_is_valid_and_hold_above_cap_is_not() {
         let at = r#"{"schema_version":1,"monthly_cap_usd_cents":1000,"time_zone":"UTC","turn_hold_usd_cents":1000}"#;
-        assert!(matches!(parse(at.as_bytes()), SharedBudgetFileState::Valid(_)));
-        let over = at.replace("\"turn_hold_usd_cents\":1000", "\"turn_hold_usd_cents\":1001");
+        assert!(matches!(
+            parse(at.as_bytes()),
+            SharedBudgetFileState::Valid(_)
+        ));
+        let over = at.replace(
+            "\"turn_hold_usd_cents\":1000",
+            "\"turn_hold_usd_cents\":1001",
+        );
         assert!(invalid(&over).contains("must not exceed"));
     }
 
@@ -363,22 +368,70 @@ mod tests {
     fn every_invalid_variant_is_rejected_with_a_reason() {
         let cases = [
             ("not json", "invalid JSON"),
-            (r#"{"schema_version":1,"monthly_cap_usd_cents":1,"time_zone":"UTC","extra":1}"#, "unknown field"),
-            (r#"{"schema_version":1,"monthly_cap_usd_cents":100}"#, "time_zone is required"),
-            (r#"{"schema_version":1,"monthly_cap_usd_cents":100,"time_zone":"Mars/Olympus"}"#, "not a known IANA zone"),
-            (r#"{"schema_version":1,"monthly_cap_usd_cents":100,"time_zone":""}"#, "not a known IANA zone"),
-            (r#"{"schema_version":1,"monthly_cap_usd_cents":0,"time_zone":"UTC"}"#, "greater than 0"),
-            (r#"{"schema_version":1,"monthly_cap_usd_cents":-5,"time_zone":"UTC"}"#, "greater than 0"),
-            (r#"{"schema_version":1,"time_zone":"UTC"}"#, "monthly_cap_usd_cents is required"),
-            (r#"{"schema_version":1,"monthly_cap_usd_cents":9223372036854775808,"time_zone":"UTC"}"#, "invalid JSON"),
-            (r#"{"schema_version":1,"monthly_cap_usd_cents":10.5,"time_zone":"UTC"}"#, "invalid JSON"),
-            (r#"{"monthly_cap_usd_cents":100,"time_zone":"UTC"}"#, "schema_version is required"),
-            (r#"{"schema_version":2,"monthly_cap_usd_cents":100,"time_zone":"UTC"}"#, "unsupported schema_version"),
-            (r#"{"schema_version":1,"monthly_cap_usd_cents":100,"time_zone":"UTC","turn_hold_usd_cents":0}"#, "greater than 0"),
-            (r#"{"schema_version":1,"monthly_cap_usd_cents":100,"time_zone":"UTC","soft_limits":{"per_session_usd_cents":0}}"#, "soft_limits.per_session"),
-            (r#"{"schema_version":1,"monthly_cap_usd_cents":100,"time_zone":"UTC","soft_limits":{"per_agent_usd_cents":-1}}"#, "soft_limits.per_agent"),
-            (r#"{"schema_version":1,"monthly_cap_usd_cents":100,"time_zone":"UTC","soft_limits":{"bogus":1}}"#, "unknown field"),
-            (r#"{"schema_version":1,"monthly_cap_usd_cents":100,"time_zone":"UTC","subagent_unmeasured_charge_usd_cents":0}"#, "subagent_unmeasured"),
+            (
+                r#"{"schema_version":1,"monthly_cap_usd_cents":1,"time_zone":"UTC","extra":1}"#,
+                "unknown field",
+            ),
+            (
+                r#"{"schema_version":1,"monthly_cap_usd_cents":100}"#,
+                "time_zone is required",
+            ),
+            (
+                r#"{"schema_version":1,"monthly_cap_usd_cents":100,"time_zone":"Mars/Olympus"}"#,
+                "not a known IANA zone",
+            ),
+            (
+                r#"{"schema_version":1,"monthly_cap_usd_cents":100,"time_zone":""}"#,
+                "not a known IANA zone",
+            ),
+            (
+                r#"{"schema_version":1,"monthly_cap_usd_cents":0,"time_zone":"UTC"}"#,
+                "greater than 0",
+            ),
+            (
+                r#"{"schema_version":1,"monthly_cap_usd_cents":-5,"time_zone":"UTC"}"#,
+                "greater than 0",
+            ),
+            (
+                r#"{"schema_version":1,"time_zone":"UTC"}"#,
+                "monthly_cap_usd_cents is required",
+            ),
+            (
+                r#"{"schema_version":1,"monthly_cap_usd_cents":9223372036854775808,"time_zone":"UTC"}"#,
+                "invalid JSON",
+            ),
+            (
+                r#"{"schema_version":1,"monthly_cap_usd_cents":10.5,"time_zone":"UTC"}"#,
+                "invalid JSON",
+            ),
+            (
+                r#"{"monthly_cap_usd_cents":100,"time_zone":"UTC"}"#,
+                "schema_version is required",
+            ),
+            (
+                r#"{"schema_version":2,"monthly_cap_usd_cents":100,"time_zone":"UTC"}"#,
+                "unsupported schema_version",
+            ),
+            (
+                r#"{"schema_version":1,"monthly_cap_usd_cents":100,"time_zone":"UTC","turn_hold_usd_cents":0}"#,
+                "greater than 0",
+            ),
+            (
+                r#"{"schema_version":1,"monthly_cap_usd_cents":100,"time_zone":"UTC","soft_limits":{"per_session_usd_cents":0}}"#,
+                "soft_limits.per_session",
+            ),
+            (
+                r#"{"schema_version":1,"monthly_cap_usd_cents":100,"time_zone":"UTC","soft_limits":{"per_agent_usd_cents":-1}}"#,
+                "soft_limits.per_agent",
+            ),
+            (
+                r#"{"schema_version":1,"monthly_cap_usd_cents":100,"time_zone":"UTC","soft_limits":{"bogus":1}}"#,
+                "unknown field",
+            ),
+            (
+                r#"{"schema_version":1,"monthly_cap_usd_cents":100,"time_zone":"UTC","subagent_unmeasured_charge_usd_cents":0}"#,
+                "subagent_unmeasured",
+            ),
         ];
         for (json, needle) in cases {
             let reason = invalid(json);
@@ -442,10 +495,16 @@ mod tests {
         let path = dir.path().join(SHARED_BUDGET_FILE_NAME);
         std::fs::write(&path, GOOD).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(LoadedSharedBudget::load(dir.path()).permissions_note(), None);
+        assert_eq!(
+            LoadedSharedBudget::load(dir.path()).permissions_note(),
+            None
+        );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let loose = LoadedSharedBudget::load(dir.path());
-        assert!(loose.config().is_some(), "a loose mode is noted, never refused");
+        assert!(
+            loose.config().is_some(),
+            "a loose mode is noted, never refused"
+        );
         assert!(loose.permissions_note().unwrap().contains("0600"));
     }
 }

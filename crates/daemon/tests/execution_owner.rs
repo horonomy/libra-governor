@@ -94,6 +94,7 @@ fn config(dir: &Path, name: &str) -> DaemonConfig {
 
         outcome_authority: None,
         launch_gate: None,
+        shared_budget: Default::default(),
         progressive_interval_secs: 60,
     }
 }

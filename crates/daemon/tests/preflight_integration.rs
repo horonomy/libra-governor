@@ -47,6 +47,7 @@ fn preflight_returns_sane_result_within_recon_budget() {
 
         outcome_authority: None,
         launch_gate: None,
+        shared_budget: Default::default(),
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
     };
 
@@ -148,6 +149,7 @@ fn second_preflight_for_same_session_supersedes_the_first() {
 
         outcome_authority: None,
         launch_gate: None,
+        shared_budget: Default::default(),
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
     };
 
@@ -303,6 +305,7 @@ fn preflight_selects_a_bucketed_tier_once_same_repo_history_exists() {
 
         outcome_authority: None,
         launch_gate: None,
+        shared_budget: Default::default(),
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
     };
 
