@@ -626,23 +626,48 @@ impl LedgerStore {
         row.map(|r| row_to_pool(pool_id.clone(), r)).transpose()
     }
 
+    /// `SUM` of one amount column for one state, saturating instead of
+    /// failing: SQLite raises an error when an integer `SUM` overflows, and
+    /// one oversized row must not make every later admission and charge
+    /// fail with it.
+    fn saturating_amount_sum(
+        tx: &rusqlite::Connection,
+        pool_id: &PoolId,
+        column: &str,
+        state: &str,
+    ) -> Result<u64, LedgerError> {
+        let summed: rusqlite::Result<i64> = tx.query_row(
+            &format!(
+                "SELECT COALESCE(SUM({column}), 0) FROM shared_pool_reservations
+                 WHERE pool_id = ?1 AND state = '{state}'"
+            ),
+            [&pool_id.0],
+            |row| row.get(0),
+        );
+        match summed {
+            Ok(total) => Ok(total.max(0) as u64),
+            Err(_) => {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT COALESCE({column}, 0) FROM shared_pool_reservations
+                     WHERE pool_id = ?1 AND state = '{state}'"
+                ))?;
+                let rows = stmt.query_map([&pool_id.0], |row| row.get::<_, i64>(0))?;
+                let mut total: u64 = 0;
+                for row in rows {
+                    total = total.saturating_add(row?.max(0) as u64);
+                }
+                Ok(total)
+            }
+        }
+    }
+
     fn settled_and_active_tx(
         tx: &rusqlite::Connection,
         pool_id: &PoolId,
     ) -> Result<(u64, u64), LedgerError> {
-        let settled: i64 = tx.query_row(
-            "SELECT COALESCE(SUM(settled_amount), 0) FROM shared_pool_reservations
-             WHERE pool_id = ?1 AND state = 'settled'",
-            [&pool_id.0],
-            |row| row.get(0),
-        )?;
-        let active: i64 = tx.query_row(
-            "SELECT COALESCE(SUM(amount), 0) FROM shared_pool_reservations
-             WHERE pool_id = ?1 AND state = 'active'",
-            [&pool_id.0],
-            |row| row.get(0),
-        )?;
-        Ok((settled as u64, active as u64))
+        let settled = Self::saturating_amount_sum(tx, pool_id, "settled_amount", "settled")?;
+        let active = Self::saturating_amount_sum(tx, pool_id, "amount", "active")?;
+        Ok((settled, active))
     }
 
     /// Sums only `settled` reservations whose own `settled_at` is at or
@@ -1168,6 +1193,39 @@ impl LedgerStore {
             if best
                 .as_ref()
                 .is_none_or(|b| reservation.created_at > b.created_at)
+            {
+                best = Some(reservation);
+            }
+        }
+        Ok(best)
+    }
+
+    /// The earliest-created row `principal_id` holds under `idempotency_key`
+    /// in any pool starting with `pool_prefix` (HORO-2195). Reserve and
+    /// charge replay lookups are scoped to one pool; this finds a key
+    /// across periods so a retry cannot be booked twice when the pool it
+    /// would resolve to has changed.
+    pub fn find_shared_reservation_by_key(
+        &self,
+        principal_id: &PrincipalId,
+        idempotency_key: &str,
+        pool_prefix: &str,
+    ) -> Result<Option<SharedPoolReservation>, LedgerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {RESERVATION_COLUMNS} FROM shared_pool_reservations
+             WHERE principal_id = ?1 AND idempotency_key = ?2
+               AND substr(pool_id, 1, length(?3)) = ?3"
+        ))?;
+        let rows = stmt.query_map(
+            rusqlite::params![principal_id.0, idempotency_key, pool_prefix],
+            read_reservation_row,
+        )?;
+        let mut best: Option<SharedPoolReservation> = None;
+        for row in rows {
+            let reservation = row_to_reservation(row?)?;
+            if best
+                .as_ref()
+                .is_none_or(|b| reservation.created_at < b.created_at)
             {
                 best = Some(reservation);
             }
@@ -3658,5 +3716,52 @@ mod lane_read_tests {
             .shared_pool_ids_with_prefix("metered:local-budget/monthly-")
             .unwrap();
         assert_eq!(ids, vec![pool("monthly-2027-01"), pool("monthly-2027-03")]);
+    }
+
+    #[test]
+    fn key_lookup_spans_pools_and_sums_saturate_instead_of_failing() {
+        let mut store = store_with(&["monthly-2027-01", "monthly-2027-02"]);
+        let jan = pool("monthly-2027-01");
+        let charge = |store: &mut LedgerStore, pool_id: &PoolId, key: &str, amount: u64| {
+            store
+                .charge_shared(SharedPoolChargeRequest {
+                    pool_id,
+                    principal_id: &owner(),
+                    session_id: "s",
+                    amount,
+                    unit: &QuotaUnit::UsdCents,
+                    idempotency_key: key,
+                    now: t0(),
+                    attribution: ExecutorAttribution::main_executor(None),
+                    capacity_source: CapacitySource::LocalConfigured { cap: 1_000 },
+                })
+                .unwrap()
+        };
+        charge(&mut store, &jan, "k", 5);
+        let found = store
+            .find_shared_reservation_by_key(&owner(), "k", "metered:local-budget/")
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.pool_id, jan);
+        assert!(store
+            .find_shared_reservation_by_key(&owner(), "other", "metered:local-budget/")
+            .unwrap()
+            .is_none());
+
+        // Three rows of i64::MAX overflow SQLite's integer SUM; the pool
+        // must still be readable and chargeable, with the total saturated.
+        for key in ["a", "b", "c"] {
+            charge(&mut store, &jan, key, i64::MAX as u64);
+        }
+        let admission = store
+            .pool_admission_for(&jan, t0(), CapacitySource::LocalConfigured { cap: 1_000 })
+            .unwrap()
+            .unwrap();
+        assert_eq!(admission.settled, u64::MAX);
+        assert_eq!(admission.remaining(), i64::MIN);
+        assert!(matches!(
+            charge(&mut store, &jan, "d", 1),
+            SharedPoolChargeOutcome::Charged { .. }
+        ));
     }
 }
