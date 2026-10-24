@@ -504,8 +504,9 @@ local upstream; 36 `Stop` and 4 `SubagentStop` events over 12 fresh sessions,
 polling the transcript saw the turn's final assistant line **p50 66 ms, p90 71
 ms, max 189 ms** after the daemon's read at `Stop` (36 samples; three of them
 179-189 ms, eleven are upper bounds because the recorder started after the file
-had landed, so the true lag is at most that). The whole turn appears at once,
-so there is no partial state to wait through. A subagent's final line appeared
+had landed, so the true lag is at most that). In these `-p` runs the whole
+turn appeared at once; an interactive session that writes lines incrementally
+may expose a partly flushed turn, and its flush timing is unmeasured. A subagent's final line appeared
 about 82-88 ms after its `SubagentStop` dispatch. No event was still
 unreadable after 8 s. Before the fix **36 of 36** `Stop` settlements fell back
 to the flat hold (26 `transcript_unreadable`, 10 `no_usage_in_window`; $360.04
@@ -543,7 +544,9 @@ polls a new read-only request, `SharedBudgetRequest::TranscriptReady`
   cap, a daemon that is down, too old (an unknown request is an error answer),
   slow (a probe has 400 ms) or refusing. Only prompt admission denies.
 - *Bounded.* The cap is 1.5 s (about 20x the measurement) and the installed
-  `Stop` entry carries no timeout. `LIBRA_GOVERNOR_STOP_FLUSH_WAIT_MS`
+  `Stop` entry carries no timeout. Worst-case hook latency is the cap plus
+  one in-flight probe (400 ms), so about 1.9 s by default and about 5.4 s at
+  the 5000 ms clamp, not 1.5 s. `LIBRA_GOVERNOR_STOP_FLUSH_WAIT_MS`
   overrides it: `0` disables the wait, larger values are clamped to 5000.
 - *Unchanged elsewhere.* No budget file: no probe, no connect. Codex: not
   involved. `SubagentStop` is not waited on: its delta charge and the `Stop`
@@ -557,7 +560,15 @@ future-stamp rules free of double counts, which is a large new surface for a
 loss the wait already avoids. It stays unbuilt; revisit it only if an
 interactive host shows lags beyond the cap.
 
-**Residuals (all over-counts, none under-count).**
+**What `ready` means.** Some priced usage exists after the lane's watermark.
+It does **not** mean the turn's final message is flushed. A host that writes
+lines incrementally can answer ready on the first probe, and that `Stop`
+settles measured-short; the remainder is recovered only by a later `Stop` or
+`SettleTail` (lost if neither runs). Requiring a terminal `stop_reason` in the
+window would narrow this but needs the reader to expose it; not built.
+
+**Residuals: over-counts, plus a bounded timing under-count when a turn is
+partly flushed (recovered at the next Stop/SettleTail, lost if neither runs).**
 
 - A transcript still unflushed at the cap (a stalled host, a lag above 1.5 s),
   or a hook the host kills while it waits (then no `Finalize` is sent at all
@@ -565,8 +576,16 @@ interactive host shows lags beyond the cap.
   lines once), books the flat hold and is not reconciled. Each such event costs
   up to `turn_hold_usd_cents` minus the real spend.
 - A partly flushed turn (for example only a tool call so far) answers
-  `ready` and settles on what is there; the remaining lines are counted by the
-  next `Stop`, not lost.
+  `ready` and settles on what is there (the under-count above); the remaining
+  lines are counted by the next `Stop`, not lost unless no later `Stop` or
+  `SettleTail` runs. Not observed on 2.1.306 `-p`; interactive is unmeasured.
+- A transcript path that never appears (`--no-session-persistence`, a mount
+  the daemon cannot see, `/compact`-style turns without a file) costs the full
+  wait on every `Stop` and then the flat hold. There is no per-session memory
+  of a previous give-up (hooks are separate processes; that needs persisted
+  state). Set `LIBRA_GOVERNOR_STOP_FLUSH_WAIT_MS=0` for such setups.
+- If the host's own `Stop` hook timeout is shorter than the wait, the host
+  kills the hook mid-wait: no `Finalize`, the hold stays held until its TTL.
 - Interactive (TTY) flush timing, `/compact` summarizers and a daemon older
   than protocol v23 (probe fails, no wait) are unmeasured or unwaited.
 
@@ -577,7 +596,10 @@ the hold remains the upper bound that admission reserves, and the amount
 booked when a turn cannot be measured. Set it near the real cost of one of
 your own turns (and no lower than the dearest turn you expect, because an
 unmeasured expensive turn is under-counted by the difference). Do not rely on
-a large hold to hide flush lag; the wait is the fix.
+a large hold to hide flush lag; the wait is the fix. Lowering the hold is not
+pure upside: admission reserves one hold per session, so a smaller hold lets
+concurrent sessions overshoot the cap by more before the next admission is
+refused.
 
 ### Installer and settlement hooks delivered in S7
 

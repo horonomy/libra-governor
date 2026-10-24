@@ -683,7 +683,8 @@ budget gate (its hook route is unchanged).
 | `SessionEnd` | present | one `SettleTail` with `session_id` and `transcript_path`; the daemon charges the records no `Stop` counted. Always silent, exit 0 |
 
 `Stop` also waits, bounded, before it settles (HORO-2246): when a budget file
-exists it polls the daemon's read-only `TranscriptReady` probe, at most 1.5 s
+exists it polls the daemon's read-only `TranscriptReady` probe, for at most 1.5 s
+(plus one in-flight probe of up to 400 ms, so about 1.9 s worst case)
 (`LIBRA_GOVERNOR_STOP_FLUSH_WAIT_MS` overrides it; `0` disables it, 5000 is the
 ceiling), because the host writes its transcript about 70 ms after the hook is
 dispatched. It never denies and never opens the transcript; a daemon that is
