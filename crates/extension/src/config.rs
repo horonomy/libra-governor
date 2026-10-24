@@ -509,4 +509,134 @@ mod tests {
             ConfigError::EventsMaxAttemptsZero
         ));
     }
+
+    /// Builds an `ExtensionConfig` that puts `url` on one of the three
+    /// destination-bearing surfaces, so every surface is held to the same
+    /// destination rule (HORO-2218 egress audit).
+    fn config_with_url(surface: &str, url: &str) -> ExtensionConfig {
+        let mut s = base_surface();
+        s.url = url.to_string();
+        match surface {
+            "business_context_provider" => ExtensionConfig {
+                business_context_provider: Some(s),
+                ..Default::default()
+            },
+            "policy_webhook" => ExtensionConfig {
+                policy_webhook: Some(s),
+                ..Default::default()
+            },
+            "events" => ExtensionConfig {
+                events: Some(EventsConfig {
+                    url: s.url,
+                    timeout_ms: EVENTS_TIMEOUT_DEFAULT_MS,
+                    max_attempts: 1,
+                    kinds: vec!["admission".to_string()],
+                    secret_command: s.secret_command,
+                    secret_args: s.secret_args,
+                }),
+                ..Default::default()
+            },
+            other => panic!("unknown surface {other}"),
+        }
+    }
+
+    const SURFACES: [&str; 3] = ["business_context_provider", "policy_webhook", "events"];
+
+    /// Every destination that is not exactly the IPv4/IPv6 loopback literal
+    /// is refused on every surface, whatever trick spells it: other
+    /// loopback-range or unspecified addresses, IPv4-mapped / expanded IPv6,
+    /// numeric encodings, DNS names, trailing dots, and RFC 3986 userinfo or
+    /// fragment confusion. The destination rule is a literal string match,
+    /// never a DNS resolution (a name that resolves to loopback today can
+    /// resolve elsewhere tomorrow).
+    #[test]
+    fn every_surface_refuses_every_non_loopback_literal_spelling() {
+        let refused = [
+            "http://10.0.0.5:8787/p",
+            "http://192.168.1.10/p",
+            "http://169.254.169.254/p",
+            "http://8.8.8.8:80/p",
+            "http://127.0.0.2:8787/p",
+            "http://0.0.0.0:8787/p",
+            "http://127.1:8787/p",
+            "http://2130706433:8787/p",
+            "http://0x7f000001:8787/p",
+            "http://[::2]:8787/p",
+            "http://[::]:8787/p",
+            "http://[::ffff:127.0.0.1]:8787/p",
+            "http://[0:0:0:0:0:0:0:1]:8787/p",
+            "http://[fe80::1]:8787/p",
+            "http://[2001:db8::1]:8787/p",
+            "http://example.com/p",
+            "http://127.0.0.1.example.com/p",
+            "http://127.0.0.1.:8787/p",
+            "http://LOCALHOST:8787/p",
+        ];
+        for surface in SURFACES {
+            for url in refused {
+                let outcome = validate(config_with_url(surface, url));
+                assert!(
+                    outcome.is_err(),
+                    "{surface} accepted non-loopback destination {url}: {outcome:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn userinfo_and_fragment_confusion_cannot_smuggle_a_remote_host() {
+        let refused = [
+            // userinfo that looks like loopback; real host is remote
+            "http://127.0.0.1@evil.example.com/p",
+            "http://127.0.0.1:80@evil.example.com/p",
+            "http://[::1]@evil.example.com/p",
+            // fragment / query used to hide the real authority
+            "http://evil.example.com#@127.0.0.1/p",
+            "http://evil.example.com?@127.0.0.1/p",
+            // backslash authority confusion
+            "http://evil.example.com\\@127.0.0.1/p",
+        ];
+        for surface in SURFACES {
+            for url in refused {
+                let outcome = validate(config_with_url(surface, url));
+                assert!(
+                    outcome.is_err(),
+                    "{surface} accepted smuggled destination {url}: {outcome:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_surface_refuses_non_http_schemes_even_on_loopback() {
+        for surface in SURFACES {
+            for url in [
+                "https://127.0.0.1:8787/p",
+                "ftp://127.0.0.1/p",
+                "ws://127.0.0.1:8787/p",
+                "file:///etc/passwd",
+                "//127.0.0.1/p",
+                "127.0.0.1:8787/p",
+            ] {
+                assert!(
+                    validate(config_with_url(surface, url)).is_err(),
+                    "{surface} accepted {url}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_surface_accepts_only_the_two_loopback_literals() {
+        for surface in SURFACES {
+            for url in [
+                "http://127.0.0.1:8787/p",
+                "http://127.0.0.1/p",
+                "http://[::1]:8787/p",
+            ] {
+                validate(config_with_url(surface, url))
+                    .unwrap_or_else(|e| panic!("{surface} refused loopback {url}: {e:?}"));
+            }
+        }
+    }
 }

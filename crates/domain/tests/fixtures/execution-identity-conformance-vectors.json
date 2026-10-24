@@ -1,0 +1,1082 @@
+{
+  "cache_key_null": "null means ScopeIdentityMissing: the implementation must refuse, never widen to a broader key",
+  "contract": "governance/product/execution-identity-contract.md",
+  "correlations": [
+    {
+      "expect": {
+        "correlates": true
+      },
+      "left": "session",
+      "name": "same-session",
+      "right": "session"
+    },
+    {
+      "expect": {
+        "correlates": true
+      },
+      "left": "host-only",
+      "name": "host-only-vs-host-only",
+      "right": "host-only"
+    },
+    {
+      "expect": {
+        "correlates": true
+      },
+      "left": "session",
+      "name": "session-vs-agent",
+      "right": "agent"
+    },
+    {
+      "expect": {
+        "correlates": true
+      },
+      "left": "agent",
+      "name": "agent-vs-turn",
+      "right": "turn-task"
+    },
+    {
+      "expect": {
+        "correlates": false
+      },
+      "left": "session",
+      "name": "claude-vs-codex-session",
+      "right": "turn-without-agent"
+    },
+    {
+      "expect": {
+        "correlates": false
+      },
+      "left": "session",
+      "name": "different-session",
+      "right": "session-2"
+    },
+    {
+      "expect": {
+        "correlates": false
+      },
+      "left": "agent",
+      "name": "different-agent",
+      "right": "agent-2"
+    },
+    {
+      "expect": {
+        "correlates": false
+      },
+      "left": "session",
+      "name": "different-host",
+      "right": "other-host"
+    }
+  ],
+  "display_id": "dimension + ':' + first 8 hex of sha256(utf8(dimension + ':' + value))",
+  "invalid": [
+    {
+      "expect": {
+        "valid": false
+      },
+      "name": "version-2",
+      "wire": {
+        "envelope_version": 2,
+        "host_id": "host-1",
+        "lineage_status": "unknown",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "tool_provider": "claude_code"
+      }
+    },
+    {
+      "expect": {
+        "valid": false
+      },
+      "name": "version-string",
+      "wire": {
+        "envelope_version": "1",
+        "host_id": "host-1",
+        "lineage_status": "unknown",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "tool_provider": "claude_code"
+      }
+    },
+    {
+      "expect": {
+        "valid": false
+      },
+      "name": "version-bool",
+      "wire": {
+        "envelope_version": true,
+        "host_id": "host-1",
+        "lineage_status": "unknown",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "tool_provider": "claude_code"
+      }
+    },
+    {
+      "expect": {
+        "valid": false
+      },
+      "name": "unknown-lineage-status",
+      "wire": {
+        "envelope_version": 1,
+        "host_id": "host-1",
+        "lineage_status": "orphan",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "tool_provider": "claude_code"
+      }
+    },
+    {
+      "expect": {
+        "valid": false
+      },
+      "name": "child-without-parent",
+      "wire": {
+        "envelope_version": 1,
+        "host_id": "host-1",
+        "lineage_status": "child",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "tool_provider": "claude_code"
+      }
+    },
+    {
+      "expect": {
+        "valid": false
+      },
+      "name": "root-with-parent",
+      "wire": {
+        "envelope_version": 1,
+        "host_id": "host-1",
+        "lineage_status": "root",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "parent_agent_id": "a-1",
+        "tool_provider": "claude_code"
+      }
+    },
+    {
+      "expect": {
+        "valid": false
+      },
+      "name": "unknown-with-parent",
+      "wire": {
+        "envelope_version": 1,
+        "host_id": "host-1",
+        "lineage_status": "unknown",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "parent_agent_id": "a-1",
+        "tool_provider": "claude_code"
+      }
+    },
+    {
+      "expect": {
+        "valid": false
+      },
+      "name": "empty-host-id",
+      "wire": {
+        "envelope_version": 1,
+        "host_id": "",
+        "lineage_status": "unknown",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "tool_provider": "claude_code"
+      }
+    },
+    {
+      "expect": {
+        "valid": false
+      },
+      "name": "uppercase-provider",
+      "wire": {
+        "envelope_version": 1,
+        "host_id": "host-1",
+        "lineage_status": "unknown",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "tool_provider": "Claude"
+      }
+    },
+    {
+      "expect": {
+        "valid": false
+      },
+      "name": "provider-with-path",
+      "wire": {
+        "envelope_version": 1,
+        "host_id": "host-1",
+        "lineage_status": "unknown",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "tool_provider": "../x"
+      }
+    },
+    {
+      "expect": {
+        "valid": false
+      },
+      "name": "session-not-a-string",
+      "wire": {
+        "envelope_version": 1,
+        "host_id": "host-1",
+        "lineage_status": "unknown",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "provider_session_id": 7,
+        "tool_provider": "claude_code"
+      }
+    },
+    {
+      "expect": {
+        "valid": false
+      },
+      "name": "bad-observed-at",
+      "wire": {
+        "envelope_version": 1,
+        "host_id": "host-1",
+        "lineage_status": "unknown",
+        "observed_at": "2026-10-24 12:00:00",
+        "tool_provider": "claude_code"
+      }
+    }
+  ],
+  "normalizers": [
+    {
+      "expect": {
+        "agent_id": null,
+        "lineage_status": "unknown",
+        "narrowest_attributable_scope": "session",
+        "provider_session_id": "s-1",
+        "turn_id": null
+      },
+      "host_id": "host-1",
+      "name": "claude-main",
+      "payload": {
+        "cwd": "/w",
+        "hook_event_name": "PostToolUse",
+        "prompt_id": "p-1",
+        "session_id": "s-1"
+      },
+      "provider": "claude_code"
+    },
+    {
+      "expect": {
+        "agent_id": "a-9",
+        "lineage_status": "unknown",
+        "narrowest_attributable_scope": "agent",
+        "provider_session_id": "s-1",
+        "turn_id": null
+      },
+      "host_id": "host-1",
+      "name": "claude-subagent",
+      "payload": {
+        "agent_id": "a-9",
+        "agent_type": "general-purpose",
+        "session_id": "s-1"
+      },
+      "provider": "claude_code"
+    },
+    {
+      "expect": {
+        "agent_id": null,
+        "lineage_status": "unknown",
+        "narrowest_attributable_scope": "session",
+        "provider_session_id": "s-1",
+        "turn_id": null
+      },
+      "host_id": "host-1",
+      "name": "claude-turn-id-not-mapped",
+      "payload": {
+        "session_id": "s-1",
+        "turn_id": "t-1"
+      },
+      "provider": "claude_code"
+    },
+    {
+      "expect": {
+        "agent_id": "a-1",
+        "lineage_status": "unknown",
+        "narrowest_attributable_scope": "unknown",
+        "provider_session_id": null,
+        "turn_id": null
+      },
+      "host_id": "host-1",
+      "name": "claude-no-session",
+      "payload": {
+        "agent_id": "a-1",
+        "cwd": "/w"
+      },
+      "provider": "claude_code"
+    },
+    {
+      "expect": {
+        "agent_id": null,
+        "lineage_status": "unknown",
+        "narrowest_attributable_scope": "unknown",
+        "provider_session_id": null,
+        "turn_id": null
+      },
+      "host_id": "host-1",
+      "name": "claude-blank-session",
+      "payload": {
+        "session_id": "   "
+      },
+      "provider": "claude_code"
+    },
+    {
+      "expect": {
+        "agent_id": null,
+        "lineage_status": "unknown",
+        "narrowest_attributable_scope": "unknown",
+        "provider_session_id": null,
+        "turn_id": null
+      },
+      "host_id": "host-1",
+      "name": "claude-non-string-session",
+      "payload": {
+        "session_id": 123
+      },
+      "provider": "claude_code"
+    },
+    {
+      "expect": {
+        "agent_id": null,
+        "lineage_status": "unknown",
+        "narrowest_attributable_scope": "unknown",
+        "provider_session_id": null,
+        "turn_id": null
+      },
+      "host_id": "host-1",
+      "name": "claude-not-a-mapping",
+      "payload": [
+        "s-1"
+      ],
+      "provider": "claude_code"
+    },
+    {
+      "expect": {
+        "agent_id": null,
+        "lineage_status": "unknown",
+        "narrowest_attributable_scope": "session",
+        "provider_session_id": "c-1",
+        "turn_id": "t-7"
+      },
+      "host_id": "host-1",
+      "name": "codex-main",
+      "payload": {
+        "session_id": "c-1",
+        "turn_id": "t-7"
+      },
+      "provider": "codex"
+    },
+    {
+      "expect": {
+        "agent_id": "a-2",
+        "lineage_status": "unknown",
+        "narrowest_attributable_scope": "turn_task",
+        "provider_session_id": "c-1",
+        "turn_id": "t-8"
+      },
+      "host_id": "host-1",
+      "name": "codex-subagent",
+      "payload": {
+        "agent_id": "a-2",
+        "session_id": "c-1",
+        "turn_id": "t-8"
+      },
+      "provider": "codex"
+    },
+    {
+      "expect": {
+        "agent_id": null,
+        "lineage_status": "unknown",
+        "narrowest_attributable_scope": "unknown",
+        "provider_session_id": null,
+        "turn_id": null
+      },
+      "host_id": "host-1",
+      "name": "codex-heuristics-only",
+      "payload": {
+        "cwd": "/w",
+        "pid": 42,
+        "transcript_path": "/t"
+      },
+      "provider": "codex"
+    }
+  ],
+  "valid": [
+    {
+      "expect": {
+        "cache_keys": {
+          "agent": null,
+          "host": [
+            "host-1"
+          ],
+          "project_worktree": null,
+          "session": null,
+          "turn_task": null
+        },
+        "display_ids": {
+          "host_id": "host_id:80f1cc7c"
+        },
+        "narrowest_attributable_scope": "unknown",
+        "round_trip": {
+          "envelope_version": 1,
+          "host_id": "host-1",
+          "lineage_status": "unknown",
+          "observed_at": "2026-10-24T12:00:00.000Z",
+          "tool_provider": "claude_code"
+        },
+        "valid": true
+      },
+      "name": "host-only",
+      "wire": {
+        "envelope_version": 1,
+        "host_id": "host-1",
+        "lineage_status": "unknown",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "tool_provider": "claude_code"
+      }
+    },
+    {
+      "expect": {
+        "cache_keys": {
+          "agent": null,
+          "host": [
+            "host-1"
+          ],
+          "project_worktree": null,
+          "session": [
+            "host-1",
+            "claude_code",
+            "s-1"
+          ],
+          "turn_task": null
+        },
+        "display_ids": {
+          "host_id": "host_id:80f1cc7c",
+          "provider_session_id": "provider_session_id:999d71d9"
+        },
+        "narrowest_attributable_scope": "session",
+        "round_trip": {
+          "envelope_version": 1,
+          "host_id": "host-1",
+          "lineage_status": "unknown",
+          "observed_at": "2026-10-24T12:00:00.000Z",
+          "provider_session_id": "s-1",
+          "tool_provider": "claude_code"
+        },
+        "valid": true
+      },
+      "name": "session",
+      "wire": {
+        "envelope_version": 1,
+        "host_id": "host-1",
+        "lineage_status": "unknown",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "provider_session_id": "s-1",
+        "tool_provider": "claude_code"
+      }
+    },
+    {
+      "expect": {
+        "cache_keys": {
+          "agent": [
+            "host-1",
+            "claude_code",
+            "s-1",
+            "a-1"
+          ],
+          "host": [
+            "host-1"
+          ],
+          "project_worktree": null,
+          "session": [
+            "host-1",
+            "claude_code",
+            "s-1"
+          ],
+          "turn_task": null
+        },
+        "display_ids": {
+          "agent_id": "agent_id:47fed135",
+          "host_id": "host_id:80f1cc7c",
+          "provider_session_id": "provider_session_id:999d71d9"
+        },
+        "narrowest_attributable_scope": "agent",
+        "round_trip": {
+          "agent_id": "a-1",
+          "envelope_version": 1,
+          "host_id": "host-1",
+          "lineage_status": "unknown",
+          "observed_at": "2026-10-24T12:00:00.000Z",
+          "provider_session_id": "s-1",
+          "tool_provider": "claude_code"
+        },
+        "valid": true
+      },
+      "name": "agent",
+      "wire": {
+        "agent_id": "a-1",
+        "envelope_version": 1,
+        "host_id": "host-1",
+        "lineage_status": "unknown",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "provider_session_id": "s-1",
+        "tool_provider": "claude_code"
+      }
+    },
+    {
+      "expect": {
+        "cache_keys": {
+          "agent": [
+            "host-1",
+            "claude_code",
+            "s-1",
+            "a-1"
+          ],
+          "host": [
+            "host-1"
+          ],
+          "project_worktree": null,
+          "session": [
+            "host-1",
+            "claude_code",
+            "s-1"
+          ],
+          "turn_task": [
+            "host-1",
+            "claude_code",
+            "s-1",
+            "a-1",
+            "t-1"
+          ]
+        },
+        "display_ids": {
+          "agent_id": "agent_id:47fed135",
+          "host_id": "host_id:80f1cc7c",
+          "provider_session_id": "provider_session_id:999d71d9",
+          "turn_id": "turn_id:30183350"
+        },
+        "narrowest_attributable_scope": "turn_task",
+        "round_trip": {
+          "agent_id": "a-1",
+          "envelope_version": 1,
+          "host_id": "host-1",
+          "lineage_status": "unknown",
+          "observed_at": "2026-10-24T12:00:00.000Z",
+          "provider_session_id": "s-1",
+          "tool_provider": "claude_code",
+          "turn_id": "t-1"
+        },
+        "valid": true
+      },
+      "name": "turn-task",
+      "wire": {
+        "agent_id": "a-1",
+        "envelope_version": 1,
+        "host_id": "host-1",
+        "lineage_status": "unknown",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "provider_session_id": "s-1",
+        "tool_provider": "claude_code",
+        "turn_id": "t-1"
+      }
+    },
+    {
+      "expect": {
+        "cache_keys": {
+          "agent": null,
+          "host": [
+            "host-1"
+          ],
+          "project_worktree": null,
+          "session": [
+            "host-1",
+            "codex",
+            "s-1"
+          ],
+          "turn_task": null
+        },
+        "display_ids": {
+          "host_id": "host_id:80f1cc7c",
+          "provider_session_id": "provider_session_id:999d71d9",
+          "turn_id": "turn_id:30183350"
+        },
+        "narrowest_attributable_scope": "session",
+        "round_trip": {
+          "envelope_version": 1,
+          "host_id": "host-1",
+          "lineage_status": "unknown",
+          "observed_at": "2026-10-24T12:00:00.000Z",
+          "provider_session_id": "s-1",
+          "tool_provider": "codex",
+          "turn_id": "t-1"
+        },
+        "valid": true
+      },
+      "name": "turn-without-agent",
+      "wire": {
+        "envelope_version": 1,
+        "host_id": "host-1",
+        "lineage_status": "unknown",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "provider_session_id": "s-1",
+        "tool_provider": "codex",
+        "turn_id": "t-1"
+      }
+    },
+    {
+      "expect": {
+        "cache_keys": {
+          "agent": null,
+          "host": [
+            "host-1"
+          ],
+          "project_worktree": null,
+          "session": null,
+          "turn_task": null
+        },
+        "display_ids": {
+          "agent_id": "agent_id:47fed135",
+          "host_id": "host_id:80f1cc7c"
+        },
+        "narrowest_attributable_scope": "unknown",
+        "round_trip": {
+          "agent_id": "a-1",
+          "envelope_version": 1,
+          "host_id": "host-1",
+          "lineage_status": "unknown",
+          "observed_at": "2026-10-24T12:00:00.000Z",
+          "tool_provider": "claude_code"
+        },
+        "valid": true
+      },
+      "name": "agent-without-session",
+      "wire": {
+        "agent_id": "a-1",
+        "envelope_version": 1,
+        "host_id": "host-1",
+        "lineage_status": "unknown",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "tool_provider": "claude_code"
+      }
+    },
+    {
+      "expect": {
+        "cache_keys": {
+          "agent": [
+            "host-1",
+            "claude_code",
+            "s-1",
+            "a-2"
+          ],
+          "host": [
+            "host-1"
+          ],
+          "project_worktree": null,
+          "session": [
+            "host-1",
+            "claude_code",
+            "s-1"
+          ],
+          "turn_task": null
+        },
+        "display_ids": {
+          "agent_id": "agent_id:bb3fab00",
+          "host_id": "host_id:80f1cc7c",
+          "provider_session_id": "provider_session_id:999d71d9"
+        },
+        "narrowest_attributable_scope": "agent",
+        "round_trip": {
+          "agent_id": "a-2",
+          "envelope_version": 1,
+          "host_id": "host-1",
+          "lineage_status": "child",
+          "observed_at": "2026-10-24T12:00:00.000Z",
+          "parent_agent_id": "a-1",
+          "provider_session_id": "s-1",
+          "tool_provider": "claude_code"
+        },
+        "valid": true
+      },
+      "name": "child-with-parent",
+      "wire": {
+        "agent_id": "a-2",
+        "envelope_version": 1,
+        "host_id": "host-1",
+        "lineage_status": "child",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "parent_agent_id": "a-1",
+        "provider_session_id": "s-1",
+        "tool_provider": "claude_code"
+      }
+    },
+    {
+      "expect": {
+        "cache_keys": {
+          "agent": [
+            "host-1",
+            "claude_code",
+            "s-1",
+            "a-1"
+          ],
+          "host": [
+            "host-1"
+          ],
+          "project_worktree": null,
+          "session": [
+            "host-1",
+            "claude_code",
+            "s-1"
+          ],
+          "turn_task": null
+        },
+        "display_ids": {
+          "agent_id": "agent_id:47fed135",
+          "host_id": "host_id:80f1cc7c",
+          "provider_session_id": "provider_session_id:999d71d9"
+        },
+        "narrowest_attributable_scope": "agent",
+        "round_trip": {
+          "agent_id": "a-1",
+          "envelope_version": 1,
+          "host_id": "host-1",
+          "lineage_status": "root",
+          "observed_at": "2026-10-24T12:00:00.000Z",
+          "provider_session_id": "s-1",
+          "tool_provider": "claude_code"
+        },
+        "valid": true
+      },
+      "name": "root",
+      "wire": {
+        "agent_id": "a-1",
+        "envelope_version": 1,
+        "host_id": "host-1",
+        "lineage_status": "root",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "provider_session_id": "s-1",
+        "tool_provider": "claude_code"
+      }
+    },
+    {
+      "expect": {
+        "cache_keys": {
+          "agent": null,
+          "host": [
+            "host-1"
+          ],
+          "project_worktree": [
+            "repo-1"
+          ],
+          "session": null,
+          "turn_task": null
+        },
+        "display_ids": {
+          "host_id": "host_id:80f1cc7c"
+        },
+        "narrowest_attributable_scope": "unknown",
+        "round_trip": {
+          "envelope_version": 1,
+          "host_id": "host-1",
+          "lineage_status": "unknown",
+          "observed_at": "2026-10-24T12:00:00.000Z",
+          "repo_id": "repo-1",
+          "tool_provider": "claude_code"
+        },
+        "valid": true
+      },
+      "name": "repo-only-context",
+      "wire": {
+        "envelope_version": 1,
+        "host_id": "host-1",
+        "lineage_status": "unknown",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "repo_id": "repo-1",
+        "tool_provider": "claude_code"
+      }
+    },
+    {
+      "expect": {
+        "cache_keys": {
+          "agent": null,
+          "host": [
+            "host-1"
+          ],
+          "project_worktree": [
+            "wt-1"
+          ],
+          "session": null,
+          "turn_task": null
+        },
+        "display_ids": {
+          "host_id": "host_id:80f1cc7c"
+        },
+        "narrowest_attributable_scope": "unknown",
+        "round_trip": {
+          "envelope_version": 1,
+          "host_id": "host-1",
+          "lineage_status": "unknown",
+          "observed_at": "2026-10-24T12:00:00.000Z",
+          "repo_id": "repo-1",
+          "tool_provider": "claude_code",
+          "worktree_id": "wt-1"
+        },
+        "valid": true
+      },
+      "name": "worktree-over-repo",
+      "wire": {
+        "envelope_version": 1,
+        "host_id": "host-1",
+        "lineage_status": "unknown",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "repo_id": "repo-1",
+        "tool_provider": "claude_code",
+        "worktree_id": "wt-1"
+      }
+    },
+    {
+      "expect": {
+        "cache_keys": {
+          "agent": [
+            "host-1",
+            "claude_code",
+            " Sess/ID:ü-1  ",
+            "a:b/c"
+          ],
+          "host": [
+            "host-1"
+          ],
+          "project_worktree": null,
+          "session": [
+            "host-1",
+            "claude_code",
+            " Sess/ID:ü-1  "
+          ],
+          "turn_task": null
+        },
+        "display_ids": {
+          "agent_id": "agent_id:c50402dc",
+          "host_id": "host_id:80f1cc7c",
+          "provider_session_id": "provider_session_id:9f71833f"
+        },
+        "narrowest_attributable_scope": "agent",
+        "round_trip": {
+          "agent_id": "a:b/c",
+          "envelope_version": 1,
+          "host_id": "host-1",
+          "lineage_status": "unknown",
+          "observed_at": "2026-10-24T12:00:00.000Z",
+          "provider_session_id": " Sess/ID:ü-1  ",
+          "tool_provider": "claude_code"
+        },
+        "valid": true
+      },
+      "name": "verbatim-unicode-and-padding",
+      "wire": {
+        "agent_id": "a:b/c",
+        "envelope_version": 1,
+        "host_id": "host-1",
+        "lineage_status": "unknown",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "provider_session_id": " Sess/ID:ü-1  ",
+        "tool_provider": "claude_code"
+      }
+    },
+    {
+      "expect": {
+        "cache_keys": {
+          "agent": null,
+          "host": [
+            "host-1"
+          ],
+          "project_worktree": null,
+          "session": [
+            "host-1",
+            "claude_code",
+            "s-1"
+          ],
+          "turn_task": null
+        },
+        "display_ids": {
+          "host_id": "host_id:80f1cc7c",
+          "provider_session_id": "provider_session_id:999d71d9"
+        },
+        "narrowest_attributable_scope": "session",
+        "round_trip": {
+          "envelope_version": 1,
+          "host_id": "host-1",
+          "lineage_status": "unknown",
+          "observed_at": "2026-10-24T12:00:00.000Z",
+          "provider_session_id": "s-1",
+          "tool_provider": "claude_code"
+        },
+        "valid": true
+      },
+      "name": "unknown-field-ignored",
+      "wire": {
+        "cost_center_id": "cc-9",
+        "envelope_version": 1,
+        "host_id": "host-1",
+        "lineage_status": "unknown",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "provider_session_id": "s-1",
+        "tool_provider": "claude_code"
+      }
+    },
+    {
+      "expect": {
+        "cache_keys": {
+          "agent": null,
+          "host": [
+            "host-1"
+          ],
+          "project_worktree": null,
+          "session": [
+            "host-1",
+            "claude_code",
+            "s-2"
+          ],
+          "turn_task": null
+        },
+        "display_ids": {
+          "host_id": "host_id:80f1cc7c",
+          "provider_session_id": "provider_session_id:3fa2ec2d"
+        },
+        "narrowest_attributable_scope": "session",
+        "round_trip": {
+          "envelope_version": 1,
+          "host_id": "host-1",
+          "lineage_status": "unknown",
+          "observed_at": "2026-10-24T12:00:00.000Z",
+          "provider_session_id": "s-2",
+          "tool_provider": "claude_code"
+        },
+        "valid": true
+      },
+      "name": "session-2",
+      "wire": {
+        "envelope_version": 1,
+        "host_id": "host-1",
+        "lineage_status": "unknown",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "provider_session_id": "s-2",
+        "tool_provider": "claude_code"
+      }
+    },
+    {
+      "expect": {
+        "cache_keys": {
+          "agent": [
+            "host-1",
+            "claude_code",
+            "s-1",
+            "a-2"
+          ],
+          "host": [
+            "host-1"
+          ],
+          "project_worktree": null,
+          "session": [
+            "host-1",
+            "claude_code",
+            "s-1"
+          ],
+          "turn_task": null
+        },
+        "display_ids": {
+          "agent_id": "agent_id:bb3fab00",
+          "host_id": "host_id:80f1cc7c",
+          "provider_session_id": "provider_session_id:999d71d9"
+        },
+        "narrowest_attributable_scope": "agent",
+        "round_trip": {
+          "agent_id": "a-2",
+          "envelope_version": 1,
+          "host_id": "host-1",
+          "lineage_status": "unknown",
+          "observed_at": "2026-10-24T12:00:00.000Z",
+          "provider_session_id": "s-1",
+          "tool_provider": "claude_code"
+        },
+        "valid": true
+      },
+      "name": "agent-2",
+      "wire": {
+        "agent_id": "a-2",
+        "envelope_version": 1,
+        "host_id": "host-1",
+        "lineage_status": "unknown",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "provider_session_id": "s-1",
+        "tool_provider": "claude_code"
+      }
+    },
+    {
+      "expect": {
+        "cache_keys": {
+          "agent": null,
+          "host": [
+            "host-2"
+          ],
+          "project_worktree": null,
+          "session": [
+            "host-2",
+            "claude_code",
+            "s-1"
+          ],
+          "turn_task": null
+        },
+        "display_ids": {
+          "host_id": "host_id:662e8da9",
+          "provider_session_id": "provider_session_id:999d71d9"
+        },
+        "narrowest_attributable_scope": "session",
+        "round_trip": {
+          "envelope_version": 1,
+          "host_id": "host-2",
+          "lineage_status": "unknown",
+          "observed_at": "2026-10-24T12:00:00.000Z",
+          "provider_session_id": "s-1",
+          "tool_provider": "claude_code"
+        },
+        "valid": true
+      },
+      "name": "other-host",
+      "wire": {
+        "envelope_version": 1,
+        "host_id": "host-2",
+        "lineage_status": "unknown",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "provider_session_id": "s-1",
+        "tool_provider": "claude_code"
+      }
+    },
+    {
+      "expect": {
+        "cache_keys": {
+          "agent": null,
+          "host": [
+            "host-1"
+          ],
+          "project_worktree": null,
+          "session": null,
+          "turn_task": null
+        },
+        "display_ids": {
+          "host_id": "host_id:80f1cc7c"
+        },
+        "narrowest_attributable_scope": "unknown",
+        "round_trip": {
+          "envelope_version": 1,
+          "host_id": "host-1",
+          "lineage_status": "unknown",
+          "observed_at": "2026-10-24T12:00:00.000Z",
+          "provider_session_id": "",
+          "tool_provider": "claude_code"
+        },
+        "valid": true
+      },
+      "name": "empty-session-id",
+      "wire": {
+        "envelope_version": 1,
+        "host_id": "host-1",
+        "lineage_status": "unknown",
+        "observed_at": "2026-10-24T12:00:00.000Z",
+        "provider_session_id": "",
+        "tool_provider": "claude_code"
+      }
+    }
+  ],
+  "vectors_version": 1
+}

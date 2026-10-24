@@ -340,6 +340,17 @@ Truthful, matching the actual implementation — not aspirational copy:
   yourself, that writes a local file and makes no network call of its
   own — it is a self-report export tool, not telemetry, and it never
   decides on your behalf to send anything anywhere.
+- **Egress inventory:** [`docs/egress-inventory.md`](docs/egress-inventory.md)
+  lists every outbound pathway in this repository. In short: only
+  `crates/gateway` (opt-in, allowlisted upstream, default
+  `api.anthropic.com`) and `crates/extension` (loopback-literal webhooks)
+  hold network clients, and a test in `cargo test` fails if any other crate
+  gains a network dependency or socket/client code. Evidence export refuses
+  every transport except local-only for every profile; the corporate/personal
+  profile is a data stamp, not a network switch. There is no telemetry, update
+  check, or upload. Not enforced by Libra: Claude Code's own telemetry and
+  WebFetch (including `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`) are host
+  traffic that Libra neither reports nor controls today.
 - **Logs and receipts:** `daemon.log`
   (`crates/daemon/src/log.rs`) never receives raw prompt text or hook
   payload content. Execution receipts record structural facts (counts,

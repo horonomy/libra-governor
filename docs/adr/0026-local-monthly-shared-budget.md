@@ -151,8 +151,13 @@ Captures from the real host binary against a fake upstream are
 
 Only `crates/gateway` (upstream allowlist, default `api.anthropic.com`) and
 `crates/extension` (loopback literal only) may hold HTTP clients. Host
-telemetry and WebFetch are Claude Code's own traffic: `doctor` reports them,
-Libra does not enforce on them.
+telemetry and WebFetch are Claude Code's own traffic: Libra neither reports
+nor enforces them today; slice S8 (HORO-2217) adds `doctor` reporting of the
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` setting (reporting only).
+
+The full pathway table, what is enforced and what is not, is in
+[`docs/egress-inventory.md`](../egress-inventory.md); a static test
+(`crates/cli/tests/egress_static_guard.rs`) enforces the crate boundary.
 
 ### Retention and export (design intent; implemented in slices S4-S8)
 
