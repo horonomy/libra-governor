@@ -108,8 +108,9 @@ pub use economic_truth::{
 pub use estimate::{Estimate, ESTIMATOR_VERSION};
 pub use execution_event::{ExecutionEvent, ExecutionEventKind};
 pub use execution_identity::{
-    is_valid_tool_provider, ExecutionIdentity, ExecutionIdentityBuilder, ExecutionIdentityError,
-    LineageStatus, Scope, ScopeIdentityMissing, EXECUTION_IDENTITY_ENVELOPE_VERSION,
+    is_valid_tool_provider, redacted_display_id, ExecutionIdentity, ExecutionIdentityBuilder,
+    ExecutionIdentityError, LineageStatus, Scope, ScopeIdentityMissing,
+    EXECUTION_IDENTITY_ENVELOPE_VERSION,
 };
 pub use execution_outcome::ExecutionOutcome;
 pub use execution_plan::{ExecutionPlan, PlanId};
@@ -131,13 +132,14 @@ pub use progressive::{
     RUNTIME_DECISION_SCHEMA_VERSION,
 };
 pub use quota_window::{
-    calendar_month_bounds, decode_provider_snapshot, decode_quota_window, AlignedPeriod,
-    BlockingStatus, BucketState, CreditNamespace, DecodedProviderSnapshot, DecodedQuotaWindow,
-    EntitlementSource, GaugeFreshness, GaugeReading, GaugeState, IanaTimeZone, IndeterminateReason,
-    OutstandingHold, PeriodState, PoolId, ProviderAccount, ProviderSnapshot, QuotaAmount,
-    QuotaEvidence, QuotaScope, QuotaSubject, QuotaUnit, QuotaUsage, QuotaWindow, QuotaWindowError,
-    QuotaWindowId, Relief, ResetWeekday, StaleReason, WallClockTime, WindowEvaluation, WindowKind,
-    WindowState, WorkingHours, WorkingHoursError, QUOTA_WINDOW_SCHEMA_VERSION,
+    calendar_month_bounds, decode_provider_snapshot, decode_quota_window, format_local_rfc3339,
+    AlignedPeriod, BlockingStatus, BucketState, CreditNamespace, DecodedProviderSnapshot,
+    DecodedQuotaWindow, EntitlementSource, GaugeFreshness, GaugeReading, GaugeState, IanaTimeZone,
+    IndeterminateReason, OutstandingHold, PeriodState, PoolId, ProviderAccount, ProviderSnapshot,
+    QuotaAmount, QuotaEvidence, QuotaScope, QuotaSubject, QuotaUnit, QuotaUsage, QuotaWindow,
+    QuotaWindowError, QuotaWindowId, Relief, ResetWeekday, StaleReason, WallClockTime,
+    WindowEvaluation, WindowKind, WindowState, WorkingHours, WorkingHoursError,
+    QUOTA_WINDOW_SCHEMA_VERSION,
 };
 pub use regime::{
     CacheClass, DimensionUnavailable, DimensionValue, RegimeBasis, RegimeComparison,

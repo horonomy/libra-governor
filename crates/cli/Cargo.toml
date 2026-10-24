@@ -38,6 +38,9 @@ trusted-principal = ["libra-governor-daemon/trusted-principal"]
 
 [dev-dependencies]
 tempfile.workspace = true
+# Test-only (HORO-2219): makes a ledger's schema look behind, to prove the
+# read-only paths refuse instead of migrating.
+rusqlite.workspace = true
 # Test-only (HORO-1768 PR-C): cross-checks the real launch gate's observed
 # admission/occupancy against `pacing-gate`'s independent simulation
 # harness in `tests/launch_live_occupancy_consistency.rs`. Never used from

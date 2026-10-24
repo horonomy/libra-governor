@@ -35,6 +35,7 @@ mod reservation;
 mod resource_account;
 mod session;
 mod shared_pool;
+mod shared_pool_retention;
 mod store;
 mod transaction;
 mod write;
@@ -69,6 +70,10 @@ pub use shared_pool::{
     SharedPoolReserveOutcome, SharedPoolReserveRequest, SharedPoolSessionUsage,
     SharedPoolSettleOutcome, SourcedAdmission,
 };
+pub use shared_pool_retention::{
+    ChargeSourceTotals, PoolExport, PoolExportExecutor, PoolPruneDetail, PruneDisposition,
+    PruneReport, PruneRequest, RetentionError,
+};
 pub use store::{LedgerStore, APPEND_ONLY_TRIGGERS};
 pub use write::DOGFOOD_PROFILE_ENV_VAR;
 
@@ -77,6 +82,10 @@ pub use write::DOGFOOD_PROFILE_ENV_VAR;
 pub enum LedgerError {
     #[error("transaction state unconfirmed; retry durable replay lookup")]
     TransactionUnconfirmed,
+    /// A read-only open found a schema version other than this build's
+    /// latest; a read-only handle cannot migrate it.
+    #[error("ledger schema version {found} is not the expected {expected}; open it with the daemon or a writing command first")]
+    SchemaNotCurrent { found: i64, expected: i64 },
     #[error("inconsistent execution association")]
     InvalidExecutionAssociation,
     #[error("sqlite error: {0}")]

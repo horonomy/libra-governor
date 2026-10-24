@@ -144,6 +144,7 @@ mod presentation;
 mod quota_cmd;
 mod quota_observation_cmd;
 mod run_cmd;
+mod shared_budget_cmd;
 mod statusline;
 mod statusline_provider;
 #[cfg(feature = "trusted-principal")]
@@ -196,6 +197,8 @@ Usage:
   libra-governor metered-pool settle --reservation <uuid> --owner <owner> --session <session-id> [--actual <n>]
   libra-governor metered-pool release --reservation <uuid> --owner <owner> --session <session-id>
   libra-governor metered-pool status --owner <owner> --pool <alias>
+  libra-governor shared-budget prune --keep-months <n> --time-zone <IANA> [--apply]
+  libra-governor shared-budget export --period <YYYY-MM> [--out <file>] [--time-zone <IANA>] [--raw-ids] [--overwrite]
 
 Global options:
   -h, --help     Print this help and exit
@@ -280,6 +283,7 @@ fn main() {
         ["run", ..] => std::process::exit(run_cmd::run(&args[1..])),
         ["launch", "status"] => std::process::exit(launch_cmd::status()),
         ["metered-pool", ..] => std::process::exit(metered_pool_cmd::run(&args[1..])),
+        ["shared-budget", ..] => std::process::exit(shared_budget_cmd::run(&args[1..])),
         ["economics", "explain", sel, value]
             if matches!(
                 *sel,

@@ -23,7 +23,7 @@
 //!   shared-pool need this campaign actually has.
 
 mod calendar;
-pub use calendar::calendar_month_bounds;
+pub use calendar::{calendar_month_bounds, format_local_rfc3339};
 pub(crate) use calendar::{local_year_month, next_working_instant};
 pub use calendar::{WorkingHours, WorkingHoursError};
 mod evaluate;
