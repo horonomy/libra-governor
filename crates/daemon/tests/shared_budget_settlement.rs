@@ -819,9 +819,10 @@ fn a_tail_charge_and_its_watermark_are_written_atomically_and_a_replay_heals() {
         at: Some(at(50)),
         message_ids: vec!["m".into()],
     };
+    let owner = principal();
     let req = || SharedPoolChargeRequest {
         pool_id: &pool,
-        principal_id: &principal(),
+        principal_id: &owner,
         session_id: "s1",
         amount: 40,
         unit: &libra_governor_domain::QuotaUnit::UsdCents,
@@ -1911,9 +1912,9 @@ fn settle_tail_refuses_foreign_and_unmeasurable_transcripts_without_charging() {
         other => panic!("{other:?}"),
     }
     // A lane that was never admitted, an empty session, a relative path.
-    assert_eq!(
-        tail_charged(&tail(&mut fx, "never-admitted", &s(&tx))),
-        (0, false)
+    expect_refused(
+        tail(&mut fx, "never-admitted", &s(&tx)),
+        SharedBudgetRefusal::NoSettledLane,
     );
     expect_refused(
         tail(&mut fx, "", &s(&tx)),
