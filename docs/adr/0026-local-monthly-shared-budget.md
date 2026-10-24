@@ -19,7 +19,8 @@ The daemon re-reads the file on every decision (see *Daemon behaviour delivered 
 **S5 (HORO-2196, HORO-2190) delivers settlement**: the turn hold is settled
 at `Stop` from priced, session-bound transcript usage, and a subagent's
 transcript is charged by `ChargeAgentTranscript` (see *Settlement delivered
-in S5*). `PROTOCOL_VERSION` is 21. The S6 Claude Code hook gate and the S10
+in S5*). `PROTOCOL_VERSION` is 22 (v22 is HORO-2246's `TranscriptReady`
+probe). The S6 Claude Code hook gate and the S10
 retention/export commands landed on `main` separately and are recorded in
 their own commits and in *Retention and export* below.
 **S7 (HORO-2216) delivers the installer and the settlement hooks**:
@@ -27,6 +28,10 @@ their own commits and in *Retention and export* below.
 entries beside the original three, and `hook subagent-stop` /
 `hook session-end` send `ChargeAgentTranscript` / `SettleTail` (see
 *Installer and settlement hooks delivered in S7*).
+**HORO-2246 fixes the flush lag at `Stop`**: the `Stop` hook now waits,
+bounded and never denying, until the daemon reports the turn's transcript
+readable before it settles (see *Flush lag at Stop*); SettleTail's
+description below is corrected.
 **S8 (HORO-2217) delivers the operator surfaces**: `libra-governor
 shared-budget status [--json]`, a budget segment on the legacy statusline,
 and the shared-budget checks in `doctor` (see *Status, statusline and doctor
@@ -324,8 +329,10 @@ the subagent path is trusted; S8 re-verifies):
    millisecond inversions (`.033` then `.032`), timestamp-less lines
    (`atis-latch`, `last-prompt`, `cost-state`, `mode`), and a systematic
    flush lag: at `Stop` the turn's final `end_turn` line is often not yet in
-   the file, and at `SubagentStop` a subagent's file may hold no assistant
-   line yet. Multi-second inversions are covered by a ten-minute slack; larger
+   the file (on 2.1.306 `-p` the whole turn appears about 70 ms after the
+   hook is dispatched, measured in *Flush lag at Stop*), and at
+   `SubagentStop` a subagent's file may hold no assistant line yet.
+   Multi-second inversions are covered by a ten-minute slack; larger
    inversions are not measured.
 5. Repeated `message.id` across content blocks - **confirmed**: split lines
    with identical usage.
@@ -364,8 +371,13 @@ flushed later is not recovered. A `message.id` whose blocks straddle the
 watermark is protected by the persisted id set; if an id aged out of that
 bounded set, or a host omits ids, tail blocks may be counted again (an
 over-count, the safe direction). Inversions larger than the slack can hide
-newer records. The last message of a session is lost unless something runs
-after the final Stop: see `SettleTail`.
+newer records. A turn whose `Stop` could not read the transcript is settled at
+the flat hold and is **never re-measured**: its late lines are either behind
+the next lower bound (no earlier mark: lost, the hold already covers them) or
+re-counted on top of the hold by the next `Stop` (an earlier mark exists: an
+over-count). `SettleTail` does not change that (see below). The `Stop` hook's
+bounded wait ([*Flush lag at Stop*](#flush-lag-at-stop-horo-2246)) exists so
+that this rarely happens.
 
 **Settled at the hold amount, `usage_known=false`, never zero:** no
 transcript path; missing, unreadable, truncated-below-the-watermark or
@@ -413,7 +425,7 @@ already-charged, so a later measurement books only the excess.
 
 **`SettleTail { session_id, transcript_path }`** (for `SessionEnd`, wired by
 S7, delivered). Charges the main-transcript records past the lane's watermark that no
-`Stop` counted (the final message of a session) as a settled `agent_absent`
+`Stop` **counted** as a settled `agent_absent`
 row (`charge_source = turn_hold`, `usage_known = true`) with the same
 binding, de-duplication, future-bound and watermark; idempotent; nothing is
 charged when nothing is measurable (a tail has no hold to fall back to; the
@@ -422,7 +434,17 @@ response flags `unmeasured`/`binding_mismatch`). It is refused with
 (a session never admitted or settled under this budget must not be billed its
 whole history); its lower bound is the same as a `Stop`'s: the lane's
 watermark, else the latest settle time (never the earliest hold, since
-earlier unmeasured settlements were already booked at the hold amount). The charge row and its watermark are written in **one ledger
+earlier unmeasured settlements were already booked at the hold amount).
+**What it does and does not recover.** The lower bound is the newest *measured*
+mark. A `Stop` settled at the flat hold writes no mark, so with no earlier mark
+the bound is that settlement's instant, and a line the host flushed late but
+stamped before it is behind the bound: SettleTail charges 0 for it. That is
+deliberate, not a gap: the hold already booked that turn, so recovering the
+line would charge it twice. SettleTail therefore recovers only records after the
+last measured mark, in practice the lines a measured `Stop` left behind (a
+message flushed after that `Stop` read). Earlier wording that it recovers "the
+final message of a session" was wrong for a flat-hold settlement, and a
+real-host run (HORO-2246) showed 0c for it every time. The charge row and its watermark are written in **one ledger
 transaction** (`charge_shared_with_watermark`), so a crash cannot leave a
 charge without its mark; an identical replay of a row that lacks a mark
 adopts it. `turn_hold` is reused for the source
@@ -455,15 +477,105 @@ id, path or content).
   remaining hold. Proposed mitigation: an `event_time` horizon clamp so a
   charge older than the retained pools is dropped or booked to a fixed
   archive row, and keeping watermark rows out of the prune.
-- Flush lag still costs a flat hold when an entire Stop window is not yet
-  flushed (it settles at the hold amount); the next Stop recovers the records
-  but the hold was already booked (an over-count).
+- Flush lag costs a flat hold when an entire Stop window is still unflushed
+  after the `Stop` hook's bounded wait (it settles at the hold amount, an
+  over-count that is not reconciled later). The wait makes this rare on the
+  observed host; see *Flush lag at Stop* for the measurement and residuals.
 - The post-`/compact` transcript is unverified.
 
 **Not done in S5** (S7 delivered the installer and `SessionEnd` wiring, S8
 the `status` command and `doctor` checks): no gateway path (S11). `Finalize` itself returns
 nothing about the settlement; it is observable through `Status`, the ledger
 and the log.
+
+### Flush lag at Stop (HORO-2246)
+
+**Problem.** Claude Code writes its transcript asynchronously. A `Stop`
+settlement that reads at once usually finds an absent file (first turn of a
+session) or no new lines (resumed session) and books the flat turn hold
+(`transcript_unreadable` / `no_usage_in_window`). A real-host run on 2.1.306
+(HORO-2193 real-host evidence, F1) had 8 of 14 settlements fall back, each at
+the default `turn_hold_usd_cents` of 1000 ($10) instead of about one cent.
+
+**Measurement** (`TestOwnedLive`: real `claude` 2.1.306 with `-p` inside a
+network-deny Seatbelt profile, isolated HOME and state dir, dummy key, fake
+local upstream; 36 `Stop` and 4 `SubagentStop` events over 12 fresh sessions,
+6 resumed pairs, 4 tool turns and 4 subagent spawns). Pre-fix run: a recorder
+polling the transcript saw the turn's final assistant line **p50 66 ms, p90 71
+ms, max 189 ms** after the daemon's read at `Stop` (36 samples; three of them
+179-189 ms, eleven are upper bounds because the recorder started after the file
+had landed, so the true lag is at most that). The whole turn appears at once,
+so there is no partial state to wait through. A subagent's final line appeared
+about 82-88 ms after its `SubagentStop` dispatch. No event was still
+unreadable after 8 s. Before the fix **36 of 36** `Stop` settlements fell back
+to the flat hold (26 `transcript_unreadable`, 10 `no_usage_in_window`; $360.04
+settled); after it **0 of 36** did ($0.44). Post-fix, the hook's own wait until
+the daemon first reported the turn readable was min 8 ms, median 74 ms, p90 82
+ms, max 99 ms over 34 waits (it includes up to 25 ms of poll granularity),
+which is the added `Stop`-hook wall time; none gave up at the cap. The fake upstream answers instantly and the runs are
+`-p`, not an interactive TTY; neither is evidence for real latency or
+interactive flush timing.
+
+**Design: a bounded wait on the hook side, decided by the daemon.**
+`hook stop` (Claude Code only, and only when `shared-budget.json` exists)
+polls a new read-only request, `SharedBudgetRequest::TranscriptReady`
+(protocol v22), before it sends the unchanged `Finalize`:
+
+- *The daemon defines "ready".* It reuses the settlement's own lane lookup
+  and windowed, session-bound reader, so the hook never opens a transcript
+  (HORO-1725 stays true). `ready = false` only for `Unreadable` and
+  `NoUsageInWindow`, the two outcomes a host that has not written yet
+  produces. Everything else answers `ready = true` at once, genuine problems
+  included (mismatch, unverified, unpriced, malformed, future-stamped, scan
+  cap, no pending hold, invalid file): a later probe would not change what
+  `Finalize` books, so waiting would only delay the hook.
+- *Read-only.* The handler takes `&LedgerStore`, writes no row and moves no
+  `Status` counter (a test compares the whole ledger and the counters around
+  repeated probes).
+- *The daemon is never occupied.* It is a single-threaded serial loop, so a
+  wait inside it would stall every other session. Each probe is its own short
+  connection, closed before the hook sleeps (5 ms doubling to 25 ms). A test
+  shows another session's `Admit` answered while a `Stop` hook is still
+  waiting.
+- *Never denies.* Every way out ends in the unchanged `Finalize`: ready, the
+  cap, a daemon that is down, too old (an unknown request is an error answer),
+  slow (a probe has 400 ms) or refusing. Only prompt admission denies.
+- *Bounded.* The cap is 1.5 s (about 20x the measurement) and the installed
+  `Stop` entry carries no timeout. `LIBRA_GOVERNOR_STOP_FLUSH_WAIT_MS`
+  overrides it: `0` disables the wait, larger values are clamped to 5000.
+- *Unchanged elsewhere.* No budget file: no probe, no connect. Codex: not
+  involved. `SubagentStop` is not waited on: its delta charge and the `Stop`
+  sweep already absorb the lag.
+
+**Why not reconcile the booked hold later (B).** The measurement shows a
+tight lag, not a persistent gap, so a short wait removes the cause. A
+reconciliation would have to edit a closed row (or add a compensating row)
+keyed to the original settlement while keeping the S5 watermark, id-set and
+future-stamp rules free of double counts, which is a large new surface for a
+loss the wait already avoids. It stays unbuilt; revisit it only if an
+interactive host shows lags beyond the cap.
+
+**Residuals (all over-counts, none under-count).**
+
+- A transcript still unflushed at the cap (a stalled host, a lag above 1.5 s),
+  or a hook the host kills while it waits (then no `Finalize` is sent at all
+  and the hold stays held until its TTL; a later `Stop` measures that turn's
+  lines once), books the flat hold and is not reconciled. Each such event costs
+  up to `turn_hold_usd_cents` minus the real spend.
+- A partly flushed turn (for example only a tool call so far) answers
+  `ready` and settles on what is there; the remaining lines are counted by the
+  next `Stop`, not lost.
+- Interactive (TTY) flush timing, `/compact` summarizers and a daemon older
+  than protocol v22 (probe fails, no wait) are unmeasured or unwaited.
+
+**Operator implication: `turn_hold_usd_cents`.** The default of 1000 ($10) is
+the price of every residual fallback above and, on a host that does not flush
+in time, of every turn. With the wait, a normal turn books its measured cost;
+the hold remains the upper bound that admission reserves, and the amount
+booked when a turn cannot be measured. Set it near the real cost of one of
+your own turns (and no lower than the dearest turn you expect, because an
+unmeasured expensive turn is under-counted by the difference). Do not rely on
+a large hold to hide flush lag; the wait is the fix.
 
 ### Installer and settlement hooks delivered in S7
 
