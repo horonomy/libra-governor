@@ -128,6 +128,10 @@ pub enum SharedBudgetRefusal {
     KeyConflict,
     /// The period's pool exists in a unit other than USD cents.
     PoolUnitMismatch,
+    /// `SettleTail` for a session with no settled hold and no watermark
+    /// under this budget: there is nothing to continue from, and charging
+    /// the whole transcript history would be wrong.
+    NoSettledLane,
 }
 
 /// State reported by `Check`.
@@ -282,6 +286,14 @@ pub struct SharedBudgetStatus {
     /// could not be de-duplicated.
     #[serde(default)]
     pub id_less_records: u64,
+    /// Transcript lines of another session (or another agent's file) that
+    /// were ignored rather than charged.
+    #[serde(default)]
+    pub foreign_lines: u64,
+    /// Subagent files a `Stop` sweep deferred to the next `Stop` because the
+    /// per-sweep byte budget was spent.
+    #[serde(default)]
+    pub sweep_deferred_files: u64,
 }
 
 /// The response to a [`SharedBudgetRequest`] (embedded in
@@ -541,6 +553,8 @@ mod tests {
             unmeasured_settlements: 4,
             unmeasured_charges: 5,
             id_less_records: 6,
+            foreign_lines: 7,
+            sweep_deferred_files: 8,
         })
         .unwrap();
         let obj = status.as_object_mut().unwrap();
@@ -551,6 +565,8 @@ mod tests {
             "unmeasured_settlements",
             "unmeasured_charges",
             "id_less_records",
+            "foreign_lines",
+            "sweep_deferred_files",
         ] {
             obj.remove(k);
         }
@@ -564,6 +580,54 @@ mod tests {
                 back.unmeasured_charges
             ),
             (0, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn settle_tail_request_and_outcome_round_trip() {
+        let req = SharedBudgetRequest::SettleTail {
+            session_id: "s".into(),
+            transcript_path: "/x/s.jsonl".into(),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["op"], "settle_tail");
+        assert_eq!(
+            serde_json::from_value::<SharedBudgetRequest>(json).unwrap(),
+            req
+        );
+        assert!(serde_json::from_str::<SharedBudgetRequest>(
+            r#"{"op":"settle_tail","session_id":"s","transcript_path":"/p","amount":1}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<SharedBudgetRequest>(
+            r#"{"op":"settle_tail","session_id":"s"}"#
+        )
+        .is_err());
+
+        let out = SharedBudgetOutcome::TailSettled {
+            reservation_id: None,
+            pool_id: Some("metered:local-budget/monthly-2027-01".into()),
+            amount_charged_usd_cents: 600,
+            already_charged: false,
+            remaining_usd_cents: 99_000,
+            overrun_usd_cents: 0,
+            unmeasured: false,
+            unpriced: true,
+            transcript_unverified: false,
+            binding_mismatch: true,
+        };
+        let json = serde_json::to_value(&out).unwrap();
+        assert_eq!(json["outcome"], "tail_settled");
+        assert_eq!(
+            serde_json::from_value::<SharedBudgetOutcome>(json).unwrap(),
+            out
+        );
+        let refused = SharedBudgetOutcome::Refused {
+            reason: SharedBudgetRefusal::NoSettledLane,
+        };
+        assert_eq!(
+            serde_json::to_value(&refused).unwrap()["reason"],
+            "no_settled_lane"
         );
     }
 }

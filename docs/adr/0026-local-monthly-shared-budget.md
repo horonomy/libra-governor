@@ -219,7 +219,12 @@ window and never downward. The actual may exceed the hold: the overrun is
 recorded unclamped and later `Admit`s are refused while `remaining < hold`.
 One API message written as several content-block lines (same `message.id`,
 identical `usage`, `apiBlockIndex` 0, 1, ...) is counted once per window and
-across windows (see *Window watermark*); an assistant record with all-zero
+across windows (see *Window watermark*). Within a window usage is the
+per-tier **maximum across all occurrences** of an id, however far apart; across
+windows a persisted id is skipped by id alone, so a streaming partial with a
+smaller usage that is counted first and a larger final usage flushed later
+would be under-counted (a residual; real Anthropic ids are unique per message
+and usage is identical across the blocks on 2.1.306). An assistant record with all-zero
 usage is free whatever its model; a counted record with no `message.id` is
 its own message and is reported in `Status.id_less_records`.
 
@@ -243,13 +248,31 @@ infer ownership.
 
 | Window | Result |
 |---|---|
-| all records present and equal | charged |
-| any record present and **different** (session B's hook given A's file) | foreign spend is **never imported**; the lane hold is settled at the **hold amount**, `usage_known=false`, reason `binding_mismatch`, the watermark moves to now (so the same file is not judged again by every later Stop), `transcript_binding_mismatches++`. A mismatch is a flagged conservative settle, not an omission; the spend is counted by its true session's own Stop |
-| otherwise any record missing/unreadable field | settle the hold at the **hold amount**, `usage_known=false`, `transcript_unverified++` |
+| every usage line is this session's | charged |
+| some lines name **another** session, some are this session's | the foreign lines are **ignored** (counted in `Status.foreign_lines`, never priced or imported); this lane's own lines are priced normally and the watermark advances only to the newest **own** counted record |
+| usage lines exist but **none** is this session's (session B's hook handed A's file) | foreign spend is never imported; the lane hold is settled at the **hold amount**, `usage_known=false`, reason `binding_mismatch`, `transcript_binding_mismatches++`. The watermark does **not** move (it never jumps to now), so the lane's own earlier unmeasured records are not skipped; foreign lines older than the mark are excluded by timestamp and newer ones are ignored at no cost. A mismatch is a flagged conservative settle, not an omission; the spend is counted by its true session's own Stop |
+| any usage line whose session field is absent / unreadable | the line could be ours: settle the hold at the **hold amount**, `usage_known=false`, `transcript_unverified++` |
 | a usage count that is not a non-negative integer | `usage_malformed`: the hold amount, `usage_known=false` (never dropped silently) |
+| a record stamped later than `now + 5 min` | `future_timestamp`: see *Future-stamped records* |
 
-One foreign record makes the whole window a mismatch; a window is never
-charged partially.
+A subagent file follows the same rule with the per-line `agentId` as a second
+binding: lines of another session or another agent are ignored; a non-empty
+file with **no** own usage line takes the unmeasured fallback once per family,
+flagged `binding_mismatch`.
+
+**Future-stamped records.** A record stamped later than `now + 5 minutes`
+(clock skew, a bad line, a hostile same-user file) is inconsistent: it is not
+counted, and a watermark is never stored later than that bound (nor with a
+year outside 2000-2200). A window containing one settles at the **hold
+amount**, `usage_known=false`, reason `future_timestamp`; the watermark
+advances at most to the newest in-bound own record, and the offending
+`message.id`s are remembered so the same lines do not flag every later
+window (a future line with no `message.id` flags every window it appears in,
+at the flat hold, until the clock passes it). As defence in depth,
+`shared_lane_watermark` ignores any stored mark later than that row's
+`settled_at` plus ten minutes, so an already-poisoned row cannot hide later
+records. `SettleTail` applies the same bound and charges nothing for such a
+window.
 
 **Evidence status of the field names: CONFIRMED on Claude Code 2.1.306
 (2026-10-24)** against a real binary (isolated HOME, fake loopback
@@ -300,8 +323,14 @@ settle time of the latest settled hold, else the oldest hold's creation; a
 window that counts nothing keeps the previous mark. Because the host
 flushes asynchronously, a record stamped before a Stop is routinely written
 after it; a wall-clock watermark would lose it for good, this one counts it
-at the next Stop. Two consecutive Stops never count a record twice, and a
-**crashed turn** (no Stop) is measured by the next Stop while the abandoned
+at the next Stop. A record the host flushed before a window's Stop is not
+counted by the next window (the mark is the newest counted record). Windows
+that cannot be measured (unpriced, malformed, unverified, scan-capped,
+future-stamped, mismatched) write a NULL mark, so the next window rescans
+those records and counts them again (an over-count on top of the flat hold:
+the safe direction); and one persistently unpriced, malformed or unverified
+record keeps every later window on the flat hold until it ages past the
+watermark slack or a mark is written. A **crashed turn** (no Stop) is measured by the next Stop while the abandoned
 hold is reclaimed by the existing TTL sweep. A late `Stop` after the hold
 expired still settles in the hold's own row and period.
 
@@ -344,8 +373,12 @@ parent + subagent never double count (pinned by fixture tests).
 
 *Stop sweep.* A subagent's file lags its own `SubagentStop`, so every
 `Finalize` also visits `<transcript_path minus .jsonl>/subagents/agent-*.jsonl`
-(at most 64 files, regular files only) and charges each file's delta through
-the same logic. A file with nothing measurable yet is **skipped** by the
+(at most 64 regular files) and charges each file's delta through the same
+logic. A sweep reads at most 128 MiB of subagent files in total; files past
+that are deferred to the next `Stop` (`Status.sweep_deferred_files`). A file
+whose `(size, mtime)` is unchanged since its last sweep is skipped (daemon
+memory only; a restart re-checks each file once, which the delta logic makes
+harmless). A file with nothing measurable yet is **skipped** by the
 sweep (not billed the fallback); a genuine problem still takes it.
 
 *Unmeasured subagent fallback* (missing/unreadable/relative path, over the
@@ -361,9 +394,16 @@ already-charged, so a later measurement books only the excess.
 S7). Charges the main-transcript records past the lane's watermark that no
 `Stop` counted (the final message of a session) as a settled `agent_absent`
 row (`charge_source = turn_hold`, `usage_known = true`) with the same
-binding, de-duplication and watermark; idempotent; nothing is charged when
-nothing is measurable (a tail has no hold to fall back to; the response
-flags `unmeasured`/`binding_mismatch`). `turn_hold` is reused for the source
+binding, de-duplication, future-bound and watermark; idempotent; nothing is
+charged when nothing is measurable (a tail has no hold to fall back to; the
+response flags `unmeasured`/`binding_mismatch`). It is refused with
+`no_settled_lane` unless the lane already has a settled hold or a watermark
+(a session never admitted or settled under this budget must not be billed its
+whole history); its lower bound is the lane's watermark, else the lane's
+earliest hold. The charge row and its watermark are written in **one ledger
+transaction** (`charge_shared_with_watermark`), so a crash cannot leave a
+charge without its mark; an identical replay of a row that lacks a mark
+adopts it. `turn_hold` is reused for the source
 because the column's CHECK constraint cannot take a new value without a table
 rebuild; the row is distinguishable as a charge row (`is_charge = 1`) and by
 its `tail:` idempotency key.

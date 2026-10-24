@@ -68,7 +68,9 @@ use libra_governor_protocol::{
 use crate::shared_budget_file::{
     ConfigDrift, LoadedSharedBudget, SharedBudgetConfig, SharedBudgetFileState, SoftLimits,
 };
-use crate::usage::priced::{observe_priced, PricedObservation, ReadMode, BUDGET_SCAN_CAP_BYTES};
+use crate::usage::priced::{
+    observe_priced, PricedObservation, ReadMode, BUDGET_SCAN_CAP_BYTES, FUTURE_SKEW,
+};
 use crate::usage::UsageUnavailable;
 
 /// How long a turn hold lives without a heartbeat. Each tool event renews
@@ -147,6 +149,10 @@ pub struct SharedBudgetRuntime {
     live: Mutex<Live>,
     clock: Arc<dyn Clock>,
     telemetry: Mutex<Telemetry>,
+    /// `(size, mtime)` of each subagent file as of its last sweep, keyed
+    /// `(session, agent)`. Process memory only: a restart re-checks every
+    /// file once, which the delta logic makes harmless.
+    sweep_seen: Mutex<std::collections::HashMap<(String, String), (u64, i128)>>,
 }
 
 /// At most this many unpriced model ids are remembered for `Status`.
@@ -164,6 +170,8 @@ struct Telemetry {
     unmeasured_settlements: u64,
     unmeasured_charges: u64,
     id_less_records: u64,
+    foreign_lines: u64,
+    sweep_deferred_files: u64,
 }
 
 /// A model id from a transcript, reduced to a safe, bounded display token:
@@ -204,6 +212,7 @@ impl SharedBudgetRuntime {
             live: Mutex::new(live),
             clock: Arc::new(SystemClock),
             telemetry: Mutex::new(Telemetry::default()),
+            sweep_seen: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -768,6 +777,7 @@ pub fn charge(
             charge_source,
             event_time,
             usage_known: true,
+            watermark: None,
         },
     )
 }
@@ -783,6 +793,8 @@ struct BookedCharge<'a> {
     event_time: Option<&'a str>,
     /// False for a conservative placeholder (an unmeasured subagent).
     usage_known: bool,
+    /// Written in the same ledger transaction as the row (a tail charge).
+    watermark: Option<&'a SettleWatermark>,
 }
 
 /// Validates and books `charge` into the right period's pool. The single
@@ -801,6 +813,7 @@ fn book_charge(
         charge_source,
         event_time,
         usage_known,
+        watermark,
     } = charge;
     if let Err(reason) = validate_identity(session_id, agent_id) {
         return Ok(refused(reason));
@@ -869,18 +882,21 @@ fn book_charge(
         }
         _ => attribution_for(agent_id, charge_source),
     };
-    let outcome = ledger.charge_shared(SharedPoolChargeRequest {
-        pool_id: &pool_id,
-        principal_id: &principal(),
-        session_id,
-        amount: amount_usd_cents,
-        unit: &QuotaUnit::UsdCents,
-        idempotency_key: key,
-        now,
-        attribution,
-        capacity_source: source(cfg),
-        usage_known,
-    });
+    let outcome = ledger.charge_shared_with_watermark(
+        SharedPoolChargeRequest {
+            pool_id: &pool_id,
+            principal_id: &principal(),
+            session_id,
+            amount: amount_usd_cents,
+            unit: &QuotaUnit::UsdCents,
+            idempotency_key: key,
+            now,
+            attribution,
+            capacity_source: source(cfg),
+            usage_known,
+        },
+        watermark,
+    );
     let outcome = match outcome {
         Ok(o) => o,
         Err(LedgerError::QuotaUnitMismatch { .. }) => {
@@ -1187,6 +1203,7 @@ pub fn settle_turn(
                         ReadMode::ParentWindow {
                             after,
                             counted_ids: &counted_ids,
+                            horizon: now + FUTURE_SKEW,
                         },
                         session_id,
                         &cfg.pricing_overrides.table(),
@@ -1195,33 +1212,48 @@ pub fn settle_turn(
                 };
                 match observation {
                     PricedObservation::Priced(window) => {
-                        if window.id_less_records > 0 {
-                            rt.note(|t| t.id_less_records += window.id_less_records);
-                        }
+                        rt.note(|t| {
+                            t.id_less_records += window.id_less_records;
+                            t.foreign_lines += window.foreign_lines;
+                        });
                         (
                             Some(window.cents),
                             None,
                             Some(SettleWatermark {
-                                at: window.last_event_time,
+                                // In bound by construction; the year check
+                                // keeps a pathological stamp out of storage.
+                                at: window
+                                    .last_event_time
+                                    .filter(|t| EVENT_YEARS.contains(&t.year())),
                                 message_ids: merged_ids(&previous_ids, &window.message_ids),
                             }),
                         )
                     }
-                    // Foreign spend is never imported, but the turn is not free
-                    // either: the hold amount is booked, flagged, and the
-                    // watermark moves to now so the same foreign file is not
-                    // judged again by every later Stop.
+                    // Every usage line named another session: nothing here is
+                    // this lane's spend, and none of it is imported. The turn
+                    // is not free either, so the hold amount is booked,
+                    // flagged. The watermark does not move: it only ever
+                    // advances to the lane's OWN counted records.
                     PricedObservation::SessionMismatch => {
                         rt.note(|t| t.binding_mismatches += 1);
-                        (
-                            None,
-                            Some("binding_mismatch"),
-                            Some(SettleWatermark {
-                                at: Some(now),
-                                message_ids: previous_ids.clone(),
-                            }),
-                        )
+                        (None, Some("binding_mismatch"), None)
                     }
+                    // A record stamped beyond now + skew cannot be trusted
+                    // and must never become the watermark: the window books
+                    // the hold, the mark advances at most to the newest
+                    // in-bound own record, and the offending ids are
+                    // remembered so they do not flag every later window.
+                    PricedObservation::FutureTimestamp {
+                        newest_in_bound,
+                        message_ids,
+                    } => (
+                        None,
+                        Some("future_timestamp"),
+                        Some(SettleWatermark {
+                            at: newest_in_bound.filter(|t| EVENT_YEARS.contains(&t.year())),
+                            message_ids: merged_ids(&previous_ids, &message_ids),
+                        }),
+                    ),
                     PricedObservation::SessionUnverified => {
                         rt.note(|t| t.unverified += 1);
                         (None, Some("transcript_unverified"), None)
@@ -1389,14 +1421,17 @@ fn charge_transcript_inner(
         mismatch: bool,
     }
     let (measured, flags): (Option<(u64, Option<OffsetDateTime>)>, Flags) = match observation {
-        PricedObservation::Priced(w) => (
-            Some((w.cents, w.last_event_time)),
-            Flags {
-                unpriced: false,
-                unverified: false,
-                mismatch: false,
-            },
-        ),
+        PricedObservation::Priced(w) => {
+            rt.note(|t| t.foreign_lines += w.foreign_lines);
+            (
+                Some((w.cents, w.last_event_time)),
+                Flags {
+                    unpriced: false,
+                    unverified: false,
+                    mismatch: false,
+                },
+            )
+        }
         // Foreign spend is never imported, but a subagent is not free
         // either: the unmeasured fallback is charged (once per family) and
         // the mismatch counted.
@@ -1411,7 +1446,7 @@ fn charge_transcript_inner(
                 },
             )
         }
-        PricedObservation::MalformedUsage => (
+        PricedObservation::MalformedUsage | PricedObservation::FutureTimestamp { .. } => (
             None,
             Flags {
                 unpriced: false,
@@ -1511,6 +1546,7 @@ fn charge_transcript_inner(
             charge_source: ChargeSource::SubagentTranscript,
             event_time: event_time.as_deref(),
             usage_known,
+            watermark: None,
         },
     )?;
     Ok(Some(match outcome {
@@ -1573,6 +1609,25 @@ pub fn sweep_subagent_transcripts(
     session_id: &str,
     transcript_path: &str,
 ) -> usize {
+    sweep_with_budget(ledger, rt, session_id, transcript_path, SWEEP_BYTE_BUDGET)
+}
+
+/// Bytes of subagent files one `Finalize` sweep may read in total. Files
+/// past it are deferred to the next `Stop` (counted in
+/// `Status.sweep_deferred_files`), so a session with many large subagent
+/// transcripts cannot make every `Stop` read gigabytes.
+pub const SWEEP_BYTE_BUDGET: u64 = 128 * 1024 * 1024;
+
+/// [`sweep_subagent_transcripts`] with an explicit byte budget.
+pub fn sweep_with_budget(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    session_id: &str,
+    transcript_path: &str,
+    byte_budget: u64,
+) -> usize {
+    use std::os::unix::fs::MetadataExt;
+
     let Some(stem) = transcript_path.strip_suffix(".jsonl") else {
         return 0;
     };
@@ -1599,19 +1654,59 @@ pub fn sweep_subagent_transcripts(
     files.sort();
     files.truncate(MAX_SWEEP_FILES);
     let mut charged = 0;
+    let mut spent: u64 = 0;
+    let mut deferred: u64 = 0;
     for (agent, path) in files {
         let Some(path) = path.to_str() else { continue };
-        if let Ok(Some(SharedBudgetOutcome::TranscriptCharged {
-            amount_charged_usd_cents,
-            ..
-        })) = charge_transcript_inner(ledger, rt, session_id, Some(&agent), path, true)
-        {
-            if amount_charged_usd_cents > 0 {
-                charged += 1;
+        let Ok(meta) = std::fs::metadata(path) else {
+            continue;
+        };
+        let stamp = (
+            meta.len(),
+            i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
+        );
+        let key = (session_id.to_string(), agent.clone());
+        let unchanged = rt
+            .sweep_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            == Some(&stamp);
+        if unchanged {
+            continue;
+        }
+        if spent.saturating_add(stamp.0) > byte_budget {
+            deferred += 1;
+            continue;
+        }
+        spent = spent.saturating_add(stamp.0);
+        match charge_transcript_inner(ledger, rt, session_id, Some(&agent), path, true) {
+            Ok(Some(SharedBudgetOutcome::TranscriptCharged {
+                amount_charged_usd_cents,
+                ..
+            })) => {
+                if amount_charged_usd_cents > 0 {
+                    charged += 1;
+                }
+                remember_swept(rt, key, stamp);
             }
+            Ok(None) => remember_swept(rt, key, stamp),
+            // A denial (invalid config) or an error is retried next Stop.
+            _ => {}
         }
     }
+    if deferred > 0 {
+        rt.note(|t| t.sweep_deferred_files += deferred);
+    }
     charged
+}
+
+fn remember_swept(rt: &SharedBudgetRuntime, key: (String, String), stamp: (u64, i128)) {
+    let mut seen = rt.sweep_seen.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() >= 4096 {
+        seen.clear();
+    }
+    seen.insert(key, stamp);
 }
 
 /// Handles `SharedBudgetRequest::SettleTail` (HORO-2196). See the request.
@@ -1665,9 +1760,35 @@ pub fn settle_tail(
         ExecutorKind::AgentAbsent,
         OWNER_POOL_PREFIX,
     )?;
-    // A lane that was never admitted has no budget history to continue.
-    let Some((after, previous_ids)) = lane_window(ledger, session_id, &holds)? else {
-        return Ok(posture(TailFlags::default(), None, 0, false));
+    // A tail continues a lane that has settled under this budget. A session
+    // that was never admitted, or whose holds never settled, has no
+    // watermark to continue from, and charging "everything past nothing"
+    // would bill its whole transcript history.
+    let persisted = ledger.shared_lane_watermark(
+        &principal(),
+        session_id,
+        None,
+        ExecutorKind::AgentAbsent,
+        OWNER_POOL_PREFIX,
+    )?;
+    let has_settled_hold = holds.iter().any(|h| h.state == ReservationState::Settled);
+    if persisted.is_none() && !has_settled_hold {
+        return Ok(refused(SharedBudgetRefusal::NoSettledLane));
+    }
+    // Lower bound: the lane's watermark, else the lane's earliest hold.
+    let (after, previous_ids) = match persisted {
+        Some(SettleWatermark {
+            at: Some(at),
+            message_ids,
+        }) => (at, message_ids),
+        _ => (
+            holds
+                .iter()
+                .map(|h| h.created_at)
+                .min()
+                .ok_or(SharedBudgetError::Internal("a settled lane has no hold"))?,
+            Vec::new(),
+        ),
     };
     let path = std::path::Path::new(transcript_path);
     if !path.is_absolute() {
@@ -1687,6 +1808,7 @@ pub fn settle_tail(
         ReadMode::ParentWindow {
             after,
             counted_ids: &counted_ids,
+            horizon: now + FUTURE_SKEW,
         },
         session_id,
         &cfg.pricing_overrides.table(),
@@ -1694,17 +1816,26 @@ pub fn settle_tail(
     );
     let flags = match observation {
         PricedObservation::Priced(window) => {
-            let Some(last) = window.last_event_time else {
+            let Some(last) = window
+                .last_event_time
+                .filter(|t| EVENT_YEARS.contains(&t.year()))
+            else {
                 return Ok(posture(TailFlags::default(), None, 0, false));
             };
             if window.cents == 0 {
                 return Ok(posture(TailFlags::default(), None, 0, false));
             }
-            if window.id_less_records > 0 {
-                rt.note(|t| t.id_less_records += window.id_less_records);
-            }
+            rt.note(|t| {
+                t.id_less_records += window.id_less_records;
+                t.foreign_lines += window.foreign_lines;
+            });
             let key = format!("tail:{}|{}|{}", lp(session_id), rfc(after), rfc(last));
-            let event_time = EVENT_YEARS.contains(&last.year()).then(|| rfc(last));
+            let event_time = rfc(last);
+            let mark = SettleWatermark {
+                at: Some(last),
+                message_ids: merged_ids(&previous_ids, &window.message_ids),
+            };
+            // The charge and its mark are one ledger transaction.
             let outcome = book_charge(
                 ledger,
                 rt,
@@ -1715,8 +1846,9 @@ pub fn settle_tail(
                     amount_usd_cents: window.cents,
                     key: &key,
                     charge_source: ChargeSource::TurnHold,
-                    event_time: event_time.as_deref(),
+                    event_time: Some(&event_time),
                     usage_known: true,
+                    watermark: Some(&mark),
                 },
             )?;
             return Ok(match outcome {
@@ -1728,33 +1860,18 @@ pub fn settle_tail(
                     remaining_usd_cents,
                     overrun_usd_cents,
                     ..
-                } => {
-                    // The mark is written after the row; a retry finds the
-                    // same row by its key and writes the same mark.
-                    ledger.record_shared_watermark(
-                        reservation_id,
-                        &SettleWatermark {
-                            at: Some(last),
-                            message_ids: merged_ids(&previous_ids, &window.message_ids),
-                        },
-                    )?;
-                    SharedBudgetOutcome::TailSettled {
-                        reservation_id: Some(reservation_id),
-                        pool_id: Some(pool_id),
-                        amount_charged_usd_cents: if already_charged {
-                            0
-                        } else {
-                            amount_usd_cents
-                        },
-                        already_charged,
-                        remaining_usd_cents,
-                        overrun_usd_cents,
-                        unmeasured: false,
-                        unpriced: false,
-                        transcript_unverified: false,
-                        binding_mismatch: false,
-                    }
-                }
+                } => SharedBudgetOutcome::TailSettled {
+                    reservation_id: Some(reservation_id),
+                    pool_id: Some(pool_id),
+                    amount_charged_usd_cents: if already_charged { 0 } else { amount_usd_cents },
+                    already_charged,
+                    remaining_usd_cents,
+                    overrun_usd_cents,
+                    unmeasured: false,
+                    unpriced: false,
+                    transcript_unverified: false,
+                    binding_mismatch: false,
+                },
                 other => other,
             });
         }
@@ -1782,7 +1899,9 @@ pub fn settle_tail(
                 ..TailFlags::default()
             }
         }
-        PricedObservation::MalformedUsage | PricedObservation::Unavailable(_) => TailFlags {
+        PricedObservation::FutureTimestamp { .. }
+        | PricedObservation::MalformedUsage
+        | PricedObservation::Unavailable(_) => TailFlags {
             unmeasured: true,
             ..TailFlags::default()
         },
@@ -1846,6 +1965,8 @@ pub fn status(
         unmeasured_settlements: 0,
         unmeasured_charges: 0,
         id_less_records: 0,
+        foreign_lines: 0,
+        sweep_deferred_files: 0,
     };
     {
         let t = rt.telemetry.lock().unwrap_or_else(|e| e.into_inner());
@@ -1855,6 +1976,8 @@ pub fn status(
         report.unmeasured_settlements = t.unmeasured_settlements;
         report.unmeasured_charges = t.unmeasured_charges;
         report.id_less_records = t.id_less_records;
+        report.foreign_lines = t.foreign_lines;
+        report.sweep_deferred_files = t.sweep_deferred_files;
     }
     let SharedBudgetFileState::Valid(cfg) = &effective.state else {
         return Ok(report);

@@ -609,7 +609,7 @@ fn a_transcript_whose_session_cannot_be_verified_settles_the_hold_unmeasured() {
 }
 
 #[test]
-fn a_window_mixing_equal_and_foreign_sessions_is_refused_whole() {
+fn a_window_mixing_own_and_foreign_lines_prices_only_the_own_lines() {
     let mut fx = Fx::new(Some(&cfg()), BASE);
     fx.admit_hold("s1");
     let tx = fx.path().join("s1.jsonl");
@@ -617,7 +617,7 @@ fn a_window_mixing_equal_and_foreign_sessions_is_refused_whole() {
         &tx,
         &[
             rec(10, "m1", SONNET, mi(1), Some("s1"), false),
-            rec(20, "m2", SONNET, mi(1), Some("someone-else"), false),
+            rec(20, "m2", SONNET, mi(9), Some("someone-else"), false),
         ],
     );
     fx.clock.set(at(60));
@@ -625,12 +625,350 @@ fn a_window_mixing_equal_and_foreign_sessions_is_refused_whole() {
     let st = fx.status();
     assert_eq!(
         totals(&st),
-        (1_000, 0),
-        "never imported partially; the hold is booked"
+        (300, 0),
+        "own 300 only; the foreign 2700 is not imported"
     );
-    assert_eq!(st.transcript_binding_mismatches, 1);
+    assert_eq!(
+        st.transcript_binding_mismatches, 0,
+        "not a mismatch: there are own lines"
+    );
+    assert_eq!(st.foreign_lines, 1);
+    assert_eq!(fx.lane("s1")[0].usage_known, Some(true));
+    // The mark is the newest OWN record, not the foreign one at 20.
+    let mark = fx
+        .ledger
+        .shared_lane_watermark(
+            &principal(),
+            "s1",
+            None,
+            ExecutorKind::AgentAbsent,
+            OWNER_PREFIX,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(mark.at, Some(at(10)));
 }
 
+#[test]
+fn an_all_foreign_window_books_the_flagged_hold_and_does_not_move_the_mark() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let mine = fx.path().join("b.jsonl");
+    fx.admit_hold("sB");
+    write_lines(&mine, &[rec(10, "b1", SONNET, mi(1), Some("sB"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize("sB", Some(&s(&mine)));
+    let mark_of = |fx: &Fx| {
+        fx.ledger
+            .shared_lane_watermark(
+                &principal(),
+                "sB",
+                None,
+                ExecutorKind::AgentAbsent,
+                OWNER_PREFIX,
+            )
+            .unwrap()
+            .unwrap()
+            .at
+    };
+    assert_eq!(mark_of(&fx), Some(at(10)));
+
+    // B's next hook is handed A's transcript.
+    let theirs = fx.path().join("a.jsonl");
+    write_lines(&theirs, &[rec(70, "a1", SONNET, mi(5), Some("sA"), false)]);
+    fx.clock.set(at(65));
+    fx.admit_hold("sB");
+    fx.clock.set(at(80));
+    fx.finalize("sB", Some(&s(&theirs)));
+    let st = fx.status();
+    assert_eq!(
+        totals(&st),
+        (300 + 1_000, 0),
+        "A's 1500 is not imported; B pays the flat hold"
+    );
+    assert_eq!(st.transcript_binding_mismatches, 1);
+    assert_eq!(mark_of(&fx), Some(at(10)), "the mark did not jump to now");
+
+    // B's own records stamped between the old mark and now are NOT lost.
+    append_lines(&mine, &[rec(75, "b2", SONNET, mi(2), Some("sB"), false)]);
+    fx.clock.set(at(100));
+    fx.admit_hold("sB");
+    fx.clock.set(at(120));
+    fx.finalize("sB", Some(&s(&mine)));
+    assert_eq!(totals(&fx.status()), (300 + 1_000 + 600, 0));
+}
+
+// ---------------------------------------------------------------------
+// Future-stamped records (S1)
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_future_stamped_record_books_the_flagged_hold_and_never_poisons_the_watermark() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    fx.admit_hold("s1");
+    let tx = fx.path().join("s1.jsonl");
+    // Year ~2090: far past now + skew, inside the accepted year range.
+    write_lines(
+        &tx,
+        &[
+            rec(10, "m1", SONNET, mi(1), Some("s1"), false),
+            rec(2_000_000_000, "future", SONNET, mi(1), Some("s1"), false),
+        ],
+    );
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    let st = fx.status();
+    assert_eq!(totals(&st), (1_000, 0), "the hold, flagged; nothing priced");
+    assert_eq!(st.unmeasured_settlements, 1);
+    assert_eq!(fx.lane("s1")[0].usage_known, Some(false));
+    let mark = fx
+        .ledger
+        .shared_lane_watermark(
+            &principal(),
+            "s1",
+            None,
+            ExecutorKind::AgentAbsent,
+            OWNER_PREFIX,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        mark.at,
+        Some(at(10)),
+        "advanced only to the newest in-bound record"
+    );
+
+    // Normal records afterwards are counted; the future line is remembered
+    // and no longer flags the window.
+    fx.clock.set(at(100));
+    fx.admit_hold("s1");
+    append_lines(&tx, &[rec(110, "m2", SONNET, mi(2), Some("s1"), false)]);
+    fx.clock.set(at(150));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(totals(&fx.status()), (1_000 + 600, 0));
+    assert_eq!(fx.lane("s1")[1].usage_known, Some(true));
+}
+
+#[test]
+fn settle_tail_does_not_charge_a_future_stamped_record() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    fx.admit_hold("s1");
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    append_lines(
+        &tx,
+        &[rec(
+            2_000_000_000,
+            "future",
+            SONNET,
+            mi(5),
+            Some("s1"),
+            false,
+        )],
+    );
+    let used = fx.status().used_usd_cents;
+    match tail(&mut fx, "s1", &s(&tx)) {
+        SharedBudgetOutcome::TailSettled {
+            unmeasured,
+            amount_charged_usd_cents,
+            ..
+        } => assert!(unmeasured && amount_charged_usd_cents == 0),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(fx.status().used_usd_cents, used);
+}
+
+// ---------------------------------------------------------------------
+// SettleTail hardening (S3) and sweep budget (S5)
+// ---------------------------------------------------------------------
+
+#[test]
+fn settle_tail_refuses_a_session_with_no_settled_lane() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(9), Some("s1"), false)]);
+    // Never admitted.
+    expect_refused(
+        tail(&mut fx, "s1", &s(&tx)),
+        SharedBudgetRefusal::NoSettledLane,
+    );
+    // Admitted but the hold never settled: still nothing to continue from.
+    fx.admit_hold("s1");
+    expect_refused(
+        tail(&mut fx, "s1", &s(&tx)),
+        SharedBudgetRefusal::NoSettledLane,
+    );
+    assert_eq!(
+        totals(&fx.status()),
+        (0, 1_000),
+        "the whole history was not billed"
+    );
+}
+
+#[test]
+fn a_tail_charge_and_its_watermark_are_written_atomically_and_a_replay_heals() {
+    use libra_governor_ledger::{
+        CapacitySource, ExecutorAttribution, SettleWatermark, SharedPoolChargeOutcome,
+        SharedPoolChargeRequest,
+    };
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    fx.admit_hold("s1");
+    let pool = libra_governor_domain::PoolId("metered:local-budget/monthly-2027-01".into());
+    let mark = SettleWatermark {
+        at: Some(at(50)),
+        message_ids: vec!["m".into()],
+    };
+    let req = || SharedPoolChargeRequest {
+        pool_id: &pool,
+        principal_id: &principal(),
+        session_id: "s1",
+        amount: 40,
+        unit: &libra_governor_domain::QuotaUnit::UsdCents,
+        idempotency_key: "tail:k",
+        now: at(60),
+        attribution: ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+        capacity_source: CapacitySource::LocalConfigured { cap: 100_000 },
+        usage_known: true,
+    };
+    let lane = |fx: &Fx| {
+        fx.ledger
+            .shared_lane_watermark(
+                &principal(),
+                "s1",
+                None,
+                ExecutorKind::AgentAbsent,
+                OWNER_PREFIX,
+            )
+            .unwrap()
+    };
+    assert_eq!(lane(&fx), None);
+    let out = fx
+        .ledger
+        .charge_shared_with_watermark(req(), Some(&mark))
+        .unwrap();
+    assert!(matches!(out, SharedPoolChargeOutcome::Charged { .. }));
+    assert_eq!(
+        lane(&fx).unwrap().at,
+        Some(at(50)),
+        "row and mark landed together"
+    );
+    // An identical replay is a no-op and keeps the mark.
+    assert!(matches!(
+        fx.ledger
+            .charge_shared_with_watermark(req(), Some(&mark))
+            .unwrap(),
+        SharedPoolChargeOutcome::AlreadyCharged(_)
+    ));
+
+    // A row written WITHOUT a mark (an older build / crash window) adopts
+    // it on the replay.
+    let mut req2 = req();
+    req2.idempotency_key = "tail:k2";
+    fx.ledger.charge_shared(req2).unwrap();
+    let mut req3 = req();
+    req3.idempotency_key = "tail:k2";
+    let later = SettleWatermark {
+        at: Some(at(58)),
+        message_ids: vec![],
+    };
+    fx.ledger
+        .charge_shared_with_watermark(req3, Some(&later))
+        .unwrap();
+    assert_eq!(lane(&fx).unwrap().at, Some(at(58)));
+}
+
+#[test]
+fn a_poisoned_stored_watermark_far_past_its_row_is_ignored() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    fx.admit_hold("s1");
+    let tx = fx.path().join("s1.jsonl");
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    let id = fx.lane("s1")[0].id;
+    // An already-poisoned row (older build / hand edit): a mark years ahead.
+    fx.ledger
+        .record_shared_watermark(
+            id,
+            &libra_governor_ledger::SettleWatermark {
+                at: Some(at(2_000_000_000)),
+                message_ids: vec![],
+            },
+        )
+        .unwrap();
+    let lane = fx
+        .ledger
+        .shared_lane_watermark(
+            &principal(),
+            "s1",
+            None,
+            ExecutorKind::AgentAbsent,
+            OWNER_PREFIX,
+        )
+        .unwrap();
+    assert_eq!(lane, None, "the poisoned mark is not trusted");
+    // So the next window still counts real records.
+    fx.clock.set(at(100));
+    fx.admit_hold("s1");
+    append_lines(&tx, &[rec(110, "m2", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(150));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(fx.status().used_usd_cents, 600);
+}
+
+#[test]
+fn the_stop_sweep_respects_its_byte_budget_and_skips_unchanged_files() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let sid = "s1";
+    let main = fx.path().join(format!("{sid}.jsonl"));
+    let dir = fx.path().join(sid).join("subagents");
+    std::fs::create_dir_all(&dir).unwrap();
+    write_lines(&main, &[rec(10, "m1", SONNET, mi(1), Some(sid), false)]);
+    write_lines(
+        &dir.join("agent-a1.jsonl"),
+        &[sub_rec(12, "x", mi(1), sid, "a1")],
+    );
+    write_lines(
+        &dir.join("agent-a2.jsonl"),
+        &[sub_rec(13, "y", mi(1), sid, "a2")],
+    );
+
+    // A budget smaller than any file defers both.
+    let n = libra_governor_daemon::shared_budget::sweep_with_budget(
+        &mut fx.ledger,
+        &fx.config.shared_budget,
+        sid,
+        &s(&main),
+        10,
+    );
+    assert_eq!(n, 0);
+    let st = fx.status();
+    assert_eq!((st.used_usd_cents, st.sweep_deferred_files), (0, 2));
+
+    // With room, both are charged...
+    let n = libra_governor_daemon::shared_budget::sweep_with_budget(
+        &mut fx.ledger,
+        &fx.config.shared_budget,
+        sid,
+        &s(&main),
+        1 << 30,
+    );
+    assert_eq!(n, 2);
+    assert_eq!(fx.status().used_usd_cents, 600);
+
+    // ...and an unchanged file is skipped before the budget is even
+    // consulted (nothing is deferred again).
+    let n = libra_governor_daemon::shared_budget::sweep_with_budget(
+        &mut fx.ledger,
+        &fx.config.shared_budget,
+        sid,
+        &s(&main),
+        10,
+    );
+    assert_eq!(n, 0);
+    assert_eq!(fx.status().sweep_deferred_files, 2);
+}
 // ---------------------------------------------------------------------
 // Unpriced and unmeasurable windows settle conservatively
 // ---------------------------------------------------------------------

@@ -162,6 +162,11 @@ const MISSING_MODEL: &str = "<missing>";
 /// this can still hide newer records.
 pub const REORDER_SLACK: time::Duration = time::Duration::minutes(10);
 
+/// How far ahead of the daemon's clock a record may be stamped before it is
+/// treated as inconsistent. Covers ordinary skew; anything later never
+/// becomes a watermark.
+pub const FUTURE_SKEW: time::Duration = time::Duration::minutes(5);
+
 /// One cent in pico-dollars (10^-12 USD).
 const PICO_PER_CENT: u128 = 10_000_000_000;
 /// Prices are dollars per million tokens, i.e. micro-dollars per token;
@@ -179,6 +184,11 @@ pub enum ReadMode<'a> {
     ParentWindow {
         after: OffsetDateTime,
         counted_ids: &'a HashSet<String>,
+        /// The latest instant a record may carry: `now` plus
+        /// [`FUTURE_SKEW`]. A record stamped later is inconsistent (clock
+        /// skew, a bad line, a hostile file); counting it would push the
+        /// watermark ahead of real time and hide every later record.
+        horizon: OffsetDateTime,
     },
     /// A subagent's own file: every record, cumulative within that file.
     /// The file is the subagent's, so its records are counted whatever they
@@ -231,6 +241,9 @@ pub struct PricedWindow {
     /// The `message.id`s counted (sorted); becomes part of the next
     /// window's watermark.
     pub message_ids: Vec<String>,
+    /// Lines of another session (or, for a subagent file, another agent)
+    /// that were ignored: they belong to someone else's accounting.
+    pub foreign_lines: u64,
     /// Counted records that carried no `message.id`. Each is its own
     /// message (it cannot be deduplicated), so a host that omits ids would
     /// double count content blocks; surfaced so it is not silent.
@@ -246,8 +259,18 @@ pub enum PricedObservation {
     /// Sorted, de-duplicated model ids (raw, unsanitised -- the caller
     /// bounds and sanitises before showing them).
     UnpricedModels(Vec<String>),
-    /// A usage record named a different session.
+    /// Usage records exist but **none** is this session's: every one named
+    /// a different session. (Foreign lines mixed with own lines are simply
+    /// ignored; see [`PricedWindow::foreign_lines`].)
     SessionMismatch,
+    /// A record is stamped later than `now + FUTURE_SKEW`. Not counted; the
+    /// window cannot be trusted. `newest_in_bound` is the newest in-bound
+    /// own record seen, and `message_ids` the ids to remember (in-bound and
+    /// future) so the same lines do not poison every later window.
+    FutureTimestamp {
+        newest_in_bound: Option<OffsetDateTime>,
+        message_ids: Vec<String>,
+    },
     /// No record named a different session, but at least one could not be
     /// verified (field absent or not a string).
     SessionUnverified,
@@ -349,10 +372,12 @@ struct Accumulator {
     per_model: BTreeMap<String, Tiers>,
     records: u64,
     id_less_records: u64,
-    mismatch: bool,
+    foreign: u64,
     unverified: bool,
     untimed: bool,
     malformed: bool,
+    future: bool,
+    future_ids: Vec<String>,
     last_event_time: Option<OffsetDateTime>,
 }
 
@@ -440,10 +465,15 @@ fn visit_line(
     }
 
     // Binding is judged on usage records only: they are what would be
-    // charged.
+    // charged. A line of another session is not this lane's spend and is
+    // ignored (counted, not priced); a line whose field cannot be read
+    // could be ours, so the window is unverifiable.
     match record.session.and_then(Lenient::into_value) {
         Some(s) if s == expected_session => {}
-        Some(_) => acc.mismatch = true,
+        Some(_) => {
+            acc.foreign += 1;
+            return ControlFlow::Continue(());
+        }
         None => acc.unverified = true,
     }
     if let ReadMode::WholeFile {
@@ -455,7 +485,17 @@ fn visit_line(
             .and_then(Lenient::into_value)
             .is_some_and(|a| a != expected)
         {
-            acc.mismatch = true;
+            acc.foreign += 1;
+            return ControlFlow::Continue(());
+        }
+    }
+    if let (ReadMode::ParentWindow { horizon, .. }, Some(ts)) = (mode, timestamp) {
+        if ts > horizon {
+            acc.future = true;
+            if let Some(id) = message_id {
+                acc.future_ids.push(id);
+            }
+            return ControlFlow::Continue(());
         }
     }
     if matches!(mode, ReadMode::ParentWindow { .. }) && timestamp.is_none() {
@@ -498,9 +538,6 @@ fn visit_line(
 }
 
 fn finish(mut acc: Accumulator, table: &PricingTable) -> PricedObservation {
-    if acc.mismatch {
-        return PricedObservation::SessionMismatch;
-    }
     if acc.unverified {
         return PricedObservation::SessionUnverified;
     }
@@ -513,11 +550,24 @@ fn finish(mut acc: Accumulator, table: &PricingTable) -> PricedObservation {
     let distinct_turns = acc.by_id.len() as u64 + acc.id_less_records;
     let mut message_ids: Vec<String> = acc.by_id.keys().cloned().collect();
     message_ids.sort_unstable();
+    if acc.future {
+        message_ids.extend(acc.future_ids.drain(..));
+        message_ids.sort_unstable();
+        message_ids.dedup();
+        return PricedObservation::FutureTimestamp {
+            newest_in_bound: acc.last_event_time,
+            message_ids,
+        };
+    }
     for (_, (tiers, model)) in acc.by_id.drain() {
         acc.per_model.entry(model).or_default().add(tiers);
     }
     if distinct_turns == 0 {
-        return PricedObservation::Unavailable(UsageUnavailable::NoUsageInWindow);
+        return if acc.foreign > 0 {
+            PricedObservation::SessionMismatch
+        } else {
+            PricedObservation::Unavailable(UsageUnavailable::NoUsageInWindow)
+        };
     }
     match window_cost_cents(&acc.per_model, table) {
         Ok(cents) => PricedObservation::Priced(PricedWindow {
@@ -525,6 +575,7 @@ fn finish(mut acc: Accumulator, table: &PricingTable) -> PricedObservation {
             records: distinct_turns,
             last_event_time: acc.last_event_time,
             message_ids,
+            foreign_lines: acc.foreign,
             id_less_records: acc.id_less_records,
         }),
         Err(models) => PricedObservation::UnpricedModels(models),
@@ -618,6 +669,7 @@ mod tests {
             ReadMode::ParentWindow {
                 after: epoch_plus(after),
                 counted_ids: &HashSet::new(),
+                horizon: epoch_plus(4_000_000_000),
             },
             SESSION,
             &PricingTable::pinned(),
@@ -837,6 +889,7 @@ mod tests {
             ReadMode::ParentWindow {
                 after: epoch_plus(0),
                 counted_ids: &HashSet::new(),
+                horizon: epoch_plus(4_000_000_000),
             },
             SESSION,
             &table,
@@ -973,7 +1026,7 @@ mod tests {
     }
 
     #[test]
-    fn a_mixed_window_is_judged_as_a_whole_mismatch_outranks_unverified() {
+    fn foreign_lines_are_ignored_and_own_lines_are_priced() {
         let ok = line(
             10,
             "a",
@@ -986,20 +1039,79 @@ mod tests {
             12,
             "c",
             "claude-sonnet-4-5",
-            [1_000_000, 0, 0, 0],
+            [9_000_000, 0, 0, 0],
             &sid("sess-B"),
         );
+        // Own + foreign: only the own line is priced; the foreign one is
+        // counted, not charged.
+        let PricedObservation::Priced(w) = observe(&file(&[ok.clone(), other.clone()]), 0) else {
+            panic!("expected Priced");
+        };
+        assert_eq!((w.cents, w.foreign_lines), (300, 1));
+        // A line whose field cannot be read could be ours: unverifiable.
         assert_eq!(
             observe(&file(&[ok.clone(), none.clone()]), 0),
             PricedObservation::SessionUnverified
         );
         assert_eq!(
-            observe(&file(&[ok.clone(), other.clone()]), 0),
-            PricedObservation::SessionMismatch
+            observe(&file(&[ok, none, other]), 0),
+            PricedObservation::SessionUnverified
+        );
+    }
+
+    #[test]
+    fn a_future_stamped_record_is_not_counted_and_flags_the_window() {
+        let f = file(&[
+            line(
+                10,
+                "a",
+                "claude-sonnet-4-5",
+                [1_000_000, 0, 0, 0],
+                &sid(SESSION),
+            ),
+            line(
+                9_000_000_000,
+                "far",
+                "claude-sonnet-4-5",
+                [1_000_000, 0, 0, 0],
+                &sid(SESSION),
+            ),
+        ]);
+        let PricedObservation::FutureTimestamp {
+            newest_in_bound,
+            message_ids,
+        } = observe_priced(
+            f.path(),
+            ReadMode::ParentWindow {
+                after: epoch_plus(0),
+                counted_ids: &HashSet::new(),
+                horizon: epoch_plus(1_000),
+            },
+            SESSION,
+            &PricingTable::pinned(),
+            BUDGET_SCAN_CAP_BYTES,
+        )
+        else {
+            panic!("expected FutureTimestamp");
+        };
+        assert_eq!(newest_in_bound, Some(epoch_plus(10)));
+        assert_eq!(message_ids, vec!["a".to_string(), "far".to_string()]);
+        // Once its id is remembered, the same line no longer flags a window.
+        let ids: HashSet<String> = message_ids.into_iter().collect();
+        let again = observe_priced(
+            f.path(),
+            ReadMode::ParentWindow {
+                after: epoch_plus(10),
+                counted_ids: &ids,
+                horizon: epoch_plus(1_000),
+            },
+            SESSION,
+            &PricingTable::pinned(),
+            BUDGET_SCAN_CAP_BYTES,
         );
         assert_eq!(
-            observe(&file(&[ok, none, other]), 0),
-            PricedObservation::SessionMismatch
+            again,
+            PricedObservation::Unavailable(UsageUnavailable::NoUsageInWindow)
         );
     }
 
@@ -1116,6 +1228,7 @@ mod tests {
             ReadMode::ParentWindow {
                 after: epoch_plus(after),
                 counted_ids: &ids,
+                horizon: epoch_plus(4_000_000_000),
             },
             SESSION,
             &PricingTable::pinned(),

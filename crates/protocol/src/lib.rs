@@ -249,9 +249,14 @@ pub use messages::{
 /// is reachable.
 ///
 /// v21 (HORO-2196): shared-budget settlement. `SharedBudgetRequest` gained
-/// `ChargeAgentTranscript`, `SharedBudgetOutcome` gained
-/// `TranscriptCharged`, `SharedBudgetRefusal` gained
-/// `TranscriptSessionMismatch`, and `SharedBudgetStatus` gained the
-/// settlement telemetry fields. A v20 peer's decoder cannot parse the new
-/// variants, so a long-lived v20 daemon must be restarted after upgrading.
+/// `ChargeAgentTranscript` (a subagent transcript, charged by cumulative
+/// delta) and `SettleTail` (the main transcript's records after the last
+/// `Stop`); `SharedBudgetOutcome` gained `TranscriptCharged` (with a
+/// `binding_mismatch` flag) and `TailSettled`; `SharedBudgetRefusal` gained
+/// `NoSettledLane`; and `SharedBudgetStatus` gained the settlement
+/// telemetry fields (`unpriced_models`, `transcript_binding_mismatches`,
+/// `transcript_unverified`, `unmeasured_settlements`, `unmeasured_charges`,
+/// `id_less_records`, `foreign_lines`, `sweep_deferred_files`). A v20 peer's
+/// decoder cannot parse the new variants, so a long-lived v20 daemon must
+/// be restarted after upgrading.
 pub const PROTOCOL_VERSION: u32 = 21;
