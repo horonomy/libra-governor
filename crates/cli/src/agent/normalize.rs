@@ -58,6 +58,15 @@ pub enum NormalizeError {
 /// Parses `raw` into a [`NormalizedEvent`] for `entry`. See module docs.
 pub fn normalize(entry: EntryPoint, raw: &str) -> Result<NormalizedEvent, NormalizeError> {
     let value: serde_json::Value = serde_json::from_str(raw)?;
+    // serde's derived struct deserializers also accept a JSON array
+    // positionally, so `["s-1"]` would otherwise decode as session `s-1`:
+    // an identity read out of a payload that names no field at all.
+    if !value.is_object() {
+        return Err(<serde_json::Error as serde::de::Error>::custom(
+            "hook payload must be a JSON object",
+        )
+        .into());
+    }
     let hook_event_name = value.get("hook_event_name").and_then(|v| v.as_str());
 
     if let Some(name) = hook_event_name {
@@ -263,5 +272,22 @@ mod tests {
                 agent_id: Some("sub-1".to_string()),
             }
         );
+    }
+
+    #[test]
+    fn a_non_object_payload_is_malformed_not_positionally_decoded() {
+        for entry in [
+            EntryPoint::PromptSubmit,
+            EntryPoint::ToolCompleted,
+            EntryPoint::TurnCompleted,
+        ] {
+            for raw in [r#"["s-1"]"#, r#"["s-1","/repo","fix it"]"#, r#""s-1""#, "7"] {
+                let err = normalize(entry, raw).unwrap_err();
+                assert!(
+                    matches!(err, NormalizeError::Malformed(_)),
+                    "{entry:?} {raw}"
+                );
+            }
+        }
     }
 }
