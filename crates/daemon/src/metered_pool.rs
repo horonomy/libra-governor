@@ -46,6 +46,20 @@ fn rfc3339(t: OffsetDateTime) -> String {
         .expect("timestamps sourced from the ledger always format as RFC3339")
 }
 
+/// The local monthly shared budget's pool owner (ADR-0026) is mutated only
+/// through `Request::SharedBudget`. Every generic metered handler refuses
+/// it with the same reason the launch gate's reserved principal gets, so
+/// no `Reserve`, `Settle`, `Release` or `Status` can reach its pools.
+fn is_reserved_owner(owner: &str) -> bool {
+    owner == libra_governor_domain::LOCAL_BUDGET_OWNER
+}
+
+fn reserved_owner_refusal() -> MeteredPoolOutcome {
+    MeteredPoolOutcome::Refused {
+        reason: MeteredRefusal::InvalidPoolKey,
+    }
+}
+
 /// Arguments for [`handle_reserve`].
 pub struct MeteredReserveArgs<'a> {
     pub owner: &'a str,
@@ -76,6 +90,9 @@ pub fn handle_reserve(
     args: MeteredReserveArgs<'_>,
     now: OffsetDateTime,
 ) -> Result<MeteredPoolOutcome, LedgerError> {
+    if is_reserved_owner(args.owner) {
+        return Ok(reserved_owner_refusal());
+    }
     let owner_principal = PrincipalId(args.owner.to_string());
     let Ok(key) = MeteredPoolKey::new(&owner_principal, args.alias) else {
         return Ok(MeteredPoolOutcome::Refused {
@@ -244,6 +261,9 @@ pub fn handle_settle(
     actual: Option<u64>,
     now: OffsetDateTime,
 ) -> Result<MeteredPoolOutcome, LedgerError> {
+    if is_reserved_owner(owner) {
+        return Ok(reserved_owner_refusal());
+    }
     if let Err(refused) = require_metered_holder(ledger, reservation_id, owner, session_id)? {
         return Ok(refused);
     }
@@ -279,6 +299,9 @@ pub fn handle_release(
     session_id: &str,
     now: OffsetDateTime,
 ) -> Result<MeteredPoolOutcome, LedgerError> {
+    if is_reserved_owner(owner) {
+        return Ok(reserved_owner_refusal());
+    }
     if let Err(refused) = require_metered_holder(ledger, reservation_id, owner, session_id)? {
         return Ok(refused);
     }
@@ -304,6 +327,9 @@ pub fn handle_status(
     alias: &str,
     now: OffsetDateTime,
 ) -> Result<MeteredPoolOutcome, LedgerError> {
+    if is_reserved_owner(owner) {
+        return Ok(reserved_owner_refusal());
+    }
     let Ok(key) = MeteredPoolKey::new(&PrincipalId(owner.to_string()), alias) else {
         return Ok(MeteredPoolOutcome::Refused {
             reason: MeteredRefusal::InvalidPoolKey,

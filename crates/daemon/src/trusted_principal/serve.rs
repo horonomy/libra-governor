@@ -122,6 +122,12 @@ pub(crate) fn strip_agent_named_paths(request: &mut Request) {
         // `reservation_id` — see `crates/protocol/src/metered_pool.rs`.
         // No filesystem-path field exists here to strip.
         Request::MeteredPool { .. } => {}
+        // `SharedBudgetRequest` carries only opaque session/agent/prompt
+        // identifiers, an amount, an idempotency key and an RFC 3339
+        // event time -- no filesystem path. Trusted mode also runs with
+        // no shared-budget file, so every such request answers
+        // `not_configured`.
+        Request::SharedBudget { .. } => {}
     }
 }
 

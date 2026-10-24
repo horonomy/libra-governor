@@ -22,6 +22,7 @@ pub mod execution_owner;
 pub mod host_event;
 pub mod launch;
 pub mod metered_pool;
+pub mod shared_budget;
 pub use execution_owner::{
     ExecutionEffect, ExecutionOperation, ExecutionOwnerOutcome, ExecutionOwnerRequest,
     NativeExecutionContext,
@@ -33,6 +34,13 @@ pub use launch::{
 pub use metered_pool::{
     MeteredPoolOutcome, MeteredPoolRequest, MeteredPoolSessionUsage, MeteredPoolSnapshotStatus,
     MeteredPoolStatus, MeteredRefusal, METERED_POOL_ENFORCEMENT_SCOPE,
+};
+pub use shared_budget::{
+    SharedBudgetCheckState, SharedBudgetConfigDrift, SharedBudgetConfigState,
+    SharedBudgetConfigView, SharedBudgetDenyReason, SharedBudgetExecutorRow, SharedBudgetOutcome,
+    SharedBudgetPeriod, SharedBudgetRefusal, SharedBudgetRequest, SharedBudgetStatus,
+    SoftLimitScope, SoftLimitWarning, SHARED_BUDGET_BASIS, SHARED_BUDGET_GUARANTEE,
+    SHARED_BUDGET_SCOPE,
 };
 mod messages;
 pub mod wire;
@@ -230,4 +238,13 @@ pub use messages::{
 /// `deny_unknown_fields` decoder and would downgrade a turn-scoped task to
 /// a misleading 150,000 lifetime budget, so the shape change is a bump: a
 /// long-lived v18 daemon must be restarted after upgrading.
-pub const PROTOCOL_VERSION: u32 = 19;
+///
+/// v20 (HORO-2195): the local monthly shared budget. `Request` gained
+/// `SharedBudget` and `Response` gained the matching `SharedBudget`
+/// variant, which a v19 peer's `deny_unknown_fields` decoder cannot
+/// parse. Existing requests are unchanged; the generic `MeteredPool`
+/// request now refuses the `local-budget` owner (a behaviour change on an
+/// owner no earlier daemon could have provisioned). A long-lived v19
+/// daemon must be restarted after upgrading before shared-budget traffic
+/// is reachable.
+pub const PROTOCOL_VERSION: u32 = 20;

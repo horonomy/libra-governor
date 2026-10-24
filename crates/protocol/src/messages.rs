@@ -170,6 +170,12 @@ pub enum Request {
     MeteredPool {
         metered_pool: crate::MeteredPoolRequest,
     },
+    /// The local monthly shared-budget IPC (HORO-2195, ADR-0026): admit/
+    /// check/charge/status against a locally configured monthly USD cap.
+    /// See `crate::shared_budget` module docs.
+    SharedBudget {
+        shared_budget: crate::SharedBudgetRequest,
+    },
 }
 
 /// The signed portion of a `RecordOutcome` push that is NOT already a
@@ -966,6 +972,9 @@ pub enum Response {
     /// carries a full `MeteredPoolStatus` including a per-session
     /// breakdown.
     MeteredPool(Box<crate::MeteredPoolOutcome>),
+    /// Answers a `SharedBudget` request (HORO-2195). Boxed for the same
+    /// large-enum-variant reason as its siblings.
+    SharedBudget(Box<crate::SharedBudgetOutcome>),
     /// The daemon could not (or would not) answer the request — e.g. a
     /// protocol version mismatch, or an internal error it caught rather
     /// than let propagate as a crash.

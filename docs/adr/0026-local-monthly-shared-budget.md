@@ -9,11 +9,17 @@ Builds on [ADR-0023](0023-metered-shared-pool.md) and amends
 [ADR-0003](0003-gateway-enforcement-boundary.md) for the local budget only.
 Slice S2 delivers this record and `calendar_month_bounds`; later slices wire it.
 
-**Implementation status.** Only `calendar_month_bounds`, `LOCAL_BUDGET_OWNER`
-and `monthly_pool_alias` exist today. Everything else below is **design
-intent, implemented in slices S4-S8** (S4 daemon core, S5 settlement, S6
-hooks, S8 doctor/status) and S11 (gateway `governor_held`); it must not be
-read as shipped behaviour.
+**Implementation status.** `calendar_month_bounds`, `LOCAL_BUDGET_OWNER`,
+`monthly_pool_alias` and the ledger's local-capacity primitives (S2/S3) exist.
+**S4 (HORO-2195) delivers the daemon core**: `shared-budget.json` loading,
+`Request::SharedBudget` (`Admit`, `Check`, `ChargeAgent`, `Status`),
+admission against the locally configured cap, month rollover, the failure
+rows `config_invalid` and `clock_anomaly`, and the tool-event heartbeat.
+The daemon re-reads the file on every decision (see *Daemon behaviour delivered in S4*). `PROTOCOL_VERSION` is 20. Everything else below is **design intent
+implemented in later slices** (S5 settlement from transcripts, S6 hooks and
+the daemon-unreachable behaviour, S7 installer, S8 doctor/status, S11
+gateway `governor_held`); it must not be read as shipped behaviour. No real
+Claude Code host has exercised any of it: S4's evidence is `TestOwnedLive`.
 
 ## Context
 
@@ -135,11 +141,53 @@ Captures from the real host binary against a fake upstream are
 
 | Condition | Result |
 |---|---|
-| No shared-budget file | Pool not consulted; intended byte-exact with today (to be pinned by a test in slice S6, not yet tested) |
+| No shared-budget file | Pool not consulted; `SharedBudget` requests answer `not_configured` and write nothing (pinned at daemon level by `shared_budget_core.rs`; the hook-level byte-exact guarantee is slice S6) |
 | File present but invalid (parse, timezone, cap, version) | Deny `config_invalid` |
 | Clock anomaly: newest pool period is later than now's period | Deny `clock_anomaly` |
 | Daemon unreachable, file present | Deny at prompt admission; allow and log at PreToolUse |
 | Unpriced model | Settle at hold amount, `usage_known=false`, shown in `doctor` |
+
+### Daemon behaviour delivered in S4 (HORO-2195)
+
+**Hot reload, fail closed.** The daemon consults `shared-budget.json` on
+every `Admit`, `Check`, `ChargeAgent` and heartbeat (a stat, re-read when the
+file changed or was just modified), not only at start:
+
+| File after start | Result |
+|---|---|
+| Created | Enforced from the next decision |
+| Edited, valid | New cap applies to the next decision. A lower cap never revokes existing holds; it denies new ones while `remaining < hold` |
+| Edited, invalid or half-written | `config_invalid` (deny) until it is valid again; existing holds are kept |
+| Deleted | Treated as absent (`not_configured`): deleting the file is read as the operator removing the budget. `Status` shows `config_state: absent` and `config_changed_since_start: true` |
+
+**Trust boundary of the file.** Any process running as the same OS user can edit or delete `shared-budget.json` (or swap it with a same-size file that keeps an older mtime, which the `(mtime, size)` change detector does not notice until the next edit). The cap is therefore cooperative, not tamper-proof, consistent with the same-user boundary in ADR-0023.
+
+**Operator recovery from `clock_anomaly`.** A forward clock jump that created
+a pool for a later month makes every `Admit` and `Check` deny `clock_anomaly`
+until real time reaches that month. `Status` names it in
+`future_pool_detected`. Recovery: correct the system clock. If a pool was
+created by a clock that has since been corrected, there is no repair command
+yet (owned by S8's `shared-budget` tooling); the manual step is to stop the
+daemon and delete that month's `quota_pools` row (and its reservations) from
+`ledger.sqlite3` after confirming it holds no real spend. Until then the
+budget fails closed rather than guessing. Changing `time_zone` near a month
+edge can produce the same state for up to about a day, since the same instant
+may name a different month.
+
+**Charges.** `ChargeAgent` is idempotent across periods: a retry resolves to
+the pool of the first attempt, found by key across all local-budget pools. An
+event time in a later period than now is booked to the current period and
+returned with `event_time_clamped: true`, because the spend already happened;
+only years outside 2000-2200 are refused. One charge above ten times the
+monthly cap, or one that would push a pool total past a safe range, is refused
+(`amount_too_large`). Against an invalid file a charge records nothing and
+answers `config_invalid`; the S5 caller must retry or spool it.
+
+**Heartbeat and over-reservation.** A tool event renews the session's active
+holds in the current period's pool (it carries no agent id, so the lane cannot
+be preferred). Until S5 settles holds at Stop, a hold clears only by expiry
+and renewal, so a finished or subagent hold can stay reserved while tool
+events continue. This over-reserves; it never under-reserves.
 
 ### Egress inventory
 

@@ -1396,12 +1396,11 @@ fn one_oversized_settlement_permanently_locks_out_a_realistic_capacity_pool() {
 /// largest value `ensure_pool`'s overflow guard still accepts), two
 /// such settlements drive `SUM(settled_amount)` — computed fresh inside
 /// `settled_and_active_tx` — past `i64::MAX` and into a genuine SQLite
-/// integer-overflow runtime error, surfaced as `Err`, not merely a huge
-/// negative `remaining()`. Verified empirically (not assumed): SQLite's
-/// all-integer `sum()` aggregate raises `"integer overflow"` here; it
-/// does not silently wrap or promote to float the way `total()` would.
+/// integer-overflow runtime error in SQLite's all-integer `sum()`. This
+/// test originally pinned that error; HORO-2195 made the totals saturate
+/// (see the assertions below), so it now pins the non-failing behaviour.
 #[test]
-fn two_settlements_at_i64_max_capacity_overflow_sum_into_a_hard_error() {
+fn two_settlements_at_i64_max_capacity_saturate_the_sum_instead_of_erroring() {
     let mut store = LedgerStore::open_in_memory().unwrap();
     // i64::MAX (not u64::MAX): a capacity this large is itself rejected
     // by `checked_i64` (see `capacity_above_i64_max_is_rejected_not_wrapped`
@@ -1438,35 +1437,22 @@ fn two_settlements_at_i64_max_capacity_overflow_sum_into_a_hard_error() {
          nothing here rejects it before the damage (the eventual SUM overflow) is done"
     );
 
-    // Pinned to the behavior actually observed when writing this test
-    // (`rtk proxy cargo test ... -- --nocapture`): SQLite's integer
-    // `sum()` raises "integer overflow", surfaced as `LedgerError::Sqlite`.
-    let result = store.pool_admission(&pool_id(), now());
-    let err = result.expect_err(
-        "two i64::MAX settlements must drive pool_admission's SUM(settled_amount) into an \
-         integer-overflow error — if this starts returning Ok, the SUM behavior (or the \
-         settlement bound) has changed and this test's premise must be re-verified",
-    );
-    let message = format!("{err:?}");
+    // HORO-2195 changed this on purpose: the settled/active totals now
+    // saturate instead of surfacing SQLite's integer-overflow error, so
+    // one oversized row can no longer brick the pool for everyone. The
+    // overrun is visible (a deeply negative remaining), not an error.
+    let admission = store
+        .pool_admission(&pool_id(), now())
+        .unwrap()
+        .expect("pool exists");
+    assert_eq!(admission.settled, 2 * (i64::MAX as u64));
+    assert!(admission.remaining() < 0, "the overrun is reported");
+    let fresh_attempt = store
+        .reserve_shared(req(&pool_id(), &principal(3), "s3", 1, "k3", now(), 900))
+        .unwrap();
     assert!(
-        message.contains("overflow"),
-        "expected a SQLite integer-overflow error, got: {message}"
-    );
-
-    // And the pool is now PERMANENTLY unusable: the exact same call
-    // fails again, and so does a fresh, uninvolved reservation attempt —
-    // there is no recovery path through this API once two such receipts
-    // land.
-    let still_broken = store.pool_admission(&pool_id(), now());
-    assert!(
-        still_broken.is_err(),
-        "the pool stays bricked, not transiently"
-    );
-    let fresh_attempt =
-        store.reserve_shared(req(&pool_id(), &principal(3), "s3", 1, "k3", now(), 900));
-    assert!(
-        fresh_attempt.is_err(),
-        "an entirely unrelated, well-behaved caller is now also denied service against this pool"
+        matches!(fresh_attempt, SharedPoolReserveOutcome::Insufficient { .. }),
+        "an unrelated caller is refused for lack of capacity, not given an error"
     );
 }
 

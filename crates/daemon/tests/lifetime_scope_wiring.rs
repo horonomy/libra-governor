@@ -39,6 +39,7 @@ fn stored_lifetime_bounded_after_one_preflight(scope: LifetimeScope) -> i64 {
         extension_runtime: std::sync::OnceLock::new(),
         outcome_authority: None,
         launch_gate: None,
+        shared_budget: Default::default(),
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
     };
 
@@ -109,6 +110,7 @@ fn second_preflight_admission(
         extension_runtime: std::sync::OnceLock::new(),
         outcome_authority: None,
         launch_gate: None,
+        shared_budget: Default::default(),
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
     };
     let listener = libra_governor_daemon::bind_or_detect_running(&config.socket_path).unwrap();

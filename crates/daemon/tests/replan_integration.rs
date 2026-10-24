@@ -173,6 +173,7 @@ fn tool_call_count_material_deviation_triggers_a_replan_visible_in_status() {
 
         outcome_authority: None,
         launch_gate: None,
+        shared_budget: Default::default(),
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
     };
 
@@ -326,6 +327,7 @@ fn possible_tool_loop_streak_triggers_a_replan_before_the_count_threshold() {
 
         outcome_authority: None,
         launch_gate: None,
+        shared_budget: Default::default(),
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
     };
 
@@ -410,6 +412,7 @@ fn exhausting_the_auto_replan_budget_escalates_instead_of_replanning_again() {
 
         outcome_authority: None,
         launch_gate: None,
+        shared_budget: Default::default(),
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
     };
 

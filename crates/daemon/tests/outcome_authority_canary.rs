@@ -112,6 +112,7 @@ fn config(
         extension_runtime: std::sync::OnceLock::new(),
         outcome_authority,
         launch_gate: None,
+        shared_budget: Default::default(),
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
     }
 }

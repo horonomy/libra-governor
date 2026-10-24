@@ -160,6 +160,7 @@ impl Harness {
 
             outcome_authority: None,
             launch_gate: None,
+            shared_budget: Default::default(),
             progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
         };
         let ledger = LedgerStore::open(&config.ledger_path).unwrap();

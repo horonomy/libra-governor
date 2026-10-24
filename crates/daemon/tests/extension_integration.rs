@@ -91,6 +91,7 @@ fn base_config(dir: &Path, policy: Policy, extensions: Option<ExtensionConfig>) 
 
         outcome_authority: None,
         launch_gate: None,
+        shared_budget: Default::default(),
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
     }
 }

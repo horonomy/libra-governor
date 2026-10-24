@@ -73,7 +73,7 @@ pub fn run() {
     };
 
     let lifetime_scope = overrides.lifetime_scope();
-    let config = daemon_config(
+    let mut config = daemon_config(
         state_dir.join("daemon.sock"),
         state_dir.join("ledger.sqlite3"),
         log_path,
@@ -87,6 +87,11 @@ pub fn run() {
         overrides.extensions,
         overrides.launcher,
     );
+    // Read once, here, from its own file (never from config.json): the
+    // budget file's presence must not flip config.json-driven behaviour.
+    config.shared_budget =
+        libra_governor_daemon::shared_budget::SharedBudgetRuntime::load(&state_dir);
+    log_shared_budget_state(&config);
 
     let listener = match libra_governor_daemon::bind_or_detect_running(&config.socket_path) {
         Ok(listener) => listener,
@@ -138,6 +143,29 @@ pub fn run() {
     }
 }
 
+/// Records the shared-budget file state at start, so an invalid file is
+/// visible in `daemon.log` rather than only as denied admissions.
+fn log_shared_budget_state(config: &DaemonConfig) {
+    use libra_governor_daemon::shared_budget_file::SharedBudgetFileState;
+    match &config.shared_budget.loaded().state {
+        SharedBudgetFileState::Absent => {}
+        SharedBudgetFileState::Valid(cfg) => libra_governor_daemon::log::append_line(
+            &config.log_path,
+            &format!(
+                "daemon: shared budget active (cap {} usd cents/month, zone {})",
+                cfg.monthly_cap_usd_cents,
+                cfg.time_zone.as_str()
+            ),
+        ),
+        SharedBudgetFileState::Invalid(reason) => libra_governor_daemon::log::append_line(
+            &config.log_path,
+            &format!(
+                "daemon: shared-budget.json invalid -- admission denies config_invalid: {reason}"
+            ),
+        ),
+    }
+}
+
 /// Builds the one production [`DaemonConfig`] literal this crate
 /// constructs, hardcoding `outcome_authority: None` (HORO-1727 Decision
 /// 1 / ADR-0017 — see that field's own docs) and this crate's default
@@ -175,6 +203,9 @@ fn daemon_config(
         outcome_authority: None,
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
         launch_gate,
+        // Absent here; default-mode `run` loads its own file afterwards and
+        // trusted mode never reads state-dir configuration.
+        shared_budget: libra_governor_daemon::shared_budget::SharedBudgetRuntime::absent(),
     }
 }
 

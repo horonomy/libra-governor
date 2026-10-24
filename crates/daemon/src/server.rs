@@ -176,6 +176,11 @@ pub struct DaemonConfig {
     /// reason: not_enabled }` (ADR-0020: off by default). See
     /// `crate::launch_gate` module docs.
     pub launch_gate: Option<crate::launch_gate::LaunchGateConfig>,
+    /// The local monthly shared budget (HORO-2195, ADR-0026), loaded from
+    /// `<state_dir>/shared-budget.json` at start. `Default` is absent: the
+    /// shared-budget path is then never consulted and every other request
+    /// behaves exactly as before.
+    pub shared_budget: crate::shared_budget::SharedBudgetRuntime,
 }
 
 /// Default [`DaemonConfig::progressive_interval_secs`] — see that
@@ -845,6 +850,55 @@ pub(crate) fn dispatch(
                     log::append_line(&config.log_path, &format!("metered pool error: {e}"));
                     Response::Error {
                         message: "internal error handling metered pool request".to_string(),
+                    }
+                }
+            }
+        }
+        Request::SharedBudget { shared_budget } => {
+            use libra_governor_protocol::{SharedBudgetOutcome, SharedBudgetRequest};
+            let rt = &config.shared_budget;
+            let outcome = match shared_budget {
+                SharedBudgetRequest::Admit {
+                    session_id,
+                    agent_id,
+                    prompt_id,
+                } => crate::shared_budget::admit(
+                    ledger,
+                    rt,
+                    &session_id,
+                    agent_id.as_deref(),
+                    prompt_id.as_deref(),
+                ),
+                SharedBudgetRequest::Check {
+                    session_id,
+                    agent_id,
+                } => crate::shared_budget::check(ledger, rt, &session_id, agent_id.as_deref()),
+                SharedBudgetRequest::ChargeAgent {
+                    session_id,
+                    agent_id,
+                    amount_usd_cents,
+                    idempotency_key,
+                    charge_source,
+                    event_time,
+                } => crate::shared_budget::charge(
+                    ledger,
+                    rt,
+                    &session_id,
+                    agent_id.as_deref(),
+                    amount_usd_cents,
+                    &idempotency_key,
+                    charge_source,
+                    event_time.as_deref(),
+                ),
+                SharedBudgetRequest::Status {} => crate::shared_budget::status(ledger, rt)
+                    .map(|status| SharedBudgetOutcome::Status(Box::new(status))),
+            };
+            match outcome {
+                Ok(outcome) => Response::SharedBudget(Box::new(outcome)),
+                Err(e) => {
+                    log::append_line(&config.log_path, &format!("shared budget error: {e}"));
+                    Response::Error {
+                        message: "internal error handling shared budget request".to_string(),
                     }
                 }
             }
@@ -1692,6 +1746,12 @@ pub(crate) fn handle_tool_invoked(
     config: &DaemonConfig,
 ) -> Result<(), DaemonError> {
     let now = time::OffsetDateTime::now_utc();
+    // Best-effort keep-alive for the session's shared-budget holds. It runs
+    // before the early returns below (the local budget needs no
+    // pre-established session) and can never fail the tool event.
+    if let Err(e) = crate::shared_budget::heartbeat(ledger, &config.shared_budget, session_id) {
+        log::append_line(&config.log_path, &format!("shared budget heartbeat: {e}"));
+    }
     ledger.increment_tool_call_count(session_id)?;
     let same_tool_streak = ledger.record_tool_invocation(session_id, tool_name, now)?;
 
@@ -3026,6 +3086,7 @@ mod tests {
 
             outcome_authority: None,
             launch_gate: None,
+            shared_budget: Default::default(),
             progressive_interval_secs: DEFAULT_PROGRESSIVE_INTERVAL_SECS,
         }
     }

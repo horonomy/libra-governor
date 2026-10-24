@@ -23,6 +23,8 @@ pub mod paths;
 pub mod pidfile;
 pub mod recon;
 pub mod server;
+pub mod shared_budget;
+pub mod shared_budget_file;
 #[cfg(feature = "trusted-principal")]
 pub mod trusted_principal;
 pub mod usage;
