@@ -2280,3 +2280,326 @@ fn a_future_window_with_unpriced_in_bound_records_does_not_advance_the_mark() {
         "unpriced in-bound records are rescanned, not skipped"
     );
 }
+
+// ---------------------------------------------------------------------
+// HORO-2246: flush lag. The `Stop` hook polls `TranscriptReady` before it
+// sends `Finalize`; these tests pin what "ready" means, that a probe is
+// read-only, and that a late flush is measured once and never double
+// counted. Fixtures are SYNTHETIC; no sleep is relied on (the flush is a
+// file write between two requests, the clock is injected).
+// ---------------------------------------------------------------------
+
+impl Fx {
+    fn ready(&mut self, session: &str, path: &Path) -> bool {
+        match self.sb(SharedBudgetRequest::TranscriptReady {
+            session_id: session.to_string(),
+            transcript_path: s(path),
+        }) {
+            SharedBudgetOutcome::TranscriptReadiness { ready } => ready,
+            other => panic!("expected TranscriptReadiness, got {other:?}"),
+        }
+    }
+
+    fn tail(&mut self, session: &str, path: &Path) -> SharedBudgetOutcome {
+        self.sb(SharedBudgetRequest::SettleTail {
+            session_id: session.to_string(),
+            transcript_path: s(path),
+        })
+    }
+}
+
+fn user_line(secs: i64, session: &str) -> String {
+    format!(
+        r#"{{"type":"user","timestamp":"{}","sessionId":"{session}","message":{{"role":"user","content":"hi"}}}}"#,
+        at(secs).format(&Rfc3339).unwrap()
+    )
+}
+
+#[test]
+fn ready_is_false_only_while_waiting_could_change_what_a_stop_books() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    // Not ready: the file is not there yet (first turn of a session).
+    fx.admit_hold("absent");
+    assert!(!fx.ready("absent", &fx.path().join("absent.jsonl")));
+
+    // Not ready: the file exists but holds no usage line (only the prompt).
+    fx.admit_hold("promptonly");
+    let p = fx.path().join("promptonly.jsonl");
+    write_lines(&p, &[user_line(5, "promptonly")]);
+    assert!(!fx.ready("promptonly", &p));
+    // Ready the moment the assistant line lands.
+    append_lines(
+        &p,
+        &[rec(10, "m1", SONNET, mi(1), Some("promptonly"), false)],
+    );
+    assert!(fx.ready("promptonly", &p));
+
+    // Not ready on a resumed session: only the previous turn's lines are in
+    // the file, and they are behind the lane's watermark.
+    let tx = fx.path().join("resumed.jsonl");
+    fx.admit_hold("resumed");
+    write_lines(&tx, &[rec(10, "r1", SONNET, mi(1), Some("resumed"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize("resumed", Some(&s(&tx)));
+    fx.clock.set(at(100));
+    fx.admit_hold("resumed");
+    assert!(
+        !fx.ready("resumed", &tx),
+        "turn 1's line is already counted"
+    );
+    append_lines(
+        &tx,
+        &[rec(110, "r2", SONNET, mi(1), Some("resumed"), false)],
+    );
+    assert!(fx.ready("resumed", &tx));
+}
+
+#[test]
+fn ready_is_true_for_every_outcome_that_waiting_cannot_improve() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let cases: Vec<(&str, Vec<String>)> = vec![
+        // A different session's lines only: settles as binding_mismatch.
+        (
+            "foreign",
+            vec![rec(10, "m1", SONNET, mi(1), Some("other"), false)],
+        ),
+        // A usage line with no session field: transcript_unverified.
+        (
+            "unverified",
+            vec![rec(10, "m1", SONNET, mi(1), None, false)],
+        ),
+        // A model the pinned table cannot price: unpriced_model.
+        (
+            "unpriced",
+            vec![rec(
+                10,
+                "m1",
+                "no-such-model",
+                mi(1),
+                Some("unpriced"),
+                false,
+            )],
+        ),
+        // A line stamped far beyond now + skew: future_timestamp.
+        (
+            "future",
+            vec![rec(10_000, "m1", SONNET, mi(1), Some("future"), false)],
+        ),
+    ];
+    for (session, lines) in cases {
+        fx.clock.set(at(0));
+        fx.admit_hold(session);
+        let p = fx.path().join(format!("{session}.jsonl"));
+        write_lines(&p, &lines);
+        fx.clock.set(at(60));
+        assert!(
+            fx.ready(session, &p),
+            "{session}: a later probe cannot change this settlement, so the hook must not wait"
+        );
+    }
+    // A session with no pending hold has nothing to settle.
+    let never = fx.path().join("never.jsonl");
+    assert!(fx.ready("never-admitted", &never));
+    // So does one whose only hold is already settled.
+    let tx = fx.path().join("done.jsonl");
+    fx.admit_hold("done");
+    write_lines(&tx, &[rec(10, "d1", SONNET, mi(1), Some("done"), false)]);
+    fx.finalize("done", Some(&s(&tx)));
+    assert!(fx.ready("done", &tx));
+}
+
+#[test]
+fn a_probe_refuses_a_bad_session_and_answers_not_configured_without_a_file() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    expect_refused(
+        fx.sb(SharedBudgetRequest::TranscriptReady {
+            session_id: String::new(),
+            transcript_path: "/x".into(),
+        }),
+        SharedBudgetRefusal::EmptySessionId,
+    );
+    let mut off = Fx::new(None, BASE);
+    let before = off.fingerprint();
+    assert!(matches!(
+        off.sb(SharedBudgetRequest::TranscriptReady {
+            session_id: "s1".into(),
+            transcript_path: "/x".into(),
+        }),
+        SharedBudgetOutcome::NotConfigured
+    ));
+    assert_eq!(
+        off.fingerprint(),
+        before,
+        "the unconfigured path writes nothing"
+    );
+    assert!(off.pools().is_empty());
+}
+
+#[test]
+fn a_probe_writes_no_row_and_moves_no_counter() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    fx.admit_hold("s1");
+    fx.admit_hold("s2");
+    fx.admit_hold("s3");
+    let mismatch = fx.path().join("s2.jsonl");
+    write_lines(
+        &mismatch,
+        &[rec(10, "m1", SONNET, mi(1), Some("elsewhere"), false)],
+    );
+    let unpriced = fx.path().join("s3.jsonl");
+    write_lines(
+        &unpriced,
+        &[rec(10, "m1", "no-such-model", mi(1), Some("s3"), false)],
+    );
+    let before = fx.fingerprint();
+    let counters = |st: &SharedBudgetStatus| {
+        (
+            st.unmeasured_settlements,
+            st.transcript_binding_mismatches,
+            st.transcript_unverified,
+            st.unpriced_models.clone(),
+            st.foreign_lines,
+            st.id_less_records,
+        )
+    };
+    let st_before = counters(&fx.status());
+    for _ in 0..3 {
+        assert!(!fx.ready("s1", &fx.path().join("s1.jsonl")));
+        assert!(fx.ready("s2", &mismatch));
+        assert!(fx.ready("s3", &unpriced));
+    }
+    assert_eq!(fx.fingerprint(), before, "a poll never touches the ledger");
+    assert_eq!(counters(&fx.status()), st_before, "nor the telemetry");
+}
+
+#[test]
+fn a_late_flush_is_measured_once_and_the_next_turn_does_not_recount_it() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    fx.admit_hold("s1");
+    // Stop is dispatched; the transcript is not written yet.
+    fx.clock.set(at(60));
+    assert!(!fx.ready("s1", &tx));
+    assert_eq!(
+        totals(&fx.status()),
+        (0, 1_000),
+        "nothing charged while waiting"
+    );
+    // The host flushes (lines stamped BEFORE the Stop, as in production).
+    write_lines(&tx, &[rec(50, "m1", SONNET, mi(1), Some("s1"), false)]);
+    assert!(fx.ready("s1", &tx));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(
+        totals(&fx.status()),
+        (300, 0),
+        "the measured 300, not the 1000 hold"
+    );
+    assert_eq!(fx.lane("s1")[0].usage_known, Some(true));
+    assert_eq!(fx.status().unmeasured_settlements, 0);
+
+    // A replayed Stop (hook retry, duplicate) settles nothing.
+    let settled = fx.fingerprint();
+    fx.finalize("s1", Some(&s(&tx)));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(fx.fingerprint(), settled);
+
+    // The next turn counts only its own line.
+    fx.clock.set(at(100));
+    fx.admit_hold("s1");
+    assert!(!fx.ready("s1", &tx));
+    append_lines(&tx, &[rec(110, "m2", SONNET, mi(2), Some("s1"), false)]);
+    fx.clock.set(at(150));
+    assert!(fx.ready("s1", &tx));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(totals(&fx.status()), (900, 0));
+    // SessionEnd afterwards has nothing left to add.
+    assert!(matches!(
+        fx.tail("s1", &tx),
+        SharedBudgetOutcome::TailSettled {
+            amount_charged_usd_cents: 0,
+            ..
+        }
+    ));
+    assert_eq!(totals(&fx.status()), (900, 0));
+}
+
+#[test]
+fn a_transcript_that_never_arrives_settles_at_the_flat_hold_and_the_session_end_tail_adds_nothing()
+{
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    fx.admit_hold("s1");
+    fx.clock.set(at(60));
+    assert!(!fx.ready("s1", &tx));
+    // The hook's deadline passes: Finalize is sent anyway and never fails.
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(
+        totals(&fx.status()),
+        (1_000, 0),
+        "the hold amount, an upper bound"
+    );
+    assert_eq!(fx.lane("s1")[0].usage_known, Some(false));
+    assert_eq!(fx.status().unmeasured_settlements, 1);
+
+    // The host flushes after the fact, stamped before the settle instant.
+    write_lines(&tx, &[rec(50, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(70));
+    // SettleTail starts at the flat settlement's instant: it recovers
+    // nothing (and must not charge on top of the hold).
+    assert!(matches!(
+        fx.tail("s1", &tx),
+        SharedBudgetOutcome::TailSettled {
+            amount_charged_usd_cents: 0,
+            ..
+        }
+    ));
+    assert_eq!(
+        totals(&fx.status()),
+        (1_000, 0),
+        "residual over-count, never a double charge"
+    );
+}
+
+#[test]
+fn a_hook_killed_while_waiting_leaves_the_hold_and_the_next_stop_measures_it_once() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    fx.admit_hold("s1");
+    fx.clock.set(at(60));
+    assert!(!fx.ready("s1", &tx));
+    // The host kills the hook: no Finalize. Nothing was charged or released.
+    assert_eq!(totals(&fx.status()), (0, 1_000));
+    // The file lands later; the user sends another prompt (renewing the
+    // lane's unexpired hold) and that turn stops normally.
+    write_lines(&tx, &[rec(50, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(100));
+    fx.admit_hold("s1");
+    append_lines(&tx, &[rec(110, "m2", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(150));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(
+        totals(&fx.status()),
+        (600, 0),
+        "both turns' lines are measured once; the killed turn costs its real spend"
+    );
+    assert_eq!(fx.lane("s1").len(), 1, "one lane hold, settled once");
+}
+
+#[test]
+fn waiting_sessions_do_not_disturb_each_other() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let (a, b) = (fx.path().join("a.jsonl"), fx.path().join("b.jsonl"));
+    fx.admit_hold("a");
+    fx.admit_hold("b");
+    fx.clock.set(at(60));
+    assert!(!fx.ready("a", &a) && !fx.ready("b", &b));
+    // b flushes first and settles while a is still waiting.
+    write_lines(&b, &[rec(50, "mb", SONNET, mi(2), Some("b"), false)]);
+    assert!(fx.ready("b", &b) && !fx.ready("a", &a));
+    fx.finalize("b", Some(&s(&b)));
+    assert_eq!(totals(&fx.status()), (600, 1_000), "a's hold is untouched");
+    write_lines(&a, &[rec(55, "ma", SONNET, mi(1), Some("a"), false)]);
+    assert!(fx.ready("a", &a));
+    fx.finalize("a", Some(&s(&a)));
+    assert_eq!(totals(&fx.status()), (900, 0));
+}

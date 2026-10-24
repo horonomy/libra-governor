@@ -259,4 +259,11 @@ pub use messages::{
 /// `id_less_records`, `foreign_lines`, `sweep_deferred_files`). A v20 peer's
 /// decoder cannot parse the new variants, so a long-lived v20 daemon must
 /// be restarted after upgrading.
-pub const PROTOCOL_VERSION: u32 = 21;
+///
+/// v22 (HORO-2246): `SharedBudgetRequest` gained `TranscriptReady` (a
+/// read-only "is this turn's transcript flushed yet?" probe the `Stop` hook
+/// polls before it sends `Finalize`) and `SharedBudgetOutcome` gained
+/// `TranscriptReadiness`. A v21 peer's decoder cannot parse either, so a
+/// long-lived v21 daemon must be restarted after upgrading; until then the
+/// hook's probe fails and `Stop` proceeds without waiting.
+pub const PROTOCOL_VERSION: u32 = 22;

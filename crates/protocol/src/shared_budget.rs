@@ -91,6 +91,20 @@ pub enum SharedBudgetRequest {
         session_id: String,
         transcript_path: String,
     },
+    /// Is the host's transcript for this session's pending turn readable
+    /// yet? (HORO-2246.) Claude Code writes its transcript asynchronously,
+    /// about 70 ms after the `Stop` hook is dispatched on 2.1.306, so a
+    /// `Stop` settlement that reads at once usually finds nothing and books
+    /// the flat turn hold. The `Stop` hook polls this, one short connection
+    /// per probe, and sends `Finalize` once it answers ready or its own
+    /// deadline passes. **Strictly read-only**: no ledger write, no
+    /// telemetry counter, and it never denies. It exists so that the daemon,
+    /// which alone binds, windows and prices a transcript, also owns the
+    /// definition of "ready"; the hook never opens the file.
+    TranscriptReady {
+        session_id: String,
+        transcript_path: String,
+    },
     /// Read-only budget posture.
     Status {},
 }
@@ -399,6 +413,15 @@ pub enum SharedBudgetOutcome {
         transcript_unverified: bool,
         /// The transcript named another session; nothing was imported.
         binding_mismatch: bool,
+    },
+    /// Answer to [`SharedBudgetRequest::TranscriptReady`].
+    TranscriptReadiness {
+        /// `false` only when waiting could help: the file is not readable
+        /// yet or holds no usage after the lane's window. `true` for
+        /// everything else, including every genuine problem (a mismatch,
+        /// malformed or unpriced usage, a scan cap), because a later probe
+        /// would not change what `Finalize` books.
+        ready: bool,
     },
     Status(Box<SharedBudgetStatus>),
 }
