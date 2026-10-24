@@ -674,7 +674,9 @@ fn write(path: &Path, text: &str) {
 
 /// A synthetic workspace. Each member is `(directory name, extra manifest
 /// text appended after the package header, [(relative file, contents)])`.
-fn workspace(members: &[(&str, &str, &[(&str, &str)])]) -> (tempfile::TempDir, Vec<Member>) {
+type FixtureMember<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+
+fn workspace(members: &[FixtureMember<'_>]) -> (tempfile::TempDir, Vec<Member>) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let list: Vec<String> = members
