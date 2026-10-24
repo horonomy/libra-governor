@@ -72,7 +72,7 @@ fn adapted(payload: &Value, entry: EntryPoint) -> Value {
         let required: &[(&str, &str)] = match entry {
             EntryPoint::PromptSubmit => &[("cwd", "/w"), ("prompt", "p")],
             EntryPoint::ToolCompleted => &[("tool_name", "Bash")],
-            EntryPoint::TurnCompleted => &[],
+            EntryPoint::ToolRequested | EntryPoint::TurnCompleted => &[],
         };
         for (key, value) in required {
             map.entry(*key).or_insert_with(|| json!(value));

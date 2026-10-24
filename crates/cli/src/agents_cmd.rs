@@ -64,10 +64,14 @@ fn render_human(matrix: &[AgentCapabilities]) -> String {
             agent_label(caps.agent),
             caps.contract_version
         ));
-        let rows: [(&str, &libra_governor_domain::Capability); 13] = [
+        let rows: [(&str, &libra_governor_domain::Capability); 14] = [
             ("preflight_gate", &caps.preflight_gate),
             ("tool_observation", &caps.tool_observation),
             ("tool_gate", &caps.tool_gate),
+            (
+                "shared_budget_admission_gate",
+                &caps.shared_budget_admission_gate,
+            ),
             ("completion_receipt", &caps.completion_receipt),
             ("model_event_observation", &caps.model_event_observation),
             ("model_gateway", &caps.model_gateway),
@@ -113,6 +117,7 @@ mod tests {
         assert!(rendered.contains("hard_budget_enforcement"));
         assert!(rendered.contains("subagent_lifecycle"));
         assert!(rendered.contains("mcp_explain_surface"));
+        assert!(rendered.contains("shared_budget_admission_gate"));
     }
 
     #[test]

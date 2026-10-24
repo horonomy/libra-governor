@@ -38,6 +38,11 @@ hook schemas vs. what remains unverified.
   running the check (a moved binary needs re-trust — see "Trust gate"
   below), and a best-effort read of `~/.codex/config.toml`'s
   `[hooks.state]` trust gate.
+- **No local shared-budget gate (ADR-0026).** Unlike Claude Code, the Codex
+  hook route never sends a shared-budget `Admit`/`Check`, never blocks a
+  prompt and never denies a tool call, whether or not `shared-budget.json`
+  exists. The capability row `shared_budget_admission_gate` is
+  Unavailable for Codex.
 - `libra-governor agents [--json]` — the capability matrix for both
   agents this integration knows about (see "Capability tiers" below).
 

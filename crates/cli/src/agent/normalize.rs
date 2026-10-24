@@ -14,7 +14,9 @@
 //! parse it replaces (see `crates/cli/tests/agent_contract.rs`).
 
 use super::event::NormalizedEvent;
-use super::payload::{PromptSubmitPayload, ToolCompletedPayload, TurnCompletedPayload};
+use super::payload::{
+    PromptSubmitPayload, ToolCompletedPayload, ToolRequestedPayload, TurnCompletedPayload,
+};
 
 /// Recognized agent lifecycle hook event names this integration does
 /// not (yet) wire to any daemon action — see the HORO-1157 non-goals.
@@ -35,6 +37,7 @@ const KNOWN_UNWIRED_EVENTS: [&str; 7] = [
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryPoint {
     PromptSubmit,
+    ToolRequested,
     ToolCompleted,
     TurnCompleted,
 }
@@ -43,6 +46,7 @@ impl EntryPoint {
     fn canonical_event_name(self) -> &'static str {
         match self {
             EntryPoint::PromptSubmit => "UserPromptSubmit",
+            EntryPoint::ToolRequested => "PreToolUse",
             EntryPoint::ToolCompleted => "PostToolUse",
             EntryPoint::TurnCompleted => "Stop",
         }
@@ -91,6 +95,14 @@ pub fn normalize(entry: EntryPoint, raw: &str) -> Result<NormalizedEvent, Normal
                 cwd: payload.cwd,
                 prompt: payload.prompt,
                 turn_id: payload.turn_id,
+                agent_id: payload.agent_id,
+                prompt_id: payload.prompt_id,
+            })
+        }
+        EntryPoint::ToolRequested => {
+            let payload: ToolRequestedPayload = serde_json::from_value(value)?;
+            Ok(NormalizedEvent::ToolRequested {
+                session_id: payload.session_id,
                 agent_id: payload.agent_id,
             })
         }
@@ -150,6 +162,7 @@ mod tests {
                 prompt: "fix it".to_string(),
                 turn_id: None,
                 agent_id: None,
+                prompt_id: None,
             }
         );
     }
@@ -270,8 +283,53 @@ mod tests {
                 prompt: "fix it".to_string(),
                 turn_id: Some("turn-1".to_string()),
                 agent_id: Some("sub-1".to_string()),
+                prompt_id: None,
             }
         );
+    }
+
+    #[test]
+    fn prompt_id_is_carried_only_when_the_host_supplies_a_string() {
+        let with = r#"{"session_id":"s","cwd":"/r","prompt":"p","prompt_id":"pid-1"}"#;
+        assert!(matches!(
+            normalize(EntryPoint::PromptSubmit, with).unwrap(),
+            NormalizedEvent::PromptSubmitted { prompt_id: Some(ref p), .. } if p == "pid-1"
+        ));
+        let junk = r#"{"session_id":"s","cwd":"/r","prompt":"p","prompt_id":7}"#;
+        assert!(matches!(
+            normalize(EntryPoint::PromptSubmit, junk).unwrap(),
+            NormalizedEvent::PromptSubmitted {
+                prompt_id: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pre_tool_use_carries_session_and_optional_agent_id_only() {
+        let main = r#"{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}"#;
+        assert_eq!(
+            normalize(EntryPoint::ToolRequested, main).unwrap(),
+            NormalizedEvent::ToolRequested {
+                session_id: "s".into(),
+                agent_id: None
+            }
+        );
+        let sub = r#"{"session_id":"s","agent_id":"sub-9","tool_name":"Bash"}"#;
+        assert_eq!(
+            normalize(EntryPoint::ToolRequested, sub).unwrap(),
+            NormalizedEvent::ToolRequested {
+                session_id: "s".into(),
+                agent_id: Some("sub-9".into())
+            }
+        );
+        assert!(normalize(EntryPoint::ToolRequested, r#"{"tool_name":"Bash"}"#).is_err());
+        // A different event name on this entry point is not a PreToolUse.
+        let other = r#"{"session_id":"s","hook_event_name":"PostToolUse"}"#;
+        assert!(matches!(
+            normalize(EntryPoint::ToolRequested, other).unwrap(),
+            NormalizedEvent::Unrecognized { .. }
+        ));
     }
 
     #[test]
