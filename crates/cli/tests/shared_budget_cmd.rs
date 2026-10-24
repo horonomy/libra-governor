@@ -669,3 +669,157 @@ fn export_of_a_missing_period_or_ledger_fails_clearly_and_writes_nothing() {
         assert_eq!(out.status.code(), Some(2), "{bad}");
     }
 }
+
+// ---------------------------------------------------------------------
+// time zone follows shared-budget.json; read-only dry run; wording
+// ---------------------------------------------------------------------
+
+const GOOD_CONFIG: &str =
+    r#"{"schema_version":1,"monthly_cap_usd_cents":50000,"time_zone":"America/New_York"}"#;
+
+fn write_config(sandbox: &Sandbox, body: &str) {
+    std::fs::create_dir_all(&sandbox.state_dir).unwrap();
+    std::fs::write(sandbox.state_dir.join("shared-budget.json"), body).unwrap();
+}
+
+#[test]
+fn prune_zone_defaults_to_the_configured_zone_and_refuses_a_mismatch() {
+    let sandbox = Sandbox::new();
+    write_config(&sandbox, GOOD_CONFIG);
+
+    let defaulted = sandbox.run(&["shared-budget", "prune", "--keep-months", "1"]);
+    assert!(
+        defaulted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&defaulted.stderr)
+    );
+    assert_eq!(stdout_json(&defaulted)["time_zone"], "America/New_York");
+
+    let same = sandbox.run(&[
+        "shared-budget",
+        "prune",
+        "--keep-months",
+        "1",
+        "--time-zone",
+        "America/New_York",
+    ]);
+    assert!(same.status.success());
+
+    let differs = sandbox.run(&[
+        "shared-budget",
+        "prune",
+        "--keep-months",
+        "1",
+        "--time-zone",
+        "UTC",
+        "--apply",
+    ]);
+    assert_eq!(differs.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&differs.stderr).contains("differs from shared-budget.json"));
+}
+
+#[test]
+fn prune_zone_is_required_without_a_valid_config() {
+    let sandbox = Sandbox::new();
+    let none = sandbox.run(&["shared-budget", "prune", "--keep-months", "1"]);
+    assert_eq!(none.status.code(), Some(2));
+
+    write_config(&sandbox, "{ not json");
+    let invalid = sandbox.run(&["shared-budget", "prune", "--keep-months", "1"]);
+    assert_eq!(invalid.status.code(), Some(2));
+    let with_flag = sandbox.run(&[
+        "shared-budget",
+        "prune",
+        "--keep-months",
+        "1",
+        "--time-zone",
+        "UTC",
+    ]);
+    assert!(with_flag.status.success());
+}
+
+#[test]
+fn prune_note_carries_the_export_first_and_replay_warning() {
+    let sandbox = Sandbox::new();
+    for apply in [false, true] {
+        let mut args = vec![
+            "shared-budget",
+            "prune",
+            "--keep-months",
+            "1",
+            "--time-zone",
+            "UTC",
+        ];
+        if apply {
+            args.push("--apply");
+        }
+        let note = stdout_json(&sandbox.run(&args))["note"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(note.contains("Export before prune"), "{note}");
+        assert!(note.contains("can no longer be exported"), "{note}");
+        assert!(
+            note.contains("older than the retention window is treated as new"),
+            "{note}"
+        );
+    }
+    let help = sandbox.run(&["shared-budget"]);
+    let text = String::from_utf8_lossy(&help.stderr).to_string();
+    assert!(text.contains("treated as new"));
+    assert!(text.contains("pseudonymised"));
+    assert!(text.contains("not safe to publish"));
+}
+
+#[test]
+fn dry_run_and_export_do_not_migrate_an_older_ledger_but_apply_would() {
+    let sandbox = Sandbox::new();
+    let mut store = sandbox.store();
+    let alias = alias_back(5);
+    seed_pool(&mut store, &alias, "s");
+    drop(store);
+    // Make the schema look one migration behind.
+    let conn = rusqlite::Connection::open(sandbox.ledger_path()).unwrap();
+    conn.execute(
+        "DELETE FROM schema_migrations WHERE version = (SELECT MAX(version) FROM schema_migrations)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let dry = sandbox.run(&[
+        "shared-budget",
+        "prune",
+        "--keep-months",
+        "1",
+        "--time-zone",
+        "UTC",
+    ]);
+    assert_eq!(dry.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&dry.stderr).contains("schema version"));
+    let export = sandbox.run(&["shared-budget", "export", "--period", period_of(&alias)]);
+    assert_eq!(export.status.code(), Some(1));
+
+    let conn = rusqlite::Connection::open(sandbox.ledger_path()).unwrap();
+    let max: i64 = conn
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        max,
+        libra_governor_ledger::latest_known_version() - 1,
+        "no migration ran"
+    );
+}
+
+#[test]
+fn export_refuses_a_symlinked_default_exports_directory() {
+    let (sandbox, alias) = seeded_export_sandbox();
+    let target = sandbox.state_dir.join("elsewhere");
+    std::fs::create_dir(&target).unwrap();
+    symlink(&target, sandbox.state_dir.join("exports")).unwrap();
+    let out = sandbox.run(&["shared-budget", "export", "--period", period_of(&alias)]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+}
