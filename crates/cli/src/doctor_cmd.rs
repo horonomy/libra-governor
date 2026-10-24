@@ -253,6 +253,37 @@ fn budget_findings_for(
             }
         });
 
+        // 4b. Capacity and exhaustion: a healthy-looking file can still deny
+        // every prompt.
+        if s.config_state == libra_governor_protocol::SharedBudgetConfigState::Valid {
+            if !s.capacity_known {
+                findings.push(Finding {
+                    id: "shared_budget_capacity",
+                    severity: Severity::Warn,
+                    message: "capacity unknown: the pool's capacity could not be established, \
+                              so the budget figures are not authoritative"
+                        .to_string(),
+                });
+            }
+            if shared_budget_view::admission_closed(s) {
+                let remaining = s.remaining_usd_cents.unwrap_or(0);
+                findings.push(Finding {
+                    id: "shared_budget_exhausted",
+                    severity: Severity::Warn,
+                    message: format!(
+                        "{}: {} remaining, less than one turn hold, so every new prompt is \
+                         denied until the period ends or the cap is raised",
+                        if remaining < 0 {
+                            "pool overrun"
+                        } else {
+                            "pool exhausted"
+                        },
+                        shared_budget_view::usd(remaining)
+                    ),
+                });
+            }
+        }
+
         // 5. Flagged settlements.
         let flagged = shared_budget_view::flagged_total(s);
         findings.push(if flagged == 0 {
@@ -357,6 +388,11 @@ fn budget_hooks_finding(
         .filter(|(_, w)| !**w)
         .map(|(name, _)| *name)
         .collect();
+    // Without the admission gate nothing is admitted, and without Stop
+    // nothing is settled: the budget is not working at all.
+    let essential_missing = missing
+        .iter()
+        .any(|name| matches!(*name, "UserPromptSubmit" | "Stop"));
     if missing.is_empty() {
         Finding {
             id: "shared_budget_hooks",
@@ -368,15 +404,18 @@ fn budget_hooks_finding(
     } else {
         Finding {
             id: "shared_budget_hooks",
-            severity: if configured {
-                Severity::Warn
-            } else {
-                Severity::Ok
+            severity: match (configured, essential_missing) {
+                (false, _) => Severity::Ok,
+                (true, true) => Severity::Error,
+                (true, false) => Severity::Warn,
             },
             message: format!(
                 "not wired for every tool: {} — re-run `libra-governor install`{}",
                 missing.join(", "),
-                if configured {
+                if configured && essential_missing {
+                    "; a budget file exists but UserPromptSubmit (admission) or Stop \
+                     (settlement) is not wired, so nothing is admitted or charged"
+                } else if configured {
                     "; until then the budget does not see that spend or cannot gate it"
                 } else {
                     " (the budget is not configured, so this is informational)"
@@ -386,11 +425,12 @@ fn budget_hooks_finding(
     }
 }
 
-/// Reports whether `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set,
-/// presence only (docs/egress-inventory.md). The value is never read into
-/// the report, and no other environment variable is consulted. Report
-/// only: it governs Claude Code's own traffic, which Libra neither sets nor
-/// enforces.
+/// Reports `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` without printing or
+/// interpreting its value (docs/egress-inventory.md). Two different facts:
+/// the process environment is checked for a non-empty value, the
+/// `settings.json` env block for the key being present. Report only: it
+/// governs Claude Code's own traffic, which Libra neither sets nor enforces,
+/// and a value such as `0` or `false` does not mean traffic is disabled.
 fn host_traffic_setting_finding() -> Finding {
     const KEY: &str = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC";
     let in_environment = std::env::var_os(KEY).is_some_and(|v| !v.is_empty());
@@ -401,16 +441,24 @@ fn host_traffic_setting_finding() -> Finding {
 }
 
 fn host_traffic_finding_for(key: &str, in_environment: bool, in_settings: bool) -> Finding {
-    let yes_no = |b: bool| if b { "set" } else { "not set" };
     Finding {
         id: "host_traffic_setting",
         severity: Severity::Ok,
         message: format!(
-            "{key}: {} in this process's environment, {} in the settings.json env block. \
-             Report only: it governs Claude Code's own traffic; Libra does not read its value, \
-             set it or enforce it (docs/egress-inventory.md)",
-            yes_no(in_environment),
-            yes_no(in_settings)
+            "{key}: process environment {} (non-empty value); settings.json env block {} (key \
+             present). Report only: the value is never printed or interpreted, so a present key \
+             does not mean non-essential traffic is disabled; it governs Claude Code's own \
+             traffic and Libra neither sets nor enforces it (docs/egress-inventory.md)",
+            if in_environment {
+                "has it"
+            } else {
+                "does not have it"
+            },
+            if in_settings {
+                "has it"
+            } else {
+                "does not have it"
+            },
         ),
     }
 }
@@ -1313,22 +1361,92 @@ mod tests {
     }
 
     #[test]
+    fn a_configured_budget_without_the_admission_or_settlement_hook_is_an_error() {
+        use shared_budget_view::{fixtures::sample_status, Posture};
+        let posture = Posture::Reported(Box::new(sample_status()));
+        for (legacy, label) in [
+            ([false, true, true], "UserPromptSubmit"),
+            ([true, true, false], "Stop"),
+        ] {
+            let mut inspection = all_wired();
+            inspection.hooks_wired = legacy;
+            let findings = budget_findings_for(&posture, Some(&inspection));
+            let hooks = find(&findings, "shared_budget_hooks");
+            assert_eq!(hooks.severity, Severity::Error, "{label}");
+            assert!(hooks.message.contains(label));
+            assert!(hooks.message.contains("nothing is admitted or charged"));
+        }
+        // Only a non-essential hook missing stays a warning.
+        let mut inspection = all_wired();
+        inspection.hooks_wired = [true, false, true];
+        let findings = budget_findings_for(&posture, Some(&inspection));
+        assert_eq!(
+            find(&findings, "shared_budget_hooks").severity,
+            Severity::Warn
+        );
+        // Nothing wired but no budget configured: informational only.
+        let findings = budget_findings_for(
+            &shared_budget_view::Posture::NotConfigured,
+            Some(&Default::default()),
+        );
+        assert_eq!(
+            find(&findings, "shared_budget_hooks").severity,
+            Severity::Ok
+        );
+    }
+
+    #[test]
+    fn an_exhausted_or_overrun_pool_and_unknown_capacity_are_surfaced() {
+        use shared_budget_view::{fixtures::sample_status, Posture};
+        let healthy = budget_findings_for(
+            &Posture::Reported(Box::new(sample_status())),
+            Some(&all_wired()),
+        );
+        assert!(healthy.iter().all(|f| f.id != "shared_budget_exhausted"));
+        assert!(healthy.iter().all(|f| f.id != "shared_budget_capacity"));
+
+        for (remaining, word) in [
+            (0, "pool exhausted"),
+            (500, "pool exhausted"),
+            (-250, "pool overrun"),
+        ] {
+            let mut s = sample_status();
+            s.remaining_usd_cents = Some(remaining);
+            let findings = budget_findings_for(&Posture::Reported(Box::new(s)), Some(&all_wired()));
+            let f = find(&findings, "shared_budget_exhausted");
+            assert_eq!(f.severity, Severity::Warn, "{remaining}");
+            assert!(f.message.contains(word), "{}", f.message);
+            assert!(f.message.contains("every new prompt is denied"));
+        }
+
+        let mut unknown = sample_status();
+        unknown.capacity_known = false;
+        let findings =
+            budget_findings_for(&Posture::Reported(Box::new(unknown)), Some(&all_wired()));
+        assert_eq!(
+            find(&findings, "shared_budget_capacity").severity,
+            Severity::Warn
+        );
+    }
+
+    #[test]
     fn the_host_traffic_report_is_presence_only() {
         let both = host_traffic_finding_for("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", true, true);
-        assert!(both.message.contains("set in this process's environment"));
-        assert!(both.message.contains("set in the settings.json env block"));
+        assert!(both.message.contains("process environment has it"));
+        assert!(both.message.contains("settings.json env block has it"));
         let neither =
             host_traffic_finding_for("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", false, false);
         assert!(neither
             .message
-            .contains("not set in this process's environment"));
+            .contains("process environment does not have it"));
         assert_eq!(both.severity, Severity::Ok);
         assert_eq!(
             neither.severity,
             Severity::Ok,
             "report only, never a failure"
         );
-        assert!(neither.message.contains("does not read its value"));
+        assert!(neither.message.contains("never printed or interpreted"));
+        assert!(neither.message.contains("does not mean"));
     }
 
     #[test]
