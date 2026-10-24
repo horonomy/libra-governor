@@ -3273,7 +3273,7 @@ mod tests {
         )
         .unwrap();
         let FinalizeOutcome::Finalized(result) = outcome else {
-            panic!("the parent's turn was left open: {outcome:?}");
+            panic!("the parent's turn was left open");
         };
         assert_eq!(result.receipt.tool_call_count, 1);
         assert_eq!(ledger.tool_call_count_for_session(&agent).unwrap(), 4);
