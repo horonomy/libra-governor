@@ -484,15 +484,20 @@ installed hooks**, so nothing here is `ProductionObserved`.
   non-string id is absent and no id is invented; an `agent_id` outside
   `[A-Za-z0-9_-]` is dropped (the daemon's sweep uses the same charset). The
   path is relayed verbatim and the daemon alone validates and reads it.
-  Without a usable id the charge would be booked `unattributed` under a
-  path-hash family, whereas the `Stop` sweep books the same file under the id
-  in its name `<session>/subagents/agent-<id>.jsonl`, so both would charge it.
-  The hook therefore sends nothing for an id-less file that has that
-  sweep-visible shape (a string check, nothing is opened) and leaves it to the
-  next `Stop`, which attributes it by name; an id-less file anywhere else is
-  charged `unattributed`. A payload without `agent_transcript_path` is not
-  charged by the hook either; the sweep still finds the file. Consequently a
-  sweep-visible id-less file is only charged at the next `Stop`.
+  *One family per file.* The daemon books a charge under the agent id, or
+  under a path hash when there is none, while the `Stop` sweep books
+  `<session>/subagents/agent-<id>.jsonl` under the id in its file name. To
+  make both converge, when the path's final component is exactly
+  `agent-<[A-Za-z0-9_-]+>.jsonl` the hook sends that file-name id as the
+  `agent_id` (a string check; nothing is opened, and the id is the
+  host-provided file name, not invented). If the payload carried a different
+  valid id the file-name id wins and the disagreement is logged, so a file is
+  never sent under two families; the existing per-family ledger idempotency
+  then dedupes the hook, the sweep, repeats, `..`, symlinked or aliased paths
+  (`/var` vs `/private/var`) and files in other directories. Any other file
+  name is charged under the payload id when valid, else `unattributed`. A
+  payload without `agent_transcript_path` is not charged by the hook; the next
+  `Stop` sweep (first 64 files) still finds it.
 - *`hook session-end`.* Sends `SettleTail { session_id, transcript_path }`;
   a session never admitted or settled is refused by the daemon
   (`no_settled_lane`) and billed nothing.

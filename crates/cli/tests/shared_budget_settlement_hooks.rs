@@ -50,6 +50,7 @@ fn bin() -> &'static str {
 
 struct Ran {
     stdout: String,
+    stderr: String,
     code: Option<i32>,
     elapsed: Duration,
 }
@@ -61,6 +62,10 @@ fn run_hook(sub: &[&str], state: &Path, payload: &str) -> Ran {
 /// `no_autospawn = false` removes the switch that stops a hook starting a
 /// daemon, so a hook that wrongly tried would actually start one.
 fn run_hook_with(sub: &[&str], state: &Path, payload: &str, no_autospawn: bool) -> Ran {
+    run_hook_bytes(sub, state, payload.as_bytes(), no_autospawn)
+}
+
+fn run_hook_bytes(sub: &[&str], state: &Path, payload: &[u8], no_autospawn: bool) -> Ran {
     let home = tempfile::tempdir().unwrap();
     let mut command = Command::new(bin());
     command
@@ -77,26 +82,27 @@ fn run_hook_with(sub: &[&str], state: &Path, payload: &str, no_autospawn: bool) 
     }
     let mut child = command.spawn().unwrap();
     let start = Instant::now();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(payload.as_bytes())
-        .unwrap();
+    // The hook may stop reading (oversize input): a closed pipe is fine.
+    let _ = child.stdin.take().unwrap().write_all(payload);
     let out = child.wait_with_output().unwrap();
     Ran {
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         code: out.status.code(),
         elapsed: start.elapsed(),
     }
 }
 
 fn write_budget(state: &Path) {
+    write_budget_cap(state, CAP);
+}
+
+fn write_budget_cap(state: &Path, cap: u64) {
     let path = state.join("shared-budget.json");
     std::fs::write(
         &path,
         format!(
-            r#"{{"schema_version":1,"monthly_cap_usd_cents":{CAP},"time_zone":"UTC","turn_hold_usd_cents":{HOLD}}}"#
+            r#"{{"schema_version":1,"monthly_cap_usd_cents":{cap},"time_zone":"UTC","turn_hold_usd_cents":{HOLD}}}"#
         ),
     )
     .unwrap();
@@ -114,6 +120,7 @@ fn session_end(state: &Path, payload: serde_json::Value) -> Ran {
 fn assert_silent_success(ran: &Ran) {
     assert_eq!(ran.code, Some(0), "{:?}", ran.stdout);
     assert_eq!(ran.stdout, "", "a settlement hook never prints");
+    assert_eq!(ran.stderr, "", "a settlement hook never writes stderr");
 }
 
 // ---------------------------------------------------------------------
@@ -430,10 +437,54 @@ fn a_stalled_daemon_is_abandoned_within_the_budget_and_never_blocks() {
     );
     assert_silent_success(&ran);
     assert!(
-        ran.elapsed < Duration::from_secs(9),
+        ran.elapsed < Duration::from_secs(7),
         "hook outlived its settle budget: {:?}",
         ran.elapsed
     );
+}
+
+#[test]
+fn oversize_or_non_utf8_stdin_is_ignored_silently_and_quickly() {
+    let valid = |pad: &str| {
+        format!(
+            r#"{{"session_id":"s","agent_transcript_path":"/t/a.jsonl","transcript_path":"/t/s.jsonl","pad":"{pad}"}}"#
+        )
+    };
+    let oversize = valid(&"x".repeat(2 * 1024 * 1024)).into_bytes();
+    let mut non_utf8 = valid("").into_bytes();
+    non_utf8.splice(5..5, [0xff, 0xfe]);
+    for sub in [["hook", "subagent-stop"], ["hook", "session-end"]] {
+        for (label, bytes) in [("oversize", &oversize), ("non-utf8", &non_utf8)] {
+            let state = tempfile::tempdir().unwrap();
+            write_budget(state.path());
+            let fake = Fake::start(state.path(), Answer::NotConfigured);
+            let ran = run_hook_bytes(&sub, state.path(), bytes, true);
+            assert_silent_success(&ran);
+            assert!(
+                ran.elapsed < Duration::from_secs(3),
+                "{sub:?} {label}: {:?}",
+                ran.elapsed
+            );
+            assert!(
+                fake.requests().is_empty(),
+                "{sub:?} {label}: {:?}",
+                fake.requests()
+            );
+        }
+    }
+    // The boundary: a payload just under the cap is still processed.
+    let state = tempfile::tempdir().unwrap();
+    write_budget(state.path());
+    let fake = Fake::start(state.path(), Answer::NotConfigured);
+    let body = valid(&"x".repeat(1024 * 1024 - 200));
+    assert!(body.len() < 1024 * 1024);
+    assert_silent_success(&run_hook_bytes(
+        &["hook", "session-end"],
+        state.path(),
+        body.as_bytes(),
+        true,
+    ));
+    assert_eq!(fake.requests().len(), 1);
 }
 
 // =====================================================================
@@ -448,12 +499,16 @@ struct Live {
 
 impl Live {
     fn start() -> Self {
+        Self::start_with_cap(CAP)
+    }
+
+    fn start_with_cap(cap: u64) -> Self {
         let mut live = Self {
             state: support::DaemonState::new(),
             home: tempfile::tempdir().unwrap(),
             daemon: None,
         };
-        write_budget(live.state.path());
+        write_budget_cap(live.state.path(), cap);
         live.daemon = Some(
             Command::new(bin())
                 .args(["daemon", "run"])
@@ -677,11 +732,35 @@ fn subagent_stop_charges_the_subagent_lane_and_session_end_settles_the_tail() {
     );
 }
 
-#[test]
-fn an_id_less_subagent_stop_never_double_charges_a_file_the_stop_sweep_attributes() {
-    let live = Live::start();
+fn agent_rows(st: &SharedBudgetStatus) -> Vec<(Option<String>, u64)> {
+    let mut rows: Vec<_> = st
+        .executors
+        .iter()
+        .filter(|e| e.executor_kind == ExecutorKind::Agent)
+        .map(|e| (e.agent_id.clone(), e.used_usd_cents))
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn assert_executors_sum_to_pool(st: &SharedBudgetStatus) {
+    let sum: u64 = st.executors.iter().map(|e| e.used_usd_cents).sum();
+    assert_eq!(sum, st.used_usd_cents, "{:?}", st.executors);
+}
+
+fn admit_via_prompt_hook(live: &Live, session: &str) {
     let repo = tempfile::tempdir().unwrap();
     std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
+    let ran = live.hook(
+        &["hook", "user-prompt-submit"],
+        serde_json::json!({"session_id": session, "cwd": repo.path(), "prompt": "go"}),
+    );
+    assert_eq!(ran.code, Some(0));
+}
+
+#[test]
+fn an_id_less_subagent_stop_is_charged_now_under_the_file_name_family_and_the_sweep_adds_nothing() {
+    let live = Live::start();
     let session = "sess-noid";
     let project = live.state.path().join("project");
     std::fs::create_dir_all(project.join(session).join("subagents")).unwrap();
@@ -690,16 +769,16 @@ fn an_id_less_subagent_stop_never_double_charges_a_file_the_stop_sweep_attribute
         .join(session)
         .join("subagents")
         .join("agent-a9z.jsonl");
-
-    live.hook(
-        &["hook", "user-prompt-submit"],
-        serde_json::json!({"session_id": session, "cwd": repo.path(), "prompt": "go"}),
-    );
+    admit_via_prompt_hook(&live, session);
     write_lines(&main, &[rec(1, "m1", session, 1_000_000, None)]);
     write_lines(&sub, &[rec(2, "s1", session, 2_000_000, Some("a9z"))]);
 
     // The host sent no usable id (blank / missing / outside the charset).
-    for agent in [serde_json::json!(""), serde_json::json!("a/z")] {
+    for agent in [
+        serde_json::json!(""),
+        serde_json::json!("a/z"),
+        serde_json::Value::Null,
+    ] {
         let ran = live.hook(
             &["hook", "subagent-stop"],
             serde_json::json!({
@@ -708,23 +787,166 @@ fn an_id_less_subagent_stop_never_double_charges_a_file_the_stop_sweep_attribute
         );
         assert_silent_success(&ran);
     }
-    assert_eq!(live.status().used_usd_cents, 0, "left to the Stop sweep");
+    let st = live.status();
+    assert_eq!(
+        st.used_usd_cents, 600,
+        "charged at the hook, not left to a later Stop"
+    );
+    assert_eq!(agent_rows(&st), vec![(Some("a9z".to_string()), 600)]);
 
+    // The turn's Stop sweeps the same file: same family, nothing added twice.
     live.hook(
         &["hook", "stop"],
         serde_json::json!({"session_id": session, "transcript_path": main}),
     );
     let st = live.status();
-    // 300 (main turn) + 600 (subagent, attributed by its file name), once.
     assert_eq!(st.used_usd_cents, 900, "{:?}", st.executors);
-    let agent_rows: Vec<_> = st
-        .executors
-        .iter()
-        .filter(|e| e.executor_kind == ExecutorKind::Agent)
-        .collect();
-    assert_eq!(agent_rows.len(), 1, "{:?}", st.executors);
-    assert_eq!(agent_rows[0].agent_id.as_deref(), Some("a9z"));
-    assert_eq!(agent_rows[0].used_usd_cents, 600);
+    assert_eq!(agent_rows(&st), vec![(Some("a9z".to_string()), 600)]);
+    assert_executors_sum_to_pool(&st);
+}
+
+#[test]
+fn a_session_ending_with_no_later_stop_still_has_its_id_less_subagent_charged_once() {
+    let live = Live::start();
+    let session = "sess-nostop";
+    let dir = live
+        .state
+        .path()
+        .join("proj")
+        .join(session)
+        .join("subagents");
+    std::fs::create_dir_all(&dir).unwrap();
+    let main = live
+        .state
+        .path()
+        .join("proj")
+        .join(format!("{session}.jsonl"));
+    let sub = dir.join("agent-n1.jsonl");
+    admit_via_prompt_hook(&live, session);
+    write_lines(&main, &[rec(1, "m1", session, 1_000_000, None)]);
+    write_lines(&sub, &[rec(2, "s1", session, 1_000_000, Some("n1"))]);
+
+    live.hook(
+        &["hook", "subagent-stop"],
+        serde_json::json!({"session_id": session, "agent_transcript_path": sub}),
+    );
+    live.hook(
+        &["hook", "session-end"],
+        serde_json::json!({"session_id": session, "transcript_path": main}),
+    );
+    let st = live.status();
+    assert_eq!(agent_rows(&st), vec![(Some("n1".to_string()), 300)]);
+    assert!(st.used_usd_cents >= 300);
+    assert_executors_sum_to_pool(&st);
+}
+
+#[test]
+fn the_same_file_by_any_path_alias_symlink_or_directory_is_charged_exactly_once() {
+    let live = Live::start();
+    let session = "sess-alias";
+    let root = live.state.path();
+    let real_dir = root.join("foreign");
+    std::fs::create_dir_all(&real_dir).unwrap();
+    let real = real_dir.join("agent-q1.jsonl");
+    write_lines(&real, &[rec(1, "q", session, 1_000_000, Some("q1"))]);
+    std::fs::create_dir_all(root.join("links")).unwrap();
+    let file_link = root.join("links").join("agent-q1.jsonl");
+    std::os::unix::fs::symlink(&real, &file_link).unwrap();
+    let dir_alias = root.join("alias");
+    std::os::unix::fs::symlink(&real_dir, &dir_alias).unwrap();
+
+    let paths: Vec<PathBuf> = vec![
+        real.clone(),
+        root.join("foreign")
+            .join("..")
+            .join("foreign")
+            .join("agent-q1.jsonl"),
+        file_link,
+        dir_alias.join("agent-q1.jsonl"),
+        real,
+    ];
+    for path in paths {
+        let ran = live.hook(
+            &["hook", "subagent-stop"],
+            serde_json::json!({
+                "session_id": session, "agent_id": "q1", "agent_transcript_path": path
+            }),
+        );
+        assert_silent_success(&ran);
+        let st = live.status();
+        assert_eq!(st.used_usd_cents, 300, "{path:?}: {:?}", st.executors);
+        assert_eq!(
+            agent_rows(&st),
+            vec![(Some("q1".to_string()), 300)],
+            "{path:?}"
+        );
+    }
+}
+
+#[test]
+fn the_sixty_fifth_subagent_file_is_charged_by_its_hook_and_never_twice() {
+    let live = Live::start_with_cap(1_000_000);
+    let session = "sess-65";
+    let project = live.state.path().join("project");
+    let dir = project.join(session).join("subagents");
+    std::fs::create_dir_all(&dir).unwrap();
+    let main = project.join(format!("{session}.jsonl"));
+    admit_via_prompt_hook(&live, session);
+    write_lines(&main, &[rec(1, "m1", session, 1_000_000, None)]);
+    let mut last = PathBuf::new();
+    for i in 0..65 {
+        let id = format!("a{i:02}");
+        last = dir.join(format!("agent-{id}.jsonl"));
+        write_lines(
+            &last,
+            &[rec(2, &format!("s{i}"), session, 1_000_000, Some(&id))],
+        );
+    }
+    // Sorted last, so the sweep (first 64 files) never reaches it.
+    live.hook(
+        &["hook", "subagent-stop"],
+        serde_json::json!({"session_id": session, "agent_transcript_path": last}),
+    );
+    assert_eq!(live.status().used_usd_cents, 300);
+    live.hook(
+        &["hook", "stop"],
+        serde_json::json!({"session_id": session, "transcript_path": main}),
+    );
+    let st = live.status();
+    assert_eq!(agent_rows(&st).len(), 65, "{:?}", st.executors);
+    assert!(agent_rows(&st).iter().all(|(_, used)| *used == 300));
+    assert_eq!(
+        st.used_usd_cents,
+        300 + 65 * 300,
+        "main turn + 65 files, once each"
+    );
+    assert_executors_sum_to_pool(&st);
+}
+
+#[test]
+fn a_payload_id_that_disagrees_with_the_file_name_never_opens_a_second_family() {
+    let live = Live::start();
+    let session = "sess-dis";
+    let sub = live.state.path().join("agent-a9z.jsonl");
+    write_lines(&sub, &[rec(1, "s1", session, 2_000_000, Some("a9z"))]);
+    for agent in ["zzz", "a9z", "other"] {
+        live.hook(
+            &["hook", "subagent-stop"],
+            serde_json::json!({
+                "session_id": session, "agent_id": agent, "agent_transcript_path": sub
+            }),
+        );
+    }
+    let st = live.status();
+    assert_eq!(st.used_usd_cents, 600);
+    assert_eq!(agent_rows(&st), vec![(Some("a9z".to_string()), 600)]);
+    assert!(
+        st.executors
+            .iter()
+            .all(|e| e.executor_kind == ExecutorKind::Agent),
+        "no unattributed or second-id row: {:?}",
+        st.executors
+    );
 }
 
 #[test]

@@ -177,11 +177,31 @@ fn with_write_lock<T>(
     body()
 }
 
+/// A hook group with no matcher, `""` or `"*"` applies to every tool.
+fn matcher_is_all_tools(group: &Value) -> bool {
+    match group.get("matcher") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(m)) => m.is_empty() || m == "*",
+        Some(_) => false,
+    }
+}
+
+/// Ours only if the command is `<path>/libra-governor <exact suffix>`: the
+/// text before the suffix must be a path whose final component is exactly
+/// `libra-governor`. A merely similar name (`libra-governor-tools/x`,
+/// `my-libra-governor-wrapper`) or a directory called `libra-governor`
+/// holding some other binary is a foreign command and is never touched.
 fn command_is_ours(command: &str) -> bool {
-    command.contains("libra-governor")
-        && OWNED_COMMAND_SUFFIXES
-            .iter()
-            .any(|suffix| command.ends_with(suffix))
+    OWNED_COMMAND_SUFFIXES.iter().any(|suffix| {
+        command
+            .strip_suffix(suffix)
+            .map(str::trim_end)
+            .is_some_and(|binary| {
+                Path::new(binary)
+                    .file_name()
+                    .is_some_and(|name| name == "libra-governor")
+            })
+    })
 }
 
 /// `true` only for a loopback host — see module docs on why
@@ -423,20 +443,42 @@ fn apply_locked(
                     event: event.to_string(),
                 })?;
 
-        let already_present = entries_arr.iter().any(|matcher| {
-            matcher
-                .get("hooks")
-                .and_then(Value::as_array)
-                .map(|inner| {
-                    inner
-                        .iter()
-                        .any(|h| h.get("command").and_then(Value::as_str) == Some(command.as_str()))
-                })
-                .unwrap_or(false)
-        });
+        let wants_timeout = matches!(event, "SubagentStop" | "SessionEnd");
+        // Only an entry in a group that applies to every tool counts as
+        // installed: our command under a user's `matcher: "Bash"` group
+        // fires for Bash only. A present entry that lacks the settlement
+        // timeout gets it added.
+        let mut already_present = false;
+        let mut upgraded = false;
+        for group in entries_arr.iter_mut() {
+            if !matcher_is_all_tools(group) {
+                continue;
+            }
+            let Some(inner) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for h in inner.iter_mut() {
+                if h.get("command").and_then(Value::as_str) != Some(command.as_str()) {
+                    continue;
+                }
+                already_present = true;
+                if wants_timeout && h.get("timeout").is_none() {
+                    if let Some(obj) = h.as_object_mut() {
+                        obj.insert(
+                            "timeout".to_string(),
+                            serde_json::json!(SETTLEMENT_HOOK_TIMEOUT_SECS),
+                        );
+                        upgraded = true;
+                    }
+                }
+            }
+        }
+        if upgraded {
+            hooks_added += 1;
+        }
         if !already_present {
             let mut hook = serde_json::json!({ "type": "command", "command": command });
-            if matches!(event, "SubagentStop" | "SessionEnd") {
+            if wants_timeout {
                 hook["timeout"] = serde_json::json!(SETTLEMENT_HOOK_TIMEOUT_SECS);
             }
             entries_arr.push(serde_json::json!({ "hooks": [hook] }));
@@ -1401,5 +1443,120 @@ mod tests {
             inspect(&path).shared_budget_hooks_wired,
             [false, false, false]
         );
+    }
+
+    #[test]
+    fn lookalike_foreign_commands_survive_uninstall_and_are_not_reported_wired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let foreign = [
+            ("Stop", "/opt/libra-governor-tools/x hook stop"),
+            ("SessionEnd", "my-libra-governor-wrapper hook session-end"),
+            ("PreToolUse", "~/libra-governor/bin/other hook pre-tool-use"),
+            (
+                "SubagentStop",
+                "/usr/bin/libra-governorx hook subagent-stop",
+            ),
+            (
+                "PostToolUse",
+                "/opt/libra-governor/bin/helper hook post-tool-use",
+            ),
+        ];
+        let mut hooks = serde_json::Map::new();
+        for (event, command) in foreign {
+            hooks.insert(
+                event.to_string(),
+                serde_json::json!([{ "hooks": [{ "type": "command", "command": command }] }]),
+            );
+        }
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({ "hooks": hooks })).unwrap(),
+        )
+        .unwrap();
+        let before = read_json(&path);
+        assert_eq!(inspect(&path).hooks_wired, [false; 3]);
+        assert_eq!(inspect(&path).shared_budget_hooks_wired, [false; 3]);
+
+        // Install adds our own six beside them; uninstall removes only those.
+        apply_hooks_only(&path, &binary()).unwrap();
+        let removed = remove(&path).unwrap();
+        assert_eq!(removed.hook_commands_removed, 6);
+        assert_eq!(read_json(&path), before, "every foreign command survives");
+    }
+
+    #[test]
+    fn a_legacy_installs_own_entries_are_still_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let seed = serde_json::json!({ "hooks": {
+            "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "/Users/a b/.cargo/bin/libra-governor hook user-prompt-submit" }] }],
+            "PostToolUse": [{ "hooks": [{ "type": "command", "command": "/opt/libra/bin/libra-governor hook post-tool-use" }] }],
+            "Stop": [{ "hooks": [{ "type": "command", "command": "libra-governor hook stop" }] }]
+        }, "statusLine": { "type": "command", "command": "/opt/libra/bin/libra-governor statusline" } });
+        std::fs::write(&path, serde_json::to_vec(&seed).unwrap()).unwrap();
+        let removed = remove(&path).unwrap();
+        assert_eq!(removed.hook_commands_removed, 3);
+        assert!(removed.statusline_removed);
+    }
+
+    #[test]
+    fn our_command_under_a_foreign_matcher_group_is_not_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let ours = "/opt/libra/bin/libra-governor hook pre-tool-use";
+        let seed = serde_json::json!({ "hooks": { "PreToolUse": [
+            { "matcher": "Bash", "hooks": [{ "type": "command", "command": ours }] }
+        ] } });
+        std::fs::write(&path, serde_json::to_vec(&seed).unwrap()).unwrap();
+
+        apply_hooks_only(&path, &binary()).unwrap();
+        let value = read_json(&path);
+        let groups = value["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(groups.len(), 2, "an all-tools entry of our own is added");
+        assert_eq!(groups[0], seed["hooks"]["PreToolUse"][0]);
+        assert!(groups[1].get("matcher").is_none());
+        assert_eq!(groups[1]["hooks"][0]["command"], ours);
+
+        // `""` and `"*"` do count as all-tools: no second entry.
+        for matcher in ["", "*"] {
+            let seed = serde_json::json!({ "hooks": { "PreToolUse": [
+                { "matcher": matcher, "hooks": [{ "type": "command", "command": ours }] }
+            ] } });
+            std::fs::write(&path, serde_json::to_vec(&seed).unwrap()).unwrap();
+            apply_hooks_only(&path, &binary()).unwrap();
+            assert_eq!(
+                read_json(&path)["hooks"]["PreToolUse"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn reinstall_adds_the_settlement_timeout_to_an_entry_that_lacks_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let seed = serde_json::json!({ "hooks": {
+            "SubagentStop": [{ "hooks": [{ "type": "command", "command": "/opt/libra/bin/libra-governor hook subagent-stop" }] }],
+            "SessionEnd": [{ "hooks": [{ "type": "command", "command": "/opt/libra/bin/libra-governor hook session-end", "timeout": 3 }] }]
+        } });
+        std::fs::write(&path, serde_json::to_vec(&seed).unwrap()).unwrap();
+
+        let applied = apply_hooks_only(&path, &binary()).unwrap();
+        let value = read_json(&path);
+        assert_eq!(value["hooks"]["SubagentStop"][0]["hooks"][0]["timeout"], 10);
+        assert_eq!(
+            value["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3,
+            "a timeout the user chose is never overwritten"
+        );
+        assert_eq!(value["hooks"]["SubagentStop"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            applied.hooks_added, 5,
+            "4 added (3 legacy + PreToolUse), SubagentStop upgraded"
+        );
+        assert_eq!(apply_hooks_only(&path, &binary()).unwrap().hooks_added, 0);
     }
 }

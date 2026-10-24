@@ -686,10 +686,12 @@ The settlement hooks (`SubagentStop`, `SessionEnd`) never block and never
 spawn a daemon: no daemon, no answer within 6 s, a malformed payload, an
 unusable session id or a missing path is a log line and exit 0. A blank id
 is treated as absent and no agent id is ever invented; an `agent_id`
-outside `[A-Za-z0-9_-]` is not forwarded. Without a usable id, a file the
-`Stop` sweep already attributes by name (`<session>/subagents/agent-<id>.jsonl`)
-is left to that sweep so it is never charged twice; any other file is charged
-unattributed, keyed by its path. Transcript paths are passed through verbatim; only the
+outside `[A-Za-z0-9_-]` is not forwarded. When the transcript's file name
+is exactly `agent-<id>.jsonl` the hook sends that id (the same one the daemon's
+`Stop` sweep derives), so the hook and the sweep book one family and a file is
+never charged twice or lost; any other file is charged under the payload id,
+else unattributed. stdin is read only once a budget file exists and is capped
+at 1 MiB (oversize or non-UTF-8 input is ignored). Transcript paths are passed through verbatim; only the
 daemon validates and reads them. `libra-governor install` writes both with
 `"timeout": 10` because the host's default window for a `SessionEnd` hook
 is short; whether the host honours that value has not been verified on a

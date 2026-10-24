@@ -16,9 +16,11 @@
 //! | present | usable | one request, outcome logged only |
 //!
 //! Identity contract: a blank id is absent, an agent id is never invented,
-//! and an agent id outside `[A-Za-z0-9_-]` is not forwarded as an id (the
-//! charge is then booked unattributed, keyed by its path, rather than
-//! dropped or attributed to a guess).
+//! and an agent id outside `[A-Za-z0-9_-]` is not forwarded as an id. When
+//! the transcript's file name is exactly `agent-<id>.jsonl`, that
+//! host-provided id is the family (it is the id the daemon's Stop sweep
+//! derives), so hook and sweep never book one file under two families;
+//! otherwise the payload id, else unattributed.
 
 use std::path::Path;
 use std::time::Duration;
@@ -41,13 +43,18 @@ pub const SETTLE_BUDGET: Duration = Duration::from_secs(6);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubagentStop {
     pub session_id: String,
-    /// `None` when the host sent none, a blank one, or one outside
-    /// `[A-Za-z0-9_-]` (see module docs).
+    /// The family the charge is booked under: the id in the transcript's file
+    /// name when it is `agent-<id>.jsonl` (the same id the daemon's `Stop`
+    /// sweep derives, so both converge on one family), else the payload id
+    /// when it is valid, else `None` (unattributed). Never invented.
     pub agent_id: Option<String>,
     /// Relayed verbatim; the daemon decides whether it is acceptable.
     pub agent_transcript_path: Option<String>,
     /// The host sent an agent id that was dropped for its charset.
     pub agent_id_rejected: bool,
+    /// The payload carried a valid id that differs from the file-name id; the
+    /// file-name id won so one file is never booked under two families.
+    pub agent_id_disagrees: bool,
 }
 
 /// A `SessionEnd` payload reduced to what the tail settlement needs.
@@ -102,19 +109,31 @@ pub fn agent_id_charset_ok(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// The id in a transcript path's final component, when that component is
+/// exactly `agent-<[A-Za-z0-9_-]+>.jsonl`. A string check; nothing is opened.
+pub fn filename_agent_id(path: &str) -> Option<String> {
+    let name = Path::new(path).file_name()?.to_str()?;
+    let id = name.strip_prefix("agent-")?.strip_suffix(".jsonl")?;
+    agent_id_charset_ok(id).then(|| id.to_string())
+}
+
 pub fn parse_subagent_stop(raw: &str) -> Result<SubagentStop, Skip> {
     let map = object(raw, "SubagentStop")?;
     let session_id = session_id(&map)?;
-    let (agent_id, agent_id_rejected) = match non_blank(&map, "agent_id") {
+    let (payload_id, agent_id_rejected) = match non_blank(&map, "agent_id") {
         Some(id) if agent_id_charset_ok(&id) => (Some(id), false),
         Some(_) => (None, true),
         None => (None, false),
     };
+    let agent_transcript_path = non_blank(&map, "agent_transcript_path");
+    let file_id = agent_transcript_path.as_deref().and_then(filename_agent_id);
+    let agent_id_disagrees = matches!((&file_id, &payload_id), (Some(f), Some(p)) if f != p);
     Ok(SubagentStop {
         session_id,
-        agent_id,
-        agent_transcript_path: non_blank(&map, "agent_transcript_path"),
+        agent_id: file_id.or(payload_id),
+        agent_transcript_path,
         agent_id_rejected,
+        agent_id_disagrees,
     })
 }
 
@@ -126,23 +145,6 @@ pub fn parse_session_end(raw: &str) -> Result<SessionEnd, Skip> {
     })
 }
 
-/// Is `path` a file the daemon's `Stop` sweep visits
-/// (`<session>/subagents/agent-<id>.jsonl`, absolute, `<id>` in
-/// `[A-Za-z0-9_-]`)? A string check only; nothing is opened.
-fn sweep_visible(path: &str) -> bool {
-    let p = Path::new(path);
-    let id = p
-        .file_name()
-        .and_then(|n| n.to_str())
-        .and_then(|n| n.strip_prefix("agent-"))
-        .and_then(|n| n.strip_suffix(".jsonl"));
-    p.is_absolute()
-        && id.is_some_and(agent_id_charset_ok)
-        && p.parent()
-            .and_then(Path::file_name)
-            .is_some_and(|d| d == "subagents")
-}
-
 /// The request for a parsed `SubagentStop`, or why none is sent.
 pub fn charge_request(stop: &SubagentStop) -> Result<SharedBudgetRequest, &'static str> {
     if budget_gate::session_id_unusable(&stop.session_id) {
@@ -152,13 +154,6 @@ pub fn charge_request(stop: &SubagentStop) -> Result<SharedBudgetRequest, &'stat
         // The next Stop's subagent sweep still finds the file.
         return Err("no agent_transcript_path in payload");
     };
-    // The daemon books an id-less charge under a path family but the Stop
-    // sweep books the same file under the id in its name: sending both would
-    // charge the file twice. Leave such a file to the sweep, which attributes
-    // it by its name (the hook never derives an id itself).
-    if stop.agent_id.is_none() && sweep_visible(&path) {
-        return Err("no usable agent_id; the Stop sweep attributes this file by name");
-    }
     Ok(SharedBudgetRequest::ChargeAgentTranscript {
         session_id: stop.session_id.clone(),
         agent_id: stop.agent_id.clone(),
@@ -281,23 +276,39 @@ fn run_with<P>(
     send(&socket_path, what, request, &log);
 }
 
-fn read_stdin() -> Option<String> {
+/// Upper bound on the hook payload we will read. Real payloads are a few KiB;
+/// anything larger is not one and is ignored rather than buffered.
+pub const MAX_STDIN_BYTES: u64 = 1024 * 1024;
+
+/// Reads stdin only once a budget file exists, bounded by
+/// [`MAX_STDIN_BYTES`]. `None` for no budget file, oversize or non-UTF-8
+/// input (all silent).
+fn read_stdin_bounded(agent: AgentKind) -> Option<String> {
     use std::io::Read;
-    let mut raw = String::new();
-    std::io::stdin().read_to_string(&mut raw).ok()?;
-    Some(raw)
+    if agent != AgentKind::ClaudeCode || !budget_gate::budget_file_present() {
+        return None;
+    }
+    let mut buf = Vec::new();
+    std::io::stdin()
+        .take(MAX_STDIN_BYTES + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.len() as u64 > MAX_STDIN_BYTES {
+        return None;
+    }
+    String::from_utf8(buf).ok()
 }
 
 /// `libra-governor hook subagent-stop`: reads stdin, never fails the host.
 pub fn run_subagent_stop(agent: AgentKind) {
-    if let Some(raw) = read_stdin() {
+    if let Some(raw) = read_stdin_bounded(agent) {
         run_subagent_stop_with_input(agent, &raw);
     }
 }
 
 /// `libra-governor hook session-end`: reads stdin, never fails the host.
 pub fn run_session_end(agent: AgentKind) {
-    if let Some(raw) = read_stdin() {
+    if let Some(raw) = read_stdin_bounded(agent) {
         run_session_end_with_input(agent, &raw);
     }
 }
@@ -310,7 +321,10 @@ pub fn run_subagent_stop_with_input(agent: AgentKind, raw: &str) {
         parse_subagent_stop,
         charge_request,
         |stop, log| {
-            if stop.agent_id_rejected {
+            if stop.agent_id_disagrees {
+                log("subagent-stop: payload agent_id differs from the transcript file name; using the file name id");
+            }
+            if stop.agent_id_rejected && stop.agent_id.is_none() {
                 log("subagent-stop: agent_id outside [A-Za-z0-9_-]; charging unattributed");
             }
         },
@@ -390,38 +404,70 @@ mod tests {
     }
 
     #[test]
-    fn an_id_less_stop_for_a_sweep_visible_file_is_left_to_the_sweep() {
-        let visible = "/h/p/s/subagents/agent-a1b2.jsonl";
-        for agent in [None, Some("a/b".to_string())] {
+    fn the_family_is_the_file_name_id_so_hook_and_sweep_converge() {
+        let path = "/h/p/s/subagents/agent-a1b2.jsonl";
+        for payload in [
+            serde_json::json!(null),
+            serde_json::json!(""),
+            serde_json::json!("a/b"),
+            serde_json::json!("a1b2"),
+        ] {
             let raw = serde_json::json!({
-                "session_id": "s", "agent_id": agent, "agent_transcript_path": visible
+                "session_id": "s", "agent_id": payload, "agent_transcript_path": path
             })
             .to_string();
-            assert!(charge_request(&parse_subagent_stop(&raw).unwrap()).is_err());
+            let stop = parse_subagent_stop(&raw).unwrap();
+            assert_eq!(stop.agent_id.as_deref(), Some("a1b2"), "{payload}");
+            assert!(!stop.agent_id_disagrees, "{payload}");
+            assert!(matches!(
+                charge_request(&stop).unwrap(),
+                SharedBudgetRequest::ChargeAgentTranscript { agent_id: Some(ref a), .. } if a == "a1b2"
+            ));
         }
-        // With a valid id the sweep books the same family, so it is sent.
-        let with_id = parse_subagent_stop(
-            &serde_json::json!({
-                "session_id": "s", "agent_id": "a1b2", "agent_transcript_path": visible
-            })
-            .to_string(),
+        // Any directory, `..`, alias or symlink path: only the final component counts.
+        for other in [
+            "/x/agent-a1b2.jsonl",
+            "/x/../y/subagents/agent-a1b2.jsonl",
+            "/private/var/z/agent-a1b2.jsonl",
+        ] {
+            assert_eq!(filename_agent_id(other).as_deref(), Some("a1b2"), "{other}");
+        }
+    }
+
+    #[test]
+    fn a_payload_id_that_disagrees_with_the_file_name_never_makes_a_second_family() {
+        let stop = parse_subagent_stop(
+            r#"{"session_id":"s","agent_id":"zzz","agent_transcript_path":"/t/agent-a1b2.jsonl"}"#,
         )
         .unwrap();
-        assert!(charge_request(&with_id).is_ok());
-        // Files the sweep cannot see are still charged, unattributed.
-        for hidden in [
-            "/h/p/s/agent-a1b2.jsonl",
-            "/h/p/s/subagents/other.jsonl",
-            "/h/p/s/subagents/agent-a.b.jsonl",
-            "/h/p/s/subagents/agent-.jsonl",
-            "subagents/agent-a1b2.jsonl",
+        assert_eq!(stop.agent_id.as_deref(), Some("a1b2"));
+        assert!(stop.agent_id_disagrees);
+    }
+
+    #[test]
+    fn a_name_that_is_not_exactly_agent_id_jsonl_falls_back_to_the_payload_id() {
+        for name in [
+            "/t/agent-.jsonl",
+            "/t/agent-a.b.jsonl",
+            "/t/agent-a b.jsonl",
+            "/t/other.jsonl",
+            "/t/agent-a1.jsonl.bak",
+            "/t/xagent-a1.jsonl",
         ] {
+            assert_eq!(filename_agent_id(name), None, "{name}");
             let stop = parse_subagent_stop(
-                &serde_json::json!({"session_id": "s", "agent_transcript_path": hidden})
-                    .to_string(),
+                &serde_json::json!({
+                    "session_id": "s", "agent_id": "p1", "agent_transcript_path": name
+                })
+                .to_string(),
             )
             .unwrap();
-            assert!(charge_request(&stop).is_ok(), "{hidden}");
+            assert_eq!(stop.agent_id.as_deref(), Some("p1"), "{name}");
+            let bare = parse_subagent_stop(
+                &serde_json::json!({"session_id": "s", "agent_transcript_path": name}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(bare.agent_id, None, "{name}");
         }
     }
 
