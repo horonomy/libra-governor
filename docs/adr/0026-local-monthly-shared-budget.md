@@ -19,9 +19,11 @@ The daemon re-reads the file on every decision (see *Daemon behaviour delivered 
 **S5 (HORO-2196, HORO-2190) delivers settlement**: the turn hold is settled
 at `Stop` from priced, session-bound transcript usage, and a subagent's
 transcript is charged by `ChargeAgentTranscript` (see *Settlement delivered
-in S5*). `PROTOCOL_VERSION` is 21. Everything else below is **design intent
-implemented in later slices** (S6 hooks and the daemon-unreachable
-behaviour, S7 installer, S8 doctor/status, S11 gateway `governor_held`); it
+in S5*). `PROTOCOL_VERSION` is 21. The S6 Claude Code hook gate and the S10
+retention/export commands landed on `main` separately and are recorded in
+their own commits and in *Retention and export* below. Everything else
+below that is not one of those is **design intent implemented in later
+slices** (S7 installer, S8 doctor/status, S11 gateway `governor_held`); it
 must not be read as shipped behaviour. No real Claude Code host has
 exercised any of it: S4's and S5's evidence is `TestOwnedLive`, and S5's
 transcripts are synthetic.
@@ -187,7 +189,7 @@ returned with `event_time_clamped: true`, because the spend already happened;
 only years outside 2000-2200 are refused. One charge above ten times the
 monthly cap, or one that would push a pool total past a safe range, is refused
 (`amount_too_large`). Against an invalid file a charge records nothing and
-answers `config_invalid`; the caller (hook runtime, S6) must retry or spool it.
+answers `config_invalid`; the caller (the hook runtime) must retry or spool it.
 
 **Heartbeat and over-reservation.** A tool event renews the session's active
 holds in the current period's pool (it carries no agent id, so the lane cannot
@@ -271,7 +273,7 @@ stamped before a `Stop` but flushed after it falls behind the watermark and
 is not counted (the window settled measured-short or at the hold amount).
 `Finalize` carries no idempotency key: a retry before the next `Admit` is a
 no-op, but a duplicate delivered after the next `Admit` would settle the
-new hold, so the S6 hook must not resend. Status telemetry (counters,
+new hold, so the hook must not resend. Status telemetry (counters,
 `unpriced_models`) is process memory and restarts at zero; the ledger's
 `usage_known` flag is the durable record.
 
@@ -296,7 +298,18 @@ measurement books only the excess. A transcript naming another session is
 refused (`transcript_session_mismatch`) and charges nothing, not even the
 fallback.
 
-**Not done in S5:** no hook runtime or installer (S6/S7), no `doctor`/status
+**Retention interaction (S10).** Two S5 values are derived from ledger rows
+and `shared-budget prune` deletes whole closed pools: the lane watermark
+(settled holds) and a subagent family's already-charged sum (charge rows).
+After a pool is pruned, a later repeat of a `SubagentStop` whose earlier
+charges lived only in a pruned period would charge the full cumulative again
+(over-charge, current period), and a lane whose settled history was pruned
+falls back to its oldest remaining hold (records before it are not counted).
+Both need the prune of a period that a still-running session or a
+still-growing subagent file straddles, which `keep_months >= 1` makes an
+edge case; they are not otherwise guarded.
+
+**Not done in S5:** no installer (S7), no `doctor`/status
 CLI (S8), no real host evidence, no gateway path (S11). `Finalize` itself
 returns nothing about the settlement; it is observable through `Status`.
 
