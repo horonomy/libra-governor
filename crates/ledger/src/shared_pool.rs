@@ -1124,6 +1124,131 @@ impl LedgerStore {
         }))
     }
 
+    /// The active, unexpired, non-charge hold of one executor lane in
+    /// `pool_id` (HORO-2195), or `None`.
+    ///
+    /// A lane is `(session_id, agent_id | NULL)` plus its `executor_kind`:
+    /// the NULL-agent comparison uses `IS` (plain `=` never matches NULL)
+    /// and the kind is part of the key so a main-executor lane is never
+    /// confused with an `unattributed` row that also has no agent. Expiry
+    /// and recency are compared as parsed instants, not RFC3339 text (see
+    /// [`Self::settled_before_tx`]). If more than one active hold matches
+    /// (which the daemon never creates), the most recently created wins.
+    pub fn active_shared_hold_for_lane(
+        &self,
+        pool_id: &PoolId,
+        principal_id: &PrincipalId,
+        session_id: &str,
+        agent_id: Option<&str>,
+        executor_kind: ExecutorKind,
+        now: OffsetDateTime,
+    ) -> Result<Option<SharedPoolReservation>, LedgerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {RESERVATION_COLUMNS} FROM shared_pool_reservations
+             WHERE pool_id = ?1 AND principal_id = ?2 AND session_id = ?3
+               AND agent_id IS ?4 AND COALESCE(executor_kind, 'unattributed') = ?5
+               AND state = 'active' AND is_charge = 0"
+        ))?;
+        let rows = stmt.query_map(
+            rusqlite::params![
+                pool_id.0,
+                principal_id.0,
+                session_id,
+                agent_id,
+                executor_kind.as_str()
+            ],
+            read_reservation_row,
+        )?;
+        let mut best: Option<SharedPoolReservation> = None;
+        for row in rows {
+            let reservation = row_to_reservation(row?)?;
+            if reservation.expires_at <= now {
+                continue;
+            }
+            if best
+                .as_ref()
+                .map_or(true, |b| reservation.created_at > b.created_at)
+            {
+                best = Some(reservation);
+            }
+        }
+        Ok(best)
+    }
+
+    /// Every active, unexpired, non-charge hold `principal_id` has for
+    /// `session_id` in any pool whose id starts with `pool_prefix`
+    /// (HORO-2195) -- the set a tool-event heartbeat renews.
+    pub fn active_shared_holds_for_session(
+        &self,
+        principal_id: &PrincipalId,
+        session_id: &str,
+        pool_prefix: &str,
+        now: OffsetDateTime,
+    ) -> Result<Vec<SharedPoolReservation>, LedgerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {RESERVATION_COLUMNS} FROM shared_pool_reservations
+             WHERE principal_id = ?1 AND session_id = ?2
+               AND substr(pool_id, 1, length(?3)) = ?3
+               AND state = 'active' AND is_charge = 0"
+        ))?;
+        let rows = stmt.query_map(
+            rusqlite::params![principal_id.0, session_id, pool_prefix],
+            read_reservation_row,
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            let reservation = row_to_reservation(row?)?;
+            if reservation.expires_at > now {
+                out.push(reservation);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Ids of every pool whose id starts with `prefix`, sorted
+    /// (HORO-2195). Used to detect a pool of a later period than the
+    /// clock says exists.
+    pub fn shared_pool_ids_with_prefix(&self, prefix: &str) -> Result<Vec<PoolId>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT pool_id FROM quota_pools WHERE substr(pool_id, 1, length(?1)) = ?1
+             ORDER BY pool_id",
+        )?;
+        let rows = stmt.query_map([prefix], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map(|ids| ids.into_iter().map(PoolId).collect())
+            .map_err(LedgerError::Sqlite)
+    }
+
+    /// The pool of the most recently created hold (any state, charges
+    /// excluded) `principal_id` has for `session_id` among pools starting
+    /// with `pool_prefix` (HORO-2195) -- the fallback period for a charge
+    /// that names no event time.
+    pub fn latest_shared_hold_pool_for_session(
+        &self,
+        principal_id: &PrincipalId,
+        session_id: &str,
+        pool_prefix: &str,
+    ) -> Result<Option<PoolId>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT pool_id, created_at FROM shared_pool_reservations
+             WHERE principal_id = ?1 AND session_id = ?2
+               AND substr(pool_id, 1, length(?3)) = ?3 AND is_charge = 0",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![principal_id.0, session_id, pool_prefix],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        let mut best: Option<(OffsetDateTime, String)> = None;
+        for row in rows {
+            let (pool, created_at) = row?;
+            let created_at = parse_time(&created_at)?;
+            if best.as_ref().map_or(true, |(t, _)| created_at > *t) {
+                best = Some((created_at, pool));
+            }
+        }
+        Ok(best.map(|(_, pool)| PoolId(pool)))
+    }
+
     /// Computes [`PoolAdmission`] for `pool_id` as of `now`, inside the
     /// caller's own transaction/connection. `Ok(None)` when no pool has
     /// been created.
@@ -3300,5 +3425,238 @@ mod tests {
                 other => panic!("expected Used, got {other:?}"),
             }
         }
+    }
+}
+
+/// HORO-2195 read helpers: lane lookup, per-session holds, pool listing.
+#[cfg(test)]
+mod lane_read_tests {
+    use super::*;
+    use libra_governor_domain::{ExecutorKind, QuotaUnit};
+
+    fn t0() -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap()
+    }
+
+    fn pool(n: &str) -> PoolId {
+        PoolId(format!("metered:local-budget/{n}"))
+    }
+
+    fn owner() -> PrincipalId {
+        PrincipalId("local-budget".to_string())
+    }
+
+    fn hold(
+        store: &mut LedgerStore,
+        pool_id: &PoolId,
+        session: &str,
+        attribution: ExecutorAttribution<'_>,
+        key: &str,
+        now: OffsetDateTime,
+    ) -> SharedPoolReservation {
+        match store
+            .reserve_shared(SharedPoolReserveRequest {
+                pool_id,
+                principal_id: &owner(),
+                session_id: session,
+                amount: 10,
+                unit: &QuotaUnit::UsdCents,
+                idempotency_key: key,
+                now,
+                ttl_secs: 100,
+                attribution,
+            })
+            .unwrap()
+        {
+            SharedPoolReserveOutcome::Granted(r) => *r,
+            other => panic!("expected Granted, got {other:?}"),
+        }
+    }
+
+    fn store_with(pools: &[&str]) -> LedgerStore {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        for p in pools {
+            store
+                .ensure_pool(&pool(p), &QuotaUnit::UsdCents, 1_000, t0())
+                .unwrap();
+        }
+        store
+    }
+
+    #[test]
+    fn lane_lookup_distinguishes_agent_absent_unattributed_and_named_agent() {
+        let mut store = store_with(&["monthly-2027-01"]);
+        let p = pool("monthly-2027-01");
+        let main = hold(
+            &mut store,
+            &p,
+            "s",
+            ExecutorAttribution::main_executor(None),
+            "k-main",
+            t0(),
+        );
+        let unknown = hold(
+            &mut store,
+            &p,
+            "s",
+            ExecutorAttribution::unattributed(None),
+            "k-unk",
+            t0(),
+        );
+        let agent = hold(
+            &mut store,
+            &p,
+            "s",
+            ExecutorAttribution::agent("a1", None),
+            "k-a1",
+            t0(),
+        );
+        let find = |agent_id: Option<&str>, kind| {
+            store
+                .active_shared_hold_for_lane(&p, &owner(), "s", agent_id, kind, t0())
+                .unwrap()
+                .map(|r| r.id)
+        };
+        assert_eq!(find(None, ExecutorKind::AgentAbsent), Some(main.id));
+        assert_eq!(find(None, ExecutorKind::Unattributed), Some(unknown.id));
+        assert_eq!(find(Some("a1"), ExecutorKind::Agent), Some(agent.id));
+        assert_eq!(find(Some("a2"), ExecutorKind::Agent), None);
+        assert_eq!(
+            store
+                .active_shared_hold_for_lane(
+                    &p,
+                    &owner(),
+                    "other",
+                    None,
+                    ExecutorKind::AgentAbsent,
+                    t0()
+                )
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn lane_lookup_ignores_expired_settled_and_charge_rows() {
+        let mut store = store_with(&["monthly-2027-01"]);
+        let p = pool("monthly-2027-01");
+        let h = hold(
+            &mut store,
+            &p,
+            "s",
+            ExecutorAttribution::main_executor(None),
+            "k",
+            t0(),
+        );
+        let lane = |store: &LedgerStore, now| {
+            store
+                .active_shared_hold_for_lane(
+                    &p,
+                    &owner(),
+                    "s",
+                    None,
+                    ExecutorKind::AgentAbsent,
+                    now,
+                )
+                .unwrap()
+        };
+        assert!(lane(&store, t0() + time::Duration::seconds(99)).is_some());
+        // expires_at == now is expired.
+        assert!(lane(&store, t0() + time::Duration::seconds(100)).is_none());
+        store.settle_shared(h.id, Some(5), t0()).unwrap();
+        assert!(lane(&store, t0()).is_none());
+        // A settled charge row for the same lane is never an active hold.
+        store
+            .charge_shared(SharedPoolChargeRequest {
+                pool_id: &p,
+                principal_id: &owner(),
+                session_id: "s",
+                amount: 3,
+                unit: &QuotaUnit::UsdCents,
+                idempotency_key: "c",
+                now: t0(),
+                attribution: ExecutorAttribution::main_executor(None),
+                capacity_source: CapacitySource::LocalConfigured { cap: 1_000 },
+            })
+            .unwrap();
+        assert!(lane(&store, t0()).is_none());
+    }
+
+    #[test]
+    fn session_holds_and_latest_pool_follow_creation_time_not_pool_name() {
+        let mut store = store_with(&["monthly-2027-01", "monthly-2027-02"]);
+        let jan = pool("monthly-2027-01");
+        let feb = pool("monthly-2027-02");
+        hold(
+            &mut store,
+            &feb,
+            "s",
+            ExecutorAttribution::main_executor(None),
+            "k1",
+            t0(),
+        );
+        // Created later but in the alphabetically earlier pool.
+        let later = t0() + time::Duration::seconds(10);
+        hold(
+            &mut store,
+            &jan,
+            "s",
+            ExecutorAttribution::agent("a", None),
+            "k2",
+            later,
+        );
+        assert_eq!(
+            store
+                .latest_shared_hold_pool_for_session(&owner(), "s", "metered:local-budget/monthly-")
+                .unwrap(),
+            Some(jan.clone())
+        );
+        assert_eq!(
+            store
+                .latest_shared_hold_pool_for_session(
+                    &owner(),
+                    "nobody",
+                    "metered:local-budget/monthly-"
+                )
+                .unwrap(),
+            None
+        );
+        // A different prefix matches nothing.
+        assert_eq!(
+            store
+                .latest_shared_hold_pool_for_session(&owner(), "s", "metered:acme/")
+                .unwrap(),
+            None
+        );
+        let holds = store
+            .active_shared_holds_for_session(&owner(), "s", "metered:local-budget/", later)
+            .unwrap();
+        assert_eq!(holds.len(), 2);
+        assert!(store
+            .active_shared_holds_for_session(
+                &owner(),
+                "s",
+                "metered:local-budget/",
+                later + time::Duration::seconds(1000)
+            )
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn pool_listing_is_prefix_exact_and_sorted() {
+        let mut store = store_with(&["monthly-2027-03", "monthly-2027-01"]);
+        store
+            .ensure_pool(
+                &PoolId("metered:acme/monthly-2027-09".into()),
+                &QuotaUnit::UsdCents,
+                1,
+                t0(),
+            )
+            .unwrap();
+        let ids = store
+            .shared_pool_ids_with_prefix("metered:local-budget/monthly-")
+            .unwrap();
+        assert_eq!(ids, vec![pool("monthly-2027-01"), pool("monthly-2027-03")]);
     }
 }
