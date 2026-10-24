@@ -131,7 +131,8 @@ fn month_index_of_alias(alias: &str) -> Option<i64> {
 /// (start of `pool_index + 1`) is at or before the start of the month
 /// `keep_months` before `current_index`.
 fn is_prunable_period(pool_index: i64, current_index: i64, keep_months: u32) -> bool {
-    pool_index + 1 <= current_index - i64::from(keep_months)
+    // end index (pool_index + 1) <= threshold index, written without the +1.
+    pool_index < current_index - i64::from(keep_months)
 }
 
 fn pool_counts(

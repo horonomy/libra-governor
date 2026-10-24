@@ -81,8 +81,7 @@ fn hold(
     session: &str,
     amount: u64,
     key: &str,
-    at: OffsetDateTime,
-    ttl_secs: u64,
+    (at, ttl_secs): (OffsetDateTime, u64),
     attribution: ExecutorAttribution<'_>,
 ) -> libra_governor_domain::SharedPoolReservationId {
     match store
@@ -145,8 +144,7 @@ fn seed_closed(store: &mut LedgerStore, alias: &str) {
         "s2",
         10,
         "h-rel",
-        now(),
-        3600,
+        (now(), 3600),
         ExecutorAttribution::default(),
     );
     store.release_shared(released, now()).unwrap();
@@ -156,8 +154,7 @@ fn seed_closed(store: &mut LedgerStore, alias: &str) {
         "s3",
         10,
         "h-exp",
-        now(),
-        1,
+        (now(), 1),
         ExecutorAttribution::default(),
     );
     let reaped = store
@@ -318,8 +315,7 @@ fn pool_with_an_active_hold_is_never_pruned() {
         "live",
         5,
         "h-live",
-        now(),
-        86_400,
+        (now(), 86_400),
         ExecutorAttribution::default(),
     );
     // Expired but not yet reaped: still `active`, still blocks.
@@ -330,8 +326,7 @@ fn pool_with_an_active_hold_is_never_pruned() {
         "stale",
         5,
         "h-stale",
-        now() - time::Duration::days(30),
-        1,
+        (now() - time::Duration::days(30), 1),
         ExecutorAttribution::default(),
     );
 
@@ -428,8 +423,7 @@ fn prune_beside_reserve_and_settle_on_another_connection_neither_deadlocks_nor_c
                 "live",
                 10,
                 &format!("k{i}"),
-                now(),
-                3600,
+                (now(), 3600),
                 ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
             );
             store.settle_shared(id, Some(10), now()).unwrap();
@@ -522,8 +516,7 @@ fn export_executor_sums_equal_pool_totals_across_agent_shapes() {
         "sess-b",
         25,
         "h1",
-        now(),
-        3600,
+        (now(), 3600),
         ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
     );
 

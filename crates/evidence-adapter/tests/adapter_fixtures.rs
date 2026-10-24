@@ -276,6 +276,27 @@ fn dropped_count_zero_is_provable_no_eviction_path_exists_in_ledger() {
             let Ok(contents) = std::fs::read_to_string(&entry) else {
                 continue;
             };
+            if entry.file_name().and_then(|n| n.to_str()) == Some("shared_pool_retention.rs") {
+                // HORO-2219: the one deliberate, operator-initiated delete
+                // path (`shared-budget prune --apply`). It is scoped to the
+                // shared-pool tables, which feed no DogFood evidence event,
+                // so it cannot make `dropped_count` untrue. Pinned to those
+                // tables so any other target still fails this guard.
+                const ALLOWED_TARGETS: [&str; 3] = [
+                    "shared_pool_reservations",
+                    "shared_pool_provider_snapshots",
+                    "quota_pools",
+                ];
+                let statements: Vec<&str> = contents.split("DELETE FROM").skip(1).collect();
+                assert!(!statements.is_empty(), "stale retention exemption");
+                for statement in statements {
+                    let target = statement.split_whitespace().next().unwrap_or_default();
+                    if !ALLOWED_TARGETS.contains(&target) || contents.contains("DROP TABLE") {
+                        offending.push(entry.clone());
+                    }
+                }
+                continue;
+            }
             if contents.contains("DELETE FROM") || contents.contains("DROP TABLE") {
                 offending.push(entry);
             }
