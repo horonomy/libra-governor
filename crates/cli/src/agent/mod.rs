@@ -19,6 +19,8 @@
 pub mod canonical;
 pub mod event;
 pub mod identity;
+#[cfg(test)]
+mod identity_conformance;
 pub mod normalize;
 pub mod payload;
 pub mod render;
