@@ -890,6 +890,45 @@ pub(crate) fn dispatch(
                     charge_source,
                     event_time.as_deref(),
                 ),
+                SharedBudgetRequest::ChargeAgentTranscript {
+                    session_id,
+                    agent_id,
+                    agent_transcript_path,
+                } => {
+                    let outcome = crate::shared_budget::charge_agent_transcript(
+                        ledger,
+                        rt,
+                        &session_id,
+                        agent_id.as_deref(),
+                        &agent_transcript_path,
+                    );
+                    if let Ok(o) = &outcome {
+                        if let Some(line) =
+                            crate::shared_budget::transcript_charge_log(&session_id, o)
+                        {
+                            log::append_line(&config.log_path, &line);
+                        }
+                    }
+                    outcome
+                }
+                SharedBudgetRequest::SettleTail {
+                    session_id,
+                    transcript_path,
+                } => {
+                    let outcome = crate::shared_budget::settle_tail(
+                        ledger,
+                        rt,
+                        &session_id,
+                        &transcript_path,
+                    );
+                    if let Ok(o) = &outcome {
+                        log::append_line(
+                            &config.log_path,
+                            &crate::shared_budget::tail_log(&session_id, o),
+                        );
+                    }
+                    outcome
+                }
                 SharedBudgetRequest::Status {} => crate::shared_budget::status(ledger, rt)
                     .map(|status| SharedBudgetOutcome::Status(Box::new(status))),
             };
@@ -2152,6 +2191,53 @@ pub(crate) fn handle_finalize(
     current_task: &mut Option<TaskSummary>,
     config: &DaemonConfig,
 ) -> Result<FinalizeOutcome, DaemonError> {
+    // The local monthly shared budget (HORO-2196, ADR-0026): settle the
+    // session's turn hold from the priced transcript window. It needs no
+    // preflight task, so it runs before and independently of the legacy
+    // finalization below, and only when a shared-budget file is in force --
+    // with none, nothing here is consulted or written and `Finalize`
+    // behaves exactly as it did. A failure is logged and never fails the
+    // receipt: the unsettled hold simply stays reserved until its TTL
+    // reclaims it, which over-reserves and never under-reserves.
+    if config.shared_budget.is_configured() {
+        match crate::shared_budget::settle_turn(
+            ledger,
+            &config.shared_budget,
+            session_id,
+            transcript_path,
+        ) {
+            Ok(settlement) => log::append_line(
+                &config.log_path,
+                &format!(
+                    "lane {}: {}",
+                    crate::shared_budget::opaque_id(session_id),
+                    settlement.label()
+                ),
+            ),
+            Err(e) => log::append_line(
+                &config.log_path,
+                &format!("shared budget settlement error: {e}"),
+            ),
+        }
+        // Subagent files lag their own SubagentStop; top them up now.
+        if let Some(path) = transcript_path {
+            let swept = crate::shared_budget::sweep_subagent_transcripts(
+                ledger,
+                &config.shared_budget,
+                session_id,
+                path,
+            );
+            if swept > 0 {
+                log::append_line(
+                    &config.log_path,
+                    &format!(
+                        "lane {}: shared budget swept {swept} subagent transcript(s)",
+                        crate::shared_budget::opaque_id(session_id)
+                    ),
+                );
+            }
+        }
+    }
     finalize_with_usage(
         session_id,
         model,

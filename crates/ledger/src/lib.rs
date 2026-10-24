@@ -65,10 +65,10 @@ pub use resource_account::{
 };
 pub use shared_pool::{
     CapacitySource, ExecutorAttribution, MeteredReserveOutcome, MeteredReserveRequest,
-    SharedPoolChargeOutcome, SharedPoolChargeRequest, SharedPoolExecutorReport,
+    SettleWatermark, SharedPoolChargeOutcome, SharedPoolChargeRequest, SharedPoolExecutorReport,
     SharedPoolExecutorUsage, SharedPoolReleaseOutcome, SharedPoolRenewOutcome,
     SharedPoolReserveOutcome, SharedPoolReserveRequest, SharedPoolSessionUsage,
-    SharedPoolSettleOutcome, SourcedAdmission,
+    SharedPoolSettleOutcome, SourcedAdmission, WATERMARK_ID_CAP,
 };
 pub use shared_pool_retention::{
     ChargeSourceTotals, PoolExport, PoolExportExecutor, PoolPruneDetail, PruneDisposition,

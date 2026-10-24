@@ -128,6 +128,7 @@ fn seed_pool(store: &mut LedgerStore, alias: &str, session: &str) {
                 now,
                 attribution,
                 capacity_source: cap,
+                usage_known: true,
             })
             .unwrap();
     }
@@ -514,6 +515,7 @@ fn export_hash_changes_when_the_ledger_changes() {
             now: OffsetDateTime::now_utc(),
             attribution: ExecutorAttribution::default(),
             capacity_source: CapacitySource::LocalConfigured { cap: 100_000 },
+            usage_known: true,
         })
         .unwrap();
     drop(store);

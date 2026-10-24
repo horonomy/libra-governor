@@ -70,6 +70,7 @@ fn charge(
             now: now(),
             attribution,
             capacity_source: cap(),
+            usage_known: true,
         })
         .unwrap();
 }

@@ -99,6 +99,7 @@ fn charge(
             now: now(),
             attribution,
             capacity_source: source,
+            usage_known: true,
         })
         .unwrap()
 }
@@ -425,6 +426,7 @@ fn charge_is_idempotent_on_its_key_and_scoped_like_reserve_keys() {
             now: now(),
             attribution: attr,
             capacity_source: local(1_000),
+            usage_known: true,
         })
         .unwrap();
     assert!(matches!(outcome, SharedPoolChargeOutcome::Charged { .. }));
@@ -458,6 +460,7 @@ fn charge_on_a_missing_pool_or_wrong_unit_is_not_silently_recorded() {
         now: now(),
         attribution: Default::default(),
         capacity_source: local(10),
+        usage_known: true,
     });
     assert!(err.is_err(), "unit mismatch must be an error, not a row");
 }
@@ -754,6 +757,7 @@ fn inconsistent_attribution_is_rejected_before_anything_is_written() {
             now: now(),
             attribution,
             capacity_source: local(10),
+            usage_known: true,
         });
         assert!(r.is_err(), "case {i} must be rejected");
         let r = store.reserve_shared_metered(MeteredReserveRequest {
@@ -1118,4 +1122,319 @@ fn invalid_attribution_is_rejected_even_when_the_pool_is_full() {
         capacity_source: cap,
     });
     assert!(r.is_err(), "must be an error, not Insufficient: {r:?}");
+}
+
+// ---------------------------------------------------------------------
+// HORO-2196: provenance on a charge, lane history, prefix totals
+// ---------------------------------------------------------------------
+
+fn charge_with(
+    store: &mut LedgerStore,
+    amount: u64,
+    key: &str,
+    usage_known: bool,
+) -> SharedPoolChargeOutcome {
+    store
+        .charge_shared(SharedPoolChargeRequest {
+            pool_id: &pool(),
+            principal_id: &owner(),
+            session_id: "s1",
+            amount,
+            unit: &QuotaUnit::UsdCents,
+            idempotency_key: key,
+            now: now(),
+            attribution: ExecutorAttribution::agent("a1", Some(ChargeSource::SubagentTranscript)),
+            capacity_source: local(10_000),
+            usage_known,
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_charge_records_whether_its_amount_was_observed_and_replay_must_agree() {
+    let (_dir, mut store) = store_with_pool(10_000);
+    let SharedPoolChargeOutcome::Charged { reservation, .. } =
+        charge_with(&mut store, 25, "k-placeholder", false)
+    else {
+        panic!("expected Charged");
+    };
+    assert_eq!(reservation.usage_known, Some(false));
+    let SharedPoolChargeOutcome::Charged { reservation, .. } =
+        charge_with(&mut store, 25, "k-observed", true)
+    else {
+        panic!("expected Charged");
+    };
+    assert_eq!(reservation.usage_known, Some(true));
+
+    assert!(matches!(
+        charge_with(&mut store, 25, "k-placeholder", false),
+        SharedPoolChargeOutcome::AlreadyCharged(_)
+    ));
+    // Same key, same amount, different provenance: not a replay.
+    assert!(matches!(
+        charge_with(&mut store, 25, "k-placeholder", true),
+        SharedPoolChargeOutcome::KeyConflict(_)
+    ));
+}
+
+#[test]
+fn charges_total_by_key_prefix_sums_only_matching_charge_rows() {
+    let (_dir, mut store) = store_with_pool(10_000);
+    charge_with(&mut store, 10, "fam-a|c10", true);
+    charge_with(&mut store, 5, "fam-a|u", false);
+    charge_with(&mut store, 99, "fam-b|c99", true);
+    fn total(store: &LedgerStore, prefix: &str) -> u64 {
+        store
+            .shared_charges_total_by_key_prefix(&owner(), prefix, "metered:acme/")
+            .unwrap()
+    }
+    assert_eq!(total(&store, "fam-a|"), 15);
+    assert_eq!(total(&store, "fam-b|"), 99);
+    assert_eq!(total(&store, "fam-"), 114);
+    assert_eq!(total(&store, "nothing|"), 0);
+    // Pool prefix scoping.
+    assert_eq!(
+        store
+            .shared_charges_total_by_key_prefix(&owner(), "fam-a|", "metered:other/")
+            .unwrap(),
+        0
+    );
+    // A turn hold is never a charge row, whatever its key looks like.
+    reserve(
+        &mut store,
+        local(10_000),
+        "s1",
+        100,
+        "fam-a|hold",
+        ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+    );
+    assert_eq!(total(&store, "fam-a|"), 15);
+}
+
+#[test]
+fn lane_holds_lists_holds_of_one_lane_in_any_state_and_never_charges() {
+    let (_dir, mut store) = store_with_pool(10_000);
+    let a = granted_id(reserve(
+        &mut store,
+        local(10_000),
+        "s1",
+        100,
+        "h1",
+        ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+    ));
+    store.settle_shared(a, Some(40), now()).unwrap();
+    reserve(
+        &mut store,
+        local(10_000),
+        "s1",
+        100,
+        "h2",
+        ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+    );
+    // Other lanes of the same session, and charges, are not this lane.
+    reserve(
+        &mut store,
+        local(10_000),
+        "s1",
+        100,
+        "h3",
+        ExecutorAttribution::agent("a1", Some(ChargeSource::TurnHold)),
+    );
+    reserve(
+        &mut store,
+        local(10_000),
+        "s2",
+        100,
+        "h4",
+        ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+    );
+    charge(
+        &mut store,
+        local(10_000),
+        "s1",
+        7,
+        "c1",
+        ExecutorAttribution::main_executor(Some(ChargeSource::Gateway)),
+    );
+    let lane = store
+        .shared_lane_holds(
+            &owner(),
+            "s1",
+            None,
+            ExecutorKind::AgentAbsent,
+            "metered:acme/",
+        )
+        .unwrap();
+    let mut keys: Vec<_> = lane.iter().map(|h| h.idempotency_key.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["h1", "h2"]);
+    let agent_lane = store
+        .shared_lane_holds(
+            &owner(),
+            "s1",
+            Some("a1"),
+            ExecutorKind::Agent,
+            "metered:acme/",
+        )
+        .unwrap();
+    assert_eq!(agent_lane.len(), 1);
+}
+
+#[test]
+fn a_settled_hold_carries_a_watermark_and_the_lane_reads_back_the_newest() {
+    use libra_governor_ledger::SettleWatermark;
+    let (_dir, mut store) = store_with_pool(10_000);
+    let at = |s: i64| OffsetDateTime::from_unix_timestamp(1_800_000_000 + s).unwrap();
+    let lane = |store: &LedgerStore| {
+        store
+            .shared_lane_watermark(
+                &owner(),
+                "s1",
+                None,
+                ExecutorKind::AgentAbsent,
+                "metered:acme/",
+            )
+            .unwrap()
+    };
+    assert_eq!(lane(&store), None);
+
+    let a = granted_id(reserve(
+        &mut store,
+        local(10_000),
+        "s1",
+        100,
+        "h1",
+        ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+    ));
+    store
+        .settle_shared_with_watermark(
+            a,
+            Some(40),
+            now(),
+            ExecutorAttribution::default(),
+            Some(&SettleWatermark {
+                at: Some(at(50)),
+                message_ids: vec!["m1".into(), "m2".into()],
+            }),
+        )
+        .unwrap();
+    let got = lane(&store).unwrap();
+    assert_eq!(
+        (got.at, got.message_ids),
+        (Some(at(50)), vec!["m1".into(), "m2".into()])
+    );
+
+    // A later hold settled WITHOUT a watermark leaves the previous one.
+    let b = granted_id(reserve(
+        &mut store,
+        local(10_000),
+        "s1",
+        100,
+        "h2",
+        ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+    ));
+    store.settle_shared(b, None, now()).unwrap();
+    assert_eq!(lane(&store).unwrap().at, Some(at(50)));
+
+    // An older mark never wins; a newer one does.
+    let c = granted_id(reserve(
+        &mut store,
+        local(10_000),
+        "s1",
+        100,
+        "h3",
+        ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+    ));
+    store
+        .settle_shared_with_watermark(
+            c,
+            Some(1),
+            now(),
+            ExecutorAttribution::default(),
+            Some(&SettleWatermark {
+                at: Some(at(10)),
+                message_ids: vec![],
+            }),
+        )
+        .unwrap();
+    assert_eq!(lane(&store).unwrap().at, Some(at(50)));
+    store
+        .record_shared_watermark(
+            c,
+            &SettleWatermark {
+                at: Some(at(90)),
+                message_ids: vec!["z".into()],
+            },
+        )
+        .unwrap();
+    let got = lane(&store).unwrap();
+    assert_eq!(got.at, Some(at(90)));
+    assert_eq!(
+        got.message_ids,
+        vec!["m1".to_string(), "m2".to_string(), "z".to_string()],
+        "ids are the union over trustworthy rows"
+    );
+    // Other lanes and sessions are untouched.
+    assert_eq!(
+        store
+            .shared_lane_watermark(
+                &owner(),
+                "s2",
+                None,
+                ExecutorKind::AgentAbsent,
+                "metered:acme/"
+            )
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn the_lane_watermark_reader_caps_the_ids_it_returns_newest_first() {
+    use libra_governor_ledger::{SettleWatermark, WATERMARK_ID_CAP};
+    let (_dir, mut store) = store_with_pool(1_000_000);
+    let at = |s: i64| OffsetDateTime::from_unix_timestamp(1_800_000_000 + s).unwrap();
+    // 40 settled holds with 20 ids each: 800 distinct ids, plus a repeat.
+    for n in 0..40i64 {
+        let id = granted_id(reserve(
+            &mut store,
+            local(1_000_000),
+            "s1",
+            10,
+            &format!("h{n}"),
+            ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+        ));
+        let ids: Vec<String> = (0..20).map(|i| format!("id-{n}-{i}")).collect();
+        store
+            .settle_shared_with_watermark(
+                id,
+                Some(5),
+                at(n * 10),
+                ExecutorAttribution::default(),
+                Some(&SettleWatermark {
+                    at: Some(at(n * 10)),
+                    message_ids: ids,
+                }),
+            )
+            .unwrap();
+    }
+    let got = store
+        .shared_lane_watermark(
+            &owner(),
+            "s1",
+            None,
+            ExecutorKind::AgentAbsent,
+            "metered:acme/",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.at, Some(at(390)));
+    assert_eq!(got.message_ids.len(), WATERMARK_ID_CAP);
+    let unique: std::collections::HashSet<_> = got.message_ids.iter().collect();
+    assert_eq!(unique.len(), WATERMARK_ID_CAP, "deduplicated");
+    assert_eq!(got.message_ids[0], "id-39-0", "newest row first");
+    assert!(
+        !got.message_ids.iter().any(|i| i == "id-0-0"),
+        "oldest rows fall off"
+    );
 }

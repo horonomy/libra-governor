@@ -182,6 +182,7 @@ use time::OffsetDateTime;
 
 mod codex_turn;
 pub use codex_turn::observe_codex_turn;
+pub mod priced;
 
 /// How much of the transcript tail this is willing to read, in bytes.
 ///

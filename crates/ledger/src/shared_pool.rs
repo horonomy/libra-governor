@@ -67,6 +67,28 @@ fn rfc3339(t: OffsetDateTime) -> Result<String, LedgerError> {
         .map_err(|e| LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))
 }
 
+/// Most `message.id`s a lane watermark returns (and a writer keeps).
+pub const WATERMARK_ID_CAP: usize = 512;
+
+/// How far past its row's `settled_at` a stored watermark may sit: a
+/// record is stamped by the host's clock a little ahead of the daemon's.
+pub const WATERMARK_SLACK: time::Duration = time::Duration::minutes(10);
+
+fn watermark_columns(
+    watermark: Option<&SettleWatermark>,
+) -> Result<(Option<String>, Option<String>), LedgerError> {
+    let Some(w) = watermark else {
+        return Ok((None, None));
+    };
+    let at = w.at.map(rfc3339).transpose()?;
+    let ids = if w.message_ids.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&w.message_ids).map_err(|_| invalid())?)
+    };
+    Ok((at, ids))
+}
+
 fn parse_time(s: &str) -> Result<OffsetDateTime, LedgerError> {
     OffsetDateTime::parse(s, &Rfc3339)
         .map_err(|_| LedgerError::Sqlite(rusqlite::Error::InvalidQuery))
@@ -397,6 +419,15 @@ pub struct SharedPoolSessionUsage {
     pub settled: u64,
 }
 
+/// The transcript high-water mark a settled lane row carries (HORO-2196):
+/// the newest record timestamp counted, and the `message.id`s counted up to
+/// it (so tail lines of an already-counted message are not counted again).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SettleWatermark {
+    pub at: Option<OffsetDateTime>,
+    pub message_ids: Vec<String>,
+}
+
 /// The outcome of [`LedgerStore::reserve_shared_core`] — a superset of
 /// both [`SharedPoolReserveOutcome`] and [`MeteredReserveOutcome`]; each
 /// public entry point maps it down to its own narrower type.
@@ -441,6 +472,11 @@ pub struct SharedPoolChargeRequest<'a> {
     /// Only used to report the post-charge [`PoolAdmission`]; a charge is
     /// never gated on it.
     pub capacity_source: CapacitySource,
+    /// Whether `amount` was observed (`true`) or is a conservative
+    /// placeholder for spend that could not be measured (`false`, HORO-2196).
+    /// Recorded as the row's `usage_known`, and part of what makes a replay
+    /// identical.
+    pub usage_known: bool,
 }
 
 /// The outcome of [`LedgerStore::charge_shared`]. There is deliberately
@@ -1000,6 +1036,20 @@ impl LedgerStore {
         &mut self,
         req: SharedPoolChargeRequest<'_>,
     ) -> Result<SharedPoolChargeOutcome, LedgerError> {
+        self.charge_shared_with_watermark(req, None)
+    }
+
+    /// [`Self::charge_shared`] that writes the row and its transcript
+    /// high-water mark in **one** transaction (HORO-2196), so a crash can
+    /// never leave a charge without its mark (which a later window would
+    /// recount). An identical replay whose row has no mark yet adopts the
+    /// supplied one.
+    pub fn charge_shared_with_watermark(
+        &mut self,
+        req: SharedPoolChargeRequest<'_>,
+        watermark: Option<&SettleWatermark>,
+    ) -> Result<SharedPoolChargeOutcome, LedgerError> {
+        let (watermark_text, ids_text) = watermark_columns(watermark)?;
         let attribution = req.attribution.resolve()?;
         let amount_i64 = checked_i64(req.amount)?;
         let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
@@ -1016,19 +1066,28 @@ impl LedgerStore {
             )
             .optional()?;
         if let Some(row) = existing {
-            tx.commit()?;
             let existing = row_to_reservation(row)?;
             // Identical means the same charge, field for field (NULL is its
             // own value): a settled turn hold, or a charge attributed
             // differently, must never be mistaken for a replay or the
             // spend would be silently dropped.
-            let identical = Self::is_charge_row_tx(&self.conn, existing.id)?
+            let identical = Self::is_charge_row_tx(&tx, existing.id)?
                 && existing.state == ReservationState::Settled
                 && existing.settled_amount == Some(req.amount)
+                && existing.usage_known == Some(req.usage_known)
                 && existing.session_id == req.session_id
                 && existing.agent_id == attribution.agent_id
                 && existing.executor_kind == attribution.executor_kind
                 && existing.charge_source == attribution.charge_source;
+            if identical && watermark_text.is_some() {
+                tx.execute(
+                    "UPDATE shared_pool_reservations
+                     SET watermark_ts = ?1, watermark_message_ids = ?2
+                     WHERE id = ?3 AND watermark_ts IS NULL",
+                    rusqlite::params![watermark_text, ids_text, existing.id.0.to_string()],
+                )?;
+            }
+            tx.commit()?;
             return Ok(if identical {
                 SharedPoolChargeOutcome::AlreadyCharged(Box::new(existing))
             } else {
@@ -1071,9 +1130,10 @@ impl LedgerStore {
             "INSERT INTO shared_pool_reservations (
                 id, pool_id, principal_id, session_id, amount, state, settled_amount,
                 usage_known, idempotency_key, created_at, expires_at, settled_at, released_at,
-                schema_version, agent_id, executor_kind, charge_source, is_charge
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'settled', ?5, 1, ?6, ?7, ?7, ?7, NULL, ?8,
-                       ?9, ?10, ?11, 1)",
+                schema_version, agent_id, executor_kind, charge_source, is_charge,
+                watermark_ts, watermark_message_ids
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'settled', ?5, ?12, ?6, ?7, ?7, ?7, NULL, ?8,
+                       ?9, ?10, ?11, 1, ?13, ?14)",
             rusqlite::params![
                 id.0.to_string(),
                 req.pool_id.0,
@@ -1086,6 +1146,9 @@ impl LedgerStore {
                 attribution.agent_id,
                 attribution.executor_kind.map(ExecutorKind::as_str),
                 attribution.charge_source.map(ChargeSource::as_str),
+                req.usage_known,
+                watermark_text,
+                ids_text,
             ],
         )?;
 
@@ -1231,6 +1294,165 @@ impl LedgerStore {
             }
         }
         Ok(best)
+    }
+
+    /// Every non-charge hold (any state) of one executor lane in any pool
+    /// whose id starts with `pool_prefix` (HORO-2196) -- the history a
+    /// settlement derives its window watermark and its target hold from,
+    /// with no extra persisted state. The lane is `(session_id, agent_id |
+    /// NULL)` plus `executor_kind`, compared as in
+    /// [`Self::active_shared_hold_for_lane`].
+    pub fn shared_lane_holds(
+        &self,
+        principal_id: &PrincipalId,
+        session_id: &str,
+        agent_id: Option<&str>,
+        executor_kind: ExecutorKind,
+        pool_prefix: &str,
+    ) -> Result<Vec<SharedPoolReservation>, LedgerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {RESERVATION_COLUMNS} FROM shared_pool_reservations
+             WHERE principal_id = ?1 AND session_id = ?2 AND agent_id IS ?3
+               AND COALESCE(executor_kind, 'unattributed') = ?4
+               AND substr(pool_id, 1, length(?5)) = ?5 AND is_charge = 0"
+        ))?;
+        let rows = stmt.query_map(
+            rusqlite::params![
+                principal_id.0,
+                session_id,
+                agent_id,
+                executor_kind.as_str(),
+                pool_prefix
+            ],
+            read_reservation_row,
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row_to_reservation(row?)?);
+        }
+        Ok(out)
+    }
+
+    /// The newest transcript high-water mark persisted on any settled hold
+    /// of one executor lane (HORO-2196), or `None` when no hold of the lane
+    /// carries one (legacy rows and windows that counted no record).
+    /// Compared as parsed instants, not text.
+    pub fn shared_lane_watermark(
+        &self,
+        principal_id: &PrincipalId,
+        session_id: &str,
+        agent_id: Option<&str>,
+        executor_kind: ExecutorKind,
+        pool_prefix: &str,
+    ) -> Result<Option<SettleWatermark>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT watermark_ts, watermark_message_ids, settled_at FROM shared_pool_reservations
+             WHERE principal_id = ?1 AND session_id = ?2 AND agent_id IS ?3
+               AND COALESCE(executor_kind, 'unattributed') = ?4
+               AND substr(pool_id, 1, length(?5)) = ?5
+               AND state = 'settled'
+               AND (watermark_ts IS NOT NULL OR watermark_message_ids IS NOT NULL)
+             ORDER BY settled_at DESC",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![
+                principal_id.0,
+                session_id,
+                agent_id,
+                executor_kind.as_str(),
+                pool_prefix
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )?;
+        // `at` is the newest trustworthy mark; the ids are the union over
+        // trustworthy rows, newest row first, capped at WATERMARK_ID_CAP
+        // (a hash set keeps the merge linear).
+        let mut best: Option<OffsetDateTime> = None;
+        let mut ids: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut any = false;
+        for row in rows {
+            let (at, row_ids, settled_at) = row?;
+            let at = at.as_deref().map(parse_time).transpose()?;
+            // Defence in depth: a mark far ahead of the instant its row
+            // settled can only come from a poisoned record (the writer
+            // clamps, but an older build or a hand edit might not). Trusting
+            // it would hide every later record, so it is ignored.
+            if let (Some(at), Some(settled)) =
+                (at, settled_at.as_deref().map(parse_time).transpose()?)
+            {
+                if at > settled + WATERMARK_SLACK {
+                    continue;
+                }
+            }
+            any = true;
+            if let Some(at) = at {
+                best = Some(best.map_or(at, |b| b.max(at)));
+            }
+            if ids.len() < WATERMARK_ID_CAP {
+                if let Some(list) =
+                    row_ids.and_then(|j| serde_json::from_str::<Vec<String>>(&j).ok())
+                {
+                    for id in list {
+                        if ids.len() >= WATERMARK_ID_CAP {
+                            break;
+                        }
+                        if seen.insert(id.clone()) {
+                            ids.push(id);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(any.then_some(SettleWatermark {
+            at: best,
+            message_ids: ids,
+        }))
+    }
+
+    /// Records a watermark on an already-written settled row (the tail
+    /// charge writes its row first, then its mark; a replay of the same
+    /// charge finds the row and writes the same mark again).
+    pub fn record_shared_watermark(
+        &mut self,
+        id: SharedPoolReservationId,
+        watermark: &SettleWatermark,
+    ) -> Result<(), LedgerError> {
+        let (at, ids) = watermark_columns(Some(watermark))?;
+        self.conn.execute(
+            "UPDATE shared_pool_reservations SET watermark_ts = ?1, watermark_message_ids = ?2
+             WHERE id = ?3 AND state = 'settled'",
+            rusqlite::params![at, ids, id.0.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Sum of the settled amounts of every charge row `principal_id` holds
+    /// whose idempotency key starts with `key_prefix`, across pools whose
+    /// id starts with `pool_prefix` (HORO-2196). It is how a cumulative
+    /// charge (a subagent transcript) finds what it has already booked,
+    /// whichever period each earlier row landed in.
+    pub fn shared_charges_total_by_key_prefix(
+        &self,
+        principal_id: &PrincipalId,
+        key_prefix: &str,
+        pool_prefix: &str,
+    ) -> Result<u64, LedgerError> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(settled_amount), 0) FROM shared_pool_reservations
+             WHERE principal_id = ?1 AND is_charge = 1 AND state = 'settled'
+               AND substr(idempotency_key, 1, length(?2)) = ?2
+               AND substr(pool_id, 1, length(?3)) = ?3",
+            rusqlite::params![principal_id.0, key_prefix, pool_prefix],
+            |row| row.get(0),
+        )?;
+        Ok(total.max(0) as u64)
     }
 
     /// Every active, unexpired, non-charge hold `principal_id` has for
@@ -1716,6 +1938,22 @@ impl LedgerStore {
         now: OffsetDateTime,
         attribution: ExecutorAttribution<'_>,
     ) -> Result<SharedPoolSettleOutcome, LedgerError> {
+        self.settle_shared_with_watermark(id, actual, now, attribution, None)
+    }
+
+    /// [`Self::settle_shared_attributed`] that also records the transcript
+    /// high-water mark the settled window counted (HORO-2196). `None`
+    /// leaves the column NULL: the window counted no record, and readers
+    /// keep the lane's previous watermark.
+    pub fn settle_shared_with_watermark(
+        &mut self,
+        id: SharedPoolReservationId,
+        actual: Option<u64>,
+        now: OffsetDateTime,
+        attribution: ExecutorAttribution<'_>,
+        watermark: Option<&SettleWatermark>,
+    ) -> Result<SharedPoolSettleOutcome, LedgerError> {
+        let (watermark_text, ids_text) = watermark_columns(watermark)?;
         let supplied = attribution.resolve()?;
         let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
         let Some(reservation) = Self::get_shared_reservation_tx(&tx, id)? else {
@@ -1760,7 +1998,8 @@ impl LedgerStore {
             "UPDATE shared_pool_reservations SET state = 'settled', settled_amount = ?1,
                                                   usage_known = ?2, settled_at = ?3,
                                                   agent_id = ?6, executor_kind = ?7,
-                                                  charge_source = ?8
+                                                  charge_source = ?8, watermark_ts = ?9,
+                                                  watermark_message_ids = ?10
              WHERE id = ?4 AND state = ?5",
             rusqlite::params![
                 settled_value_i64,
@@ -1771,6 +2010,8 @@ impl LedgerStore {
                 agent_id,
                 executor_kind,
                 charge_source,
+                watermark_text,
+                ids_text,
             ],
         )?;
         if updated == 0 {
@@ -3635,6 +3876,7 @@ mod lane_read_tests {
                 now: t0(),
                 attribution: ExecutorAttribution::main_executor(None),
                 capacity_source: CapacitySource::LocalConfigured { cap: 1_000 },
+                usage_known: true,
             })
             .unwrap();
         assert!(lane(&store, t0()).is_none());
@@ -3734,6 +3976,7 @@ mod lane_read_tests {
                     now: t0(),
                     attribution: ExecutorAttribution::main_executor(None),
                     capacity_source: CapacitySource::LocalConfigured { cap: 1_000 },
+                    usage_known: true,
                 })
                 .unwrap()
         };
