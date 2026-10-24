@@ -170,6 +170,7 @@ fn parse_inner(bytes: &[u8]) -> Result<SharedBudgetConfig, String> {
 pub struct FileFingerprint {
     pub sha256_hex: String,
     pub mtime_unix_nanos: i128,
+    pub size: u64,
     pub mode: u32,
 }
 
@@ -225,6 +226,7 @@ fn read_file(path: &Path) -> Read {
                 sha256_hex: hex(&Sha256::digest(&bytes)),
                 mtime_unix_nanos: i128::from(meta.mtime()) * 1_000_000_000
                     + i128::from(meta.mtime_nsec()),
+                size: meta.len(),
                 mode: meta.mode() & 0o7777,
             };
             Read::Bytes(bytes, fingerprint)
@@ -232,6 +234,17 @@ fn read_file(path: &Path) -> Read {
         // Raced with a removal between stat and read.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Read::Missing,
         Err(e) => Read::Failed(format!("cannot read: {e}")),
+    }
+}
+
+/// One fresh read of the file: its state and, when it was readable, its
+/// identity. A file that cannot be read or parsed is `Invalid`, never
+/// `Absent`; only a missing file is `Absent`.
+pub fn read_current(path: &Path) -> (SharedBudgetFileState, Option<FileFingerprint>) {
+    match read_file(path) {
+        Read::Missing => (SharedBudgetFileState::Absent, None),
+        Read::Bytes(bytes, fingerprint) => (parse(&bytes), Some(fingerprint)),
+        Read::Failed(reason) => (SharedBudgetFileState::Invalid(reason), None),
     }
 }
 

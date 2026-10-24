@@ -111,9 +111,36 @@ impl Clock for ManualClock {
     }
 }
 
+/// What the file said when last consulted, and whether that differs from
+/// what the daemon read at start.
+#[derive(Debug, Clone)]
+pub struct EffectiveConfig {
+    pub state: SharedBudgetFileState,
+    pub changed_since_start: bool,
+}
+
+struct Live {
+    state: SharedBudgetFileState,
+    hash: Option<String>,
+    /// `(mtime ns, size)` at the last read; `None` forces a read.
+    key: Option<Option<(i128, u64)>>,
+}
+
+/// A file modified this recently is re-read even when its stat looks
+/// unchanged, because coarse filesystem timestamps can hide a same-size
+/// rewrite made within one tick.
+const RECENT_MODIFICATION_SECS: u64 = 2;
+
 /// The shared-budget configuration a daemon runs with, plus its clock.
+///
+/// The file is consulted on every request (a stat; a re-read only when it
+/// changed), so a file created, edited, broken or deleted after start takes
+/// effect from the next decision, failing closed: an unreadable, partial or
+/// invalid file denies `config_invalid`, and a deleted file means the
+/// operator removed the budget (`not_configured`).
 pub struct SharedBudgetRuntime {
     loaded: LoadedSharedBudget,
+    live: Mutex<Live>,
     clock: Arc<dyn Clock>,
 }
 
@@ -130,8 +157,14 @@ impl SharedBudgetRuntime {
     }
 
     pub fn new(loaded: LoadedSharedBudget) -> Self {
+        let live = Live {
+            state: loaded.state.clone(),
+            hash: loaded.fingerprint.as_ref().map(|f| f.sha256_hex.clone()),
+            key: None,
+        };
         Self {
             loaded,
+            live: Mutex::new(live),
             clock: Arc::new(SystemClock),
         }
     }
@@ -146,6 +179,7 @@ impl SharedBudgetRuntime {
         self
     }
 
+    /// The configuration as read at daemon start.
     pub fn loaded(&self) -> &LoadedSharedBudget {
         &self.loaded
     }
@@ -154,9 +188,42 @@ impl SharedBudgetRuntime {
         self.clock.now()
     }
 
-    /// Whether a shared-budget file existed at start (valid or not).
+    /// The configuration in force right now, re-reading the file if it
+    /// changed since the last look.
+    pub fn effective(&self) -> EffectiveConfig {
+        let start_hash = self.loaded.fingerprint.as_ref().map(|f| &f.sha256_hex);
+        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(path) = &self.loaded.path {
+            let meta = std::fs::metadata(path).ok();
+            let key = meta.as_ref().map(|m| {
+                use std::os::unix::fs::MetadataExt;
+                (
+                    i128::from(m.mtime()) * 1_000_000_000 + i128::from(m.mtime_nsec()),
+                    m.len(),
+                )
+            });
+            let recent = meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok().or(Some(std::time::Duration::ZERO)))
+                .is_some_and(|age| age.as_secs() < RECENT_MODIFICATION_SECS);
+            if live.key != Some(key) || recent {
+                let (state, fingerprint) = crate::shared_budget_file::read_current(path);
+                live.state = state;
+                live.hash = fingerprint.map(|f| f.sha256_hex);
+                live.key = Some(key);
+            }
+        }
+        EffectiveConfig {
+            changed_since_start: live.state != self.loaded.state
+                || live.hash.as_ref() != start_hash,
+            state: live.state.clone(),
+        }
+    }
+
+    /// Whether a shared-budget file is in force (valid or not).
     pub fn is_configured(&self) -> bool {
-        !matches!(self.loaded.state, SharedBudgetFileState::Absent)
+        !matches!(self.effective().state, SharedBudgetFileState::Absent)
     }
 }
 
@@ -226,8 +293,8 @@ fn refused(reason: SharedBudgetRefusal) -> SharedBudgetOutcome {
 }
 
 /// Either the usable configuration or the outcome that ends the request.
-fn configured(rt: &SharedBudgetRuntime) -> Result<&SharedBudgetConfig, SharedBudgetOutcome> {
-    match &rt.loaded.state {
+fn configured(state: &SharedBudgetFileState) -> Result<SharedBudgetConfig, SharedBudgetOutcome> {
+    match state {
         SharedBudgetFileState::Absent => Err(SharedBudgetOutcome::NotConfigured),
         SharedBudgetFileState::Invalid(reason) => Err(denied(
             SharedBudgetDenyReason::ConfigInvalid,
@@ -235,7 +302,7 @@ fn configured(rt: &SharedBudgetRuntime) -> Result<&SharedBudgetConfig, SharedBud
             None,
             Some(reason.clone()),
         )),
-        SharedBudgetFileState::Valid(cfg) => Ok(cfg),
+        SharedBudgetFileState::Valid(cfg) => Ok(cfg.clone()),
     }
 }
 
@@ -421,17 +488,19 @@ pub fn admit(
     agent_id: Option<&str>,
     prompt_id: Option<&str>,
 ) -> Result<SharedBudgetOutcome, SharedBudgetError> {
-    if matches!(rt.loaded.state, SharedBudgetFileState::Absent) {
+    let state = rt.effective().state;
+    if matches!(state, SharedBudgetFileState::Absent) {
         return Ok(SharedBudgetOutcome::NotConfigured);
     }
     let kind = match validate_identity(session_id, agent_id) {
         Ok(kind) => kind,
         Err(reason) => return Ok(refused(reason)),
     };
-    let cfg = match configured(rt) {
+    let cfg = match configured(&state) {
         Ok(cfg) => cfg,
         Err(outcome) => return Ok(outcome),
     };
+    let cfg = &cfg;
     let now = rt.now();
     let period = period_at(cfg, now)?;
     if let Some(later) = later_pool(ledger, &period)? {
@@ -545,17 +614,19 @@ pub fn check(
     session_id: &str,
     agent_id: Option<&str>,
 ) -> Result<SharedBudgetOutcome, SharedBudgetError> {
-    if matches!(rt.loaded.state, SharedBudgetFileState::Absent) {
+    let state = rt.effective().state;
+    if matches!(state, SharedBudgetFileState::Absent) {
         return Ok(SharedBudgetOutcome::NotConfigured);
     }
     let kind = match validate_identity(session_id, agent_id) {
         Ok(kind) => kind,
         Err(reason) => return Ok(refused(reason)),
     };
-    let cfg = match configured(rt) {
+    let cfg = match configured(&state) {
         Ok(cfg) => cfg,
         Err(outcome) => return Ok(outcome),
     };
+    let cfg = &cfg;
     let now = rt.now();
     let period = period_at(cfg, now)?;
     if let Some(later) = later_pool(ledger, &period)? {
@@ -600,7 +671,8 @@ pub fn charge(
     charge_source: ChargeSource,
     event_time: Option<&str>,
 ) -> Result<SharedBudgetOutcome, SharedBudgetError> {
-    if matches!(rt.loaded.state, SharedBudgetFileState::Absent) {
+    let state = rt.effective().state;
+    if matches!(state, SharedBudgetFileState::Absent) {
         return Ok(SharedBudgetOutcome::NotConfigured);
     }
     if let Err(reason) = validate_identity(session_id, agent_id) {
@@ -619,10 +691,11 @@ pub fn charge(
             _ => return Ok(refused(SharedBudgetRefusal::InvalidEventTime)),
         },
     };
-    let cfg = match configured(rt) {
+    let cfg = match configured(&state) {
         Ok(cfg) => cfg,
         Err(outcome) => return Ok(outcome),
     };
+    let cfg = &cfg;
     let now = rt.now();
     let current = period_at(cfg, now)?;
 
@@ -721,7 +794,8 @@ pub fn status(
     rt: &SharedBudgetRuntime,
 ) -> Result<SharedBudgetStatus, SharedBudgetError> {
     let loaded = rt.loaded();
-    let (config_state, config_invalid_reason) = match &loaded.state {
+    let effective = rt.effective();
+    let (config_state, config_invalid_reason) = match &effective.state {
         SharedBudgetFileState::Absent => (SharedBudgetConfigState::Absent, None),
         SharedBudgetFileState::Valid(_) => (SharedBudgetConfigState::Valid, None),
         SharedBudgetFileState::Invalid(reason) => {
@@ -742,6 +816,7 @@ pub fn status(
         config_state,
         config_invalid_reason,
         config_drift,
+        config_changed_since_start: effective.changed_since_start,
         config_path: loaded.path.as_ref().map(|p| p.display().to_string()),
         config_permissions_note: loaded.permissions_note(),
         config: None,
@@ -755,7 +830,7 @@ pub fn status(
         executors: Vec::new(),
         warnings: Vec::new(),
     };
-    let Some(cfg) = loaded.config() else {
+    let SharedBudgetFileState::Valid(cfg) = &effective.state else {
         return Ok(report);
     };
     report.config = Some(SharedBudgetConfigView {
@@ -809,7 +884,9 @@ pub fn heartbeat(
     rt: &SharedBudgetRuntime,
     session_id: &str,
 ) -> Result<usize, SharedBudgetError> {
-    if rt.loaded.config().is_none() || validate_identity(session_id, None).is_err() {
+    if !matches!(rt.effective().state, SharedBudgetFileState::Valid(_))
+        || validate_identity(session_id, None).is_err()
+    {
         return Ok(0);
     }
     let now = rt.now();

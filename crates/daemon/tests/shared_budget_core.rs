@@ -1196,41 +1196,42 @@ fn status_carries_the_honest_labels_and_the_running_configuration() {
 }
 
 #[test]
-fn status_reports_drift_between_the_file_on_disk_and_the_running_config() {
-    use std::os::unix::fs::PermissionsExt;
+fn status_reports_the_file_in_force_and_its_drift_from_the_start_config() {
     let mut fx = Fx::new(Some(&cfg_json(5_000, "UTC", 1_000)), JAN);
     let file = fx.path().join(SHARED_BUDGET_FILE_NAME);
-    assert_eq!(fx.status().config_drift, SharedBudgetConfigDrift::None);
+    let s = fx.status();
+    assert_eq!(s.config_drift, SharedBudgetConfigDrift::None);
+    assert!(!s.config_changed_since_start);
 
     std::fs::write(&file, cfg_json(9_000, "UTC", 1_000)).unwrap();
     let s = fx.status();
     assert_eq!(s.config_drift, SharedBudgetConfigDrift::Changed);
+    assert!(s.config_changed_since_start);
     assert_eq!(
         s.config.unwrap().monthly_cap_usd_cents,
-        5_000,
-        "the running config is what was loaded at start, not what is on disk"
+        9_000,
+        "the daemon enforces the file in force, not the one read at start"
     );
     std::fs::remove_file(&file).unwrap();
-    assert_eq!(fx.status().config_drift, SharedBudgetConfigDrift::Removed);
+    let s = fx.status();
+    assert_eq!(s.config_drift, SharedBudgetConfigDrift::Removed);
+    assert_eq!(s.config_state, SharedBudgetConfigState::Absent);
+    assert!(s.config_changed_since_start);
 
-    // Absent at start, file appears later.
     let mut absent = Fx::new(None, JAN);
     assert_eq!(absent.status().config_drift, SharedBudgetConfigDrift::None);
     std::fs::write(
         absent.path().join(SHARED_BUDGET_FILE_NAME),
-        cfg_json(1, "UTC", 1),
+        cfg_json(1_000, "UTC", 1_000),
     )
     .unwrap();
-    assert_eq!(
-        absent.status().config_drift,
-        SharedBudgetConfigDrift::Appeared
-    );
-    assert_eq!(
-        absent.status().config_state,
-        SharedBudgetConfigState::Absent
-    );
+    let s = absent.status();
+    assert_eq!(s.config_drift, SharedBudgetConfigDrift::Appeared);
+    assert_eq!(s.config_state, SharedBudgetConfigState::Valid);
+    assert!(s.config_changed_since_start);
 
     // A loose mode is noted, never refused.
+    use std::os::unix::fs::PermissionsExt;
     let mut loose = Fx::new(Some(&cfg_json(5_000, "UTC", 1_000)), JAN);
     std::fs::set_permissions(
         loose.path().join(SHARED_BUDGET_FILE_NAME),
@@ -1244,6 +1245,95 @@ fn status_reports_drift_between_the_file_on_disk_and_the_running_config() {
         .unwrap()
         .contains("0600"));
     let _ = loose.status();
+}
+
+// ---------------------------------------------------------------------
+// Hot reload: the file in force is consulted on every decision (fail closed)
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_file_created_after_start_is_enforced_from_the_next_decision() {
+    let mut fx = Fx::new(None, JAN);
+    assert_eq!(
+        fx.admit("a", None, None),
+        SharedBudgetOutcome::NotConfigured
+    );
+    std::fs::write(
+        fx.path().join(SHARED_BUDGET_FILE_NAME),
+        cfg_json(2_000, "UTC", 1_000),
+    )
+    .unwrap();
+    grant(fx.admit("a", None, None));
+    grant(fx.admit("b", None, None));
+    expect_cap_exhausted(fx.admit("c", None, None), 0);
+    let s = fx.status();
+    assert_eq!(s.config_state, SharedBudgetConfigState::Valid);
+    assert!(s.config_changed_since_start);
+}
+
+#[test]
+fn a_changed_cap_applies_next_and_a_lower_cap_never_revokes_existing_holds() {
+    let mut fx = Fx::new(Some(&cfg_json(3_000, "UTC", 1_000)), JAN);
+    let file = fx.path().join(SHARED_BUDGET_FILE_NAME);
+    let a = grant(fx.admit("a", None, None));
+    grant(fx.admit("b", None, None));
+    // Same byte length as before ("3000" -> "1500"): the change is still seen.
+    std::fs::write(&file, cfg_json(1_500, "UTC", 1_000)).unwrap();
+    expect_cap_exhausted(fx.admit("c", None, None), -500);
+    let again = grant(fx.admit("a", None, None));
+    assert!(
+        again.reused,
+        "an existing hold is never revoked by a lower cap"
+    );
+    assert_eq!(again.id, a.id);
+    std::fs::write(&file, cfg_json(5_000, "UTC", 1_000)).unwrap();
+    assert_eq!(grant(fx.admit("c", None, None)).remaining, 2_000);
+}
+
+#[test]
+fn a_file_that_becomes_invalid_denies_and_one_that_becomes_valid_recovers() {
+    let mut fx = Fx::new(Some(&cfg_json(5_000, "UTC", 1_000)), JAN);
+    let file = fx.path().join(SHARED_BUDGET_FILE_NAME);
+    let held = grant(fx.admit("a", None, None));
+    // A partially written file is invalid, never "no budget".
+    std::fs::write(&file, "{\"schema_version\":1,\"monthly_ca").unwrap();
+    expect_denied(
+        fx.admit("b", None, None),
+        SharedBudgetDenyReason::ConfigInvalid,
+    );
+    expect_denied(fx.check("a", None), SharedBudgetDenyReason::ConfigInvalid);
+    expect_denied(
+        fx.charge("a", None, 5, "k", ChargeSource::Gateway, None),
+        SharedBudgetDenyReason::ConfigInvalid,
+    );
+    assert_eq!(fx.status().config_state, SharedBudgetConfigState::Invalid);
+    std::fs::write(&file, cfg_json(5_000, "UTC", 1_000)).unwrap();
+    let back = grant(fx.admit("a", None, None));
+    assert!(back.reused);
+    assert_eq!(back.id, held.id, "recovery keeps the existing hold");
+    grant(fx.admit("b", None, None));
+}
+
+#[test]
+fn a_file_deleted_after_start_means_not_consulted_and_status_says_so() {
+    let mut fx = Fx::new(Some(&cfg_json(2_000, "UTC", 1_000)), JAN);
+    let file = fx.path().join(SHARED_BUDGET_FILE_NAME);
+    grant(fx.admit("a", None, None));
+    std::fs::remove_file(&file).unwrap();
+    let before = fx.fingerprint();
+    assert_eq!(
+        fx.admit("b", None, None),
+        SharedBudgetOutcome::NotConfigured
+    );
+    assert_eq!(fx.check("b", None), SharedBudgetOutcome::NotConfigured);
+    assert_eq!(fx.fingerprint(), before, "nothing is consulted or written");
+    let s = fx.status();
+    assert_eq!(s.config_state, SharedBudgetConfigState::Absent);
+    assert!(s.config_changed_since_start);
+    // Putting the file back re-enforces it, counting the earlier hold.
+    std::fs::write(&file, cfg_json(2_000, "UTC", 1_000)).unwrap();
+    grant(fx.admit("b", None, None));
+    expect_cap_exhausted(fx.admit("c", None, None), 0);
 }
 
 // ---------------------------------------------------------------------

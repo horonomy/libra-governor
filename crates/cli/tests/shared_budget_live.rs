@@ -526,13 +526,14 @@ fn a_real_daemon_reports_not_configured_invalid_and_drift_honestly() {
     assert_eq!(status.config_state, SharedBudgetConfigState::Absent);
     assert!(!status.capacity_known);
     assert_eq!(status.config_drift, SharedBudgetConfigDrift::None);
-    // A file that appears after start is reported but not applied.
+    // A file that appears after start is enforced from the next decision.
     none.write_config(&config_json(1_000));
     assert_eq!(
         none.status().config_drift,
         SharedBudgetConfigDrift::Appeared
     );
-    assert_eq!(none.admit("s1"), SharedBudgetOutcome::NotConfigured);
+    reservation_id(&none.admit("s1"));
+    assert_denied_cap(&none.admit("s2"), 0);
 
     let mut bad = Live::new(Some("{ not json"));
     bad.start();
@@ -545,13 +546,14 @@ fn a_real_daemon_reports_not_configured_invalid_and_drift_honestly() {
     }
     let status = bad.status();
     assert_eq!(status.config_state, SharedBudgetConfigState::Invalid);
-    // Fixing the file on disk is drift: the daemon is still running the
-    // invalid configuration it started with, and says so.
+    // Fixing the file takes effect without a restart.
     bad.write_config(&config_json(1_000));
     assert_eq!(bad.status().config_drift, SharedBudgetConfigDrift::Changed);
-    assert_eq!(bad.status().config_state, SharedBudgetConfigState::Invalid);
+    assert_eq!(bad.status().config_state, SharedBudgetConfigState::Valid);
+    assert!(bad.status().config_changed_since_start);
     bad.stop();
     bad.start();
     assert_eq!(bad.status().config_state, SharedBudgetConfigState::Valid);
+    assert!(!bad.status().config_changed_since_start);
     reservation_id(&bad.admit("s1"));
 }

@@ -129,7 +129,7 @@ pub struct SoftLimitWarning {
     pub threshold_usd_cents: u64,
 }
 
-/// Whether the shared-budget file was present and usable at daemon start.
+/// Whether the shared-budget file in force is present and usable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SharedBudgetConfigState {
@@ -186,7 +186,13 @@ pub struct SharedBudgetStatus {
     pub scope: String,
     pub config_state: SharedBudgetConfigState,
     pub config_invalid_reason: Option<String>,
+    /// Drift of the file on disk against what the daemon read at start.
+    /// Informational: the daemon re-reads the file on every request, so
+    /// `config_state` and `config` already describe the file in force.
     pub config_drift: SharedBudgetConfigDrift,
+    /// The file in force differs from what was read at daemon start
+    /// (created, edited, broken or deleted since).
+    pub config_changed_since_start: bool,
     pub config_path: Option<String>,
     pub config_permissions_note: Option<String>,
     pub config: Option<SharedBudgetConfigView>,
