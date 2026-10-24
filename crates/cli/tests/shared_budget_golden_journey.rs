@@ -10,11 +10,15 @@
 //! Nothing here is `ProductionObserved`.
 //!
 //! Determinism: no sleep is relied on for correctness (the only waits are
-//! bounded readiness polls). Month rollover cannot inject a clock into a
-//! running daemon, so it is driven by charges booked to an earlier period
-//! through `event_time`, with every month derived from the daemon's own
-//! reported period; the injected-clock rollover matrix lives in
-//! `crates/daemon/tests/shared_budget_core.rs`.
+//! bounded readiness polls). A running `daemon run` has no clock injection
+//! point (and none is added for tests), so (g) is NOT a clock-driven
+//! rollover: it proves period separation and retention against the real
+//! daemon by booking charges to earlier periods through `event_time`. The
+//! genuine injected-clock rollover (`ManualClock`) is covered in-process by
+//! `crates/daemon/tests/shared_budget_core.rs`. Months are labelled from the
+//! daemon's own reported period, but that period follows the real clock, so a
+//! run straddling a UTC month boundary could still disagree with itself (a
+//! known residual).
 //!
 //! Every child is owned by a guard that kills and reaps it on drop.
 
@@ -827,7 +831,8 @@ fn a_restarted_and_a_sigkilled_daemon_recover_state_and_reclaim_dead_holds() {
 }
 
 // =====================================================================
-// (g) Month rollover: a new period's pool; the old one is retained.
+// (g) Period separation and retention (not a clock-driven rollover): the
+//     current period is its own pool and an earlier one is retained.
 // =====================================================================
 
 /// `monthly-YYYY-MM` shifted back by `months`.
@@ -899,7 +904,7 @@ fn export(journey: &Journey, label: &str) -> Value {
 }
 
 #[test]
-fn a_new_period_gets_its_own_pool_and_the_old_one_is_retained() {
+fn a_charge_booked_to_an_earlier_period_stays_in_its_own_retained_pool() {
     let journey = Journey::start(&config(50_000, None));
     let now = current_label(&journey);
     let previous = label_back(&now, 1);

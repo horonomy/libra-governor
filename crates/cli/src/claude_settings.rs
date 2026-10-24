@@ -71,7 +71,8 @@ const OWNED_COMMAND_SUFFIXES: [&str; 8] = [
 ];
 
 /// The three legacy hooks, in the order [`Inspection::hooks_wired`] reports
-/// them. Unchanged so `doctor` and the evidence report keep their meaning.
+/// them. The set is unchanged; since HORO-2217 an event counts as wired only
+/// when our command is in an all-tools group (see `inspect`).
 const HOOK_EVENTS: [&str; 3] = ["UserPromptSubmit", "PostToolUse", "Stop"];
 
 /// The shared-budget hooks (HORO-2216, ADR-0026 S7), reported separately in
