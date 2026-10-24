@@ -15,6 +15,7 @@
 //! compatibility.
 
 // Slice A exposes the pure bridge without wiring it into the live CLI path.
+pub mod budget_gate;
 #[allow(dead_code)]
 pub mod canonical;
 pub mod event;

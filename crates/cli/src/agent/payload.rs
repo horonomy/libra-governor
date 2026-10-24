@@ -51,6 +51,20 @@ pub struct PromptSubmitPayload {
     /// expose it in subagent contexts.
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// Host prompt identifier where the host supplies one; makes a retried
+    /// shared-budget `Admit` idempotent. Never invented when absent.
+    #[serde(default, deserialize_with = "optional_native_call_id")]
+    pub prompt_id: Option<String>,
+}
+
+/// `PreToolUse` payload (HORO-2215). Only the identity fields the shared
+/// budget check needs; `tool_input` and everything else is ignored.
+#[derive(Debug, Deserialize)]
+pub struct ToolRequestedPayload {
+    pub session_id: String,
+    /// Present only for tool events inside a subagent; never invented.
+    #[serde(default, deserialize_with = "optional_native_call_id")]
+    pub agent_id: Option<String>,
 }
 
 /// `PostToolUse` payload.

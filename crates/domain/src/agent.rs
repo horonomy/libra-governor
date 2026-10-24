@@ -185,6 +185,14 @@ pub struct AgentCapabilities {
     /// observed after). See ADR 0003 §8: MVP 1.0 hooks are advisory for
     /// every agent — the gateway is the only hard-enforcement point.
     pub tool_gate: Capability,
+    /// The local monthly shared budget (ADR-0026) can refuse a prompt, and
+    /// deny a tool call once the budget is exhausted or invalid, through
+    /// this host's hooks. Cooperative and admission-bounded: refused before
+    /// spend at prompt admission, with in-turn spend visible only
+    /// afterwards, in Libra-accounted USD and never provider quota. Distinct
+    /// from [`Self::tool_gate`] (a general tool-call gate, still unavailable)
+    /// and from [`Self::hard_budget_enforcement`] (gateway-only).
+    pub shared_budget_admission_gate: Capability,
     /// A `Stop`-shaped hook can finalize the task into an
     /// `ExecutionReceipt`.
     pub completion_receipt: Capability,
@@ -250,6 +258,18 @@ impl AgentCapabilities {
                           are advisory only — hard enforcement is the gateway (ADR 0003)"
                     .to_string(),
                 follow_up: None,
+            },
+        };
+        let shared_budget_admission_gate = match agent {
+            AgentKind::ClaudeCode => Capability::Available,
+            AgentKind::Codex => Capability::Unavailable {
+                gap: CapabilityGap::NotWiredByLibra {
+                    detail: "the shared monthly budget gate is wired to Claude Code hooks only; \
+                              the Codex hook route neither asks the daemon to admit a prompt nor \
+                              denies tool calls on budget state"
+                        .to_string(),
+                    follow_up: None,
+                },
             },
         };
         let model_event_observation = Capability::Unavailable {
@@ -362,6 +382,7 @@ impl AgentCapabilities {
             preflight_gate: Capability::Available,
             tool_observation: Capability::Available,
             tool_gate,
+            shared_budget_admission_gate,
             completion_receipt: Capability::Available,
             model_event_observation,
             host_reported_economic_observation,
@@ -464,6 +485,24 @@ mod tests {
                 "{agent:?} must not claim hard tool gating in MVP 1.0 — ADR 0003"
             );
         }
+    }
+
+    /// The shared-budget gate is a separate, cooperative capability: only
+    /// Claude Code has it, and it never turns on the general tool gate or the
+    /// gateway-only hard budget.
+    #[test]
+    fn shared_budget_admission_gate_is_claude_code_only_and_not_a_hard_cap() {
+        let claude = AgentCapabilities::for_agent(AgentKind::ClaudeCode);
+        assert!(claude.shared_budget_admission_gate.is_available());
+        assert!(!claude.tool_gate.is_available());
+        let codex = AgentCapabilities::for_agent(AgentKind::Codex);
+        assert!(matches!(
+            codex.shared_budget_admission_gate,
+            Capability::Unavailable {
+                gap: CapabilityGap::NotWiredByLibra { .. }
+            }
+        ));
+        assert!(!codex.claims_pre_spend_refusal());
     }
 
     #[test]

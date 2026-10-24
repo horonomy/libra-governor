@@ -16,6 +16,9 @@
 //!   any check fails. Never a broad `pkill -f` by process name.
 //! - `hook user-prompt-submit` — the Claude Code `UserPromptSubmit` hook
 //!   entry point (see `integrations/claude-code/README.md`).
+//! - `hook pre-tool-use` — the Claude Code `PreToolUse` hook entry point:
+//!   denies a tool call only when the local shared budget is exhausted or
+//!   invalid, otherwise silent (HORO-2215).
 //! - `hook post-tool-use` — the Claude Code `PostToolUse` hook entry
 //!   point: fire-and-forget tool-call counting (HORO-1126).
 //! - `hook stop` — the Claude Code `Stop` hook entry point: finalizes
@@ -131,6 +134,7 @@ mod evidence_report_cmd;
 mod gateway_cmd;
 mod hook;
 mod hook_post_tool_use;
+mod hook_pre_tool_use;
 mod hook_stop;
 mod install_cmd;
 mod launch_cmd;
@@ -153,6 +157,7 @@ Usage:
   libra-governor daemon run
   libra-governor daemon stop
   libra-governor hook user-prompt-submit
+  libra-governor hook pre-tool-use
   libra-governor hook post-tool-use
   libra-governor hook stop
   libra-governor codex-hook user-prompt-submit
@@ -238,6 +243,7 @@ fn main() {
             std::process::exit(daemon_cmd::run_trusted(std::path::Path::new(path)))
         }
         ["hook", "user-prompt-submit"] => hook::run(),
+        ["hook", "pre-tool-use"] => hook_pre_tool_use::run(),
         ["hook", "post-tool-use"] => hook_post_tool_use::run(),
         ["hook", "stop"] => hook_stop::run(),
         ["codex-hook", "user-prompt-submit"] => codex_hook::run_prompt_submit(),

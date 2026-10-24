@@ -90,6 +90,7 @@ pub fn normalize_builtin(
             prompt,
             turn_id,
             agent_id,
+            prompt_id: _,
         } => (
             HostEventKind::Lifecycle,
             json!({"event_type": "turn_start"}),
@@ -144,7 +145,9 @@ pub fn normalize_builtin(
             turn_id,
             json!({"facts.event_type": "native_hook_mapping"}),
         ),
-        NormalizedEvent::RecognizedUnwired { .. } | NormalizedEvent::Unrecognized { .. } => {
+        NormalizedEvent::ToolRequested { .. }
+        | NormalizedEvent::RecognizedUnwired { .. }
+        | NormalizedEvent::Unrecognized { .. } => {
             return Err(HostBindingFailure {
                 stage: HostBindingStage::Event,
                 reason: HostBindingReason::UnsupportedNativeEvent,
@@ -212,6 +215,7 @@ fn tool_facts(tool_name: String, native_call_id: Option<String>) -> Value {
 fn entry_point_name(entry: EntryPoint) -> &'static str {
     match entry {
         EntryPoint::PromptSubmit => "UserPromptSubmit",
+        EntryPoint::ToolRequested => "PreToolUse",
         EntryPoint::ToolCompleted => "PostToolUse",
         EntryPoint::TurnCompleted => "Stop",
     }

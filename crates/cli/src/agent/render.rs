@@ -88,6 +88,33 @@ pub fn render_context_envelope(message: &str) -> String {
     serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// Claude Code's blocking output for `UserPromptSubmit` (HORO-2215): the
+/// prompt is erased from context and `reason` is shown to the user. Exactly
+/// the two documented keys.
+pub fn render_prompt_block(reason: &str) -> String {
+    let output = serde_json::json!({
+        "decision": "block",
+        "reason": reason,
+    });
+    serde_json::to_string(&output).unwrap_or_else(|_| r#"{"decision":"block"}"#.to_string())
+}
+
+/// Claude Code's `PreToolUse` deny output (HORO-2215). Allowing a tool call
+/// is the absence of any output, never a rendered value.
+pub fn render_pre_tool_deny(reason: &str) -> String {
+    let output = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    });
+    serde_json::to_string(&output).unwrap_or_else(|_| {
+        r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny"}}"#
+            .to_string()
+    })
+}
+
 /// Renders the human-readable Estimate-vs-Actual summary printed to
 /// stderr on a successful finalize.
 pub fn format_receipt_summary(result: &FinalizeResult) -> String {
