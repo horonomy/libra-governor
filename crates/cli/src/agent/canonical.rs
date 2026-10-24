@@ -514,6 +514,35 @@ mod tests {
             assert_eq!(failure.reason, HostBindingReason::InvalidEvent);
         }
     }
+    /// The decoder now reads a missing session as "no session"; the canonical
+    /// adapter must still refuse it rather than emit a session-less event.
+    #[test]
+    fn a_native_event_without_a_usable_session_cannot_produce_canonical_success() {
+        let fixture = include_bytes!("../../tests/fixtures/agent/codex/post-tool-use.json");
+        let fixture_text = std::str::from_utf8(fixture).unwrap();
+        assert!(fixture_text.contains("\"session_id\": \"fixture-session\""));
+        for replacement in [
+            "\"session_id\": null",
+            "\"session_id\": 7",
+            "\"session_id\": \" \"",
+        ] {
+            let native = fixture_text.replace("\"session_id\": \"fixture-session\"", replacement);
+            let failure = normalize_builtin(
+                AgentKind::Codex,
+                EntryPoint::ToolCompleted,
+                native.as_bytes(),
+                &context(AgentKind::Codex),
+            )
+            .expect_err("an absent session must not bind");
+            assert_eq!(failure.stage, HostBindingStage::Event, "{replacement}");
+            assert_eq!(
+                failure.reason,
+                HostBindingReason::InvalidEvent,
+                "{replacement}"
+            );
+        }
+    }
+
     #[test]
     fn intact_native_bundle_cannot_substitute_a_same_id_changed_observation() {
         let native = include_bytes!("../../tests/fixtures/agent/codex/post-tool-use.json");
