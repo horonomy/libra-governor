@@ -103,6 +103,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 21,
         sql: include_str!("../migrations/0021_shared_pool_executor_attribution.sql"),
     },
+    Migration {
+        version: 22,
+        sql: include_str!("../migrations/0022_shared_pool_settle_watermark.sql"),
+    },
 ];
 
 /// The highest migration version this build of the crate knows about
@@ -349,6 +353,77 @@ mod tests {
         ] {
             assert!(conn.execute(bad, []).is_err(), "CHECK must reject: {bad}");
         }
+    }
+
+    #[test]
+    fn migration_22_preserves_0021_shared_pool_rows_and_leaves_the_watermark_null() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        apply_known_through(&mut conn, 21);
+        conn.execute(
+            "INSERT INTO quota_pools (pool_id, unit_json, capacity, schema_version, created_at, updated_at)
+             VALUES ('metered:acme/usd', '\"usd_cents\"', 5000, 'v1', '2026-10-24T00:00:00Z', '2026-10-24T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        for (id, state, settled) in [("a", "active", None), ("b", "settled", Some(700i64))] {
+            conn.execute(
+                "INSERT INTO shared_pool_reservations (
+                    id, pool_id, principal_id, session_id, amount, state, settled_amount,
+                    usage_known, idempotency_key, created_at, expires_at, settled_at,
+                    released_at, schema_version, agent_id, executor_kind, charge_source
+                 ) VALUES (?1, 'metered:acme/usd', 'acme', 'sess-1', 900, ?2, ?3, 1, ?1,
+                           '2026-10-24T00:00:00Z', '2026-10-24T01:00:00Z', NULL, NULL, 'v1',
+                           NULL, 'agent_absent', 'turn_hold')",
+                rusqlite::params![id, state, settled],
+            )
+            .unwrap();
+        }
+
+        apply_all(&mut conn).unwrap();
+
+        type Row = (String, i64, Option<i64>, Option<String>, Option<String>);
+        let rows: Vec<Row> = conn
+            .prepare(
+                "SELECT id, amount, settled_amount, executor_kind, watermark_ts
+                 FROM shared_pool_reservations ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "a".to_string(),
+                    900,
+                    None,
+                    Some("agent_absent".to_string()),
+                    None
+                ),
+                (
+                    "b".to_string(),
+                    900,
+                    Some(700),
+                    Some("agent_absent".to_string()),
+                    None
+                ),
+            ],
+            "rows survive intact; the watermark is never backfilled"
+        );
+        let version: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 22);
+        assert_eq!(latest_known_version(), 22);
+        // Re-applying is a no-op.
+        apply_all(&mut conn).unwrap();
     }
 
     #[test]

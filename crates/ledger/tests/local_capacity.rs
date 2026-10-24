@@ -1279,3 +1279,110 @@ fn lane_holds_lists_holds_of_one_lane_in_any_state_and_never_charges() {
         .unwrap();
     assert_eq!(agent_lane.len(), 1);
 }
+
+#[test]
+fn a_settled_hold_carries_a_watermark_and_the_lane_reads_back_the_newest() {
+    use libra_governor_ledger::SettleWatermark;
+    let (_dir, mut store) = store_with_pool(10_000);
+    let at = |s: i64| OffsetDateTime::from_unix_timestamp(1_800_000_000 + s).unwrap();
+    let lane = |store: &LedgerStore| {
+        store
+            .shared_lane_watermark(
+                &owner(),
+                "s1",
+                None,
+                ExecutorKind::AgentAbsent,
+                "metered:acme/",
+            )
+            .unwrap()
+    };
+    assert_eq!(lane(&store), None);
+
+    let a = granted_id(reserve(
+        &mut store,
+        local(10_000),
+        "s1",
+        100,
+        "h1",
+        ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+    ));
+    store
+        .settle_shared_with_watermark(
+            a,
+            Some(40),
+            now(),
+            ExecutorAttribution::default(),
+            Some(&SettleWatermark {
+                at: Some(at(50)),
+                message_ids: vec!["m1".into(), "m2".into()],
+            }),
+        )
+        .unwrap();
+    let got = lane(&store).unwrap();
+    assert_eq!(
+        (got.at, got.message_ids),
+        (Some(at(50)), vec!["m1".into(), "m2".into()])
+    );
+
+    // A later hold settled WITHOUT a watermark leaves the previous one.
+    let b = granted_id(reserve(
+        &mut store,
+        local(10_000),
+        "s1",
+        100,
+        "h2",
+        ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+    ));
+    store.settle_shared(b, None, now()).unwrap();
+    assert_eq!(lane(&store).unwrap().at, Some(at(50)));
+
+    // An older mark never wins; a newer one does.
+    let c = granted_id(reserve(
+        &mut store,
+        local(10_000),
+        "s1",
+        100,
+        "h3",
+        ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+    ));
+    store
+        .settle_shared_with_watermark(
+            c,
+            Some(1),
+            now(),
+            ExecutorAttribution::default(),
+            Some(&SettleWatermark {
+                at: Some(at(10)),
+                message_ids: vec![],
+            }),
+        )
+        .unwrap();
+    assert_eq!(lane(&store).unwrap().at, Some(at(50)));
+    store
+        .record_shared_watermark(
+            c,
+            &SettleWatermark {
+                at: Some(at(90)),
+                message_ids: vec!["z".into()],
+            },
+        )
+        .unwrap();
+    let got = lane(&store).unwrap();
+    assert_eq!(
+        (got.at, got.message_ids),
+        (Some(at(90)), vec!["z".to_string()])
+    );
+    // Other lanes and sessions are untouched.
+    assert_eq!(
+        store
+            .shared_lane_watermark(
+                &owner(),
+                "s2",
+                None,
+                ExecutorKind::AgentAbsent,
+                "metered:acme/"
+            )
+            .unwrap(),
+        None
+    );
+}
