@@ -696,27 +696,47 @@ pub fn charge(
         Err(outcome) => return Ok(outcome),
     };
     let cfg = &cfg;
+    // One charge can never exceed ten months of budget.
+    if amount_usd_cents > cfg.monthly_cap_usd_cents.saturating_mul(10) {
+        return Ok(refused(SharedBudgetRefusal::AmountTooLarge));
+    }
     let now = rt.now();
     let current = period_at(cfg, now)?;
+    let key = format!("charge:{}|{}", lp(session_id), lp(idempotency_key));
 
-    let pool_id = match event {
-        Some(t) => {
+    // A retry resolves to the pool the first attempt landed in, wherever
+    // the fallback would point today: the ledger's replay lookup is
+    // scoped to one pool, so without this a retry after a month change
+    // would book the same spend twice.
+    let existing = ledger.find_shared_reservation_by_key(&principal(), &key, OWNER_POOL_PREFIX)?;
+    let mut clamped = false;
+    let pool_id = match (&existing, event) {
+        (Some(found), _) => found.pool_id.clone(),
+        (None, Some(t)) => {
             let target = period_at(cfg, t)?;
             if target.pool_id.0 > current.pool_id.0 {
-                return Ok(denied(
-                    SharedBudgetDenyReason::ClockAnomaly,
-                    None,
-                    Some(current.end),
-                    Some("event time is in a later period than now".to_string()),
-                ));
+                // Spend that already happened is never refused for a
+                // plausible timestamp: book it now and say so.
+                clamped = true;
+                current.pool_id.clone()
+            } else {
+                target.pool_id
             }
-            target.pool_id
         }
-        None => ledger
+        (None, None) => ledger
             .latest_shared_hold_pool_for_session(&principal(), session_id, OWNER_POOL_PREFIX)?
             .unwrap_or_else(|| current.pool_id.clone()),
     };
     ensure_period_pool(ledger, &pool_id, cfg, now)?;
+    if existing.is_none() {
+        // Keep every pool total far inside i64 so no later sum can overflow.
+        let committed = ledger
+            .pool_admission_for(&pool_id, now, source(cfg))?
+            .map_or(0, |a| a.settled.saturating_add(a.active));
+        if committed.saturating_add(amount_usd_cents) > (i64::MAX / 2) as u64 {
+            return Ok(refused(SharedBudgetRefusal::AmountTooLarge));
+        }
+    }
 
     // An unknown agent on a subagent charge is explicitly UNKNOWN, not the
     // main executor; any other source without an agent is the main one.
@@ -726,7 +746,6 @@ pub fn charge(
         }
         _ => attribution_for(agent_id, charge_source),
     };
-    let key = format!("charge:{}|{}", lp(session_id), lp(idempotency_key));
     let outcome = ledger.charge_shared(SharedPoolChargeRequest {
         pool_id: &pool_id,
         principal_id: &principal(),
@@ -765,6 +784,7 @@ pub fn charge(
             remaining_usd_cents: admission.remaining(),
             overrun_usd_cents: overrun,
             capacity_known,
+            event_time_clamped: clamped,
         },
         SharedPoolChargeOutcome::AlreadyCharged(reservation) => {
             let admission = ledger.pool_admission_for(&pool_id, now, source(cfg))?;
@@ -777,6 +797,7 @@ pub fn charge(
                 remaining_usd_cents: admission.map_or(0, |a| a.remaining()),
                 overrun_usd_cents: admission.map_or(0, |a| a.overrun()),
                 capacity_known: admission.is_some_and(|a| a.capacity_known),
+                event_time_clamped: false,
             }
         }
         SharedPoolChargeOutcome::KeyConflict(_) => refused(SharedBudgetRefusal::KeyConflict),

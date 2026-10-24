@@ -411,19 +411,26 @@ fn a_later_period_pool_is_a_clock_anomaly_that_denies_and_charges_nothing() {
     expect_denied(fx.check("s1", None), SharedBudgetDenyReason::ClockAnomaly);
     assert_eq!(fx.fingerprint(), before, "a denied Admit writes nothing");
     assert!(fx.status().clock_anomaly);
-    // A charge whose event time is itself in a later period is not booked.
-    expect_denied(
-        fx.charge(
-            "s1",
-            None,
-            5,
-            "k",
-            ChargeSource::Gateway,
-            Some("2027-02-10T00:00:00Z"),
-        ),
-        SharedBudgetDenyReason::ClockAnomaly,
-    );
-    assert_eq!(fx.fingerprint(), before);
+    // Spend that already happened is never refused for a plausible
+    // timestamp: a later-period event time is booked to the current period.
+    match fx.charge(
+        "s1",
+        None,
+        5,
+        "k",
+        ChargeSource::Gateway,
+        Some("2027-02-10T00:00:00Z"),
+    ) {
+        SharedBudgetOutcome::Charged {
+            pool_id,
+            event_time_clamped,
+            ..
+        } => {
+            assert_eq!(pool_id, "metered:local-budget/monthly-2027-01");
+            assert!(event_time_clamped);
+        }
+        other => panic!("{other:?}"),
+    }
 
     // Once the clock catches up to the newest pool the anomaly is gone.
     fx.clock.set(t("2027-03-02T00:00:00Z"));
@@ -1245,6 +1252,131 @@ fn status_reports_the_file_in_force_and_its_drift_from_the_start_config() {
         .unwrap()
         .contains("0600"));
     let _ = loose.status();
+}
+
+// ---------------------------------------------------------------------
+// Charge: cross-period idempotency, clamping, bounds
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_retried_charge_after_a_month_change_is_a_replay_not_a_second_booking() {
+    let mut fx = Fx::new(Some(&cfg_json(5_000, "UTC", 1_000)), "2027-01-31T23:00:00Z");
+    let first = fx.charge("s1", None, 100, "retry-me", ChargeSource::Gateway, None);
+    let SharedBudgetOutcome::Charged {
+        pool_id: first_pool,
+        reservation_id,
+        ..
+    } = first
+    else {
+        panic!("{first:?}");
+    };
+    assert_eq!(first_pool, "metered:local-budget/monthly-2027-01");
+    // The month turns and the session is admitted again: its latest hold
+    // now lives in February, which is where a fresh fallback would point.
+    fx.clock.set(t("2027-02-01T00:05:00Z"));
+    grant(fx.admit("s1", None, None));
+    match fx.charge("s1", None, 100, "retry-me", ChargeSource::Gateway, None) {
+        SharedBudgetOutcome::Charged {
+            already_charged,
+            pool_id,
+            reservation_id: again,
+            ..
+        } => {
+            assert!(already_charged, "the retry is a replay");
+            assert_eq!(pool_id, first_pool);
+            assert_eq!(again, reservation_id);
+        }
+        other => panic!("{other:?}"),
+    }
+    let used = |fx: &Fx, pool: &str| {
+        fx.ledger
+            .shared_pool_executor_usage(&libra_governor_domain::PoolId(pool.into()))
+            .unwrap()
+            .total_used
+    };
+    assert_eq!(used(&fx, "metered:local-budget/monthly-2027-01"), 100);
+    assert_eq!(used(&fx, "metered:local-budget/monthly-2027-02"), 0);
+}
+
+#[test]
+fn a_plausible_future_event_time_is_clamped_and_recorded_but_an_absurd_one_is_refused() {
+    let mut fx = Fx::new(Some(&cfg_json(5_000, "UTC", 1_000)), JAN);
+    match fx.charge(
+        "s1",
+        None,
+        40,
+        "k",
+        ChargeSource::Gateway,
+        Some("2027-02-03T00:00:00Z"),
+    ) {
+        SharedBudgetOutcome::Charged {
+            pool_id,
+            event_time_clamped,
+            ..
+        } => {
+            assert_eq!(pool_id, "metered:local-budget/monthly-2027-01");
+            assert!(event_time_clamped);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(fx.status().used_usd_cents, 40, "the spend is on the books");
+    match fx.charge(
+        "s1",
+        None,
+        1,
+        "k2",
+        ChargeSource::Gateway,
+        Some("2027-01-02T00:00:00Z"),
+    ) {
+        SharedBudgetOutcome::Charged {
+            event_time_clamped, ..
+        } => assert!(!event_time_clamped),
+        other => panic!("{other:?}"),
+    }
+    expect_refused(
+        fx.charge(
+            "s1",
+            None,
+            1,
+            "k3",
+            ChargeSource::Gateway,
+            Some("9999-01-01T00:00:00Z"),
+        ),
+        SharedBudgetRefusal::InvalidEventTime,
+    );
+}
+
+#[test]
+fn one_charge_above_ten_times_the_cap_is_refused_and_pool_totals_stay_summable() {
+    let mut fx = Fx::new(Some(&cfg_json(1_000, "UTC", 1_000)), JAN);
+    expect_refused(
+        fx.charge("s1", None, 10_001, "big", ChargeSource::Gateway, None),
+        SharedBudgetRefusal::AmountTooLarge,
+    );
+    assert!(matches!(
+        fx.charge("s1", None, 10_000, "edge", ChargeSource::Gateway, None),
+        SharedBudgetOutcome::Charged { .. }
+    ));
+    assert_eq!(fx.status().used_usd_cents, 10_000);
+
+    // A huge cap: the second near-maximal charge would push the pool total
+    // past the range SQLite can add, so it is refused before it is written.
+    let huge = 4_000_000_000_000_000_000u64;
+    let mut fx = Fx::new(Some(&cfg_json(huge, "UTC", 1_000)), JAN);
+    assert!(matches!(
+        fx.charge("s1", None, huge, "one", ChargeSource::Gateway, None),
+        SharedBudgetOutcome::Charged { .. }
+    ));
+    expect_refused(
+        fx.charge("s1", None, huge, "two", ChargeSource::Gateway, None),
+        SharedBudgetRefusal::AmountTooLarge,
+    );
+    // The pool still answers and a small later charge still works.
+    assert!(matches!(
+        fx.charge("s1", None, 5, "three", ChargeSource::Gateway, None),
+        SharedBudgetOutcome::Charged { .. }
+    ));
+    assert!(fx.status().capacity_known);
 }
 
 // ---------------------------------------------------------------------

@@ -89,6 +89,9 @@ pub enum SharedBudgetRefusal {
     /// `agent_id` is present but empty.
     InvalidAgentId,
     InvalidAmount,
+    /// One charge above ten times the monthly cap, or one that would push
+    /// the pool's total past the range the ledger can add safely.
+    AmountTooLarge,
     InvalidIdempotencyKey,
     /// `event_time` is not RFC 3339.
     InvalidEventTime,
@@ -261,6 +264,9 @@ pub enum SharedBudgetOutcome {
         remaining_usd_cents: i64,
         overrun_usd_cents: u64,
         capacity_known: bool,
+        /// The event time named a later period than now, so the spend was
+        /// booked to the current period instead of being dropped.
+        event_time_clamped: bool,
     },
     Status(Box<SharedBudgetStatus>),
 }
