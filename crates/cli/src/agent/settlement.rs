@@ -126,6 +126,23 @@ pub fn parse_session_end(raw: &str) -> Result<SessionEnd, Skip> {
     })
 }
 
+/// Is `path` a file the daemon's `Stop` sweep visits
+/// (`<session>/subagents/agent-<id>.jsonl`, absolute, `<id>` in
+/// `[A-Za-z0-9_-]`)? A string check only; nothing is opened.
+fn sweep_visible(path: &str) -> bool {
+    let p = Path::new(path);
+    let id = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix("agent-"))
+        .and_then(|n| n.strip_suffix(".jsonl"));
+    p.is_absolute()
+        && id.is_some_and(agent_id_charset_ok)
+        && p.parent()
+            .and_then(Path::file_name)
+            .is_some_and(|d| d == "subagents")
+}
+
 /// The request for a parsed `SubagentStop`, or why none is sent.
 pub fn charge_request(stop: &SubagentStop) -> Result<SharedBudgetRequest, &'static str> {
     if budget_gate::session_id_unusable(&stop.session_id) {
@@ -135,6 +152,13 @@ pub fn charge_request(stop: &SubagentStop) -> Result<SharedBudgetRequest, &'stat
         // The next Stop's subagent sweep still finds the file.
         return Err("no agent_transcript_path in payload");
     };
+    // The daemon books an id-less charge under a path family but the Stop
+    // sweep books the same file under the id in its name: sending both would
+    // charge the file twice. Leave such a file to the sweep, which attributes
+    // it by its name (the hook never derives an id itself).
+    if stop.agent_id.is_none() && sweep_visible(&path) {
+        return Err("no usable agent_id; the Stop sweep attributes this file by name");
+    }
     Ok(SharedBudgetRequest::ChargeAgentTranscript {
         session_id: stop.session_id.clone(),
         agent_id: stop.agent_id.clone(),
@@ -362,6 +386,42 @@ mod tests {
             let stop = parse_subagent_stop(&raw).unwrap();
             assert_eq!(stop.agent_id, None, "{bad:?}");
             assert!(stop.agent_id_rejected, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn an_id_less_stop_for_a_sweep_visible_file_is_left_to_the_sweep() {
+        let visible = "/h/p/s/subagents/agent-a1b2.jsonl";
+        for agent in [None, Some("a/b".to_string())] {
+            let raw = serde_json::json!({
+                "session_id": "s", "agent_id": agent, "agent_transcript_path": visible
+            })
+            .to_string();
+            assert!(charge_request(&parse_subagent_stop(&raw).unwrap()).is_err());
+        }
+        // With a valid id the sweep books the same family, so it is sent.
+        let with_id = parse_subagent_stop(
+            &serde_json::json!({
+                "session_id": "s", "agent_id": "a1b2", "agent_transcript_path": visible
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(charge_request(&with_id).is_ok());
+        // Files the sweep cannot see are still charged, unattributed.
+        for hidden in [
+            "/h/p/s/agent-a1b2.jsonl",
+            "/h/p/s/subagents/other.jsonl",
+            "/h/p/s/subagents/agent-a.b.jsonl",
+            "/h/p/s/subagents/agent-.jsonl",
+            "subagents/agent-a1b2.jsonl",
+        ] {
+            let stop = parse_subagent_stop(
+                &serde_json::json!({"session_id": "s", "agent_transcript_path": hidden})
+                    .to_string(),
+            )
+            .unwrap();
+            assert!(charge_request(&stop).is_ok(), "{hidden}");
         }
     }
 

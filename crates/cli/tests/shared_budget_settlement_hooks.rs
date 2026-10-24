@@ -678,6 +678,78 @@ fn subagent_stop_charges_the_subagent_lane_and_session_end_settles_the_tail() {
 }
 
 #[test]
+fn an_id_less_subagent_stop_never_double_charges_a_file_the_stop_sweep_attributes() {
+    let live = Live::start();
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
+    let session = "sess-noid";
+    let project = live.state.path().join("project");
+    std::fs::create_dir_all(project.join(session).join("subagents")).unwrap();
+    let main = project.join(format!("{session}.jsonl"));
+    let sub = project
+        .join(session)
+        .join("subagents")
+        .join("agent-a9z.jsonl");
+
+    live.hook(
+        &["hook", "user-prompt-submit"],
+        serde_json::json!({"session_id": session, "cwd": repo.path(), "prompt": "go"}),
+    );
+    write_lines(&main, &[rec(1, "m1", session, 1_000_000, None)]);
+    write_lines(&sub, &[rec(2, "s1", session, 2_000_000, Some("a9z"))]);
+
+    // The host sent no usable id (blank / missing / outside the charset).
+    for agent in [serde_json::json!(""), serde_json::json!("a/z")] {
+        let ran = live.hook(
+            &["hook", "subagent-stop"],
+            serde_json::json!({
+                "session_id": session, "agent_id": agent, "agent_transcript_path": sub
+            }),
+        );
+        assert_silent_success(&ran);
+    }
+    assert_eq!(live.status().used_usd_cents, 0, "left to the Stop sweep");
+
+    live.hook(
+        &["hook", "stop"],
+        serde_json::json!({"session_id": session, "transcript_path": main}),
+    );
+    let st = live.status();
+    // 300 (main turn) + 600 (subagent, attributed by its file name), once.
+    assert_eq!(st.used_usd_cents, 900, "{:?}", st.executors);
+    let agent_rows: Vec<_> = st
+        .executors
+        .iter()
+        .filter(|e| e.executor_kind == ExecutorKind::Agent)
+        .collect();
+    assert_eq!(agent_rows.len(), 1, "{:?}", st.executors);
+    assert_eq!(agent_rows[0].agent_id.as_deref(), Some("a9z"));
+    assert_eq!(agent_rows[0].used_usd_cents, 600);
+}
+
+#[test]
+fn an_id_less_subagent_stop_for_a_file_the_sweep_cannot_see_is_charged_unattributed() {
+    let live = Live::start();
+    let session = "sess-odd";
+    let odd = live.state.path().join("elsewhere.jsonl");
+    write_lines(&odd, &[rec(1, "s1", session, 1_000_000, Some("zz"))]);
+    let payload = serde_json::json!({
+        "session_id": session, "hook_event_name": "SubagentStop",
+        "agent_transcript_path": odd
+    });
+    assert_silent_success(&live.hook(&["hook", "subagent-stop"], payload.clone()));
+    let st = live.status();
+    assert_eq!(st.used_usd_cents, 300);
+    assert!(st
+        .executors
+        .iter()
+        .any(|e| e.executor_kind == ExecutorKind::Unattributed && e.used_usd_cents == 300));
+    // A repeat books nothing.
+    live.hook(&["hook", "subagent-stop"], payload);
+    assert_eq!(live.status().used_usd_cents, 300);
+}
+
+#[test]
 fn session_end_for_a_session_never_admitted_bills_nothing() {
     let live = Live::start();
     let main = live.state.path().join("ghost.jsonl");
