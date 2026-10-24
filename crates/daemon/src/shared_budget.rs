@@ -262,8 +262,7 @@ fn later_pool(ledger: &LedgerStore, current: &Period) -> Result<Option<PoolId>, 
     Ok(ledger
         .shared_pool_ids_with_prefix(POOL_PREFIX)?
         .into_iter()
-        .filter(|p| p.0 > current.pool_id.0)
-        .next_back())
+        .rfind(|p| p.0 > current.pool_id.0))
 }
 
 fn anomaly(later: &PoolId, current: &Period) -> SharedBudgetOutcome {
@@ -454,7 +453,7 @@ pub fn admit(
         if let SharedPoolRenewOutcome::Renewed(renewed) =
             ledger.renew_shared(existing.id, &principal(), session_id, now, HOLD_TTL_SECS)?
         {
-            return Ok(allowed(ledger, cfg, &period, &renewed, true, now)?);
+            return allowed(ledger, cfg, &period, &renewed, true, now);
         }
     }
 
@@ -496,7 +495,7 @@ pub fn admit(
         };
         match outcome {
             MeteredReserveOutcome::Granted(hold) => {
-                return Ok(allowed(ledger, cfg, &period, &hold, false, now)?)
+                return allowed(ledger, cfg, &period, &hold, false, now);
             }
             MeteredReserveOutcome::AlreadyGranted(hold) => {
                 let live = hold.state == libra_governor_domain::ReservationState::Active
@@ -504,7 +503,7 @@ pub fn admit(
                     && hold.session_id == session_id
                     && hold.agent_id.as_deref() == agent_id;
                 if live {
-                    return Ok(allowed(ledger, cfg, &period, &hold, true, now)?);
+                    return allowed(ledger, cfg, &period, &hold, true, now);
                 }
                 if attempt == 0 {
                     key = prompt_key("n", &Uuid::new_v4().to_string());

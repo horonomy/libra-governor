@@ -73,7 +73,7 @@ pub fn run() {
     };
 
     let lifetime_scope = overrides.lifetime_scope();
-    let config = daemon_config(
+    let mut config = daemon_config(
         state_dir.join("daemon.sock"),
         state_dir.join("ledger.sqlite3"),
         log_path,
@@ -86,10 +86,11 @@ pub fn run() {
         overrides.gateway,
         overrides.extensions,
         overrides.launcher,
-        // Read once, here, from its own file (never from config.json): the
-        // budget file's presence must not flip config.json-driven behaviour.
-        libra_governor_daemon::shared_budget::SharedBudgetRuntime::load(&state_dir),
     );
+    // Read once, here, from its own file (never from config.json): the
+    // budget file's presence must not flip config.json-driven behaviour.
+    config.shared_budget =
+        libra_governor_daemon::shared_budget::SharedBudgetRuntime::load(&state_dir);
     log_shared_budget_state(&config);
 
     let listener = match libra_governor_daemon::bind_or_detect_running(&config.socket_path) {
@@ -184,7 +185,6 @@ fn daemon_config(
     gateway: Option<libra_governor_gateway::config::GatewayConfig>,
     extensions: Option<libra_governor_extension::ExtensionConfig>,
     launch_gate: Option<libra_governor_daemon::launch_gate::LaunchGateConfig>,
-    shared_budget: libra_governor_daemon::shared_budget::SharedBudgetRuntime,
 ) -> DaemonConfig {
     DaemonConfig {
         socket_path,
@@ -203,7 +203,9 @@ fn daemon_config(
         outcome_authority: None,
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
         launch_gate,
-        shared_budget,
+        // Absent here; default-mode `run` loads its own file afterwards and
+        // trusted mode never reads state-dir configuration.
+        shared_budget: libra_governor_daemon::shared_budget::SharedBudgetRuntime::absent(),
     }
 }
 
@@ -263,8 +265,6 @@ pub fn run_trusted(config_path: &Path) -> i32 {
         None,
         None,
         None,
-        // Trusted mode never reads state-dir configuration.
-        libra_governor_daemon::shared_budget::SharedBudgetRuntime::absent(),
     );
 
     let listener = match bind_trusted_socket(&cfg) {

@@ -1167,7 +1167,7 @@ impl LedgerStore {
             }
             if best
                 .as_ref()
-                .map_or(true, |b| reservation.created_at > b.created_at)
+                .is_none_or(|b| reservation.created_at > b.created_at)
             {
                 best = Some(reservation);
             }
@@ -1242,7 +1242,7 @@ impl LedgerStore {
         for row in rows {
             let (pool, created_at) = row?;
             let created_at = parse_time(&created_at)?;
-            if best.as_ref().map_or(true, |(t, _)| created_at > *t) {
+            if best.as_ref().is_none_or(|(t, _)| created_at > *t) {
                 best = Some((created_at, pool));
             }
         }
