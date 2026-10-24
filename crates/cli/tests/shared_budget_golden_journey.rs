@@ -999,3 +999,78 @@ fn prune_removes_only_an_ended_period_and_leaves_the_current_one_intact() {
     assert!(is_allowed(&journey.admit("i-2")), "admission still works");
     assert_reconciled(&journey);
 }
+
+// =====================================================================
+// `doctor` against the live daemon.
+// =====================================================================
+
+#[test]
+fn doctor_reports_the_live_budget_and_never_prints_the_host_traffic_value() {
+    const SENTINEL: &str = "SENTINEL-VALUE-must-never-be-printed";
+    let journey = Journey::start(&config(50_000, None));
+    assert!(is_allowed(&journey.admit("d-1")));
+
+    let out = journey
+        .command(&["doctor", "--json"])
+        .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", SENTINEL)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(!text.contains(SENTINEL), "the value must never be printed");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains(SENTINEL),
+        "nor on stderr"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "warnings do not fail doctor: {text}"
+    );
+
+    let doc: Value = serde_json::from_str(&text).unwrap();
+    let finding = |id: &str| -> Value {
+        doc["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["id"] == id)
+            .unwrap_or_else(|| panic!("no {id} finding in {text}"))
+            .clone()
+    };
+    assert_eq!(finding("shared_budget_config")["severity"], "ok");
+    assert_eq!(finding("shared_budget_daemon")["severity"], "ok");
+    assert_eq!(finding("shared_budget_clock")["severity"], "ok");
+    assert_eq!(finding("shared_budget_settlements")["severity"], "ok");
+    // The isolated HOME has no settings.json, so the hooks are not wired.
+    let hooks = finding("shared_budget_hooks");
+    assert_eq!(hooks["severity"], "warn");
+    assert!(hooks["message"].as_str().unwrap().contains("SessionEnd"));
+    let limits = finding("shared_budget_limits")["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for needle in [
+        "admission-bounded (cooperative)",
+        "in-turn overshoot",
+        "Codex route has no budget gate",
+        "no gateway hard cap",
+        "never a provider bill or quota",
+    ] {
+        assert!(limits.contains(needle), "{needle}: {limits}");
+    }
+    let traffic = finding("host_traffic_setting")["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        traffic.contains("set in this process's environment"),
+        "{traffic}"
+    );
+    assert!(!traffic.contains("not set in this process's environment"));
+
+    // Without the variable it says so.
+    let plain = journey.cli(&["doctor", "--json"]);
+    let plain_text = String::from_utf8_lossy(&plain.stdout).into_owned();
+    assert!(plain_text.contains("not set in this process's environment"));
+}
