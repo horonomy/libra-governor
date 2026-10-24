@@ -419,11 +419,11 @@ mod tests {
                 "greater than 0",
             ),
             (
-                r#"{"schema_version":1,"monthly_cap_usd_cents":100,"time_zone":"UTC","soft_limits":{"per_session_usd_cents":0}}"#,
+                r#"{"schema_version":1,"monthly_cap_usd_cents":10000,"time_zone":"UTC","soft_limits":{"per_session_usd_cents":0}}"#,
                 "soft_limits.per_session",
             ),
             (
-                r#"{"schema_version":1,"monthly_cap_usd_cents":100,"time_zone":"UTC","soft_limits":{"per_agent_usd_cents":-1}}"#,
+                r#"{"schema_version":1,"monthly_cap_usd_cents":10000,"time_zone":"UTC","soft_limits":{"per_agent_usd_cents":-1}}"#,
                 "soft_limits.per_agent",
             ),
             (
@@ -431,7 +431,7 @@ mod tests {
                 "unknown field",
             ),
             (
-                r#"{"schema_version":1,"monthly_cap_usd_cents":100,"time_zone":"UTC","subagent_unmeasured_charge_usd_cents":0}"#,
+                r#"{"schema_version":1,"monthly_cap_usd_cents":10000,"time_zone":"UTC","subagent_unmeasured_charge_usd_cents":0}"#,
                 "subagent_unmeasured",
             ),
         ];
