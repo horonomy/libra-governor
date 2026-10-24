@@ -198,6 +198,8 @@ enum Answer {
     Reply(Response),
     /// Accept, read the request, never answer (until the daemon is dropped).
     Stall,
+    /// Send one byte every 150 ms for 3 s, never a full line.
+    Trickle,
 }
 
 struct Fake {
@@ -246,6 +248,16 @@ impl Fake {
                         );
                     }
                     Answer::Stall => held.push(stream),
+                    Answer::Trickle => {
+                        std::thread::spawn(move || {
+                            for _ in 0..20 {
+                                if (&stream).write_all(b" ").is_err() {
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(150));
+                            }
+                        });
+                    }
                 }
             }
         });
@@ -554,12 +566,6 @@ fn prompt_denials_block_without_calling_preflight() {
         (
             denied(SharedBudgetDenyReason::ClockAnomaly),
             "clock anomaly",
-        ),
-        (
-            SharedBudgetOutcome::Refused {
-                reason: SharedBudgetRefusal::EmptySessionId,
-            },
-            "refused this session identity",
         ),
     ];
     for (outcome, needle) in cases {
@@ -1021,4 +1027,126 @@ fn drain(mut r: impl Read) -> String {
     let mut s = String::new();
     let _ = r.read_to_string(&mut s);
     s
+}
+
+// =====================================================================
+// Review fixes: host-input refusals fail open, parent-path stat errors,
+// retry only on stale-daemon errors, one overall PreToolUse deadline.
+// =====================================================================
+
+#[test]
+fn unusable_session_ids_with_a_budget_file_never_block_and_send_no_admit() {
+    for session in ["", "   ", "\t", "execution-owner-v1:forged"] {
+        let state = tempfile::tempdir().unwrap();
+        write_budget(state.path(), &config(5_000, ""));
+        let fake = Fake::start(state.path(), |_| {
+            reply(denied(SharedBudgetDenyReason::CapExhausted))
+        });
+        let ran = prompt(state.path(), session, repo().path(), &[]);
+        assert_eq!(ran.code, Some(0));
+        assert!(
+            !ran.stdout.contains("decision"),
+            "{session:?}: {}",
+            ran.stdout
+        );
+        assert!(outer_context(&ran).contains("preflight skipped"));
+        assert!(
+            fake.requests().is_empty(),
+            "{session:?}: {:?}",
+            fake.requests()
+        );
+    }
+}
+
+#[test]
+fn a_daemon_refusal_of_host_input_fails_open_and_continues_to_preflight() {
+    for refusal in [
+        SharedBudgetRefusal::EmptySessionId,
+        SharedBudgetRefusal::ReservedSessionScope,
+        SharedBudgetRefusal::InvalidAgentId,
+    ] {
+        let state = tempfile::tempdir().unwrap();
+        write_budget(state.path(), &config(5_000, ""));
+        let fake = Fake::start(state.path(), move |req| match req {
+            Request::SharedBudget { .. } => reply(SharedBudgetOutcome::Refused { reason: refusal }),
+            _ => err("scripted"),
+        });
+        let ran = prompt(state.path(), "s-refused", repo().path(), &[]);
+        assert!(
+            !ran.stdout.contains("decision"),
+            "{refusal:?}: {}",
+            ran.stdout
+        );
+        assert_eq!(
+            fake.kinds(),
+            vec!["shared_budget:admit".to_string(), "preflight".to_string()]
+        );
+    }
+}
+
+#[test]
+fn an_unsearchable_state_dir_is_not_a_budget_file_and_fails_open() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc_geteuid() } == 0 {
+        eprintln!("skipped: running as root ignores directory permissions");
+        return;
+    }
+    // The state dir sits under a parent that cannot be searched (EACCES on a
+    // parent path component). The hook itself would chmod the state dir back
+    // to 0700, so the unsearchable component must be above it.
+    let parent = tempfile::tempdir().unwrap();
+    let state = parent.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    write_budget(&state, &config(5_000, ""));
+    std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+    let ran = prompt(
+        &state,
+        "s-eacces",
+        repo().path(),
+        &[("LIBRA_GOVERNOR_NO_AUTOSPAWN", "1")],
+    );
+    let tool = pre_tool(&state, tool_payload("s", None));
+    std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!ran.stdout.contains("decision"), "{}", ran.stdout);
+    assert_allow(&tool);
+}
+
+extern "C" {
+    #[link_name = "geteuid"]
+    fn libc_geteuid() -> u32;
+}
+
+#[test]
+fn an_error_after_a_possible_commit_is_not_retried_so_no_second_hold() {
+    let state = tempfile::tempdir().unwrap();
+    write_budget(state.path(), &config(5_000, ""));
+    let fake = Fake::start(state.path(), |_| err("ledger busy after commit"));
+    let reason = assert_block(&prompt(state.path(), "s-once", repo().path(), &[]));
+    assert!(reason.contains("libra-governor daemon run"), "{reason}");
+    assert_eq!(fake.kinds(), vec!["shared_budget:admit".to_string()]);
+}
+
+#[test]
+fn a_stale_daemon_version_error_is_retried_once() {
+    let state = tempfile::tempdir().unwrap();
+    write_budget(state.path(), &config(5_000, ""));
+    let fake = Fake::start(state.path(), |_| {
+        err("protocol version mismatch: daemon speaks 1, client sent 20")
+    });
+    assert_block(&prompt(state.path(), "s-stale", repo().path(), &[]));
+    assert_eq!(fake.kinds().len(), 2, "{:?}", fake.kinds());
+}
+
+#[test]
+fn pre_tool_use_has_one_overall_deadline_even_against_a_trickling_daemon() {
+    let state = tempfile::tempdir().unwrap();
+    write_budget(state.path(), &config(5_000, ""));
+    let _fake = Fake::start(state.path(), |_| Answer::Trickle);
+    let ran = pre_tool(state.path(), tool_payload("s", None));
+    assert_allow(&ran);
+    assert!(
+        ran.elapsed < Duration::from_millis(1_500),
+        "total deadline exceeded: {:?}",
+        ran.elapsed
+    );
 }

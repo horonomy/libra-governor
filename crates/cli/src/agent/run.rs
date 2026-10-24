@@ -249,6 +249,17 @@ pub(crate) fn run_prompt_submit_with_input(agent: AgentKind, raw: &str) {
     // existed (no extra connection, no extra output byte).
     let mut budget_warning: Option<String> = None;
     if agent == AgentKind::ClaudeCode && budget_gate::budget_file_present() {
+        // A session id the daemon would refuse purely for what the host sent
+        // is the existing skipped path: no Admit, never a block.
+        if budget_gate::session_id_unusable(&session_id) {
+            log(
+                &log_path,
+                agent,
+                "preflight: unusable session id, skipping shared budget and preflight",
+            );
+            print_context("[libra-governor] preflight skipped: missing or reserved session id.");
+            return;
+        }
         match budget_gate::admit(&socket_path, &session_id, prompt_id, &|m| {
             log(&log_path, agent, m)
         }) {

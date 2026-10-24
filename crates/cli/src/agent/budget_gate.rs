@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use libra_governor_protocol::{
     Request, Response, SharedBudgetCheckState, SharedBudgetDenyReason, SharedBudgetOutcome,
-    SharedBudgetRefusal, SharedBudgetRequest, SoftLimitScope, SoftLimitWarning,
+    SharedBudgetRequest, SoftLimitScope, SoftLimitWarning,
 };
 
 use crate::client::{self, ClientError};
@@ -60,20 +60,42 @@ fn budget_file_path() -> Option<PathBuf> {
         .map(|dir| dir.join(BUDGET_FILE_NAME))
 }
 
-/// Cheap stat: does a budget file exist? "Not found", and "the state
-/// directory is not a directory" (nothing can exist beneath it), count as
-/// absent; any other stat error (permissions, I/O) is treated as present so
-/// the daemon, not a failed stat, decides.
-pub fn budget_file_present() -> bool {
-    match budget_file_path() {
-        Some(path) => match std::fs::symlink_metadata(&path) {
-            Ok(_) => true,
-            Err(e) => {
-                e.kind() != std::io::ErrorKind::NotFound && e.raw_os_error() != Some(libc::ENOTDIR)
-            }
-        },
-        None => false,
+/// Can this process search (traverse) `dir`? Without that, nothing beneath
+/// it can be stat'ed, and the daemon cannot run there either.
+fn dir_searchable(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    match std::ffi::CString::new(dir.as_os_str().as_bytes()) {
+        // SAFETY: `c` is a valid NUL-terminated path for the call's duration.
+        Ok(c) => unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 },
+        Err(_) => false,
     }
+}
+
+/// Cheap stat: does a budget file exist? Absent means the file is not there
+/// or cannot exist/be reached through its parent (state dir missing, not a
+/// directory, or not searchable): that is not a budget decision, so the hook
+/// fails open as it always did. Only an error on the file entry itself, in
+/// a searchable state dir, counts as present so the daemon decides.
+pub fn budget_file_present() -> bool {
+    let Some(path) = budget_file_path() else {
+        return false;
+    };
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => true,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ENOTDIR) {
+                return false;
+            }
+            path.parent().map(dir_searchable).unwrap_or(false)
+        }
+    }
+}
+
+/// Session ids the daemon would refuse purely because of what the host
+/// sent. These never block (fail open), and are not sent as `Admit`.
+pub fn session_id_unusable(session_id: &str) -> bool {
+    // Mirrors the daemon's reserved execution-owner scope prefix.
+    session_id.trim().is_empty() || session_id.starts_with("execution-owner-v1:")
 }
 
 fn usd(cents: i64) -> String {
@@ -135,31 +157,21 @@ fn denied_reason(
     }
 }
 
-fn refusal_name(reason: SharedBudgetRefusal) -> &'static str {
-    match reason {
-        SharedBudgetRefusal::EmptySessionId => "empty session id",
-        SharedBudgetRefusal::ReservedSessionScope => "reserved session scope",
-        SharedBudgetRefusal::InvalidAgentId => "invalid agent id",
-        SharedBudgetRefusal::InvalidAmount => "invalid amount",
-        SharedBudgetRefusal::AmountTooLarge => "amount too large",
-        SharedBudgetRefusal::InvalidIdempotencyKey => "invalid idempotency key",
-        SharedBudgetRefusal::InvalidEventTime => "invalid event time",
-        SharedBudgetRefusal::KeyConflict => "key conflict",
-        SharedBudgetRefusal::PoolUnitMismatch => "pool unit mismatch",
-    }
-}
-
 fn unreachable_reason() -> String {
     format!(
         "Libra shared budget: budget enforcement unavailable: daemon unreachable, so this \
-         prompt cannot be admitted while shared-budget.json exists ({LABEL})."
+         prompt cannot be admitted while shared-budget.json exists. Start the Libra daemon \
+         (libra-governor daemon run), or remove/fix shared-budget.json, or unset \
+         LIBRA_GOVERNOR_NO_AUTOSPAWN ({LABEL})."
     )
 }
 
 fn unusable_reason() -> String {
     format!(
         "Libra shared budget: budget enforcement unavailable: the daemon gave an unusable \
-         answer, so this prompt cannot be admitted while shared-budget.json exists ({LABEL})."
+         answer, so this prompt cannot be admitted while shared-budget.json exists. Restart \
+         the Libra daemon (libra-governor daemon run) or remove/fix shared-budget.json \
+         ({LABEL})."
     )
 }
 
@@ -222,12 +234,9 @@ pub fn decide_admit(outcome: &SharedBudgetOutcome) -> Admission {
                 detail.as_deref(),
             ),
         },
-        SharedBudgetOutcome::Refused { reason } => Admission::Block {
-            reason: format!(
-                "Libra shared budget refused this session identity ({}) ({LABEL}).",
-                refusal_name(*reason)
-            ),
-        },
+        // A refusal is driven purely by host-supplied identity, not by the
+        // budget: never block the user's prompt for it.
+        SharedBudgetOutcome::Refused { .. } => Admission::Proceed { warning: None },
         // Not an answer to Admit: the budget file exists, so fail closed.
         _ => Admission::Block {
             reason: unusable_reason(),
@@ -264,6 +273,13 @@ pub fn decide_check(outcome: &SharedBudgetOutcome) -> Option<String> {
     }
 }
 
+/// Only errors a stale daemon gives *before* handling the request justify a
+/// resend. Any other error may follow a committed hold, and an `Admit`
+/// without a `prompt_id` is not idempotent, so resending could reserve twice.
+fn stale_daemon_error(message: &str) -> bool {
+    message.starts_with("protocol version mismatch") || message == "malformed request"
+}
+
 /// Asks the daemon to admit one prompt. Only called when the budget file
 /// exists. Connecting uses the same autospawn path as Preflight (so
 /// `LIBRA_GOVERNOR_NO_AUTOSPAWN` is honoured); a daemon that cannot be
@@ -294,14 +310,23 @@ pub fn admit(
             }
         };
         match client::roundtrip(&stream, request()) {
-            Ok(Response::SharedBudget(outcome)) => return decide_admit(&outcome),
+            Ok(Response::SharedBudget(outcome)) => {
+                if let SharedBudgetOutcome::Refused { reason } = &*outcome {
+                    log(&format!(
+                        "shared budget: admit refused ({reason:?}); failing open"
+                    ));
+                }
+                return decide_admit(&outcome);
+            }
             Ok(_) => {
                 log("shared budget: unexpected response kind for Admit");
                 return Admission::Block {
                     reason: unusable_reason(),
                 };
             }
-            Err(ClientError::DaemonError(message)) if attempt == 0 => {
+            Err(ClientError::DaemonError(message))
+                if attempt == 0 && stale_daemon_error(&message) =>
+            {
                 log(&format!(
                     "shared budget: daemon error, retrying once: {message}"
                 ));
@@ -328,29 +353,36 @@ pub fn check_denial(
     agent_id: Option<&str>,
     log: &dyn Fn(&str),
 ) -> Option<String> {
-    let stream = match client::connect_only_with_budget(socket_path, CHECK_BUDGET) {
-        Ok(stream) => stream,
-        Err(e) => {
-            log(&format!("pre-tool-use: shared budget check skipped: {e}"));
-            return None;
-        }
-    };
+    let socket = socket_path.to_path_buf();
     let request = Request::SharedBudget {
         shared_budget: SharedBudgetRequest::Check {
             session_id: session_id.to_string(),
             agent_id: agent_id.map(str::to_owned),
         },
     };
-    match client::roundtrip(&stream, request) {
-        Ok(Response::SharedBudget(outcome)) => decide_check(&outcome),
-        Ok(_) => {
+    // One overall deadline around connect + write + read: a daemon that
+    // trickles bytes defeats per-read socket timeouts. The worker is
+    // abandoned on timeout; the hook process exits right after.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let outcome = client::connect_only_with_budget(&socket, CHECK_BUDGET)
+            .and_then(|stream| client::roundtrip(&stream, request));
+        let _ = tx.send(outcome);
+    });
+    match rx.recv_timeout(CHECK_BUDGET) {
+        Ok(Ok(Response::SharedBudget(outcome))) => decide_check(&outcome),
+        Ok(Ok(_)) => {
             log("pre-tool-use: unexpected response kind for Check, allowing");
             None
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             log(&format!(
                 "pre-tool-use: shared budget check failed, allowing: {e}"
             ));
+            None
+        }
+        Err(_) => {
+            log("pre-tool-use: shared budget check timed out, allowing");
             None
         }
     }
@@ -360,6 +392,7 @@ pub fn check_denial(
 mod tests {
     use super::*;
     use libra_governor_domain::{ExecutorKind, SharedPoolReservationId};
+    use libra_governor_protocol::SharedBudgetRefusal;
 
     fn allowed(warnings: Vec<SoftLimitWarning>, unavailable: bool) -> SharedBudgetOutcome {
         SharedBudgetOutcome::Allowed {
@@ -456,12 +489,30 @@ mod tests {
             assert!(reason.contains("Libra-accounted USD, admission-bounded"));
             assert!(!reason.contains('\n'));
         }
-        let Admission::Block { reason } = decide_admit(&SharedBudgetOutcome::Refused {
-            reason: SharedBudgetRefusal::EmptySessionId,
-        }) else {
-            panic!("refusal must block")
-        };
-        assert!(reason.contains("empty session id"));
+        // Host-input refusals never block.
+        assert_eq!(
+            decide_admit(&SharedBudgetOutcome::Refused {
+                reason: SharedBudgetRefusal::EmptySessionId,
+            }),
+            Admission::Proceed { warning: None }
+        );
+    }
+
+    #[test]
+    fn host_driven_session_ids_are_unusable_but_real_ones_are_not() {
+        for bad in ["", "   ", "\t\n", "execution-owner-v1:abc"] {
+            assert!(session_id_unusable(bad), "{bad:?}");
+        }
+        assert!(!session_id_unusable("sess-1"));
+    }
+
+    #[test]
+    fn only_known_stale_daemon_errors_are_retried() {
+        assert!(stale_daemon_error(
+            "protocol version mismatch: daemon speaks 20, client sent 21"
+        ));
+        assert!(stale_daemon_error("malformed request"));
+        assert!(!stale_daemon_error("ledger busy"));
     }
 
     #[test]
