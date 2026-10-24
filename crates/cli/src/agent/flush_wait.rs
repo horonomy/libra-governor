@@ -118,6 +118,13 @@ fn probe_daemon(socket: &Path, session_id: &str, transcript_path: &str) -> Probe
     // One connection per probe, dropped before the caller sleeps.
     let answer = client::connect_only_with_budget(socket, PROBE_BUDGET)
         .and_then(|stream| client::roundtrip(&stream, request));
+    probe_from(answer)
+}
+
+/// Maps a probe's round trip to what the hook does next. Only an explicit
+/// "not ready" keeps waiting; an error, a timeout, an old daemon's error
+/// answer, a refusal, "not configured" or any other answer ends the wait.
+fn probe_from(answer: Result<Response, client::ClientError>) -> Probe {
     match answer {
         Ok(Response::SharedBudget(outcome)) => match *outcome {
             SharedBudgetOutcome::TranscriptReadiness { ready: false } => Probe::NotReady,
@@ -282,11 +289,50 @@ mod tests {
     }
 
     #[test]
-    fn a_daemon_that_cannot_help_ends_the_wait_at_once() {
-        // Unreachable, too old, slow or refusing probes all map to Done.
-        let (ended, clock, calls) = run(DEFAULT_CAP, &[Probe::Done]);
-        assert_eq!((ended, calls), (Ended::Immediate, 1));
-        assert!(clock.naps.borrow().is_empty());
+    fn only_an_explicit_not_ready_keeps_the_hook_waiting() {
+        use libra_governor_protocol::SharedBudgetRefusal;
+        let sb = |o: SharedBudgetOutcome| Ok(Response::SharedBudget(Box::new(o)));
+        assert_eq!(
+            probe_from(sb(SharedBudgetOutcome::TranscriptReadiness {
+                ready: false
+            })),
+            Probe::NotReady
+        );
+        assert_eq!(
+            probe_from(sb(SharedBudgetOutcome::TranscriptReadiness { ready: true })),
+            Probe::Done
+        );
+        assert_eq!(
+            probe_from(sb(SharedBudgetOutcome::NotConfigured)),
+            Probe::Done
+        );
+        assert_eq!(
+            probe_from(sb(SharedBudgetOutcome::Refused {
+                reason: SharedBudgetRefusal::EmptySessionId
+            })),
+            Probe::Done
+        );
+        // An older daemon answers an unknown request with an error.
+        assert_eq!(
+            probe_from(Ok(Response::Error {
+                message: "unknown".into()
+            })),
+            Probe::Done
+        );
+        assert_eq!(probe_from(Ok(Response::Ack)), Probe::Done);
+        // Unreachable or slow (a connect/read timeout) is a client error.
+        let down = client::ClientError::DaemonUnavailable(
+            std::path::PathBuf::from("/x"),
+            "timed out".into(),
+        );
+        assert_eq!(probe_from(Err(down)), Probe::Done);
+        assert_eq!(
+            probe_from(Err(client::ClientError::ProtocolMismatch(23, 22))),
+            Probe::Done,
+            "a daemon on another protocol version"
+        );
+        let slow = std::io::Error::from(std::io::ErrorKind::TimedOut);
+        assert_eq!(probe_from(Err(slow.into())), Probe::Done);
     }
 
     #[test]

@@ -401,6 +401,64 @@ fn assistant_line(session: &str, id: &str) -> String {
     )
 }
 
+/// A pass-through between the hook and the real daemon that counts the
+/// connections (one per probe or request), so a test can wait until the hook
+/// has provably probed before it acts.
+struct Proxy {
+    connections: Arc<std::sync::atomic::AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Proxy {
+    fn start(listen: &Path, target: PathBuf) -> Self {
+        let listener = UnixListener::bind(listen).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (count, halt) = (connections.clone(), stop.clone());
+        let handle = std::thread::spawn(move || {
+            while !halt.load(Ordering::SeqCst) {
+                let Ok((client, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                };
+                client.set_nonblocking(false).unwrap();
+                let Ok(daemon) = UnixStream::connect(&target) else {
+                    continue;
+                };
+                count.fetch_add(1, Ordering::SeqCst);
+                let (mut c_in, mut c_out) = (client.try_clone().unwrap(), client);
+                let (mut d_in, mut d_out) = (daemon.try_clone().unwrap(), daemon);
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut c_in, &mut d_out);
+                });
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut d_in, &mut c_out);
+                });
+            }
+        });
+        Self {
+            connections,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn seen(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 #[test]
 fn a_real_daemon_settles_a_late_flushed_turn_at_the_measured_amount_while_other_sessions_proceed() {
     let live = Live::start();
@@ -408,16 +466,25 @@ fn a_real_daemon_settles_a_late_flushed_turn_at_the_measured_amount_while_other_
         live.admit("s1"),
         SharedBudgetOutcome::Allowed { .. }
     ));
+    // The hook talks to the daemon through a counting pass-through in its own
+    // state dir (which holds the budget file that switches the wait on).
+    let hook_state = tempfile::tempdir().unwrap();
+    write_budget(hook_state.path());
+    let proxy = Proxy::start(&hook_state.path().join("daemon.sock"), live.sock());
     let transcript = live.state.path().join("s1.jsonl");
-    // The transcript does not exist: the Stop hook must be waiting.
     let started = Instant::now();
     let mut child = spawn_stop(
-        stop_command(live.state.path(), live.home.path(), Some("5000")),
+        stop_command(hook_state.path(), live.home.path(), Some("5000")),
         &payload("s1", &transcript),
     );
 
-    // The daemon is not occupied by the waiting hook: another session's
-    // admission is answered while that hook is still polling.
+    // Wait (bounded poll) until the hook has demonstrably probed at least
+    // once, so the next Admit happens while it is polling and sleeping.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while proxy.seen() == 0 {
+        assert!(Instant::now() < deadline, "the hook never probed");
+        std::thread::sleep(Duration::from_millis(2));
+    }
     assert!(matches!(
         live.admit("s2"),
         SharedBudgetOutcome::Allowed { .. }
