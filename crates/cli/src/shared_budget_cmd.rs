@@ -1,12 +1,17 @@
 //! `libra-governor shared-budget <prune|export>` (HORO-2219): retention and
 //! a local-only export for the local monthly shared budget (ADR-0026).
 //!
-//! Both subcommands open the ledger file directly, exactly as the other
-//! offline commands do (`evidence-report`, `dogfood-evidence`): the store
-//! runs in WAL mode with a 5 s `busy_timeout`, prune takes one short
-//! `BEGIN IMMEDIATE` transaction per pool, and export is a single read
-//! snapshot, so both are safe to run while the daemon is up. Neither
+//! Both subcommands open the ledger file directly, like the other offline
+//! commands: a 5 s `busy_timeout`, one short `BEGIN IMMEDIATE` transaction
+//! per pool for `prune --apply`, so they are safe to run while the daemon is
+//! up. A dry-run prune and `export` open the ledger **read-only** (no
+//! migration, no journal-mode change, no WAL checkpoint) and refuse a schema
+//! that is not current; only `prune --apply` opens it for writing. Neither
 //! creates a missing ledger and neither contacts the daemon.
+//!
+//! Export ids are pseudonymised, not anonymised: a 32-bit unsalted digest is
+//! guessable for low-entropy ids and linkable across exports, so a redacted
+//! export is not safe to publish.
 //!
 //! Local only: nothing here opens a socket or spawns a process. `export`
 //! writes one owner-only file and refuses any `--out` that is not a plain
@@ -22,6 +27,7 @@ use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use libra_governor_daemon::shared_budget_file::{LoadedSharedBudget, SharedBudgetFileState};
 use libra_governor_domain::{
     calendar_month_bounds, format_local_rfc3339, monthly_pool_alias, redacted_display_id,
     IanaTimeZone, MeteredPoolKey, PrincipalId, QuotaUnit, LOCAL_BUDGET_OWNER,
@@ -36,11 +42,15 @@ const HELP: &str = "Usage:\n  \
     libra-governor shared-budget prune --keep-months <n> --time-zone <IANA> [--apply]\n  \
     libra-governor shared-budget export --period <YYYY-MM> [--out <file>] [--time-zone <IANA>] \
     [--raw-ids] [--overwrite]\n\n\
-    prune   Dry run by default; deletes only with --apply. Removes closed rows of ended monthly \
-    periods older than the last <n> closed months (n >= 1). Pruned periods can no longer be \
-    exported.\n  \
+    prune   Dry run by default (deletes nothing); deletes only with --apply. Removes closed rows of \
+    ended monthly periods older than the last <n> closed months (n >= 1). Export before prune: \
+    pruned periods can no longer be exported, and replaying a charge older than the retention \
+    window is treated as new. --time-zone defaults to <state-dir>/shared-budget.json's zone and \
+    must match it when both are given; without that file it is required.\n  \
     export  Writes a local JSON file (0600; default under <state-dir>/exports/). Session and \
-    agent ids are replaced by short digests unless --raw-ids is given. Nothing is sent anywhere.";
+    agent ids are pseudonymised (32-bit unsalted digest; guessable for low-entropy ids; linkable \
+    across exports) unless --raw-ids is given; this is not anonymisation and not safe to \
+    publish. Nothing is sent anywhere. --time-zone defaults to the configured zone, else UTC.";
 
 pub const EXPORT_SCHEMA: &str = "libra.shared-budget-export.v1";
 pub const PRUNE_SCHEMA: &str = "libra.shared-budget-prune.v1";
@@ -131,10 +141,7 @@ fn run_prune(args: &[String]) -> i32 {
         Ok(n) if n >= 1 => n,
         _ => return usage_error("--keep-months must be an integer >= 1"),
     };
-    let Some(zone_raw) = flags.value("time-zone") else {
-        return usage_error("--time-zone is required (the current month depends on it)");
-    };
-    let time_zone = match parse_time_zone(zone_raw) {
+    let time_zone = match resolve_prune_zone(flags.value("time-zone")) {
         Ok(z) => z,
         Err(e) => return usage_error(&e),
     };
@@ -145,7 +152,13 @@ fn run_prune(args: &[String]) -> i32 {
         Err(code) => return code,
     };
     let report = if ledger_path.exists() {
-        let mut store = match LedgerStore::open(&ledger_path) {
+        // Only --apply needs write access; a dry run stays read-only.
+        let opened = if apply {
+            LedgerStore::open(&ledger_path)
+        } else {
+            LedgerStore::open_read_only(&ledger_path)
+        };
+        let mut store = match opened {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("libra-governor shared-budget prune: could not open ledger: {e}");
@@ -171,19 +184,65 @@ fn run_prune(args: &[String]) -> i32 {
         empty_report(keep_months, !apply)
     };
 
+    const RETENTION_WARNING: &str = "Export before prune: pruned periods can no longer be \
+         exported, and replaying a charge older than the retention window is treated as new.";
     let note = if apply {
-        "Applied. Pruned periods can no longer be exported."
+        format!("Applied. {RETENTION_WARNING}")
     } else {
-        "Dry run: nothing was deleted or written. Re-run with --apply to delete; pruned \
-         periods can no longer be exported, so export first if you need them."
+        format!(
+            "Dry run: nothing was deleted (the ledger was opened read-only). Re-run with --apply \
+             to delete. {RETENTION_WARNING}"
+        )
     };
     let out = json!({
         "schema": PRUNE_SCHEMA,
         "report": report,
+        "time_zone": time_zone.as_str(),
         "note": note,
     });
     println!("{out}");
     0
+}
+
+/// The zone recorded in `<state-dir>/shared-budget.json`, when that file is
+/// present and valid. An invalid file yields `None` plus a stderr warning.
+fn configured_zone() -> Option<IanaTimeZone> {
+    let state_dir = libra_governor_daemon::paths::state_dir().ok()?;
+    let loaded = LoadedSharedBudget::load(&state_dir);
+    match &loaded.state {
+        SharedBudgetFileState::Valid(config) => Some(config.time_zone.clone()),
+        SharedBudgetFileState::Invalid(reason) => {
+            eprintln!(
+                "libra-governor shared-budget: shared-budget.json is invalid ({reason}); \
+                 ignoring it for the time zone"
+            );
+            None
+        }
+        SharedBudgetFileState::Absent => None,
+    }
+}
+
+/// The prune zone: the daemon's configured zone by default; an explicit
+/// `--time-zone` must equal it when the file is valid; required otherwise.
+fn resolve_prune_zone(explicit: Option<&str>) -> Result<IanaTimeZone, String> {
+    let explicit = explicit.map(parse_time_zone).transpose()?;
+    match (configured_zone(), explicit) {
+        (Some(configured), Some(given)) if configured != given => Err(format!(
+            "--time-zone {} differs from shared-budget.json's time_zone {}; the current month \
+             must be computed in the zone the daemon uses",
+            given.as_str(),
+            configured.as_str()
+        )),
+        (Some(configured), _) => Ok(configured),
+        (None, Some(given)) => Ok(given),
+        (None, None) => {
+            Err("--time-zone is required (no valid shared-budget.json to take it from)".to_string())
+        }
+    }
+}
+
+fn utc_zone() -> IanaTimeZone {
+    IanaTimeZone::new("UTC").expect("UTC is in the bundled tz database")
 }
 
 fn empty_report(keep_months: u32, dry_run: bool) -> libra_governor_ledger::PruneReport {
@@ -386,6 +445,11 @@ fn default_out_path(period: &str, raw_ids: bool) -> Result<PathBuf, String> {
         .mode(0o700)
         .create(&dir)
         .map_err(|e| format!("could not create exports directory: {e}"))?;
+    let meta = std::fs::symlink_metadata(&dir)
+        .map_err(|e| format!("could not inspect exports directory: {e}"))?;
+    if !meta.file_type().is_dir() {
+        return Err("the exports path is not a real directory (symlink?); refusing".to_string());
+    }
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
         .map_err(|e| format!("could not secure exports directory: {e}"))?;
     let suffix = if raw_ids { "-raw-ids" } else { "" };
@@ -452,9 +516,12 @@ fn run_export(args: &[String]) -> i32 {
     let Some((year, month)) = parse_period(period_raw) else {
         return usage_error("--period must be YYYY-MM");
     };
-    let time_zone = match parse_time_zone(flags.value("time-zone").unwrap_or("UTC")) {
-        Ok(z) => z,
-        Err(e) => return usage_error(&e),
+    let time_zone = match flags.value("time-zone") {
+        Some(name) => match parse_time_zone(name) {
+            Ok(z) => z,
+            Err(e) => return usage_error(&e),
+        },
+        None => configured_zone().unwrap_or_else(utc_zone),
     };
     let redact_ids = !flags.switch("raw-ids");
     let overwrite = flags.switch("overwrite");
@@ -487,7 +554,7 @@ fn run_export(args: &[String]) -> i32 {
         );
         return 1;
     }
-    let store = match LedgerStore::open(&ledger_path) {
+    let store = match LedgerStore::open_read_only(&ledger_path) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("libra-governor shared-budget export: could not open ledger: {e}");
