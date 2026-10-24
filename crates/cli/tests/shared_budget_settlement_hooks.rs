@@ -444,6 +444,43 @@ fn a_stalled_daemon_is_abandoned_within_the_budget_and_never_blocks() {
 }
 
 #[test]
+fn without_a_budget_file_stdin_is_never_read() {
+    // The caller keeps stdin open and never writes: a hook that read it
+    // before checking for the budget file would hang.
+    let state = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    for sub in [["hook", "subagent-stop"], ["hook", "session-end"]] {
+        let mut child = Command::new(bin())
+            .args(sub)
+            .env("LIBRA_GOVERNOR_STATE_DIR", state.path())
+            .env("HOME", home.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() > deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        if status.is_none() {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        assert!(
+            status.is_some_and(|s| s.success()),
+            "{sub:?} blocked on stdin with no budget file"
+        );
+    }
+}
+
+#[test]
 fn oversize_or_non_utf8_stdin_is_ignored_silently_and_quickly() {
     let valid = |pad: &str| {
         format!(
