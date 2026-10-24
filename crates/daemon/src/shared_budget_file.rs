@@ -30,7 +30,10 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use std::collections::BTreeMap;
+
 use libra_governor_domain::IanaTimeZone;
+use libra_governor_gateway::pricing::{ModelPricing, PricingTable};
 
 /// File name under the daemon state directory.
 pub const SHARED_BUDGET_FILE_NAME: &str = "shared-budget.json";
@@ -60,6 +63,104 @@ struct RawFile {
     turn_hold_usd_cents: Option<i64>,
     soft_limits: Option<RawSoftLimits>,
     subagent_unmeasured_charge_usd_cents: Option<i64>,
+    pricing_overrides: Option<BTreeMap<String, RawModelPricing>>,
+}
+
+/// One model's USD-per-million-token prices, the same four tiers as the
+/// gateway's `ModelPricing`. All four are required: a half-specified price
+/// would silently price a tier at zero.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawModelPricing {
+    input_usd_per_mtok: f64,
+    cache_creation_input_usd_per_mtok: f64,
+    cache_read_input_usd_per_mtok: f64,
+    output_usd_per_mtok: f64,
+}
+
+/// Most overrides a file may carry, and the longest model id: the file is
+/// operator-written and tiny, and both are sanity bounds, not limits that
+/// matter in practice.
+const MAX_PRICING_OVERRIDES: usize = 64;
+const MAX_MODEL_ID_LEN: usize = 128;
+/// No real price approaches this; it only stops an obviously mistyped unit.
+const MAX_USD_PER_MTOK: f64 = 100_000.0;
+
+/// Validated operator corrections to the pinned pricing table
+/// (`pricing_overrides`, HORO-2196). Every price is finite, non-negative
+/// and bounded, which is what makes the `Eq` below sound.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PricingOverrides(BTreeMap<String, ModelPricing>);
+
+impl Eq for PricingOverrides {}
+
+impl PricingOverrides {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The pinned table with these overrides applied on top.
+    pub fn table(&self) -> PricingTable {
+        if self.0.is_empty() {
+            PricingTable::pinned()
+        } else {
+            PricingTable::with_overrides(self.0.clone())
+        }
+    }
+}
+
+fn price(name: &str, model: &str, value: f64) -> Result<f64, String> {
+    if value.is_finite() && (0.0..=MAX_USD_PER_MTOK).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "pricing_overrides[{model:?}].{name} must be a finite number between 0 and {MAX_USD_PER_MTOK}"
+        ))
+    }
+}
+
+fn parse_overrides(
+    raw: Option<BTreeMap<String, RawModelPricing>>,
+) -> Result<PricingOverrides, String> {
+    let Some(raw) = raw else {
+        return Ok(PricingOverrides::default());
+    };
+    if raw.len() > MAX_PRICING_OVERRIDES {
+        return Err(format!(
+            "pricing_overrides has {} entries; at most {MAX_PRICING_OVERRIDES} are accepted",
+            raw.len()
+        ));
+    }
+    let mut out = BTreeMap::new();
+    for (model, p) in raw {
+        if model.trim().is_empty() || model.len() > MAX_MODEL_ID_LEN {
+            return Err(format!(
+                "pricing_overrides model ids must be 1-{MAX_MODEL_ID_LEN} characters"
+            ));
+        }
+        out.insert(
+            model.clone(),
+            ModelPricing {
+                input_usd_per_mtok: price("input_usd_per_mtok", &model, p.input_usd_per_mtok)?,
+                cache_creation_input_usd_per_mtok: price(
+                    "cache_creation_input_usd_per_mtok",
+                    &model,
+                    p.cache_creation_input_usd_per_mtok,
+                )?,
+                cache_read_input_usd_per_mtok: price(
+                    "cache_read_input_usd_per_mtok",
+                    &model,
+                    p.cache_read_input_usd_per_mtok,
+                )?,
+                output_usd_per_mtok: price("output_usd_per_mtok", &model, p.output_usd_per_mtok)?,
+            },
+        );
+    }
+    Ok(PricingOverrides(out))
 }
 
 /// Warn-only thresholds. They never mint capacity and never deny.
@@ -77,6 +178,9 @@ pub struct SharedBudgetConfig {
     pub turn_hold_usd_cents: u64,
     pub soft_limits: SoftLimits,
     pub subagent_unmeasured_charge_usd_cents: Option<u64>,
+    /// Operator corrections to the pinned pricing table; empty means the
+    /// pinned table is used as is.
+    pub pricing_overrides: PricingOverrides,
 }
 
 /// What the shared-budget file said when it was read.
@@ -156,12 +260,14 @@ fn parse_inner(bytes: &[u8]) -> Result<SharedBudgetConfig, String> {
         "subagent_unmeasured_charge_usd_cents",
         raw.subagent_unmeasured_charge_usd_cents,
     )?;
+    let pricing_overrides = parse_overrides(raw.pricing_overrides)?;
     Ok(SharedBudgetConfig {
         monthly_cap_usd_cents: cap,
         time_zone,
         turn_hold_usd_cents: turn_hold,
         soft_limits,
         subagent_unmeasured_charge_usd_cents,
+        pricing_overrides,
     })
 }
 
@@ -521,5 +627,99 @@ mod tests {
             "a loose mode is noted, never refused"
         );
         assert!(loose.permissions_note().unwrap().contains("0600"));
+    }
+    const FLAT_PRICE: &str = r#"{"input_usd_per_mtok":2.0,"cache_creation_input_usd_per_mtok":2.5,
+        "cache_read_input_usd_per_mtok":0.2,"output_usd_per_mtok":10.0}"#;
+
+    fn with_overrides(body: &str) -> String {
+        format!(
+            r#"{{"schema_version":1,"monthly_cap_usd_cents":10000,"time_zone":"UTC",
+            "pricing_overrides":{body}}}"#
+        )
+    }
+
+    #[test]
+    fn pricing_overrides_are_optional_and_default_to_the_pinned_table() {
+        let SharedBudgetFileState::Valid(c) = parse(GOOD.as_bytes()) else {
+            panic!("GOOD is valid");
+        };
+        assert!(c.pricing_overrides.is_empty());
+        assert!(c
+            .pricing_overrides
+            .table()
+            .lookup("claude-sonnet-4-5")
+            .is_some());
+        assert_eq!(c.pricing_overrides.table().override_count(), 0);
+    }
+
+    #[test]
+    fn valid_pricing_overrides_extend_and_replace_the_pinned_table() {
+        let json = with_overrides(&format!(
+            r#"{{"new-model-1":{FLAT_PRICE},"claude-sonnet-4-5":{FLAT_PRICE}}}"#
+        ));
+        let SharedBudgetFileState::Valid(c) = parse(json.as_bytes()) else {
+            panic!("expected valid");
+        };
+        assert_eq!(c.pricing_overrides.len(), 2);
+        let table = c.pricing_overrides.table();
+        assert_eq!(
+            table.lookup("new-model-1").unwrap().output_usd_per_mtok,
+            10.0
+        );
+        assert_eq!(
+            table
+                .lookup("claude-sonnet-4-5")
+                .unwrap()
+                .input_usd_per_mtok,
+            2.0
+        );
+    }
+
+    #[test]
+    fn invalid_pricing_overrides_make_the_whole_file_invalid() {
+        let too_many = {
+            let entries: Vec<String> = (0..65).map(|i| format!(r#""m{i}":{FLAT_PRICE}"#)).collect();
+            with_overrides(&format!("{{{}}}", entries.join(",")))
+        };
+        let cases = [
+            (
+                with_overrides(
+                    r#"{"m":{"input_usd_per_mtok":-1.0,"cache_creation_input_usd_per_mtok":1.0,
+                    "cache_read_input_usd_per_mtok":1.0,"output_usd_per_mtok":1.0}}"#,
+                ),
+                "input_usd_per_mtok must be a finite number",
+            ),
+            (
+                with_overrides(
+                    r#"{"m":{"input_usd_per_mtok":1.0,"cache_creation_input_usd_per_mtok":1.0,
+                    "cache_read_input_usd_per_mtok":1.0,"output_usd_per_mtok":1e12}}"#,
+                ),
+                "output_usd_per_mtok must be a finite number",
+            ),
+            (
+                with_overrides(r#"{"m":{"input_usd_per_mtok":1.0}}"#),
+                "missing field",
+            ),
+            (
+                with_overrides(
+                    r#"{"m":{"input_usd_per_mtok":1.0,"cache_creation_input_usd_per_mtok":1.0,
+                    "cache_read_input_usd_per_mtok":1.0,"output_usd_per_mtok":1.0,"bogus":1}}"#,
+                ),
+                "unknown field",
+            ),
+            (
+                with_overrides(&format!(r#"{{"  ":{FLAT_PRICE}}}"#)),
+                "model ids must be",
+            ),
+            (with_overrides("[]"), "invalid JSON"),
+            (too_many, "at most 64"),
+        ];
+        for (json, needle) in cases {
+            let reason = match parse(json.as_bytes()) {
+                SharedBudgetFileState::Invalid(r) => r,
+                other => panic!("{json}: expected invalid, got {other:?}"),
+            };
+            assert!(reason.contains(needle), "{needle}: {reason}");
+        }
     }
 }
