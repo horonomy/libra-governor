@@ -15,11 +15,16 @@ Slice S2 delivers this record and `calendar_month_bounds`; later slices wire it.
 `Request::SharedBudget` (`Admit`, `Check`, `ChargeAgent`, `Status`),
 admission against the locally configured cap, month rollover, the failure
 rows `config_invalid` and `clock_anomaly`, and the tool-event heartbeat.
-The daemon re-reads the file on every decision (see *Daemon behaviour delivered in S4*). `PROTOCOL_VERSION` is 21 (HORO-2196). Everything else below is **design intent
-implemented in later slices** (S5 settlement from transcripts, S6 hooks and
-the daemon-unreachable behaviour, S7 installer, S8 doctor/status, S11
-gateway `governor_held`); it must not be read as shipped behaviour. No real
-Claude Code host has exercised any of it: S4's evidence is `TestOwnedLive`.
+The daemon re-reads the file on every decision (see *Daemon behaviour delivered in S4*).
+**S5 (HORO-2196, HORO-2190) delivers settlement**: the turn hold is settled
+at `Stop` from priced, session-bound transcript usage, and a subagent's
+transcript is charged by `ChargeAgentTranscript` (see *Settlement delivered
+in S5*). `PROTOCOL_VERSION` is 21. Everything else below is **design intent
+implemented in later slices** (S6 hooks and the daemon-unreachable
+behaviour, S7 installer, S8 doctor/status, S11 gateway `governor_held`); it
+must not be read as shipped behaviour. No real Claude Code host has
+exercised any of it: S4's and S5's evidence is `TestOwnedLive`, and S5's
+transcripts are synthetic.
 
 ## Context
 
@@ -91,7 +96,8 @@ The unit is **Libra-accounted, list-price-equivalent USD at the pinned
 upstream guarantee.
 
 Unpriced model, by path: hooks-only settlement uses the hold amount with
-`usage_known=false`, surfaced in `doctor` (design intent, S5/S8). The
+`usage_known=false` (delivered in S5) and names the model in `Status`
+`unpriced_models`; the `doctor` presentation is S8. The
 gateway's USD budget path instead refuses with `403 unpriced_model`
 (`crates/gateway/src/pricing.rs` module docs; `Decision::UnpricedModel` in
 `crates/gateway/src/proxy.rs`).
@@ -145,7 +151,7 @@ Captures from the real host binary against a fake upstream are
 | File present but invalid (parse, timezone, cap, version) | Deny `config_invalid` |
 | Clock anomaly: newest pool period is later than now's period | Deny `clock_anomaly` |
 | Daemon unreachable, file present | Deny at prompt admission; allow and log at PreToolUse |
-| Unpriced model | Settle at hold amount, `usage_known=false`, shown in `doctor` |
+| Unpriced model | Settle at hold amount, `usage_known=false`, named in `Status.unpriced_models` (S5; `doctor` is S8) |
 
 ### Daemon behaviour delivered in S4 (HORO-2195)
 
@@ -181,13 +187,118 @@ returned with `event_time_clamped: true`, because the spend already happened;
 only years outside 2000-2200 are refused. One charge above ten times the
 monthly cap, or one that would push a pool total past a safe range, is refused
 (`amount_too_large`). Against an invalid file a charge records nothing and
-answers `config_invalid`; the S5 caller must retry or spool it.
+answers `config_invalid`; the caller (hook runtime, S6) must retry or spool it.
 
 **Heartbeat and over-reservation.** A tool event renews the session's active
 holds in the current period's pool (it carries no agent id, so the lane cannot
-be preferred). Until S5 settles holds at Stop, a hold clears only by expiry
-and renewal, so a finished or subagent hold can stay reserved while tool
-events continue. This over-reserves; it never under-reserves.
+be preferred). Since S5 the main-executor hold clears at `Stop`; a subagent
+lane's hold (admitted with an `agent_id`) and any hold whose `Stop` never
+arrives or was refused (transcript mismatch) still clear only by expiry and
+renewal, so such a hold can stay reserved while tool events continue. This
+over-reserves; it never under-reserves.
+
+### Settlement delivered in S5 (HORO-2196, HORO-2190)
+
+**What is measured.** A session's `Stop` (`Request::Finalize`, when a
+shared-budget file is in force; with none the path is not consulted and
+`Finalize` is unchanged) settles the lane's `(session, agent_absent)` turn
+hold exactly once, with `charge_source = turn_hold`. The actual is the
+transcript window's usage priced in **USD cents**: every assistant record's
+`model` and all four token tiers (input, output, cache-creation,
+cache-read; `fresh_tokens()` remains the token-budget rule only), priced
+from the gateway `PricingTable` plus the file's optional `pricing_overrides`
+(an addition to the S4 file, `schema_version` stays 1; all four prices per
+model, finite, 0-100000 USD/Mtok, at most 64 models). Rounding: summed
+exactly in integer pico-dollars and rounded **up** to a whole cent **once
+per Stop window** (never per record), so the error is below one cent per
+window and never downward. The actual may exceed the hold: the overrun is
+recorded unclamped and later `Admit`s are refused while `remaining < hold`.
+Dedup by `message.id` (HORO-1882) is unchanged; an assistant record with
+all-zero usage is free whatever its model.
+
+**What is not counted.** Records flagged sidechain are excluded from the
+parent window (they belong to the subagent charge). A `usage` object on a
+tool-result line (the Agent tool's `tool_response.usage`) is never read.
+Nothing is measured from the gateway, a provider bill or an inferred
+source. Known pricing limitations above still apply.
+
+**Session binding (HORO-2190).** Before any window is charged every usage
+record in it must carry the transcript's native per-line session field,
+equal to the hook's `session_id`; path, cwd and timestamps are never used to
+infer ownership.
+
+| Window | Result |
+|---|---|
+| all records present and equal | charged |
+| any record present and **different** (session B's hook given A's file) | charge **nothing**, hold left to its TTL, `transcript_binding_mismatches++` (the spend is counted by its true session's own Stop) |
+| otherwise any record missing/unreadable field | settle the hold at the **hold amount**, `usage_known=false`, `transcript_unverified++` |
+
+One foreign record makes the whole window a mismatch; a window is never
+charged partially.
+
+**Evidence status of the field names: UNCONFIRMED.** The field names live in
+two constants (`TRANSCRIPT_SESSION_FIELD = "sessionId"`,
+`TRANSCRIPT_SIDECHAIN_FIELD = "isSidechain"`, `usage/priced.rs`). This
+repository holds no transcript fixture, characterization document or test
+that evidences them (the Claude Code hook payload's `session_id` is not a
+transcript line); they are the names the public Claude Code JSONL format is
+understood to use, mirrored by synthetic fixtures. Real-host confirmation is
+a later step. A wrong session name fails safe (every window unverifiable,
+settled at the hold amount); a wrong sidechain name would let a parent window
+include subagent records, so the subagent charge must not be relied on until
+it is confirmed.
+
+**Window watermark (no migration).** A window is every record **strictly
+after** the lane's watermark: the latest `settled_at` of the lane's settled
+holds, or the oldest hold's `created_at` when none has settled. It is derived
+from existing ledger rows and advances only when a hold settles, so two
+consecutive Stops never count a record twice, and a **crashed turn** (no
+Stop) is measured by the next Stop (its hold expired unsettled; the
+watermark did not move) while the abandoned hold is reclaimed by the
+existing TTL sweep. A late `Stop` after the hold expired still settles in
+the hold's own row and period.
+
+**Settled at the hold amount, `usage_known=false`, never zero:** no
+transcript path; missing, unreadable, truncated-below-the-watermark or
+rotated transcript (no usage after the watermark); a window over the 32 MiB
+scan cap; a usage record with no timestamp; an unpriced model (named in
+`unpriced_models`); an unverifiable session field; and an invalid
+configuration file at `Stop` (settles the hold in its own pool; overrides
+from an untrusted file are not used). With no hold nothing is written.
+
+**Known limits.** Claude Code writes its transcript asynchronously: a record
+stamped before a `Stop` but flushed after it falls behind the watermark and
+is not counted (the window settled measured-short or at the hold amount).
+`Finalize` carries no idempotency key: a retry before the next `Admit` is a
+no-op, but a duplicate delivered after the next `Admit` would settle the
+new hold, so the S6 hook must not resend. Status telemetry (counters,
+`unpriced_models`) is process memory and restarts at zero; the ledger's
+`usage_known` flag is the durable record.
+
+**Subagent charge.** `ChargeAgentTranscript { session_id, agent_id,
+agent_transcript_path }` makes the daemon read the subagent's own file
+(32 MiB cap, same binding rule, all records counted) and book only
+`cumulative - already charged` with source `subagent_transcript`, executor
+`agent` (or `unattributed` when no `agent_id`: no id is ever invented, and
+each unattributed transcript path is its own family). "Already charged" is
+the sum of every row under the `(session, agent-or-path)` key prefix across
+periods, so a repeated `SubagentStop` books nothing and a larger file books
+the difference; charges are never refunded. Parent windows exclude
+sidechain records, so parent + subagent never double count (pinned by a
+fixture test asserting the pool total equals the sum of executors).
+
+*Unmeasured subagent fallback* (missing/unreadable/relative path, over the
+cap, empty, unpriced model, unverifiable session): never silently omitted;
+`subagent_unmeasured_charge_usd_cents` (else `turn_hold_usd_cents`) is
+charged **once per family** with `usage_known=false` and counted in
+`unmeasured_charges`. It counts toward already-charged, so a later
+measurement books only the excess. A transcript naming another session is
+refused (`transcript_session_mismatch`) and charges nothing, not even the
+fallback.
+
+**Not done in S5:** no hook runtime or installer (S6/S7), no `doctor`/status
+CLI (S8), no real host evidence, no gateway path (S11). `Finalize` itself
+returns nothing about the settlement; it is observable through `Status`.
 
 ### Egress inventory
 
