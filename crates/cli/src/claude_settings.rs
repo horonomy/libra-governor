@@ -775,6 +775,18 @@ pub fn inspect(path: &Path) -> Inspection {
     }
 }
 
+/// Whether the `env` block of `path` has a key named `key`. Presence only:
+/// the value is never read out of this function, so a doctor report cannot
+/// leak it. A missing or unparsable file has no keys.
+pub fn env_key_present(path: &Path, key: &str) -> bool {
+    let Ok((Some(root), _)) = read_object(path) else {
+        return false;
+    };
+    root.get("env")
+        .and_then(Value::as_object)
+        .is_some_and(|env| env.contains_key(key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1449,6 +1461,18 @@ mod tests {
             inspect(&path).shared_budget_hooks_wired,
             [false, false, false]
         );
+    }
+
+    #[test]
+    fn env_key_presence_never_depends_on_or_exposes_the_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        assert!(!env_key_present(&path, "K"), "missing file");
+        std::fs::write(&path, br#"{"env":{"K":"anything","OTHER":"x"}}"#).unwrap();
+        assert!(env_key_present(&path, "K"));
+        assert!(!env_key_present(&path, "ABSENT"));
+        std::fs::write(&path, b"not json").unwrap();
+        assert!(!env_key_present(&path, "K"), "unparsable file");
     }
 
     #[test]
