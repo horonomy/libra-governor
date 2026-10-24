@@ -718,20 +718,26 @@ pub fn inspect(path: &Path) -> Inspection {
             .and_then(|hooks| hooks.get(event))
             .and_then(Value::as_array)
             .map(|entries| {
-                entries.iter().any(|matcher| {
-                    matcher
-                        .get("hooks")
-                        .and_then(Value::as_array)
-                        .map(|inner| {
-                            inner.iter().any(|h| {
-                                h.get("command")
-                                    .and_then(Value::as_str)
-                                    .map(command_is_ours)
-                                    .unwrap_or(false)
+                // Only a group that applies to every tool counts: our command
+                // under a user's `matcher: "Bash"` group fires for Bash only
+                // (the same rule `apply` uses to decide it is installed).
+                entries
+                    .iter()
+                    .filter(|g| matcher_is_all_tools(g))
+                    .any(|matcher| {
+                        matcher
+                            .get("hooks")
+                            .and_then(Value::as_array)
+                            .map(|inner| {
+                                inner.iter().any(|h| {
+                                    h.get("command")
+                                        .and_then(Value::as_str)
+                                        .map(command_is_ours)
+                                        .unwrap_or(false)
+                                })
                             })
-                        })
-                        .unwrap_or(false)
-                })
+                            .unwrap_or(false)
+                    })
             })
             .unwrap_or(false)
     };
@@ -1443,6 +1449,35 @@ mod tests {
             inspect(&path).shared_budget_hooks_wired,
             [false, false, false]
         );
+    }
+
+    #[test]
+    fn our_command_under_a_foreign_matcher_group_is_not_reported_wired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let ours = |sub: &str| format!("/opt/libra/bin/libra-governor {sub}");
+        let group = |matcher: Option<&str>, command: String| {
+            let mut g = serde_json::json!({ "hooks": [{ "type": "command", "command": command }] });
+            if let Some(m) = matcher {
+                g["matcher"] = serde_json::json!(m);
+            }
+            g
+        };
+        let hooks = serde_json::json!({
+            "PreToolUse": [group(Some("Bash"), ours("hook pre-tool-use"))],
+            "PostToolUse": [group(Some("Edit|Write"), ours("hook post-tool-use"))],
+            "SubagentStop": [group(Some("*"), ours("hook subagent-stop"))],
+            "SessionEnd": [group(Some(""), ours("hook session-end"))],
+            "Stop": [group(None, ours("hook stop"))],
+        });
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({ "hooks": hooks })).unwrap(),
+        )
+        .unwrap();
+        let inspection = inspect(&path);
+        assert_eq!(inspection.shared_budget_hooks_wired, [false, true, true]);
+        assert_eq!(inspection.hooks_wired, [false, false, true]);
     }
 
     #[test]
