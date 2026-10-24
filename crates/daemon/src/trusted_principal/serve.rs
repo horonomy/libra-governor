@@ -244,6 +244,8 @@ mod tests {
     #[test]
     fn strip_agent_named_paths_blanks_preflight_cwd() {
         let mut request = Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the bug".to_string(),
             cwd: PathBuf::from("/home/agent/project"),
             session_id: "s1".to_string(),
@@ -258,6 +260,7 @@ mod tests {
     #[test]
     fn strip_agent_named_paths_blanks_finalize_transcript_path() {
         let mut request = Request::Finalize {
+            agent_id: None,
             session_id: "s1".to_string(),
             model: None,
             provider: None,
@@ -279,6 +282,8 @@ mod tests {
         assert_eq!(request, Request::Status);
 
         let mut request = Request::ToolInvoked {
+            agent_id: None,
+            provider: None,
             session_id: "s1".to_string(),
             tool_name: "bash".to_string(),
         };

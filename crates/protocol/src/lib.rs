@@ -260,10 +260,21 @@ pub use messages::{
 /// decoder cannot parse the new variants, so a long-lived v20 daemon must
 /// be restarted after upgrading.
 ///
-/// v22 (HORO-2246): `SharedBudgetRequest` gained `TranscriptReady` (a
+/// v22 (HORO-2197): legacy-route executor attribution. `Preflight` and
+/// `ToolInvoked` gained optional `agent_id` and `provider`, and `Finalize`
+/// gained an optional `agent_id`, so a subagent's tool call (which carries
+/// its parent's `session_id`) is booked to its own `(session, agent)` lane
+/// instead of the parent's. The fields are omitted from the wire when
+/// absent, so a v22 client's main-executor traffic is byte-identical to
+/// v21. They are a bump rather than a silent addition because a v21
+/// daemon's `deny_unknown_fields` decoder rejects them outright and, worse,
+/// would otherwise keep mis-attributing: a long-lived v21 daemon must be
+/// restarted after upgrading.
+///
+/// v23 (HORO-2246): `SharedBudgetRequest` gained `TranscriptReady` (a
 /// read-only "is this turn's transcript flushed yet?" probe the `Stop` hook
 /// polls before it sends `Finalize`) and `SharedBudgetOutcome` gained
-/// `TranscriptReadiness`. A v21 peer's decoder cannot parse either, so a
-/// long-lived v21 daemon must be restarted after upgrading; until then the
+/// `TranscriptReadiness`. A v22 peer's decoder cannot parse either, so a
+/// long-lived v22 daemon must be restarted after upgrading; until then the
 /// hook's probe fails and `Stop` proceeds without waiting.
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 23;

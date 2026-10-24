@@ -58,6 +58,8 @@ fn stored_lifetime_bounded_after_one_preflight(scope: LifetimeScope) -> i64 {
     let request = RequestEnvelope {
         protocol_version: PROTOCOL_VERSION,
         request: Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug".to_string(),
             cwd: fixture_repo(),
             session_id: "lifetime-scope-wiring".to_string(),
@@ -136,6 +138,8 @@ fn second_preflight_admission(
         let request = RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
             request: Request::Preflight {
+                agent_id: None,
+                provider: None,
                 task_hint: "fix the login bug".to_string(),
                 cwd: fixture_repo(),
                 session_id: "lifetime-scope-spend".to_string(),

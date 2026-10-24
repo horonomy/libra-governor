@@ -19,8 +19,8 @@ The daemon re-reads the file on every decision (see *Daemon behaviour delivered 
 **S5 (HORO-2196, HORO-2190) delivers settlement**: the turn hold is settled
 at `Stop` from priced, session-bound transcript usage, and a subagent's
 transcript is charged by `ChargeAgentTranscript` (see *Settlement delivered
-in S5*). `PROTOCOL_VERSION` is 22 (v22 is HORO-2246's `TranscriptReady`
-probe). The S6 Claude Code hook gate and the S10
+in S5*). `PROTOCOL_VERSION` was 21 at S5, is 22 since HORO-2197 and is 23 since
+HORO-2246 (the `TranscriptReady` probe). The S6 Claude Code hook gate and the S10
 retention/export commands landed on `main` separately and are recorded in
 their own commits and in *Retention and export* below.
 **S7 (HORO-2216) delivers the installer and the settlement hooks**:
@@ -512,14 +512,16 @@ to the flat hold (26 `transcript_unreadable`, 10 `no_usage_in_window`; $360.04
 settled); after it **0 of 36** did ($0.44). Post-fix, the hook's own wait until
 the daemon first reported the turn readable was min 8 ms, median 74 ms, p90 82
 ms, max 99 ms over 34 waits (it includes up to 25 ms of poll granularity),
-which is the added `Stop`-hook wall time; none gave up at the cap. The fake upstream answers instantly and the runs are
+which is the added `Stop`-hook wall time; none gave up at the cap. A further
+16 turns run with every core busy waited p50 74 ms, p90 84 ms, max 89 ms, all
+measured. The fake upstream answers instantly and the runs are
 `-p`, not an interactive TTY; neither is evidence for real latency or
 interactive flush timing.
 
 **Design: a bounded wait on the hook side, decided by the daemon.**
 `hook stop` (Claude Code only, and only when `shared-budget.json` exists)
 polls a new read-only request, `SharedBudgetRequest::TranscriptReady`
-(protocol v22), before it sends the unchanged `Finalize`:
+(protocol v23), before it sends the unchanged `Finalize`:
 
 - *The daemon defines "ready".* It reuses the settlement's own lane lookup
   and windowed, session-bound reader, so the hook never opens a transcript
@@ -566,7 +568,7 @@ interactive host shows lags beyond the cap.
   `ready` and settles on what is there; the remaining lines are counted by the
   next `Stop`, not lost.
 - Interactive (TTY) flush timing, `/compact` summarizers and a daemon older
-  than protocol v22 (probe fails, no wait) are unmeasured or unwaited.
+  than protocol v23 (probe fails, no wait) are unmeasured or unwaited.
 
 **Operator implication: `turn_hold_usd_cents`.** The default of 1000 ($10) is
 the price of every residual fallback above and, on a host that does not flush
@@ -741,6 +743,16 @@ delivery exists; that remains the separate, versioned workstream above.
   instead of a hard-cap claim.
 - Overshoot beyond the hold is possible in hooks-only mode and is accepted
   until S11.
+- HORO-2197 attributes the *legacy* per-session counters (tool calls, streak,
+  task binding) to the `(session, agent)` executor, so a subagent no longer
+  inflates its parent's. It deliberately leaves this budget's holds,
+  heartbeat and settlement keyed by the host's real `session_id`: that route
+  already carries `(session, agent | none)` with `agent_absent | agent |
+  unattributed` executor kinds. See `docs/execution-owner-contract.md`, which also records the mixed-version
+  behaviour (v21 CLI -> v22 daemon fails open; v22 CLI -> v21 daemon loses the
+  first `ToolInvoked`), the estimator-history effect (pre-change receipts
+  counted subagent calls into the parent; later ones do not) and the
+  unreclaimed derived-lane counter rows.
 - Tests of the month window pin tzdb behaviour (Asuncion 2023-10 gap, Havana
   2026-11 fold); a jiff bump that changes those rules must update them
   deliberately.

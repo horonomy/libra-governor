@@ -23,3 +23,16 @@ cache keys, display ids, correlation) and `crates/cli/src/agent/identity_conform
    README and the `PINNED_SHA256` constants in both runners.
 4. Run both runners. A failing vector is a Libra defect to fix (or, if the
    contract changed, a documented follow-up); never weaken a vector.
+
+## Known deviation
+
+One normalizer vector is a documented, tested deviation rather than a match:
+`claude-not-a-mapping` (payload `["s-1"]`). The reference emits an envelope
+with every identity field absent; Libra refuses the whole hook event, because a
+non-object names no field and derived struct decoders would otherwise read the
+array positionally (`["s-1"]` becoming session `s-1`). The vector's actual
+guarantee, that no session is ever attributed from a non-mapping, holds and is
+asserted for every entry point (`JUSTIFIED_DEVIATIONS` in
+`crates/cli/src/agent/identity_conformance.rs`). The other nine normalizer
+vectors match exactly; since HORO-2197 that includes `claude-no-session`,
+`claude-non-string-session` and `codex-heuristics-only`.

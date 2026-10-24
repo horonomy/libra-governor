@@ -151,6 +151,83 @@ reserved internal `execution-owner-v1:` namespace. Owner queries never select
 legacy rows, and an existing flat record colliding with that namespace makes
 initial association ambiguous. No session/agent/turn is backfilled.
 
+## Legacy hook route: per-executor attribution (HORO-2197)
+
+This is not the owner route above; it records what the legacy
+`Preflight`/`ToolInvoked`/`Finalize` route (the one `hook user-prompt-submit`,
+`post-tool-use` and `stop` use, and the source of the per-session tool-call
+counters `status` reads) does with the executor identity, since the owner route
+stays default-off for Codex and absent for Claude Code.
+
+A subagent's tool call carries its **parent's** `session_id` plus an
+`agent_id`. Until HORO-2197 that route keyed its task binding, tool-call
+counter, same-tool streak, replan hysteresis and shadow decisions on
+`session_id` alone, so subagent activity was booked to the parent. Now:
+
+- IPC protocol is **22**. `Preflight` and `ToolInvoked` gained optional
+  `agent_id` and `provider`; `Finalize` gained optional `agent_id`. Absent
+  fields are omitted on the wire, so a main-executor request is byte-identical
+  to protocol 21. The bump (rather than a silent addition) is because a v21
+  daemon's strict decoder rejects the fields and would otherwise keep
+  mis-attributing; a running older daemon self-restarts onto the new binary.
+- The daemon derives the ledger key (`crates/daemon/src/legacy_executor.rs`):
+  no `agent_id` is the session's main executor (`agent_absent`) and keeps the
+  raw `session_id` key, so old clients and existing rows are unchanged; a
+  non-blank `agent_id` is its own `(provider, session, agent)` lane; a **blank**
+  `agent_id` is *present but unnameable* and gets the session's single
+  `unattributed` lane. A missing agent never means root, and a blank one never
+  means missing. Derived keys live under the reserved prefix
+  `legacy-executor-v1:`, which a client may not use as its own `session_id`.
+- A subagent's `Preflight` creates its own task, its `ToolInvoked` its own
+  counter, its `Finalize` its own receipt. Its calls no longer extend the
+  parent's counter, streak or replan evidence, and the parent's receipt counts
+  only its own calls. A subagent whose prompt hook did not carry an
+  `agent_id` has no bound task, so its calls are counted but drive no replan.
+- `Finalize` closes the lane `Preflight` bound for the turn. `Stop` is the
+  main thread's hook, and a host may still forward an `agent_id` on it, or on
+  the tool calls but not the prompt. A derived lane that never had a preflight
+  has no task, so a `Finalize` naming one falls back to the session's own
+  lane; a derived lane that does have an active task (a prompt that carried
+  the same `agent_id`, i.e. a main thread run as an agent) is kept. The
+  fallback is one-way: a `Finalize` with no agent does not search the session's
+  agent lanes. Claude Code is not observed to end a subagent with `Stop`
+  (subagents end via `SubagentStop`); nothing here assumes a `Stop` naming an
+  agent is that agent's own turn ending.
+- Not re-keyed, on purpose: the shared-budget heartbeat and `Stop`
+  settlement still use the host's real `session_id` (the shared budget has its
+  own `(session, agent)` handling and settles subagents from `SubagentStop`),
+  and extensions are told the real session, never a derived key.
+- A hook payload with no usable session (absent, blank or whitespace-only,
+  not a string) is decoded as such, never coerced, and the **hook CLI** skips
+  it: no request, no counter, no shared "empty" lane. This is hook-side
+  behaviour only; the daemon wire still accepts a blank `session_id` from a
+  direct client (it is not refused there). Before this, a whitespace-only
+  session from a hook was a valid shared lane; it is now skipped. A reserved
+  `legacy-executor-v1:` session fails open in the hook without taking a
+  shared-budget `Admit` hold.
+
+### Compatibility, history and residuals
+
+- Mixed versions: a v21 CLI against a v22 daemon fails open (its requests are
+  version-mismatched, so governance is silently off for those hooks until the
+  CLI is upgraded). A v22 CLI against a still-running v21 daemon: the old
+  daemon errors and is replaced; the first `ToolInvoked` after the upgrade
+  (fire-and-forget, never spawns) can be lost.
+- Estimator history: receipts written before this change counted a
+  session's subagent tool calls into the parent's `tool_call_count`; receipts
+  written after count the parent's own calls only. The estimator's
+  tool-call-count history therefore mixes inflated and parent-only samples.
+  This is not corrected retroactively; it biases typical-count thresholds
+  (and so replan sensitivity) slightly for a while after upgrade.
+- Residual: `tool_call_counts` rows for derived lanes are never reclaimed
+  (the main lane's rows have the same property); growth is one small row per
+  subagent per session.
+
+Evidence is local and synthetic (a real hook CLI against a real daemon and its
+ledger, `crates/cli/tests/legacy_executor_attribution.rs`). No real Claude Code
+or Codex subagent has been observed attributing this way, so nothing here
+claims `ProductionObserved`.
+
 ## Migration and cache policy
 
 SQLite schema **15** added `execution_lanes`, `execution_turns`, and

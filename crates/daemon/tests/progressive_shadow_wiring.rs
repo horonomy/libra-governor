@@ -188,6 +188,8 @@ fn cadence_only_shadow_decision_never_mutates_existing_ledger_state() {
         &mut current_task,
         &config,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug".to_string(),
             cwd: fixture_repo(),
             session_id: "shadow-session".to_string(),
@@ -215,6 +217,8 @@ fn cadence_only_shadow_decision_never_mutates_existing_ledger_state() {
         &mut current_task,
         &config,
         Request::ToolInvoked {
+            agent_id: None,
+            provider: None,
             session_id: "shadow-session".to_string(),
             tool_name: "Read".to_string(),
         },

@@ -130,6 +130,8 @@ fn admission_happy_path_initializes_a_budget_and_reserves_the_work_envelope() {
         &mut current_task,
         &config,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug".to_string(),
             cwd: fixture_repo(),
             session_id: "happy-path-session".to_string(),
@@ -204,6 +206,8 @@ fn admission_deny_writes_no_reservation_and_leaves_the_reserve_untouched() {
         &mut current_task,
         &config,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug".to_string(),
             cwd: fixture_repo(),
             session_id: "deny-session".to_string(),
@@ -282,6 +286,8 @@ fn admission_approval_required_writes_no_reservation() {
         &mut current_task,
         &config,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug".to_string(),
             cwd: fixture_repo(),
             session_id: "approval-session".to_string(),
@@ -323,6 +329,8 @@ fn admission_approval_required_writes_no_reservation() {
         &mut current_task,
         &config,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug, part two".to_string(),
             cwd: fixture_repo(),
             session_id: "approval-session".to_string(),
@@ -414,6 +422,8 @@ fn send_distinct_tool_calls(
             current_task,
             config,
             Request::ToolInvoked {
+                agent_id: None,
+                provider: None,
                 session_id: session_id.to_string(),
                 tool_name: tools[(i as usize) % tools.len()].to_string(),
             },
@@ -439,6 +449,8 @@ fn a_replan_releases_the_old_plans_reservation_and_reserves_the_new_one() {
         &mut current_task,
         &config,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug".to_string(),
             cwd: fixture_repo(),
             session_id: "replan-reserve-session".to_string(),
@@ -515,6 +527,8 @@ fn finalize_settles_active_reservations_and_records_receipt_evidence() {
         &mut current_task,
         &config,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug".to_string(),
             cwd: fixture_repo(),
             session_id: "finalize-session".to_string(),
@@ -535,6 +549,7 @@ fn finalize_settles_active_reservations_and_records_receipt_evidence() {
         &mut current_task,
         &config,
         Request::Finalize {
+            agent_id: None,
             session_id: "finalize-session".to_string(),
             model: None,
             provider: None,
@@ -593,6 +608,8 @@ fn identical_preflights_produce_identical_admission_and_reserve_decisions() {
             &mut current_task,
             &config,
             Request::Preflight {
+                agent_id: None,
+                provider: None,
                 task_hint: "fix the login bug".to_string(),
                 cwd: fixture_repo(),
                 session_id: session_id.to_string(),
@@ -663,6 +680,8 @@ fn a_material_event_replan_does_not_reserve_capacity_for_a_task_denied_at_admiss
         &mut current_task,
         &config,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug".to_string(),
             cwd: fixture_repo(),
             session_id: "denied-replan-session".to_string(),
@@ -700,6 +719,8 @@ fn a_material_event_replan_does_not_reserve_capacity_for_a_task_denied_at_admiss
             &mut current_task,
             &config,
             Request::ToolInvoked {
+                agent_id: None,
+                provider: None,
                 session_id: "denied-replan-session".to_string(),
                 tool_name: "Bash".to_string(),
             },
@@ -787,6 +808,8 @@ fn a_material_event_replan_does_not_reserve_capacity_for_a_task_left_approval_re
         &mut current_task,
         &config,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug".to_string(),
             cwd: fixture_repo(),
             session_id: "approval-replan-session".to_string(),
@@ -828,6 +851,8 @@ fn a_material_event_replan_does_not_reserve_capacity_for_a_task_left_approval_re
         &mut current_task,
         &config,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug, part two".to_string(),
             cwd: fixture_repo(),
             session_id: "approval-replan-session".to_string(),
@@ -866,6 +891,8 @@ fn a_material_event_replan_does_not_reserve_capacity_for_a_task_left_approval_re
             &mut current_task,
             &config,
             Request::ToolInvoked {
+                agent_id: None,
+                provider: None,
                 session_id: "approval-replan-session".to_string(),
                 tool_name: "Bash".to_string(),
             },

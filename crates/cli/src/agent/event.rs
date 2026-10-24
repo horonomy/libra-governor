@@ -11,11 +11,17 @@ use std::path::PathBuf;
 
 /// One normalized hook event, payload-carrying where the daemon needs
 /// data from it.
+///
+/// `session_id` is `None` when the host named no usable session (absent,
+/// blank or not a string). The event is still a faithful reading of the
+/// payload -- its other identity fields are kept -- but nothing may be
+/// keyed on a missing session: every consumer in `run` skips the event
+/// rather than substitute an empty or shared lane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NormalizedEvent {
     /// `UserPromptSubmit`.
     PromptSubmitted {
-        session_id: String,
+        session_id: Option<String>,
         cwd: PathBuf,
         prompt: String,
         /// Codex documents this on turn-scoped hooks; absent where the
@@ -30,13 +36,13 @@ pub enum NormalizedEvent {
     /// `PreToolUse` (HORO-2215): a tool call is about to run. Carries only
     /// the identity the shared-budget check needs.
     ToolRequested {
-        session_id: String,
+        session_id: Option<String>,
         /// Present only inside a subagent; never invented.
         agent_id: Option<String>,
     },
     /// `PostToolUse`.
     ToolCompleted {
-        session_id: String,
+        session_id: Option<String>,
         tool_name: String,
         /// Native call ID where the host exposes one (`tool_use_id`).
         native_call_id: Option<String>,
@@ -45,7 +51,7 @@ pub enum NormalizedEvent {
     },
     /// `Stop`.
     TurnCompleted {
-        session_id: String,
+        session_id: Option<String>,
         model: Option<String>,
         turn_id: Option<String>,
         agent_id: Option<String>,

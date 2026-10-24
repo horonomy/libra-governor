@@ -169,6 +169,8 @@ fn a_preflight_projection_between_original_and_extended_ceiling_flips_from_deny_
         &mut current_task,
         &daemon_config,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "implement the thing".to_string(),
             cwd: fixture_repo(),
             session_id: session_id.clone(),
@@ -217,6 +219,8 @@ fn a_preflight_projection_between_original_and_extended_ceiling_flips_from_deny_
         &mut current_task,
         &daemon_config,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "implement the thing".to_string(),
             cwd: fixture_repo(),
             session_id: session_id.clone(),
@@ -269,6 +273,8 @@ fn a_preflight_projection_between_original_and_extended_ceiling_flips_from_deny_
         &mut current_task,
         &daemon_config,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "implement the thing".to_string(),
             cwd: fixture_repo(),
             session_id,
@@ -313,6 +319,8 @@ fn a_gateway_request_that_only_fits_without_the_reserve_term_is_policy_denied_no
         &mut current_task,
         &daemon_config,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "implement the thing".to_string(),
             cwd: fixture_repo(),
             session_id: session_id.clone(),

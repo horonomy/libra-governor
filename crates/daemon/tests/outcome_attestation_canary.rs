@@ -173,6 +173,8 @@ fn admit_task(
         ledger,
         current_task,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "canary task".to_string(),
             cwd: fixture_repo(),
             session_id: session_id.to_string(),
@@ -201,6 +203,7 @@ fn finalize(
         ledger,
         current_task,
         Request::Finalize {
+            agent_id: None,
             session_id: session_id.to_string(),
             model: None,
             provider: None,

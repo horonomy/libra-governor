@@ -151,6 +151,8 @@ fn deadline_first_confidence_floor_denies_cold_start_but_the_deadline_pressure_s
         &mut current_task,
         &config,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug under a hard release deadline".to_string(),
             cwd: fixture_repo(),
             session_id: "deadline-session".to_string(),
@@ -212,6 +214,8 @@ fn deadline_first_confidence_floor_denies_cold_start_but_the_deadline_pressure_s
         &mut current_task2,
         &config2,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug under a hard release deadline".to_string(),
             cwd: fixture_repo(),
             session_id: "deadline-session-2".to_string(),
@@ -299,6 +303,8 @@ fn concurrent_subagents_near_a_tight_hard_ceiling_through_the_real_ledger_spend_
             &mut current_task,
             &config,
             Request::Preflight {
+                agent_id: None,
+                provider: None,
                 task_hint: "run many concurrent subagents against one shared task".to_string(),
                 cwd: fixture_repo(),
                 session_id: session_id.clone(),
@@ -495,6 +501,8 @@ fn security_evidence_credential_and_prompt_content_never_touch_persisted_state()
         &mut current_task,
         &config,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: format!("fix the login bug — {PRIVACY_NONCE}"),
             cwd: fixture_repo(),
             session_id: "security-session".to_string(),

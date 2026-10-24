@@ -110,13 +110,15 @@ impl Drop for RemoveFileOnDrop {
 /// share an identity (execution-identity contract, "Provider-native id
 /// that is empty or whitespace-only"). Claude Code sends no `turn_id`, so
 /// one found in its payload is not mapped (it is not a turn identity until
-/// the owner decides otherwise); Codex's is. Non-object payloads never reach
-/// here: `normalize` refuses them as malformed (a refusal, not an envelope
-/// with an absent session). Lineage is always `Unknown`.
+/// the owner decides otherwise); Codex's is. A missing session is an
+/// envelope with an absent session (never an empty-string one), so an
+/// agent-only identity cannot be keyed at session or agent scope. Non-object
+/// payloads never reach here: `normalize` refuses them as malformed.
+/// Lineage is always `Unknown`.
 pub fn capture(
     host_id: &str,
     agent: AgentKind,
-    provider_session_id: &str,
+    provider_session_id: Option<&str>,
     agent_id: Option<&str>,
     turn_id: Option<&str>,
     now: OffsetDateTime,
@@ -126,7 +128,7 @@ pub fn capture(
     }
 
     let mut builder = ExecutionIdentityBuilder::new(host_id, agent.as_tool_provider());
-    if let Some(session) = native(provider_session_id) {
+    if let Some(session) = provider_session_id.and_then(native) {
         builder = builder.provider_session_id(session);
     }
     if let Some(agent_id) = agent_id.and_then(native) {
@@ -222,7 +224,7 @@ mod tests {
         let identity = capture(
             "host-1",
             AgentKind::Codex,
-            "sess-1",
+            Some("sess-1"),
             Some("sub-1"),
             Some("turn-1"),
             OffsetDateTime::now_utc(),
@@ -241,7 +243,7 @@ mod tests {
         let identity = capture(
             "host-1",
             AgentKind::ClaudeCode,
-            "sess-1",
+            Some("sess-1"),
             None,
             None,
             OffsetDateTime::now_utc(),
@@ -256,7 +258,7 @@ mod tests {
         let identity = capture(
             "host-1",
             AgentKind::Codex,
-            "  \t",
+            Some("  \t"),
             Some(""),
             Some("   "),
             OffsetDateTime::now_utc(),
@@ -269,7 +271,7 @@ mod tests {
         let padded = capture(
             "host-1",
             AgentKind::Codex,
-            " Sess/ID:\u{fc}-1  ",
+            Some(" Sess/ID:\u{fc}-1  "),
             Some(" a "),
             Some(" t "),
             OffsetDateTime::now_utc(),
@@ -285,7 +287,7 @@ mod tests {
         let identity = capture(
             "host-1",
             AgentKind::ClaudeCode,
-            "sess-1",
+            Some("sess-1"),
             Some("sub-1"),
             Some("turn-1"),
             OffsetDateTime::now_utc(),
@@ -293,5 +295,20 @@ mod tests {
         .unwrap();
         assert_eq!(identity.agent_id(), Some("sub-1"));
         assert_eq!(identity.turn_id(), None);
+    }
+
+    #[test]
+    fn capture_without_a_session_keeps_the_agent_and_never_fabricates_a_session() {
+        let identity = capture(
+            "host-1",
+            AgentKind::ClaudeCode,
+            None,
+            Some("a-1"),
+            None,
+            OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+        assert_eq!(identity.provider_session_id(), None);
+        assert_eq!(identity.agent_id(), Some("a-1"));
     }
 }

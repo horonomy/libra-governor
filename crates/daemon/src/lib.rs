@@ -16,6 +16,7 @@ pub mod gateway_authority;
 pub mod host_binding;
 pub mod host_runtime;
 pub mod launch_gate;
+pub mod legacy_executor;
 pub mod log;
 pub mod metered_pool;
 pub mod outcome_authority_wiring;
