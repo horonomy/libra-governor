@@ -496,6 +496,16 @@ fn no_budget_file_never_sends_a_shared_budget_request() {
 }
 
 #[test]
+fn a_state_dir_that_is_not_a_directory_has_no_budget_file_so_everything_fails_open() {
+    let parent = tempfile::tempdir().unwrap();
+    let blocked = parent.path().join("blocked");
+    std::fs::write(&blocked, "not a directory").unwrap();
+    let ran = prompt(&blocked, "s-enotdir", parent.path(), &[]);
+    assert!(!ran.stdout.contains("decision"), "{}", ran.stdout);
+    assert_allow(&pre_tool(&blocked, tool_payload("s", None)));
+}
+
+#[test]
 fn no_budget_file_post_tool_use_and_stop_print_nothing_and_exit_zero() {
     let state = support::DaemonState::new();
     for (sub, payload) in [

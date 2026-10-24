@@ -60,15 +60,18 @@ fn budget_file_path() -> Option<PathBuf> {
         .map(|dir| dir.join(BUDGET_FILE_NAME))
 }
 
-/// Cheap stat: does a budget file exist? Only "not found" counts as absent;
-/// any other stat error (permissions, I/O) is treated as present so the
-/// daemon, not a failed stat, decides.
+/// Cheap stat: does a budget file exist? "Not found", and "the state
+/// directory is not a directory" (nothing can exist beneath it), count as
+/// absent; any other stat error (permissions, I/O) is treated as present so
+/// the daemon, not a failed stat, decides.
 pub fn budget_file_present() -> bool {
     match budget_file_path() {
-        Some(path) => !matches!(
-            std::fs::symlink_metadata(&path),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound
-        ),
+        Some(path) => match std::fs::symlink_metadata(&path) {
+            Ok(_) => true,
+            Err(e) => {
+                e.kind() != std::io::ErrorKind::NotFound && e.raw_os_error() != Some(libc::ENOTDIR)
+            }
+        },
         None => false,
     }
 }
