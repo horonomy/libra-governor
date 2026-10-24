@@ -26,10 +26,15 @@ their own commits and in *Retention and export* below.
 `libra-governor install` writes `PreToolUse`, `SubagentStop` and `SessionEnd`
 entries beside the original three, and `hook subagent-stop` /
 `hook session-end` send `ChargeAgentTranscript` / `SettleTail` (see
-*Installer and settlement hooks delivered in S7*). Everything else
-below that is not one of those is **design intent implemented in later
-slices** (S8 doctor/status, S11 gateway `governor_held`); it
-must not be read as shipped behaviour. No real Claude Code host has
+*Installer and settlement hooks delivered in S7*).
+**S8 (HORO-2217) delivers the operator surfaces**: `libra-governor
+shared-budget status [--json]`, a budget segment on the legacy statusline,
+and the shared-budget checks in `doctor` (see *Status, statusline and doctor
+delivered in S8*). **Not built**: the S11 gateway hard cap (`governor_held`),
+a Codex budget gate, remote upload, and any real-host evidence (everything is
+`TestOwnedLive`; nothing is `ProductionObserved`). Everything else below that
+is not delivered by a slice named above is **design intent**; it must not be
+read as shipped behaviour. No real Claude Code host has
 exercised any of it as an installed hook: S4's and S5's evidence is
 `TestOwnedLive`; S5's transcript field names were confirmed against a real
 Claude Code 2.1.306 binary in an isolated harness, and its fixtures mirror
@@ -106,7 +111,7 @@ upstream guarantee.
 
 Unpriced model, by path: hooks-only settlement uses the hold amount with
 `usage_known=false` (delivered in S5) and names the model in `Status`
-`unpriced_models`; the `doctor` presentation is S8. The
+`unpriced_models`; `shared-budget status` and `doctor` show it (S8). The
 gateway's USD budget path instead refuses with `403 unpriced_model`
 (`crates/gateway/src/pricing.rs` module docs; `Decision::UnpricedModel` in
 `crates/gateway/src/proxy.rs`).
@@ -160,7 +165,7 @@ Captures from the real host binary against a fake upstream are
 | File present but invalid (parse, timezone, cap, version) | Deny `config_invalid` |
 | Clock anomaly: newest pool period is later than now's period | Deny `clock_anomaly` |
 | Daemon unreachable, file present | Deny at prompt admission; allow and log at PreToolUse |
-| Unpriced model | Settle at hold amount, `usage_known=false`, named in `Status.unpriced_models` (S5; `doctor` is S8) |
+| Unpriced model | Settle at hold amount, `usage_known=false`, named in `Status.unpriced_models` (S5; shown by `status` and `doctor`, S8) |
 
 ### Daemon behaviour delivered in S4 (HORO-2195)
 
@@ -182,7 +187,8 @@ a pool for a later month makes every `Admit` and `Check` deny `clock_anomaly`
 until real time reaches that month. `Status` names it in
 `future_pool_detected`. Recovery: correct the system clock. If a pool was
 created by a clock that has since been corrected, there is no repair command
-yet (owned by S8's `shared-budget` tooling); the manual step is to stop the
+yet (S8's `status` and `doctor` report the anomaly but do not repair it); the
+manual step is to stop the
 daemon and delete that month's `quota_pools` row (and its reservations) from
 `ledger.sqlite3` after confirming it holds no real spend. Until then the
 budget fails closed rather than guessing. Changing `time_zone` near a month
@@ -454,8 +460,8 @@ id, path or content).
   but the hold was already booked (an over-count).
 - The post-`/compact` transcript is unverified.
 
-**Not done in S5** (S7 has since delivered the installer and `SessionEnd`
-wiring): no `doctor`/status CLI (S8), no gateway path (S11). `Finalize` itself returns
+**Not done in S5** (S7 delivered the installer and `SessionEnd` wiring, S8
+the `status` command and `doctor` checks): no gateway path (S11). `Finalize` itself returns
 nothing about the settlement; it is observable through `Status`, the ledger
 and the log.
 
@@ -504,18 +510,62 @@ installed hooks**, so nothing here is `ProductionObserved`.
 - *Fail open.* Neither handler prints, blocks, spawns a daemon or exits
   nonzero; no daemon, a malformed payload, a reserved or blank session id, or
   no answer within 5 s is a log line. Only prompt admission denies.
-- *Residuals.* `doctor` still judges only the original three hooks
-  (`Inspection` reports the new ones separately for S8). A session whose
+- *Residuals.* S8 closed the `doctor` gap: it now reports all six hooks. A session whose
   `SessionEnd` never fires (a killed host) has its tail left unsettled; no
   other path settles it.
+
+### Status, statusline and doctor delivered in S8
+
+**Implementation status (S8, HORO-2217).** Guarantee label unchanged:
+**admission-bounded (cooperative)**; amounts are Libra-accounted
+list-price-equivalent USD at the pinned `PRICING_VERSION`, never a provider
+bill or quota. Evidence class: `TestOwnedLive` (a real daemon and real hook
+and CLI processes, synthetic transcripts); **nothing here is
+`ProductionObserved`** and this is not a release GO.
+
+- `libra-governor shared-budget status [--json]` is read-only. With no
+  `shared-budget.json` it prints `not configured` and does not connect to,
+  start or write anything. Otherwise it asks the running daemon for the
+  existing `Status` request (it never starts one; with the daemon down it
+  describes only the file and says the figures are unavailable). It shows the
+  config state and reason, the zone-local period, cap, settled, held and
+  remaining (negative remaining is shown as an overrun), a per-executor table
+  (session, agent, kind `agent_absent`/`agent`/`unattributed`, settled, held)
+  reconciled against the pool total with any discrepancy flagged, warn-only
+  soft-limit warnings, flagged-settlement counts since the daemon started
+  (`unmeasured_settlements`, `unmeasured_charges`, `future_timestamp_settlements`,
+  binding mismatch, unverified, foreign lines, deferred sweep files), and
+  `clock_anomaly`. `Status` gained one additive, defaulted field,
+  `future_timestamp_settlements`; no protocol version bump (an older peer
+  decodes it as zero).
+- The legacy `statusline` line gains ` | budget $12.30/$500 (2%)` (settled
+  plus held against the cap) with a trailing ` WARN` for a soft-limit warning
+  or an overrun, **only when a budget file exists**; without one the line is
+  byte-for-byte unchanged, and any failure drops the segment. The shared-host
+  `statusline provider` document is not changed.
+- `doctor` reports the budget file state, whether the six hooks are wired in
+  an all-tools group, daemon reachability, clock anomaly, flagged settlement
+  counts, any per-executor reconciliation discrepancy, and, by presence only,
+  whether `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set (in its own
+  environment and in the `settings.json` env block; the value and every other
+  variable are never read into the report). It also states what the budget
+  does not cover.
+- The S7 review finding L-A is fixed: `inspect()` counted our command under a
+  user's foreign matcher group (for example `Bash`) as wired; it now requires
+  a no-matcher, `""` or `"*"` group, the same rule `install` applies.
+- **Not built, and not claimed:** the S11 gateway hard cap (`governor_held`);
+  a Codex budget gate (the Codex route neither admits nor charges); remote
+  upload (S10 delivers a local export only); a `clock_anomaly` repair command;
+  in-turn overshoot protection in hooks-only mode; real-host evidence.
 
 ### Egress inventory
 
 Only `crates/gateway` (upstream allowlist, default `api.anthropic.com`) and
 `crates/extension` (loopback literal only) may hold HTTP clients. Host
 telemetry and WebFetch are Claude Code's own traffic: Libra neither reports
-nor enforces them today; slice S8 (HORO-2217) adds `doctor` reporting of the
-`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` setting (reporting only).
+nor enforces them; slice S8 (HORO-2217) delivered `doctor` reporting of the
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` setting (presence only, reporting
+only).
 
 The full pathway table, what is enforced and what is not, is in
 [`docs/egress-inventory.md`](../egress-inventory.md); a static test
@@ -569,5 +619,5 @@ delivery exists; that remains the separate, versioned workstream above.
 
 ## Not decided here
 
-Release GO/NO-GO, remote upload, gateway `governor_held`, any provider-bill
+Release GO/NO-GO, remote upload, gateway `governor_held` (S11, not built), a Codex budget gate, any provider-bill
 reconciliation, and any change to the ADR-0023 production-feed ban.

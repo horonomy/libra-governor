@@ -17,9 +17,11 @@ Audited at `main` 7af0f89 across the Rust workspace, `providers/`, `scripts/`,
   `dogfood-evidence export` write local files and make no network call.
 - **Not enforced by Libra:** Claude Code's own telemetry, WebFetch, and
   `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` are *host* traffic. Libra does
-  not read, report or enforce them today (`doctor`'s `telemetry` finding only
-  states that Libra itself has no telemetry code path). Slice S8 (HORO-2217)
-  adds `doctor` reporting of the setting, reporting only.
+  not set or enforce them. `doctor` reports whether
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set (slice S8, HORO-2217):
+  presence only, in its own environment and in the `settings.json` env block;
+  it never prints the value or any other variable. `doctor`'s `telemetry`
+  finding separately states that Libra itself has no telemetry code path.
 
 ## Authorized vs unauthorized
 
@@ -109,8 +111,10 @@ Checked and absent: `reqwest`, `ureq`, `curl`, `isahc`, `surf`, `attohttpc`,
   changes no network behaviour; non-local transport is refused for every
   profile because the adapter config has no profile input at all.
 - Claude Code telemetry, WebFetch and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`
-  are not read, reported or enforced by Libra. `doctor` reporting of
-  the setting is planned in slice S8 (HORO-2217) and is not built yet.
+  are not enforced by Libra. `doctor` reports only whether
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set (slice S8, HORO-2217;
+  delivered, reporting only, presence only). Telemetry and WebFetch are
+  neither read nor reported.
 - Nothing prevents a user from pointing the agent at a different base URL;
   the gateway only governs traffic routed through it.
 
