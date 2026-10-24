@@ -503,7 +503,7 @@ installed hooks**, so nothing here is `ProductionObserved`.
   (`no_settled_lane`) and billed nothing.
 - *Fail open.* Neither handler prints, blocks, spawns a daemon or exits
   nonzero; no daemon, a malformed payload, a reserved or blank session id, or
-  no answer within 6 s is a log line. Only prompt admission denies.
+  no answer within 5 s is a log line. Only prompt admission denies.
 - *Residuals.* `doctor` still judges only the original three hooks
   (`Inspection` reports the new ones separately for S8). A session whose
   `SessionEnd` never fires (a killed host) has its tail left unsettled; no

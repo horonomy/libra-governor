@@ -37,7 +37,7 @@ use crate::client;
 /// Wall-clock budget for the whole connect + write + read round trip. The
 /// installed hook entries ask Claude Code for a 10 s window; this stays well
 /// inside it. A slow daemon is abandoned, never waited on past this.
-pub const SETTLE_BUDGET: Duration = Duration::from_secs(6);
+pub const SETTLE_BUDGET: Duration = Duration::from_secs(5);
 
 /// A `SubagentStop` payload reduced to what the charge needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,10 +250,8 @@ fn run_with<P>(
         }
     };
 
-    // Cheap stat first: no budget file means nothing is parsed or sent.
-    if !budget_gate::budget_file_present() {
-        return;
-    }
+    // The entry points stat the budget file before reading stdin, so
+    // reaching here means it exists (or a caller chose to bypass that).
     let parsed = match parse(raw) {
         Ok(parsed) => parsed,
         Err(Skip::Malformed(why)) => {

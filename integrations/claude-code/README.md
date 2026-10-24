@@ -683,7 +683,7 @@ budget gate (its hook route is unchanged).
 | `SessionEnd` | present | one `SettleTail` with `session_id` and `transcript_path`; the daemon charges the records no `Stop` counted. Always silent, exit 0 |
 
 The settlement hooks (`SubagentStop`, `SessionEnd`) never block and never
-spawn a daemon: no daemon, no answer within 6 s, a malformed payload, an
+spawn a daemon: no daemon, no answer within 5 s, a malformed payload, an
 unusable session id or a missing path is a log line and exit 0. A blank id
 is treated as absent and no agent id is ever invented; an `agent_id`
 outside `[A-Za-z0-9_-]` is not forwarded. When the transcript's file name
