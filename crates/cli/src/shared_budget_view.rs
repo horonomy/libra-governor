@@ -295,13 +295,17 @@ pub fn statusline_segment(status: &SharedBudgetStatus) -> Option<String> {
     }
     let cap = status.config.as_ref()?.monthly_cap_usd_cents;
     let spent = committed(status);
+    // Rounded up for any spend, so 0.4% never reads 0% and 99.9% never 99%.
     let percent = if cap == 0 {
         0
     } else {
-        (u128::from(spent) * 100 / u128::from(cap)).min(9_999)
+        (u128::from(spent) * 100)
+            .div_ceil(u128::from(cap))
+            .min(9_999)
     };
-    let overrun = status.remaining_usd_cents.is_some_and(|r| r < 0);
-    let warn = !status.warnings.is_empty() || overrun;
+    // At or below zero remaining, admission is closed (fully held or overrun).
+    let closed = status.remaining_usd_cents.is_some_and(|r| r <= 0);
+    let warn = !status.warnings.is_empty() || closed;
     Some(format!(
         "budget {}/{} ({percent}%){}",
         usd_u(spent),
@@ -431,6 +435,12 @@ fn render_reported(out: &mut String, s: &SharedBudgetStatus) {
         out.push_str("No capacity is known, so no spend figures are authoritative.\n");
         return;
     };
+    if !s.capacity_known {
+        out.push_str(
+            "CAPACITY UNKNOWN: the pool exists but its capacity could not be established, so \
+             the figures below are not authoritative\n",
+        );
+    }
     let tz = IanaTimeZone::new(&cfg.time_zone).ok();
     if let Some(period) = &s.period {
         out.push_str(&format!(
@@ -617,6 +627,7 @@ pub fn render_json(posture: &Posture, state_dir: Option<&Path>) -> Value {
                 None => Value::Null,
             };
             v["pool_exists"] = json!(s.pool_exists);
+            v["capacity_known"] = json!(s.capacity_known);
             v["amounts_usd_cents"] = json!({
                 "monthly_cap": s.config.as_ref().map(|c| c.monthly_cap_usd_cents),
                 "settled": s.used_usd_cents,
@@ -665,6 +676,17 @@ pub fn render_json(posture: &Posture, state_dir: Option<&Path>) -> Value {
             v["future_pool_detected"] = json!(s.future_pool_detected);
             v
         }
+    }
+}
+
+/// Whether a new prompt would be refused for lack of budget: less than one
+/// turn hold remains (which includes fully held and overrun pools).
+pub fn admission_closed(s: &SharedBudgetStatus) -> bool {
+    match (&s.config, s.remaining_usd_cents) {
+        (Some(cfg), Some(remaining)) => {
+            remaining < i64::try_from(cfg.turn_hold_usd_cents).unwrap_or(i64::MAX)
+        }
+        _ => false,
     }
 }
 
@@ -785,7 +807,7 @@ mod tests {
     fn the_segment_shows_committed_spend_cap_and_percent() {
         assert_eq!(
             statusline_segment(&status()).as_deref(),
-            Some("budget $12.30/$500 (2%)")
+            Some("budget $12.30/$500 (3%)")
         );
     }
 
@@ -804,6 +826,29 @@ mod tests {
         let mut over = status();
         over.remaining_usd_cents = Some(-1);
         assert!(statusline_segment(&over).unwrap().ends_with(" WARN"));
+    }
+
+    #[test]
+    fn the_segment_warns_when_nothing_remains_and_rounds_the_percent_up() {
+        let mut full = status();
+        full.remaining_usd_cents = Some(0);
+        assert!(statusline_segment(&full).unwrap().ends_with(" WARN"));
+
+        // 1 cent of a $500 cap is 0.002%: shown as 1%, not 0%.
+        let mut tiny = status();
+        tiny.used_usd_cents = 1;
+        tiny.reserved_usd_cents = 0;
+        assert!(statusline_segment(&tiny).unwrap().contains("(1%)"));
+        // 49,951 of 50,000 is 99.9%: shown as 100%, not 99%.
+        let mut almost = status();
+        almost.used_usd_cents = 49_951;
+        almost.reserved_usd_cents = 0;
+        assert!(statusline_segment(&almost).unwrap().contains("(100%)"));
+        // No spend stays 0%.
+        let mut none = status();
+        none.used_usd_cents = 0;
+        none.reserved_usd_cents = 0;
+        assert!(statusline_segment(&none).unwrap().contains("(0%)"));
     }
 
     #[test]
@@ -853,6 +898,18 @@ mod tests {
         assert!(text.contains("-$2.50"), "{text}");
         assert!(text.contains("OVERRUN"), "{text}");
         assert!(text.contains("DISCREPANCY"), "{text}");
+    }
+
+    #[test]
+    fn unknown_capacity_is_surfaced_in_human_and_json_status() {
+        let mut s = status();
+        s.capacity_known = false;
+        let text = render_human(&Posture::Reported(Box::new(s.clone())), None);
+        assert!(text.contains("CAPACITY UNKNOWN"), "{text}");
+        let v = render_json(&Posture::Reported(Box::new(s)), None);
+        assert_eq!(v["capacity_known"], false);
+        let known = render_json(&Posture::Reported(Box::new(status())), None);
+        assert_eq!(known["capacity_known"], true);
     }
 
     #[test]

@@ -53,6 +53,7 @@ const HELP: &str = "Usage:\n  \
     zone-local period, cap, settled, held, remaining (negative = overrun), per-executor table \
     reconciled against the pool total, soft-limit warnings (warn-only), flagged settlements and \
     clock anomaly. With no shared-budget.json it prints \"not configured\" and does nothing else. \
+    Exits 0 even for a discrepancy, clock anomaly or invalid config (doctor is the failing check). \
     Amounts are Libra-accounted list-price-equivalent USD, never a provider bill or quota.\n  \
     prune   Dry run by default (deletes nothing); deletes only with --apply. Removes closed rows of \
     ended monthly periods older than the last <n> closed months (n >= 1). Export before prune: \
