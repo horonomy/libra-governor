@@ -237,6 +237,7 @@ fn grant(outcome: SharedBudgetOutcome) -> Grant {
             remaining_usd_cents,
             period_end,
             warnings,
+            ..
         } => Grant {
             id: reservation_id,
             pool_id,
@@ -1377,6 +1378,54 @@ fn one_charge_above_ten_times_the_cap_is_refused_and_pool_totals_stay_summable()
         SharedBudgetOutcome::Charged { .. }
     ));
     assert!(fx.status().capacity_known);
+}
+
+#[test]
+fn a_tool_event_renews_only_the_current_periods_holds() {
+    let mut fx = Fx::new(Some(&cfg_json(5_000, "UTC", 1_000)), "2027-01-31T23:50:00Z");
+    let old = grant(fx.admit("s", None, None));
+    fx.clock.set(t("2027-02-01T00:10:00Z"));
+    let new = grant(fx.admit("s", None, None));
+    assert_ne!(old.id, new.id);
+    let expiry = |fx: &Fx, id| {
+        fx.ledger
+            .get_shared_reservation(id)
+            .unwrap()
+            .unwrap()
+            .expires_at
+    };
+    let (old_before, new_before) = (expiry(&fx, old.id), expiry(&fx, new.id));
+    fx.clock.set(t("2027-02-01T00:30:00Z"));
+    fx.call(Request::ToolInvoked {
+        session_id: "s".into(),
+        tool_name: "Bash".into(),
+    });
+    assert_eq!(
+        expiry(&fx, old.id),
+        old_before,
+        "last month's hold is not kept alive"
+    );
+    assert!(
+        expiry(&fx, new.id) > new_before,
+        "this month's hold is renewed"
+    );
+}
+
+#[test]
+fn status_names_the_future_pool_behind_a_clock_anomaly() {
+    let mut fx = Fx::new(Some(&cfg_json(5_000, "UTC", 1_000)), JAN);
+    assert_eq!(fx.status().future_pool_detected, None);
+    fx.ledger
+        .ensure_pool(
+            &libra_governor_domain::PoolId("metered:local-budget/monthly-2027-04".into()),
+            &libra_governor_domain::QuotaUnit::UsdCents,
+            5_000,
+            t(JAN),
+        )
+        .unwrap();
+    let s = fx.status();
+    assert!(s.clock_anomaly);
+    assert_eq!(s.future_pool_detected.as_deref(), Some("monthly-2027-04"));
 }
 
 // ---------------------------------------------------------------------

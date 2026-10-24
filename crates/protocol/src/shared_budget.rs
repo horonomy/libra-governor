@@ -202,6 +202,9 @@ pub struct SharedBudgetStatus {
     /// A pool of a later period than the clock's current one exists;
     /// admission denies until that is resolved.
     pub clock_anomaly: bool,
+    /// Alias (`monthly-YYYY-MM`) of the newest pool when it is of a later
+    /// period than the clock's, which is what causes `clock_anomaly`.
+    pub future_pool_detected: Option<String>,
     pub period: Option<SharedBudgetPeriod>,
     /// Whether the current period's pool has been created yet (it is
     /// created lazily by the first `Admit`).
@@ -239,6 +242,9 @@ pub enum SharedBudgetOutcome {
         remaining_usd_cents: i64,
         period_end: String,
         warnings: Vec<SoftLimitWarning>,
+        /// The hold was granted but the soft-limit warnings could not be
+        /// computed; `warnings` is empty and says nothing about limits.
+        warnings_unavailable: bool,
     },
     Denied {
         reason: SharedBudgetDenyReason,

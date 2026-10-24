@@ -448,7 +448,7 @@ fn soft_warnings(
 }
 
 fn allowed(
-    ledger: &LedgerStore,
+    ledger: &mut LedgerStore,
     cfg: &SharedBudgetConfig,
     period: &Period,
     hold: &SharedPoolReservation,
@@ -458,15 +458,32 @@ fn allowed(
     let executor_kind = hold.executor_kind.ok_or(SharedBudgetError::Internal(
         "a granted hold has no executor kind",
     ))?;
-    let warnings = if cfg.soft_limits == SoftLimits::default() {
-        Vec::new()
+    // The hold is already granted. Nothing after this point may strand it:
+    // warnings are best-effort, and if even the remaining figure cannot be
+    // read, a hold this call just created is released before the error.
+    let remaining = match remaining_of(ledger, &hold.pool_id, cfg, now) {
+        Ok(remaining) => remaining,
+        Err(e) => {
+            if !reused {
+                let _ = ledger.release_shared(hold.id, now);
+            }
+            return Err(e);
+        }
+    };
+    let (warnings, warnings_unavailable) = if cfg.soft_limits == SoftLimits::default() {
+        (Vec::new(), false)
     } else {
-        let report = ledger.shared_pool_executor_usage(&hold.pool_id)?;
-        soft_warnings(
-            &report,
-            &cfg.soft_limits,
-            Some((&hold.session_id, hold.agent_id.as_deref(), executor_kind)),
-        )
+        match ledger.shared_pool_executor_usage(&hold.pool_id) {
+            Ok(report) => (
+                soft_warnings(
+                    &report,
+                    &cfg.soft_limits,
+                    Some((&hold.session_id, hold.agent_id.as_deref(), executor_kind)),
+                ),
+                false,
+            ),
+            Err(_) => (Vec::new(), true),
+        }
     };
     Ok(SharedBudgetOutcome::Allowed {
         reservation_id: hold.id,
@@ -474,9 +491,10 @@ fn allowed(
         hold_usd_cents: hold.amount,
         hold_reused: reused,
         executor_kind,
-        remaining_usd_cents: remaining_of(ledger, &hold.pool_id, cfg, now)?,
+        remaining_usd_cents: remaining,
         period_end: rfc(period.end),
         warnings,
+        warnings_unavailable,
     })
 }
 
@@ -842,6 +860,7 @@ pub fn status(
         config_permissions_note: loaded.permissions_note(),
         config: None,
         clock_anomaly: false,
+        future_pool_detected: None,
         period: None,
         pool_exists: false,
         capacity_known: false,
@@ -864,7 +883,13 @@ pub fn status(
     });
     let now = rt.now();
     let period = period_at(cfg, now)?;
-    report.clock_anomaly = later_pool(ledger, &period)?.is_some();
+    let later = later_pool(ledger, &period)?;
+    report.clock_anomaly = later.is_some();
+    report.future_pool_detected = later.map(|p| {
+        p.0.strip_prefix(OWNER_POOL_PREFIX)
+            .unwrap_or(&p.0)
+            .to_string()
+    });
     report.period = Some(SharedBudgetPeriod {
         pool_id: period.pool_id.0.clone(),
         start: rfc(period.start),
@@ -876,10 +901,16 @@ pub fn status(
     if let Some(admission) = ledger.pool_admission_for(&period.pool_id, now, source(cfg))? {
         report.pool_exists = true;
         report.capacity_known = admission.capacity_known;
-        report.used_usd_cents = admission.settled;
-        report.reserved_usd_cents = admission.active;
-        report.remaining_usd_cents = Some(admission.remaining());
+        // Totals and per-executor rows come from one ledger snapshot, so the
+        // table always sums to the figures reported beside it.
         let executors = ledger.shared_pool_executor_usage(&period.pool_id)?;
+        report.used_usd_cents = executors.total_used;
+        report.reserved_usd_cents = executors.total_reserved;
+        let remaining = i128::from(cfg.monthly_cap_usd_cents)
+            - i128::from(executors.total_used)
+            - i128::from(executors.total_reserved);
+        report.remaining_usd_cents =
+            Some(remaining.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64);
         report.warnings = soft_warnings(&executors, &cfg.soft_limits, None);
         report.executors = executors
             .executors
@@ -897,24 +928,33 @@ pub fn status(
 }
 
 /// Tool-event heartbeat: renews every active, unexpired local-budget hold
-/// of `session_id`, whichever lane it belongs to (a tool event carries no
-/// agent id). Returns how many were renewed. Does nothing -- not even a
+/// of `session_id` in the current period's pool, whichever lane it belongs
+/// to (a tool event carries no agent id, so the lane cannot be preferred). Returns how many were renewed. Does nothing -- not even a
 /// ledger read -- unless a valid shared-budget file is loaded.
 pub fn heartbeat(
     ledger: &mut LedgerStore,
     rt: &SharedBudgetRuntime,
     session_id: &str,
 ) -> Result<usize, SharedBudgetError> {
-    if !matches!(rt.effective().state, SharedBudgetFileState::Valid(_))
-        || validate_identity(session_id, None).is_err()
-    {
+    let state = rt.effective().state;
+    let SharedBudgetFileState::Valid(cfg) = &state else {
+        return Ok(0);
+    };
+    if validate_identity(session_id, None).is_err() {
         return Ok(0);
     }
     let now = rt.now();
+    let period = period_at(cfg, now)?;
     let mut renewed = 0;
+    // Only the current period's holds: an earlier period's hold clears by
+    // settling or by its own expiry, and a tool event in a later month is
+    // not evidence that last month's turn is still running.
     for hold in
         ledger.active_shared_holds_for_session(&principal(), session_id, OWNER_POOL_PREFIX, now)?
     {
+        if hold.pool_id != period.pool_id {
+            continue;
+        }
         if matches!(
             ledger.renew_shared(hold.id, &principal(), session_id, now, HOLD_TTL_SECS)?,
             SharedPoolRenewOutcome::Renewed(_)
