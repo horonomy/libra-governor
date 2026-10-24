@@ -41,7 +41,7 @@
 //! session ids and the reserved `execution-owner-v1:` prefix are refused.
 //! This path does not require a pre-established session; it never invents
 //! one.
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::{Arc, Mutex};
 
 use time::format_description::well_known::Rfc3339;
@@ -54,7 +54,7 @@ use libra_governor_domain::{
 };
 use libra_governor_ledger::{
     CapacitySource, ExecutorAttribution, LedgerError, LedgerStore, MeteredReserveOutcome,
-    MeteredReserveRequest, SharedPoolChargeOutcome, SharedPoolChargeRequest,
+    MeteredReserveRequest, SettleWatermark, SharedPoolChargeOutcome, SharedPoolChargeRequest,
     SharedPoolExecutorReport, SharedPoolRenewOutcome, SharedPoolReserveRequest,
     SharedPoolSettleOutcome,
 };
@@ -163,6 +163,7 @@ struct Telemetry {
     unverified: u64,
     unmeasured_settlements: u64,
     unmeasured_charges: u64,
+    id_less_records: u64,
 }
 
 /// A model id from a transcript, reduced to a safe, bounded display token:
@@ -932,6 +933,70 @@ fn book_charge(
     })
 }
 
+/// An opaque, stable display id for a session in log lines: the first eight
+/// hex digits of its SHA-256. Log lines never carry the session or agent id
+/// themselves, a path or a transcript excerpt.
+pub fn opaque_id(session_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(session_id.as_bytes())
+        .iter()
+        .take(4)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// A structured log line for a flagged subagent transcript charge
+/// (mismatch, unverified, unpriced or unmeasured), or `None` when the
+/// charge was clean. Status counters are volatile; this line and the
+/// ledger's `usage_known` flag are the durable record.
+pub fn transcript_charge_log(session_id: &str, outcome: &SharedBudgetOutcome) -> Option<String> {
+    let SharedBudgetOutcome::TranscriptCharged {
+        amount_charged_usd_cents,
+        cumulative_usd_cents,
+        unmeasured,
+        unpriced,
+        transcript_unverified,
+        binding_mismatch,
+        ..
+    } = outcome
+    else {
+        return None;
+    };
+    if !(*unmeasured || *unpriced || *transcript_unverified || *binding_mismatch) {
+        return None;
+    }
+    Some(format!(
+        "shared budget event=subagent_charge lane={} unmeasured={unmeasured} unpriced={unpriced} \
+         unverified={transcript_unverified} binding_mismatch={binding_mismatch} \
+         charged={amount_charged_usd_cents}c cumulative={cumulative_usd_cents}c",
+        opaque_id(session_id)
+    ))
+}
+
+/// The structured log line for a `SettleTail` outcome.
+pub fn tail_log(session_id: &str, outcome: &SharedBudgetOutcome) -> String {
+    match outcome {
+        SharedBudgetOutcome::TailSettled {
+            amount_charged_usd_cents,
+            already_charged,
+            unmeasured,
+            unpriced,
+            transcript_unverified,
+            binding_mismatch,
+            ..
+        } => format!(
+            "shared budget event=settle_tail lane={} charged={amount_charged_usd_cents}c \
+             already={already_charged} unmeasured={unmeasured} unpriced={unpriced} \
+             unverified={transcript_unverified} binding_mismatch={binding_mismatch}",
+            opaque_id(session_id)
+        ),
+        _ => format!(
+            "shared budget event=settle_tail lane={} not_applied",
+            opaque_id(session_id)
+        ),
+    }
+}
+
 /// What settling a `Stop` did (HORO-2196). Content-free: it is logged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnSettlement {
@@ -955,9 +1020,6 @@ pub enum TurnSettlement {
         /// Why the window was not measured; `None` when it was.
         unmeasured_reason: Option<&'static str>,
     },
-    /// The transcript named a different session. Nothing was charged and
-    /// the hold was left for its TTL.
-    TranscriptMismatch,
     /// The hold was already settled by another call (lost a race).
     AlreadySettled,
 }
@@ -969,9 +1031,6 @@ impl TurnSettlement {
             Self::NotConfigured => "shared budget not configured".to_string(),
             Self::NotApplicable => "shared budget: session not applicable".to_string(),
             Self::NoHold => "shared budget: no unsettled hold".to_string(),
-            Self::TranscriptMismatch => {
-                "shared budget: transcript session mismatch, nothing charged".to_string()
-            }
             Self::AlreadySettled => "shared budget: hold already settled".to_string(),
             Self::Settled {
                 hold_usd_cents,
@@ -987,6 +1046,56 @@ impl TurnSettlement {
             ),
         }
     }
+}
+
+/// Most `message.id`s a watermark remembers. A turn is a few dozen
+/// messages; this keeps tail-block protection across several windows while
+/// bounding the row.
+const MAX_WATERMARK_IDS: usize = 512;
+
+/// Where the next window of a main-executor lane starts: the persisted
+/// transcript high-water mark (newest record timestamp counted, plus the
+/// message ids counted up to it), else -- legacy rows and lanes whose
+/// windows never counted a record -- the settle time of the latest settled
+/// hold, else the oldest hold's creation.
+fn lane_window(
+    ledger: &LedgerStore,
+    session_id: &str,
+    holds: &[SharedPoolReservation],
+) -> Result<Option<(OffsetDateTime, Vec<String>)>, SharedBudgetError> {
+    if let Some(SettleWatermark {
+        at: Some(at),
+        message_ids,
+    }) = ledger.shared_lane_watermark(
+        &principal(),
+        session_id,
+        None,
+        ExecutorKind::AgentAbsent,
+        OWNER_POOL_PREFIX,
+    )? {
+        return Ok(Some((at, message_ids)));
+    }
+    Ok(holds
+        .iter()
+        .filter(|h| h.state == ReservationState::Settled)
+        .filter_map(|h| h.settled_at)
+        .max()
+        .or_else(|| holds.iter().map(|h| h.created_at).min())
+        .map(|t| (t, Vec::new())))
+}
+
+fn merged_ids(previous: &[String], counted: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(previous.len() + counted.len());
+    let mut seen = HashSet::new();
+    for id in previous.iter().chain(counted) {
+        if seen.insert(id.as_str()) {
+            out.push(id.clone());
+        }
+    }
+    if out.len() > MAX_WATERMARK_IDS {
+        out.drain(..out.len() - MAX_WATERMARK_IDS);
+    }
+    out
 }
 
 /// Settles the session's main-executor turn hold at `Stop` (HORO-2196).
@@ -1063,67 +1172,94 @@ pub fn settle_turn(
     else {
         return Ok(TurnSettlement::NoHold);
     };
-    let after = holds
-        .iter()
-        .filter(|h| h.state == ReservationState::Settled)
-        .filter_map(|h| h.settled_at)
-        .max()
-        .or_else(|| holds.iter().map(|h| h.created_at).min())
-        .unwrap_or(target.created_at);
+    let (after, previous_ids) =
+        lane_window(ledger, session_id, &holds)?.unwrap_or((target.created_at, Vec::new()));
+    let counted_ids: HashSet<String> = previous_ids.iter().cloned().collect();
 
-    let (actual, reason): (Option<u64>, Option<&'static str>) = match &state {
-        SharedBudgetFileState::Valid(cfg) => {
-            let observation = match transcript_path {
-                None => PricedObservation::Unavailable(UsageUnavailable::NoTranscriptPath),
-                Some(path) => observe_priced(
-                    std::path::Path::new(path),
-                    ReadMode::ParentWindow { after },
-                    session_id,
-                    &cfg.pricing_overrides.table(),
-                    BUDGET_SCAN_CAP_BYTES,
-                ),
-            };
-            match observation {
-                PricedObservation::Priced(window) => (Some(window.cents), None),
-                PricedObservation::SessionMismatch => {
-                    rt.note(|t| t.binding_mismatches += 1);
-                    return Ok(TurnSettlement::TranscriptMismatch);
-                }
-                PricedObservation::SessionUnverified => {
-                    rt.note(|t| t.unverified += 1);
-                    (None, Some("transcript_unverified"))
-                }
-                PricedObservation::UnpricedModels(models) => {
-                    rt.note_unpriced(&models);
-                    (None, Some("unpriced_model"))
-                }
-                PricedObservation::Unavailable(why) => (
-                    None,
-                    Some(match why {
-                        UsageUnavailable::NoTranscriptPath => "no_transcript_path",
-                        UsageUnavailable::Unreadable => "transcript_unreadable",
-                        UsageUnavailable::ScanCapReached => "scan_cap_reached",
-                        UsageUnavailable::NoUsageInWindow => "no_usage_in_window",
-                        UsageUnavailable::TurnIncomplete | UsageUnavailable::Inconsistent => {
-                            "transcript_inconsistent"
+    let now = rt.now();
+    let (actual, reason, watermark): (Option<u64>, Option<&'static str>, Option<SettleWatermark>) =
+        match &state {
+            SharedBudgetFileState::Valid(cfg) => {
+                let observation = match transcript_path {
+                    None => PricedObservation::Unavailable(UsageUnavailable::NoTranscriptPath),
+                    Some(path) => observe_priced(
+                        std::path::Path::new(path),
+                        ReadMode::ParentWindow {
+                            after,
+                            counted_ids: &counted_ids,
+                        },
+                        session_id,
+                        &cfg.pricing_overrides.table(),
+                        BUDGET_SCAN_CAP_BYTES,
+                    ),
+                };
+                match observation {
+                    PricedObservation::Priced(window) => {
+                        if window.id_less_records > 0 {
+                            rt.note(|t| t.id_less_records += window.id_less_records);
                         }
-                    }),
-                ),
+                        (
+                            Some(window.cents),
+                            None,
+                            Some(SettleWatermark {
+                                at: window.last_event_time,
+                                message_ids: merged_ids(&previous_ids, &window.message_ids),
+                            }),
+                        )
+                    }
+                    // Foreign spend is never imported, but the turn is not free
+                    // either: the hold amount is booked, flagged, and the
+                    // watermark moves to now so the same foreign file is not
+                    // judged again by every later Stop.
+                    PricedObservation::SessionMismatch => {
+                        rt.note(|t| t.binding_mismatches += 1);
+                        (
+                            None,
+                            Some("binding_mismatch"),
+                            Some(SettleWatermark {
+                                at: Some(now),
+                                message_ids: previous_ids.clone(),
+                            }),
+                        )
+                    }
+                    PricedObservation::SessionUnverified => {
+                        rt.note(|t| t.unverified += 1);
+                        (None, Some("transcript_unverified"), None)
+                    }
+                    PricedObservation::MalformedUsage => (None, Some("usage_malformed"), None),
+                    PricedObservation::UnpricedModels(models) => {
+                        rt.note_unpriced(&models);
+                        (None, Some("unpriced_model"), None)
+                    }
+                    PricedObservation::Unavailable(why) => (
+                        None,
+                        Some(match why {
+                            UsageUnavailable::NoTranscriptPath => "no_transcript_path",
+                            UsageUnavailable::Unreadable => "transcript_unreadable",
+                            UsageUnavailable::ScanCapReached => "scan_cap_reached",
+                            UsageUnavailable::NoUsageInWindow => "no_usage_in_window",
+                            UsageUnavailable::TurnIncomplete | UsageUnavailable::Inconsistent => {
+                                "transcript_inconsistent"
+                            }
+                        }),
+                        None,
+                    ),
+                }
             }
-        }
-        // An invalid file: the pricing it would supply is not trusted.
-        SharedBudgetFileState::Invalid(_) => (None, Some("config_invalid")),
-        SharedBudgetFileState::Absent => return Ok(TurnSettlement::NotConfigured),
-    };
+            // An invalid file: the pricing it would supply is not trusted.
+            SharedBudgetFileState::Invalid(_) => (None, Some("config_invalid"), None),
+            SharedBudgetFileState::Absent => return Ok(TurnSettlement::NotConfigured),
+        };
     if reason.is_some() {
         rt.note(|t| t.unmeasured_settlements += 1);
     }
 
-    let outcome = ledger.settle_shared_attributed(
+    let outcome = ledger.settle_shared_with_watermark(
         target.id,
         actual,
-        rt.now(),
+        now,
         ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+        watermark.as_ref(),
     )?;
     Ok(match outcome {
         SharedPoolSettleOutcome::Settled {
@@ -1180,22 +1316,47 @@ pub fn charge_agent_transcript(
     agent_id: Option<&str>,
     agent_transcript_path: &str,
 ) -> Result<SharedBudgetOutcome, SharedBudgetError> {
+    Ok(charge_transcript_inner(
+        ledger,
+        rt,
+        session_id,
+        agent_id,
+        agent_transcript_path,
+        false,
+    )?
+    .unwrap_or(SharedBudgetOutcome::NotConfigured))
+}
+
+/// The shared body of `ChargeAgentTranscript` and the `Stop` sweep. With
+/// `sweep` set, a file with nothing measurable yet (missing, unreadable,
+/// no assistant record) returns `None` instead of charging the unmeasured
+/// fallback: a sweep runs on every `Stop` and must not bill a subagent that
+/// simply has not flushed its first record. Genuine problems (mismatch,
+/// unverified, unpriced, malformed) still take the fallback.
+fn charge_transcript_inner(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    session_id: &str,
+    agent_id: Option<&str>,
+    agent_transcript_path: &str,
+    sweep: bool,
+) -> Result<Option<SharedBudgetOutcome>, SharedBudgetError> {
     use sha2::{Digest, Sha256};
 
     let state = rt.effective().state;
     if matches!(state, SharedBudgetFileState::Absent) {
-        return Ok(SharedBudgetOutcome::NotConfigured);
+        return Ok(Some(SharedBudgetOutcome::NotConfigured));
     }
     let executor_kind = match validate_identity(session_id, agent_id) {
         // A subagent without a known id is explicitly UNKNOWN, never the
         // main executor.
         Ok(ExecutorKind::AgentAbsent) => ExecutorKind::Unattributed,
         Ok(kind) => kind,
-        Err(reason) => return Ok(refused(reason)),
+        Err(reason) => return Ok(Some(refused(reason))),
     };
     let cfg = match configured(&state) {
         Ok(cfg) => cfg,
-        Err(outcome) => return Ok(outcome),
+        Err(outcome) => return Ok(Some(outcome)),
     };
     let cfg = &cfg;
 
@@ -1215,7 +1376,7 @@ pub fn charge_agent_transcript(
     } else {
         observe_priced(
             path,
-            ReadMode::WholeFile,
+            ReadMode::WholeFile { agent_id },
             session_id,
             &cfg.pricing_overrides.table(),
             BUDGET_SCAN_CAP_BYTES,
@@ -1225,6 +1386,7 @@ pub fn charge_agent_transcript(
     struct Flags {
         unpriced: bool,
         unverified: bool,
+        mismatch: bool,
     }
     let (measured, flags): (Option<(u64, Option<OffsetDateTime>)>, Flags) = match observation {
         PricedObservation::Priced(w) => (
@@ -1232,12 +1394,31 @@ pub fn charge_agent_transcript(
             Flags {
                 unpriced: false,
                 unverified: false,
+                mismatch: false,
             },
         ),
+        // Foreign spend is never imported, but a subagent is not free
+        // either: the unmeasured fallback is charged (once per family) and
+        // the mismatch counted.
         PricedObservation::SessionMismatch => {
             rt.note(|t| t.binding_mismatches += 1);
-            return Ok(refused(SharedBudgetRefusal::TranscriptSessionMismatch));
+            (
+                None,
+                Flags {
+                    unpriced: false,
+                    unverified: false,
+                    mismatch: true,
+                },
+            )
         }
+        PricedObservation::MalformedUsage => (
+            None,
+            Flags {
+                unpriced: false,
+                unverified: false,
+                mismatch: false,
+            },
+        ),
         PricedObservation::SessionUnverified => {
             rt.note(|t| t.unverified += 1);
             (
@@ -1245,6 +1426,7 @@ pub fn charge_agent_transcript(
                 Flags {
                     unpriced: false,
                     unverified: true,
+                    mismatch: false,
                 },
             )
         }
@@ -1255,14 +1437,17 @@ pub fn charge_agent_transcript(
                 Flags {
                     unpriced: true,
                     unverified: false,
+                    mismatch: false,
                 },
             )
         }
+        PricedObservation::Unavailable(_) if sweep => return Ok(None),
         PricedObservation::Unavailable(_) => (
             None,
             Flags {
                 unpriced: false,
                 unverified: false,
+                mismatch: false,
             },
         ),
     };
@@ -1293,7 +1478,7 @@ pub fn charge_agent_transcript(
         // Nothing new to book. Report the posture without writing.
         let period = period_at(cfg, now)?;
         let admission = ledger.pool_admission_for(&period.pool_id, now, source(cfg))?;
-        return Ok(SharedBudgetOutcome::TranscriptCharged {
+        return Ok(Some(SharedBudgetOutcome::TranscriptCharged {
             reservation_id: None,
             pool_id: None,
             amount_charged_usd_cents: 0,
@@ -1309,8 +1494,9 @@ pub fn charge_agent_transcript(
             unmeasured,
             unpriced: flags.unpriced,
             transcript_unverified: flags.unverified,
+            binding_mismatch: flags.mismatch,
             event_time_clamped: false,
-        });
+        }));
     }
 
     let outcome = book_charge(
@@ -1327,7 +1513,7 @@ pub fn charge_agent_transcript(
             usage_known,
         },
     )?;
-    Ok(match outcome {
+    Ok(Some(match outcome {
         SharedBudgetOutcome::Charged {
             reservation_id,
             pool_id,
@@ -1359,11 +1545,257 @@ pub fn charge_agent_transcript(
                 unmeasured,
                 unpriced: flags.unpriced,
                 transcript_unverified: flags.unverified,
+                binding_mismatch: flags.mismatch,
                 event_time_clamped,
             }
         }
         other => other,
-    })
+    }))
+}
+
+/// Most subagent files one `Stop` sweep will look at.
+const MAX_SWEEP_FILES: usize = 64;
+
+/// Charges the not-yet-charged part of every native subagent transcript of
+/// `session_id` (HORO-2196). The host writes a subagent's file only when
+/// the subagent runs and lags behind its `SubagentStop`, so a subagent's
+/// final records are often missing when its own `SubagentStop` charges it.
+/// The parent's `Stop` therefore also visits
+/// `<transcript_path minus .jsonl>/subagents/agent-<agent_id>.jsonl` and
+/// charges each file's delta through the same cumulative-delta logic (same
+/// binding: each usage line's `sessionId` must be the parent's and its
+/// `agentId` this file's). A file with nothing measurable yet is skipped,
+/// not billed the unmeasured fallback. Returns how many files were charged
+/// something. Never fails the `Stop`.
+pub fn sweep_subagent_transcripts(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    session_id: &str,
+    transcript_path: &str,
+) -> usize {
+    let Some(stem) = transcript_path.strip_suffix(".jsonl") else {
+        return 0;
+    };
+    if !std::path::Path::new(transcript_path).is_absolute() {
+        return 0;
+    }
+    let dir = std::path::Path::new(stem).join("subagents");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let mut files: Vec<(String, std::path::PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let agent = name.strip_prefix("agent-")?.strip_suffix(".jsonl")?;
+            let valid = !agent.is_empty()
+                && agent
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            valid.then(|| (agent.to_string(), e.path()))
+        })
+        .collect();
+    files.sort();
+    files.truncate(MAX_SWEEP_FILES);
+    let mut charged = 0;
+    for (agent, path) in files {
+        let Some(path) = path.to_str() else { continue };
+        if let Ok(Some(SharedBudgetOutcome::TranscriptCharged {
+            amount_charged_usd_cents,
+            ..
+        })) = charge_transcript_inner(ledger, rt, session_id, Some(&agent), path, true)
+        {
+            if amount_charged_usd_cents > 0 {
+                charged += 1;
+            }
+        }
+    }
+    charged
+}
+
+/// Handles `SharedBudgetRequest::SettleTail` (HORO-2196). See the request.
+pub fn settle_tail(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    session_id: &str,
+    transcript_path: &str,
+) -> Result<SharedBudgetOutcome, SharedBudgetError> {
+    let state = rt.effective().state;
+    if matches!(state, SharedBudgetFileState::Absent) {
+        return Ok(SharedBudgetOutcome::NotConfigured);
+    }
+    if let Err(reason) = validate_identity(session_id, None) {
+        return Ok(refused(reason));
+    }
+    let cfg = match configured(&state) {
+        Ok(cfg) => cfg,
+        Err(outcome) => return Ok(outcome),
+    };
+    let cfg = &cfg;
+    let now = rt.now();
+    let period = period_at(cfg, now)?;
+    let admission = ledger.pool_admission_for(&period.pool_id, now, source(cfg))?;
+    let posture = |tail: TailFlags,
+                   row: Option<(libra_governor_domain::SharedPoolReservationId, String)>,
+                   charged: u64,
+                   already: bool| {
+        let (id, pool) = row.map_or((None, None), |(i, p)| (Some(i), Some(p)));
+        SharedBudgetOutcome::TailSettled {
+            reservation_id: id,
+            pool_id: pool,
+            amount_charged_usd_cents: charged,
+            already_charged: already,
+            remaining_usd_cents: admission.map_or_else(
+                || i64::try_from(cfg.monthly_cap_usd_cents).unwrap_or(i64::MAX),
+                |a| a.remaining(),
+            ),
+            overrun_usd_cents: admission.map_or(0, |a| a.overrun()),
+            unmeasured: tail.unmeasured,
+            unpriced: tail.unpriced,
+            transcript_unverified: tail.unverified,
+            binding_mismatch: tail.mismatch,
+        }
+    };
+
+    let holds = ledger.shared_lane_holds(
+        &principal(),
+        session_id,
+        None,
+        ExecutorKind::AgentAbsent,
+        OWNER_POOL_PREFIX,
+    )?;
+    // A lane that was never admitted has no budget history to continue.
+    let Some((after, previous_ids)) = lane_window(ledger, session_id, &holds)? else {
+        return Ok(posture(TailFlags::default(), None, 0, false));
+    };
+    let path = std::path::Path::new(transcript_path);
+    if !path.is_absolute() {
+        return Ok(posture(
+            TailFlags {
+                unmeasured: true,
+                ..TailFlags::default()
+            },
+            None,
+            0,
+            false,
+        ));
+    }
+    let counted_ids: HashSet<String> = previous_ids.iter().cloned().collect();
+    let observation = observe_priced(
+        path,
+        ReadMode::ParentWindow {
+            after,
+            counted_ids: &counted_ids,
+        },
+        session_id,
+        &cfg.pricing_overrides.table(),
+        BUDGET_SCAN_CAP_BYTES,
+    );
+    let flags = match observation {
+        PricedObservation::Priced(window) => {
+            let Some(last) = window.last_event_time else {
+                return Ok(posture(TailFlags::default(), None, 0, false));
+            };
+            if window.cents == 0 {
+                return Ok(posture(TailFlags::default(), None, 0, false));
+            }
+            if window.id_less_records > 0 {
+                rt.note(|t| t.id_less_records += window.id_less_records);
+            }
+            let key = format!("tail:{}|{}|{}", lp(session_id), rfc(after), rfc(last));
+            let event_time = EVENT_YEARS.contains(&last.year()).then(|| rfc(last));
+            let outcome = book_charge(
+                ledger,
+                rt,
+                &state,
+                BookedCharge {
+                    session_id,
+                    agent_id: None,
+                    amount_usd_cents: window.cents,
+                    key: &key,
+                    charge_source: ChargeSource::TurnHold,
+                    event_time: event_time.as_deref(),
+                    usage_known: true,
+                },
+            )?;
+            return Ok(match outcome {
+                SharedBudgetOutcome::Charged {
+                    reservation_id,
+                    pool_id,
+                    already_charged,
+                    amount_usd_cents,
+                    remaining_usd_cents,
+                    overrun_usd_cents,
+                    ..
+                } => {
+                    // The mark is written after the row; a retry finds the
+                    // same row by its key and writes the same mark.
+                    ledger.record_shared_watermark(
+                        reservation_id,
+                        &SettleWatermark {
+                            at: Some(last),
+                            message_ids: merged_ids(&previous_ids, &window.message_ids),
+                        },
+                    )?;
+                    SharedBudgetOutcome::TailSettled {
+                        reservation_id: Some(reservation_id),
+                        pool_id: Some(pool_id),
+                        amount_charged_usd_cents: if already_charged {
+                            0
+                        } else {
+                            amount_usd_cents
+                        },
+                        already_charged,
+                        remaining_usd_cents,
+                        overrun_usd_cents,
+                        unmeasured: false,
+                        unpriced: false,
+                        transcript_unverified: false,
+                        binding_mismatch: false,
+                    }
+                }
+                other => other,
+            });
+        }
+        PricedObservation::Unavailable(UsageUnavailable::NoUsageInWindow) => TailFlags::default(),
+        PricedObservation::SessionMismatch => {
+            rt.note(|t| t.binding_mismatches += 1);
+            TailFlags {
+                mismatch: true,
+                ..TailFlags::default()
+            }
+        }
+        PricedObservation::SessionUnverified => {
+            rt.note(|t| t.unverified += 1);
+            TailFlags {
+                unverified: true,
+                unmeasured: true,
+                ..TailFlags::default()
+            }
+        }
+        PricedObservation::UnpricedModels(models) => {
+            rt.note_unpriced(&models);
+            TailFlags {
+                unpriced: true,
+                unmeasured: true,
+                ..TailFlags::default()
+            }
+        }
+        PricedObservation::MalformedUsage | PricedObservation::Unavailable(_) => TailFlags {
+            unmeasured: true,
+            ..TailFlags::default()
+        },
+    };
+    Ok(posture(flags, None, 0, false))
+}
+
+#[derive(Default)]
+struct TailFlags {
+    unmeasured: bool,
+    unpriced: bool,
+    unverified: bool,
+    mismatch: bool,
 }
 
 /// Handles `SharedBudgetRequest::Status`.
@@ -1413,6 +1845,7 @@ pub fn status(
         transcript_unverified: 0,
         unmeasured_settlements: 0,
         unmeasured_charges: 0,
+        id_less_records: 0,
     };
     {
         let t = rt.telemetry.lock().unwrap_or_else(|e| e.into_inner());
@@ -1421,6 +1854,7 @@ pub fn status(
         report.transcript_unverified = t.unverified;
         report.unmeasured_settlements = t.unmeasured_settlements;
         report.unmeasured_charges = t.unmeasured_charges;
+        report.id_less_records = t.id_less_records;
     }
     let SharedBudgetFileState::Valid(cfg) = &effective.state else {
         return Ok(report);

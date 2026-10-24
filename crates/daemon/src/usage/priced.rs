@@ -10,28 +10,59 @@
 //! shared cap needs: the transcript must belong to the session being
 //! charged, and a subagent's records must not be charged twice.
 //!
-//! # Evidence status of the per-line field names (read this)
+//! # Evidence status of the per-line field names
 //!
 //! [`TRANSCRIPT_SESSION_FIELD`] and [`TRANSCRIPT_SIDECHAIN_FIELD`] are
-//! **UNCONFIRMED against a real Claude Code host**. This repository
-//! contains no transcript fixture, characterization document or test that
-//! names a per-line session field or a sidechain flag (the Claude Code
-//! hook payload's own `session_id` is documented in
-//! `docs/native-agent-lifecycle-characterization.md`, but that is the hook
-//! payload, not a transcript line). The names below are the ones the
-//! public Claude Code JSONL format is understood to use; the synthetic
-//! fixtures in this crate's tests *mirror* that understanding, so they
-//! prove the logic, not the host. Real-host confirmation is a later step.
+//! **CONFIRMED on a real Claude Code 2.1.306 host (2026-10-24)**: a real
+//! binary with an isolated HOME, a fake loopback upstream and a
+//! network-deny sandbox, synthetic prompts only. Observed:
 //!
-//! The failure mode of a wrong name is safe by construction: if real
-//! transcripts do not carry [`TRANSCRIPT_SESSION_FIELD`], every window is
-//! "unverifiable" and settles at the hold amount with `usage_known=false`
-//! (see [`PricedObservation::SessionUnverified`]); nothing is ever charged
-//! on an unverified binding. If real transcripts do not carry
-//! [`TRANSCRIPT_SIDECHAIN_FIELD`], sidechain records are not excluded from
-//! a parent window, which would double-count with the subagent charge --
-//! so that name needs the same real-host confirmation before the subagent
-//! path is relied on.
+//! - every main-transcript conversation line carries `sessionId` equal to
+//!   the hook payload's `session_id`, and `isSidechain: false`;
+//! - a subagent's lines are NOT inline: they live in a separate file
+//!   `<session-dir>/subagents/agent-<agent_id>.jsonl` (session-dir = the
+//!   hook's `transcript_path` without `.jsonl`), carry `isSidechain: true`,
+//!   an `agentId`, and the **parent's** `sessionId`; `SubagentStop` carries
+//!   `agent_id`, `agent_type` and `agent_transcript_path`, with `session_id`
+//!   equal to the parent's; each subagent file holds only its own agent's
+//!   lines (not cumulative across agents);
+//! - `--resume` keeps the same `sessionId` and appends to the same file;
+//! - one API message with several content blocks is written as several
+//!   `assistant` lines with the same `message.id`, identical
+//!   `message.usage` and `apiBlockIndex` 0, 1, ...;
+//! - timestamps are ISO-8601 millisecond `Z` but not strictly monotonic in
+//!   file order, and some lines (`atis-latch`, `last-prompt`, `cost-state`,
+//!   `mode`) have no timestamp at all;
+//! - flush lag is real and systematic: at `Stop` the turn's final
+//!   `end_turn` assistant line is often not yet in the file, and at
+//!   `SubagentStop` a subagent's file may have no assistant line yet.
+//!
+//! Still unverified on a real host: the post-`/compact` transcript. The
+//! fixtures in this crate reproduce the *shape* above with synthetic ids.
+//! A mismatch of these names would fail safe for the session field (every
+//! window unverifiable) but not for the sidechain flag, so a host upgrade
+//! that renames either must be re-checked.
+//!
+//! # What "fails safe" does and does not mean
+//!
+//! Every window that cannot be measured (unverified session, unpriced
+//! model, malformed counts, scan cap, mismatch) settles at the flat hold
+//! amount. That is conservative **only if the hold is at least the real
+//! cost of the turn**. An expensive turn settled at a small hold is
+//! under-counted: the cap is an estimate, not a guarantee, and a larger
+//! `turn_hold_usd_cents` is the only lever.
+//!
+//! # Watermark, ordering and flush lag
+//!
+//! The host writes the transcript asynchronously, so records stamped before
+//! a Stop are routinely flushed after it. The window therefore starts after
+//! the newest record timestamp **already counted** (persisted on the
+//! settled hold), not after the wall-clock time of the Stop. Residuals: a
+//! record stamped at or before an already-counted record but flushed later
+//! is not recovered; a `message.id` whose content blocks straddle the
+//! watermark may have its tail blocks counted again by the next window (an
+//! over-count, the safe direction); and the last turn of a session is never
+//! recovered after its final Stop.
 //!
 //! # Session binding (never inferred)
 //!
@@ -88,7 +119,7 @@
 //! returned. The session id from a *different* session is compared and
 //! dropped, never returned.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::path::Path;
 
@@ -102,18 +133,14 @@ use libra_governor_gateway::pricing::PricingTable;
 use super::{scan_lines_backward, ScanEnd, UsageUnavailable};
 
 /// The per-line field of a Claude Code JSONL transcript that names the
-/// session a record belongs to.
-///
-/// **UNCONFIRMED against a real host** -- see this module's header. No
-/// fixture, characterization document or test in this repository
-/// evidences it; the value is the name the public transcript format is
-/// understood to use. A wrong value fails safe (every window becomes
-/// unverifiable and settles at the hold amount).
+/// session a record belongs to. **Confirmed on Claude Code 2.1.306,
+/// 2026-10-24** (see this module's header for what was observed).
 pub const TRANSCRIPT_SESSION_FIELD: &str = "sessionId";
 
-/// The per-line boolean marking a subagent ("sidechain") record that sits
-/// inside a transcript. **UNCONFIRMED against a real host**, same status
-/// as [`TRANSCRIPT_SESSION_FIELD`].
+/// The per-line boolean marking a subagent ("sidechain") record. **Confirmed
+/// on Claude Code 2.1.306, 2026-10-24**: subagent lines carry `true` and live
+/// in a separate `subagents/agent-<id>.jsonl` file; main-transcript lines
+/// carry `false`.
 pub const TRANSCRIPT_SIDECHAIN_FIELD: &str = "isSidechain";
 
 /// Bytes a budget read may scan: a parent window or a whole subagent file.
@@ -125,6 +152,16 @@ pub const BUDGET_SCAN_CAP_BYTES: u64 = 32 * 1024 * 1024;
 /// names the gap instead of hiding it.
 const MISSING_MODEL: &str = "<missing>";
 
+/// How far older than the watermark a record must be before the reverse
+/// scan stops. Hosts do not write strictly monotonic timestamps (a
+/// tool-result or sidechain line can carry an earlier stamp than the
+/// assistant line above it), so the first old line is not the end of the
+/// window. Ten minutes is a judgement, not a measured host property
+/// (a real 2.1.306 host showed millisecond-scale inversions; see the
+/// real-host checklist in ADR-0026): out-of-order stamps further apart than
+/// this can still hide newer records.
+pub const REORDER_SLACK: time::Duration = time::Duration::minutes(10);
+
 /// One cent in pico-dollars (10^-12 USD).
 const PICO_PER_CENT: u128 = 10_000_000_000;
 /// Prices are dollars per million tokens, i.e. micro-dollars per token;
@@ -134,13 +171,20 @@ const PRICE_SCALE: f64 = 1_000_000.0;
 
 /// What a read covers.
 #[derive(Debug, Clone, Copy)]
-pub enum ReadMode {
+pub enum ReadMode<'a> {
     /// A parent transcript: only records strictly after `after` (the
-    /// watermark of the last settled window), sidechain records excluded.
-    ParentWindow { after: OffsetDateTime },
-    /// A subagent's own file: every record, cumulative. The file is the
-    /// subagent's, so its records are counted whatever they are flagged.
-    WholeFile,
+    /// newest record timestamp already counted), sidechain records
+    /// excluded, and lines of a `message.id` in `counted_ids` skipped (the
+    /// tail content blocks of a message an earlier window already counted).
+    ParentWindow {
+        after: OffsetDateTime,
+        counted_ids: &'a HashSet<String>,
+    },
+    /// A subagent's own file: every record, cumulative within that file.
+    /// The file is the subagent's, so its records are counted whatever they
+    /// are flagged. When `agent_id` is given, a usage record carrying a
+    /// different `agentId` makes the file a session mismatch.
+    WholeFile { agent_id: Option<&'a str> },
 }
 
 /// Token counts by tier for one model, summed over the window.
@@ -175,15 +219,22 @@ impl Tiers {
 }
 
 /// A fully priced window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PricedWindow {
     /// Libra-accounted USD cents, rounded up once for the window.
     pub cents: u64,
     /// Distinct turns that contributed (a content-block-repeated turn
     /// counts once).
     pub records: u64,
-    /// The newest record timestamp seen, if any record carried one.
+    /// The newest timestamp among the records this window counted.
     pub last_event_time: Option<OffsetDateTime>,
+    /// The `message.id`s counted (sorted); becomes part of the next
+    /// window's watermark.
+    pub message_ids: Vec<String>,
+    /// Counted records that carried no `message.id`. Each is its own
+    /// message (it cannot be deduplicated), so a host that omits ids would
+    /// double count content blocks; surfaced so it is not silent.
+    pub id_less_records: u64,
 }
 
 /// The result of a priced, session-bound read. Each non-`Priced` variant
@@ -200,6 +251,9 @@ pub enum PricedObservation {
     /// No record named a different session, but at least one could not be
     /// verified (field absent or not a string).
     SessionUnverified,
+    /// At least one usage record carried a token count that is not a
+    /// non-negative integer, so the window's cost cannot be known.
+    MalformedUsage,
     /// Nothing could be measured: no path, unreadable, over the cap, no
     /// usage in the window, or a usage record that cannot be placed in
     /// time ([`UsageUnavailable::Inconsistent`]).
@@ -237,6 +291,8 @@ struct PricedLine {
     session: Option<Lenient<String>>,
     #[serde(rename = "isSidechain", default)]
     sidechain: Option<Lenient<bool>>,
+    #[serde(rename = "agentId", default)]
+    agent: Option<Lenient<String>>,
     message: Option<PricedMessage>,
 }
 
@@ -246,25 +302,40 @@ struct PricedMessage {
     id: Option<Lenient<String>>,
     #[serde(default)]
     model: Option<Lenient<String>>,
-    usage: Option<PricedUsage>,
+    usage: Option<Lenient<PricedUsage>>,
 }
 
+/// Every count is lenient: a token field that is present but not a
+/// non-negative integer (a float, a string, a negative) must not make serde
+/// fail the whole line and drop the record silently (that would be an
+/// invisible under-count). It is detected and the window settles
+/// conservatively instead (see [`PricedObservation::MalformedUsage`]).
+/// An explicit `null` or an absent count is zero, as in the token reader.
 #[derive(Deserialize)]
 struct PricedUsage {
-    input_tokens: Option<u64>,
-    cache_creation_input_tokens: Option<u64>,
-    cache_read_input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
+    #[serde(default)]
+    input_tokens: Option<Lenient<u64>>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<Lenient<u64>>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<Lenient<u64>>,
+    #[serde(default)]
+    output_tokens: Option<Lenient<u64>>,
 }
 
 impl PricedUsage {
-    fn tiers(&self) -> Tiers {
-        Tiers {
-            input: self.input_tokens.unwrap_or(0),
-            cache_creation: self.cache_creation_input_tokens.unwrap_or(0),
-            cache_read: self.cache_read_input_tokens.unwrap_or(0),
-            output: self.output_tokens.unwrap_or(0),
-        }
+    /// `None` when any present count is not a non-negative integer.
+    fn tiers(self) -> Option<Tiers> {
+        let count = |v: Option<Lenient<u64>>| match v {
+            None => Some(0),
+            Some(l) => l.into_value(),
+        };
+        Some(Tiers {
+            input: count(self.input_tokens)?,
+            cache_creation: count(self.cache_creation_input_tokens)?,
+            cache_read: count(self.cache_read_input_tokens)?,
+            output: count(self.output_tokens)?,
+        })
     }
 }
 
@@ -281,6 +352,7 @@ struct Accumulator {
     mismatch: bool,
     unverified: bool,
     untimed: bool,
+    malformed: bool,
     last_event_time: Option<OffsetDateTime>,
 }
 
@@ -324,11 +396,21 @@ fn visit_line(
         .timestamp
         .and_then(Lenient::into_value)
         .and_then(|ts| OffsetDateTime::parse(&ts, &Rfc3339).ok());
-    if let (ReadMode::ParentWindow { after }, Some(ts)) = (mode, timestamp) {
-        // Strictly after the watermark: a record stamped exactly at the
-        // end of the previous window was already settled with it.
+    if let (ReadMode::ParentWindow { after, .. }, Some(ts)) = (mode, timestamp) {
         if ts <= after {
-            return ControlFlow::Break(());
+            // Not counted: it is at or before the watermark. But the scan
+            // does NOT stop here. A host may stamp a user / tool-result /
+            // sidechain line out of order, and breaking at the first old
+            // line of any type would hide every newer assistant record
+            // above it (an invisible under-count). The scan stops only
+            // once records are older than the watermark by more than
+            // [`REORDER_SLACK`]; failing that it ends at the byte bound
+            // ([`BUDGET_SCAN_CAP_BYTES`]), which is reported as
+            // unmeasured, never as a partial sum.
+            if ts < after - REORDER_SLACK {
+                return ControlFlow::Break(());
+            }
+            return ControlFlow::Continue(());
         }
     }
     if record.kind.and_then(Lenient::into_value).as_deref() != Some("assistant") {
@@ -347,6 +429,15 @@ fn visit_line(
     let Some(usage) = message.usage else {
         return ControlFlow::Continue(());
     };
+    let usage = usage.into_value().and_then(PricedUsage::tiers);
+    let message_id = message.id.and_then(Lenient::into_value);
+    if let (ReadMode::ParentWindow { counted_ids, .. }, Some(id)) = (mode, message_id.as_ref()) {
+        if counted_ids.contains(id) {
+            // A later content block of a message an earlier window already
+            // counted (the host flushed it after that Stop).
+            return ControlFlow::Continue(());
+        }
+    }
 
     // Binding is judged on usage records only: they are what would be
     // charged.
@@ -354,6 +445,18 @@ fn visit_line(
         Some(s) if s == expected_session => {}
         Some(_) => acc.mismatch = true,
         None => acc.unverified = true,
+    }
+    if let ReadMode::WholeFile {
+        agent_id: Some(expected),
+    } = mode
+    {
+        if record
+            .agent
+            .and_then(Lenient::into_value)
+            .is_some_and(|a| a != expected)
+        {
+            acc.mismatch = true;
+        }
     }
     if matches!(mode, ReadMode::ParentWindow { .. }) && timestamp.is_none() {
         // Cannot be placed relative to the watermark, so counting it could
@@ -364,13 +467,18 @@ fn visit_line(
         acc.last_event_time = Some(acc.last_event_time.map_or(ts, |t| t.max(ts)));
     }
 
-    let tiers = usage.tiers();
+    let Some(tiers) = usage else {
+        // Present but not integer counts: counted as a record whose cost
+        // is unknowable, flagged, never dropped.
+        acc.malformed = true;
+        return ControlFlow::Continue(());
+    };
     let model = message
         .model
         .and_then(Lenient::into_value)
         .filter(|m| !m.trim().is_empty())
         .unwrap_or_else(|| MISSING_MODEL.to_string());
-    match message.id.and_then(Lenient::into_value) {
+    match message_id {
         Some(id) => {
             acc.by_id
                 .entry(id)
@@ -396,10 +504,15 @@ fn finish(mut acc: Accumulator, table: &PricingTable) -> PricedObservation {
     if acc.unverified {
         return PricedObservation::SessionUnverified;
     }
+    if acc.malformed {
+        return PricedObservation::MalformedUsage;
+    }
     if acc.untimed {
         return PricedObservation::Unavailable(UsageUnavailable::Inconsistent);
     }
     let distinct_turns = acc.by_id.len() as u64 + acc.id_less_records;
+    let mut message_ids: Vec<String> = acc.by_id.keys().cloned().collect();
+    message_ids.sort_unstable();
     for (_, (tiers, model)) in acc.by_id.drain() {
         acc.per_model.entry(model).or_default().add(tiers);
     }
@@ -411,6 +524,8 @@ fn finish(mut acc: Accumulator, table: &PricingTable) -> PricedObservation {
             cents,
             records: distinct_turns,
             last_event_time: acc.last_event_time,
+            message_ids,
+            id_less_records: acc.id_less_records,
         }),
         Err(models) => PricedObservation::UnpricedModels(models),
     }
@@ -502,6 +617,7 @@ mod tests {
             f.path(),
             ReadMode::ParentWindow {
                 after: epoch_plus(after),
+                counted_ids: &HashSet::new(),
             },
             SESSION,
             &PricingTable::pinned(),
@@ -536,7 +652,7 @@ mod tests {
         // Counted (and bound) in a whole-file read.
         let whole = observe_priced(
             f.path(),
-            ReadMode::WholeFile,
+            ReadMode::WholeFile { agent_id: None },
             SESSION,
             &PricingTable::pinned(),
             BUDGET_SCAN_CAP_BYTES,
@@ -720,6 +836,7 @@ mod tests {
             f.path(),
             ReadMode::ParentWindow {
                 after: epoch_plus(0),
+                counted_ids: &HashSet::new(),
             },
             SESSION,
             &table,
@@ -923,7 +1040,7 @@ mod tests {
     fn a_missing_or_empty_transcript_is_unavailable() {
         let missing = observe_priced(
             Path::new("/nonexistent/definitely/not/here.jsonl"),
-            ReadMode::WholeFile,
+            ReadMode::WholeFile { agent_id: None },
             SESSION,
             &PricingTable::pinned(),
             BUDGET_SCAN_CAP_BYTES,
@@ -958,7 +1075,7 @@ mod tests {
         ]);
         let o = observe_priced(
             f.path(),
-            ReadMode::WholeFile,
+            ReadMode::WholeFile { agent_id: None },
             SESSION,
             &PricingTable::pinned(),
             64,
@@ -987,5 +1104,207 @@ mod tests {
         write!(f, r#"{{"type":"assistant","timestamp":"{}","mess"#, rfc(11)).unwrap();
         f.flush().unwrap();
         assert_eq!(cents(observe(&f, 0)), 300);
+    }
+    fn observe_skipping(
+        f: &tempfile::NamedTempFile,
+        after: i64,
+        counted: &[&str],
+    ) -> PricedObservation {
+        let ids: HashSet<String> = counted.iter().map(|s| s.to_string()).collect();
+        observe_priced(
+            f.path(),
+            ReadMode::ParentWindow {
+                after: epoch_plus(after),
+                counted_ids: &ids,
+            },
+            SESSION,
+            &PricingTable::pinned(),
+            BUDGET_SCAN_CAP_BYTES,
+        )
+    }
+
+    #[test]
+    fn lines_of_an_already_counted_message_are_skipped_and_do_not_move_the_watermark() {
+        let f = file(&[
+            line(
+                20,
+                "done",
+                "claude-sonnet-4-5",
+                [1_000_000, 0, 0, 0],
+                &sid(SESSION),
+            ),
+            line(
+                30,
+                "new",
+                "claude-sonnet-4-5",
+                [1_000_000, 0, 0, 0],
+                &sid(SESSION),
+            ),
+        ]);
+        let PricedObservation::Priced(w) = observe_skipping(&f, 10, &["done"]) else {
+            panic!("expected Priced");
+        };
+        assert_eq!(w.cents, 300);
+        assert_eq!(w.message_ids, vec!["new".to_string()]);
+        assert_eq!(w.last_event_time, Some(epoch_plus(30)));
+        // Only skipped lines in the window: nothing to measure.
+        let only = file(&[line(
+            20,
+            "done",
+            "claude-sonnet-4-5",
+            [1, 0, 0, 0],
+            &sid(SESSION),
+        )]);
+        assert_eq!(
+            observe_skipping(&only, 10, &["done"]),
+            PricedObservation::Unavailable(UsageUnavailable::NoUsageInWindow)
+        );
+    }
+
+    #[test]
+    fn an_old_line_within_the_slack_does_not_truncate_the_scan() {
+        let user = |secs: i64| {
+            format!(
+                r#"{{"type":"user","timestamp":"{}",{}"message":{{"role":"user"}}}}"#,
+                rfc(secs),
+                sid(SESSION)
+            )
+        };
+        // Order: A (new), an old user line inside the slack, B (new).
+        let f = file(&[
+            line(
+                2_000,
+                "a",
+                "claude-sonnet-4-5",
+                [1_000_000, 0, 0, 0],
+                &sid(SESSION),
+            ),
+            user(1_950),
+            line(
+                2_010,
+                "b",
+                "claude-sonnet-4-5",
+                [1_000_000, 0, 0, 0],
+                &sid(SESSION),
+            ),
+        ]);
+        assert_eq!(cents(observe(&f, 1_990)), 600);
+        // Beyond the slack the scan stops: the documented limit.
+        let far = file(&[
+            line(
+                5_000,
+                "a",
+                "claude-sonnet-4-5",
+                [1_000_000, 0, 0, 0],
+                &sid(SESSION),
+            ),
+            user(100),
+            line(
+                5_010,
+                "b",
+                "claude-sonnet-4-5",
+                [1_000_000, 0, 0, 0],
+                &sid(SESSION),
+            ),
+        ]);
+        assert_eq!(cents(observe(&far, 4_990)), 300);
+    }
+
+    #[test]
+    fn timestamp_less_lines_are_ignored_and_never_break_the_scan() {
+        let f = file(&[
+            line(
+                10,
+                "a",
+                "claude-sonnet-4-5",
+                [1_000_000, 0, 0, 0],
+                &sid(SESSION),
+            ),
+            r#"{"type":"last-prompt","sessionId":"sess-A"}"#.to_string(),
+            r#"{"type":"atis-latch"}"#.to_string(),
+            line(
+                20,
+                "b",
+                "claude-sonnet-4-5",
+                [1_000_000, 0, 0, 0],
+                &sid(SESSION),
+            ),
+        ]);
+        assert_eq!(cents(observe(&f, 0)), 600);
+    }
+
+    #[test]
+    fn non_integer_token_counts_are_malformed_not_dropped() {
+        for bad in ["1.5", "\"7\"", "-3", "true"] {
+            let l = line(
+                10,
+                "m",
+                "claude-sonnet-4-5",
+                [1_000_000, 0, 0, 0],
+                &sid(SESSION),
+            )
+            .replace(
+                "\"input_tokens\":1000000",
+                &format!("\"input_tokens\":{bad}"),
+            );
+            let f = file(&[
+                l,
+                line(
+                    11,
+                    "ok",
+                    "claude-sonnet-4-5",
+                    [1_000_000, 0, 0, 0],
+                    &sid(SESSION),
+                ),
+            ]);
+            assert_eq!(observe(&f, 0), PricedObservation::MalformedUsage, "{bad}");
+        }
+        // null and absent counts are zero, as in the token reader.
+        let l = line(10, "m", "claude-sonnet-4-5", [0, 0, 0, 0], &sid(SESSION))
+            .replace("\"input_tokens\":0", "\"input_tokens\":null");
+        assert!(matches!(
+            observe(&file(&[l]), 0),
+            PricedObservation::Priced(_)
+        ));
+    }
+
+    #[test]
+    fn lines_without_a_message_id_are_each_their_own_message_and_counted_in_the_report() {
+        let l = |secs: i64| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"{}",{}"message":{{"model":"claude-sonnet-4-5","usage":{{"input_tokens":1000000}}}}}}"#,
+                rfc(secs),
+                sid(SESSION)
+            )
+        };
+        let PricedObservation::Priced(w) = observe(&file(&[l(10), l(11)]), 0) else {
+            panic!("expected Priced");
+        };
+        assert_eq!((w.cents, w.records, w.id_less_records), (600, 2, 2));
+        assert!(w.message_ids.is_empty());
+    }
+
+    #[test]
+    fn a_subagent_line_naming_another_agent_is_a_mismatch() {
+        let l = line(
+            10,
+            "m",
+            "claude-sonnet-4-5",
+            [1_000_000, 0, 0, 0],
+            &format!("{}\"agentId\":\"zzz\",", sid(SESSION)),
+        );
+        let f = file(&[l]);
+        let read = |agent| {
+            observe_priced(
+                f.path(),
+                ReadMode::WholeFile { agent_id: agent },
+                SESSION,
+                &PricingTable::pinned(),
+                BUDGET_SCAN_CAP_BYTES,
+            )
+        };
+        assert_eq!(read(Some("aaa")), PricedObservation::SessionMismatch);
+        assert!(matches!(read(Some("zzz")), PricedObservation::Priced(_)));
+        assert!(matches!(read(None), PricedObservation::Priced(_)));
     }
 }

@@ -78,6 +78,19 @@ pub enum SharedBudgetRequest {
         agent_id: Option<String>,
         agent_transcript_path: String,
     },
+    /// Settle the tail of a session's main transcript (HORO-2196): the
+    /// records past the lane's watermark that no `Stop` has counted yet
+    /// (the host flushes its transcript asynchronously, so the final
+    /// message of a session is often not in the file at the last `Stop`).
+    /// Meant for `SessionEnd`. Charged as a settled `agent_absent` row
+    /// (`charge_source = turn_hold`, `usage_known = true`) with the same
+    /// session binding, de-duplication and watermark as a `Stop`
+    /// settlement; idempotent. Nothing is charged when nothing is
+    /// measurable: a tail has no hold to fall back to.
+    SettleTail {
+        session_id: String,
+        transcript_path: String,
+    },
     /// Read-only budget posture.
     Status {},
 }
@@ -115,10 +128,6 @@ pub enum SharedBudgetRefusal {
     KeyConflict,
     /// The period's pool exists in a unit other than USD cents.
     PoolUnitMismatch,
-    /// The transcript's own per-line session field names a different
-    /// session than the request (HORO-2196). Nothing is charged: the
-    /// spend belongs to the session the file really records.
-    TranscriptSessionMismatch,
 }
 
 /// State reported by `Check`.
@@ -269,6 +278,10 @@ pub struct SharedBudgetStatus {
     /// be measured.
     #[serde(default)]
     pub unmeasured_charges: u64,
+    /// Counted transcript records that carried no `message.id` and so
+    /// could not be de-duplicated.
+    #[serde(default)]
+    pub id_less_records: u64,
 }
 
 /// The response to a [`SharedBudgetRequest`] (embedded in
@@ -344,7 +357,31 @@ pub enum SharedBudgetOutcome {
         unpriced: bool,
         /// The transcript's session could not be verified.
         transcript_unverified: bool,
+        /// The transcript's per-line session field named a different
+        /// session than the request. Its spend was not imported; the
+        /// unmeasured fallback was charged instead.
+        #[serde(default)]
+        binding_mismatch: bool,
         event_time_clamped: bool,
+    },
+    /// Answer to [`SharedBudgetRequest::SettleTail`].
+    TailSettled {
+        /// The row written; `None` when nothing was charged.
+        reservation_id: Option<SharedPoolReservationId>,
+        pool_id: Option<String>,
+        amount_charged_usd_cents: u64,
+        /// An identical earlier tail charge was found (a retry).
+        already_charged: bool,
+        remaining_usd_cents: i64,
+        overrun_usd_cents: u64,
+        /// Records past the watermark exist but could not be measured
+        /// (unreadable, over the cap, malformed, unpriced, unverifiable);
+        /// nothing was charged for them.
+        unmeasured: bool,
+        unpriced: bool,
+        transcript_unverified: bool,
+        /// The transcript named another session; nothing was imported.
+        binding_mismatch: bool,
     },
     Status(Box<SharedBudgetStatus>),
 }
@@ -450,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_outcome_and_refusal_round_trip() {
+    fn transcript_outcome_round_trips() {
         let charged = SharedBudgetOutcome::TranscriptCharged {
             reservation_id: None,
             pool_id: None,
@@ -464,6 +501,7 @@ mod tests {
             unmeasured: false,
             unpriced: false,
             transcript_unverified: false,
+            binding_mismatch: true,
             event_time_clamped: false,
         };
         let json = serde_json::to_value(&charged).unwrap();
@@ -471,13 +509,6 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<SharedBudgetOutcome>(json).unwrap(),
             charged
-        );
-        let refused = SharedBudgetOutcome::Refused {
-            reason: SharedBudgetRefusal::TranscriptSessionMismatch,
-        };
-        assert_eq!(
-            serde_json::to_value(&refused).unwrap()["reason"],
-            "transcript_session_mismatch"
         );
     }
 
@@ -509,6 +540,7 @@ mod tests {
             transcript_unverified: 2,
             unmeasured_settlements: 4,
             unmeasured_charges: 5,
+            id_less_records: 6,
         })
         .unwrap();
         let obj = status.as_object_mut().unwrap();
@@ -518,6 +550,7 @@ mod tests {
             "transcript_unverified",
             "unmeasured_settlements",
             "unmeasured_charges",
+            "id_less_records",
         ] {
             obj.remove(k);
         }

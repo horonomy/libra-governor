@@ -1,0 +1,14 @@
+{"type":"queue-operation","timestamp":"2026-10-24T03:05:25.203Z","sessionId":"00000000-0000-4000-8000-0000000000a1","operation":"enqueue"}
+{"type":"user","timestamp":"2026-10-24T03:05:25.215Z","sessionId":"00000000-0000-4000-8000-0000000000a1","isSidechain":false,"message":{"role":"user","content":"synthetic prompt"}}
+{"type":"atis-latch","sessionId":"00000000-0000-4000-8000-0000000000a1"}
+{"type":"attachment","timestamp":"2026-10-24T03:05:25.257Z","sessionId":"00000000-0000-4000-8000-0000000000a1","isSidechain":false}
+{"type":"api-request","timestamp":"2026-10-24T03:05:25.269Z","sessionId":"00000000-0000-4000-8000-0000000000a1"}
+{"type":"assistant","timestamp":"2026-10-24T03:05:25.272Z","sessionId":"00000000-0000-4000-8000-0000000000a1","isSidechain":false,"apiBlockIndex":0,"message":{"id":"msg_a","model":"claude-opus-5-5","role":"assistant","usage":{"input_tokens":1000000,"cache_creation_input_tokens":200000,"cache_read_input_tokens":300000,"output_tokens":50000}}}
+{"type":"assistant","timestamp":"2026-10-24T03:05:25.273Z","sessionId":"00000000-0000-4000-8000-0000000000a1","isSidechain":false,"apiBlockIndex":1,"message":{"id":"msg_a","model":"claude-opus-5-5","role":"assistant","usage":{"input_tokens":1000000,"cache_creation_input_tokens":200000,"cache_read_input_tokens":300000,"output_tokens":50000}}}
+{"type":"last-prompt","sessionId":"00000000-0000-4000-8000-0000000000a1"}
+{"type":"user","timestamp":"2026-10-24T03:05:25.271Z","sessionId":"00000000-0000-4000-8000-0000000000a1","isSidechain":false,"toolUseResult":{"usage":{"input_tokens":9000000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":9000000}},"message":{"role":"user","content":"tool result"}}
+{"type":"assistant","timestamp":"2026-10-24T03:05:25.461Z","sessionId":"00000000-0000-4000-8000-0000000000a1","isSidechain":false,"apiBlockIndex":0,"message":{"id":"msg_b","model":"claude-opus-5-5","role":"assistant","usage":{"input_tokens":500000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}}
+{"type":"cost-state","sessionId":"00000000-0000-4000-8000-0000000000a1"}
+{"type":"assistant","timestamp":"2026-10-24T03:05:25.625Z","sessionId":"00000000-0000-4000-8000-0000000000a1","isSidechain":false,"apiBlockIndex":0,"message":{"id":"msg_c","model":"claude-opus-5-5","role":"assistant","usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":100000}}}
+{"type":"system","timestamp":"2026-10-24T03:05:25.664Z","sessionId":"00000000-0000-4000-8000-0000000000a1","isSidechain":false}
+{"type":"mode","sessionId":"00000000-0000-4000-8000-0000000000a1"}

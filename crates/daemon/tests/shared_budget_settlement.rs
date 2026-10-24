@@ -368,6 +368,7 @@ fn transcribed(o: SharedBudgetOutcome) -> Tc {
             unmeasured,
             unpriced,
             transcript_unverified,
+            binding_mismatch,
             event_time_clamped,
             ..
         } => Tc {
@@ -380,6 +381,7 @@ fn transcribed(o: SharedBudgetOutcome) -> Tc {
             unmeasured,
             unpriced,
             unverified: transcript_unverified,
+            mismatch: binding_mismatch,
             clamped: event_time_clamped,
         },
         other => panic!("expected TranscriptCharged, got {other:?}"),
@@ -396,6 +398,7 @@ struct Tc {
     unmeasured: bool,
     unpriced: bool,
     unverified: bool,
+    mismatch: bool,
     clamped: bool,
 }
 
@@ -545,33 +548,41 @@ fn an_actual_above_the_hold_is_recorded_unclamped_and_the_next_admit_is_refused(
 // ---------------------------------------------------------------------
 
 #[test]
-fn another_sessions_transcript_charges_nothing_and_is_counted_then_its_own_stop_pays() {
+fn another_sessions_transcript_is_never_imported_but_the_turn_settles_at_the_hold() {
     let mut fx = Fx::new(Some(&cfg()), BASE);
     fx.admit_hold("sB");
     fx.admit_hold("sA");
     let tx = fx.path().join("a.jsonl");
-    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("sA"), false)]);
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(5), Some("sA"), false)]);
     fx.clock.set(at(60));
 
-    // Session B's hook was handed session A's transcript.
+    // Session B's hook was handed session A's transcript: A's 1500 cents
+    // are NOT imported into B, but B's turn is not free either.
     fx.finalize("sB", Some(&s(&tx)));
     let st = fx.status();
     assert_eq!(
         totals(&st),
-        (0, 2_000),
-        "B charged nothing; both holds stand"
+        (1_000, 1_000),
+        "B settled at its hold; A's hold stands"
     );
     assert_eq!(st.transcript_binding_mismatches, 1);
-    assert_eq!(
-        fx.lane("sB")[0].state,
-        libra_governor_domain::ReservationState::Active,
-        "B's hold is left for its TTL"
-    );
+    assert_eq!(st.unmeasured_settlements, 1);
+    let b = fx.lane("sB");
+    assert_eq!(b[0].settled_amount, Some(1_000));
+    assert_eq!(b[0].usage_known, Some(false));
 
     // Spend is counted by its true session's own Stop.
     fx.finalize("sA", Some(&s(&tx)));
-    assert_eq!(totals(&fx.status()), (300, 1_000));
-    assert_eq!(fx.status().transcript_binding_mismatches, 1);
+    assert_eq!(totals(&fx.status()), (1_000 + 1_500, 0));
+
+    // The watermark moved, so the same foreign file is not judged again by
+    // B's next turn: no repeated mismatch for the same stale content.
+    fx.clock.set(at(100));
+    fx.admit_hold("sB");
+    fx.clock.set(at(120));
+    fx.finalize("sB", Some(&s(&tx)));
+    let st = fx.status();
+    assert_eq!(st.transcript_binding_mismatches, 1, "not repeated forever");
 }
 
 #[test]
@@ -612,7 +623,11 @@ fn a_window_mixing_equal_and_foreign_sessions_is_refused_whole() {
     fx.clock.set(at(60));
     fx.finalize("s1", Some(&s(&tx)));
     let st = fx.status();
-    assert_eq!(totals(&st), (0, 1_000), "never charged partially");
+    assert_eq!(
+        totals(&st),
+        (1_000, 0),
+        "never imported partially; the hold is booked"
+    );
     assert_eq!(st.transcript_binding_mismatches, 1);
 }
 
@@ -1013,17 +1028,17 @@ fn an_unpriced_or_unverifiable_subagent_is_charged_the_fallback_with_its_flag() 
 }
 
 #[test]
-fn another_sessions_subagent_transcript_is_refused_and_charges_nothing() {
+fn another_sessions_subagent_transcript_is_not_imported_and_takes_the_fallback_once() {
     let mut fx = Fx::new(Some(&cfg()), BASE);
     let sub = fx.path().join("agent.jsonl");
     write_lines(&sub, &[rec(10, "a1", SONNET, mi(5), Some("other"), true)]);
-    let before = fx.fingerprint();
-    expect_refused(
-        fx.transcript_charge("s1", Some("x"), &s(&sub)),
-        SharedBudgetRefusal::TranscriptSessionMismatch,
-    );
-    assert_eq!(fx.fingerprint(), before, "not even the fallback is charged");
-    assert_eq!(fx.status().transcript_binding_mismatches, 1);
+    let o = transcribed(fx.transcript_charge("s1", Some("x"), &s(&sub)));
+    assert_eq!(o.charged, 1_000, "the fallback, not the foreign 1500");
+    assert!(o.mismatch && o.unmeasured && !o.usage_known);
+    let again = transcribed(fx.transcript_charge("s1", Some("x"), &s(&sub)));
+    assert_eq!((again.charged, again.already), (0, true));
+    assert_eq!(totals(&fx.status()), (1_000, 0));
+    assert_eq!(fx.status().transcript_binding_mismatches, 2);
 }
 
 #[test]
@@ -1139,4 +1154,447 @@ fn parent_and_subagent_reconcile_with_no_duplicated_spend() {
         .find(|e| e.agent_id.as_deref() == Some("x"))
         .unwrap();
     assert_eq!((main.used_usd_cents, agent.used_usd_cents), (450, 750));
+}
+
+// ---------------------------------------------------------------------
+// Flush lag, ordering, watermark (real-host findings, Claude Code 2.1.306)
+// ---------------------------------------------------------------------
+
+/// A subagent line: native `agentId` and `isSidechain`.
+fn sub_rec(secs: i64, id: &str, tiers: [u64; 4], session: &str, agent: &str) -> String {
+    rec(secs, id, SONNET, tiers, Some(session), true).replace(
+        "\"isSidechain\":true,",
+        &format!("\"isSidechain\":true,\"agentId\":\"{agent}\","),
+    )
+}
+
+#[test]
+fn a_record_flushed_after_the_stop_is_recovered_by_the_next_stop() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    fx.admit_hold("s1");
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(totals(&fx.status()), (300, 0));
+
+    // The host flushes m2 (stamped 55, BEFORE the Stop at 60) only later.
+    append_lines(&tx, &[rec(55, "m2", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(100));
+    fx.admit_hold("s1");
+    append_lines(&tx, &[rec(110, "m3", SONNET, mi(2), Some("s1"), false)]);
+    fx.clock.set(at(150));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(
+        totals(&fx.status()),
+        (300 + 300 + 600, 0),
+        "m2 was stamped before the first Stop's wall clock but is not lost"
+    );
+}
+
+#[test]
+fn tail_blocks_of_an_already_counted_message_are_not_counted_again() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    fx.admit_hold("s1");
+    // Only block 0 of message X is in the file at the first Stop.
+    write_lines(&tx, &[rec(10, "x", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(totals(&fx.status()), (300, 0));
+
+    // Block 1 of X (same id, same usage) arrives later, plus a new message.
+    append_lines(&tx, &[rec(12, "x", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(100));
+    fx.admit_hold("s1");
+    append_lines(&tx, &[rec(110, "y", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(150));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(
+        totals(&fx.status()),
+        (600, 0),
+        "X counted once across both windows; only Y is new"
+    );
+}
+
+#[test]
+fn an_out_of_order_old_line_does_not_hide_newer_records_above_it() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    fx.admit_hold("s1");
+    write_lines(&tx, &[rec(100, "m0", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(150));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(totals(&fx.status()), (300, 0));
+
+    // File order: A (new), O (an OLD user line, stamped 95), B (new).
+    let old_user = format!(
+        r#"{{"type":"user","timestamp":"{}","sessionId":"s1","isSidechain":false,"message":{{"role":"user","content":"x"}}}}"#,
+        at(95).format(&Rfc3339).unwrap()
+    );
+    fx.admit_hold("s1");
+    append_lines(
+        &tx,
+        &[
+            rec(200, "a", SONNET, mi(1), Some("s1"), false),
+            old_user,
+            rec(210, "b", SONNET, mi(2), Some("s1"), false),
+        ],
+    );
+    fx.clock.set(at(250));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(
+        totals(&fx.status()),
+        (300 + 900, 0),
+        "both A and B are counted"
+    );
+}
+
+#[test]
+fn a_token_count_that_is_not_an_integer_is_flagged_not_dropped() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    fx.admit_hold("s1");
+    let tx = fx.path().join("s1.jsonl");
+    let bad = rec(10, "m1", SONNET, mi(1), Some("s1"), false)
+        .replace("\"input_tokens\":1000000", "\"input_tokens\":1000000.5");
+    write_lines(&tx, &[bad, rec(20, "m2", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    let st = fx.status();
+    assert_eq!(
+        totals(&st),
+        (1_000, 0),
+        "the hold, not a silent partial sum"
+    );
+    assert_eq!(st.unmeasured_settlements, 1);
+    assert_eq!(fx.lane("s1")[0].usage_known, Some(false));
+}
+
+#[test]
+fn two_stops_for_one_invocation_are_handled() {
+    // Background-subagent case: a second Stop (and a second prompt) can fire
+    // for one print invocation.
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    fx.admit_hold("s1");
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    // A second Stop with no hold in between: nothing to settle.
+    let before = fx.fingerprint();
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(fx.fingerprint(), before);
+    // The notification turn: a second prompt admits a new hold, a second Stop
+    // settles it from the records written meanwhile.
+    fx.clock.set(at(70));
+    fx.admit_hold("s1");
+    append_lines(&tx, &[rec(80, "m2", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(90));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(totals(&fx.status()), (600, 0));
+}
+
+// ---------------------------------------------------------------------
+// Real-shaped fixtures (synthetic ids, structure of Claude Code 2.1.306)
+// ---------------------------------------------------------------------
+
+const REAL_SESSION: &str = "00000000-0000-4000-8000-0000000000a1";
+const REAL_AGENT: &str = "a0123456789abcdef";
+const REAL_START: &str = "2026-10-24T03:05:20Z";
+const REAL_STOP: &str = "2026-10-24T03:05:30Z";
+
+fn stage_real_layout(fx: &Fx) -> (std::path::PathBuf, std::path::PathBuf) {
+    let main = fx.path().join(format!("{REAL_SESSION}.jsonl"));
+    let subdir = fx.path().join(REAL_SESSION).join("subagents");
+    std::fs::create_dir_all(&subdir).unwrap();
+    let sub = subdir.join(format!("agent-{REAL_AGENT}.jsonl"));
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    std::fs::copy(fixtures.join("claude_code_2_1_306_main.jsonl"), &main).unwrap();
+    std::fs::copy(fixtures.join("claude_code_2_1_306_subagent.jsonl"), &sub).unwrap();
+    (main, sub)
+}
+
+#[test]
+fn the_real_shaped_main_transcript_counts_each_message_once_and_ignores_the_noise() {
+    let mut fx = Fx::new(Some(&cfg()), REAL_START);
+    let (main, _sub) = stage_real_layout(&fx);
+    fx.admit_hold(REAL_SESSION);
+    fx.clock.set(t(REAL_STOP));
+    fx.finalize(REAL_SESSION, Some(&s(&main)));
+    // msg_a (two content-block lines): 606c; msg_b 200c; msg_c 200c. The
+    // timestamp-less lines, the out-of-order user line and the tool-result
+    // usage (9M tokens) contribute nothing.
+    // The same Stop also swept the staged subagent file: 264c.
+    let st = fx.status();
+    assert_eq!(totals(&st), (1_006 + 264, 0));
+    let main_row = st.executors.iter().find(|e| e.agent_id.is_none()).unwrap();
+    assert_eq!(main_row.used_usd_cents, 1_006);
+}
+
+#[test]
+fn the_stop_sweep_charges_a_subagent_file_that_lagged_its_own_subagent_stop() {
+    let mut fx = Fx::new(Some(&cfg()), REAL_START);
+    let (main, sub) = stage_real_layout(&fx);
+    fx.admit_hold(REAL_SESSION);
+
+    // SubagentStop fired when the file had no assistant line yet.
+    let full = std::fs::read_to_string(&sub).unwrap();
+    let no_assistant: String = full
+        .lines()
+        .filter(|l| !l.contains("\"assistant\""))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&sub, no_assistant).unwrap();
+    // Explicit SubagentStop with nothing measurable: the unmeasured fallback
+    // (1000c) is charged once, flagged.
+    let early = transcribed(fx.transcript_charge(REAL_SESSION, Some(REAL_AGENT), &s(&sub)));
+    assert_eq!((early.charged, early.unmeasured), (1_000, true));
+
+    // The file catches up; the PARENT's Stop sweeps it: 264c measured is
+    // below the 1000c fallback already booked, so nothing more is charged.
+    std::fs::write(&sub, full).unwrap();
+    fx.clock.set(t(REAL_STOP));
+    fx.finalize(REAL_SESSION, Some(&s(&main)));
+    let st = fx.status();
+    assert_eq!(st.used_usd_cents, 1_006 + 1_000);
+    let sub_row = st
+        .executors
+        .iter()
+        .find(|e| e.agent_id.as_deref() == Some(REAL_AGENT))
+        .unwrap();
+    assert_eq!(sub_row.used_usd_cents, 1_000);
+}
+
+#[test]
+fn the_stop_sweep_tops_up_a_subagent_by_delta_and_skips_files_with_nothing_yet() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let sid = "s1";
+    let main = fx.path().join(format!("{sid}.jsonl"));
+    let dir = fx.path().join(sid).join("subagents");
+    std::fs::create_dir_all(&dir).unwrap();
+    let a = dir.join("agent-aaa1.jsonl");
+    let empty = dir.join("agent-bbb2.jsonl");
+    write_lines(&main, &[rec(10, "m1", SONNET, mi(1), Some(sid), false)]);
+    write_lines(&a, &[sub_rec(12, "s1a", mi(1), sid, "aaa1")]);
+    // A subagent that has written only its prompt so far.
+    write_lines(
+        &empty,
+        &[format!(
+            r#"{{"type":"user","timestamp":"{}","sessionId":"s1","isSidechain":true,"agentId":"bbb2"}}"#,
+            at(11).format(&Rfc3339).unwrap()
+        )],
+    );
+    // aaa1's own SubagentStop saw 300c.
+    let first = transcribed(fx.transcript_charge(sid, Some("aaa1"), &s(&a)));
+    assert_eq!(first.charged, 300);
+    // It then wrote more.
+    append_lines(&a, &[sub_rec(13, "s1b", mi(2), sid, "aaa1")]);
+
+    fx.admit_hold(sid);
+    fx.clock.set(at(60));
+    fx.finalize(sid, Some(&s(&main)));
+    let st = fx.status();
+    // parent 300 + aaa1 (300 + 600 delta) = 1200; bbb2 billed nothing.
+    assert_eq!(totals(&st), (1_200, 0));
+    assert!(st
+        .executors
+        .iter()
+        .all(|e| e.agent_id.as_deref() != Some("bbb2")));
+
+    // A second Stop sweeps again and adds nothing.
+    fx.admit_hold(sid);
+    fx.clock.set(at(100));
+    append_lines(&main, &[rec(90, "m2", SONNET, mi(1), Some(sid), false)]);
+    fx.finalize(sid, Some(&s(&main)));
+    assert_eq!(totals(&fx.status()), (1_200 + 300, 0));
+}
+
+#[test]
+fn a_swept_subagent_file_naming_another_agent_takes_the_fallback_once() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let sid = "s1";
+    let main = fx.path().join(format!("{sid}.jsonl"));
+    let dir = fx.path().join(sid).join("subagents");
+    std::fs::create_dir_all(&dir).unwrap();
+    write_lines(&main, &[rec(10, "m1", SONNET, mi(1), Some(sid), false)]);
+    // The file name says aaa1; its lines say zzz9.
+    write_lines(
+        &dir.join("agent-aaa1.jsonl"),
+        &[sub_rec(12, "q", mi(9), sid, "zzz9")],
+    );
+    fx.admit_hold(sid);
+    fx.clock.set(at(60));
+    fx.finalize(sid, Some(&s(&main)));
+    fx.admit_hold(sid);
+    fx.clock.set(at(80));
+    fx.finalize(sid, Some(&s(&main)));
+    let st = fx.status();
+    let row = st
+        .executors
+        .iter()
+        .find(|e| e.agent_id.as_deref() == Some("aaa1"))
+        .unwrap();
+    assert_eq!(
+        row.used_usd_cents, 1_000,
+        "fallback once, foreign 2700 never imported"
+    );
+}
+
+// ---------------------------------------------------------------------
+// SettleTail
+// ---------------------------------------------------------------------
+
+fn tail(fx: &mut Fx, session: &str, path: &str) -> SharedBudgetOutcome {
+    fx.sb(SharedBudgetRequest::SettleTail {
+        session_id: session.to_string(),
+        transcript_path: path.to_string(),
+    })
+}
+
+fn tail_charged(o: &SharedBudgetOutcome) -> (u64, bool) {
+    match o {
+        SharedBudgetOutcome::TailSettled {
+            amount_charged_usd_cents,
+            already_charged,
+            ..
+        } => (*amount_charged_usd_cents, *already_charged),
+        other => panic!("expected TailSettled, got {other:?}"),
+    }
+}
+
+#[test]
+fn settle_tail_charges_the_final_message_exactly_once() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    fx.admit_hold("s1");
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(totals(&fx.status()), (300, 0));
+
+    // The session's final message is flushed after the last Stop; there is
+    // no next Stop to recover it. SessionEnd runs SettleTail.
+    append_lines(
+        &tx,
+        &[
+            rec(58, "last", SONNET, mi(2), Some("s1"), false),
+            rec(59, "last", SONNET, mi(2), Some("s1"), false),
+        ],
+    );
+    fx.clock.set(at(200));
+    let first = tail(&mut fx, "s1", &s(&tx));
+    assert_eq!(tail_charged(&first), (600, false));
+    let st = fx.status();
+    assert_eq!(totals(&st), (900, 0));
+    let row = st.executors.iter().find(|e| e.session_id == "s1").unwrap();
+    assert_eq!(
+        (row.executor_kind, row.agent_id.as_deref()),
+        (ExecutorKind::AgentAbsent, None)
+    );
+
+    // Idempotent: a repeat charges nothing.
+    let before = fx.fingerprint();
+    let second = tail(&mut fx, "s1", &s(&tx));
+    assert_eq!(tail_charged(&second), (0, false));
+    assert_eq!(fx.fingerprint(), before);
+    assert_eq!(totals(&fx.status()), (900, 0));
+
+    // And a later Stop does not recount it either.
+    fx.admit_hold("s1");
+    fx.clock.set(at(300));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(
+        totals(&fx.status()),
+        (900 + 1_000, 0),
+        "empty window -> hold"
+    );
+}
+
+#[test]
+fn settle_tail_charge_row_is_a_known_usage_main_executor_charge() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    fx.admit_hold("s1");
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    append_lines(&tx, &[rec(70, "last", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(100));
+    let o = tail(&mut fx, "s1", &s(&tx));
+    let SharedBudgetOutcome::TailSettled {
+        reservation_id: Some(id),
+        ..
+    } = o
+    else {
+        panic!("expected a written row");
+    };
+    let row = fx.ledger.get_shared_reservation(id).unwrap().unwrap();
+    assert_eq!(row.usage_known, Some(true));
+    assert_eq!(row.executor_kind, Some(ExecutorKind::AgentAbsent));
+    assert_eq!(row.charge_source, Some(ChargeSource::TurnHold));
+}
+
+#[test]
+fn settle_tail_refuses_foreign_and_unmeasurable_transcripts_without_charging() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    fx.admit_hold("s1");
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    let used = fx.status().used_usd_cents;
+
+    let foreign = fx.path().join("f.jsonl");
+    write_lines(
+        &foreign,
+        &[rec(70, "z", SONNET, mi(9), Some("other"), false)],
+    );
+    match tail(&mut fx, "s1", &s(&foreign)) {
+        SharedBudgetOutcome::TailSettled {
+            binding_mismatch,
+            amount_charged_usd_cents,
+            ..
+        } => {
+            assert!(binding_mismatch);
+            assert_eq!(amount_charged_usd_cents, 0);
+        }
+        other => panic!("{other:?}"),
+    }
+    let noid = fx.path().join("n.jsonl");
+    write_lines(&noid, &[rec(70, "z", SONNET, mi(9), None, false)]);
+    match tail(&mut fx, "s1", &s(&noid)) {
+        SharedBudgetOutcome::TailSettled {
+            transcript_unverified,
+            unmeasured,
+            ..
+        } => {
+            assert!(transcript_unverified && unmeasured);
+        }
+        other => panic!("{other:?}"),
+    }
+    // A lane that was never admitted, an empty session, a relative path.
+    assert_eq!(
+        tail_charged(&tail(&mut fx, "never-admitted", &s(&tx))),
+        (0, false)
+    );
+    expect_refused(
+        tail(&mut fx, "", &s(&tx)),
+        SharedBudgetRefusal::EmptySessionId,
+    );
+    match tail(&mut fx, "s1", "relative.jsonl") {
+        SharedBudgetOutcome::TailSettled { unmeasured, .. } => assert!(unmeasured),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(fx.status().used_usd_cents, used, "nothing was charged");
+
+    std::fs::write(fx.path().join(SHARED_BUDGET_FILE_NAME), "nope").unwrap();
+    expect_denied(
+        tail(&mut fx, "s1", &s(&tx)),
+        SharedBudgetDenyReason::ConfigInvalid,
+    );
+    let mut none = Fx::new(None, BASE);
+    assert_eq!(
+        tail(&mut none, "s1", "/x.jsonl"),
+        SharedBudgetOutcome::NotConfigured
+    );
 }
