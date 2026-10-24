@@ -263,11 +263,14 @@ flagged `binding_mismatch`.
 **Future-stamped records.** A record stamped later than `now + 5 minutes`
 (clock skew, a bad line, a hostile same-user file) is inconsistent: it is not
 counted, and a watermark is never stored later than that bound (nor with a
-year outside 2000-2200). A window containing one settles at the **hold
-amount**, `usage_known=false`, reason `future_timestamp`; the watermark
-advances at most to the newest in-bound own record, and the offending
-`message.id`s are remembered so the same lines do not flag every later
-window (a future line with no `message.id` flags every window it appears in,
+year outside 2000-2200). The in-bound own records of such a window are
+still measured: it settles at **max(priced, hold)**, reason
+`future_timestamp` (recorded as measured only when the priced amount exceeds
+the hold; otherwise the hold amount, `usage_known=false`). The watermark
+advances at most to the newest in-bound own record (it stays unset when there
+is none), and the in-bound and offending `message.id`s are remembered, even
+when no timestamp mark exists, so nothing is recounted and the same lines do
+not flag every later window (a future line with no `message.id` flags every window it appears in,
 at the flat hold, until the clock passes it). As defence in depth,
 `shared_lane_watermark` ignores any stored mark later than that row's
 `settled_at` plus ten minutes, so an already-poisoned row cannot hide later
@@ -375,7 +378,11 @@ parent + subagent never double count (pinned by fixture tests).
 `Finalize` also visits `<transcript_path minus .jsonl>/subagents/agent-*.jsonl`
 (at most 64 regular files) and charges each file's delta through the same
 logic. A sweep reads at most 128 MiB of subagent files in total; files past
-that are deferred to the next `Stop` (`Status.sweep_deferred_files`). A file
+that are deferred to the next `Stop` (`Status.sweep_deferred_files`). A
+file is charged against the budget at no more than one read can scan (32 MiB),
+and the first file of every sweep is always processed, so a file larger than
+the whole budget is never starved. A file the read cap truncates takes the
+flagged unmeasured fallback once (it is not skipped on every sweep). A file
 whose `(size, mtime)` is unchanged since its last sweep is skipped (daemon
 memory only; a restart re-checks each file once, which the delta logic makes
 harmless). A file with nothing measurable yet is **skipped** by the
@@ -399,8 +406,9 @@ charged when nothing is measurable (a tail has no hold to fall back to; the
 response flags `unmeasured`/`binding_mismatch`). It is refused with
 `no_settled_lane` unless the lane already has a settled hold or a watermark
 (a session never admitted or settled under this budget must not be billed its
-whole history); its lower bound is the lane's watermark, else the lane's
-earliest hold. The charge row and its watermark are written in **one ledger
+whole history); its lower bound is the same as a `Stop`'s: the lane's
+watermark, else the latest settle time (never the earliest hold, since
+earlier unmeasured settlements were already booked at the hold amount). The charge row and its watermark are written in **one ledger
 transaction** (`charge_shared_with_watermark`), so a crash cannot leave a
 charge without its mark; an identical replay of a row that lacks a mark
 adopts it. `turn_hold` is reused for the source
