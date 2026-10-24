@@ -195,6 +195,8 @@ fn preflighted_scoped(
         &mut current_task,
         &daemon_config,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "add a login endpoint".to_string(),
             cwd: fixture_repo(),
             session_id: session_id.clone(),

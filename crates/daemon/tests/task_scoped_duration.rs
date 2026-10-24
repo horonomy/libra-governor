@@ -207,6 +207,8 @@ impl Harness {
 
     fn preflight(&mut self, session_id: &str) -> libra_governor_protocol::PreflightResult {
         match self.send(Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug".to_string(),
             cwd: fixture_repo(),
             session_id: session_id.to_string(),
@@ -218,6 +220,7 @@ impl Harness {
 
     fn finalize(&mut self, session_id: &str) -> FinalizeResult {
         match self.send(Request::Finalize {
+            agent_id: None,
             session_id: session_id.to_string(),
             model: None,
             provider: None,
@@ -376,6 +379,8 @@ fn a_replanned_turn_is_measured_from_the_turns_start_not_from_the_replan() {
     // trigger semantics themselves).
     for _ in 0..4 {
         harness.send(Request::ToolInvoked {
+            agent_id: None,
+            provider: None,
             session_id: "replan-session".to_string(),
             tool_name: "Bash".to_string(),
         });

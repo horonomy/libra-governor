@@ -259,4 +259,15 @@ pub use messages::{
 /// `id_less_records`, `foreign_lines`, `sweep_deferred_files`). A v20 peer's
 /// decoder cannot parse the new variants, so a long-lived v20 daemon must
 /// be restarted after upgrading.
-pub const PROTOCOL_VERSION: u32 = 21;
+///
+/// v22 (HORO-2197): legacy-route executor attribution. `Preflight` and
+/// `ToolInvoked` gained optional `agent_id` and `provider`, and `Finalize`
+/// gained an optional `agent_id`, so a subagent's tool call (which carries
+/// its parent's `session_id`) is booked to its own `(session, agent)` lane
+/// instead of the parent's. The fields are omitted from the wire when
+/// absent, so a v22 client's main-executor traffic is byte-identical to
+/// v21. They are a bump rather than a silent addition because a v21
+/// daemon's `deny_unknown_fields` decoder rejects them outright and, worse,
+/// would otherwise keep mis-attributing: a long-lived v21 daemon must be
+/// restarted after upgrading.
+pub const PROTOCOL_VERSION: u32 = 22;

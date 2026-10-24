@@ -392,6 +392,8 @@ pub(crate) fn run_prompt_submit_with_input(agent: AgentKind, raw: &str) {
         task_hint: prompt,
         cwd,
         session_id,
+        agent_id,
+        provider: Some(super::label(agent).to_string()),
     };
 
     match client::roundtrip(&stream, request) {
@@ -655,6 +657,8 @@ pub(crate) fn run_tool_completed_with_input(agent: AgentKind, raw: &str) {
     let request = Request::ToolInvoked {
         session_id,
         tool_name,
+        agent_id,
+        provider: Some(super::label(agent).to_string()),
     };
 
     // Best-effort: a daemon-unavailable or write error here is not
@@ -860,6 +864,7 @@ pub(crate) fn run_turn_completed_with_input(agent: AgentKind, raw: &str) {
         // conversion is still a conversion, and this crate has no
         // business reading the transcript.
         transcript_path: transcript_path.map(|p| p.to_string_lossy().into_owned()),
+        agent_id,
     };
 
     match client::roundtrip(&stream, request) {

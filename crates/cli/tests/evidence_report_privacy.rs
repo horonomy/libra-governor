@@ -143,6 +143,8 @@ impl Sandbox {
         let envelope = RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
             request: Request::Preflight {
+                agent_id: None,
+                provider: None,
                 task_hint: format!("fix the login bug — {marker}"),
                 cwd: fixture_repo(),
                 session_id: "evidence-report-privacy-session".to_string(),

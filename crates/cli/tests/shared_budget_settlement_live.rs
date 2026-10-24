@@ -132,6 +132,7 @@ impl Live {
 
     fn finalize(&self, session: &str, transcript: &Path) {
         match self.call(Request::Finalize {
+            agent_id: None,
             session_id: session.to_string(),
             model: None,
             provider: Some("claude-code".to_string()),

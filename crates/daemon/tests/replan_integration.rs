@@ -94,6 +94,8 @@ fn send_distinct_tool_calls(
             current_task,
             config,
             Request::ToolInvoked {
+                agent_id: None,
+                provider: None,
                 session_id: session_id.to_string(),
                 tool_name: tools[(i as usize) % tools.len()].to_string(),
             },
@@ -191,6 +193,8 @@ fn tool_call_count_material_deviation_triggers_a_replan_visible_in_status() {
         &mut current_task,
         &config,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug".to_string(),
             cwd: fixture_repo(),
             session_id: "replan-session".to_string(),
@@ -345,6 +349,8 @@ fn possible_tool_loop_streak_triggers_a_replan_before_the_count_threshold() {
         &mut current_task,
         &config,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug".to_string(),
             cwd: fixture_repo(),
             session_id: "loop-session".to_string(),
@@ -362,6 +368,8 @@ fn possible_tool_loop_streak_triggers_a_replan_before_the_count_threshold() {
             &mut current_task,
             &config,
             Request::ToolInvoked {
+                agent_id: None,
+                provider: None,
                 session_id: "loop-session".to_string(),
                 tool_name: "Bash".to_string(),
             },
@@ -430,6 +438,8 @@ fn exhausting_the_auto_replan_budget_escalates_instead_of_replanning_again() {
         &mut current_task,
         &config,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug".to_string(),
             cwd: fixture_repo(),
             session_id: "escalate-session".to_string(),

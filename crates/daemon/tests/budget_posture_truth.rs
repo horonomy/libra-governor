@@ -202,6 +202,8 @@ impl Harness {
 
     fn preflight(&mut self, session_id: &str) -> libra_governor_protocol::PreflightResult {
         match self.send(Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug".to_string(),
             cwd: fixture_repo(),
             session_id: session_id.to_string(),
@@ -505,6 +507,7 @@ fn a_finished_task_leaves_no_budget_behind_in_idle() {
     );
 
     match harness.send(Request::Finalize {
+        agent_id: None,
         session_id: "finished-session".to_string(),
         model: None,
         provider: None,

@@ -49,6 +49,20 @@ pub enum Request {
         task_hint: String,
         cwd: PathBuf,
         session_id: String,
+        /// The executor inside `session_id` that submitted the prompt
+        /// (HORO-2197). `None` is the session's own main executor and keeps
+        /// the pre-v22 session-keyed lane byte for byte; `Some(id)` is a
+        /// subagent (or `--agent` main thread) with its own lane; a blank
+        /// `Some` is an agent that is present but unnameable and gets the
+        /// session's *unattributed* lane, never the parent's. See
+        /// `libra_governor_daemon::legacy_executor`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        /// The calling CLI entry point's own agent-kind label
+        /// (`"claude-code"` / `"codex"`), set only by the hook; part of an
+        /// agent lane's key, ignored for the session's main executor.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
     },
     /// Ask the daemon for its current task/preflight state. Answered
     /// entirely from state the daemon already holds — never triggers new
@@ -63,6 +77,14 @@ pub enum Request {
     ToolInvoked {
         session_id: String,
         tool_name: String,
+        /// See [`Request::Preflight`]'s `agent_id`: a subagent's tool call
+        /// carries its parent's `session_id` and must not feed the
+        /// parent's counters.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        /// See [`Request::Preflight`]'s `provider`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
     },
     /// Ask the daemon to finalize the task bound to `session_id`: compute
     /// elapsed duration, gather the tool-call count, and persist an
@@ -96,6 +118,10 @@ pub enum Request {
         /// `libra_governor_daemon::usage` for the bounded read and for
         /// what is (and is not) extracted from the file.
         transcript_path: Option<String>,
+        /// See [`Request::Preflight`]'s `agent_id`: finalizes that
+        /// executor's lane, never the parent's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
     },
     /// Ask the daemon to compute real calibration evidence — duration
     /// coverage and admission-replay metrics — over every locally
@@ -1071,6 +1097,8 @@ mod tests {
                 task_hint: "fix the login bug".to_string(),
                 cwd: PathBuf::from("/repo"),
                 session_id: "sess-1".to_string(),
+                agent_id: None,
+                provider: None,
             },
         };
         let json = serde_json::to_string(&envelope).unwrap();
@@ -1148,6 +1176,8 @@ mod tests {
         let request = Request::ToolInvoked {
             session_id: "sess-1".to_string(),
             tool_name: "Bash".to_string(),
+            agent_id: None,
+            provider: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         let round_tripped: Request = serde_json::from_str(&json).unwrap();
@@ -1162,6 +1192,7 @@ mod tests {
                 model,
                 provider: Some("claude-code".to_string()),
                 transcript_path: None,
+                agent_id: None,
             };
             let json = serde_json::to_string(&request).unwrap();
             let round_tripped: Request = serde_json::from_str(&json).unwrap();
@@ -1180,6 +1211,7 @@ mod tests {
                 model: None,
                 provider: Some("claude-code".to_string()),
                 transcript_path,
+                agent_id: None,
             };
             let json = serde_json::to_string(&request).unwrap();
             let round_tripped: Request = serde_json::from_str(&json).unwrap();
@@ -1596,5 +1628,57 @@ mod tests {
              `used` or `remaining` here would eventually be filled in \
              with an active task's figure."
         );
+    }
+
+    /// HORO-2197: the executor fields are additive on the wire. A request
+    /// from a pre-v22 client (no `agent_id`/`provider` keys) decodes with
+    /// them absent, and a main-executor request re-encodes to exactly the
+    /// bytes a pre-v22 client sent.
+    #[test]
+    fn legacy_executor_fields_are_additive_and_omitted_when_absent() {
+        let old_preflight = r#"{"kind":"preflight","task_hint":"h","cwd":"/r","session_id":"s"}"#;
+        let old_tool = r#"{"kind":"tool_invoked","session_id":"s","tool_name":"Bash"}"#;
+        let old_finalize = r#"{"kind":"finalize","session_id":"s","model":null,"provider":"claude-code","transcript_path":null}"#;
+        for raw in [old_preflight, old_tool, old_finalize] {
+            let request: Request = serde_json::from_str(raw).unwrap();
+            match &request {
+                Request::Preflight {
+                    agent_id, provider, ..
+                }
+                | Request::ToolInvoked {
+                    agent_id, provider, ..
+                } => {
+                    assert_eq!((agent_id, provider), (&None, &None), "{raw}");
+                }
+                Request::Finalize { agent_id, .. } => assert_eq!(agent_id, &None, "{raw}"),
+                other => panic!("{other:?}"),
+            }
+            let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+            assert_eq!(serde_json::to_value(&request).unwrap(), value, "{raw}");
+        }
+    }
+
+    #[test]
+    fn legacy_executor_fields_round_trip_when_present_including_blank() {
+        for agent in ["a-1", "", "  "] {
+            let tool = Request::ToolInvoked {
+                session_id: "s".into(),
+                tool_name: "Bash".into(),
+                agent_id: Some(agent.into()),
+                provider: Some("claude-code".into()),
+            };
+            let json = serde_json::to_string(&tool).unwrap();
+            assert!(json.contains("\"agent_id\""), "{json}");
+            assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), tool);
+        }
+        let finalize = Request::Finalize {
+            session_id: "s".into(),
+            model: None,
+            provider: Some("claude-code".into()),
+            transcript_path: None,
+            agent_id: Some("a-1".into()),
+        };
+        let json = serde_json::to_string(&finalize).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), finalize);
     }
 }
