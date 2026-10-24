@@ -441,6 +441,11 @@ pub struct SharedPoolChargeRequest<'a> {
     /// Only used to report the post-charge [`PoolAdmission`]; a charge is
     /// never gated on it.
     pub capacity_source: CapacitySource,
+    /// Whether `amount` was observed (`true`) or is a conservative
+    /// placeholder for spend that could not be measured (`false`, HORO-2196).
+    /// Recorded as the row's `usage_known`, and part of what makes a replay
+    /// identical.
+    pub usage_known: bool,
 }
 
 /// The outcome of [`LedgerStore::charge_shared`]. There is deliberately
@@ -1025,6 +1030,7 @@ impl LedgerStore {
             let identical = Self::is_charge_row_tx(&self.conn, existing.id)?
                 && existing.state == ReservationState::Settled
                 && existing.settled_amount == Some(req.amount)
+                && existing.usage_known == Some(req.usage_known)
                 && existing.session_id == req.session_id
                 && existing.agent_id == attribution.agent_id
                 && existing.executor_kind == attribution.executor_kind
@@ -1072,7 +1078,7 @@ impl LedgerStore {
                 id, pool_id, principal_id, session_id, amount, state, settled_amount,
                 usage_known, idempotency_key, created_at, expires_at, settled_at, released_at,
                 schema_version, agent_id, executor_kind, charge_source, is_charge
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'settled', ?5, 1, ?6, ?7, ?7, ?7, NULL, ?8,
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'settled', ?5, ?12, ?6, ?7, ?7, ?7, NULL, ?8,
                        ?9, ?10, ?11, 1)",
             rusqlite::params![
                 id.0.to_string(),
@@ -1086,6 +1092,7 @@ impl LedgerStore {
                 attribution.agent_id,
                 attribution.executor_kind.map(ExecutorKind::as_str),
                 attribution.charge_source.map(ChargeSource::as_str),
+                req.usage_known,
             ],
         )?;
 
@@ -1231,6 +1238,65 @@ impl LedgerStore {
             }
         }
         Ok(best)
+    }
+
+    /// Every non-charge hold (any state) of one executor lane in any pool
+    /// whose id starts with `pool_prefix` (HORO-2196) -- the history a
+    /// settlement derives its window watermark and its target hold from,
+    /// with no extra persisted state. The lane is `(session_id, agent_id |
+    /// NULL)` plus `executor_kind`, compared as in
+    /// [`Self::active_shared_hold_for_lane`].
+    pub fn shared_lane_holds(
+        &self,
+        principal_id: &PrincipalId,
+        session_id: &str,
+        agent_id: Option<&str>,
+        executor_kind: ExecutorKind,
+        pool_prefix: &str,
+    ) -> Result<Vec<SharedPoolReservation>, LedgerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {RESERVATION_COLUMNS} FROM shared_pool_reservations
+             WHERE principal_id = ?1 AND session_id = ?2 AND agent_id IS ?3
+               AND COALESCE(executor_kind, 'unattributed') = ?4
+               AND substr(pool_id, 1, length(?5)) = ?5 AND is_charge = 0"
+        ))?;
+        let rows = stmt.query_map(
+            rusqlite::params![
+                principal_id.0,
+                session_id,
+                agent_id,
+                executor_kind.as_str(),
+                pool_prefix
+            ],
+            read_reservation_row,
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row_to_reservation(row?)?);
+        }
+        Ok(out)
+    }
+
+    /// Sum of the settled amounts of every charge row `principal_id` holds
+    /// whose idempotency key starts with `key_prefix`, across pools whose
+    /// id starts with `pool_prefix` (HORO-2196). It is how a cumulative
+    /// charge (a subagent transcript) finds what it has already booked,
+    /// whichever period each earlier row landed in.
+    pub fn shared_charges_total_by_key_prefix(
+        &self,
+        principal_id: &PrincipalId,
+        key_prefix: &str,
+        pool_prefix: &str,
+    ) -> Result<u64, LedgerError> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(settled_amount), 0) FROM shared_pool_reservations
+             WHERE principal_id = ?1 AND is_charge = 1 AND state = 'settled'
+               AND substr(idempotency_key, 1, length(?2)) = ?2
+               AND substr(pool_id, 1, length(?3)) = ?3",
+            rusqlite::params![principal_id.0, key_prefix, pool_prefix],
+            |row| row.get(0),
+        )?;
+        Ok(total.max(0) as u64)
     }
 
     /// Every active, unexpired, non-charge hold `principal_id` has for
@@ -3635,6 +3701,7 @@ mod lane_read_tests {
                 now: t0(),
                 attribution: ExecutorAttribution::main_executor(None),
                 capacity_source: CapacitySource::LocalConfigured { cap: 1_000 },
+                usage_known: true,
             })
             .unwrap();
         assert!(lane(&store, t0()).is_none());
@@ -3734,6 +3801,7 @@ mod lane_read_tests {
                     now: t0(),
                     attribution: ExecutorAttribution::main_executor(None),
                     capacity_source: CapacitySource::LocalConfigured { cap: 1_000 },
+                    usage_known: true,
                 })
                 .unwrap()
         };

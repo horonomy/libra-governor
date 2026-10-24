@@ -41,6 +41,7 @@
 //! session ids and the reserved `execution-owner-v1:` prefix are refused.
 //! This path does not require a pre-established session; it never invents
 //! one.
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use time::format_description::well_known::Rfc3339;
@@ -49,12 +50,13 @@ use uuid::Uuid;
 
 use libra_governor_domain::{
     calendar_month_bounds, monthly_pool_alias, ChargeSource, ExecutorKind, MeteredPoolKey, PoolId,
-    PrincipalId, QuotaUnit, SharedPoolReservation, LOCAL_BUDGET_OWNER,
+    PrincipalId, QuotaUnit, ReservationState, SharedPoolReservation, LOCAL_BUDGET_OWNER,
 };
 use libra_governor_ledger::{
     CapacitySource, ExecutorAttribution, LedgerError, LedgerStore, MeteredReserveOutcome,
     MeteredReserveRequest, SharedPoolChargeOutcome, SharedPoolChargeRequest,
     SharedPoolExecutorReport, SharedPoolRenewOutcome, SharedPoolReserveRequest,
+    SharedPoolSettleOutcome,
 };
 use libra_governor_protocol::{
     SharedBudgetCheckState, SharedBudgetConfigDrift, SharedBudgetConfigState,
@@ -66,6 +68,8 @@ use libra_governor_protocol::{
 use crate::shared_budget_file::{
     ConfigDrift, LoadedSharedBudget, SharedBudgetConfig, SharedBudgetFileState, SoftLimits,
 };
+use crate::usage::priced::{observe_priced, PricedObservation, ReadMode, BUDGET_SCAN_CAP_BYTES};
+use crate::usage::UsageUnavailable;
 
 /// How long a turn hold lives without a heartbeat. Each tool event renews
 /// it, so only an abandoned turn (a crash, a kill) ever waits this out.
@@ -142,6 +146,38 @@ pub struct SharedBudgetRuntime {
     loaded: LoadedSharedBudget,
     live: Mutex<Live>,
     clock: Arc<dyn Clock>,
+    telemetry: Mutex<Telemetry>,
+}
+
+/// At most this many unpriced model ids are remembered for `Status`.
+const MAX_UNPRICED_MODELS: usize = 32;
+/// Longest model id kept for display.
+const MAX_MODEL_DISPLAY_LEN: usize = 96;
+
+/// Settlement telemetry (HORO-2196). Process memory only: it counts since
+/// the daemon started. The durable record is the ledger (`usage_known`).
+#[derive(Default)]
+struct Telemetry {
+    unpriced_models: BTreeSet<String>,
+    binding_mismatches: u64,
+    unverified: u64,
+    unmeasured_settlements: u64,
+    unmeasured_charges: u64,
+}
+
+/// A model id from a transcript, reduced to a safe, bounded display token:
+/// it came from a file any same-user process can write.
+fn display_model(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || "._:-/<>".contains(*c))
+        .take(MAX_MODEL_DISPLAY_LEN)
+        .collect();
+    if cleaned.is_empty() {
+        "<unprintable>".to_string()
+    } else {
+        cleaned
+    }
 }
 
 impl Default for SharedBudgetRuntime {
@@ -166,7 +202,22 @@ impl SharedBudgetRuntime {
             loaded,
             live: Mutex::new(live),
             clock: Arc::new(SystemClock),
+            telemetry: Mutex::new(Telemetry::default()),
         }
+    }
+
+    fn note(&self, f: impl FnOnce(&mut Telemetry)) {
+        f(&mut self.telemetry.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+
+    fn note_unpriced(&self, models: &[String]) {
+        self.note(|t| {
+            for m in models {
+                if t.unpriced_models.len() < MAX_UNPRICED_MODELS {
+                    t.unpriced_models.insert(display_model(m));
+                }
+            }
+        });
     }
 
     /// Reads `<state_dir>/shared-budget.json`.
@@ -693,6 +744,7 @@ pub fn charge(
     if matches!(state, SharedBudgetFileState::Absent) {
         return Ok(SharedBudgetOutcome::NotConfigured);
     }
+    // Same precedence as before the split: identity, amount, key.
     if let Err(reason) = validate_identity(session_id, agent_id) {
         return Ok(refused(reason));
     }
@@ -702,6 +754,59 @@ pub fn charge(
     if idempotency_key.trim().is_empty() {
         return Ok(refused(SharedBudgetRefusal::InvalidIdempotencyKey));
     }
+    let key = format!("charge:{}|{}", lp(session_id), lp(idempotency_key));
+    book_charge(
+        ledger,
+        rt,
+        &state,
+        BookedCharge {
+            session_id,
+            agent_id,
+            amount_usd_cents,
+            key: &key,
+            charge_source,
+            event_time,
+            usage_known: true,
+        },
+    )
+}
+
+/// One post-hoc charge, ready to book.
+struct BookedCharge<'a> {
+    session_id: &'a str,
+    agent_id: Option<&'a str>,
+    amount_usd_cents: u64,
+    /// The complete ledger idempotency key.
+    key: &'a str,
+    charge_source: ChargeSource,
+    event_time: Option<&'a str>,
+    /// False for a conservative placeholder (an unmeasured subagent).
+    usage_known: bool,
+}
+
+/// Validates and books `charge` into the right period's pool. The single
+/// write path for `ChargeAgent` and `ChargeAgentTranscript`.
+fn book_charge(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    state: &SharedBudgetFileState,
+    charge: BookedCharge<'_>,
+) -> Result<SharedBudgetOutcome, SharedBudgetError> {
+    let BookedCharge {
+        session_id,
+        agent_id,
+        amount_usd_cents,
+        key,
+        charge_source,
+        event_time,
+        usage_known,
+    } = charge;
+    if let Err(reason) = validate_identity(session_id, agent_id) {
+        return Ok(refused(reason));
+    }
+    if amount_usd_cents == 0 || i64::try_from(amount_usd_cents).is_err() {
+        return Ok(refused(SharedBudgetRefusal::InvalidAmount));
+    }
     let event = match event_time {
         None => None,
         Some(raw) => match OffsetDateTime::parse(raw, &Rfc3339) {
@@ -709,7 +814,7 @@ pub fn charge(
             _ => return Ok(refused(SharedBudgetRefusal::InvalidEventTime)),
         },
     };
-    let cfg = match configured(&state) {
+    let cfg = match configured(state) {
         Ok(cfg) => cfg,
         Err(outcome) => return Ok(outcome),
     };
@@ -720,13 +825,12 @@ pub fn charge(
     }
     let now = rt.now();
     let current = period_at(cfg, now)?;
-    let key = format!("charge:{}|{}", lp(session_id), lp(idempotency_key));
 
     // A retry resolves to the pool the first attempt landed in, wherever
     // the fallback would point today: the ledger's replay lookup is
     // scoped to one pool, so without this a retry after a month change
     // would book the same spend twice.
-    let existing = ledger.find_shared_reservation_by_key(&principal(), &key, OWNER_POOL_PREFIX)?;
+    let existing = ledger.find_shared_reservation_by_key(&principal(), key, OWNER_POOL_PREFIX)?;
     let mut clamped = false;
     let pool_id = match (&existing, event) {
         (Some(found), _) => found.pool_id.clone(),
@@ -770,10 +874,11 @@ pub fn charge(
         session_id,
         amount: amount_usd_cents,
         unit: &QuotaUnit::UsdCents,
-        idempotency_key: &key,
+        idempotency_key: key,
         now,
         attribution,
         capacity_source: source(cfg),
+        usage_known,
     });
     let outcome = match outcome {
         Ok(o) => o,
@@ -827,6 +932,440 @@ pub fn charge(
     })
 }
 
+/// What settling a `Stop` did (HORO-2196). Content-free: it is logged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnSettlement {
+    /// No shared-budget file: nothing was consulted or written.
+    NotConfigured,
+    /// The session id is empty or reserved; there is no lane to settle.
+    NotApplicable,
+    /// The lane has no unsettled hold (the turn was never admitted, or it
+    /// was already settled -- a retried `Stop` lands here).
+    NoHold,
+    Settled {
+        reservation_id: libra_governor_domain::SharedPoolReservationId,
+        pool_id: String,
+        hold_usd_cents: u64,
+        settled_usd_cents: u64,
+        /// False when the hold amount was settled because the window could
+        /// not be measured.
+        usage_known: bool,
+        /// How far the settled amount exceeds the hold (never clamped).
+        overrun_usd_cents: u64,
+        /// Why the window was not measured; `None` when it was.
+        unmeasured_reason: Option<&'static str>,
+    },
+    /// The transcript named a different session. Nothing was charged and
+    /// the hold was left for its TTL.
+    TranscriptMismatch,
+    /// The hold was already settled by another call (lost a race).
+    AlreadySettled,
+}
+
+impl TurnSettlement {
+    /// A short, content-free label for the daemon log.
+    pub fn label(&self) -> String {
+        match self {
+            Self::NotConfigured => "shared budget not configured".to_string(),
+            Self::NotApplicable => "shared budget: session not applicable".to_string(),
+            Self::NoHold => "shared budget: no unsettled hold".to_string(),
+            Self::TranscriptMismatch => {
+                "shared budget: transcript session mismatch, nothing charged".to_string()
+            }
+            Self::AlreadySettled => "shared budget: hold already settled".to_string(),
+            Self::Settled {
+                hold_usd_cents,
+                settled_usd_cents,
+                usage_known,
+                overrun_usd_cents,
+                unmeasured_reason,
+                ..
+            } => format!(
+                "shared budget: settled {settled_usd_cents}c of {hold_usd_cents}c hold \
+                 (usage_known={usage_known}, overrun={overrun_usd_cents}c, reason={})",
+                unmeasured_reason.unwrap_or("measured")
+            ),
+        }
+    }
+}
+
+/// Settles the session's main-executor turn hold at `Stop` (HORO-2196).
+///
+/// Called once per `Finalize`, before and independently of the legacy task
+/// finalization: the shared budget needs no preflight task. With no file in
+/// force it does nothing at all.
+///
+/// # Which hold, which window
+///
+/// The target is the lane's most recently created hold still `active`
+/// (expired-but-unswept included) or `expired`; a late settle after expiry
+/// is recorded in the hold's own row, in the hold's own period.
+///
+/// The window is every transcript record **strictly after** the lane's
+/// watermark: the latest `settled_at` of the lane's settled holds, or, when
+/// none has settled yet, the creation time of the lane's oldest hold. The
+/// watermark is derived from existing ledger rows (no migration), and it
+/// advances only when a hold actually settles, so:
+///
+/// - two consecutive Stops never count a record twice;
+/// - a crashed turn (no Stop) is measured by the *next* Stop: its hold
+///   expired unsettled, so the watermark did not move past its records.
+///   The abandoned hold itself is reclaimed by TTL (`Admit`'s sweep).
+///
+/// A record the host flushes to the file *after* the Stop that should have
+/// covered it, but stamped before that Stop, falls behind the watermark and
+/// is not counted (Claude Code writes its transcript asynchronously). The
+/// window it was missing from settled either measured-short or at the hold
+/// amount; this is the known limit of a timestamp watermark.
+///
+/// # Outcomes
+///
+/// - measured and bound to the session: settle at the priced USD cents,
+///   `usage_known=true`. The amount may exceed the hold; the overrun is
+///   recorded and later `Admit`s are refused while `remaining < hold`.
+/// - the transcript names another session: charge nothing, leave the hold
+///   (it expires by TTL), count the mismatch.
+/// - anything unmeasurable (no path, missing/rotated/truncated file, over
+///   the cap, no usage in the window, session field absent, unpriced
+///   model): settle at the **hold amount** with `usage_known=false`.
+/// - the file is present but invalid: settle at the hold amount (overrides
+///   from an untrusted file are not used).
+/// - no hold: nothing.
+pub fn settle_turn(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    session_id: &str,
+    transcript_path: Option<&str>,
+) -> Result<TurnSettlement, SharedBudgetError> {
+    let state = rt.effective().state;
+    if matches!(state, SharedBudgetFileState::Absent) {
+        return Ok(TurnSettlement::NotConfigured);
+    }
+    if validate_identity(session_id, None).is_err() {
+        return Ok(TurnSettlement::NotApplicable);
+    }
+    let holds = ledger.shared_lane_holds(
+        &principal(),
+        session_id,
+        None,
+        ExecutorKind::AgentAbsent,
+        OWNER_POOL_PREFIX,
+    )?;
+    let Some(target) = holds
+        .iter()
+        .filter(|h| {
+            matches!(
+                h.state,
+                ReservationState::Active | ReservationState::Expired
+            )
+        })
+        .max_by_key(|h| h.created_at)
+    else {
+        return Ok(TurnSettlement::NoHold);
+    };
+    let after = holds
+        .iter()
+        .filter(|h| h.state == ReservationState::Settled)
+        .filter_map(|h| h.settled_at)
+        .max()
+        .or_else(|| holds.iter().map(|h| h.created_at).min())
+        .unwrap_or(target.created_at);
+
+    let (actual, reason): (Option<u64>, Option<&'static str>) = match &state {
+        SharedBudgetFileState::Valid(cfg) => {
+            let observation = match transcript_path {
+                None => PricedObservation::Unavailable(UsageUnavailable::NoTranscriptPath),
+                Some(path) => observe_priced(
+                    std::path::Path::new(path),
+                    ReadMode::ParentWindow { after },
+                    session_id,
+                    &cfg.pricing_overrides.table(),
+                    BUDGET_SCAN_CAP_BYTES,
+                ),
+            };
+            match observation {
+                PricedObservation::Priced(window) => (Some(window.cents), None),
+                PricedObservation::SessionMismatch => {
+                    rt.note(|t| t.binding_mismatches += 1);
+                    return Ok(TurnSettlement::TranscriptMismatch);
+                }
+                PricedObservation::SessionUnverified => {
+                    rt.note(|t| t.unverified += 1);
+                    (None, Some("transcript_unverified"))
+                }
+                PricedObservation::UnpricedModels(models) => {
+                    rt.note_unpriced(&models);
+                    (None, Some("unpriced_model"))
+                }
+                PricedObservation::Unavailable(why) => (
+                    None,
+                    Some(match why {
+                        UsageUnavailable::NoTranscriptPath => "no_transcript_path",
+                        UsageUnavailable::Unreadable => "transcript_unreadable",
+                        UsageUnavailable::ScanCapReached => "scan_cap_reached",
+                        UsageUnavailable::NoUsageInWindow => "no_usage_in_window",
+                        UsageUnavailable::TurnIncomplete | UsageUnavailable::Inconsistent => {
+                            "transcript_inconsistent"
+                        }
+                    }),
+                ),
+            }
+        }
+        // An invalid file: the pricing it would supply is not trusted.
+        SharedBudgetFileState::Invalid(_) => (None, Some("config_invalid")),
+        SharedBudgetFileState::Absent => return Ok(TurnSettlement::NotConfigured),
+    };
+    if reason.is_some() {
+        rt.note(|t| t.unmeasured_settlements += 1);
+    }
+
+    let outcome = ledger.settle_shared_attributed(
+        target.id,
+        actual,
+        rt.now(),
+        ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+    )?;
+    Ok(match outcome {
+        SharedPoolSettleOutcome::Settled {
+            reservation,
+            overrun,
+            ..
+        } => TurnSettlement::Settled {
+            reservation_id: reservation.id,
+            pool_id: reservation.pool_id.0.clone(),
+            hold_usd_cents: reservation.amount,
+            settled_usd_cents: reservation.settled_amount.unwrap_or(reservation.amount),
+            usage_known: reservation.usage_known.unwrap_or(false),
+            overrun_usd_cents: overrun.unwrap_or(0),
+            unmeasured_reason: reason,
+        },
+        SharedPoolSettleOutcome::AlreadyFinal(_) | SharedPoolSettleOutcome::NotFound => {
+            TurnSettlement::AlreadySettled
+        }
+    })
+}
+
+/// Handles `SharedBudgetRequest::ChargeAgentTranscript` (HORO-2196).
+///
+/// Reads the subagent's own transcript (bounded, session-bound), prices it
+/// cumulatively and books only what is not yet charged for this
+/// `(session, agent)` -- or, for an unattributed subagent, this transcript
+/// path. See [`SharedBudgetRequest::ChargeAgentTranscript`].
+///
+/// # Idempotency
+///
+/// The ledger key is `subagent-transcript:<session>|<family>|c<cumulative>`
+/// (a measured delta) or `...|u` (the unmeasured fallback), where
+/// `<family>` is the agent id, or a hash of the path when there is none.
+/// "Already charged" is the sum of every row under the
+/// `subagent-transcript:<session>|<family>|` prefix, across periods, so:
+///
+/// - a repeated `SubagentStop` with the same transcript books nothing;
+/// - a later, larger transcript books only the difference;
+/// - an earlier unmeasured fallback counts as already charged, so a later
+///   measurement larger than it books the rest, and a smaller one books
+///   nothing. A charge is never refunded.
+///
+/// # Unmeasured fallback
+///
+/// A missing, unreadable, over-cap, empty, unpriced or unverifiable
+/// transcript is never silently omitted: `subagent_unmeasured_charge_usd_cents`
+/// (else `turn_hold_usd_cents`) is charged once for the family with
+/// `usage_known=false`. A transcript naming another session is refused and
+/// charges nothing at all.
+pub fn charge_agent_transcript(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    session_id: &str,
+    agent_id: Option<&str>,
+    agent_transcript_path: &str,
+) -> Result<SharedBudgetOutcome, SharedBudgetError> {
+    use sha2::{Digest, Sha256};
+
+    let state = rt.effective().state;
+    if matches!(state, SharedBudgetFileState::Absent) {
+        return Ok(SharedBudgetOutcome::NotConfigured);
+    }
+    let executor_kind = match validate_identity(session_id, agent_id) {
+        // A subagent without a known id is explicitly UNKNOWN, never the
+        // main executor.
+        Ok(ExecutorKind::AgentAbsent) => ExecutorKind::Unattributed,
+        Ok(kind) => kind,
+        Err(reason) => return Ok(refused(reason)),
+    };
+    let cfg = match configured(&state) {
+        Ok(cfg) => cfg,
+        Err(outcome) => return Ok(outcome),
+    };
+    let cfg = &cfg;
+
+    let family = match agent_id {
+        Some(agent) => format!("agent:{agent}"),
+        None => {
+            let digest = Sha256::digest(agent_transcript_path.as_bytes());
+            let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+            format!("path-sha256:{hex}")
+        }
+    };
+    let prefix = format!("subagent-transcript:{}|{}|", lp(session_id), lp(&family));
+
+    let path = std::path::Path::new(agent_transcript_path);
+    let observation = if agent_transcript_path.trim().is_empty() || !path.is_absolute() {
+        PricedObservation::Unavailable(UsageUnavailable::NoTranscriptPath)
+    } else {
+        observe_priced(
+            path,
+            ReadMode::WholeFile,
+            session_id,
+            &cfg.pricing_overrides.table(),
+            BUDGET_SCAN_CAP_BYTES,
+        )
+    };
+
+    struct Flags {
+        unpriced: bool,
+        unverified: bool,
+    }
+    let (measured, flags): (Option<(u64, Option<OffsetDateTime>)>, Flags) = match observation {
+        PricedObservation::Priced(w) => (
+            Some((w.cents, w.last_event_time)),
+            Flags {
+                unpriced: false,
+                unverified: false,
+            },
+        ),
+        PricedObservation::SessionMismatch => {
+            rt.note(|t| t.binding_mismatches += 1);
+            return Ok(refused(SharedBudgetRefusal::TranscriptSessionMismatch));
+        }
+        PricedObservation::SessionUnverified => {
+            rt.note(|t| t.unverified += 1);
+            (
+                None,
+                Flags {
+                    unpriced: false,
+                    unverified: true,
+                },
+            )
+        }
+        PricedObservation::UnpricedModels(models) => {
+            rt.note_unpriced(&models);
+            (
+                None,
+                Flags {
+                    unpriced: true,
+                    unverified: false,
+                },
+            )
+        }
+        PricedObservation::Unavailable(_) => (
+            None,
+            Flags {
+                unpriced: false,
+                unverified: false,
+            },
+        ),
+    };
+
+    let already =
+        ledger.shared_charges_total_by_key_prefix(&principal(), &prefix, OWNER_POOL_PREFIX)?;
+    let (amount, key, event_time, usage_known) = match measured {
+        Some((cumulative, last_event)) => {
+            let delta = cumulative.saturating_sub(already);
+            let event_time = last_event
+                .filter(|t| EVENT_YEARS.contains(&t.year()))
+                .map(rfc);
+            (delta, format!("{prefix}c{cumulative}"), event_time, true)
+        }
+        None => {
+            let fallback = cfg
+                .subagent_unmeasured_charge_usd_cents
+                .unwrap_or(cfg.turn_hold_usd_cents);
+            // Charged once per family; anything already booked stands.
+            let amount = if already == 0 { fallback } else { 0 };
+            (amount, format!("{prefix}u"), None, false)
+        }
+    };
+    let unmeasured = !usage_known;
+
+    let now = rt.now();
+    if amount == 0 {
+        // Nothing new to book. Report the posture without writing.
+        let period = period_at(cfg, now)?;
+        let admission = ledger.pool_admission_for(&period.pool_id, now, source(cfg))?;
+        return Ok(SharedBudgetOutcome::TranscriptCharged {
+            reservation_id: None,
+            pool_id: None,
+            amount_charged_usd_cents: 0,
+            cumulative_usd_cents: already,
+            already_charged: true,
+            executor_kind,
+            remaining_usd_cents: admission.map_or_else(
+                || i64::try_from(cfg.monthly_cap_usd_cents).unwrap_or(i64::MAX),
+                |a| a.remaining(),
+            ),
+            overrun_usd_cents: admission.map_or(0, |a| a.overrun()),
+            usage_known,
+            unmeasured,
+            unpriced: flags.unpriced,
+            transcript_unverified: flags.unverified,
+            event_time_clamped: false,
+        });
+    }
+
+    let outcome = book_charge(
+        ledger,
+        rt,
+        &state,
+        BookedCharge {
+            session_id,
+            agent_id,
+            amount_usd_cents: amount,
+            key: &key,
+            charge_source: ChargeSource::SubagentTranscript,
+            event_time: event_time.as_deref(),
+            usage_known,
+        },
+    )?;
+    Ok(match outcome {
+        SharedBudgetOutcome::Charged {
+            reservation_id,
+            pool_id,
+            amount_usd_cents,
+            already_charged,
+            executor_kind,
+            remaining_usd_cents,
+            overrun_usd_cents,
+            event_time_clamped,
+            ..
+        } => {
+            if unmeasured && !already_charged {
+                rt.note(|t| t.unmeasured_charges += 1);
+            }
+            SharedBudgetOutcome::TranscriptCharged {
+                reservation_id: Some(reservation_id),
+                pool_id: Some(pool_id),
+                amount_charged_usd_cents: if already_charged { 0 } else { amount_usd_cents },
+                cumulative_usd_cents: if already_charged {
+                    already
+                } else {
+                    already.saturating_add(amount_usd_cents)
+                },
+                already_charged,
+                executor_kind,
+                remaining_usd_cents,
+                overrun_usd_cents,
+                usage_known,
+                unmeasured,
+                unpriced: flags.unpriced,
+                transcript_unverified: flags.unverified,
+                event_time_clamped,
+            }
+        }
+        other => other,
+    })
+}
+
 /// Handles `SharedBudgetRequest::Status`.
 pub fn status(
     ledger: &LedgerStore,
@@ -869,7 +1408,20 @@ pub fn status(
         remaining_usd_cents: None,
         executors: Vec::new(),
         warnings: Vec::new(),
+        unpriced_models: Vec::new(),
+        transcript_binding_mismatches: 0,
+        transcript_unverified: 0,
+        unmeasured_settlements: 0,
+        unmeasured_charges: 0,
     };
+    {
+        let t = rt.telemetry.lock().unwrap_or_else(|e| e.into_inner());
+        report.unpriced_models = t.unpriced_models.iter().cloned().collect();
+        report.transcript_binding_mismatches = t.binding_mismatches;
+        report.transcript_unverified = t.unverified;
+        report.unmeasured_settlements = t.unmeasured_settlements;
+        report.unmeasured_charges = t.unmeasured_charges;
+    }
     let SharedBudgetFileState::Valid(cfg) = &effective.state else {
         return Ok(report);
     };
@@ -880,6 +1432,7 @@ pub fn status(
         soft_limit_per_session_usd_cents: cfg.soft_limits.per_session_usd_cents,
         soft_limit_per_agent_usd_cents: cfg.soft_limits.per_agent_usd_cents,
         subagent_unmeasured_charge_usd_cents: cfg.subagent_unmeasured_charge_usd_cents,
+        pricing_override_count: cfg.pricing_overrides.len() as u64,
     });
     let now = rt.now();
     let period = period_at(cfg, now)?;

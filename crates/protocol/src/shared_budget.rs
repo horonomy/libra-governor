@@ -62,6 +62,22 @@ pub enum SharedBudgetRequest {
         charge_source: ChargeSource,
         event_time: Option<String>,
     },
+    /// Charge a subagent's own transcript (HORO-2196). The daemon reads
+    /// `agent_transcript_path` itself (the caller supplies a path, never an
+    /// amount), prices the file's usage cumulatively and books only the
+    /// part not yet charged for this `(session, agent)`, so a repeated
+    /// `SubagentStop` never double-charges and a later, larger transcript
+    /// charges only the difference. An unreadable, over-cap, unpriced or
+    /// unverifiable transcript is never silently omitted: a conservative
+    /// fallback amount is charged once instead, flagged `unmeasured`.
+    ///
+    /// With no `agent_id` the row is `unattributed` and the daemon never
+    /// invents an id.
+    ChargeAgentTranscript {
+        session_id: String,
+        agent_id: Option<String>,
+        agent_transcript_path: String,
+    },
     /// Read-only budget posture.
     Status {},
 }
@@ -99,6 +115,10 @@ pub enum SharedBudgetRefusal {
     KeyConflict,
     /// The period's pool exists in a unit other than USD cents.
     PoolUnitMismatch,
+    /// The transcript's own per-line session field names a different
+    /// session than the request (HORO-2196). Nothing is charged: the
+    /// spend belongs to the session the file really records.
+    TranscriptSessionMismatch,
 }
 
 /// State reported by `Check`.
@@ -161,6 +181,9 @@ pub struct SharedBudgetConfigView {
     pub soft_limit_per_session_usd_cents: Option<u64>,
     pub soft_limit_per_agent_usd_cents: Option<u64>,
     pub subagent_unmeasured_charge_usd_cents: Option<u64>,
+    /// How many models the file's `pricing_overrides` price (HORO-2196).
+    #[serde(default)]
+    pub pricing_override_count: u64,
 }
 
 /// The current budget period.
@@ -221,6 +244,31 @@ pub struct SharedBudgetStatus {
     /// included.
     pub executors: Vec<SharedBudgetExecutorRow>,
     pub warnings: Vec<SoftLimitWarning>,
+    /// Settlement telemetry (HORO-2196). Held in daemon memory: it counts
+    /// since the daemon started and restarts at zero. The ledger rows
+    /// (`usage_known`) are the durable record.
+    ///
+    /// Models seen in a transcript that the pricing table (plus the file's
+    /// `pricing_overrides`) could not price, bounded and sanitised. A
+    /// window containing one settled at the hold amount.
+    #[serde(default)]
+    pub unpriced_models: Vec<String>,
+    /// Transcripts refused because their per-line session field named a
+    /// different session than the hook's.
+    #[serde(default)]
+    pub transcript_binding_mismatches: u64,
+    /// Windows or subagent files whose session could not be verified
+    /// (field absent or unreadable); settled/charged conservatively.
+    #[serde(default)]
+    pub transcript_unverified: u64,
+    /// Turn windows settled at the hold amount with `usage_known=false`
+    /// because they could not be measured.
+    #[serde(default)]
+    pub unmeasured_settlements: u64,
+    /// Subagent fallback charges written because the transcript could not
+    /// be measured.
+    #[serde(default)]
+    pub unmeasured_charges: u64,
 }
 
 /// The response to a [`SharedBudgetRequest`] (embedded in
@@ -272,6 +320,30 @@ pub enum SharedBudgetOutcome {
         capacity_known: bool,
         /// The event time named a later period than now, so the spend was
         /// booked to the current period instead of being dropped.
+        event_time_clamped: bool,
+    },
+    /// Answer to [`SharedBudgetRequest::ChargeAgentTranscript`].
+    TranscriptCharged {
+        /// The row written; `None` when nothing new was booked.
+        reservation_id: Option<SharedPoolReservationId>,
+        pool_id: Option<String>,
+        /// What this request added (the delta, or the fallback amount).
+        amount_charged_usd_cents: u64,
+        /// Everything now charged for this `(session, agent)` subagent
+        /// transcript, including earlier calls and fallbacks.
+        cumulative_usd_cents: u64,
+        /// Nothing was written because the amount was already booked.
+        already_charged: bool,
+        executor_kind: ExecutorKind,
+        remaining_usd_cents: i64,
+        overrun_usd_cents: u64,
+        /// False when the charge is the unmeasured fallback.
+        usage_known: bool,
+        unmeasured: bool,
+        /// A model in the transcript could not be priced.
+        unpriced: bool,
+        /// The transcript's session could not be verified.
+        transcript_unverified: bool,
         event_time_clamped: bool,
     },
     Status(Box<SharedBudgetStatus>),
@@ -347,5 +419,118 @@ mod tests {
         );
         let not_configured = serde_json::to_value(SharedBudgetOutcome::NotConfigured).unwrap();
         assert_eq!(not_configured["outcome"], "not_configured");
+    }
+    #[test]
+    fn transcript_charge_request_round_trips_and_rejects_unknown_fields() {
+        let req = SharedBudgetRequest::ChargeAgentTranscript {
+            session_id: "s".into(),
+            agent_id: Some("a".into()),
+            agent_transcript_path: "/x/agent-a.jsonl".into(),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["op"], "charge_agent_transcript");
+        assert_eq!(
+            serde_json::from_value::<SharedBudgetRequest>(json).unwrap(),
+            req
+        );
+        // The caller supplies a path, never an amount.
+        assert!(serde_json::from_str::<SharedBudgetRequest>(
+            r#"{"op":"charge_agent_transcript","session_id":"s","agent_transcript_path":"/p",
+            "amount_usd_cents":5}"#
+        )
+        .is_err());
+        let minimal: SharedBudgetRequest = serde_json::from_str(
+            r#"{"op":"charge_agent_transcript","session_id":"s","agent_transcript_path":"/p"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            minimal,
+            SharedBudgetRequest::ChargeAgentTranscript { agent_id: None, .. }
+        ));
+    }
+
+    #[test]
+    fn transcript_outcome_and_refusal_round_trip() {
+        let charged = SharedBudgetOutcome::TranscriptCharged {
+            reservation_id: None,
+            pool_id: None,
+            amount_charged_usd_cents: 0,
+            cumulative_usd_cents: 750,
+            already_charged: true,
+            executor_kind: ExecutorKind::Agent,
+            remaining_usd_cents: 99_250,
+            overrun_usd_cents: 0,
+            usage_known: true,
+            unmeasured: false,
+            unpriced: false,
+            transcript_unverified: false,
+            event_time_clamped: false,
+        };
+        let json = serde_json::to_value(&charged).unwrap();
+        assert_eq!(json["outcome"], "transcript_charged");
+        assert_eq!(
+            serde_json::from_value::<SharedBudgetOutcome>(json).unwrap(),
+            charged
+        );
+        let refused = SharedBudgetOutcome::Refused {
+            reason: SharedBudgetRefusal::TranscriptSessionMismatch,
+        };
+        assert_eq!(
+            serde_json::to_value(&refused).unwrap()["reason"],
+            "transcript_session_mismatch"
+        );
+    }
+
+    #[test]
+    fn a_status_from_an_older_daemon_decodes_with_zeroed_settlement_telemetry() {
+        let mut status = serde_json::to_value(SharedBudgetStatus {
+            basis: SHARED_BUDGET_BASIS.into(),
+            guarantee: SHARED_BUDGET_GUARANTEE.into(),
+            scope: SHARED_BUDGET_SCOPE.into(),
+            config_state: SharedBudgetConfigState::Absent,
+            config_invalid_reason: None,
+            config_drift: SharedBudgetConfigDrift::None,
+            config_changed_since_start: false,
+            config_path: None,
+            config_permissions_note: None,
+            config: None,
+            clock_anomaly: false,
+            future_pool_detected: None,
+            period: None,
+            pool_exists: false,
+            capacity_known: false,
+            used_usd_cents: 0,
+            reserved_usd_cents: 0,
+            remaining_usd_cents: None,
+            executors: vec![],
+            warnings: vec![],
+            unpriced_models: vec!["m".into()],
+            transcript_binding_mismatches: 3,
+            transcript_unverified: 2,
+            unmeasured_settlements: 4,
+            unmeasured_charges: 5,
+        })
+        .unwrap();
+        let obj = status.as_object_mut().unwrap();
+        for k in [
+            "unpriced_models",
+            "transcript_binding_mismatches",
+            "transcript_unverified",
+            "unmeasured_settlements",
+            "unmeasured_charges",
+        ] {
+            obj.remove(k);
+        }
+        let back: SharedBudgetStatus = serde_json::from_value(status).unwrap();
+        assert!(back.unpriced_models.is_empty());
+        assert_eq!(
+            (
+                back.transcript_binding_mismatches,
+                back.transcript_unverified,
+                back.unmeasured_settlements,
+                back.unmeasured_charges
+            ),
+            (0, 0, 0, 0)
+        );
     }
 }

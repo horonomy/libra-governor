@@ -15,7 +15,7 @@ Slice S2 delivers this record and `calendar_month_bounds`; later slices wire it.
 `Request::SharedBudget` (`Admit`, `Check`, `ChargeAgent`, `Status`),
 admission against the locally configured cap, month rollover, the failure
 rows `config_invalid` and `clock_anomaly`, and the tool-event heartbeat.
-The daemon re-reads the file on every decision (see *Daemon behaviour delivered in S4*). `PROTOCOL_VERSION` is 20. Everything else below is **design intent
+The daemon re-reads the file on every decision (see *Daemon behaviour delivered in S4*). `PROTOCOL_VERSION` is 21 (HORO-2196). Everything else below is **design intent
 implemented in later slices** (S5 settlement from transcripts, S6 hooks and
 the daemon-unreachable behaviour, S7 installer, S8 doctor/status, S11
 gateway `governor_held`); it must not be read as shipped behaviour. No real

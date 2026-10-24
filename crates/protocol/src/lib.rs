@@ -247,4 +247,11 @@ pub use messages::{
 /// owner no earlier daemon could have provisioned). A long-lived v19
 /// daemon must be restarted after upgrading before shared-budget traffic
 /// is reachable.
-pub const PROTOCOL_VERSION: u32 = 20;
+///
+/// v21 (HORO-2196): shared-budget settlement. `SharedBudgetRequest` gained
+/// `ChargeAgentTranscript`, `SharedBudgetOutcome` gained
+/// `TranscriptCharged`, `SharedBudgetRefusal` gained
+/// `TranscriptSessionMismatch`, and `SharedBudgetStatus` gained the
+/// settlement telemetry fields. A v20 peer's decoder cannot parse the new
+/// variants, so a long-lived v20 daemon must be restarted after upgrading.
+pub const PROTOCOL_VERSION: u32 = 21;

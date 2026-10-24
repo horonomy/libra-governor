@@ -99,6 +99,7 @@ fn charge(
             now: now(),
             attribution,
             capacity_source: source,
+            usage_known: true,
         })
         .unwrap()
 }
@@ -425,6 +426,7 @@ fn charge_is_idempotent_on_its_key_and_scoped_like_reserve_keys() {
             now: now(),
             attribution: attr,
             capacity_source: local(1_000),
+            usage_known: true,
         })
         .unwrap();
     assert!(matches!(outcome, SharedPoolChargeOutcome::Charged { .. }));
@@ -458,6 +460,7 @@ fn charge_on_a_missing_pool_or_wrong_unit_is_not_silently_recorded() {
         now: now(),
         attribution: Default::default(),
         capacity_source: local(10),
+        usage_known: true,
     });
     assert!(err.is_err(), "unit mismatch must be an error, not a row");
 }
@@ -754,6 +757,7 @@ fn inconsistent_attribution_is_rejected_before_anything_is_written() {
             now: now(),
             attribution,
             capacity_source: local(10),
+            usage_known: true,
         });
         assert!(r.is_err(), "case {i} must be rejected");
         let r = store.reserve_shared_metered(MeteredReserveRequest {
@@ -1118,4 +1122,160 @@ fn invalid_attribution_is_rejected_even_when_the_pool_is_full() {
         capacity_source: cap,
     });
     assert!(r.is_err(), "must be an error, not Insufficient: {r:?}");
+}
+
+// ---------------------------------------------------------------------
+// HORO-2196: provenance on a charge, lane history, prefix totals
+// ---------------------------------------------------------------------
+
+fn charge_with(
+    store: &mut LedgerStore,
+    amount: u64,
+    key: &str,
+    usage_known: bool,
+) -> SharedPoolChargeOutcome {
+    store
+        .charge_shared(SharedPoolChargeRequest {
+            pool_id: &pool(),
+            principal_id: &owner(),
+            session_id: "s1",
+            amount,
+            unit: &QuotaUnit::UsdCents,
+            idempotency_key: key,
+            now: now(),
+            attribution: ExecutorAttribution::agent("a1", Some(ChargeSource::SubagentTranscript)),
+            capacity_source: local(10_000),
+            usage_known,
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_charge_records_whether_its_amount_was_observed_and_replay_must_agree() {
+    let (_dir, mut store) = store_with_pool(10_000);
+    let SharedPoolChargeOutcome::Charged { reservation, .. } =
+        charge_with(&mut store, 25, "k-placeholder", false)
+    else {
+        panic!("expected Charged");
+    };
+    assert_eq!(reservation.usage_known, Some(false));
+    let SharedPoolChargeOutcome::Charged { reservation, .. } =
+        charge_with(&mut store, 25, "k-observed", true)
+    else {
+        panic!("expected Charged");
+    };
+    assert_eq!(reservation.usage_known, Some(true));
+
+    assert!(matches!(
+        charge_with(&mut store, 25, "k-placeholder", false),
+        SharedPoolChargeOutcome::AlreadyCharged(_)
+    ));
+    // Same key, same amount, different provenance: not a replay.
+    assert!(matches!(
+        charge_with(&mut store, 25, "k-placeholder", true),
+        SharedPoolChargeOutcome::KeyConflict(_)
+    ));
+}
+
+#[test]
+fn charges_total_by_key_prefix_sums_only_matching_charge_rows() {
+    let (_dir, mut store) = store_with_pool(10_000);
+    charge_with(&mut store, 10, "fam-a|c10", true);
+    charge_with(&mut store, 5, "fam-a|u", false);
+    charge_with(&mut store, 99, "fam-b|c99", true);
+    fn total(store: &LedgerStore, prefix: &str) -> u64 {
+        store
+            .shared_charges_total_by_key_prefix(&owner(), prefix, "metered:acme/")
+            .unwrap()
+    }
+    assert_eq!(total(&store, "fam-a|"), 15);
+    assert_eq!(total(&store, "fam-b|"), 99);
+    assert_eq!(total(&store, "fam-"), 114);
+    assert_eq!(total(&store, "nothing|"), 0);
+    // Pool prefix scoping.
+    assert_eq!(
+        store
+            .shared_charges_total_by_key_prefix(&owner(), "fam-a|", "metered:other/")
+            .unwrap(),
+        0
+    );
+    // A turn hold is never a charge row, whatever its key looks like.
+    reserve(
+        &mut store,
+        local(10_000),
+        "s1",
+        100,
+        "fam-a|hold",
+        ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+    );
+    assert_eq!(total(&store, "fam-a|"), 15);
+}
+
+#[test]
+fn lane_holds_lists_holds_of_one_lane_in_any_state_and_never_charges() {
+    let (_dir, mut store) = store_with_pool(10_000);
+    let a = granted_id(reserve(
+        &mut store,
+        local(10_000),
+        "s1",
+        100,
+        "h1",
+        ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+    ));
+    store.settle_shared(a, Some(40), now()).unwrap();
+    reserve(
+        &mut store,
+        local(10_000),
+        "s1",
+        100,
+        "h2",
+        ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+    );
+    // Other lanes of the same session, and charges, are not this lane.
+    reserve(
+        &mut store,
+        local(10_000),
+        "s1",
+        100,
+        "h3",
+        ExecutorAttribution::agent("a1", Some(ChargeSource::TurnHold)),
+    );
+    reserve(
+        &mut store,
+        local(10_000),
+        "s2",
+        100,
+        "h4",
+        ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+    );
+    charge(
+        &mut store,
+        local(10_000),
+        "s1",
+        7,
+        "c1",
+        ExecutorAttribution::main_executor(Some(ChargeSource::Gateway)),
+    );
+    let lane = store
+        .shared_lane_holds(
+            &owner(),
+            "s1",
+            None,
+            ExecutorKind::AgentAbsent,
+            "metered:acme/",
+        )
+        .unwrap();
+    let mut keys: Vec<_> = lane.iter().map(|h| h.idempotency_key.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["h1", "h2"]);
+    let agent_lane = store
+        .shared_lane_holds(
+            &owner(),
+            "s1",
+            Some("a1"),
+            ExecutorKind::Agent,
+            "metered:acme/",
+        )
+        .unwrap();
+    assert_eq!(agent_lane.len(), 1);
 }
