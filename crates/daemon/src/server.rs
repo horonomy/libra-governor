@@ -963,6 +963,15 @@ pub(crate) fn dispatch(
                     }
                     outcome
                 }
+                SharedBudgetRequest::TranscriptReady {
+                    session_id,
+                    transcript_path,
+                } => crate::shared_budget::transcript_ready(
+                    ledger,
+                    rt,
+                    &session_id,
+                    &transcript_path,
+                ),
                 SharedBudgetRequest::Status {} => crate::shared_budget::status(ledger, rt)
                     .map(|status| SharedBudgetOutcome::Status(Box::new(status))),
             };
