@@ -551,7 +551,7 @@ fn finish(mut acc: Accumulator, table: &PricingTable) -> PricedObservation {
     let mut message_ids: Vec<String> = acc.by_id.keys().cloned().collect();
     message_ids.sort_unstable();
     if acc.future {
-        message_ids.extend(acc.future_ids.drain(..));
+        message_ids.append(&mut acc.future_ids);
         message_ids.sort_unstable();
         message_ids.dedup();
         return PricedObservation::FutureTimestamp {
