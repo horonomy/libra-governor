@@ -108,8 +108,9 @@ pub use economic_truth::{
 pub use estimate::{Estimate, ESTIMATOR_VERSION};
 pub use execution_event::{ExecutionEvent, ExecutionEventKind};
 pub use execution_identity::{
-    is_valid_tool_provider, ExecutionIdentity, ExecutionIdentityBuilder, ExecutionIdentityError,
-    LineageStatus, Scope, ScopeIdentityMissing, EXECUTION_IDENTITY_ENVELOPE_VERSION,
+    is_valid_tool_provider, redacted_display_id, ExecutionIdentity, ExecutionIdentityBuilder,
+    ExecutionIdentityError, LineageStatus, Scope, ScopeIdentityMissing,
+    EXECUTION_IDENTITY_ENVELOPE_VERSION,
 };
 pub use execution_outcome::ExecutionOutcome;
 pub use execution_plan::{ExecutionPlan, PlanId};
