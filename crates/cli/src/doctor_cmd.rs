@@ -25,7 +25,9 @@ use std::path::{Path, PathBuf};
 
 use libra_governor_protocol::{DoctorResult, Request, Response};
 
-use crate::{claude_settings, client, codex_hooks_file, gateway_cmd, install_cmd};
+use crate::{
+    claude_settings, client, codex_hooks_file, gateway_cmd, install_cmd, shared_budget_view,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Severity {
@@ -120,7 +122,345 @@ fn collect_findings(daemon_present: bool) -> Vec<Finding> {
     findings.push(quota_source_mode_finding());
     findings.push(pacing_authority_finding());
     findings.push(execution_identity_capture_finding());
+    findings.extend(shared_budget_findings());
+    findings.push(host_traffic_setting_finding());
     findings
+}
+
+/// The hooks the shared budget needs, by Claude Code event name, in the
+/// order of the two `Inspection` arrays.
+const BUDGET_HOOK_NAMES: [&str; 6] = [
+    "UserPromptSubmit",
+    "PostToolUse",
+    "Stop",
+    "PreToolUse",
+    "SubagentStop",
+    "SessionEnd",
+];
+
+/// Local monthly shared budget checks (HORO-2217, ADR-0026). Read-only:
+/// never starts the daemon, never writes, and with no budget file it asks
+/// the daemon nothing.
+fn shared_budget_findings() -> Vec<Finding> {
+    let posture = shared_budget_view::collect(shared_budget_view::REPORT_BUDGET);
+    let settings = claude_settings::settings_path()
+        .ok()
+        .map(|p| claude_settings::inspect(&p));
+    budget_findings_for(&posture, settings.as_ref())
+}
+
+fn budget_findings_for(
+    posture: &shared_budget_view::Posture,
+    settings: Option<&claude_settings::Inspection>,
+) -> Vec<Finding> {
+    use shared_budget_view::Posture;
+    let mut findings = Vec::new();
+    let configured = !matches!(posture, Posture::NotConfigured);
+
+    // 1. The budget file.
+    findings.push(match posture {
+        Posture::NotConfigured => Finding {
+            id: "shared_budget_config",
+            severity: Severity::Ok,
+            message: "no shared-budget.json: the local monthly shared budget is not configured \
+                      (nothing is admitted against or charged to it)"
+                .to_string(),
+        },
+        Posture::DaemonUnreachable { file, .. } => match &file.state {
+            libra_governor_daemon::shared_budget_file::SharedBudgetFileState::Invalid(why) => {
+                invalid_config_finding(why)
+            }
+            libra_governor_daemon::shared_budget_file::SharedBudgetFileState::Valid(cfg) => {
+                Finding {
+                    id: "shared_budget_config",
+                    severity: Severity::Ok,
+                    message: format!(
+                        "shared-budget.json valid: monthly cap {} in {}",
+                        shared_budget_view::usd_u(cfg.monthly_cap_usd_cents),
+                        cfg.time_zone.as_str()
+                    ),
+                }
+            }
+            libra_governor_daemon::shared_budget_file::SharedBudgetFileState::Absent => Finding {
+                id: "shared_budget_config",
+                severity: Severity::Ok,
+                message: "no shared-budget.json: the local monthly shared budget is not \
+                          configured"
+                    .to_string(),
+            },
+        },
+        Posture::Reported(s) => match s.config_state {
+            libra_governor_protocol::SharedBudgetConfigState::Invalid => invalid_config_finding(
+                s.config_invalid_reason
+                    .as_deref()
+                    .unwrap_or("unknown reason"),
+            ),
+            _ => Finding {
+                id: "shared_budget_config",
+                severity: Severity::Ok,
+                message: match &s.config {
+                    Some(cfg) => format!(
+                        "shared-budget.json valid: monthly cap {} in {}, turn hold {}",
+                        shared_budget_view::usd_u(cfg.monthly_cap_usd_cents),
+                        cfg.time_zone,
+                        shared_budget_view::usd_u(cfg.turn_hold_usd_cents)
+                    ),
+                    None => "shared-budget.json valid".to_string(),
+                },
+            },
+        },
+    });
+
+    // 2. The six hooks.
+    findings.push(budget_hooks_finding(configured, settings));
+
+    // 3. Daemon reachability, only meaningful once a budget is configured.
+    if let Posture::DaemonUnreachable { reason, .. } = posture {
+        findings.push(Finding {
+            id: "shared_budget_daemon",
+            severity: Severity::Warn,
+            message: format!(
+                "a budget is configured but the daemon did not answer a status request ({}); \
+                 it starts on the next prompt, and spend figures are unavailable until then",
+                reason
+            ),
+        });
+    } else if let Posture::Reported(_) = posture {
+        findings.push(Finding {
+            id: "shared_budget_daemon",
+            severity: Severity::Ok,
+            message: "daemon answered a shared-budget status request".to_string(),
+        });
+    }
+
+    if let Posture::Reported(s) = posture {
+        // 4. Clock anomaly.
+        findings.push(if s.clock_anomaly {
+            Finding {
+                id: "shared_budget_clock",
+                severity: Severity::Error,
+                message: format!(
+                    "clock anomaly: a pool of a later period ({}) exists than the clock's; \
+                     prompt admission denies until this is resolved",
+                    s.future_pool_detected.as_deref().unwrap_or("unknown")
+                ),
+            }
+        } else {
+            Finding {
+                id: "shared_budget_clock",
+                severity: Severity::Ok,
+                message: "no clock anomaly".to_string(),
+            }
+        });
+
+        // 4b. Capacity and exhaustion: a healthy-looking file can still deny
+        // every prompt.
+        if s.config_state == libra_governor_protocol::SharedBudgetConfigState::Valid {
+            if !s.capacity_known {
+                findings.push(Finding {
+                    id: "shared_budget_capacity",
+                    severity: Severity::Warn,
+                    message: "capacity unknown: the pool's capacity could not be established, \
+                              so the budget figures are not authoritative"
+                        .to_string(),
+                });
+            }
+            if shared_budget_view::admission_closed(s) {
+                let remaining = s.remaining_usd_cents.unwrap_or(0);
+                findings.push(Finding {
+                    id: "shared_budget_exhausted",
+                    severity: Severity::Warn,
+                    message: format!(
+                        "{}: {} remaining, less than one turn hold, so every new prompt is \
+                         denied until the period ends or the cap is raised",
+                        if remaining < 0 {
+                            "pool overrun"
+                        } else {
+                            "pool exhausted"
+                        },
+                        shared_budget_view::usd(remaining)
+                    ),
+                });
+            }
+        }
+
+        // 5. Flagged settlements.
+        let flagged = shared_budget_view::flagged_total(s);
+        findings.push(if flagged == 0 {
+            Finding {
+                id: "shared_budget_settlements",
+                severity: Severity::Ok,
+                message: "no unmeasured or flagged settlements since the daemon started"
+                    .to_string(),
+            }
+        } else {
+            let detail: Vec<String> = shared_budget_view::flagged_counts(s)
+                .iter()
+                .filter(|(_, n)| *n > 0)
+                .map(|(name, n)| format!("{name}={n}"))
+                .chain(
+                    (!s.unpriced_models.is_empty())
+                        .then(|| format!("unpriced_models={}", s.unpriced_models.len())),
+                )
+                .collect();
+            Finding {
+                id: "shared_budget_settlements",
+                severity: Severity::Warn,
+                message: format!(
+                    "flagged settlements since the daemon started (estimated or skipped, not \
+                     measured): {}; see `libra-governor shared-budget status`",
+                    detail.join(", ")
+                ),
+            }
+        });
+
+        // 6. Reconciliation of the per-executor table.
+        if let Some(why) = shared_budget_view::reconcile(s).discrepancy() {
+            findings.push(Finding {
+                id: "shared_budget_reconciliation",
+                severity: Severity::Error,
+                message: format!("per-executor rows do not reconcile with the pool: {why}"),
+            });
+        }
+    }
+
+    // 7. What the budget does not cover, always.
+    findings.push(Finding {
+        id: "shared_budget_limits",
+        severity: Severity::Ok,
+        message: format!(
+            "guarantee: {}; amounts are {}. The budget does NOT cover: {}",
+            shared_budget_view::GUARANTEE_LABEL,
+            shared_budget_view::USD_MEANING,
+            shared_budget_view::NOT_COVERED
+                .iter()
+                .map(|item| format!("({item})"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+    });
+    findings
+}
+
+fn invalid_config_finding(reason: &str) -> Finding {
+    Finding {
+        id: "shared_budget_config",
+        severity: Severity::Error,
+        message: format!(
+            "shared-budget.json is INVALID ({}): every prompt is denied until it is fixed",
+            reason
+                .chars()
+                .take(160)
+                .collect::<String>()
+                .replace(|c: char| c.is_control(), " ")
+        ),
+    }
+}
+
+/// Whether all six hooks are wired. With no budget configured an unwired
+/// hook is informational; with one, it means spend goes unaccounted.
+fn budget_hooks_finding(
+    configured: bool,
+    settings: Option<&claude_settings::Inspection>,
+) -> Finding {
+    let Some(inspection) = settings else {
+        return Finding {
+            id: "shared_budget_hooks",
+            severity: if configured {
+                Severity::Warn
+            } else {
+                Severity::Ok
+            },
+            message: "could not resolve ~/.claude/settings.json (HOME unset), so the six hooks \
+                      cannot be checked"
+                .to_string(),
+        };
+    };
+    let wired: Vec<bool> = inspection
+        .hooks_wired
+        .iter()
+        .chain(inspection.shared_budget_hooks_wired.iter())
+        .copied()
+        .collect();
+    let missing: Vec<&str> = BUDGET_HOOK_NAMES
+        .iter()
+        .zip(&wired)
+        .filter(|(_, w)| !**w)
+        .map(|(name, _)| *name)
+        .collect();
+    // Without the admission gate nothing is admitted, and without Stop
+    // nothing is settled: the budget is not working at all.
+    let essential_missing = missing
+        .iter()
+        .any(|name| matches!(*name, "UserPromptSubmit" | "Stop"));
+    if missing.is_empty() {
+        Finding {
+            id: "shared_budget_hooks",
+            severity: Severity::Ok,
+            message: "all six hooks wired in an all-tools group (UserPromptSubmit, PostToolUse, \
+                      Stop, PreToolUse, SubagentStop, SessionEnd)"
+                .to_string(),
+        }
+    } else {
+        Finding {
+            id: "shared_budget_hooks",
+            severity: match (configured, essential_missing) {
+                (false, _) => Severity::Ok,
+                (true, true) => Severity::Error,
+                (true, false) => Severity::Warn,
+            },
+            message: format!(
+                "not wired for every tool: {} — re-run `libra-governor install`{}",
+                missing.join(", "),
+                if configured && essential_missing {
+                    "; a budget file exists but UserPromptSubmit (admission) or Stop \
+                     (settlement) is not wired, so nothing is admitted or charged"
+                } else if configured {
+                    "; until then the budget does not see that spend or cannot gate it"
+                } else {
+                    " (the budget is not configured, so this is informational)"
+                }
+            ),
+        }
+    }
+}
+
+/// Reports `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` without printing or
+/// interpreting its value (docs/egress-inventory.md). Two different facts:
+/// the process environment is checked for a non-empty value, the
+/// `settings.json` env block for the key being present. Report only: it
+/// governs Claude Code's own traffic, which Libra neither sets nor enforces,
+/// and a value such as `0` or `false` does not mean traffic is disabled.
+fn host_traffic_setting_finding() -> Finding {
+    const KEY: &str = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC";
+    let in_environment = std::env::var_os(KEY).is_some_and(|v| !v.is_empty());
+    let in_settings = claude_settings::settings_path()
+        .ok()
+        .is_some_and(|p| claude_settings::env_key_present(&p, KEY));
+    host_traffic_finding_for(KEY, in_environment, in_settings)
+}
+
+fn host_traffic_finding_for(key: &str, in_environment: bool, in_settings: bool) -> Finding {
+    Finding {
+        id: "host_traffic_setting",
+        severity: Severity::Ok,
+        message: format!(
+            "{key}: process environment {} (non-empty value); settings.json env block {} (key \
+             present). Report only: the value is never printed or interpreted, so a present key \
+             does not mean non-essential traffic is disabled; it governs Claude Code's own \
+             traffic and Libra neither sets nor enforces it (docs/egress-inventory.md)",
+            if in_environment {
+                "has it"
+            } else {
+                "does not have it"
+            },
+            if in_settings {
+                "has it"
+            } else {
+                "does not have it"
+            },
+        ),
+    }
 }
 
 /// HORO-1767: names `quota explain --replay`'s actual authority honestly
@@ -891,6 +1231,222 @@ mod tests {
             severity: Severity::Error,
             message: "broken".to_string(),
         }
+    }
+
+    fn find<'a>(findings: &'a [Finding], id: &str) -> &'a Finding {
+        findings
+            .iter()
+            .find(|f| f.id == id)
+            .unwrap_or_else(|| panic!("no {id} finding in {findings:?}"))
+    }
+
+    fn all_wired() -> claude_settings::Inspection {
+        claude_settings::Inspection {
+            file_present: true,
+            hooks_wired: [true; 3],
+            shared_budget_hooks_wired: [true; 3],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn with_no_budget_file_doctor_is_quiet_but_still_states_the_limits() {
+        use shared_budget_view::Posture;
+        let findings = budget_findings_for(&Posture::NotConfigured, Some(&Default::default()));
+        assert_eq!(
+            find(&findings, "shared_budget_config").severity,
+            Severity::Ok
+        );
+        assert!(find(&findings, "shared_budget_config")
+            .message
+            .contains("not configured"));
+        // Unwired hooks are informational when there is no budget.
+        assert_eq!(
+            find(&findings, "shared_budget_hooks").severity,
+            Severity::Ok
+        );
+        assert!(findings.iter().all(|f| f.severity == Severity::Ok));
+        let limits = &find(&findings, "shared_budget_limits").message;
+        assert!(limits.contains("admission-bounded (cooperative)"));
+        assert!(limits.contains("in-turn overshoot"));
+        assert!(limits.contains("Codex route has no budget gate"));
+        assert!(limits.contains("no gateway hard cap"));
+        assert!(limits.contains("never a provider bill or quota"));
+    }
+
+    #[test]
+    fn a_configured_budget_with_a_missing_hook_warns_and_names_it() {
+        use shared_budget_view::{fixtures::sample_status, Posture};
+        let mut inspection = all_wired();
+        inspection.shared_budget_hooks_wired = [false, true, true];
+        let findings = budget_findings_for(
+            &Posture::Reported(Box::new(sample_status())),
+            Some(&inspection),
+        );
+        let hooks = find(&findings, "shared_budget_hooks");
+        assert_eq!(hooks.severity, Severity::Warn);
+        assert!(hooks.message.contains("PreToolUse"), "{}", hooks.message);
+        assert!(!hooks.message.contains("SessionEnd"), "{}", hooks.message);
+
+        let healthy = budget_findings_for(
+            &Posture::Reported(Box::new(sample_status())),
+            Some(&all_wired()),
+        );
+        assert_eq!(find(&healthy, "shared_budget_hooks").severity, Severity::Ok);
+        assert_eq!(find(&healthy, "shared_budget_clock").severity, Severity::Ok);
+        assert_eq!(
+            find(&healthy, "shared_budget_settlements").severity,
+            Severity::Ok
+        );
+        assert_eq!(
+            find(&healthy, "shared_budget_daemon").severity,
+            Severity::Ok
+        );
+    }
+
+    #[test]
+    fn clock_anomaly_flagged_settlements_and_a_bad_reconciliation_are_reported() {
+        use shared_budget_view::{fixtures::sample_status, Posture};
+        let mut s = sample_status();
+        s.clock_anomaly = true;
+        s.future_pool_detected = Some("monthly-2027-01".into());
+        s.unmeasured_settlements = 2;
+        s.future_timestamp_settlements = 1;
+        s.executors[0].used_usd_cents += 1;
+        let findings = budget_findings_for(&Posture::Reported(Box::new(s)), Some(&all_wired()));
+        let clock = find(&findings, "shared_budget_clock");
+        assert_eq!(clock.severity, Severity::Error);
+        assert!(clock.message.contains("monthly-2027-01"));
+        let flagged = find(&findings, "shared_budget_settlements");
+        assert_eq!(flagged.severity, Severity::Warn);
+        assert!(flagged.message.contains("unmeasured_settlements=2"));
+        assert!(flagged.message.contains("future_timestamp_settlements=1"));
+        assert_eq!(
+            find(&findings, "shared_budget_reconciliation").severity,
+            Severity::Error
+        );
+    }
+
+    #[test]
+    fn an_invalid_budget_file_is_an_error_and_an_unreachable_daemon_a_warning() {
+        use libra_governor_protocol::SharedBudgetConfigState;
+        use shared_budget_view::{fixtures::sample_status, Posture};
+        let mut s = sample_status();
+        s.config_state = SharedBudgetConfigState::Invalid;
+        s.config_invalid_reason = Some("monthly_cap_usd_cents must be greater than 0".into());
+        s.config = None;
+        let findings = budget_findings_for(&Posture::Reported(Box::new(s)), Some(&all_wired()));
+        let config = find(&findings, "shared_budget_config");
+        assert_eq!(config.severity, Severity::Error);
+        assert!(config.message.contains("every prompt is denied"));
+
+        let down = Posture::DaemonUnreachable {
+            file: Box::new(
+                libra_governor_daemon::shared_budget_file::LoadedSharedBudget::from_bytes(
+                    None,
+                    br#"{"schema_version":1,"monthly_cap_usd_cents":50000,"time_zone":"UTC"}"#,
+                ),
+            ),
+            reason: "connection refused".into(),
+        };
+        let findings = budget_findings_for(&down, Some(&all_wired()));
+        assert_eq!(
+            find(&findings, "shared_budget_daemon").severity,
+            Severity::Warn
+        );
+        assert_eq!(
+            find(&findings, "shared_budget_config").severity,
+            Severity::Ok
+        );
+    }
+
+    #[test]
+    fn a_configured_budget_without_the_admission_or_settlement_hook_is_an_error() {
+        use shared_budget_view::{fixtures::sample_status, Posture};
+        let posture = Posture::Reported(Box::new(sample_status()));
+        for (legacy, label) in [
+            ([false, true, true], "UserPromptSubmit"),
+            ([true, true, false], "Stop"),
+        ] {
+            let mut inspection = all_wired();
+            inspection.hooks_wired = legacy;
+            let findings = budget_findings_for(&posture, Some(&inspection));
+            let hooks = find(&findings, "shared_budget_hooks");
+            assert_eq!(hooks.severity, Severity::Error, "{label}");
+            assert!(hooks.message.contains(label));
+            assert!(hooks.message.contains("nothing is admitted or charged"));
+        }
+        // Only a non-essential hook missing stays a warning.
+        let mut inspection = all_wired();
+        inspection.hooks_wired = [true, false, true];
+        let findings = budget_findings_for(&posture, Some(&inspection));
+        assert_eq!(
+            find(&findings, "shared_budget_hooks").severity,
+            Severity::Warn
+        );
+        // Nothing wired but no budget configured: informational only.
+        let findings = budget_findings_for(
+            &shared_budget_view::Posture::NotConfigured,
+            Some(&Default::default()),
+        );
+        assert_eq!(
+            find(&findings, "shared_budget_hooks").severity,
+            Severity::Ok
+        );
+    }
+
+    #[test]
+    fn an_exhausted_or_overrun_pool_and_unknown_capacity_are_surfaced() {
+        use shared_budget_view::{fixtures::sample_status, Posture};
+        let healthy = budget_findings_for(
+            &Posture::Reported(Box::new(sample_status())),
+            Some(&all_wired()),
+        );
+        assert!(healthy.iter().all(|f| f.id != "shared_budget_exhausted"));
+        assert!(healthy.iter().all(|f| f.id != "shared_budget_capacity"));
+
+        for (remaining, word) in [
+            (0, "pool exhausted"),
+            (500, "pool exhausted"),
+            (-250, "pool overrun"),
+        ] {
+            let mut s = sample_status();
+            s.remaining_usd_cents = Some(remaining);
+            let findings = budget_findings_for(&Posture::Reported(Box::new(s)), Some(&all_wired()));
+            let f = find(&findings, "shared_budget_exhausted");
+            assert_eq!(f.severity, Severity::Warn, "{remaining}");
+            assert!(f.message.contains(word), "{}", f.message);
+            assert!(f.message.contains("every new prompt is denied"));
+        }
+
+        let mut unknown = sample_status();
+        unknown.capacity_known = false;
+        let findings =
+            budget_findings_for(&Posture::Reported(Box::new(unknown)), Some(&all_wired()));
+        assert_eq!(
+            find(&findings, "shared_budget_capacity").severity,
+            Severity::Warn
+        );
+    }
+
+    #[test]
+    fn the_host_traffic_report_is_presence_only() {
+        let both = host_traffic_finding_for("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", true, true);
+        assert!(both.message.contains("process environment has it"));
+        assert!(both.message.contains("settings.json env block has it"));
+        let neither =
+            host_traffic_finding_for("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", false, false);
+        assert!(neither
+            .message
+            .contains("process environment does not have it"));
+        assert_eq!(both.severity, Severity::Ok);
+        assert_eq!(
+            neither.severity,
+            Severity::Ok,
+            "report only, never a failure"
+        );
+        assert!(neither.message.contains("never printed or interpreted"));
+        assert!(neither.message.contains("does not mean"));
     }
 
     #[test]

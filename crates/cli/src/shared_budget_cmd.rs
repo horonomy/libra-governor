@@ -1,5 +1,10 @@
-//! `libra-governor shared-budget <prune|export>` (HORO-2219): retention and
-//! a local-only export for the local monthly shared budget (ADR-0026).
+//! `libra-governor shared-budget <status|prune|export>`: a read-only status
+//! view (HORO-2217), retention and a local-only export (HORO-2219) for the
+//! local monthly shared budget (ADR-0026).
+//!
+//! `status` asks a running daemon (never starts one) and, with no
+//! `shared-budget.json`, prints "not configured" without connecting or
+//! writing anything; see [`crate::shared_budget_view`].
 //!
 //! Both subcommands open the ledger file directly, like the other offline
 //! commands: a 5 s `busy_timeout`, one short `BEGIN IMMEDIATE` transaction
@@ -18,15 +23,16 @@
 //! local file path. Delivering an export anywhere is a separate, unbuilt
 //! workstream (ADR-0026).
 //!
-//! The group is a flat dispatch on the first argument: a later subcommand
-//! (`status`, `doctor`) is one more arm in [`run`] plus its own function,
-//! with no change to the logic below.
+//! The group is a flat dispatch on the first argument: a further subcommand
+//! is one more arm in [`run`] plus its own function, with no change to the
+//! logic below.
 
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use crate::shared_budget_view;
 use libra_governor_daemon::shared_budget_file::{LoadedSharedBudget, SharedBudgetFileState};
 use libra_governor_domain::{
     calendar_month_bounds, format_local_rfc3339, monthly_pool_alias, redacted_display_id,
@@ -39,9 +45,16 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 const HELP: &str = "Usage:\n  \
+    libra-governor shared-budget status [--json]\n  \
     libra-governor shared-budget prune --keep-months <n> --time-zone <IANA> [--apply]\n  \
     libra-governor shared-budget export --period <YYYY-MM> [--out <file>] [--time-zone <IANA>] \
     [--raw-ids] [--overwrite]\n\n\
+    status   Read-only budget posture from the running daemon (never starts one): config state, \
+    zone-local period, cap, settled, held, remaining (negative = overrun), per-executor table \
+    reconciled against the pool total, soft-limit warnings (warn-only), flagged settlements and \
+    clock anomaly. With no shared-budget.json it prints \"not configured\" and does nothing else. \
+    Exits 0 even for a discrepancy, clock anomaly or invalid config (doctor is the failing check). \
+    Amounts are Libra-accounted list-price-equivalent USD, never a provider bill or quota.\n  \
     prune   Dry run by default (deletes nothing); deletes only with --apply. Removes closed rows of \
     ended monthly periods older than the last <n> closed months (n >= 1). Export before prune: \
     pruned periods can no longer be exported, and replaying a charge older than the retention \
@@ -107,6 +120,7 @@ impl Flags {
 
 pub fn run(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
+        Some("status") => run_status(&args[1..]),
         Some("prune") => run_prune(&args[1..]),
         Some("export") => run_export(&args[1..]),
         Some(other) => usage_error(&format!("unknown subcommand {other:?}")),
@@ -123,6 +137,29 @@ fn ledger_path_or_report(command: &str) -> Result<PathBuf, i32> {
         eprintln!("libra-governor shared-budget {command}: could not resolve state dir: {e}");
         1
     })
+}
+
+// ---------------------------------------------------------------------
+// status
+// ---------------------------------------------------------------------
+
+fn run_status(args: &[String]) -> i32 {
+    let flags = match Flags::parse(args, &[], &["json"]) {
+        Ok(f) => f,
+        Err(e) => return usage_error(&e),
+    };
+    let posture = shared_budget_view::collect(shared_budget_view::REPORT_BUDGET);
+    let state_dir = shared_budget_view::state_dir();
+    if flags.switch("json") {
+        let doc = shared_budget_view::render_json(&posture, state_dir.as_deref());
+        println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
+    } else {
+        print!(
+            "{}",
+            shared_budget_view::render_human(&posture, state_dir.as_deref())
+        );
+    }
+    0
 }
 
 // ---------------------------------------------------------------------

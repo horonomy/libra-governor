@@ -37,6 +37,15 @@ disagree, trust the command.
 | Interruption signal | Unavailable — host exposes no `Interrupt`/cancel hook event | Unavailable — Codex exposes `Interrupt`, but it is not wired by Libra yet |
 | MCP explain surface | Unavailable — not wired by Libra yet | Unavailable — not wired by Libra yet |
 
+Operator surfaces for the shared budget (ADR-0026 S8, not capability rows
+and not in `agents --json`): `libra-governor shared-budget status [--json]`
+and the shared-budget checks in `doctor` are read-only and host-neutral, and
+the legacy statusline appends a short budget segment only while
+`shared-budget.json` exists (Claude Code only; Codex has no statusline). They
+report Claude Code's budgeted spend; Codex spend is neither admitted nor
+charged, and `doctor` says so, along with the lack of a gateway hard cap and
+of in-turn overshoot protection.
+
 Every "Unavailable" row names a concrete reason (a missing host
 primitive, a deliberate Libra scoping decision, or a real
 incompatibility) rather than a bare "no" — see

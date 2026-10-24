@@ -12,8 +12,19 @@ use libra_governor_protocol::{Confidence, ReplanState, Request, Response, Status
 use crate::client;
 
 pub fn run() {
-    let line = render_status_line();
+    let mut line = render_status_line();
+    // Appended only when a shared-budget file exists; any failure leaves the
+    // line byte-for-byte what it always was (HORO-2217).
+    if let Some(segment) = crate::shared_budget_view::statusline_segment_if_configured() {
+        line = with_budget_segment(&line, &segment);
+    }
     println!("{line}");
+}
+
+/// The legacy line followed by the budget segment. The legacy part is never
+/// edited: a founder wrapper greps it (see [`format_status`]).
+fn with_budget_segment(line: &str, segment: &str) -> String {
+    format!("{line} | {segment}")
 }
 
 fn render_status_line() -> String {
@@ -140,6 +151,15 @@ mod tests {
             configured_budget: None,
             task_budget_freshness: None,
         }
+    }
+
+    #[test]
+    fn the_budget_segment_is_appended_after_the_untouched_legacy_line() {
+        let base = format_status(&status_for(None));
+        let line = with_budget_segment(&base, "budget $1.00/$500 (0%)");
+        assert!(line.starts_with(&base));
+        assert_eq!(line, "libra: idle | budget $1.00/$500 (0%)");
+        assert!(!line.contains('\n'));
     }
 
     #[test]

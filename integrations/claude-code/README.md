@@ -709,9 +709,15 @@ The installer (`libra-governor install`, HORO-2216) adds the `PreToolUse`,
 `SubagentStop` and `SessionEnd` entries beside the original three,
 idempotently, and `uninstall` removes exactly those. They are installed
 whether or not a budget file exists; without one each is a cheap no-op.
-Not delivered: `status`/`doctor` reporting of the new hooks (S8; `doctor`
-still judges only the original three). No real Claude Code host has run
-these installed hooks yet; the evidence is `TestOwnedLive`.
+`libra-governor shared-budget status [--json]` shows the budget (config
+state, zone-local period, cap, settled, held, remaining, a per-executor
+table reconciled against the pool total, warn-only soft-limit warnings,
+flagged settlements, clock anomaly), the legacy statusline appends a short
+`budget $12.30/$500 (3%)` segment only while a budget file exists, and
+`doctor` checks the file, all six hooks, daemon reachability, clock anomaly
+and flagged settlements (HORO-2217, ADR-0026 S8). Not built: the gateway
+hard cap (S11), remote upload, and any real-host evidence. No real Claude
+Code host has run these installed hooks yet; the evidence is `TestOwnedLive`.
 
 ## What this integration intentionally does not do (yet)
 

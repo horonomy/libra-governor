@@ -71,7 +71,8 @@ const OWNED_COMMAND_SUFFIXES: [&str; 8] = [
 ];
 
 /// The three legacy hooks, in the order [`Inspection::hooks_wired`] reports
-/// them. Unchanged so `doctor` and the evidence report keep their meaning.
+/// them. The set is unchanged; since HORO-2217 an event counts as wired only
+/// when our command is in an all-tools group (see `inspect`).
 const HOOK_EVENTS: [&str; 3] = ["UserPromptSubmit", "PostToolUse", "Stop"];
 
 /// The shared-budget hooks (HORO-2216, ADR-0026 S7), reported separately in
@@ -718,20 +719,26 @@ pub fn inspect(path: &Path) -> Inspection {
             .and_then(|hooks| hooks.get(event))
             .and_then(Value::as_array)
             .map(|entries| {
-                entries.iter().any(|matcher| {
-                    matcher
-                        .get("hooks")
-                        .and_then(Value::as_array)
-                        .map(|inner| {
-                            inner.iter().any(|h| {
-                                h.get("command")
-                                    .and_then(Value::as_str)
-                                    .map(command_is_ours)
-                                    .unwrap_or(false)
+                // Only a group that applies to every tool counts: our command
+                // under a user's `matcher: "Bash"` group fires for Bash only
+                // (the same rule `apply` uses to decide it is installed).
+                entries
+                    .iter()
+                    .filter(|g| matcher_is_all_tools(g))
+                    .any(|matcher| {
+                        matcher
+                            .get("hooks")
+                            .and_then(Value::as_array)
+                            .map(|inner| {
+                                inner.iter().any(|h| {
+                                    h.get("command")
+                                        .and_then(Value::as_str)
+                                        .map(command_is_ours)
+                                        .unwrap_or(false)
+                                })
                             })
-                        })
-                        .unwrap_or(false)
-                })
+                            .unwrap_or(false)
+                    })
             })
             .unwrap_or(false)
     };
@@ -767,6 +774,18 @@ pub fn inspect(path: &Path) -> Inspection {
         base_url_present,
         base_url_is_loopback,
     }
+}
+
+/// Whether the `env` block of `path` has a key named `key`. Presence only:
+/// the value is never read out of this function, so a doctor report cannot
+/// leak it. A missing or unparsable file has no keys.
+pub fn env_key_present(path: &Path, key: &str) -> bool {
+    let Ok((Some(root), _)) = read_object(path) else {
+        return false;
+    };
+    root.get("env")
+        .and_then(Value::as_object)
+        .is_some_and(|env| env.contains_key(key))
 }
 
 #[cfg(test)]
@@ -1443,6 +1462,47 @@ mod tests {
             inspect(&path).shared_budget_hooks_wired,
             [false, false, false]
         );
+    }
+
+    #[test]
+    fn env_key_presence_never_depends_on_or_exposes_the_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        assert!(!env_key_present(&path, "K"), "missing file");
+        std::fs::write(&path, br#"{"env":{"K":"anything","OTHER":"x"}}"#).unwrap();
+        assert!(env_key_present(&path, "K"));
+        assert!(!env_key_present(&path, "ABSENT"));
+        std::fs::write(&path, b"not json").unwrap();
+        assert!(!env_key_present(&path, "K"), "unparsable file");
+    }
+
+    #[test]
+    fn our_command_under_a_foreign_matcher_group_is_not_reported_wired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let ours = |sub: &str| format!("/opt/libra/bin/libra-governor {sub}");
+        let group = |matcher: Option<&str>, command: String| {
+            let mut g = serde_json::json!({ "hooks": [{ "type": "command", "command": command }] });
+            if let Some(m) = matcher {
+                g["matcher"] = serde_json::json!(m);
+            }
+            g
+        };
+        let hooks = serde_json::json!({
+            "PreToolUse": [group(Some("Bash"), ours("hook pre-tool-use"))],
+            "PostToolUse": [group(Some("Edit|Write"), ours("hook post-tool-use"))],
+            "SubagentStop": [group(Some("*"), ours("hook subagent-stop"))],
+            "SessionEnd": [group(Some(""), ours("hook session-end"))],
+            "Stop": [group(None, ours("hook stop"))],
+        });
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({ "hooks": hooks })).unwrap(),
+        )
+        .unwrap();
+        let inspection = inspect(&path);
+        assert_eq!(inspection.shared_budget_hooks_wired, [false, true, true]);
+        assert_eq!(inspection.hooks_wired, [false, false, true]);
     }
 
     #[test]
