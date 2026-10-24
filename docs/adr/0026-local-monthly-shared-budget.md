@@ -267,14 +267,17 @@ year outside 2000-2200). The in-bound own records of such a window are
 still measured: it settles at **max(priced, hold)**, reason
 `future_timestamp` (recorded as measured only when the priced amount exceeds
 the hold; otherwise the hold amount, `usage_known=false`). The watermark
-advances at most to the newest in-bound own record (it stays unset when there
-is none), and the in-bound and offending `message.id`s are remembered, even
-when no timestamp mark exists, so nothing is recounted and the same lines do
-not flag every later window (a future line with no `message.id` flags every window it appears in,
-at the flat hold, until the clock passes it). As defence in depth,
+advances at most to the newest in-bound own record, and only when those
+records were priced (otherwise it does not move and they are rescanned). The
+future-stamped lines are **never** remembered as counted: they stay after the
+mark and are re-evaluated every window, so each is counted exactly once, when
+the clock brings its stamp inside the horizon. The cost of leaving such a
+line in the file is that every window it appears in books at least the hold
+(`max(priced, hold)`). As defence in depth,
 `shared_lane_watermark` ignores any stored mark later than that row's
 `settled_at` plus ten minutes, so an already-poisoned row cannot hide later
-records. `SettleTail` applies the same bound and charges nothing for such a
+records; it returns at most 512 `message.id`s, newest row first, deduplicated
+linearly. `SettleTail` applies the same bound and charges nothing for such a
 window.
 
 **Evidence status of the field names: CONFIRMED on Claude Code 2.1.306

@@ -717,7 +717,7 @@ fn a_future_stamped_record_books_the_flagged_hold_and_never_poisons_the_watermar
     fx.clock.set(at(60));
     fx.finalize("s1", Some(&s(&tx)));
     let st = fx.status();
-    assert_eq!(totals(&st), (1_000, 0), "the hold, flagged; nothing priced");
+    assert_eq!(totals(&st), (1_000, 0), "max(300, hold): flagged");
     assert_eq!(st.unmeasured_settlements, 1);
     assert_eq!(fx.lane("s1")[0].usage_known, Some(false));
     let mark = fx
@@ -737,15 +737,28 @@ fn a_future_stamped_record_books_the_flagged_hold_and_never_poisons_the_watermar
         "advanced only to the newest in-bound record"
     );
 
-    // Normal records afterwards are counted; the future line is remembered
-    // and no longer flags the window.
+    // The future line is not remembered as counted: it stays after the
+    // mark and flags every window it appears in (conservatively, never
+    // below the hold), while the in-bound records beside it are still
+    // measured and the lane keeps working.
     fx.clock.set(at(100));
     fx.admit_hold("s1");
     append_lines(&tx, &[rec(110, "m2", SONNET, mi(2), Some("s1"), false)]);
     fx.clock.set(at(150));
     fx.finalize("s1", Some(&s(&tx)));
-    assert_eq!(totals(&fx.status()), (1_000 + 600, 0));
-    assert_eq!(fx.lane("s1")[1].usage_known, Some(true));
+    assert_eq!(totals(&fx.status()), (1_000 + 1_000, 0), "max(600, hold)");
+    let mark = fx
+        .ledger
+        .shared_lane_watermark(
+            &principal(),
+            "s1",
+            None,
+            ExecutorKind::AgentAbsent,
+            OWNER_PREFIX,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(mark.message_ids.iter().all(|id| id != "future"));
 }
 
 #[test]
@@ -2045,17 +2058,19 @@ fn a_future_stamped_record_beside_in_bound_spend_books_the_priced_amount() {
         Some(at(20)),
         "never beyond the newest in-bound record"
     );
-    for id in ["m1", "m2", "future"] {
+    for id in ["m1", "m2"] {
         assert!(mark.message_ids.iter().any(|m| m == id), "{id} remembered");
     }
+    assert!(mark.message_ids.iter().all(|m| m != "future"));
 
-    // Nothing is recounted; a new record is counted alone.
+    // m1 and m2 are not recounted: the next window prices only m3 (300) and,
+    // the future line still being there, books max(300, hold).
     fx.clock.set(at(100));
     fx.admit_hold("s1");
     append_lines(&tx, &[rec(110, "m3", SONNET, mi(1), Some("s1"), false)]);
     fx.clock.set(at(150));
     fx.finalize("s1", Some(&s(&tx)));
-    assert_eq!(totals(&fx.status()), (1_200 + 300, 0));
+    assert_eq!(totals(&fx.status()), (1_200 + 1_000, 0));
 }
 
 #[test]
@@ -2148,7 +2163,7 @@ fn settle_tail_with_a_poisoned_mark_falls_back_to_the_latest_settlement() {
 }
 
 #[test]
-fn a_future_only_window_remembers_its_ids_without_a_timestamp_mark() {
+fn a_future_only_window_leaves_no_state_and_the_lane_measures_again() {
     let mut fx = Fx::new(Some(&cfg()), BASE);
     fx.admit_hold("s1");
     let tx = fx.path().join("s1.jsonl");
@@ -2166,29 +2181,98 @@ fn a_future_only_window_remembers_its_ids_without_a_timestamp_mark() {
     fx.clock.set(at(60));
     fx.finalize("s1", Some(&s(&tx)));
     assert_eq!(totals(&fx.status()), (1_000, 0));
-    let mark = fx
-        .ledger
-        .shared_lane_watermark(
-            &principal(),
-            "s1",
-            None,
-            ExecutorKind::AgentAbsent,
-            OWNER_PREFIX,
-        )
-        .unwrap()
-        .unwrap();
     assert_eq!(
-        mark.at, None,
-        "no in-bound record: the timestamp stays unset"
+        fx.ledger
+            .shared_lane_watermark(
+                &principal(),
+                "s1",
+                None,
+                ExecutorKind::AgentAbsent,
+                OWNER_PREFIX
+            )
+            .unwrap(),
+        None,
+        "nothing was poisoned or remembered"
     );
-    assert_eq!(mark.message_ids, vec!["future".to_string()]);
-
-    // The next window counts normal records and is not re-flagged.
+    // Later normal records are measured (the lane still books at least the
+    // hold while the bad line is present).
     fx.clock.set(at(100));
     fx.admit_hold("s1");
-    append_lines(&tx, &[rec(110, "m1", SONNET, mi(1), Some("s1"), false)]);
+    append_lines(&tx, &[rec(110, "m1", SONNET, mi(5), Some("s1"), false)]);
     fx.clock.set(at(150));
     fx.finalize("s1", Some(&s(&tx)));
-    assert_eq!(totals(&fx.status()), (1_000 + 300, 0));
+    assert_eq!(
+        totals(&fx.status()),
+        (1_000 + 1_500, 0),
+        "priced above the hold"
+    );
     assert_eq!(fx.lane("s1")[1].usage_known, Some(true));
+}
+
+#[test]
+fn a_future_record_is_counted_exactly_once_when_the_clock_catches_up() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    fx.admit_hold("s1");
+    let tx = fx.path().join("s1.jsonl");
+    // "later" is stamped one hour ahead: beyond the 5 minute skew.
+    write_lines(
+        &tx,
+        &[
+            rec(10, "m1", SONNET, mi(1), Some("s1"), false),
+            rec(3_660, "later", SONNET, mi(2), Some("s1"), false),
+        ],
+    );
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(totals(&fx.status()), (1_000, 0), "max(300, hold), flagged");
+
+    // The clock passes the record's stamp: it is now an ordinary record.
+    fx.clock.set(at(3_800));
+    fx.admit_hold("s1");
+    fx.clock.set(at(4_000));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(
+        totals(&fx.status()),
+        (1_000 + 600, 0),
+        "counted once, not lost"
+    );
+    assert_eq!(fx.lane("s1")[1].usage_known, Some(true));
+
+    // A third window does not count it again.
+    fx.clock.set(at(4_100));
+    fx.admit_hold("s1");
+    append_lines(&tx, &[rec(4_150, "m3", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(4_200));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(totals(&fx.status()), (1_000 + 600 + 300, 0));
+}
+
+#[test]
+fn a_future_window_with_unpriced_in_bound_records_does_not_advance_the_mark() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    fx.admit_hold("s1");
+    let tx = fx.path().join("s1.jsonl");
+    write_lines(
+        &tx,
+        &[
+            rec(10, "u", "mystery-model-9", mi(1), Some("s1"), false),
+            rec(2_000_000_000, "future", SONNET, mi(1), Some("s1"), false),
+        ],
+    );
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(totals(&fx.status()), (1_000, 0));
+    assert_eq!(
+        fx.ledger
+            .shared_lane_watermark(
+                &principal(),
+                "s1",
+                None,
+                ExecutorKind::AgentAbsent,
+                OWNER_PREFIX
+            )
+            .unwrap(),
+        None,
+        "unpriced in-bound records are rescanned, not skipped"
+    );
 }

@@ -1067,7 +1067,7 @@ impl TurnSettlement {
 /// Most `message.id`s a watermark remembers. A turn is a few dozen
 /// messages; this keeps tail-block protection across several windows while
 /// bounding the row.
-const MAX_WATERMARK_IDS: usize = 512;
+const MAX_WATERMARK_IDS: usize = libra_governor_ledger::WATERMARK_ID_CAP;
 
 /// Where the next window of a main-executor lane starts: the persisted
 /// transcript high-water mark (newest record timestamp counted, plus the
@@ -1242,10 +1242,7 @@ pub fn settle_turn(
                         (None, Some("binding_mismatch"), None)
                     }
                     // A record stamped beyond now + skew cannot be trusted
-                    // and must never become the watermark: the window books
-                    // the hold, the mark advances at most to the newest
-                    // in-bound own record, and the offending ids are
-                    // remembered so they do not flag every later window.
+                    // and must never become the watermark.
                     // The in-bound own records are still measured spend:
                     // the window books max(priced, hold). Above the hold the
                     // priced amount is recorded as measured; at or below it
@@ -1257,7 +1254,12 @@ pub fn settle_turn(
                     } => (
                         priced_cents.filter(|c| *c > target.amount),
                         Some("future_timestamp"),
-                        Some(SettleWatermark {
+                        // The mark advances only when the in-bound records
+                        // were priced, and only to the newest of them. The
+                        // future-stamped lines stay after the mark and are
+                        // re-evaluated every window: each is counted exactly
+                        // once, when its stamp comes within the horizon.
+                        priced_cents.map(|_| SettleWatermark {
                             at: newest_in_bound.filter(|t| EVENT_YEARS.contains(&t.year())),
                             message_ids: merged_ids(&previous_ids, &message_ids),
                         }),

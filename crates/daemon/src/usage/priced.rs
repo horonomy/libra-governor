@@ -265,8 +265,9 @@ pub enum PricedObservation {
     SessionMismatch,
     /// A record is stamped later than `now + FUTURE_SKEW`. Not counted; the
     /// window cannot be trusted. `newest_in_bound` is the newest in-bound
-    /// own record seen, and `message_ids` the ids to remember (in-bound and
-    /// future) so the same lines do not poison every later window.
+    /// own record seen, and `message_ids` the in-bound ids counted. The
+    /// future-stamped ids are deliberately NOT returned: they were never
+    /// priced, and a record that later becomes in-bound must be counted then.
     ///
     /// `priced_cents` is the cost of the **in-bound own** records alone
     /// (`None` when there are none, or one of them is unpriced): the caller
@@ -383,7 +384,6 @@ struct Accumulator {
     untimed: bool,
     malformed: bool,
     future: bool,
-    future_ids: Vec<String>,
     last_event_time: Option<OffsetDateTime>,
 }
 
@@ -498,9 +498,6 @@ fn visit_line(
     if let (ReadMode::ParentWindow { horizon, .. }, Some(ts)) = (mode, timestamp) {
         if ts > horizon {
             acc.future = true;
-            if let Some(id) = message_id {
-                acc.future_ids.push(id);
-            }
             return ControlFlow::Continue(());
         }
     }
@@ -557,9 +554,6 @@ fn finish(mut acc: Accumulator, table: &PricingTable) -> PricedObservation {
     let mut message_ids: Vec<String> = acc.by_id.keys().cloned().collect();
     message_ids.sort_unstable();
     if acc.future {
-        message_ids.append(&mut acc.future_ids);
-        message_ids.sort_unstable();
-        message_ids.dedup();
         for (_, (tiers, model)) in acc.by_id.drain() {
             acc.per_model.entry(model).or_default().add(tiers);
         }
@@ -1114,24 +1108,27 @@ mod tests {
             "the in-bound record is still priced"
         );
         assert_eq!(newest_in_bound, Some(epoch_plus(10)));
-        assert_eq!(message_ids, vec!["a".to_string(), "far".to_string()]);
-        // Once its id is remembered, the same line no longer flags a window.
-        let ids: HashSet<String> = message_ids.into_iter().collect();
+        assert_eq!(
+            message_ids,
+            vec!["a".to_string()],
+            "the future-stamped id is not remembered as counted"
+        );
+        // Once the horizon passes its stamp the same line is just a record.
         let again = observe_priced(
             f.path(),
             ReadMode::ParentWindow {
                 after: epoch_plus(10),
-                counted_ids: &ids,
-                horizon: epoch_plus(1_000),
+                counted_ids: &message_ids.into_iter().collect(),
+                horizon: epoch_plus(10_000_000_000),
             },
             SESSION,
             &PricingTable::pinned(),
             BUDGET_SCAN_CAP_BYTES,
         );
-        assert_eq!(
-            again,
-            PricedObservation::Unavailable(UsageUnavailable::NoUsageInWindow)
-        );
+        let PricedObservation::Priced(w) = again else {
+            panic!("expected Priced, got {again:?}");
+        };
+        assert_eq!((w.cents, w.message_ids), (300, vec!["far".to_string()]));
     }
 
     #[test]

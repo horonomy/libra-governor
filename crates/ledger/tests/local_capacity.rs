@@ -1388,3 +1388,53 @@ fn a_settled_hold_carries_a_watermark_and_the_lane_reads_back_the_newest() {
         None
     );
 }
+
+#[test]
+fn the_lane_watermark_reader_caps_the_ids_it_returns_newest_first() {
+    use libra_governor_ledger::{SettleWatermark, WATERMARK_ID_CAP};
+    let (_dir, mut store) = store_with_pool(1_000_000);
+    let at = |s: i64| OffsetDateTime::from_unix_timestamp(1_800_000_000 + s).unwrap();
+    // 40 settled holds with 20 ids each: 800 distinct ids, plus a repeat.
+    for n in 0..40i64 {
+        let id = granted_id(reserve(
+            &mut store,
+            local(1_000_000),
+            "s1",
+            10,
+            &format!("h{n}"),
+            ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+        ));
+        let ids: Vec<String> = (0..20).map(|i| format!("id-{n}-{i}")).collect();
+        store
+            .settle_shared_with_watermark(
+                id,
+                Some(5),
+                at(n * 10),
+                ExecutorAttribution::default(),
+                Some(&SettleWatermark {
+                    at: Some(at(n * 10)),
+                    message_ids: ids,
+                }),
+            )
+            .unwrap();
+    }
+    let got = store
+        .shared_lane_watermark(
+            &owner(),
+            "s1",
+            None,
+            ExecutorKind::AgentAbsent,
+            "metered:acme/",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.at, Some(at(390)));
+    assert_eq!(got.message_ids.len(), WATERMARK_ID_CAP);
+    let unique: std::collections::HashSet<_> = got.message_ids.iter().collect();
+    assert_eq!(unique.len(), WATERMARK_ID_CAP, "deduplicated");
+    assert_eq!(got.message_ids[0], "id-39-0", "newest row first");
+    assert!(
+        !got.message_ids.iter().any(|i| i == "id-0-0"),
+        "oldest rows fall off"
+    );
+}

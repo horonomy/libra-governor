@@ -67,6 +67,9 @@ fn rfc3339(t: OffsetDateTime) -> Result<String, LedgerError> {
         .map_err(|e| LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))
 }
 
+/// Most `message.id`s a lane watermark returns (and a writer keeps).
+pub const WATERMARK_ID_CAP: usize = 512;
+
 /// How far past its row's `settled_at` a stored watermark may sit: a
 /// record is stamped by the host's clock a little ahead of the daemon's.
 pub const WATERMARK_SLACK: time::Duration = time::Duration::minutes(10);
@@ -1348,7 +1351,8 @@ impl LedgerStore {
                AND COALESCE(executor_kind, 'unattributed') = ?4
                AND substr(pool_id, 1, length(?5)) = ?5
                AND state = 'settled'
-               AND (watermark_ts IS NOT NULL OR watermark_message_ids IS NOT NULL)",
+               AND (watermark_ts IS NOT NULL OR watermark_message_ids IS NOT NULL)
+             ORDER BY settled_at DESC",
         )?;
         let rows = stmt.query_map(
             rusqlite::params![
@@ -1366,12 +1370,12 @@ impl LedgerStore {
                 ))
             },
         )?;
-        // `at` is the newest trustworthy mark. The ids are the union over
-        // every trustworthy row, including rows that carry ids but no
-        // timestamp (a window whose only offending line was future-stamped),
-        // so remembering an id never depends on having a timestamp.
+        // `at` is the newest trustworthy mark; the ids are the union over
+        // trustworthy rows, newest row first, capped at WATERMARK_ID_CAP
+        // (a hash set keeps the merge linear).
         let mut best: Option<OffsetDateTime> = None;
         let mut ids: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut any = false;
         for row in rows {
             let (at, row_ids, settled_at) = row?;
@@ -1391,10 +1395,17 @@ impl LedgerStore {
             if let Some(at) = at {
                 best = Some(best.map_or(at, |b| b.max(at)));
             }
-            if let Some(list) = row_ids.and_then(|j| serde_json::from_str::<Vec<String>>(&j).ok()) {
-                for id in list {
-                    if !ids.contains(&id) {
-                        ids.push(id);
+            if ids.len() < WATERMARK_ID_CAP {
+                if let Some(list) =
+                    row_ids.and_then(|j| serde_json::from_str::<Vec<String>>(&j).ok())
+                {
+                    for id in list {
+                        if ids.len() >= WATERMARK_ID_CAP {
+                            break;
+                        }
+                        if seen.insert(id.clone()) {
+                            ids.push(id);
+                        }
                     }
                 }
             }
