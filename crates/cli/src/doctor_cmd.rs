@@ -510,9 +510,13 @@ fn quota_source_mode_finding() -> Finding {
 /// `session` is captured, as a raw `session_id` column on
 /// `session_preflights`/`session_tasks`/`shadow_runtime_decisions`
 /// (`crates/daemon/src/server.rs`), not as a persisted envelope.
-/// `agent`/`turn` are parsed by the hook into an envelope
+/// `agent` is partially captured (HORO-2197): the hook sends `agent_id`
+/// and the provider label on legacy requests and the daemon keys a
+/// subagent's counters and task to a derived lane
+/// (`crates/daemon/src/legacy_executor.rs`), still not an envelope.
+/// `turn` is parsed by the hook into an envelope
 /// (`crates/cli/src/agent/identity.rs`) that only ever reaches a
-/// redacted log line — no daemon request carries them, and the
+/// redacted log line — no daemon request carries it, and the
 /// `ExecutionOwner` IPC that would persist them (HORO-1600,
 /// `crates/ledger/src/execution_owner.rs`) has no production caller
 /// yet (only `crates/daemon/tests/execution_owner.rs` sends it).
@@ -537,13 +541,19 @@ fn execution_identity_capture_finding() -> Finding {
         id: "execution_identity_capture",
         severity: Severity::Ok,
         message: "session: captured (the host's real session_id is sent on every \
-                  Preflight/ToolInvoked/Finalize request and keys session_preflights, \
-                  session_tasks and shadow_runtime_decisions rows -- as a raw session_id \
-                  column, not a persisted ExecutionIdentity envelope) -- agent/turn: not \
-                  captured (hooks parse agent_id/turn_id into an envelope that is only \
-                  written to a redacted log line; no daemon request carries them, and the \
-                  ExecutionOwner IPC that would persist them has no production caller yet) \
-                  -- task: not captured (every decision row has a task_id, but it is \
+                  Preflight/ToolInvoked/Finalize request; the main executor's rows in \
+                  session_preflights, session_tasks, tool_call_counts and \
+                  shadow_runtime_decisions are keyed by that raw session_id, not by a \
+                  persisted ExecutionIdentity envelope) -- agent: partially captured \
+                  (HORO-2197: the hooks send the agent_id and provider label on legacy \
+                  Preflight/ToolInvoked/Finalize requests, and the daemon books a \
+                  subagent's tool-call counters and task to its own derived \
+                  (session, agent) lane, a blank agent to the session's unattributed \
+                  lane; this is a ledger lane key, not a persisted ExecutionIdentity \
+                  envelope, and Stop still finalizes the main thread's lane) -- turn: not \
+                  captured (parsed into an envelope that is only written to a redacted \
+                  log line; the ExecutionOwner IPC that would persist it has no \
+                  production caller yet) -- task: not captured (every decision row has a task_id, but it is \
                   Libra's own economic TaskId minted per session -- a different concept \
                   from the contract's provider-native turn/task dimension) -- host: \
                   implicit (one daemon and one ledger per state directory; a generated \
@@ -1703,7 +1713,12 @@ mod tests {
         assert_eq!(finding.id, "execution_identity_capture");
         assert_eq!(finding.severity, Severity::Ok);
         assert!(finding.message.contains("session: captured"));
-        assert!(finding.message.contains("agent/turn: not captured"));
+        assert!(finding.message.contains("agent: partially captured"));
+        assert!(finding.message.contains("derived"));
+        assert!(finding.message.contains("turn: not captured"));
+        assert!(finding.message.contains("keyed by that raw session_id"));
+        // The pre-HORO-2197 claim that no request carries the agent is false.
+        assert!(!finding.message.contains("no daemon request carries"));
         assert!(finding.message.contains("task: not captured"));
         assert!(finding.message.contains("TaskId"));
         assert!(finding.message.contains("host: implicit"));

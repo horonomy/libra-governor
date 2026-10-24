@@ -191,6 +191,8 @@ impl Harness {
         cwd: PathBuf,
     ) -> libra_governor_protocol::PreflightResult {
         match self.send(Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug".to_string(),
             cwd,
             session_id: session_id.to_string(),
@@ -247,6 +249,7 @@ impl Harness {
 
     fn finalize(&mut self, session_id: &str, transcript: Option<&Path>) -> FinalizeResult {
         match self.send(Request::Finalize {
+            agent_id: None,
             session_id: session_id.to_string(),
             model: None,
             provider: Some("claude-code".to_string()),

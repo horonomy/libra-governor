@@ -335,6 +335,8 @@ fn a_tool_event_with_no_file_leaves_every_shared_pool_table_untouched() {
     let mut fx = Fx::new(None, JAN);
     let before = fx.fingerprint();
     match fx.call(Request::ToolInvoked {
+        agent_id: None,
+        provider: None,
         session_id: "s1".into(),
         tool_name: "Bash".into(),
     }) {
@@ -632,6 +634,8 @@ fn a_tool_event_renews_the_sessions_hold_and_only_that_sessions() {
 
     fx.clock.set(t(JAN) + time::Duration::seconds(3_000));
     match fx.call(Request::ToolInvoked {
+        agent_id: None,
+        provider: None,
         session_id: "mine".into(),
         tool_name: "Bash".into(),
     }) {
@@ -667,6 +671,8 @@ impl Fx {
 fn a_tool_event_for_an_invalid_config_is_acked_and_touches_no_hold() {
     let mut fx = Fx::new(Some("{bad"), JAN);
     match fx.call(Request::ToolInvoked {
+        agent_id: None,
+        provider: None,
         session_id: "s".into(),
         tool_name: "Bash".into(),
     }) {
@@ -1397,6 +1403,8 @@ fn a_tool_event_renews_only_the_current_periods_holds() {
     let (old_before, new_before) = (expiry(&fx, old.id), expiry(&fx, new.id));
     fx.clock.set(t("2027-02-01T00:30:00Z"));
     fx.call(Request::ToolInvoked {
+        agent_id: None,
+        provider: None,
         session_id: "s".into(),
         tool_name: "Bash".into(),
     });
@@ -1579,5 +1587,5 @@ fn the_generic_metered_pool_rpc_refuses_the_local_budget_owner_on_every_op() {
 
 #[test]
 fn protocol_version_is_bumped_past_the_shared_budget_shape_change() {
-    assert_eq!(PROTOCOL_VERSION, 21);
+    assert_eq!(PROTOCOL_VERSION, 22);
 }

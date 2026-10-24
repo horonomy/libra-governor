@@ -59,6 +59,12 @@ pub enum NormalizeError {
     Malformed(#[from] serde_json::Error),
 }
 
+/// A session id that can name a session: blank or whitespace-only is absent,
+/// never a lane shared by every event that lacks one.
+fn native_session(session_id: Option<String>) -> Option<String> {
+    session_id.filter(|s| !s.trim().is_empty())
+}
+
 /// Parses `raw` into a [`NormalizedEvent`] for `entry`. See module docs.
 pub fn normalize(entry: EntryPoint, raw: &str) -> Result<NormalizedEvent, NormalizeError> {
     let value: serde_json::Value = serde_json::from_str(raw)?;
@@ -91,7 +97,7 @@ pub fn normalize(entry: EntryPoint, raw: &str) -> Result<NormalizedEvent, Normal
         EntryPoint::PromptSubmit => {
             let payload: PromptSubmitPayload = serde_json::from_value(value)?;
             Ok(NormalizedEvent::PromptSubmitted {
-                session_id: payload.session_id,
+                session_id: native_session(payload.session_id),
                 cwd: payload.cwd,
                 prompt: payload.prompt,
                 turn_id: payload.turn_id,
@@ -102,14 +108,14 @@ pub fn normalize(entry: EntryPoint, raw: &str) -> Result<NormalizedEvent, Normal
         EntryPoint::ToolRequested => {
             let payload: ToolRequestedPayload = serde_json::from_value(value)?;
             Ok(NormalizedEvent::ToolRequested {
-                session_id: payload.session_id,
+                session_id: native_session(payload.session_id),
                 agent_id: payload.agent_id,
             })
         }
         EntryPoint::ToolCompleted => {
             let payload: ToolCompletedPayload = serde_json::from_value(value)?;
             Ok(NormalizedEvent::ToolCompleted {
-                session_id: payload.session_id,
+                session_id: native_session(payload.session_id),
                 tool_name: payload.tool_name,
                 native_call_id: payload.tool_use_id,
                 turn_id: payload.turn_id,
@@ -119,7 +125,7 @@ pub fn normalize(entry: EntryPoint, raw: &str) -> Result<NormalizedEvent, Normal
         EntryPoint::TurnCompleted => {
             let payload: TurnCompletedPayload = serde_json::from_value(value)?;
             Ok(NormalizedEvent::TurnCompleted {
-                session_id: payload.session_id,
+                session_id: native_session(payload.session_id),
                 model: payload.model,
                 turn_id: payload.turn_id,
                 agent_id: payload.agent_id,
@@ -157,7 +163,7 @@ mod tests {
         assert_eq!(
             event,
             NormalizedEvent::PromptSubmitted {
-                session_id: "s".to_string(),
+                session_id: Some("s".to_string()),
                 cwd: "/repo".into(),
                 prompt: "fix it".to_string(),
                 turn_id: None,
@@ -174,7 +180,7 @@ mod tests {
         assert_eq!(
             event,
             NormalizedEvent::ToolCompleted {
-                session_id: "s".to_string(),
+                session_id: Some("s".to_string()),
                 tool_name: "Bash".to_string(),
                 native_call_id: None,
                 turn_id: None,
@@ -278,7 +284,7 @@ mod tests {
         assert_eq!(
             event,
             NormalizedEvent::PromptSubmitted {
-                session_id: "s".to_string(),
+                session_id: Some("s".to_string()),
                 cwd: "/repo".into(),
                 prompt: "fix it".to_string(),
                 turn_id: Some("turn-1".to_string()),
@@ -311,7 +317,7 @@ mod tests {
         assert_eq!(
             normalize(EntryPoint::ToolRequested, main).unwrap(),
             NormalizedEvent::ToolRequested {
-                session_id: "s".into(),
+                session_id: Some("s".into()),
                 agent_id: None
             }
         );
@@ -319,11 +325,17 @@ mod tests {
         assert_eq!(
             normalize(EntryPoint::ToolRequested, sub).unwrap(),
             NormalizedEvent::ToolRequested {
-                session_id: "s".into(),
+                session_id: Some("s".into()),
                 agent_id: Some("sub-9".into())
             }
         );
-        assert!(normalize(EntryPoint::ToolRequested, r#"{"tool_name":"Bash"}"#).is_err());
+        assert_eq!(
+            normalize(EntryPoint::ToolRequested, r#"{"tool_name":"Bash"}"#).unwrap(),
+            NormalizedEvent::ToolRequested {
+                session_id: None,
+                agent_id: None
+            }
+        );
         // A different event name on this entry point is not a PreToolUse.
         let other = r#"{"session_id":"s","hook_event_name":"PostToolUse"}"#;
         assert!(matches!(
@@ -347,5 +359,91 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_session_the_host_did_not_name_is_absent_never_coerced_or_shared() {
+        for session in [
+            "",
+            r#","session_id":null"#,
+            r#","session_id":123"#,
+            r#","session_id":"""#,
+            r#","session_id":"   ""#,
+            r#","session_id":["s-1"]"#,
+            r#","session_id":{"id":"s-1"}"#,
+        ] {
+            let raw = if session.is_empty() {
+                r#"{"cwd":"/r","prompt":"p","tool_name":"Bash","agent_id":"a-1"}"#.to_string()
+            } else {
+                format!(
+                    r#"{{"cwd":"/r","prompt":"p","tool_name":"Bash","agent_id":"a-1"{session}}}"#
+                )
+            };
+            for entry in [
+                EntryPoint::PromptSubmit,
+                EntryPoint::ToolRequested,
+                EntryPoint::ToolCompleted,
+                EntryPoint::TurnCompleted,
+            ] {
+                let event = normalize(entry, &raw).unwrap();
+                let session_id = match event {
+                    NormalizedEvent::PromptSubmitted {
+                        session_id,
+                        agent_id,
+                        ..
+                    }
+                    | NormalizedEvent::ToolCompleted {
+                        session_id,
+                        agent_id,
+                        ..
+                    }
+                    | NormalizedEvent::ToolRequested {
+                        session_id,
+                        agent_id,
+                    }
+                    | NormalizedEvent::TurnCompleted {
+                        session_id,
+                        agent_id,
+                        ..
+                    } => {
+                        assert_eq!(agent_id.as_deref(), Some("a-1"), "{raw}");
+                        session_id
+                    }
+                    other => panic!("{raw}: {other:?}"),
+                };
+                assert_eq!(session_id, None, "{entry:?} {raw}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_padded_session_is_kept_verbatim() {
+        let event = normalize(
+            EntryPoint::ToolRequested,
+            r#"{"session_id":" s 1 ","tool_name":"Bash"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            event,
+            NormalizedEvent::ToolRequested {
+                session_id: Some(" s 1 ".into()),
+                agent_id: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_blank_agent_id_is_carried_as_blank_not_dropped() {
+        // The legacy route must be able to tell "no agent" from "an agent
+        // we cannot name".
+        let event = normalize(
+            EntryPoint::ToolCompleted,
+            r#"{"session_id":"s","tool_name":"Bash","agent_id":"  "}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            event,
+            NormalizedEvent::ToolCompleted { agent_id: Some(ref a), .. } if a == "  "
+        ));
     }
 }

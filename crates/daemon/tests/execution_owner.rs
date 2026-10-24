@@ -312,6 +312,8 @@ fn missing_richer_dimensions_mismatched_context_and_legacy_rows_never_guess() {
     let i = identity("codex", "agent", "turn");
     gap(f.outcome(owner(i.clone(), Op::Query {})), Gap::Missing);
     let legacy = f.request(Request::Preflight {
+        agent_id: None,
+        provider: None,
         task_hint: String::new(),
         cwd: f.dir.path().into(),
         session_id: "same-native-session".into(),
@@ -368,7 +370,9 @@ fn missing_richer_dimensions_mismatched_context_and_legacy_rows_never_guess() {
     assert!(matches!(
         f.request(Request::ToolInvoked {
             session_id: reserved,
-            tool_name: "Read".into()
+            tool_name: "Read".into(),
+            agent_id: None,
+            provider: None,
         }),
         Response::Error { .. }
     ));

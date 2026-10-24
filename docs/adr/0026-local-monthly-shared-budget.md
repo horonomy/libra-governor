@@ -19,7 +19,7 @@ The daemon re-reads the file on every decision (see *Daemon behaviour delivered 
 **S5 (HORO-2196, HORO-2190) delivers settlement**: the turn hold is settled
 at `Stop` from priced, session-bound transcript usage, and a subagent's
 transcript is charged by `ChargeAgentTranscript` (see *Settlement delivered
-in S5*). `PROTOCOL_VERSION` is 21. The S6 Claude Code hook gate and the S10
+in S5*). `PROTOCOL_VERSION` was 21 at S5 and is 22 since HORO-2197. The S6 Claude Code hook gate and the S10
 retention/export commands landed on `main` separately and are recorded in
 their own commits and in *Retention and export* below.
 **S7 (HORO-2216) delivers the installer and the settlement hooks**:
@@ -629,6 +629,16 @@ delivery exists; that remains the separate, versioned workstream above.
   instead of a hard-cap claim.
 - Overshoot beyond the hold is possible in hooks-only mode and is accepted
   until S11.
+- HORO-2197 attributes the *legacy* per-session counters (tool calls, streak,
+  task binding) to the `(session, agent)` executor, so a subagent no longer
+  inflates its parent's. It deliberately leaves this budget's holds,
+  heartbeat and settlement keyed by the host's real `session_id`: that route
+  already carries `(session, agent | none)` with `agent_absent | agent |
+  unattributed` executor kinds. See `docs/execution-owner-contract.md`, which also records the mixed-version
+  behaviour (v21 CLI -> v22 daemon fails open; v22 CLI -> v21 daemon loses the
+  first `ToolInvoked`), the estimator-history effect (pre-change receipts
+  counted subagent calls into the parent; later ones do not) and the
+  unreclaimed derived-lane counter rows.
 - Tests of the month window pin tzdb behaviour (Asuncion 2023-10 gap, Havana
   2026-11 fold); a jiff bump that changes those rules must update them
   deliberately.

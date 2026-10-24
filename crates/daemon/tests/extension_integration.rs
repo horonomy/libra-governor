@@ -327,6 +327,8 @@ fn a_tight_deadline_from_business_context_narrows_admission_through_the_real_pat
         &mut current_task,
         &config,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug".to_string(),
             cwd: fixture_repo(),
             session_id: "sess-1".to_string(),
@@ -423,6 +425,8 @@ fn business_context_narrows_evaluate_but_never_the_persisted_budget_policy() {
         &mut current_task,
         &config,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug".to_string(),
             cwd: fixture_repo(),
             session_id: "sess-1".to_string(),
@@ -471,6 +475,8 @@ fn a_business_context_fetch_failure_leaves_preflight_equivalent_to_no_extension_
         &mut current_task,
         &config_with,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug".to_string(),
             cwd: fixture_repo(),
             session_id: "sess-1".to_string(),
@@ -497,6 +503,8 @@ fn a_business_context_fetch_failure_leaves_preflight_equivalent_to_no_extension_
         &mut current_task2,
         &config_without,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug".to_string(),
             cwd: fixture_repo(),
             session_id: "sess-1".to_string(),
@@ -585,6 +593,8 @@ fn preflight_into_approval_required(
         &mut current_task,
         config,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug".to_string(),
             cwd: fixture_repo(),
             session_id: "approval-session".to_string(),
@@ -622,6 +632,8 @@ fn preflight_into_approval_required(
         &mut current_task,
         config,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug, part two".to_string(),
             cwd: fixture_repo(),
             session_id: "approval-session".to_string(),
@@ -776,6 +788,8 @@ fn a_hard_ceiling_deny_issues_zero_policy_webhook_requests() {
         &mut current_task,
         &config,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "a task whose cold-start estimate projects far past a 1-token hard ceiling"
                 .to_string(),
             cwd: fixture_repo(),
@@ -835,6 +849,8 @@ fn an_admission_event_is_delivered_end_to_end_with_a_verifiable_signature() {
     let envelope = RequestEnvelope {
         protocol_version: PROTOCOL_VERSION,
         request: Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug".to_string(),
             cwd: fixture_repo(),
             session_id: "sess-1".to_string(),
@@ -887,6 +903,8 @@ fn record_outcome_writes_attestation_but_never_promotes_the_receipt() {
         &mut current_task,
         &config,
         Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug".to_string(),
             cwd: fixture_repo(),
             session_id: "sess-1".to_string(),
@@ -903,6 +921,7 @@ fn record_outcome_writes_attestation_but_never_promotes_the_receipt() {
         &mut current_task,
         &config,
         Request::Finalize {
+            agent_id: None,
             session_id: "sess-1".to_string(),
             model: None,
             provider: None,

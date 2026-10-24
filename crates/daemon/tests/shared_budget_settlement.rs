@@ -307,6 +307,7 @@ fn principal() -> libra_governor_domain::PrincipalId {
 impl Fx {
     fn finalize(&mut self, session: &str, transcript: Option<&str>) {
         match self.call(Request::Finalize {
+            agent_id: None,
             session_id: session.to_string(),
             model: None,
             provider: Some("claude-code".to_string()),

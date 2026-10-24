@@ -67,6 +67,8 @@ fn preflight_returns_sane_result_within_recon_budget() {
     let request = RequestEnvelope {
         protocol_version: PROTOCOL_VERSION,
         request: Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug".to_string(),
             cwd: fixture_repo(),
             session_id: "integration-test-session".to_string(),
@@ -166,6 +168,8 @@ fn second_preflight_for_same_session_supersedes_the_first() {
             let request = RequestEnvelope {
                 protocol_version: PROTOCOL_VERSION,
                 request: Request::Preflight {
+                    agent_id: None,
+                    provider: None,
                     task_hint: "fix the login bug".to_string(),
                     cwd,
                     session_id: "repeat-session".to_string(),
@@ -323,6 +327,8 @@ fn preflight_selects_a_bucketed_tier_once_same_repo_history_exists() {
     let request = RequestEnvelope {
         protocol_version: PROTOCOL_VERSION,
         request: Request::Preflight {
+            agent_id: None,
+            provider: None,
             task_hint: "fix the login bug".to_string(),
             cwd: fixture_repo(),
             session_id: "bucketed-test-session".to_string(),
