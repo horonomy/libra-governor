@@ -464,6 +464,12 @@ pub(crate) fn run_tool_requested_with_input(agent: AgentKind, raw: &str) {
         return;
     };
 
+    // A reserved-namespace session is the existing skipped path: fail open
+    // without asking the daemon (the daemon would refuse it anyway).
+    if budget_gate::session_id_unusable(&session_id) {
+        return;
+    }
+
     // Cheap stat first: no budget file means the daemon is not even
     // contacted.
     if !budget_gate::budget_file_present() {

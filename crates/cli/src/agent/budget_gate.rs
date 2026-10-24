@@ -95,7 +95,9 @@ pub fn budget_file_present() -> bool {
 /// sent. These never block (fail open), and are not sent as `Admit`.
 pub fn session_id_unusable(session_id: &str) -> bool {
     // Mirrors the daemon's reserved execution-owner scope prefix.
-    session_id.trim().is_empty() || session_id.starts_with("execution-owner-v1:")
+    session_id.trim().is_empty()
+        || session_id.starts_with("execution-owner-v1:")
+        || libra_governor_daemon::legacy_executor::is_reserved_session(session_id)
 }
 
 fn usd(cents: i64) -> String {
@@ -500,7 +502,13 @@ mod tests {
 
     #[test]
     fn host_driven_session_ids_are_unusable_but_real_ones_are_not() {
-        for bad in ["", "   ", "\t\n", "execution-owner-v1:abc"] {
+        for bad in [
+            "",
+            "   ",
+            "\t\n",
+            "execution-owner-v1:abc",
+            "legacy-executor-v1:[\"agent\",null,\"s\",\"a\"]",
+        ] {
             assert!(session_id_unusable(bad), "{bad:?}");
         }
         assert!(!session_id_unusable("sess-1"));
