@@ -634,7 +634,11 @@ delivery exists; that remains the separate, versioned workstream above.
   inflates its parent's. It deliberately leaves this budget's holds,
   heartbeat and settlement keyed by the host's real `session_id`: that route
   already carries `(session, agent | none)` with `agent_absent | agent |
-  unattributed` executor kinds. See `docs/execution-owner-contract.md`.
+  unattributed` executor kinds. See `docs/execution-owner-contract.md`, which also records the mixed-version
+  behaviour (v21 CLI -> v22 daemon fails open; v22 CLI -> v21 daemon loses the
+  first `ToolInvoked`), the estimator-history effect (pre-change receipts
+  counted subagent calls into the parent; later ones do not) and the
+  unreclaimed derived-lane counter rows.
 - Tests of the month window pin tzdb behaviour (Asuncion 2023-10 gap, Havana
   2026-11 fold); a jiff bump that changes those rules must update them
   deliberately.
