@@ -23,6 +23,7 @@ use libra_governor_protocol::{
     FinalizeOutcome, NativeExecutionContext, Request, Response,
 };
 
+use super::budget_gate::{self, Admission};
 use super::event::NormalizedEvent;
 use super::normalize::{normalize, EntryPoint, NormalizeError};
 use super::render;
@@ -187,14 +188,15 @@ pub(crate) fn run_prompt_submit_with_input(agent: AgentKind, raw: &str) {
         }
     };
 
-    let (session_id, cwd, prompt, turn_id, agent_id) = match event {
+    let (session_id, cwd, prompt, turn_id, agent_id, prompt_id) = match event {
         NormalizedEvent::PromptSubmitted {
             session_id,
             cwd,
             prompt,
             turn_id,
             agent_id,
-        } => (session_id, cwd, prompt, turn_id, agent_id),
+            prompt_id,
+        } => (session_id, cwd, prompt, turn_id, agent_id, prompt_id),
         NormalizedEvent::RecognizedUnwired { hook_event_name } => {
             log(
                 &log_path,
@@ -213,7 +215,9 @@ pub(crate) fn run_prompt_submit_with_input(agent: AgentKind, raw: &str) {
             print_context("[libra-governor] preflight skipped: unrecognized hook event.");
             return;
         }
-        NormalizedEvent::ToolCompleted { .. } | NormalizedEvent::TurnCompleted { .. } => {
+        NormalizedEvent::ToolRequested { .. }
+        | NormalizedEvent::ToolCompleted { .. }
+        | NormalizedEvent::TurnCompleted { .. } => {
             unreachable!("normalize(EntryPoint::PromptSubmit, ..) never returns these variants")
         }
     };
@@ -238,6 +242,26 @@ pub(crate) fn run_prompt_submit_with_input(agent: AgentKind, raw: &str) {
             print_context("[libra-governor] preflight skipped: daemon state dir unavailable.");
             return;
         }
+    };
+
+    // HORO-2215: the local shared budget gates Claude Code prompts. With no
+    // shared-budget.json nothing below this block differs from before it
+    // existed (no extra connection, no extra output byte).
+    let mut budget_warning: Option<String> = None;
+    if agent == AgentKind::ClaudeCode && budget_gate::budget_file_present() {
+        match budget_gate::admit(&socket_path, &session_id, prompt_id, &|m| {
+            log(&log_path, agent, m)
+        }) {
+            Admission::Block { reason } => {
+                println!("{}", render::render_prompt_block(&reason));
+                return;
+            }
+            Admission::Proceed { warning } => budget_warning = warning,
+        }
+    }
+    let print_context = |message: &str| match budget_warning.as_deref() {
+        Some(warning) => print_context(&format!("{message}\n{warning}")),
+        None => print_context(message),
     };
 
     let stream = match client::ensure_daemon_connection(&socket_path) {
@@ -369,6 +393,60 @@ pub(crate) fn run_prompt_submit_with_input(agent: AgentKind, raw: &str) {
     }
 }
 
+/// `PreToolUse` (HORO-2215): denies a tool call only when the local shared
+/// budget is exhausted or invalid. Every other outcome -- no budget file,
+/// no running daemon, a timeout past [`budget_gate::CHECK_BUDGET`], any
+/// error -- prints nothing, which Claude Code reads as "allow". Never
+/// spawns a daemon, never panics, never exits nonzero.
+pub fn run_tool_requested(agent: AgentKind) {
+    let log_path = libra_governor_daemon::paths::log_path();
+    let Some(raw) = read_stdin(&log_path, agent) else {
+        return;
+    };
+
+    run_tool_requested_with_input(agent, &raw);
+}
+
+pub(crate) fn run_tool_requested_with_input(agent: AgentKind, raw: &str) {
+    // Codex has no budget gate: its route is unchanged.
+    if agent != AgentKind::ClaudeCode {
+        return;
+    }
+    let log_path = libra_governor_daemon::paths::log_path();
+
+    let (session_id, agent_id) = match normalize(EntryPoint::ToolRequested, raw) {
+        Ok(NormalizedEvent::ToolRequested {
+            session_id,
+            agent_id,
+        }) => (session_id, agent_id),
+        Ok(_) => return,
+        Err(NormalizeError::Malformed(e)) => {
+            log(
+                &log_path,
+                agent,
+                &format!("pre-tool-use: malformed hook payload: {e}"),
+            );
+            return;
+        }
+    };
+
+    // Cheap stat first: no budget file means the daemon is not even
+    // contacted.
+    if !budget_gate::budget_file_present() {
+        return;
+    }
+    let Ok(socket_path) = libra_governor_daemon::paths::socket_path() else {
+        return;
+    };
+    if let Some(reason) =
+        budget_gate::check_denial(&socket_path, &session_id, agent_id.as_deref(), &|m| {
+            log(&log_path, agent, m)
+        })
+    {
+        println!("{}", render::render_pre_tool_deny(&reason));
+    }
+}
+
 /// Reads stdin and fires a cheap, fire-and-forget `ToolInvoked`
 /// notification at the daemon. Never spawns the daemon, never blocks on
 /// a response, never panics, never exits nonzero, prints nothing to
@@ -424,7 +502,9 @@ pub(crate) fn run_tool_completed_with_input(agent: AgentKind, raw: &str) {
             );
             return;
         }
-        NormalizedEvent::PromptSubmitted { .. } | NormalizedEvent::TurnCompleted { .. } => {
+        NormalizedEvent::PromptSubmitted { .. }
+        | NormalizedEvent::ToolRequested { .. }
+        | NormalizedEvent::TurnCompleted { .. } => {
             unreachable!("normalize(EntryPoint::ToolCompleted, ..) never returns these variants")
         }
     };
@@ -600,7 +680,9 @@ pub(crate) fn run_turn_completed_with_input(agent: AgentKind, raw: &str) {
             );
             return;
         }
-        NormalizedEvent::PromptSubmitted { .. } | NormalizedEvent::ToolCompleted { .. } => {
+        NormalizedEvent::PromptSubmitted { .. }
+        | NormalizedEvent::ToolRequested { .. }
+        | NormalizedEvent::ToolCompleted { .. } => {
             unreachable!("normalize(EntryPoint::TurnCompleted, ..) never returns these variants")
         }
     };
