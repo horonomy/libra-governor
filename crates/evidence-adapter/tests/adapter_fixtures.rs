@@ -424,3 +424,39 @@ fn token_currency_non_fabrication_schema_has_no_usage_field_and_usage_never_infl
         "actual_usage must have zero influence on the emitted event"
     );
 }
+
+/// HORO-2218: exhaustive over `TransportPolicy`, so adding a variant is a
+/// compile error here until its v1 stance is decided. Every variant other
+/// than `LocalOnly` must be refused at config load, regardless of anything
+/// else (the adapter config carries no Profile: the corporate/personal
+/// profile is a data stamp on events, not a transport switch).
+#[test]
+fn every_non_local_only_transport_policy_is_refused_at_config_load() {
+    fn expect_refused(policy: TransportPolicy) -> bool {
+        match policy {
+            TransportPolicy::LocalOnly => false,
+            TransportPolicy::ManualWindow | TransportPolicy::MonthlyWindow => true,
+        }
+    }
+    for policy in [
+        TransportPolicy::LocalOnly,
+        TransportPolicy::ManualWindow,
+        TransportPolicy::MonthlyWindow,
+    ] {
+        let result = AdapterConfig::new(policy);
+        if expect_refused(policy) {
+            assert_eq!(
+                result.unwrap_err(),
+                AdapterConfigError::WindowTransportNotOfferedInV1(policy)
+            );
+            // `validate` on a hand-built config must agree: no construction
+            // path skips the refusal.
+            let hand_built = AdapterConfig {
+                transport_policy: policy,
+            };
+            assert!(hand_built.validate().is_err());
+        } else {
+            assert!(result.is_ok());
+        }
+    }
+}

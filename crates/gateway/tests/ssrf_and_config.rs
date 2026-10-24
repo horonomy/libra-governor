@@ -268,3 +268,168 @@ fn the_configured_upstream_is_the_only_destination_any_request_reaches() {
     assert_eq!(received[0].path, "/v1/messages");
     assert!(received[0].header("x-forwarded-host").is_none());
 }
+
+/// HORO-2218 egress audit: the destination rule holds against host
+/// lookalikes and URL-parsing confusion, not just the obvious
+/// `evil.example.com` case. With the default allowlist (only
+/// `api.anthropic.com`), nothing else may become the upstream.
+#[test]
+fn host_lookalikes_and_url_confusion_never_become_the_upstream() {
+    // (upstream, expected refusal). The specific error matters: a lookalike
+    // must be refused as a foreign host, a smuggled credential as userinfo.
+    let cases: Vec<(&str, RefusalCheck)> = vec![
+        ("https://api.anthropic.com.evil.example.com", |e| {
+            matches!(e, ConfigError::UpstreamHostNotAllowed { .. })
+        }),
+        ("https://evilapi.anthropic.com", |e| {
+            matches!(e, ConfigError::UpstreamHostNotAllowed { .. })
+        }),
+        ("https://api.anthropic.com.", |e| {
+            matches!(e, ConfigError::UpstreamHostNotAllowed { .. })
+        }),
+        ("https://api-anthropic.com", |e| {
+            matches!(e, ConfigError::UpstreamHostNotAllowed { .. })
+        }),
+        ("https://evil.example.com@api.anthropic.com", |e| {
+            matches!(e, ConfigError::UpstreamHasUserinfo)
+        }),
+        ("https://api.anthropic.com@evil.example.com", |e| {
+            matches!(e, ConfigError::UpstreamHasUserinfo)
+        }),
+        ("https://api.anthropic.com:443@evil.example.com", |e| {
+            matches!(e, ConfigError::UpstreamHasUserinfo)
+        }),
+        ("https://evil.example.com#@api.anthropic.com", |e| {
+            matches!(
+                e,
+                ConfigError::UpstreamHasPathOrQuery | ConfigError::UpstreamNotAUrl { .. }
+            )
+        }),
+        ("https://evil.example.com?@api.anthropic.com", |e| {
+            matches!(
+                e,
+                ConfigError::UpstreamHasPathOrQuery | ConfigError::UpstreamNotAUrl { .. }
+            )
+        }),
+        ("https://[::1]", |e| {
+            matches!(e, ConfigError::UpstreamHostNotAllowed { .. })
+        }),
+        ("https://127.0.0.1", |e| {
+            matches!(e, ConfigError::UpstreamHostNotAllowed { .. })
+        }),
+        ("https://localhost", |e| {
+            matches!(e, ConfigError::UpstreamHostNotAllowed { .. })
+        }),
+        ("ws://api.anthropic.com", |e| {
+            matches!(e, ConfigError::UpstreamSchemeNotHttps { .. })
+        }),
+        ("ftp://api.anthropic.com", |e| {
+            matches!(e, ConfigError::UpstreamSchemeNotHttps { .. })
+        }),
+        ("//api.anthropic.com", |e| {
+            matches!(e, ConfigError::UpstreamNotAUrl { .. })
+        }),
+        ("api.anthropic.com", |e| {
+            matches!(e, ConfigError::UpstreamNotAUrl { .. })
+        }),
+    ];
+    for (upstream, expected) in cases {
+        let error = validate(config_for(upstream), ResourceKind::Tokens)
+            .expect_err(&format!("{upstream} must not produce a running gateway"));
+        assert!(expected(&error), "{upstream} was refused as {error:?}");
+    }
+}
+
+/// The plaintext opt-in is a loopback opt-in only. `is_loopback_host`
+/// accepts all of `127.0.0.0/8` and `::1` plus the name `localhost`, so
+/// those spellings are the only plaintext hosts that can pass (and only when
+/// also allowlisted); every other address is refused as a non-https scheme
+/// even when flagged and allowlisted.
+#[test]
+fn plaintext_upstream_is_refused_for_every_non_loopback_address_even_when_flagged_and_allowlisted()
+{
+    for host in [
+        "10.0.0.5",
+        "169.254.169.254",
+        "0.0.0.0",
+        "8.8.8.8",
+        "[::ffff:8.8.8.8]",
+        "[2001:db8::1]",
+        "[fe80::1]",
+        "example.com",
+    ] {
+        let mut config = config_for(&format!("http://{host}"));
+        config.allow_plaintext_loopback_upstream = true;
+        config.upstream_host_allowlist = vec![host.trim_matches(['[', ']']).to_string()];
+        let error = validate(config, ResourceKind::Tokens).expect_err(host);
+        assert!(
+            matches!(error, ConfigError::UpstreamSchemeNotHttps { .. }),
+            "http://{host} was refused as {error:?}"
+        );
+    }
+
+    // The loopback spellings pass only when flagged AND allowlisted.
+    for host in ["127.0.0.1", "127.0.0.2", "127.1.2.3", "[::1]", "localhost"] {
+        // The allowlist is matched against the authority's host as written,
+        // so an IPv6 literal is allowlisted with its brackets.
+        let bare = host.to_string();
+
+        let mut config = config_for(&format!("http://{host}:9"));
+        config.allow_plaintext_loopback_upstream = true;
+        config.upstream_host_allowlist = vec![bare.clone()];
+        assert!(
+            validate(config, ResourceKind::Tokens).is_ok(),
+            "flagged+allowlisted loopback {host} should validate"
+        );
+
+        // Loopback but not allowlisted: the allowlist still binds.
+        let mut config = config_for(&format!("http://{host}:9"));
+        config.allow_plaintext_loopback_upstream = true;
+        assert!(
+            matches!(
+                validate(config, ResourceKind::Tokens).unwrap_err(),
+                ConfigError::UpstreamHostNotAllowed { .. }
+            ),
+            "{host}"
+        );
+
+        // Allowlisted but not flagged: plaintext is refused.
+        let mut config = config_for(&format!("http://{host}:9"));
+        config.upstream_host_allowlist = vec![bare];
+        assert!(
+            matches!(
+                validate(config, ResourceKind::Tokens).unwrap_err(),
+                ConfigError::UpstreamSchemeNotHttps { .. }
+            ),
+            "{host}"
+        );
+    }
+
+    // Spellings that are not canonical loopback literals are not loopback.
+    // `127.1` and numeric forms do not parse as IP addresses here.
+    for host in ["127.1", "2130706433"] {
+        let mut config = config_for(&format!("http://{host}:9"));
+        config.allow_plaintext_loopback_upstream = true;
+        config.upstream_host_allowlist = vec![host.to_string()];
+        assert!(
+            matches!(
+                validate(config, ResourceKind::Tokens).unwrap_err(),
+                ConfigError::UpstreamSchemeNotHttps { .. }
+            ),
+            "{host}"
+        );
+    }
+}
+
+/// Positive control so the refusals above are not vacuous: the one
+/// default destination validates.
+#[test]
+fn the_default_allowlisted_https_upstream_validates() {
+    let validated = validate(
+        config_for("https://api.anthropic.com"),
+        ResourceKind::Tokens,
+    )
+    .expect("default upstream is allowed");
+    assert_eq!(validated.upstream_origin(), "https://api.anthropic.com");
+    assert_eq!(validated.upstream_scheme, "https");
+}
