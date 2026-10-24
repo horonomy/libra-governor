@@ -19,8 +19,10 @@ Audited at `main` 7af0f89 across the Rust workspace, `providers/`, `scripts/`,
   `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` are *host* traffic. Libra does
   not set or enforce them. `doctor` reports whether
   `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set (slice S8, HORO-2217):
-  presence only, in its own environment and in the `settings.json` env block;
-  it never prints the value or any other variable. `doctor`'s `telemetry`
+  a non-empty value in its own environment and the key's presence in the
+  `settings.json` env block; it never prints or interprets the value (a
+  present key set to `0` or `false` does not mean traffic is disabled) or any
+  other variable. `doctor`'s `telemetry`
   finding separately states that Libra itself has no telemetry code path.
 
 ## Authorized vs unauthorized
@@ -113,7 +115,8 @@ Checked and absent: `reqwest`, `ureq`, `curl`, `isahc`, `surf`, `attohttpc`,
 - Claude Code telemetry, WebFetch and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`
   are not enforced by Libra. `doctor` reports only whether
   `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set (slice S8, HORO-2217;
-  delivered, reporting only, presence only). Telemetry and WebFetch are
+  delivered, reporting only; non-empty in the process environment, key present
+  in `settings.json`, value never printed or interpreted). Telemetry and WebFetch are
   neither read nor reported.
 - Nothing prevents a user from pointing the agent at a different base URL;
   the gateway only governs traffic routed through it.

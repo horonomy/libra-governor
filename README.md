@@ -351,7 +351,8 @@ Truthful, matching the actual implementation — not aspirational copy:
   check, or upload. Not enforced by Libra: Claude Code's own telemetry and
   WebFetch (including `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`) are host
   traffic that Libra does not control; `doctor` only reports whether
-  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set (presence only).
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set (a non-empty process value or a `settings.json` key; the value is
+  never printed or interpreted).
 - **Logs and receipts:** `daemon.log`
   (`crates/daemon/src/log.rs`) never receives raw prompt text or hook
   payload content. Execution receipts record structural facts (counts,

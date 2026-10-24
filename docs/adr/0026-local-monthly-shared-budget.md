@@ -538,18 +538,34 @@ and CLI processes, synthetic transcripts); **nothing here is
   `clock_anomaly`. `Status` gained one additive, defaulted field,
   `future_timestamp_settlements`; no protocol version bump (an older peer
   decodes it as zero).
-- The legacy `statusline` line gains ` | budget $12.30/$500 (2%)` (settled
-  plus held against the cap) with a trailing ` WARN` for a soft-limit warning
-  or an overrun, **only when a budget file exists**; without one the line is
+- The legacy `statusline` line gains ` | budget $12.30/$500 (3%)` (settled
+  plus held against the cap, percent rounded up for any spend) with a
+  trailing ` WARN` for a soft-limit warning or when nothing remains (fully
+  held or overrun), **only when a budget file exists**; without one the line is
   byte-for-byte unchanged, and any failure drops the segment. The shared-host
   `statusline provider` document is not changed.
 - `doctor` reports the budget file state, whether the six hooks are wired in
   an all-tools group, daemon reachability, clock anomaly, flagged settlement
-  counts, any per-executor reconciliation discrepancy, and, by presence only,
-  whether `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set (in its own
-  environment and in the `settings.json` env block; the value and every other
-  variable are never read into the report). It also states what the budget
-  does not cover.
+  counts, any per-executor reconciliation discrepancy, an exhausted or
+  overrun pool (Warn: less than one turn hold remains, every new prompt is
+  denied) and unknown capacity (Warn), and whether
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set (two different facts: a
+  non-empty value in its own environment, and the key's presence in the
+  `settings.json` env block; the value is never printed or interpreted, so a
+  present key set to `0` or `false` does not mean traffic is disabled, and no
+  other variable is read into the report). It also states what the budget
+  does not cover. With a budget file present, a missing `UserPromptSubmit`
+  (admission) or `Stop` (settlement) hook is an **Error** (doctor exits 1):
+  nothing is admitted or charged. Other missing hooks are a Warn.
+- **Exit codes.** `shared-budget status` is a viewer and exits 0 even for a
+  reconciliation DISCREPANCY, `clock_anomaly` or an invalid config (the
+  state is in its output and `--json`); `doctor` is the failing check.
+- **Intentional behaviour change (L-A).** `inspect()` and so the legacy
+  `hooks_wired` result now treat a hook in a matcher-scoped group (for
+  example `PostToolUse` under `Bash`) as not wired, matching `install`.
+  `doctor`'s legacy `claude_settings` finding therefore moves from Ok to
+  Warn for an install that only has such a group, and the evidence report
+  that consumes `hooks_wired` follows. This is deliberate, not a regression.
 - The S7 review finding L-A is fixed: `inspect()` counted our command under a
   user's foreign matcher group (for example `Bash`) as wired; it now requires
   a no-matcher, `""` or `"*"` group, the same rule `install` applies.
@@ -564,8 +580,8 @@ Only `crates/gateway` (upstream allowlist, default `api.anthropic.com`) and
 `crates/extension` (loopback literal only) may hold HTTP clients. Host
 telemetry and WebFetch are Claude Code's own traffic: Libra neither reports
 nor enforces them; slice S8 (HORO-2217) delivered `doctor` reporting of the
-`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` setting (presence only, reporting
-only).
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` setting (reporting only; value never
+printed or interpreted).
 
 The full pathway table, what is enforced and what is not, is in
 [`docs/egress-inventory.md`](../egress-inventory.md); a static test

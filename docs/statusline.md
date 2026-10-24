@@ -184,9 +184,9 @@ exact phrases, and breaking it to make a migration tidier would break a working
 setup to serve an internal preference.
 
 One addition, made only when it applies (HORO-2217): while a
-`shared-budget.json` exists, the line is followed by ` | budget $12.30/$500 (2%)`
-(settled plus held against the cap, with a trailing ` WARN` for a soft-limit
-warning or an overrun). The part before ` | budget` is untouched, and with no
+`shared-budget.json` exists, the line is followed by ` | budget $12.30/$500 (3%)`
+(settled plus held against the cap, percent rounded up, with a trailing
+` WARN` for a soft-limit warning or when nothing remains). The part before ` | budget` is untouched, and with no
 budget file, or if the daemon does not answer in 200 ms, the line is exactly
 what it was. `statusline provider` is not changed.
 
