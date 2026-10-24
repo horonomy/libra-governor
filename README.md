@@ -90,7 +90,7 @@ wires this binary's hooks and statusline into
 `~/.claude/settings.json` (via `libra-governor install` — see
 "Uninstall" below for exactly what that touches), and finishes by
 running `libra-governor doctor` so you see real, current state rather
-than an installer's own claim of success. If you want the three hooks
+than an installer's own claim of success. If you want the six hooks
 without changing Claude Code's statusline setting, use
 `./scripts/install.sh --hooks-only` or, after installing the binary,
 `libra-governor install --hooks-only`. This mode preserves `statusLine`
@@ -395,7 +395,8 @@ libra-governor uninstall --yes    # also deletes the state directory without pro
 
 Removes exactly what this integration's own installer added:
 
-1. The `UserPromptSubmit`/`PostToolUse`/`Stop` hook entries,
+1. The `UserPromptSubmit`/`PostToolUse`/`Stop` and `PreToolUse`/`SubagentStop`/`SessionEnd`
+   hook entries,
    `statusLine`, and — if present — the gateway's `env.ANTHROPIC_BASE_URL`
    (loopback-only) and `apiKeyHelper` keys from `~/.claude/settings.json`.
    Every other key in that file — anything from another tool, or your

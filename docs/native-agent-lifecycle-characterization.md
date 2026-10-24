@@ -22,7 +22,7 @@ This characterization does not use either transcript to infer lineage.
 
 | Lifecycle case | Host contract / evidence | Libra behavior in this worktree | Characterization |
 |---|---|---|---|
-| New session | Codex and Claude Code document `SessionStart.source = startup`. | Only `UserPromptSubmit`, `PostToolUse`, and `Stop` are installed. `SessionStart` is recognized as unwired; no identity is captured from it. | Host event shapes documented; Libra handling tested with a synthetic payload. Native end-to-end acquisition is unverified. |
+| New session | Codex and Claude Code document `SessionStart.source = startup`. | `UserPromptSubmit`, `PostToolUse`, `Stop` and, for Claude Code only, `PreToolUse`, `SubagentStop`, `SessionEnd` (shared-budget gate and settlement, ADR-0026) are installed. `SessionStart` is recognized as unwired; no identity is captured from it. | Host event shapes documented; Libra handling tested with a synthetic payload. Native end-to-end acquisition is unverified. |
 | Resume | Both hosts document `SessionStart.source = resume`. | `SessionStart` remains unwired. No persisted mapping binds a resumed session to a prior Libra identity. | Host event shapes documented; whether either host preserves its session ID across resume is unverified. |
 | Clear | Both hosts document `SessionStart.source = clear`. | `SessionStart` remains unwired. Libra does not reset or reconcile identity on clear. | Host event shapes documented; provider session ID and host state reset behavior are unverified. |
 | Fork | Claude Code documents `SessionStart.source = fork`; Codex's documented start sources omit `fork`. | No fork event or parent-agent field is captured. | Claude hook availability is documented, but fork identifier relationships are unknown; Codex fork semantics are undocumented here. No lineage is inferred. |
@@ -32,8 +32,10 @@ This characterization does not use either transcript to infer lineage.
 
 ## Evidence boundary
 
-The adapter has three wired entry points: prompt submit, post-tool use, and
-stop. The normalizer returns `RecognizedUnwired` for `SessionStart`,
+The identity adapter has three wired entry points: prompt submit, post-tool
+use, and stop. (`hook subagent-stop` and `hook session-end` parse their own
+payloads in `agent/settlement.rs` for shared-budget settlement only and feed
+no identity.) The normalizer returns `RecognizedUnwired` for `SessionStart`,
 `SessionEnd`, `SubagentStart`, `SubagentStop`, `Interrupt`, `PreCompact`, and
 `PostCompact`; it does not relay their extra fields to the identity builder.
 The capture function preserves only the host ID, provider session ID, and

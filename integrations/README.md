@@ -25,7 +25,7 @@ disagree, trust the command.
 | Preflight gate (`UserPromptSubmit`) | Available | Available |
 | Tool observation (`PostToolUse`) | Available | Available |
 | Tool gate (hard pre-call refusal) | Unavailable — MVP 1.0 hooks are advisory; the gateway is the only hard-enforcement point (ADR 0003) | Unavailable — same reason |
-| Shared budget admission gate (`UserPromptSubmit` block, `PreToolUse` deny; ADR-0026) | Available — cooperative, admission-bounded, Libra-accounted USD; only acts when `shared-budget.json` exists | **Unavailable** — not wired by Libra: the Codex hook route never asks the daemon to admit a prompt and has no budget gate |
+| Shared budget admission gate and settlement (`UserPromptSubmit` block, `PreToolUse` deny, `SubagentStop` charge, `SessionEnd` tail settle; installed by `libra-governor install`; ADR-0026 S6/S7) | Available — cooperative (admission-bounded), Libra-accounted USD; only acts when `shared-budget.json` exists. Not host-verified: no real Claude Code host has run the installed hooks | **Unavailable** — not wired by Libra: the Codex hook route never asks the daemon to admit a prompt and has no budget gate |
 | Completion receipt (`Stop`) | Available | Available |
 | Model event observation (token/cost/provider per request) | Unavailable — no hook payload exposes this | Unavailable — same |
 | Model gateway | Available | **Unavailable — incompatible wire format** (`responses` vs. `messages`) |
@@ -56,7 +56,8 @@ is a pure function of agent identity, never a runtime probe.
 - No MCP-based enforcement — `ARCHITECTURE.md` forbids MCP as a security
   or enforcement boundary for any agent.
 - No daemon/protocol/ledger wiring for session or subagent lifecycle
-  events yet — both hosts expose the underlying hook events; neither is
-  wired to a daemon action.
+  events as lifecycle — both hosts expose the underlying hook events; the
+  only wiring is Claude Code's `SubagentStop`/`SessionEnd` to shared-budget
+  settlement (ADR-0026), which records no lifecycle state.
 
 See each agent's own README for what is fully in scope for that host.
