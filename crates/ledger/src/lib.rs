@@ -35,6 +35,7 @@ mod reservation;
 mod resource_account;
 mod session;
 mod shared_pool;
+mod shared_pool_retention;
 mod store;
 mod transaction;
 mod write;
@@ -68,6 +69,10 @@ pub use shared_pool::{
     SharedPoolExecutorUsage, SharedPoolReleaseOutcome, SharedPoolRenewOutcome,
     SharedPoolReserveOutcome, SharedPoolReserveRequest, SharedPoolSessionUsage,
     SharedPoolSettleOutcome, SourcedAdmission,
+};
+pub use shared_pool_retention::{
+    ChargeSourceTotals, PoolExport, PoolExportExecutor, PoolPruneDetail, PruneDisposition,
+    PruneReport, PruneRequest, RetentionError,
 };
 pub use store::{LedgerStore, APPEND_ONLY_TRIGGERS};
 pub use write::DOGFOOD_PROFILE_ENV_VAR;

@@ -193,6 +193,17 @@ pub fn calendar_month_bounds(
     (start, end)
 }
 
+/// `instant` rendered as an RFC 3339 string in `tz`'s wall clock with its
+/// numeric UTC offset (no bracketed zone suffix), e.g.
+/// `2026-09-01T00:00:00-04:00`. Display only: the offset is the zone's
+/// rule at that instant, so a DST fold renders each pass distinctly.
+pub fn format_local_rfc3339(instant: OffsetDateTime, tz: &IanaTimeZone) -> String {
+    to_jiff_timestamp(instant)
+        .to_zoned(zone(tz))
+        .strftime("%Y-%m-%dT%H:%M:%S%:z")
+        .to_string()
+}
+
 /// The civil `(year, month)` of `instant` in `tz`.
 pub(crate) fn local_year_month(instant: OffsetDateTime, tz: &IanaTimeZone) -> (i16, i8) {
     let date = to_jiff_timestamp(instant).to_zoned(zone(tz)).date();
