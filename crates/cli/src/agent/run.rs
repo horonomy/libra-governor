@@ -118,7 +118,7 @@ fn capture_and_log_identity(
     match super::identity::capture(
         &host_id,
         agent,
-        session_id,
+        Some(session_id),
         agent_id,
         turn_id,
         time::OffsetDateTime::now_utc(),
@@ -220,6 +220,18 @@ pub(crate) fn run_prompt_submit_with_input(agent: AgentKind, raw: &str) {
         | NormalizedEvent::TurnCompleted { .. } => {
             unreachable!("normalize(EntryPoint::PromptSubmit, ..) never returns these variants")
         }
+    };
+
+    // A host that named no usable session (absent, blank, not a string)
+    // cannot be keyed: skip, exactly as the pre-HORO-2197 malformed path did.
+    let Some(session_id) = session_id else {
+        log(
+            &log_path,
+            agent,
+            "preflight: no usable session id in hook payload, skipping",
+        );
+        print_context("[libra-governor] preflight skipped: malformed hook payload.");
+        return;
     };
 
     let identity = capture_and_log_identity(
@@ -441,6 +453,15 @@ pub(crate) fn run_tool_requested_with_input(agent: AgentKind, raw: &str) {
         }
     };
 
+    let Some(session_id) = session_id else {
+        log(
+            &log_path,
+            agent,
+            "pre-tool-use: no usable session id in hook payload, skipping",
+        );
+        return;
+    };
+
     // Cheap stat first: no budget file means the daemon is not even
     // contacted.
     if !budget_gate::budget_file_present() {
@@ -518,6 +539,15 @@ pub(crate) fn run_tool_completed_with_input(agent: AgentKind, raw: &str) {
         | NormalizedEvent::TurnCompleted { .. } => {
             unreachable!("normalize(EntryPoint::ToolCompleted, ..) never returns these variants")
         }
+    };
+
+    let Some(session_id) = session_id else {
+        log(
+            &log_path,
+            agent,
+            "post-tool-use: no usable session id in hook payload, skipping",
+        );
+        return;
     };
 
     let identity = capture_and_log_identity(
@@ -696,6 +726,15 @@ pub(crate) fn run_turn_completed_with_input(agent: AgentKind, raw: &str) {
         | NormalizedEvent::ToolCompleted { .. } => {
             unreachable!("normalize(EntryPoint::TurnCompleted, ..) never returns these variants")
         }
+    };
+
+    let Some(session_id) = session_id else {
+        log(
+            &log_path,
+            agent,
+            "stop: no usable session id in hook payload, skipping",
+        );
+        return;
     };
 
     let identity = capture_and_log_identity(

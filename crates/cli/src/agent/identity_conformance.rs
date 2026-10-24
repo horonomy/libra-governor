@@ -12,14 +12,17 @@
 //! fields an entry point requires (`cwd`, `prompt`, `tool_name`) are added
 //! only when absent.
 //!
-//! Four vectors are NOT satisfied (`REFUSED_NOT_ABSENT`): Libra refuses the
-//! whole hook event when `session_id` is missing/non-string or the payload
-//! is not a mapping, where the reference emits an envelope with an absent
-//! session. Libra fails closed (no session-attributed identity is ever
-//! produced), but making `session_id` optional is a protocol change in a
-//! separate slice, tracked as HORO-2197 (it makes `session_id` optional so
-//! these vectors match, then the ignored test is un-ignored). They are pinned as refusals below and run exactly in an
-//! ignored test.
+//! HORO-2197 made `session_id` optional in the hook decoder (absent, blank
+//! and non-string all read as "no session"), which brings three of the four
+//! vectors #211 left deviating onto the reference: `claude-no-session`,
+//! `claude-non-string-session` and `codex-heuristics-only`. They run in
+//! `normalizer_vectors_hold_through_libras_payload_path` like every other
+//! normalizer vector.
+//!
+//! One vector remains a named, justified deviation ([`JUSTIFIED_DEVIATIONS`]):
+//! `claude-not-a-mapping`. See the constant for the invariant. Every other
+//! requirement of the contract (no fabricated ids, blank is absent, Claude
+//! `turn_id` unmapped) is asserted by the vectors that do match.
 
 use libra_governor_domain::{AgentKind, ExecutionIdentity, Scope};
 use serde_json::{json, Value};
@@ -33,12 +36,21 @@ const VECTORS: &str =
     include_str!("../../../domain/tests/fixtures/execution-identity-conformance-vectors.json");
 const PINNED_SHA256: &str = "c6ab9b978540e723a4d338f40b5218f6e355667c35dec456e9b7a650233b5a13";
 
-const REFUSED_NOT_ABSENT: [&str; 4] = [
-    "claude-no-session",
-    "claude-non-string-session",
-    "claude-not-a-mapping",
-    "codex-heuristics-only",
-];
+/// Vectors Libra deliberately does not match, each with the invariant that
+/// forbids it. Pinned by [`justified_deviations_refuse_and_never_attribute_a_session`].
+///
+/// `claude-not-a-mapping` (payload `["s-1"]`): the reference emits an
+/// envelope with every identity field absent. Libra refuses the whole hook
+/// event instead. Invariant: a hook payload that is not a JSON object names
+/// no field at all, and serde's derived struct decoders would otherwise read
+/// the array *positionally*, so `["s-1"]` would become session `s-1` -- an
+/// identity read out of a payload that names nothing. `normalize` therefore
+/// rejects every non-object before any decoder runs, and the event produces
+/// no envelope, no daemon request and no counter. This is strictly stricter
+/// than the reference (the reference's envelope would also carry no session);
+/// what the vector protects -- no session is ever attributed from a
+/// non-mapping -- holds, and is asserted here for every entry point.
+const JUSTIFIED_DEVIATIONS: [&str; 1] = ["claude-not-a-mapping"];
 
 fn vectors() -> Value {
     serde_json::from_str(VECTORS).expect("vendored vectors are valid JSON")
@@ -114,7 +126,7 @@ fn identity_from_payload(
         capture(
             host_id,
             agent,
-            &session,
+            session.as_deref(),
             agent_id.as_deref(),
             turn_id.as_deref(),
             time::OffsetDateTime::now_utc(),
@@ -173,7 +185,7 @@ fn normalizer_vectors_hold_through_libras_payload_path() {
     let mut checked = 0;
     for vector in normalizers(&doc) {
         let name = vector["name"].as_str().unwrap();
-        if REFUSED_NOT_ABSENT.contains(&name) {
+        if JUSTIFIED_DEVIATIONS.contains(&name) {
             continue;
         }
         let agent = agent_kind(vector["provider"].as_str().unwrap());
@@ -187,57 +199,90 @@ fn normalizer_vectors_hold_through_libras_payload_path() {
             checked += 1;
         }
     }
-    // 5 vectors x 3 entry points + 'claude-main', routed to its one named entry point.
-    assert_eq!(checked, 5 * 3 + 1);
+    // 8 vectors x 3 entry points + 'claude-main', routed to its one named entry point.
+    assert_eq!(checked, 8 * 3 + 1);
 }
 
 #[test]
-fn refused_normalizer_vectors_fail_closed_and_never_attribute_a_session() {
+fn justified_deviations_refuse_and_never_attribute_a_session() {
     let doc = vectors();
     let mut refused = 0;
     for vector in normalizers(&doc) {
         let name = vector["name"].as_str().unwrap();
-        if !REFUSED_NOT_ABSENT.contains(&name) {
+        if !JUSTIFIED_DEVIATIONS.contains(&name) {
             continue;
         }
+        assert!(
+            !vector["payload"].is_object(),
+            "{name}: a deviation justified by the non-object guard must be a non-object payload"
+        );
         let agent = agent_kind(vector["provider"].as_str().unwrap());
         for entry in entry_points(&vector["payload"]) {
             let identity = identity_from_payload(agent, "host-1", entry, &vector["payload"]);
             assert!(
                 identity.is_none(),
-                "{name}/{entry:?}: Libra now accepts this payload; move it out of REFUSED_NOT_ABSENT \
-                 and drop its ignored exact-match test"
+                "{name}/{entry:?}: Libra now accepts this payload; move it out of \
+                 JUSTIFIED_DEVIATIONS and let the exact-match test cover it"
             );
             refused += 1;
         }
         assert_eq!(
             vector["expect"]["provider_session_id"],
             Value::Null,
-            "{name}"
+            "{name}: the reference attributes no session either"
         );
     }
-    assert_eq!(refused, 4 * 3);
+    assert_eq!(refused, JUSTIFIED_DEVIATIONS.len() * 3);
+}
+
+/// What the three newly matching vectors must never be turned into: the
+/// absent session stays absent (not `""`, not a stringified number), and
+/// the agent-only identity cannot be keyed at any scope that needs a
+/// session.
+#[test]
+fn an_absent_session_is_never_filled_in_or_widened() {
+    for (provider, payload) in [
+        (
+            AgentKind::ClaudeCode,
+            json!({"agent_id": "a-1", "cwd": "/w"}),
+        ),
+        (
+            AgentKind::ClaudeCode,
+            json!({"session_id": 123, "agent_id": "a-1"}),
+        ),
+        (
+            AgentKind::ClaudeCode,
+            json!({"session_id": "  ", "agent_id": "a-1"}),
+        ),
+        (
+            AgentKind::Codex,
+            json!({"agent_id": "a-1", "turn_id": "t-1"}),
+        ),
+    ] {
+        for entry in entry_points(&payload) {
+            let identity = identity_from_payload(provider, "host-1", entry, &payload)
+                .unwrap_or_else(|| panic!("{payload}/{entry:?}: refused"));
+            assert_eq!(identity.provider_session_id(), None, "{payload}");
+            assert_eq!(identity.agent_id(), Some("a-1"), "{payload}");
+            for scope in [Scope::TurnTask, Scope::Agent, Scope::Session] {
+                assert!(
+                    identity.cache_key(scope).is_err(),
+                    "{payload}/{entry:?}: {scope:?} must error, not widen"
+                );
+            }
+            assert_eq!(narrowest_attributable_scope(&identity), Scope::Unknown);
+        }
+    }
 }
 
 #[test]
-#[ignore = "known deviation: Libra refuses the whole hook event when session_id is missing/non-string or the payload is not a mapping; session-optional hook pipeline is a separate protocol slice (HORO-2197)"]
-fn deviation_refused_vectors_exact_match() {
-    let doc = vectors();
-    for vector in normalizers(&doc) {
-        let name = vector["name"].as_str().unwrap();
-        if !REFUSED_NOT_ABSENT.contains(&name) {
-            continue;
-        }
-        let agent = agent_kind(vector["provider"].as_str().unwrap());
-        for entry in entry_points(&vector["payload"]) {
-            let identity = identity_from_payload(
-                agent,
-                vector["host_id"].as_str().unwrap(),
-                entry,
-                &vector["payload"],
-            )
-            .unwrap_or_else(|| panic!("{name}/{entry:?}: refused, vector expects an envelope"));
-            assert_matches_expectation(name, &identity, &vector["expect"]);
-        }
+fn a_mapping_with_the_deviating_arrays_content_is_not_a_session_either() {
+    // The array form is refused; the nearest object form names no session
+    // and must not borrow the array's element as one.
+    let payload = json!({"0": "s-1"});
+    for entry in entry_points(&payload) {
+        let identity = identity_from_payload(AgentKind::ClaudeCode, "host-1", entry, &payload)
+            .expect("an object with unknown keys decodes");
+        assert_eq!(identity.provider_session_id(), None);
     }
 }

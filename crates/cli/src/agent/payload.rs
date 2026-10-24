@@ -40,7 +40,11 @@ use serde::Deserialize;
 /// `UserPromptSubmit` payload.
 #[derive(Debug, Deserialize)]
 pub struct PromptSubmitPayload {
-    pub session_id: String,
+    /// Absent, blank and non-string all read as `None` (see
+    /// [`optional_native_call_id`]): the host did not name a session, and
+    /// one is never coerced or invented from another value.
+    #[serde(default, deserialize_with = "optional_native_call_id")]
+    pub session_id: Option<String>,
     pub cwd: PathBuf,
     pub prompt: String,
     /// Codex turn ID where supplied. Claude Code does not document this
@@ -61,7 +65,8 @@ pub struct PromptSubmitPayload {
 /// budget check needs; `tool_input` and everything else is ignored.
 #[derive(Debug, Deserialize)]
 pub struct ToolRequestedPayload {
-    pub session_id: String,
+    #[serde(default, deserialize_with = "optional_native_call_id")]
+    pub session_id: Option<String>,
     /// Present only for tool events inside a subagent; never invented.
     #[serde(default, deserialize_with = "optional_native_call_id")]
     pub agent_id: Option<String>,
@@ -70,7 +75,8 @@ pub struct ToolRequestedPayload {
 /// `PostToolUse` payload.
 #[derive(Debug, Deserialize)]
 pub struct ToolCompletedPayload {
-    pub session_id: String,
+    #[serde(default, deserialize_with = "optional_native_call_id")]
+    pub session_id: Option<String>,
     pub tool_name: String,
     #[serde(default)]
     pub turn_id: Option<String>,
@@ -86,7 +92,8 @@ pub struct ToolCompletedPayload {
 /// documents it only for `SessionStart`, so it remains optional.
 #[derive(Debug, Deserialize)]
 pub struct TurnCompletedPayload {
-    pub session_id: String,
+    #[serde(default, deserialize_with = "optional_native_call_id")]
+    pub session_id: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -99,6 +106,8 @@ pub struct TurnCompletedPayload {
     pub transcript_path: Option<PathBuf>,
 }
 
+/// A string field the host may omit or mistype: anything that is not a JSON
+/// string reads as absent. A number is never stringified into an id.
 fn optional_native_call_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -131,7 +140,7 @@ mod tests {
             "agent_type": "reviewer"
         }"#;
         let payload: PromptSubmitPayload = serde_json::from_str(json).unwrap();
-        assert_eq!(payload.session_id, "sess-1");
+        assert_eq!(payload.session_id.as_deref(), Some("sess-1"));
         assert_eq!(payload.prompt, "fix the bug");
     }
 
@@ -147,7 +156,7 @@ mod tests {
             "hook_event_name": "PostToolUse"
         }"#;
         let payload: ToolCompletedPayload = serde_json::from_str(json).unwrap();
-        assert_eq!(payload.session_id, "sess-1");
+        assert_eq!(payload.session_id.as_deref(), Some("sess-1"));
         assert_eq!(payload.tool_name, "Bash");
         assert_eq!(payload.tool_use_id.as_deref(), Some("call-1"));
     }
@@ -162,7 +171,7 @@ mod tests {
             "last_assistant_message": "done"
         }"#;
         let payload: TurnCompletedPayload = serde_json::from_str(json).unwrap();
-        assert_eq!(payload.session_id, "sess-1");
+        assert_eq!(payload.session_id.as_deref(), Some("sess-1"));
         assert_eq!(payload.model, None);
     }
 

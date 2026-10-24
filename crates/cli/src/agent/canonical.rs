@@ -154,10 +154,17 @@ pub fn normalize_builtin(
             });
         }
     };
+    // The Host Integration contract allows an event with no session, but
+    // Libra's adapter has never produced one and nothing downstream keys on
+    // an absent session: refuse exactly as before the payload decoder became
+    // session-optional (HORO-2197).
+    let Some(session_id) = session_id else {
+        return Err(failure_invalid_native());
+    };
     let identity = identity::capture(
         &context.host_id,
         agent,
-        &session_id,
+        Some(&session_id),
         agent_id.as_deref(),
         turn_id.as_deref(),
         now,
@@ -300,7 +307,7 @@ mod tests {
         assert!(matches!(
             legacy,
             NormalizedEvent::PromptSubmitted { ref session_id, ref prompt, .. }
-                if session_id == "fixture-session" && prompt == "fix the login bug"
+                if session_id.as_deref() == Some("fixture-session") && prompt == "fix the login bug"
         ));
         let result = normalize_builtin(
             AgentKind::Codex,
