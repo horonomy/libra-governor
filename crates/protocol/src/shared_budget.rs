@@ -294,6 +294,11 @@ pub struct SharedBudgetStatus {
     /// per-sweep byte budget was spent.
     #[serde(default)]
     pub sweep_deferred_files: u64,
+    /// Settlements, subagent charges or tail settlements whose transcript
+    /// held a record stamped beyond now + skew (HORO-2217). Such a record is
+    /// never trusted as a watermark.
+    #[serde(default)]
+    pub future_timestamp_settlements: u64,
 }
 
 /// The response to a [`SharedBudgetRequest`] (embedded in
@@ -555,6 +560,7 @@ mod tests {
             id_less_records: 6,
             foreign_lines: 7,
             sweep_deferred_files: 8,
+            future_timestamp_settlements: 9,
         })
         .unwrap();
         let obj = status.as_object_mut().unwrap();
@@ -567,6 +573,7 @@ mod tests {
             "id_less_records",
             "foreign_lines",
             "sweep_deferred_files",
+            "future_timestamp_settlements",
         ] {
             obj.remove(k);
         }

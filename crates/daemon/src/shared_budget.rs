@@ -172,6 +172,7 @@ struct Telemetry {
     id_less_records: u64,
     foreign_lines: u64,
     sweep_deferred_files: u64,
+    future_timestamps: u64,
 }
 
 /// A model id from a transcript, reduced to a safe, bounded display token:
@@ -1251,19 +1252,22 @@ pub fn settle_turn(
                         priced_cents,
                         newest_in_bound,
                         message_ids,
-                    } => (
-                        priced_cents.filter(|c| *c > target.amount),
-                        Some("future_timestamp"),
-                        // The mark advances only when the in-bound records
-                        // were priced, and only to the newest of them. The
-                        // future-stamped lines stay after the mark and are
-                        // re-evaluated every window: each is counted exactly
-                        // once, when its stamp comes within the horizon.
-                        priced_cents.map(|_| SettleWatermark {
-                            at: newest_in_bound.filter(|t| EVENT_YEARS.contains(&t.year())),
-                            message_ids: merged_ids(&previous_ids, &message_ids),
-                        }),
-                    ),
+                    } => {
+                        rt.note(|t| t.future_timestamps += 1);
+                        (
+                            priced_cents.filter(|c| *c > target.amount),
+                            Some("future_timestamp"),
+                            // The mark advances only when the in-bound records
+                            // were priced, and only to the newest of them. The
+                            // future-stamped lines stay after the mark and are
+                            // re-evaluated every window: each is counted exactly
+                            // once, when its stamp comes within the horizon.
+                            priced_cents.map(|_| SettleWatermark {
+                                at: newest_in_bound.filter(|t| EVENT_YEARS.contains(&t.year())),
+                                message_ids: merged_ids(&previous_ids, &message_ids),
+                            }),
+                        )
+                    }
                     PricedObservation::SessionUnverified => {
                         rt.note(|t| t.unverified += 1);
                         (None, Some("transcript_unverified"), None)
@@ -1456,7 +1460,18 @@ fn charge_transcript_inner(
                 },
             )
         }
-        PricedObservation::MalformedUsage | PricedObservation::FutureTimestamp { .. } => (
+        PricedObservation::FutureTimestamp { .. } => {
+            rt.note(|t| t.future_timestamps += 1);
+            (
+                None,
+                Flags {
+                    unpriced: false,
+                    unverified: false,
+                    mismatch: false,
+                },
+            )
+        }
+        PricedObservation::MalformedUsage => (
             None,
             Flags {
                 unpriced: false,
@@ -1927,9 +1942,14 @@ pub fn settle_tail(
                 ..TailFlags::default()
             }
         }
-        PricedObservation::FutureTimestamp { .. }
-        | PricedObservation::MalformedUsage
-        | PricedObservation::Unavailable(_) => TailFlags {
+        PricedObservation::FutureTimestamp { .. } => {
+            rt.note(|t| t.future_timestamps += 1);
+            TailFlags {
+                unmeasured: true,
+                ..TailFlags::default()
+            }
+        }
+        PricedObservation::MalformedUsage | PricedObservation::Unavailable(_) => TailFlags {
             unmeasured: true,
             ..TailFlags::default()
         },
@@ -1995,6 +2015,7 @@ pub fn status(
         id_less_records: 0,
         foreign_lines: 0,
         sweep_deferred_files: 0,
+        future_timestamp_settlements: 0,
     };
     {
         let t = rt.telemetry.lock().unwrap_or_else(|e| e.into_inner());
@@ -2006,6 +2027,7 @@ pub fn status(
         report.id_less_records = t.id_less_records;
         report.foreign_lines = t.foreign_lines;
         report.sweep_deferred_files = t.sweep_deferred_files;
+        report.future_timestamp_settlements = t.future_timestamps;
     }
     let SharedBudgetFileState::Valid(cfg) = &effective.state else {
         return Ok(report);

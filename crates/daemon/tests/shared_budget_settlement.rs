@@ -719,6 +719,10 @@ fn a_future_stamped_record_books_the_flagged_hold_and_never_poisons_the_watermar
     let st = fx.status();
     assert_eq!(totals(&st), (1_000, 0), "max(300, hold): flagged");
     assert_eq!(st.unmeasured_settlements, 1);
+    assert_eq!(
+        st.future_timestamp_settlements, 1,
+        "the future-stamped window is counted in status"
+    );
     assert_eq!(fx.lane("s1")[0].usage_known, Some(false));
     let mark = fx
         .ledger
