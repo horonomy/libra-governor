@@ -142,7 +142,7 @@ pub fn usd_u(cents: u64) -> String {
 
 /// `$500` for a whole-dollar figure, `$500.25` otherwise.
 fn usd_short(cents: u64) -> String {
-    if cents % 100 == 0 {
+    if cents.is_multiple_of(100) {
         format!("${}", cents / 100)
     } else {
         usd_u(cents)

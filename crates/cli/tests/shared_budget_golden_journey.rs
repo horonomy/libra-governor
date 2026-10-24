@@ -909,10 +909,7 @@ fn a_new_period_gets_its_own_pool_and_the_old_one_is_retained() {
 
     // The current period is its own pool: last month's spend is not in it.
     let status = journey.status();
-    assert_eq!(
-        status.period.as_ref().unwrap().pool_id.ends_with(&now),
-        true
-    );
+    assert!(status.period.as_ref().unwrap().pool_id.ends_with(&now));
     assert_eq!(
         (status.used_usd_cents, status.reserved_usd_cents),
         (0, HOLD),
