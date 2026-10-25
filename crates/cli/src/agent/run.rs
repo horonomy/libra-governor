@@ -756,6 +756,10 @@ pub(crate) fn run_turn_completed_with_input(agent: AgentKind, raw: &str) {
         turn_id.as_deref(),
     );
 
+    // The host writes its transcript ~70 ms after this hook is dispatched;
+    // wait (bounded, never denying) so Finalize can measure the turn.
+    super::flush_wait::await_stop_flush(agent, &session_id, transcript_path.as_deref());
+
     let socket_path = match libra_governor_daemon::paths::socket_path() {
         Ok(p) => p,
         Err(e) => {

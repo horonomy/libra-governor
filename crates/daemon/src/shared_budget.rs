@@ -1118,6 +1118,20 @@ fn merged_ids(previous: &[String], counted: &[String]) -> Vec<String> {
     out
 }
 
+/// The hold a `Stop` settles: the lane's most recently created hold that is
+/// still `active` (expired-but-unswept included) or `expired`.
+fn pending_hold(holds: &[SharedPoolReservation]) -> Option<&SharedPoolReservation> {
+    holds
+        .iter()
+        .filter(|h| {
+            matches!(
+                h.state,
+                ReservationState::Active | ReservationState::Expired
+            )
+        })
+        .max_by_key(|h| h.created_at)
+}
+
 /// Settles the session's main-executor turn hold at `Stop` (HORO-2196).
 ///
 /// Called once per `Finalize`, before and independently of the legacy task
@@ -1180,16 +1194,7 @@ pub fn settle_turn(
         ExecutorKind::AgentAbsent,
         OWNER_POOL_PREFIX,
     )?;
-    let Some(target) = holds
-        .iter()
-        .filter(|h| {
-            matches!(
-                h.state,
-                ReservationState::Active | ReservationState::Expired
-            )
-        })
-        .max_by_key(|h| h.created_at)
-    else {
+    let Some(target) = pending_hold(&holds) else {
         return Ok(TurnSettlement::NoHold);
     };
     let (after, previous_ids) =
@@ -1955,6 +1960,74 @@ pub fn settle_tail(
         },
     };
     Ok(posture(flags, None, 0, false))
+}
+
+/// Handles `SharedBudgetRequest::TranscriptReady` (HORO-2246): would a
+/// `Stop` settlement right now find this turn's usage in the transcript?
+///
+/// **Read-only by construction**: it takes `&LedgerStore`, writes nothing,
+/// and touches no telemetry counter (a poll must not inflate
+/// `unmeasured_settlements`, `unverified` and the rest).
+///
+/// The answer is `ready = false` only when waiting could change what
+/// `Finalize` books, which is exactly the two outcomes a host that has not
+/// written the transcript yet produces: `Unreadable` (the file does not
+/// exist yet, as on the first turn of a session) and `NoUsageInWindow` (a
+/// resumed session whose new lines are not appended yet). Every other
+/// observation is `ready = true`, genuine problems included (binding
+/// mismatch, unverified, unpriced, malformed, future-stamped, scan cap):
+/// they settle the same way however long the hook waits, so burning the
+/// deadline on them would only delay the hook. A lane with no pending hold
+/// has nothing to settle and is ready; so is an invalid file, which settles
+/// the hold at its own amount regardless.
+pub fn transcript_ready(
+    ledger: &LedgerStore,
+    rt: &SharedBudgetRuntime,
+    session_id: &str,
+    transcript_path: &str,
+) -> Result<SharedBudgetOutcome, SharedBudgetError> {
+    let state = rt.effective().state;
+    let cfg = match &state {
+        SharedBudgetFileState::Absent => return Ok(SharedBudgetOutcome::NotConfigured),
+        SharedBudgetFileState::Invalid(_) => {
+            return Ok(SharedBudgetOutcome::TranscriptReadiness { ready: true })
+        }
+        SharedBudgetFileState::Valid(cfg) => cfg,
+    };
+    if let Err(reason) = validate_identity(session_id, None) {
+        return Ok(refused(reason));
+    }
+    let holds = ledger.shared_lane_holds(
+        &principal(),
+        session_id,
+        None,
+        ExecutorKind::AgentAbsent,
+        OWNER_POOL_PREFIX,
+    )?;
+    let Some(target) = pending_hold(&holds) else {
+        return Ok(SharedBudgetOutcome::TranscriptReadiness { ready: true });
+    };
+    let (after, previous_ids) =
+        lane_window(ledger, session_id, &holds)?.unwrap_or((target.created_at, Vec::new()));
+    let counted_ids: HashSet<String> = previous_ids.into_iter().collect();
+    let observation = observe_priced(
+        std::path::Path::new(transcript_path),
+        ReadMode::ParentWindow {
+            after,
+            counted_ids: &counted_ids,
+            horizon: rt.now() + FUTURE_SKEW,
+        },
+        session_id,
+        &cfg.pricing_overrides.table(),
+        BUDGET_SCAN_CAP_BYTES,
+    );
+    let ready = !matches!(
+        observation,
+        PricedObservation::Unavailable(
+            UsageUnavailable::Unreadable | UsageUnavailable::NoUsageInWindow
+        )
+    );
+    Ok(SharedBudgetOutcome::TranscriptReadiness { ready })
 }
 
 #[derive(Default)]

@@ -682,6 +682,15 @@ budget gate (its hook route is unchanged).
 | `SessionEnd` (`hook session-end`) | absent | nothing is parsed or sent, the daemon is not contacted |
 | `SessionEnd` | present | one `SettleTail` with `session_id` and `transcript_path`; the daemon charges the records no `Stop` counted. Always silent, exit 0 |
 
+`Stop` also waits, bounded, before it settles (HORO-2246): when a budget file
+exists it polls the daemon's read-only `TranscriptReady` probe, for at most 1.5 s
+(plus one in-flight probe of up to 400 ms, so about 1.9 s worst case)
+(`LIBRA_GOVERNOR_STOP_FLUSH_WAIT_MS` overrides it; `0` disables it, 5000 is the
+ceiling), because the host writes its transcript about 70 ms after the hook is
+dispatched. It never denies and never opens the transcript; a daemon that is
+down, older or slow ends the wait and `Finalize` is sent as before. With no
+budget file nothing is probed. See ADR-0026 *Flush lag at Stop*.
+
 The settlement hooks (`SubagentStop`, `SessionEnd`) never block and never
 spawn a daemon: no daemon, no answer within 5 s, a malformed payload, an
 unusable session id or a missing path is a log line and exit 0. A blank id

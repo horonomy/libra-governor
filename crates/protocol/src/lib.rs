@@ -270,4 +270,11 @@ pub use messages::{
 /// daemon's `deny_unknown_fields` decoder rejects them outright and, worse,
 /// would otherwise keep mis-attributing: a long-lived v21 daemon must be
 /// restarted after upgrading.
-pub const PROTOCOL_VERSION: u32 = 22;
+///
+/// v23 (HORO-2246): `SharedBudgetRequest` gained `TranscriptReady` (a
+/// read-only "is this turn's transcript flushed yet?" probe the `Stop` hook
+/// polls before it sends `Finalize`) and `SharedBudgetOutcome` gained
+/// `TranscriptReadiness`. A v22 peer's decoder cannot parse either, so a
+/// long-lived v22 daemon must be restarted after upgrading; until then the
+/// hook's probe fails and `Stop` proceeds without waiting.
+pub const PROTOCOL_VERSION: u32 = 23;

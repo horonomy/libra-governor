@@ -19,6 +19,7 @@ pub mod budget_gate;
 #[allow(dead_code)]
 pub mod canonical;
 pub mod event;
+pub mod flush_wait;
 pub mod identity;
 #[cfg(test)]
 mod identity_conformance;
