@@ -286,8 +286,9 @@ fn committed(status: &SharedBudgetStatus) -> u64 {
 // ---------------------------------------------------------------------
 
 /// The short statusline segment, e.g. `budget $12.30/$500 (2%)` with a
-/// ` WARN` marker when a soft limit is crossed or the pool is overrun.
-/// `None` for a state that has nothing useful to say in a few characters.
+/// ` WARN` marker when a soft limit is crossed or the pool is overrun, and
+/// a ` · blocked: next prompt denied` marker once less than a turn hold
+/// remains. `None` for a state that has nothing useful to say in a few characters.
 pub fn statusline_segment(status: &SharedBudgetStatus) -> Option<String> {
     match status.config_state {
         SharedBudgetConfigState::Absent => return None,
@@ -310,8 +311,15 @@ pub fn statusline_segment(status: &SharedBudgetStatus) -> Option<String> {
     // At or below zero remaining, admission is closed (fully held or overrun).
     let closed = status.remaining_usd_cents.is_some_and(|r| r <= 0);
     let warn = !status.warnings.is_empty() || closed;
+    // Less than one turn hold left: the next prompt for a lane without a hold
+    // is denied, which the spend figures alone do not show.
+    let blocked = if admission_closed(status) {
+        " · blocked: next prompt denied"
+    } else {
+        ""
+    };
     Some(format!(
-        "budget {}/{} ({percent}%){}",
+        "budget {}/{} ({percent}%){}{blocked}",
         usd_u(spent),
         usd_short(cap),
         if warn { " WARN" } else { "" }
@@ -834,14 +842,45 @@ mod tests {
 
         let mut over = status();
         over.remaining_usd_cents = Some(-1);
-        assert!(statusline_segment(&over).unwrap().ends_with(" WARN"));
+        let over_segment = statusline_segment(&over).unwrap();
+        assert!(over_segment.contains(" WARN"), "{over_segment}");
+    }
+
+    #[test]
+    fn the_segment_says_when_the_next_prompt_would_be_denied() {
+        // The healthy fixture ($487.70 left, $10 hold) carries no marker.
+        assert!(!statusline_segment(&status()).unwrap().contains("blocked"));
+
+        // $9.99 left is below the $10 hold: not zero, but a prompt is denied.
+        let mut short = status();
+        short.remaining_usd_cents = Some(999);
+        assert_eq!(
+            statusline_segment(&short).as_deref(),
+            Some("budget $12.30/$500 (3%) · blocked: next prompt denied")
+        );
+
+        // Exactly one hold left still admits.
+        let mut exact = status();
+        exact.remaining_usd_cents = Some(1_000);
+        assert!(!statusline_segment(&exact).unwrap().contains("blocked"));
+
+        // Unusable states keep their terse text.
+        let mut anomaly = status();
+        anomaly.clock_anomaly = true;
+        anomaly.remaining_usd_cents = Some(0);
+        assert_eq!(
+            statusline_segment(&anomaly).as_deref(),
+            Some("budget: clock anomaly")
+        );
     }
 
     #[test]
     fn the_segment_warns_when_nothing_remains_and_rounds_the_percent_up() {
         let mut full = status();
         full.remaining_usd_cents = Some(0);
-        assert!(statusline_segment(&full).unwrap().ends_with(" WARN"));
+        let full_segment = statusline_segment(&full).unwrap();
+        assert!(full_segment.contains(" WARN"), "{full_segment}");
+        assert!(full_segment.ends_with(" · blocked: next prompt denied"));
 
         // 1 cent of a $500 cap is 0.002%: shown as 1%, not 0%.
         let mut tiny = status();
