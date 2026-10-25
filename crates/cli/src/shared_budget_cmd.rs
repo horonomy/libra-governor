@@ -54,7 +54,7 @@ const HELP: &str = "Usage:\n  \
     [--turn-hold-usd <amount>] [--per-session-soft-usd <amount>] \
     [--per-agent-soft-usd <amount>] [--force]\n  \
     libra-governor shared-budget status [--json]\n  \
-    libra-governor shared-budget prune --keep-months <n> --time-zone <IANA> [--apply]\n  \
+    libra-governor shared-budget prune --keep-months <n> --time-zone <IANA> [--apply] [--json]\n  \
     libra-governor shared-budget export --period <YYYY-MM> [--out <file>] [--time-zone <IANA>] \
     [--raw-ids] [--overwrite]\n\n\
     init     Writes <state-dir>/shared-budget.json to turn the monthly budget on. --monthly-usd is \
@@ -74,7 +74,8 @@ const HELP: &str = "Usage:\n  \
     ended monthly periods older than the last <n> closed months (n >= 1). Export before prune: \
     pruned periods can no longer be exported, and a charge for an event older than the oldest \
     retained period is refused by the daemon. --time-zone defaults to <state-dir>/shared-budget.json's zone and \
-    must match it when both are given; without that file it is required.\n  \
+    must match it when both are given; without that file it is required. JSON stays on stdout; \
+    a summary on stderr explains the action and skipped holds (--json suppresses the summary).\n  \
     export  Writes a local JSON file (0600; default under <state-dir>/exports/). Session and \
     agent ids are pseudonymised (32-bit unsalted digest; guessable for low-entropy ids; linkable \
     across exports) unless --raw-ids is given; this is not anonymisation and not safe to \
@@ -506,7 +507,7 @@ fn run_status(args: &[String]) -> i32 {
 // ---------------------------------------------------------------------
 
 fn run_prune(args: &[String]) -> i32 {
-    let flags = match Flags::parse(args, &["keep-months", "time-zone"], &["apply"]) {
+    let flags = match Flags::parse(args, &["keep-months", "time-zone"], &["apply", "json"]) {
         Ok(f) => f,
         Err(e) => return usage_error(&e),
     };
@@ -570,6 +571,27 @@ fn run_prune(args: &[String]) -> i32 {
              to delete. {RETENTION_WARNING}"
         )
     };
+    if !flags.switch("json") {
+        let active = report
+            .pools
+            .iter()
+            .filter(|p| p.disposition == libra_governor_ledger::PruneDisposition::SkippedActiveHold)
+            .count();
+        if report.dry_run {
+            eprintln!(
+                "Dry run: would prune {} period(s), {} rows; nothing deleted. Re-run with --apply.",
+                report.pools_selected, report.rows_selected
+            );
+        } else {
+            eprintln!(
+                "Applied: pruned {} period(s), deleted {} rows.",
+                report.pools_pruned, report.rows_deleted
+            );
+        }
+        eprintln!("Kept {} rows; skipped {active} active-hold period(s); retaining {} closed month(s) in {}.",
+            report.rows_kept, report.keep_months, time_zone.as_str());
+        eprintln!("{RETENTION_WARNING}");
+    }
     let out = json!({
         "schema": PRUNE_SCHEMA,
         "report": report,

@@ -254,6 +254,63 @@ fn prune_is_a_dry_run_unless_apply_is_given() {
 }
 
 #[test]
+fn prune_explains_counts_and_active_holds_while_preserving_json_stdout() {
+    let sandbox = Sandbox::new();
+    let mut store = sandbox.store();
+    let eligible = alias_back(5);
+    let held = alias_back(6);
+    seed_pool(&mut store, &eligible, "old");
+    seed_pool(&mut store, &held, "held");
+    seed_active_hold(&mut store, &held);
+    drop(store);
+    let args = [
+        "shared-budget",
+        "prune",
+        "--keep-months",
+        "1",
+        "--time-zone",
+        "UTC",
+    ];
+    let dry = sandbox.run(&args);
+    assert!(dry.status.success());
+    assert_eq!(stdout_json(&dry)["report"]["dry_run"], true);
+    let diagnostic = String::from_utf8(dry.stderr).unwrap();
+    for expected in [
+        "Dry run",
+        "1 period",
+        "3 rows",
+        "1 active",
+        "--apply",
+        "Export before prune",
+    ] {
+        assert!(
+            diagnostic.contains(expected),
+            "missing {expected}: {diagnostic}"
+        );
+    }
+    assert!(sandbox
+        .store()
+        .quota_pool(&pool(&eligible))
+        .unwrap()
+        .is_some());
+    let mut apply_args = args.to_vec();
+    apply_args.push("--apply");
+    let applied = sandbox.run(&apply_args);
+    assert!(applied.status.success());
+    assert_eq!(stdout_json(&applied)["report"]["rows_deleted"], 3);
+    assert!(String::from_utf8(applied.stderr)
+        .unwrap()
+        .contains("Applied"));
+    assert!(sandbox.store().quota_pool(&pool(&held)).unwrap().is_some());
+    let mut json_args = args.to_vec();
+    json_args.push("--json");
+    let json = sandbox.run(&json_args);
+    assert!(json.status.success());
+    assert!(json.stderr.is_empty());
+    assert_eq!(stdout_json(&json)["schema"], "libra.shared-budget-prune.v1");
+}
+
+#[test]
 fn prune_never_removes_a_pool_with_an_active_hold() {
     let sandbox = Sandbox::new();
     let mut store = sandbox.store();
