@@ -2810,25 +2810,33 @@ fn pruning_every_pool_does_not_reopen_the_guard() {
 }
 
 #[test]
-fn an_event_in_the_oldest_retained_period_is_allowed_and_a_refusal_changes_nothing() {
+fn events_at_or_before_the_prune_horizon_are_refused_and_later_ones_book_to_their_own_period() {
     let (mut fx, _main, _sub) = january_subagent_charged_then_pruned();
-    // Pools: May only. Keep-1 means April would be retained; add it by a
-    // charge into the current period first, then check the boundary.
+    // January is the horizon; May is the only pool. April was never booked.
     let before = fx.fingerprint();
-    expect_refused(
-        charge_agent_at(&mut fx, "k1", "2027-04-30T23:00:00Z"),
-        SharedBudgetRefusal::EventBeforeRetention,
-    );
-    expect_refused(
-        charge_agent_at(&mut fx, "k1", "2027-04-30T23:00:00Z"),
-        SharedBudgetRefusal::EventBeforeRetention,
-    );
+    for event in ["2027-01-31T23:00:00Z", "2026-12-31T23:00:00Z"] {
+        expect_refused(
+            charge_agent_at(&mut fx, "k1", event),
+            SharedBudgetRefusal::EventBeforeRetention,
+        );
+    }
     assert_eq!(fx.fingerprint(), before, "refusals write nothing");
-    // Exactly the oldest retained period (May) is allowed.
-    let ok = charge_agent_at(&mut fx, "k2", "2027-05-01T00:00:00Z");
+
+    // April is after the horizon: real spend, booked to April's own pool.
+    let ok = charge_agent_at(&mut fx, "k2", "2027-04-30T23:00:00Z");
+    match ok {
+        SharedBudgetOutcome::Charged {
+            pool_id,
+            already_charged: false,
+            event_time_clamped: false,
+            ..
+        } => assert!(pool_id.ends_with("monthly-2027-04"), "{pool_id}"),
+        other => panic!("{other:?}"),
+    }
+    // The current period works, and a retry resolves to the existing row.
+    let ok = charge_agent_at(&mut fx, "k3", "2027-05-01T00:00:00Z");
     assert!(matches!(ok, SharedBudgetOutcome::Charged { .. }), "{ok:?}");
-    // A retry of an existing key still resolves to its own row.
-    let again = charge_agent_at(&mut fx, "k2", "2027-05-01T00:00:00Z");
+    let again = charge_agent_at(&mut fx, "k2", "2027-04-30T23:00:00Z");
     assert!(
         matches!(
             again,
@@ -2839,6 +2847,19 @@ fn an_event_in_the_oldest_retained_period_is_allowed_and_a_refusal_changes_nothi
         ),
         "{again:?}"
     );
+}
+
+#[test]
+fn on_a_never_pruned_ledger_an_event_before_the_first_pool_books_to_its_own_period() {
+    let mut fx = Fx::new(Some(&cfg()), "2027-10-05T12:00:00Z");
+    grant(fx.admit("s1", None, Some("p1")));
+    assert_eq!(fx.pools().len(), 1, "October is the first pool");
+    match charge_agent_at(&mut fx, "k1", "2027-09-30T22:00:00Z") {
+        SharedBudgetOutcome::Charged { pool_id, .. } => {
+            assert!(pool_id.ends_with("monthly-2027-09"), "{pool_id}")
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 fn subagent_used(fx: &mut Fx) -> u64 {
@@ -2852,8 +2873,9 @@ fn subagent_used(fx: &mut Fx) -> u64 {
 
 #[test]
 fn a_grown_subagent_file_after_a_prune_books_exactly_the_new_delta() {
-    // January charged 300c, January pruned. The file grows to a cumulative
-    // 600c in May: only the 300c delta is booked, not 600c.
+    // The ADR-0026 example: January charged 300c, January pruned. The file
+    // grows to a cumulative 600c in May: only the 300c delta is booked, not
+    // 600c (the setup asserts the 300c subagent share inside the 600c total).
     let (mut fx, main, sub) = january_subagent_charged_then_pruned();
     let may_secs = (t("2027-05-10T12:01:00Z") - t(BASE)).whole_seconds();
     append_lines(&sub, &[sub_rec(may_secs, "s1b", mi(1), "s1", "aaa1")]);

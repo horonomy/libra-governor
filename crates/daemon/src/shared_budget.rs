@@ -869,19 +869,11 @@ fn book_charge(
                 // be told from a replay of one already booked (HORO-2250):
                 // a re-swept subagent file after a restart, say. Refuse it
                 // rather than recreate the period and book it a second time.
-                // A period between retained pools is unaffected (a prune
-                // only ever removes the oldest ones).
-                // A prune records the newest pool it removed, which holds even
-                // when no pool remains. The oldest retained pool covers
-                // ledgers pruned before that record existed.
+                // A prune records the newest pool it removed (even when no
+                // pool remains). Only a period at or before that is refused;
+                // a period the budget simply never booked into is not.
                 let pruned_through = ledger.shared_retention_horizon(OWNER_POOL_PREFIX)?;
-                let oldest_retained = ledger
-                    .shared_pool_ids_with_prefix(POOL_PREFIX)?
-                    .into_iter()
-                    .next();
-                if pruned_through.is_some_and(|h| target.pool_id.0 <= h.0)
-                    || oldest_retained.is_some_and(|o| target.pool_id.0 < o.0)
-                {
+                if pruned_through.is_some_and(|h| target.pool_id.0 <= h.0) {
                     return Ok(refused(SharedBudgetRefusal::EventBeforeRetention));
                 }
                 target.pool_id

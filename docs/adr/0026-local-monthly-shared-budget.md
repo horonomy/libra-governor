@@ -491,14 +491,14 @@ id, path or content).
   a second time, recreating the pruned pool. Two guards close it:
   1. *Event horizon.* `prune` records, in the same transaction as the delete,
      the newest pool it removed (`shared_retention_horizon`, migration 0023). A
-     charge whose event time falls in that period or an earlier one, or in a
-     period older than the oldest retained pool (ledgers pruned before the
-     record existed), is refused (`EventBeforeRetention`, protocol v24) and
-     books nothing. This holds even when a prune removed every pool; with no
-     prune ever run, a backdated charge still books to its own period. A retry
-     of a charge that already exists resolves to its own pool first. In the
-     `Stop` sweep a refused file is not charged and is retried harmlessly at
-     each later `Stop`.
+     charge whose event time falls in that period or an earlier one is refused
+     (`EventBeforeRetention`, protocol v24) and books nothing. This holds even
+     when a prune removed every pool. A period after the horizon that simply
+     never had a pool (April after a January prune; September before a first
+     October pool) is real spend and books to its own period. A retry of a
+     charge that already exists resolves to its own pool first. In the `Stop`
+     sweep a refused file is not charged and is retried harmlessly at each later
+     `Stop`.
   2. *Cumulative floor (migration 0023).* A subagent's "already charged" total
      is the sum of its charge rows. `prune` now folds each pruned pool's
      `subagent-transcript:` charges into `shared_charge_floor`, keyed by the
@@ -509,8 +509,9 @@ id, path or content).
      600c, books 300c). The table is additive and forward-only; an older ledger
      opens by applying the migration, and an older binary refuses the newer
      schema as it does for any migration. Month accounting is unchanged.
-  Residuals: a hand-made `ChargeAgent` for an event before the first pool ever
-  created is refused too. Main-lane watermarks are not kept by a prune; a lane
+  Residuals: **a ledger pruned before migration 0023 existed has no floor and
+  no horizon, so it gets neither protection** (v0.0.4 is unreleased, so no such
+  ledger is expected). Main-lane watermarks are not kept by a prune; a lane
   whose marks were pruned falls back to its oldest remaining hold, and
   `SettleTail` refuses (`no_settled_lane`) a session with neither, so no main
   spend is re-booked. Only `subagent-transcript:` families are floored; a

@@ -1454,7 +1454,10 @@ impl LedgerStore {
     /// whose idempotency key starts with `key_prefix`, across pools whose
     /// id starts with `pool_prefix` (HORO-2196). It is how a cumulative
     /// charge (a subagent transcript) finds what it has already booked,
-    /// whichever period each earlier row landed in.
+    /// whichever period each earlier row landed in. It also adds what a
+    /// retention prune folded into `shared_charge_floor` for exactly this
+    /// `key_prefix`; `pool_prefix` scopes only the retained rows, NOT the floor
+    /// (the floor is not tied to a pool).
     pub fn shared_charges_total_by_key_prefix(
         &self,
         principal_id: &PrincipalId,
