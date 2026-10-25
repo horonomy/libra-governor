@@ -55,6 +55,8 @@ pub enum NormalizedEvent {
         model: Option<String>,
         turn_id: Option<String>,
         agent_id: Option<String>,
+        /// The prompt this `Stop` ends, when the host names one.
+        prompt_id: Option<String>,
         /// The host's own transcript for this session, relayed to the
         /// daemon so a receipt can record
         /// measured token usage (HORO-1725). Never opened by this crate.

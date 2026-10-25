@@ -922,6 +922,7 @@ fn record_outcome_writes_attestation_but_never_promotes_the_receipt() {
         &config,
         Request::Finalize {
             agent_id: None,
+            prompt_id: None,
             session_id: "sess-1".to_string(),
             model: None,
             provider: None,

@@ -632,3 +632,126 @@ fn read_only_open_refuses_a_schema_that_is_not_current() {
         libra_governor_ledger::LedgerError::SchemaNotCurrent { .. }
     ));
 }
+
+#[test]
+fn prune_keeps_each_subagent_family_total_outside_the_pruned_rows() {
+    let (_dir, mut store) = new_store();
+    let old = pool("monthly-2026-07");
+    ensure(&mut store, &old);
+    let fam = "subagent-transcript:2:s1|4:aaa1|";
+    for (key, amount) in [(format!("{fam}c100"), 100), (format!("{fam}c250"), 150)] {
+        charge(
+            &mut store,
+            &old,
+            "s1",
+            amount,
+            &key,
+            ExecutorAttribution::main_executor(Some(ChargeSource::SubagentTranscript)),
+        );
+    }
+    // Not a subagent-transcript family: never folded into the floor.
+    charge(
+        &mut store,
+        &old,
+        "s1",
+        7,
+        "charge:2:s1|2:k1",
+        ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+    );
+    let total = |store: &LedgerStore, prefix: &str| {
+        store
+            .shared_charges_total_by_key_prefix(&owner(), prefix, "metered:local-budget/")
+            .unwrap()
+    };
+    assert_eq!(total(&store, fam), 250);
+    let prefix = "metered:local-budget/";
+    assert_eq!(store.shared_retention_horizon(prefix).unwrap(), None);
+    assert_eq!(prune(&mut store, 1, true).pools_pruned, 0);
+    assert_eq!(
+        store.shared_retention_horizon(prefix).unwrap(),
+        None,
+        "a dry run records no horizon"
+    );
+    assert_eq!(prune(&mut store, 1, false).pools_pruned, 1);
+    assert_eq!(
+        store.shared_retention_horizon(prefix).unwrap(),
+        Some(old.clone())
+    );
+    assert_eq!(row_count(&store, &old), 0);
+    assert_eq!(
+        total(&store, fam),
+        250,
+        "the family total survives the prune"
+    );
+    assert_eq!(
+        total(&store, "charge:2:s1|"),
+        0,
+        "other charges are not kept"
+    );
+
+    // A later pruned pool adds to the same family; a retained row is not
+    // counted twice (the floor holds only pruned rows).
+    let older = pool("monthly-2026-06");
+    ensure(&mut store, &older);
+    charge(
+        &mut store,
+        &older,
+        "s1",
+        50,
+        &format!("{fam}c300"),
+        ExecutorAttribution::main_executor(Some(ChargeSource::SubagentTranscript)),
+    );
+    assert_eq!(total(&store, fam), 300);
+    assert_eq!(prune(&mut store, 1, false).pools_pruned, 1);
+    assert_eq!(total(&store, fam), 300);
+    assert_eq!(
+        store.shared_retention_horizon(prefix).unwrap(),
+        Some(old.clone()),
+        "the horizon never moves backwards"
+    );
+    // A dry run changes nothing.
+    assert_eq!(prune(&mut store, 1, true).pools_pruned, 0);
+    assert_eq!(total(&store, fam), 300);
+}
+
+#[test]
+fn a_prune_that_fails_midway_leaves_no_floor_and_no_horizon() {
+    let (dir, mut store) = new_store();
+    let old = pool("monthly-2026-07");
+    ensure(&mut store, &old);
+    charge(
+        &mut store,
+        &old,
+        "s1",
+        100,
+        "subagent-transcript:2:s1|4:aaa1|c100",
+        ExecutorAttribution::main_executor(Some(ChargeSource::SubagentTranscript)),
+    );
+    // Force the last statement of the prune transaction (the pool delete)
+    // to fail, after the floor, horizon and reservation deletes ran.
+    let raw = rusqlite::Connection::open(dir.path().join("ledger.sqlite3")).unwrap();
+    raw.execute_batch(
+        "CREATE TRIGGER boom BEFORE DELETE ON quota_pools
+         BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+    )
+    .unwrap();
+    let failed = store.prune_closed_periods(PruneRequest {
+        keep_months: 1,
+        now: now(),
+        time_zone: &utc(),
+        dry_run: false,
+    });
+    assert!(failed.is_err(), "the forced failure surfaces");
+    let count = |table: &str| -> i64 {
+        raw.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(count("shared_charge_floor"), 0, "no floor row survives");
+    assert_eq!(count("shared_retention_horizon"), 0, "no horizon survives");
+    assert_eq!(row_count(&store, &old), 1, "the charge row is intact");
+
+    raw.execute_batch("DROP TRIGGER boom").unwrap();
+    assert_eq!(prune(&mut store, 1, false).pools_pruned, 1);
+    assert_eq!(count("shared_charge_floor"), 1);
+    assert_eq!(count("shared_retention_horizon"), 1);
+}

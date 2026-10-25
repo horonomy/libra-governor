@@ -122,6 +122,16 @@ pub enum Request {
         /// executor's lane, never the parent's.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_id: Option<String>,
+        /// The host's id of the prompt whose turn this `Stop` ends (Claude
+        /// Code's `prompt_id`, the same value `UserPromptSubmit` carried
+        /// into `SharedBudgetRequest::Admit`). The shared budget uses it
+        /// only to recognise a replayed `Stop`: a `Finalize` naming a
+        /// prompt whose hold has already settled settles nothing, so a
+        /// duplicate or late `Stop` cannot consume the next turn's hold
+        /// (HORO-2250). Absent (older hooks, Codex) keeps the previous
+        /// behaviour. Never an identity: it selects no lane.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_id: Option<String>,
     },
     /// Ask the daemon to compute real calibration evidence — duration
     /// coverage and admission-replay metrics — over every locally
@@ -1193,6 +1203,7 @@ mod tests {
                 provider: Some("claude-code".to_string()),
                 transcript_path: None,
                 agent_id: None,
+                prompt_id: None,
             };
             let json = serde_json::to_string(&request).unwrap();
             let round_tripped: Request = serde_json::from_str(&json).unwrap();
@@ -1212,6 +1223,7 @@ mod tests {
                 provider: Some("claude-code".to_string()),
                 transcript_path,
                 agent_id: None,
+                prompt_id: None,
             };
             let json = serde_json::to_string(&request).unwrap();
             let round_tripped: Request = serde_json::from_str(&json).unwrap();
@@ -1677,6 +1689,7 @@ mod tests {
             provider: Some("claude-code".into()),
             transcript_path: None,
             agent_id: Some("a-1".into()),
+            prompt_id: None,
         };
         let json = serde_json::to_string(&finalize).unwrap();
         assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), finalize);

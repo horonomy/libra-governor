@@ -19,8 +19,9 @@ The daemon re-reads the file on every decision (see *Daemon behaviour delivered 
 **S5 (HORO-2196, HORO-2190) delivers settlement**: the turn hold is settled
 at `Stop` from priced, session-bound transcript usage, and a subagent's
 transcript is charged by `ChargeAgentTranscript` (see *Settlement delivered
-in S5*). `PROTOCOL_VERSION` was 21 at S5, is 22 since HORO-2197 and is 23 since
-HORO-2246 (the `TranscriptReady` probe). The S6 Claude Code hook gate and the S10
+in S5*). `PROTOCOL_VERSION` was 21 at S5, is 22 since HORO-2197, is 23 since
+HORO-2246 (the `TranscriptReady` probe) and is 24 since HORO-2250 (`Finalize`
+carries the `Stop`'s `prompt_id`). The S6 Claude Code hook gate and the S10
 retention/export commands landed on `main` separately and are recorded in
 their own commits and in *Retention and export* below.
 **S7 (HORO-2216) delivers the installer and the settlement hooks**:
@@ -462,21 +463,59 @@ id, path or content).
 
 **Known limits (tracked follow-ups, not implemented here).**
 
-- *Duplicate Finalize after the next Admit (M1).* `Finalize` carries no
-  idempotency key. Scenario: Stop #1 settles hold H1; the user prompts and
-  Admit creates H2; a duplicate of Stop #1 arrives and settles H2 early from
-  an empty window (the hold amount), booking a turn that has not happened.
-  Proposed mitigation: key the settlement by hold id / persist the
-  transcript high-water mark on the request so a replayed Stop that carries
-  no new records settles nothing.
-- *S10 prune re-charge (M3).* `shared-budget prune` deletes whole closed
-  pools, including the rows the watermark and the subagent already-charged
-  sum are read from. Scenario: a subagent file charged in a pruned month is
-  swept again in the current month and its full cumulative is charged again
-  (over-charge); a lane whose marks were pruned falls back to its oldest
-  remaining hold. Proposed mitigation: an `event_time` horizon clamp so a
-  charge older than the retained pools is dropped or booked to a fixed
-  archive row, and keeping watermark rows out of the prune.
+- *Duplicate Finalize after the next Admit (M1), fixed by HORO-2250 where the
+  host names the prompt.* Reproduced: Stop #1 settles hold H1; the user
+  prompts and Admit creates H2; a duplicate of Stop #1 settled H2 early from an
+  empty window (the hold amount), booking a turn that had not happened. Now
+  `Finalize` carries the `Stop`'s optional `prompt_id` (protocol v24, relayed by
+  `hook stop`), and a `Stop` naming a prompt whose own hold has already settled
+  settles nothing. **Residual:** the guard needs the id. A `Stop` without one
+  (an older hook, a host that omits it) is indistinguishable from a real `Stop`
+  whose transcript has not flushed and still settles the pending hold; and when
+  a re-prompt renewed the hold (no `Stop` between), only the first prompt's id
+  is recorded on the hold, so a later duplicate of the *second* prompt's `Stop`
+  is not recognised. The legacy task `Finalize` is unchanged.
+  **Host assumption, unproven:** that the `prompt_id` on a `Stop` equals the
+  one on that turn's `UserPromptSubmit` (ADR evidence lists both payloads as
+  carrying `prompt_id`; their equality has not been observed on a real host).
+  If they differ the guard never matches and behaviour is the pre-fix one.
+  **Version skew:** a v24 `hook stop` that has a `prompt_id` sends it; a
+  still-running v23 daemon rejects the unknown field (`deny_unknown_fields`), so
+  that `Finalize` fails and the hold stays until its TTL. Restart the daemon
+  after upgrading. A v24 daemon accepts the v23 hook's `Finalize` unchanged.
+- *S10 prune re-charge (M3), fixed by HORO-2250.* Reproduced through the real
+  request path: `shared-budget prune` deleted a closed pool and with it the
+  idempotency memory of the charges booked there, so a subagent file charged in
+  that month and swept again later (the `Stop` sweep re-checks every file once
+  after a daemon restart, and a resumed session can be months old) was charged
+  a second time, recreating the pruned pool. Two guards close it:
+  1. *Event horizon.* `prune` records, in the same transaction as the delete,
+     the newest pool it removed (`shared_retention_horizon`, migration 0023). A
+     charge whose event time falls in that period or an earlier one is refused
+     (`EventBeforeRetention`, protocol v24) and books nothing. This holds even
+     when a prune removed every pool. A period after the horizon that simply
+     never had a pool (April after a January prune; September before a first
+     October pool) is real spend and books to its own period. A retry of a
+     charge that already exists resolves to its own pool first. In the `Stop`
+     sweep a refused file is not charged and is retried harmlessly at each later
+     `Stop`.
+  2. *Cumulative floor (migration 0023).* A subagent's "already charged" total
+     is the sum of its charge rows. `prune` now folds each pruned pool's
+     `subagent-transcript:` charges into `shared_charge_floor`, keyed by the
+     family prefix, in the same transaction as the delete, and the total reads
+     retained rows plus the floor (a retained row is never also in the floor).
+     So a replay of a pruned charge books 0 and a file that grew after the prune
+     books exactly the delta (a 300c subagent charged in a pruned month, grown to
+     600c, books 300c). The table is additive and forward-only; an older ledger
+     opens by applying the migration, and an older binary refuses the newer
+     schema as it does for any migration. Month accounting is unchanged.
+  Residuals: **a ledger pruned before migration 0023 existed has no floor and
+  no horizon, so it gets neither protection** (v0.0.4 is unreleased, so no such
+  ledger is expected). Main-lane watermarks are not kept by a prune; a lane
+  whose marks were pruned falls back to its oldest remaining hold, and
+  `SettleTail` refuses (`no_settled_lane`) a session with neither, so no main
+  spend is re-booked. Only `subagent-transcript:` families are floored; a
+  `ChargeAgent` with a caller-chosen key relies on the event horizon alone.
 - Flush lag costs a flat hold when an entire Stop window is still unflushed
   after the `Stop` hook's bounded wait (it settles at the hold amount, an
   over-count that is not reconciled later). The wait makes this rare on the
@@ -743,11 +782,10 @@ a **separate, versioned workstream and is not delivered** by this ADR.
   open the ledger read-only (no migration, no WAL checkpoint) and refuse a
   schema that is not current.
 - **Export before prune.** Pruned periods can no longer be exported, and a
-  pruned period also drops its idempotency-key memory: replaying a charge
-  older than the retention window is treated as new (a backdated charge
-  whose event time falls in a pruned period would recreate the pool and
-  book again). Follow-up, not done here: the daemon should refuse or clamp
-  an `event_time` older than the retention horizon.
+  pruned period also drops its idempotency-key memory. Since HORO-2250 the
+  daemon refuses (`EventBeforeRetention`, books nothing) a charge whose event
+  time falls in a period older than the oldest retained pool, so a replay of an
+  old charge cannot recreate the pruned pool and book again.
 - `export --period YYYY-MM` writes a local `0600` file (schema
   `libra.shared-budget-export.v1`, per-executor aggregates plus pool
   totals, SHA-256 over the canonical body, no content). Session and agent

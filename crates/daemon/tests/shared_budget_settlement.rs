@@ -306,8 +306,18 @@ fn principal() -> libra_governor_domain::PrincipalId {
 
 impl Fx {
     fn finalize(&mut self, session: &str, transcript: Option<&str>) {
+        self.finalize_for_prompt(session, transcript, None);
+    }
+
+    fn finalize_for_prompt(
+        &mut self,
+        session: &str,
+        transcript: Option<&str>,
+        prompt: Option<&str>,
+    ) {
         match self.call(Request::Finalize {
             agent_id: None,
+            prompt_id: prompt.map(String::from),
             session_id: session.to_string(),
             model: None,
             provider: Some("claude-code".to_string()),
@@ -2603,4 +2613,292 @@ fn waiting_sessions_do_not_disturb_each_other() {
     assert!(fx.ready("a", &a));
     fx.finalize("a", Some(&s(&a)));
     assert_eq!(totals(&fx.status()), (900, 0));
+}
+
+// ---------------------------------------------------------------------
+// M1 (HORO-2250): a duplicate Stop must not consume the next turn's hold
+// ---------------------------------------------------------------------
+
+/// Turn 1 (prompt `p1`) settles at 300c; turn 2 (prompt `p2`) is admitted.
+fn after_turn_one_and_the_next_admit() -> (Fx, std::path::PathBuf) {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    grant(fx.admit("s1", None, Some("p1")));
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p1"));
+    assert_eq!(totals(&fx.status()), (300, 0));
+    fx.clock.set(at(100));
+    grant(fx.admit("s1", None, Some("p2")));
+    assert_eq!(totals(&fx.status()), (300, 1_000));
+    (fx, tx)
+}
+
+#[test]
+fn a_duplicate_stop_after_the_next_admit_does_not_settle_the_new_hold() {
+    let (mut fx, tx) = after_turn_one_and_the_next_admit();
+    fx.clock.set(at(110));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p1"));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p1"));
+    assert_eq!(
+        totals(&fx.status()),
+        (300, 1_000),
+        "turn 2's hold is still held and nothing is booked for a turn that has not happened"
+    );
+    let lane = fx.lane("s1");
+    assert_eq!(lane.len(), 2);
+    assert_eq!(
+        lane[1].state,
+        libra_governor_domain::ReservationState::Active
+    );
+
+    // The real Stop for turn 2 still settles it, measured, once.
+    append_lines(&tx, &[rec(120, "m2", SONNET, mi(2), Some("s1"), false)]);
+    fx.clock.set(at(150));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p2"));
+    assert_eq!(totals(&fx.status()), (900, 0), "300 + 600, each once");
+    // ...and a late duplicate of either Stop changes nothing.
+    let before = fx.fingerprint();
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p1"));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p2"));
+    assert_eq!(fx.fingerprint(), before);
+}
+
+#[test]
+fn a_stop_for_a_re_prompted_turn_still_settles_the_renewed_hold() {
+    // Interrupt, then re-prompt: the second Admit renews hold H1 (its key
+    // still names p1) and the Stop names p2. That is not a replay.
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    grant(fx.admit("s1", None, Some("p1")));
+    fx.clock.set(at(5));
+    grant(fx.admit("s1", None, Some("p2")));
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p2"));
+    assert_eq!(totals(&fx.status()), (300, 0));
+}
+
+#[test]
+fn a_duplicate_stop_without_a_prompt_id_cannot_be_told_from_a_real_one() {
+    // Residual, pinned so it is not mistaken for a guarantee: with no
+    // prompt id an empty-window Stop is the flush-lag case, and the pending
+    // hold settles at its flat amount.
+    let (mut fx, tx) = after_turn_one_and_the_next_admit();
+    fx.clock.set(at(110));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(totals(&fx.status()), (1_300, 0));
+}
+
+// ---------------------------------------------------------------------
+// M3 (HORO-2250): a charge older than the retention horizon is replay
+// ---------------------------------------------------------------------
+
+impl Fx {
+    /// `shared-budget prune --apply --keep-months 1`, as the CLI does it.
+    fn prune_keeping_one_month(&mut self) -> libra_governor_ledger::PruneReport {
+        use libra_governor_daemon::shared_budget::Clock as _;
+        let zone = libra_governor_domain::IanaTimeZone::new("UTC").unwrap();
+        self.ledger
+            .prune_closed_periods(libra_governor_ledger::PruneRequest {
+                keep_months: 1,
+                now: self.clock.now(),
+                time_zone: &zone,
+                dry_run: false,
+            })
+            .unwrap()
+    }
+}
+
+/// A session with a charged subagent file in January, whose January pool is
+/// then pruned while the session lives on into May.
+fn january_subagent_charged_then_pruned() -> (Fx, std::path::PathBuf, std::path::PathBuf) {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let sid = "s1";
+    let main = fx.path().join("s1.jsonl");
+    let dir = fx.path().join(sid).join("subagents");
+    std::fs::create_dir_all(&dir).unwrap();
+    let sub = dir.join("agent-aaa1.jsonl");
+    fx.admit_hold(sid);
+    write_lines(&main, &[rec(10, "m1", SONNET, mi(1), Some(sid), false)]);
+    write_lines(&sub, &[sub_rec(12, "s1a", mi(1), sid, "aaa1")]);
+    fx.clock.set(at(60));
+    fx.finalize(sid, Some(&s(&main)));
+    assert_eq!(fx.status().used_usd_cents, 600, "300 parent + 300 subagent");
+    assert_eq!(fx.pools().len(), 1);
+
+    // The session is resumed in May; the January pool is outside the window.
+    fx.clock.set(t("2027-05-10T12:00:00Z"));
+    fx.admit_hold(sid);
+    let report = fx.prune_keeping_one_month();
+    assert_eq!(report.pools_pruned, 1, "{report:?}");
+    assert_eq!(fx.pools().len(), 1, "only the May pool remains");
+    (fx, main, sub)
+}
+
+#[test]
+fn a_stop_sweep_does_not_recharge_a_subagent_file_whose_period_was_pruned() {
+    let (mut fx, main, sub) = january_subagent_charged_then_pruned();
+    // A daemon restart forgets which files it already swept; the same
+    // unchanged file is visited again at the next Stop.
+    let body = std::fs::read_to_string(&sub).unwrap();
+    std::fs::write(&sub, body).unwrap();
+    fx.clock.set(t("2027-05-10T12:05:00Z"));
+    fx.finalize("s1", Some(&s(&main)));
+    assert_eq!(
+        fx.pools().len(),
+        1,
+        "the pruned January pool was not recreated: {:?}",
+        fx.pools()
+    );
+    assert!(
+        fx.status()
+            .executors
+            .iter()
+            .all(|e| e.agent_id.as_deref() != Some("aaa1")),
+        "the May pool carries no replayed January subagent spend"
+    );
+}
+
+#[test]
+fn a_charge_agent_replay_into_a_pruned_period_is_refused() {
+    let (mut fx, _main, _sub) = january_subagent_charged_then_pruned();
+    let outcome = fx.sb(SharedBudgetRequest::ChargeAgent {
+        session_id: "s1".into(),
+        agent_id: Some("aaa1".into()),
+        amount_usd_cents: 300,
+        idempotency_key: "k1".into(),
+        charge_source: libra_governor_domain::ChargeSource::SubagentTranscript,
+        event_time: Some("2027-01-15T12:00:12Z".into()),
+    });
+    expect_refused(outcome, SharedBudgetRefusal::EventBeforeRetention);
+    assert_eq!(fx.pools().len(), 1);
+}
+
+fn charge_agent_at(fx: &mut Fx, key: &str, event: &str) -> SharedBudgetOutcome {
+    fx.sb(SharedBudgetRequest::ChargeAgent {
+        session_id: "s1".into(),
+        agent_id: Some("aaa1".into()),
+        amount_usd_cents: 300,
+        idempotency_key: key.into(),
+        charge_source: libra_governor_domain::ChargeSource::SubagentTranscript,
+        event_time: Some(event.into()),
+    })
+}
+
+#[test]
+fn pruning_every_pool_does_not_reopen_the_guard() {
+    // Prune with NO later admit: the January pool is the only one and goes.
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    grant(fx.admit("s1", None, Some("p1")));
+    fx.clock.set(at(60));
+    fx.finalize_for_prompt("s1", None, Some("p1"));
+    fx.clock.set(t("2027-05-10T12:00:00Z"));
+    let report = fx.prune_keeping_one_month();
+    assert_eq!(report.pools_pruned, 1, "{report:?}");
+    assert!(fx.pools().is_empty(), "no pool remains");
+
+    expect_refused(
+        charge_agent_at(&mut fx, "k1", "2027-01-15T12:00:12Z"),
+        SharedBudgetRefusal::EventBeforeRetention,
+    );
+    assert!(fx.pools().is_empty(), "January was not recreated");
+    // The current period still works with no pool at all.
+    let ok = charge_agent_at(&mut fx, "k2", "2027-05-10T11:00:00Z");
+    assert!(matches!(ok, SharedBudgetOutcome::Charged { .. }), "{ok:?}");
+    assert_eq!(fx.pools().len(), 1);
+}
+
+#[test]
+fn events_at_or_before_the_prune_horizon_are_refused_and_later_ones_book_to_their_own_period() {
+    let (mut fx, _main, _sub) = january_subagent_charged_then_pruned();
+    // January is the horizon; May is the only pool. April was never booked.
+    let before = fx.fingerprint();
+    for event in ["2027-01-31T23:00:00Z", "2026-12-31T23:00:00Z"] {
+        expect_refused(
+            charge_agent_at(&mut fx, "k1", event),
+            SharedBudgetRefusal::EventBeforeRetention,
+        );
+    }
+    assert_eq!(fx.fingerprint(), before, "refusals write nothing");
+
+    // April is after the horizon: real spend, booked to April's own pool.
+    let ok = charge_agent_at(&mut fx, "k2", "2027-04-30T23:00:00Z");
+    match ok {
+        SharedBudgetOutcome::Charged {
+            pool_id,
+            already_charged: false,
+            event_time_clamped: false,
+            ..
+        } => assert!(pool_id.ends_with("monthly-2027-04"), "{pool_id}"),
+        other => panic!("{other:?}"),
+    }
+    // The current period works, and a retry resolves to the existing row.
+    let ok = charge_agent_at(&mut fx, "k3", "2027-05-01T00:00:00Z");
+    assert!(matches!(ok, SharedBudgetOutcome::Charged { .. }), "{ok:?}");
+    let again = charge_agent_at(&mut fx, "k2", "2027-04-30T23:00:00Z");
+    assert!(
+        matches!(
+            again,
+            SharedBudgetOutcome::Charged {
+                already_charged: true,
+                ..
+            }
+        ),
+        "{again:?}"
+    );
+}
+
+#[test]
+fn on_a_never_pruned_ledger_an_event_before_the_first_pool_books_to_its_own_period() {
+    let mut fx = Fx::new(Some(&cfg()), "2027-10-05T12:00:00Z");
+    grant(fx.admit("s1", None, Some("p1")));
+    assert_eq!(fx.pools().len(), 1, "October is the first pool");
+    match charge_agent_at(&mut fx, "k1", "2027-09-30T22:00:00Z") {
+        SharedBudgetOutcome::Charged { pool_id, .. } => {
+            assert!(pool_id.ends_with("monthly-2027-09"), "{pool_id}")
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+fn subagent_used(fx: &mut Fx) -> u64 {
+    fx.status()
+        .executors
+        .iter()
+        .filter(|e| e.agent_id.as_deref() == Some("aaa1"))
+        .map(|e| e.used_usd_cents)
+        .sum()
+}
+
+#[test]
+fn a_grown_subagent_file_after_a_prune_books_exactly_the_new_delta() {
+    // The ADR-0026 example: January charged 300c, January pruned. The file
+    // grows to a cumulative 600c in May: only the 300c delta is booked, not
+    // 600c (the setup asserts the 300c subagent share inside the 600c total).
+    let (mut fx, main, sub) = january_subagent_charged_then_pruned();
+    let may_secs = (t("2027-05-10T12:01:00Z") - t(BASE)).whole_seconds();
+    append_lines(&sub, &[sub_rec(may_secs, "s1b", mi(1), "s1", "aaa1")]);
+    fx.clock.set(t("2027-05-10T12:05:00Z"));
+    fx.finalize("s1", Some(&s(&main)));
+    assert_eq!(subagent_used(&mut fx), 300, "May books the delta only");
+    // And the same file swept again books nothing more.
+    let body = std::fs::read_to_string(&sub).unwrap();
+    std::fs::write(&sub, body).unwrap();
+    fx.finalize("s1", Some(&s(&main)));
+    assert_eq!(subagent_used(&mut fx), 300);
+}
+
+#[test]
+fn replaying_the_pruned_subagent_total_books_zero() {
+    let (mut fx, main, sub) = january_subagent_charged_then_pruned();
+    let body = std::fs::read_to_string(&sub).unwrap();
+    std::fs::write(&sub, body).unwrap();
+    fx.clock.set(t("2027-05-10T12:05:00Z"));
+    fx.finalize("s1", Some(&s(&main)));
+    // Also the explicit SubagentStop path.
+    let c = transcribed(fx.transcript_charge("s1", Some("aaa1"), &s(&sub)));
+    assert_eq!((c.charged, c.already), (0, true), "{}", c.cumulative);
+    assert_eq!(subagent_used(&mut fx), 0, "nothing was re-booked");
+    assert_eq!(fx.pools().len(), 1);
 }

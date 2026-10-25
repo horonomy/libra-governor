@@ -100,6 +100,10 @@ pub struct TurnCompletedPayload {
     pub turn_id: Option<String>,
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// Claude Code's id of the prompt this `Stop` ends. Relayed so the daemon
+    /// can recognise a replayed `Stop` (HORO-2250); a non-string reads as absent.
+    #[serde(default, deserialize_with = "optional_native_call_id")]
+    pub prompt_id: Option<String>,
     /// Optional host transcript path. This crate relays it but does not
     /// parse it as a lineage or identity source.
     #[serde(default)]

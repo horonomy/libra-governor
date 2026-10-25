@@ -312,6 +312,14 @@ fn lp(s: &str) -> String {
     format!("{}:{s}", s.len())
 }
 
+/// The idempotency key of a hold. `tag` is `p` for a hold admitted for a
+/// host-named prompt and `n` for a nonce. [`settle_turn`] rebuilds the `p`
+/// key to recognise a replayed `Stop`, so both sides must use this.
+fn hold_key(session_id: &str, agent_id: Option<&str>, tag: &str, id: &str) -> String {
+    let agent_part = agent_id.map_or_else(|| "-".to_string(), lp);
+    format!("hold:{}|{agent_part}|{tag}{}", lp(session_id), lp(id))
+}
+
 fn source(cfg: &SharedBudgetConfig) -> CapacitySource {
     CapacitySource::LocalConfigured {
         cap: cfg.monthly_cap_usd_cents,
@@ -606,9 +614,7 @@ pub fn admit(
         }
     }
 
-    let agent_part = agent_id.map_or_else(|| "-".to_string(), lp);
-    let prompt_key =
-        |tag: &str, id: &str| format!("hold:{}|{agent_part}|{tag}{}", lp(session_id), lp(id));
+    let prompt_key = |tag: &str, id: &str| hold_key(session_id, agent_id, tag, id);
     let mut key = match prompt_id.filter(|p| !p.trim().is_empty()) {
         Some(p) => prompt_key("p", p),
         None => prompt_key("n", &Uuid::new_v4().to_string()),
@@ -857,6 +863,19 @@ fn book_charge(
                 clamped = true;
                 current.pool_id.clone()
             } else {
+                // `prune` deletes whole ended pools and with them the
+                // idempotency memory of the charges booked there, so a
+                // charge for an event older than every retained pool cannot
+                // be told from a replay of one already booked (HORO-2250):
+                // a re-swept subagent file after a restart, say. Refuse it
+                // rather than recreate the period and book it a second time.
+                // A prune records the newest pool it removed (even when no
+                // pool remains). Only a period at or before that is refused;
+                // a period the budget simply never booked into is not.
+                let pruned_through = ledger.shared_retention_horizon(OWNER_POOL_PREFIX)?;
+                if pruned_through.is_some_and(|h| target.pool_id.0 <= h.0) {
+                    return Ok(refused(SharedBudgetRefusal::EventBeforeRetention));
+                }
                 target.pool_id
             }
         }
@@ -1174,11 +1193,16 @@ fn pending_hold(holds: &[SharedPoolReservation]) -> Option<&SharedPoolReservatio
 /// - the file is present but invalid: settle at the hold amount (overrides
 ///   from an untrusted file are not used).
 /// - no hold: nothing.
+/// - `prompt_id` names a prompt whose hold already settled (a replayed
+///   `Stop`): nothing, even when a newer hold is pending. Without a
+///   `prompt_id` a duplicate cannot be told from a real `Stop` whose
+///   transcript has not flushed, and settles the pending hold.
 pub fn settle_turn(
     ledger: &mut LedgerStore,
     rt: &SharedBudgetRuntime,
     session_id: &str,
     transcript_path: Option<&str>,
+    prompt_id: Option<&str>,
 ) -> Result<TurnSettlement, SharedBudgetError> {
     let state = rt.effective().state;
     if matches!(state, SharedBudgetFileState::Absent) {
@@ -1194,6 +1218,19 @@ pub fn settle_turn(
         ExecutorKind::AgentAbsent,
         OWNER_POOL_PREFIX,
     )?;
+    // A `Stop` for a prompt whose own hold already settled is a replay (a
+    // duplicate or late delivery). The lane's pending hold now belongs to a
+    // LATER turn; settling it from this stale window would book a turn that
+    // has not happened (HORO-2250).
+    if let Some(p) = prompt_id.filter(|p| !p.trim().is_empty()) {
+        let key = hold_key(session_id, None, "p", p);
+        if holds
+            .iter()
+            .any(|h| h.state == ReservationState::Settled && h.idempotency_key == key)
+        {
+            return Ok(TurnSettlement::AlreadySettled);
+        }
+    }
     let Some(target) = pending_hold(&holds) else {
         return Ok(TurnSettlement::NoHold);
     };

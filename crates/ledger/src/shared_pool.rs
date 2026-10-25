@@ -1433,11 +1433,31 @@ impl LedgerStore {
         Ok(())
     }
 
+    /// The newest pool a retention prune removed among pools whose id starts
+    /// with `pool_prefix` (HORO-2250), if any prune ever ran.
+    pub fn shared_retention_horizon(
+        &self,
+        pool_prefix: &str,
+    ) -> Result<Option<PoolId>, LedgerError> {
+        let found: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT pool_id FROM shared_retention_horizon WHERE pool_prefix = ?1",
+                [pool_prefix],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.map(PoolId))
+    }
+
     /// Sum of the settled amounts of every charge row `principal_id` holds
     /// whose idempotency key starts with `key_prefix`, across pools whose
     /// id starts with `pool_prefix` (HORO-2196). It is how a cumulative
     /// charge (a subagent transcript) finds what it has already booked,
-    /// whichever period each earlier row landed in.
+    /// whichever period each earlier row landed in. It also adds what a
+    /// retention prune folded into `shared_charge_floor` for exactly this
+    /// `key_prefix`; `pool_prefix` scopes only the retained rows, NOT the floor
+    /// (the floor is not tied to a pool).
     pub fn shared_charges_total_by_key_prefix(
         &self,
         principal_id: &PrincipalId,
@@ -1452,7 +1472,15 @@ impl LedgerStore {
             rusqlite::params![principal_id.0, key_prefix, pool_prefix],
             |row| row.get(0),
         )?;
-        Ok(total.max(0) as u64)
+        // Plus what a retention prune folded away (HORO-2250). Only the
+        // exact family prefix is ever stored, so match it exactly.
+        let floor: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(total), 0) FROM shared_charge_floor
+             WHERE principal_id = ?1 AND key_prefix = ?2",
+            rusqlite::params![principal_id.0, key_prefix],
+            |row| row.get(0),
+        )?;
+        Ok(total.saturating_add(floor).max(0) as u64)
     }
 
     /// Every active, unexpired, non-charge hold `principal_id` has for

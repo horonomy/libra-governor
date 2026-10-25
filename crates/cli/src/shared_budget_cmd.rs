@@ -69,8 +69,8 @@ const HELP: &str = "Usage:\n  \
     Amounts are Libra-accounted list-price-equivalent USD, never a provider bill or quota.\n  \
     prune   Dry run by default (deletes nothing); deletes only with --apply. Removes closed rows of \
     ended monthly periods older than the last <n> closed months (n >= 1). Export before prune: \
-    pruned periods can no longer be exported, and replaying a charge older than the retention \
-    window is treated as new. --time-zone defaults to <state-dir>/shared-budget.json's zone and \
+    pruned periods can no longer be exported, and a charge for an event older than the oldest \
+    retained period is refused by the daemon. --time-zone defaults to <state-dir>/shared-budget.json's zone and \
     must match it when both are given; without that file it is required.\n  \
     export  Writes a local JSON file (0600; default under <state-dir>/exports/). Session and \
     agent ids are pseudonymised (32-bit unsalted digest; guessable for low-entropy ids; linkable \
@@ -512,7 +512,7 @@ fn run_prune(args: &[String]) -> i32 {
     };
 
     const RETENTION_WARNING: &str = "Export before prune: pruned periods can no longer be \
-         exported, and replaying a charge older than the retention window is treated as new.";
+         exported, and a charge for an event older than the oldest retained period is refused by the daemon.";
     let note = if apply {
         format!("Applied. {RETENTION_WARNING}")
     } else {

@@ -277,4 +277,13 @@ pub use messages::{
 /// `TranscriptReadiness`. A v22 peer's decoder cannot parse either, so a
 /// long-lived v22 daemon must be restarted after upgrading; until then the
 /// hook's probe fails and `Stop` proceeds without waiting.
-pub const PROTOCOL_VERSION: u32 = 23;
+///
+/// v24 (HORO-2250): `Request::Finalize` gained an optional `prompt_id`, the
+/// prompt whose turn the `Stop` ends, so a replayed `Stop` cannot settle the
+/// next turn's shared-budget hold. A v23 daemon's `deny_unknown_fields`
+/// decoder rejects a `Finalize` that carries it, so a long-lived v23 daemon
+/// must be restarted after upgrading; the hook omits the field when the
+/// payload has none.
+/// `SharedBudgetRefusal` also gained `EventBeforeRetention` (a charge whose
+/// event time precedes every retained pool), which a v23 decoder cannot parse.
+pub const PROTOCOL_VERSION: u32 = 24;
