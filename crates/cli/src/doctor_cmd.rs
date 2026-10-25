@@ -162,9 +162,11 @@ fn budget_findings_for(
         Posture::NotConfigured => Finding {
             id: "shared_budget_config",
             severity: Severity::Ok,
-            message: "no shared-budget.json: the local monthly shared budget is not configured \
-                      (nothing is admitted against or charged to it)"
-                .to_string(),
+            message: format!(
+                "no shared-budget.json: the local monthly shared budget is not configured \
+                 (nothing is admitted against or charged to it). {}",
+                shared_budget_view::ENABLE_HINT
+            ),
         },
         Posture::DaemonUnreachable { file, .. } => match &file.state {
             libra_governor_daemon::shared_budget_file::SharedBudgetFileState::Invalid(why) => {
@@ -184,9 +186,10 @@ fn budget_findings_for(
             libra_governor_daemon::shared_budget_file::SharedBudgetFileState::Absent => Finding {
                 id: "shared_budget_config",
                 severity: Severity::Ok,
-                message: "no shared-budget.json: the local monthly shared budget is not \
-                          configured"
-                    .to_string(),
+                message: format!(
+                    "no shared-budget.json: the local monthly shared budget is not configured. {}",
+                    shared_budget_view::ENABLE_HINT
+                ),
             },
         },
         Posture::Reported(s) => match s.config_state {
@@ -1270,6 +1273,9 @@ mod tests {
         assert!(find(&findings, "shared_budget_config")
             .message
             .contains("not configured"));
+        assert!(find(&findings, "shared_budget_config")
+            .message
+            .contains("shared-budget init --monthly-usd <n> --time-zone <IANA>"));
         // Unwired hooks are informational when there is no budget.
         assert_eq!(
             find(&findings, "shared_budget_hooks").severity,

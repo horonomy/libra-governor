@@ -33,6 +33,10 @@ pub const STATUS_SCHEMA: &str = "libra.shared-budget-status.v1";
 /// The limit's kind, as ADR-0026 words it.
 pub const GUARANTEE_LABEL: &str = "admission-bounded (cooperative)";
 
+/// How to turn the budget on; shown wherever "not configured" is reported.
+pub const ENABLE_HINT: &str = "To enable it: libra-governor shared-budget init --monthly-usd <n> \
+    --time-zone <IANA> (for example --monthly-usd 200 --time-zone America/New_York)";
+
 /// What a dollar figure means.
 pub const USD_MEANING: &str = "Libra-accounted list-price-equivalent USD at the pinned \
      PRICING_VERSION; never a provider bill or quota";
@@ -372,6 +376,7 @@ pub fn render_human(posture: &Posture, state_dir: Option<&Path>) -> String {
                     out.push_str("  No shared-budget.json; nothing was consulted or written.\n")
                 }
             }
+            out.push_str(&format!("  {ENABLE_HINT}\n"));
         }
         Posture::DaemonUnreachable { file, reason } => {
             out.push_str("Shared budget (local, this host and OS user)\n");
@@ -580,7 +585,11 @@ pub fn render_json(posture: &Posture, state_dir: Option<&Path>) -> Value {
         })
     };
     match posture {
-        Posture::NotConfigured => base("not_configured"),
+        Posture::NotConfigured => {
+            let mut v = base("not_configured");
+            v["how_to_enable"] = json!(ENABLE_HINT);
+            v
+        }
         Posture::DaemonUnreachable { file, reason } => {
             let mut v = base("daemon_unreachable");
             v["daemon_reason"] = json!(one_line(reason));
@@ -932,8 +941,13 @@ mod tests {
     fn not_configured_says_so_and_json_is_marked() {
         let text = render_human(&Posture::NotConfigured, Some(Path::new("/s")));
         assert!(text.starts_with("Shared budget: not configured"), "{text}");
+        assert!(
+            text.contains("shared-budget init --monthly-usd <n> --time-zone <IANA>"),
+            "the how-to-enable line is shown: {text}"
+        );
         let v = render_json(&Posture::NotConfigured, None);
         assert_eq!(v["state"], "not_configured");
+        assert_eq!(v["how_to_enable"], ENABLE_HINT);
         assert_eq!(v["schema"], STATUS_SCHEMA);
         assert_eq!(v["guarantee"], GUARANTEE_LABEL);
     }

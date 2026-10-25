@@ -226,3 +226,54 @@ fn a_missing_or_unknown_subcommand_is_still_a_usage_error() {
     assert_eq!(env.run(&["shared-budget"]).status.code(), Some(2));
     assert_eq!(env.run(&["shared-budget", "bogus"]).status.code(), Some(2));
 }
+
+#[test]
+fn not_configured_status_and_doctor_say_how_to_enable_it() {
+    let env = Env::new();
+    let status = text(&env.run(&["shared-budget", "status"]).stdout);
+    assert!(
+        status.starts_with("Shared budget: not configured"),
+        "{status}"
+    );
+    assert!(
+        status.contains("shared-budget init --monthly-usd"),
+        "{status}"
+    );
+    let json: Value =
+        serde_json::from_slice(&env.run(&["shared-budget", "status", "--json"]).stdout).unwrap();
+    assert_eq!(json["state"], "not_configured");
+    assert!(json["how_to_enable"].as_str().unwrap().contains("init"));
+
+    let doctor: Value = serde_json::from_slice(&env.run(&["doctor", "--json"]).stdout).unwrap();
+    let finding = doctor["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "shared_budget_config")
+        .unwrap();
+    assert!(finding["message"]
+        .as_str()
+        .unwrap()
+        .contains("shared-budget init --monthly-usd"));
+}
+
+#[test]
+fn install_mentions_the_budget_only_when_none_is_configured() {
+    let env = Env::new();
+    let first = env.run(&["install"]);
+    assert!(first.status.success(), "{first:?}");
+    assert!(
+        text(&first.stdout).contains("shared-budget init --monthly-usd"),
+        "{}",
+        text(&first.stdout)
+    );
+
+    assert!(env.run(&init_args("200", "UTC")).status.success());
+    let second = env.run(&["install"]);
+    assert!(second.status.success(), "{second:?}");
+    assert!(
+        !text(&second.stdout).contains("shared-budget init"),
+        "{}",
+        text(&second.stdout)
+    );
+}

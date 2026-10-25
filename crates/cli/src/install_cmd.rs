@@ -152,6 +152,9 @@ fn run_claude(install_statusline: bool) {
                 );
             }
             println!("Next: submit a prompt in Claude Code, then run `libra-governor doctor`.");
+            if let Some(hint) = budget_hint(crate::agent::budget_gate::budget_file_present()) {
+                println!("{hint}");
+            }
         }
         Err(e) => {
             eprintln!(
@@ -161,6 +164,17 @@ fn run_claude(install_statusline: bool) {
             std::process::exit(1);
         }
     }
+}
+
+/// The optional-budget pointer printed after a Claude Code install, only
+/// while no `shared-budget.json` exists.
+fn budget_hint(budget_file_present: bool) -> Option<String> {
+    (!budget_file_present).then(|| {
+        format!(
+            "Optional: cap spend with a local monthly budget. {}",
+            crate::shared_budget_view::ENABLE_HINT
+        )
+    })
 }
 
 /// `libra-governor install --agent codex` — wires `~/.codex/hooks.json`
@@ -284,5 +298,17 @@ mod build_output_path_warning_tests {
             build_output_path_warning(Path::new("/Users/bryant/.local/bin/libra-governor"))
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod budget_hint_tests {
+    use super::budget_hint;
+
+    #[test]
+    fn the_budget_pointer_is_only_printed_while_no_budget_file_exists() {
+        let hint = budget_hint(false).expect("shown when unconfigured");
+        assert!(hint.contains("shared-budget init --monthly-usd"), "{hint}");
+        assert_eq!(budget_hint(true), None);
     }
 }
