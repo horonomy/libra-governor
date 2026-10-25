@@ -336,13 +336,22 @@ fn a_blocked_prompt_names_the_zone_the_reservation_and_the_remedy() {
     env.start_daemon();
 
     // The first session's hold leaves $0.49, less than the $0.50 a turn needs.
-    assert!(!env.prompt("session-a", repo.path()).contains("\"block\""));
+    let admitted = env.prompt("session-a", repo.path());
+    let admitted_doc: Value = serde_json::from_str(admitted.trim()).expect("hook output is JSON");
+    assert!(admitted_doc.get("decision").is_none(), "{admitted}");
+    let status: Value =
+        serde_json::from_slice(&env.run(&["shared-budget", "status", "--json"]).stdout).unwrap();
+    assert_eq!(
+        status["amounts_usd_cents"]["held"], 50,
+        "the admitted turn holds $0.50: {status}"
+    );
+    assert_eq!(status["amounts_usd_cents"]["remaining"], 49);
     let blocked = env.prompt("session-b", repo.path());
     let doc: Value = serde_json::from_str(blocked.trim()).expect("a block decision");
     assert_eq!(doc["decision"], "block");
     let reason = doc["reason"].as_str().unwrap();
     assert!(
-        reason.contains("$0.49 remaining is below the $0.50 a turn reserves"),
+        reason.contains("$0.49 remaining is less than the $0.50 a turn reserves"),
         "{reason}"
     );
     assert!(reason.contains("(Asia/Taipei)"), "{reason}");
@@ -355,6 +364,11 @@ fn a_blocked_prompt_names_the_zone_the_reservation_and_the_remedy() {
             && reason.contains("shared-budget.json (applies to the next prompt)"),
         "{reason}"
     );
+    assert!(
+        reason.contains("finish or stop other active sessions"),
+        "{reason}"
+    );
+    assert!(!reason.contains("wait for the period"), "{reason}");
 }
 
 #[test]

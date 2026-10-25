@@ -187,7 +187,7 @@ fn denied_reason(
             let left = match (remaining, ctx.turn_hold_usd_cents) {
                 (Some(r), Some(hold)) if r >= 0 && (r as u64) < hold => {
                     format!(
-                        "{} remaining is below the {} a turn reserves",
+                        "{} remaining is less than the {} a turn reserves",
                         usd(r),
                         usd_u(hold)
                     )
@@ -204,10 +204,13 @@ fn denied_reason(
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "shared-budget.json".to_string());
+            // The remainder is net of other sessions' live holds and the
+            // denial does not say how much is held, so waiting for the
+            // period to end is not claimed as the way out.
             format!(
                 "Libra shared monthly budget exhausted: {left}{end}. To continue, raise \
-                 monthly_cap_usd_cents in {file} (applies to the next prompt) or wait for the \
-                 period to end ({LABEL})."
+                 monthly_cap_usd_cents in {file} (applies to the next prompt) or finish or stop \
+                 other active sessions whose in-flight turns hold part of the budget ({LABEL})."
             )
         }
         SharedBudgetDenyReason::ConfigInvalid => {
@@ -519,7 +522,7 @@ mod tests {
             panic!("must block")
         };
         assert!(
-            reason.contains("$0.49 remaining is below the $0.50 a turn reserves"),
+            reason.contains("$0.49 remaining is less than the $0.50 a turn reserves"),
             "{reason}"
         );
     }
@@ -533,7 +536,7 @@ mod tests {
             assert!(
                 reason.contains(
                     "raise monthly_cap_usd_cents in /state/shared-budget.json (applies to the \
-                     next prompt) or wait for the period to end"
+                     next prompt) or finish or stop other active sessions"
                 ),
                 "{reason}"
             );
