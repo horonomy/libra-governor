@@ -307,6 +307,17 @@ impl LedgerStore {
              DO UPDATE SET total = total + excluded.total",
             [&pool_id],
         )?;
+        // Remember how far retention has reached, so the daemon can refuse a
+        // replay into a pruned period even when no pool remains.
+        tx.execute(
+            "INSERT INTO shared_retention_horizon (pool_prefix, pool_id)
+             VALUES (?1, ?2)
+             ON CONFLICT (pool_prefix) DO UPDATE SET pool_id = max(pool_id, excluded.pool_id)",
+            rusqlite::params![
+                format!("{METERED_POOL_PREFIX}{LOCAL_BUDGET_OWNER}/"),
+                &pool_id
+            ],
+        )?;
         let deleted = tx.execute(
             "DELETE FROM shared_pool_reservations
              WHERE pool_id = ?1 AND state IN ('settled', 'released', 'expired')",

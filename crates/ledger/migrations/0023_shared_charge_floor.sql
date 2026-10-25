@@ -13,3 +13,13 @@ CREATE TABLE IF NOT EXISTS shared_charge_floor (
     total        INTEGER NOT NULL CHECK (total >= 0),
     PRIMARY KEY (principal_id, key_prefix)
 );
+
+-- The newest pool a retention prune has ever removed, per pool-id prefix
+-- (HORO-2250). Once its idempotency memory is gone, a charge for an event in
+-- that period or any earlier one cannot be told from a replay, so the daemon
+-- refuses it. Recorded in the same transaction as the delete, so "no pool
+-- left" is distinguishable from "never had one".
+CREATE TABLE IF NOT EXISTS shared_retention_horizon (
+    pool_prefix TEXT NOT NULL PRIMARY KEY,
+    pool_id     TEXT NOT NULL
+);

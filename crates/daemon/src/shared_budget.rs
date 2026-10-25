@@ -871,14 +871,17 @@ fn book_charge(
                 // rather than recreate the period and book it a second time.
                 // A period between retained pools is unaffected (a prune
                 // only ever removes the oldest ones).
-                // With no pool at all (a prune can remove every one) the
-                // horizon is the current period: nothing older is retained.
-                let horizon = ledger
+                // A prune records the newest pool it removed, which holds even
+                // when no pool remains. The oldest retained pool covers
+                // ledgers pruned before that record existed.
+                let pruned_through = ledger.shared_retention_horizon(OWNER_POOL_PREFIX)?;
+                let oldest_retained = ledger
                     .shared_pool_ids_with_prefix(POOL_PREFIX)?
                     .into_iter()
-                    .next()
-                    .map_or_else(|| current.pool_id.clone(), |oldest| oldest);
-                if target.pool_id.0 < horizon.0 {
+                    .next();
+                if pruned_through.is_some_and(|h| target.pool_id.0 <= h.0)
+                    || oldest_retained.is_some_and(|o| target.pool_id.0 < o.0)
+                {
                     return Ok(refused(SharedBudgetRefusal::EventBeforeRetention));
                 }
                 target.pool_id

@@ -1433,6 +1433,23 @@ impl LedgerStore {
         Ok(())
     }
 
+    /// The newest pool a retention prune removed among pools whose id starts
+    /// with `pool_prefix` (HORO-2250), if any prune ever ran.
+    pub fn shared_retention_horizon(
+        &self,
+        pool_prefix: &str,
+    ) -> Result<Option<PoolId>, LedgerError> {
+        let found: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT pool_id FROM shared_retention_horizon WHERE pool_prefix = ?1",
+                [pool_prefix],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.map(PoolId))
+    }
+
     /// Sum of the settled amounts of every charge row `principal_id` holds
     /// whose idempotency key starts with `key_prefix`, across pools whose
     /// id starts with `pool_prefix` (HORO-2196). It is how a cumulative

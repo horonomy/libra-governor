@@ -489,12 +489,16 @@ id, path or content).
   that month and swept again later (the `Stop` sweep re-checks every file once
   after a daemon restart, and a resumed session can be months old) was charged
   a second time, recreating the pruned pool. Two guards close it:
-  1. *Event horizon.* A charge whose event time falls in a period **older than
-     the oldest retained pool** (or, when a prune removed every pool, older than
-     the current period) is refused (`EventBeforeRetention`, protocol v24) and
-     books nothing; a retry of a charge that already exists still resolves to
-     its own pool first. In the `Stop` sweep a refused file is not charged and
-     is retried harmlessly at each later `Stop`.
+  1. *Event horizon.* `prune` records, in the same transaction as the delete,
+     the newest pool it removed (`shared_retention_horizon`, migration 0023). A
+     charge whose event time falls in that period or an earlier one, or in a
+     period older than the oldest retained pool (ledgers pruned before the
+     record existed), is refused (`EventBeforeRetention`, protocol v24) and
+     books nothing. This holds even when a prune removed every pool; with no
+     prune ever run, a backdated charge still books to its own period. A retry
+     of a charge that already exists resolves to its own pool first. In the
+     `Stop` sweep a refused file is not charged and is retried harmlessly at
+     each later `Stop`.
   2. *Cumulative floor (migration 0023).* A subagent's "already charged" total
      is the sum of its charge rows. `prune` now folds each pruned pool's
      `subagent-transcript:` charges into `shared_charge_floor`, keyed by the

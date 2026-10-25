@@ -664,7 +664,19 @@ fn prune_keeps_each_subagent_family_total_outside_the_pruned_rows() {
             .unwrap()
     };
     assert_eq!(total(&store, fam), 250);
+    let prefix = "metered:local-budget/";
+    assert_eq!(store.shared_retention_horizon(prefix).unwrap(), None);
+    assert_eq!(prune(&mut store, 1, true).pools_pruned, 0);
+    assert_eq!(
+        store.shared_retention_horizon(prefix).unwrap(),
+        None,
+        "a dry run records no horizon"
+    );
     assert_eq!(prune(&mut store, 1, false).pools_pruned, 1);
+    assert_eq!(
+        store.shared_retention_horizon(prefix).unwrap(),
+        Some(old.clone())
+    );
     assert_eq!(row_count(&store, &old), 0);
     assert_eq!(
         total(&store, fam),
@@ -692,6 +704,11 @@ fn prune_keeps_each_subagent_family_total_outside_the_pruned_rows() {
     assert_eq!(total(&store, fam), 300);
     assert_eq!(prune(&mut store, 1, false).pools_pruned, 1);
     assert_eq!(total(&store, fam), 300);
+    assert_eq!(
+        store.shared_retention_horizon(prefix).unwrap(),
+        Some(old.clone()),
+        "the horizon never moves backwards"
+    );
     // A dry run changes nothing.
     assert_eq!(prune(&mut store, 1, true).pools_pruned, 0);
     assert_eq!(total(&store, fam), 300);
