@@ -1946,10 +1946,17 @@ mod tests {
 
     fn task(replan_state: ReplanState) -> TaskSummary {
         TaskSummary {
-            task_id: TaskId::new(),
+            // Fixed ids made only of hex letters: a random UUID printed into
+            // the text could contain a quantile's digits ("1234", ...) by
+            // chance and flake the privacy assertions below.
+            task_id: TaskId(uuid::Uuid::from_u128(
+                0xaaaa_aaaa_bbbb_cccc_dddd_eeee_ffff_aaaa,
+            )),
             confidence: Confidence::Medium,
             recon_cost_seconds: 2.1,
-            plan_id: PlanId::new(),
+            plan_id: PlanId(uuid::Uuid::from_u128(
+                0xbbbb_bbbb_cccc_dddd_eeee_ffff_aaaa_bbbb,
+            )),
             remaining_estimate: estimate_with(Some(600), false, 7),
             replan_state,
         }
