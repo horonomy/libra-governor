@@ -320,6 +320,25 @@ fn hold_key(session_id: &str, agent_id: Option<&str>, tag: &str, id: &str) -> St
     format!("hold:{}|{agent_part}|{tag}{}", lp(session_id), lp(id))
 }
 
+/// Records the host prompt a main-executor hold was admitted for, so a replayed
+/// `Stop` for it stays recognisable after the hold row is renewed past it or
+/// pruned (HORO-2250). Subagent lanes never settle at `Stop`, so only the main
+/// lane keeps the mapping.
+fn remember_prompt(
+    ledger: &mut LedgerStore,
+    session_id: &str,
+    agent_id: Option<&str>,
+    prompt_id: Option<&str>,
+    hold: &SharedPoolReservation,
+) -> Result<(), SharedBudgetError> {
+    if agent_id.is_none() {
+        if let Some(p) = prompt_id.filter(|p| !p.trim().is_empty()) {
+            ledger.record_hold_prompt(&principal(), session_id, p, hold.id)?;
+        }
+    }
+    Ok(())
+}
+
 fn source(cfg: &SharedBudgetConfig) -> CapacitySource {
     CapacitySource::LocalConfigured {
         cap: cfg.monthly_cap_usd_cents,
@@ -610,9 +629,18 @@ pub fn admit(
         kind,
         now,
     )? {
-        if let SharedPoolRenewOutcome::Renewed(renewed) =
-            ledger.renew_shared(existing.id, &principal(), session_id, now, HOLD_TTL_SECS)?
-        {
+        // The prompt joins the hold's accepted set in the renewal's own
+        // transaction (HORO-2250). A renewal drops the idempotency key, so
+        // without this a replayed Stop for the renewed prompt is unknown.
+        let renewing = prompt_id.filter(|p| !p.trim().is_empty());
+        if let SharedPoolRenewOutcome::Renewed(renewed) = ledger.renew_shared_for_prompt(
+            existing.id,
+            &principal(),
+            session_id,
+            now,
+            HOLD_TTL_SECS,
+            renewing,
+        )? {
             return allowed(ledger, cfg, &period, &renewed, true, now);
         }
     }
@@ -653,6 +681,7 @@ pub fn admit(
         };
         match outcome {
             MeteredReserveOutcome::Granted(hold) => {
+                remember_prompt(ledger, session_id, agent_id, prompt_id, &hold)?;
                 return allowed(ledger, cfg, &period, &hold, false, now);
             }
             MeteredReserveOutcome::AlreadyGranted(hold) => {
@@ -661,6 +690,7 @@ pub fn admit(
                     && hold.session_id == session_id
                     && hold.agent_id.as_deref() == agent_id;
                 if live {
+                    remember_prompt(ledger, session_id, agent_id, prompt_id, &hold)?;
                     return allowed(ledger, cfg, &period, &hold, true, now);
                 }
                 if attempt == 0 {
@@ -1226,10 +1256,19 @@ pub fn settle_turn(
     // LATER turn; settling it from this stale window would book a turn that
     // has not happened (HORO-2250).
     if let Some(p) = prompt_id.filter(|p| !p.trim().is_empty()) {
+        // Any prompt a hold accepted (first or renewed, kept after a prune)
+        // names its hold; a Stop for a hold that is not the pending one is a
+        // replay. The first-prompt key check below also covers holds
+        // admitted before the mapping existed.
+        let replay = match ledger.hold_for_prompt(&principal(), session_id, p)? {
+            Some(accepted) => pending_hold(&holds).is_none_or(|t| t.id != accepted),
+            None => false,
+        };
         let key = hold_key(session_id, None, "p", p);
-        if holds
-            .iter()
-            .any(|h| h.state == ReservationState::Settled && h.idempotency_key == key)
+        if replay
+            || holds
+                .iter()
+                .any(|h| h.state == ReservationState::Settled && h.idempotency_key == key)
         {
             return Ok(TurnSettlement::AlreadySettled);
         }
