@@ -550,6 +550,7 @@ fn finalize_settles_active_reservations_and_records_receipt_evidence() {
         &config,
         Request::Finalize {
             agent_id: None,
+            prompt_id: None,
             session_id: "finalize-session".to_string(),
             model: None,
             provider: None,

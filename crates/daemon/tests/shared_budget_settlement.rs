@@ -306,8 +306,18 @@ fn principal() -> libra_governor_domain::PrincipalId {
 
 impl Fx {
     fn finalize(&mut self, session: &str, transcript: Option<&str>) {
+        self.finalize_for_prompt(session, transcript, None);
+    }
+
+    fn finalize_for_prompt(
+        &mut self,
+        session: &str,
+        transcript: Option<&str>,
+        prompt: Option<&str>,
+    ) {
         match self.call(Request::Finalize {
             agent_id: None,
+            prompt_id: prompt.map(String::from),
             session_id: session.to_string(),
             model: None,
             provider: Some("claude-code".to_string()),
@@ -2603,4 +2613,79 @@ fn waiting_sessions_do_not_disturb_each_other() {
     assert!(fx.ready("a", &a));
     fx.finalize("a", Some(&s(&a)));
     assert_eq!(totals(&fx.status()), (900, 0));
+}
+
+// ---------------------------------------------------------------------
+// M1 (HORO-2250): a duplicate Stop must not consume the next turn's hold
+// ---------------------------------------------------------------------
+
+/// Turn 1 (prompt `p1`) settles at 300c; turn 2 (prompt `p2`) is admitted.
+fn after_turn_one_and_the_next_admit() -> (Fx, std::path::PathBuf) {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    grant(fx.admit("s1", None, Some("p1")));
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p1"));
+    assert_eq!(totals(&fx.status()), (300, 0));
+    fx.clock.set(at(100));
+    grant(fx.admit("s1", None, Some("p2")));
+    assert_eq!(totals(&fx.status()), (300, 1_000));
+    (fx, tx)
+}
+
+#[test]
+fn a_duplicate_stop_after_the_next_admit_does_not_settle_the_new_hold() {
+    let (mut fx, tx) = after_turn_one_and_the_next_admit();
+    fx.clock.set(at(110));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p1"));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p1"));
+    assert_eq!(
+        totals(&fx.status()),
+        (300, 1_000),
+        "turn 2's hold is still held and nothing is booked for a turn that has not happened"
+    );
+    let lane = fx.lane("s1");
+    assert_eq!(lane.len(), 2);
+    assert_eq!(
+        lane[1].state,
+        libra_governor_domain::ReservationState::Active
+    );
+
+    // The real Stop for turn 2 still settles it, measured, once.
+    append_lines(&tx, &[rec(120, "m2", SONNET, mi(2), Some("s1"), false)]);
+    fx.clock.set(at(150));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p2"));
+    assert_eq!(totals(&fx.status()), (900, 0), "300 + 600, each once");
+    // ...and a late duplicate of either Stop changes nothing.
+    let before = fx.fingerprint();
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p1"));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p2"));
+    assert_eq!(fx.fingerprint(), before);
+}
+
+#[test]
+fn a_stop_for_a_re_prompted_turn_still_settles_the_renewed_hold() {
+    // Interrupt, then re-prompt: the second Admit renews hold H1 (its key
+    // still names p1) and the Stop names p2. That is not a replay.
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    grant(fx.admit("s1", None, Some("p1")));
+    fx.clock.set(at(5));
+    grant(fx.admit("s1", None, Some("p2")));
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p2"));
+    assert_eq!(totals(&fx.status()), (300, 0));
+}
+
+#[test]
+fn a_duplicate_stop_without_a_prompt_id_cannot_be_told_from_a_real_one() {
+    // Residual, pinned so it is not mistaken for a guarantee: with no
+    // prompt id an empty-window Stop is the flush-lag case, and the pending
+    // hold settles at its flat amount.
+    let (mut fx, tx) = after_turn_one_and_the_next_admit();
+    fx.clock.set(at(110));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(totals(&fx.status()), (1_300, 0));
 }

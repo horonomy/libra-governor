@@ -19,8 +19,9 @@ The daemon re-reads the file on every decision (see *Daemon behaviour delivered 
 **S5 (HORO-2196, HORO-2190) delivers settlement**: the turn hold is settled
 at `Stop` from priced, session-bound transcript usage, and a subagent's
 transcript is charged by `ChargeAgentTranscript` (see *Settlement delivered
-in S5*). `PROTOCOL_VERSION` was 21 at S5, is 22 since HORO-2197 and is 23 since
-HORO-2246 (the `TranscriptReady` probe). The S6 Claude Code hook gate and the S10
+in S5*). `PROTOCOL_VERSION` was 21 at S5, is 22 since HORO-2197, is 23 since
+HORO-2246 (the `TranscriptReady` probe) and is 24 since HORO-2250 (`Finalize`
+carries the `Stop`'s `prompt_id`). The S6 Claude Code hook gate and the S10
 retention/export commands landed on `main` separately and are recorded in
 their own commits and in *Retention and export* below.
 **S7 (HORO-2216) delivers the installer and the settlement hooks**:
@@ -462,13 +463,18 @@ id, path or content).
 
 **Known limits (tracked follow-ups, not implemented here).**
 
-- *Duplicate Finalize after the next Admit (M1).* `Finalize` carries no
-  idempotency key. Scenario: Stop #1 settles hold H1; the user prompts and
-  Admit creates H2; a duplicate of Stop #1 arrives and settles H2 early from
-  an empty window (the hold amount), booking a turn that has not happened.
-  Proposed mitigation: key the settlement by hold id / persist the
-  transcript high-water mark on the request so a replayed Stop that carries
-  no new records settles nothing.
+- *Duplicate Finalize after the next Admit (M1), fixed by HORO-2250 where the
+  host names the prompt.* Reproduced: Stop #1 settles hold H1; the user
+  prompts and Admit creates H2; a duplicate of Stop #1 settled H2 early from an
+  empty window (the hold amount), booking a turn that had not happened. Now
+  `Finalize` carries the `Stop`'s optional `prompt_id` (protocol v24, relayed by
+  `hook stop`), and a `Stop` naming a prompt whose own hold has already settled
+  settles nothing. **Residual:** the guard needs the id. A `Stop` without one
+  (an older hook, a host that omits it) is indistinguishable from a real `Stop`
+  whose transcript has not flushed and still settles the pending hold; and when
+  a re-prompt renewed the hold (no `Stop` between), only the first prompt's id
+  is recorded on the hold, so a later duplicate of the *second* prompt's `Stop`
+  is not recognised. The legacy task `Finalize` is unchanged.
 - *S10 prune re-charge (M3).* `shared-budget prune` deletes whole closed
   pools, including the rows the watermark and the subagent already-charged
   sum are read from. Scenario: a subagent file charged in a pruned month is

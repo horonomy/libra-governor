@@ -621,6 +621,39 @@ fn prompt_admit_carries_the_session_prompt_id_and_no_agent() {
 }
 
 #[test]
+fn stop_finalize_carries_the_prompt_id_the_host_named() {
+    let state = tempfile::tempdir().unwrap();
+    write_budget(state.path(), &config(5_000, ""));
+    let fake = Fake::start(state.path(), |_| reply(SharedBudgetOutcome::NotConfigured));
+    let payload = serde_json::json!({
+        "session_id": "s-stop", "hook_event_name": "Stop", "prompt_id": "pid-7",
+        "transcript_path": "/h/p/s-stop.jsonl", "stop_hook_active": false,
+    })
+    .to_string();
+    run_hook(&["hook", "stop"], state.path(), &payload, &[]);
+    let finalize = fake
+        .requests()
+        .into_iter()
+        .find(|r| r["type"] == "finalize" || r["kind"] == "finalize")
+        .expect("a Finalize was sent");
+    assert_eq!(finalize["prompt_id"], "pid-7", "{finalize}");
+
+    // A payload without one sends none (no id is invented).
+    let state = tempfile::tempdir().unwrap();
+    write_budget(state.path(), &config(5_000, ""));
+    let fake = Fake::start(state.path(), |_| reply(SharedBudgetOutcome::NotConfigured));
+    let payload =
+        serde_json::json!({"session_id": "s-stop", "hook_event_name": "Stop"}).to_string();
+    run_hook(&["hook", "stop"], state.path(), &payload, &[]);
+    let finalize = fake
+        .requests()
+        .into_iter()
+        .find(|r| r["type"] == "finalize" || r["kind"] == "finalize")
+        .expect("a Finalize was sent");
+    assert!(finalize.get("prompt_id").is_none(), "{finalize}");
+}
+
+#[test]
 fn not_configured_and_allowed_continue_to_preflight() {
     for outcome in [SharedBudgetOutcome::NotConfigured, allowed(vec![])] {
         let state = tempfile::tempdir().unwrap();

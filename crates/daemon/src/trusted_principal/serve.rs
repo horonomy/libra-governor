@@ -261,6 +261,7 @@ mod tests {
     fn strip_agent_named_paths_blanks_finalize_transcript_path() {
         let mut request = Request::Finalize {
             agent_id: None,
+            prompt_id: None,
             session_id: "s1".to_string(),
             model: None,
             provider: None,

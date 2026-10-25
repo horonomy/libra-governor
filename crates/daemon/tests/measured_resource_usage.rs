@@ -250,6 +250,7 @@ impl Harness {
     fn finalize(&mut self, session_id: &str, transcript: Option<&Path>) -> FinalizeResult {
         match self.send(Request::Finalize {
             agent_id: None,
+            prompt_id: None,
             session_id: session_id.to_string(),
             model: None,
             provider: Some("claude-code".to_string()),

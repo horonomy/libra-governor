@@ -508,6 +508,7 @@ fn a_finished_task_leaves_no_budget_behind_in_idle() {
 
     match harness.send(Request::Finalize {
         agent_id: None,
+        prompt_id: None,
         session_id: "finished-session".to_string(),
         model: None,
         provider: None,

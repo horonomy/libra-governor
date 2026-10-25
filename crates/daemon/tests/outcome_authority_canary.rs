@@ -192,6 +192,7 @@ fn finalize(
         current_task,
         Request::Finalize {
             agent_id: None,
+            prompt_id: None,
             session_id: session_id.to_string(),
             model: None,
             provider: None,

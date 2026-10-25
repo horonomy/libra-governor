@@ -725,6 +725,7 @@ pub(crate) fn dispatch(
             provider,
             transcript_path,
             agent_id,
+            prompt_id,
         } => match handle_finalize_for_lane(
             &session_id,
             &crate::legacy_executor::lane_key(
@@ -735,6 +736,7 @@ pub(crate) fn dispatch(
             model,
             provider,
             transcript_path.as_deref(),
+            prompt_id.as_deref(),
             ledger,
             current_task,
             config,
@@ -2293,6 +2295,7 @@ pub(crate) fn handle_finalize(
         model,
         provider,
         transcript_path,
+        None,
         ledger,
         current_task,
         config,
@@ -2311,6 +2314,7 @@ fn handle_finalize_for_lane(
     model: Option<String>,
     provider: Option<String>,
     transcript_path: Option<&str>,
+    prompt_id: Option<&str>,
     ledger: &mut LedgerStore,
     current_task: &mut Option<TaskSummary>,
     config: &DaemonConfig,
@@ -2329,6 +2333,7 @@ fn handle_finalize_for_lane(
             &config.shared_budget,
             session_id,
             transcript_path,
+            prompt_id,
         ) {
             Ok(settlement) => log::append_line(
                 &config.log_path,
@@ -3276,6 +3281,7 @@ mod tests {
             None,
             Some("claude-code".into()),
             None,
+            None,
             &mut ledger,
             &mut current,
             &config,
@@ -3305,6 +3311,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &mut ledger,
             &mut current,
             &config,
@@ -3330,6 +3337,7 @@ mod tests {
         let outcome = handle_finalize_for_lane(
             "s",
             "s",
+            None,
             None,
             None,
             None,

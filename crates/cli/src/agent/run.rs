@@ -707,14 +707,22 @@ pub(crate) fn run_turn_completed_with_input(agent: AgentKind, raw: &str) {
         }
     };
 
-    let (session_id, model, turn_id, agent_id, transcript_path) = match event {
+    let (session_id, model, turn_id, agent_id, prompt_id, transcript_path) = match event {
         NormalizedEvent::TurnCompleted {
             session_id,
             model,
             turn_id,
             agent_id,
+            prompt_id,
             transcript_path,
-        } => (session_id, model, turn_id, agent_id, transcript_path),
+        } => (
+            session_id,
+            model,
+            turn_id,
+            agent_id,
+            prompt_id,
+            transcript_path,
+        ),
         NormalizedEvent::RecognizedUnwired { hook_event_name } => {
             log(
                 &log_path,
@@ -875,6 +883,7 @@ pub(crate) fn run_turn_completed_with_input(agent: AgentKind, raw: &str) {
         // business reading the transcript.
         transcript_path: transcript_path.map(|p| p.to_string_lossy().into_owned()),
         agent_id,
+        prompt_id,
     };
 
     match client::roundtrip(&stream, request) {

@@ -135,6 +135,7 @@ pub fn normalize_builtin(
             turn_id,
             agent_id,
             // This inactive projection does not replace the live daemon usage relay.
+            prompt_id: _,
             transcript_path: _,
         } => (
             HostEventKind::Lifecycle,
