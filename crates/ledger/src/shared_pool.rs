@@ -1452,7 +1452,15 @@ impl LedgerStore {
             rusqlite::params![principal_id.0, key_prefix, pool_prefix],
             |row| row.get(0),
         )?;
-        Ok(total.max(0) as u64)
+        // Plus what a retention prune folded away (HORO-2250). Only the
+        // exact family prefix is ever stored, so match it exactly.
+        let floor: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(total), 0) FROM shared_charge_floor
+             WHERE principal_id = ?1 AND key_prefix = ?2",
+            rusqlite::params![principal_id.0, key_prefix],
+            |row| row.get(0),
+        )?;
+        Ok(total.saturating_add(floor).max(0) as u64)
     }
 
     /// Every active, unexpired, non-charge hold `principal_id` has for

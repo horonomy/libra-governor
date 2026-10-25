@@ -107,6 +107,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 22,
         sql: include_str!("../migrations/0022_shared_pool_settle_watermark.sql"),
     },
+    Migration {
+        version: 23,
+        sql: include_str!("../migrations/0023_shared_charge_floor.sql"),
+    },
 ];
 
 /// The highest migration version this build of the crate knows about
@@ -420,8 +424,8 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 22);
-        assert_eq!(latest_known_version(), 22);
+        assert_eq!(version, 23);
+        assert_eq!(latest_known_version(), 23);
         // Re-applying is a no-op.
         apply_all(&mut conn).unwrap();
     }

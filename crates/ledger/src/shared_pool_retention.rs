@@ -288,6 +288,25 @@ impl LedgerStore {
                 rows_selected: 0,
             });
         }
+        // Keep each subagent's cumulative charged total (HORO-2250): the
+        // idempotency keys of the rows below are its only record, and a
+        // replay or a grown transcript must not be booked again. The family
+        // prefix is the key up to its last '|' (rtrim strips the trailing
+        // non-'|' characters).
+        tx.execute(
+            "INSERT INTO shared_charge_floor (principal_id, key_prefix, total)
+             SELECT principal_id,
+                    rtrim(idempotency_key, replace(idempotency_key, '|', '')),
+                    SUM(settled_amount)
+             FROM shared_pool_reservations
+             WHERE pool_id = ?1 AND is_charge = 1 AND state = 'settled'
+               AND settled_amount IS NOT NULL
+               AND substr(idempotency_key, 1, 20) = 'subagent-transcript:'
+             GROUP BY principal_id, rtrim(idempotency_key, replace(idempotency_key, '|', ''))
+             ON CONFLICT (principal_id, key_prefix)
+             DO UPDATE SET total = total + excluded.total",
+            [&pool_id],
+        )?;
         let deleted = tx.execute(
             "DELETE FROM shared_pool_reservations
              WHERE pool_id = ?1 AND state IN ('settled', 'released', 'expired')",

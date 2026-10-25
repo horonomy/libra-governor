@@ -2841,3 +2841,42 @@ fn an_event_in_the_oldest_retained_period_is_allowed_and_a_refusal_changes_nothi
     );
 }
 
+fn subagent_used(fx: &mut Fx) -> u64 {
+    fx.status()
+        .executors
+        .iter()
+        .filter(|e| e.agent_id.as_deref() == Some("aaa1"))
+        .map(|e| e.used_usd_cents)
+        .sum()
+}
+
+#[test]
+fn a_grown_subagent_file_after_a_prune_books_exactly_the_new_delta() {
+    // January charged 300c, January pruned. The file grows to a cumulative
+    // 600c in May: only the 300c delta is booked, not 600c.
+    let (mut fx, main, sub) = january_subagent_charged_then_pruned();
+    let may_secs = (t("2027-05-10T12:01:00Z") - t(BASE)).whole_seconds();
+    append_lines(&sub, &[sub_rec(may_secs, "s1b", mi(1), "s1", "aaa1")]);
+    fx.clock.set(t("2027-05-10T12:05:00Z"));
+    fx.finalize("s1", Some(&s(&main)));
+    assert_eq!(subagent_used(&mut fx), 300, "May books the delta only");
+    // And the same file swept again books nothing more.
+    let body = std::fs::read_to_string(&sub).unwrap();
+    std::fs::write(&sub, body).unwrap();
+    fx.finalize("s1", Some(&s(&main)));
+    assert_eq!(subagent_used(&mut fx), 300);
+}
+
+#[test]
+fn replaying_the_pruned_subagent_total_books_zero() {
+    let (mut fx, main, sub) = january_subagent_charged_then_pruned();
+    let body = std::fs::read_to_string(&sub).unwrap();
+    std::fs::write(&sub, body).unwrap();
+    fx.clock.set(t("2027-05-10T12:05:00Z"));
+    fx.finalize("s1", Some(&s(&main)));
+    // Also the explicit SubagentStop path.
+    let c = transcribed(fx.transcript_charge("s1", Some("aaa1"), &s(&sub)));
+    assert_eq!((c.charged, c.already), (0, true), "{}", c.cumulative);
+    assert_eq!(subagent_used(&mut fx), 0, "nothing was re-booked");
+    assert_eq!(fx.pools().len(), 1);
+}
