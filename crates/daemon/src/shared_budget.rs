@@ -320,25 +320,6 @@ fn hold_key(session_id: &str, agent_id: Option<&str>, tag: &str, id: &str) -> St
     format!("hold:{}|{agent_part}|{tag}{}", lp(session_id), lp(id))
 }
 
-/// Records the host prompt a main-executor hold was admitted for, so a replayed
-/// `Stop` for it stays recognisable after the hold row is renewed past it or
-/// pruned (HORO-2250). Subagent lanes never settle at `Stop`, so only the main
-/// lane keeps the mapping.
-fn remember_prompt(
-    ledger: &mut LedgerStore,
-    session_id: &str,
-    agent_id: Option<&str>,
-    prompt_id: Option<&str>,
-    hold: &SharedPoolReservation,
-) -> Result<(), SharedBudgetError> {
-    if agent_id.is_none() {
-        if let Some(p) = prompt_id.filter(|p| !p.trim().is_empty()) {
-            ledger.record_hold_prompt(&principal(), session_id, p, hold.id)?;
-        }
-    }
-    Ok(())
-}
-
 fn source(cfg: &SharedBudgetConfig) -> CapacitySource {
     CapacitySource::LocalConfigured {
         cap: cfg.monthly_cap_usd_cents,
@@ -632,7 +613,11 @@ pub fn admit(
         // The prompt joins the hold's accepted set in the renewal's own
         // transaction (HORO-2250). A renewal drops the idempotency key, so
         // without this a replayed Stop for the renewed prompt is unknown.
-        let renewing = prompt_id.filter(|p| !p.trim().is_empty());
+        // Main lane only: a subagent's Admit may carry the parent's prompt id
+        // and must not take over its mapping.
+        let renewing = prompt_id
+            .filter(|p| !p.trim().is_empty())
+            .filter(|_| agent_id.is_none());
         if let SharedPoolRenewOutcome::Renewed(renewed) = ledger.renew_shared_for_prompt(
             existing.id,
             &principal(),
@@ -653,22 +638,28 @@ pub fn admit(
     // At most one retry: the first key may name a hold that already
     // finished (the prompt was re-sent after its turn ended), which is a
     // new turn and needs a new hold.
+    let main_prompt = prompt_id
+        .filter(|p| !p.trim().is_empty())
+        .filter(|_| agent_id.is_none());
     for attempt in 0..2 {
-        let outcome = ledger.reserve_shared_metered(MeteredReserveRequest {
-            base: SharedPoolReserveRequest {
-                pool_id: &period.pool_id,
-                principal_id: &principal(),
-                session_id,
-                amount: cfg.turn_hold_usd_cents,
-                unit: &QuotaUnit::UsdCents,
-                idempotency_key: &key,
-                now,
-                ttl_secs: HOLD_TTL_SECS,
-                attribution: attribution_for(agent_id, ChargeSource::TurnHold),
+        let outcome = ledger.reserve_shared_metered_for_prompt(
+            MeteredReserveRequest {
+                base: SharedPoolReserveRequest {
+                    pool_id: &period.pool_id,
+                    principal_id: &principal(),
+                    session_id,
+                    amount: cfg.turn_hold_usd_cents,
+                    unit: &QuotaUnit::UsdCents,
+                    idempotency_key: &key,
+                    now,
+                    ttl_secs: HOLD_TTL_SECS,
+                    attribution: attribution_for(agent_id, ChargeSource::TurnHold),
+                },
+                session_cap: None,
+                capacity_source: source(cfg),
             },
-            session_cap: None,
-            capacity_source: source(cfg),
-        });
+            main_prompt,
+        );
         let outcome = match outcome {
             Ok(o) => o,
             Err(LedgerError::QuotaUnitMismatch { .. }) => {
@@ -681,7 +672,6 @@ pub fn admit(
         };
         match outcome {
             MeteredReserveOutcome::Granted(hold) => {
-                remember_prompt(ledger, session_id, agent_id, prompt_id, &hold)?;
                 return allowed(ledger, cfg, &period, &hold, false, now);
             }
             MeteredReserveOutcome::AlreadyGranted(hold) => {
@@ -690,7 +680,6 @@ pub fn admit(
                     && hold.session_id == session_id
                     && hold.agent_id.as_deref() == agent_id;
                 if live {
-                    remember_prompt(ledger, session_id, agent_id, prompt_id, &hold)?;
                     return allowed(ledger, cfg, &period, &hold, true, now);
                 }
                 if attempt == 0 {
@@ -1258,18 +1247,18 @@ pub fn settle_turn(
     if let Some(p) = prompt_id.filter(|p| !p.trim().is_empty()) {
         // Any prompt a hold accepted (first or renewed, kept after a prune)
         // names its hold; a Stop for a hold that is not the pending one is a
-        // replay. The first-prompt key check below also covers holds
-        // admitted before the mapping existed.
+        // replay. A prompt with no mapping falls back to the first-prompt
+        // key (holds admitted before the mapping existed).
+        let key = hold_key(session_id, None, "p", p);
         let replay = match ledger.hold_for_prompt(&principal(), session_id, p)? {
             Some(accepted) => pending_hold(&holds).is_none_or(|t| t.id != accepted),
-            None => false,
-        };
-        let key = hold_key(session_id, None, "p", p);
-        if replay
-            || holds
+            // No mapping (a hold admitted before migration 0024): the first
+            // prompt's key is all there is.
+            None => holds
                 .iter()
-                .any(|h| h.state == ReservationState::Settled && h.idempotency_key == key)
-        {
+                .any(|h| h.state == ReservationState::Settled && h.idempotency_key == key),
+        };
+        if replay {
             return Ok(TurnSettlement::AlreadySettled);
         }
     }

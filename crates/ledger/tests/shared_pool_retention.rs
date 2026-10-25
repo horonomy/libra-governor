@@ -806,3 +806,50 @@ fn a_renewal_records_its_prompt_atomically_and_a_prune_keeps_it() {
     assert_eq!(row_count(&store, &id), 0);
     assert_eq!(got(&store, "p2"), Some(h));
 }
+
+#[test]
+fn a_grant_records_its_prompt_in_its_own_transaction_and_a_refusal_records_nothing() {
+    let (_dir, mut store) = new_store();
+    let id = pool("monthly-2026-10");
+    ensure(&mut store, &id);
+    let reserve = |store: &mut LedgerStore, amount: u64, key: &str, prompt: &str| {
+        store
+            .reserve_shared_metered_for_prompt(
+                MeteredReserveRequest {
+                    base: SharedPoolReserveRequest {
+                        pool_id: &id,
+                        principal_id: &owner(),
+                        session_id: "s1",
+                        amount,
+                        unit: &QuotaUnit::UsdCents,
+                        idempotency_key: key,
+                        now: now(),
+                        ttl_secs: 3600,
+                        attribution: ExecutorAttribution::default(),
+                    },
+                    session_cap: None,
+                    capacity_source: cap(),
+                },
+                Some(prompt),
+            )
+            .unwrap()
+    };
+    let granted = match reserve(&mut store, 10, "k1", "p1") {
+        MeteredReserveOutcome::Granted(h) => h.id,
+        other => panic!("{other:?}"),
+    };
+    let got = |store: &LedgerStore, p: &str| store.hold_for_prompt(&owner(), "s1", p).unwrap();
+    assert_eq!(got(&store, "p1"), Some(granted));
+    // A retry of the same key resolves to the same live hold.
+    assert!(matches!(
+        reserve(&mut store, 10, "k1", "p1b"),
+        MeteredReserveOutcome::AlreadyGranted(_)
+    ));
+    assert_eq!(got(&store, "p1b"), Some(granted));
+    // Over the cap: refused, and no prompt row is left behind.
+    assert!(matches!(
+        reserve(&mut store, 5_000_000, "k2", "p2"),
+        MeteredReserveOutcome::Insufficient { .. }
+    ));
+    assert_eq!(got(&store, "p2"), None);
+}

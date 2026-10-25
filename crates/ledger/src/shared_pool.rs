@@ -1658,6 +1658,48 @@ impl LedgerStore {
         }
     }
 
+    /// [`Self::reserve_shared_metered`] that also records `prompt_id` as
+    /// accepted by the granted (or live, retried) hold, in one transaction
+    /// with the grant (HORO-2250). `None` is exactly `reserve_shared_metered`.
+    pub fn reserve_shared_metered_for_prompt(
+        &mut self,
+        req: MeteredReserveRequest<'_>,
+        prompt_id: Option<&str>,
+    ) -> Result<MeteredReserveOutcome, LedgerError> {
+        let Some(prompt) = prompt_id else {
+            return self.reserve_shared_metered(req);
+        };
+        let principal = req.base.principal_id.clone();
+        let session = req.base.session_id.to_string();
+        // One outer transaction: the reserve's own `begin` nests as a
+        // savepoint, so the grant and its prompt row commit or roll back
+        // together.
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let outcome = self.reserve_shared_metered(req)?;
+            let hold = match &outcome {
+                MeteredReserveOutcome::Granted(h) => Some(h),
+                MeteredReserveOutcome::AlreadyGranted(h)
+                    if h.state == ReservationState::Active && h.session_id == session =>
+                {
+                    Some(h)
+                }
+                _ => None,
+            };
+            if let Some(h) = hold {
+                Self::record_hold_prompt_tx(&self.conn, &principal, &session, prompt, h.id)?;
+            }
+            Ok(outcome)
+        })();
+        match &result {
+            Ok(_) => self.conn.execute_batch("COMMIT")?,
+            Err(_) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+            }
+        }
+        result
+    }
+
     /// Shared reserve mechanics for both [`Self::reserve_shared`] (no
     /// `metered` gate) and [`Self::reserve_shared_metered`] (`Some` gate).
     /// See module docs for the transaction/idempotency guarantees that
