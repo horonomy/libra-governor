@@ -489,8 +489,16 @@ id, path or content).
   **Residual:** the guard needs the id. A `Stop` without one (an older hook, a
   host that omits it) is indistinguishable from a real `Stop` whose transcript
   has not flushed and still settles the pending hold. The table grows by one
-  small row per prompt and is not pruned. The legacy task `Finalize` is
-  unchanged.
+  small row per prompt and is not pruned. A prompt id longer than 256 bytes is
+  treated as absent (never truncated, so two ids cannot collide), which bounds
+  that row's size. A duplicate or late replay of `Admit(p1)` after `p2` is
+  admitted re-points `p1` to the newest hold: a re-sent id means "a new turn
+  for this id" and the host id cannot say otherwise, so a later `Stop(p1)` then
+  settles that newest hold. A late `Stop` for an older hold that never settled
+  is skipped without touching the newer hold; its spend is not lost, because the
+  next hold's transcript window starts at the lane watermark, which that
+  settlement never advanced, and so counts those records. The legacy task
+  `Finalize` is unchanged.
   **Host assumption, unproven:** that the `prompt_id` on a `Stop` equals the
   one on that turn's `UserPromptSubmit` (ADR evidence lists both payloads as
   carrying `prompt_id`; their equality has not been observed on a real host).

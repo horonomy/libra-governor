@@ -853,3 +853,60 @@ fn a_grant_records_its_prompt_in_its_own_transaction_and_a_refusal_records_nothi
     ));
     assert_eq!(got(&store, "p2"), None);
 }
+
+#[test]
+fn a_failed_prompt_insert_rolls_the_whole_grant_back_and_leaves_the_store_usable() {
+    let (dir, mut store) = new_store();
+    let id = pool("monthly-2026-10");
+    ensure(&mut store, &id);
+    let raw = rusqlite::Connection::open(dir.path().join("ledger.sqlite3")).unwrap();
+    raw.execute_batch(
+        "CREATE TRIGGER boom BEFORE INSERT ON shared_hold_prompts
+         BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+    )
+    .unwrap();
+    let reserve = |store: &mut LedgerStore, key: &str, prompt: &str| {
+        store.reserve_shared_metered_for_prompt(
+            MeteredReserveRequest {
+                base: SharedPoolReserveRequest {
+                    pool_id: &id,
+                    principal_id: &owner(),
+                    session_id: "s1",
+                    amount: 10,
+                    unit: &QuotaUnit::UsdCents,
+                    idempotency_key: key,
+                    now: now(),
+                    ttl_secs: 3600,
+                    attribution: ExecutorAttribution::default(),
+                },
+                session_cap: None,
+                capacity_source: cap(),
+            },
+            Some(prompt),
+        )
+    };
+    assert!(
+        reserve(&mut store, "k1", "p1").is_err(),
+        "the insert failure surfaces"
+    );
+    let count = |table: &str| -> i64 {
+        raw.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(
+        count("shared_pool_reservations"),
+        0,
+        "the hold was rolled back"
+    );
+    assert_eq!(count("shared_hold_prompts"), 0);
+    assert_eq!(row_count(&store, &id), 0);
+
+    // The connection is back in autocommit: a later grant works and is durable.
+    raw.execute_batch("DROP TRIGGER boom").unwrap();
+    assert!(matches!(
+        reserve(&mut store, "k1", "p1").unwrap(),
+        MeteredReserveOutcome::Granted(_)
+    ));
+    assert_eq!(count("shared_pool_reservations"), 1);
+    assert_eq!(count("shared_hold_prompts"), 1);
+}

@@ -3212,3 +3212,29 @@ fn a_late_stop_for_an_older_unsettled_hold_does_not_settle_the_newer_pending_one
         libra_governor_domain::ReservationState::Active
     );
 }
+
+#[test]
+fn an_over_long_prompt_id_is_treated_as_absent_and_never_truncated() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let long = "x".repeat(257);
+    let tx = fx.path().join("s1.jsonl");
+    grant(fx.admit("s1", None, Some(&long)));
+    let rows: i64 = rusqlite::Connection::open(&fx.config.ledger_path)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM shared_hold_prompts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "nothing was stored for it");
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    // With the id ignored, the Stop settles like an id-less one.
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some(&long));
+    assert_eq!(totals(&fx.status()), (300, 0));
+    // The longest accepted id (256 bytes) is kept.
+    let edge = "y".repeat(256);
+    grant(fx.admit("s1", None, Some(&edge)));
+    let rows: i64 = rusqlite::Connection::open(&fx.config.ledger_path)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM shared_hold_prompts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1);
+}

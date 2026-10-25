@@ -320,6 +320,15 @@ fn hold_key(session_id: &str, agent_id: Option<&str>, tag: &str, id: &str) -> St
     format!("hold:{}|{agent_part}|{tag}{}", lp(session_id), lp(id))
 }
 
+/// Longest host prompt id the budget keeps (bytes). A longer one is treated as
+/// absent -- never truncated, which could make two ids collide -- so a hostile
+/// or broken host cannot grow the per-prompt table with huge keys.
+const MAX_PROMPT_ID_BYTES: usize = 256;
+
+fn usable_prompt(prompt_id: Option<&str>) -> Option<&str> {
+    prompt_id.filter(|p| !p.trim().is_empty() && p.len() <= MAX_PROMPT_ID_BYTES)
+}
+
 fn source(cfg: &SharedBudgetConfig) -> CapacitySource {
     CapacitySource::LocalConfigured {
         cap: cfg.monthly_cap_usd_cents,
@@ -579,6 +588,7 @@ pub fn admit(
     agent_id: Option<&str>,
     prompt_id: Option<&str>,
 ) -> Result<SharedBudgetOutcome, SharedBudgetError> {
+    let prompt_id = usable_prompt(prompt_id);
     let state = rt.effective().state;
     if matches!(state, SharedBudgetFileState::Absent) {
         return Ok(SharedBudgetOutcome::NotConfigured);
@@ -1226,6 +1236,7 @@ pub fn settle_turn(
     transcript_path: Option<&str>,
     prompt_id: Option<&str>,
 ) -> Result<TurnSettlement, SharedBudgetError> {
+    let prompt_id = usable_prompt(prompt_id);
     let state = rt.effective().state;
     if matches!(state, SharedBudgetFileState::Absent) {
         return Ok(TurnSettlement::NotConfigured);
