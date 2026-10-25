@@ -331,3 +331,11 @@ fn a_blocked_prompt_names_the_zone_the_reservation_and_the_remedy() {
         "{reason}"
     );
 }
+
+#[test]
+fn the_top_level_usage_lists_init() {
+    let env = Env::new();
+    let out = env.run(&["--help"]);
+    assert!(out.status.success());
+    assert!(text(&out.stdout).contains("shared-budget init --monthly-usd"));
+}
