@@ -311,6 +311,31 @@ fn prune_explains_counts_and_active_holds_while_preserving_json_stdout() {
 }
 
 #[test]
+fn prune_guidance_uses_the_pruned_horizon_instead_of_retained_pool_age() {
+    let sandbox = Sandbox::new();
+    let out = sandbox.run(&[
+        "shared-budget",
+        "prune",
+        "--keep-months",
+        "1",
+        "--time-zone",
+        "UTC",
+    ]);
+    assert!(out.status.success());
+    let note = stdout_json(&out)["note"].as_str().unwrap().to_string();
+    let diagnostic = String::from_utf8(out.stderr).unwrap();
+    for message in [&note, &diagnostic] {
+        assert!(message.contains("events in or before the newest pruned period"));
+        assert!(!message.contains("oldest retained period"));
+        assert!(message.contains("Export before prune"));
+    }
+    assert!(
+        !sandbox.ledger_path().exists(),
+        "guidance must not create a cutoff or ledger"
+    );
+}
+
+#[test]
 fn prune_never_removes_a_pool_with_an_active_hold() {
     let sandbox = Sandbox::new();
     let mut store = sandbox.store();
@@ -819,13 +844,13 @@ fn prune_note_carries_the_export_first_and_replay_warning() {
         assert!(note.contains("Export before prune"), "{note}");
         assert!(note.contains("can no longer be exported"), "{note}");
         assert!(
-            note.contains("older than the oldest retained period is refused by the daemon"),
+            note.contains("events in or before the newest pruned period are refused by the daemon"),
             "{note}"
         );
     }
     let help = sandbox.run(&["shared-budget"]);
     let text = String::from_utf8_lossy(&help.stderr).to_string();
-    assert!(text.contains("is refused by the daemon"));
+    assert!(text.contains("pruned period are refused by the daemon"));
     assert!(text.contains("pseudonymised"));
     assert!(text.contains("not safe to publish"));
 }
