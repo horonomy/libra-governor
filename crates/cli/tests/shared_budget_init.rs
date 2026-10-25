@@ -6,8 +6,9 @@
 //! Evidence class: TestOwnedLive (real CLI and daemon processes, no real
 //! Claude Code host).
 
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -51,6 +52,27 @@ impl Env {
             .stdin(Stdio::null())
             .output()
             .unwrap()
+    }
+
+    /// A prompt through the real `UserPromptSubmit` hook; returns its stdout.
+    fn prompt(&self, session: &str, repo: &Path) -> String {
+        let mut child = Command::new(bin())
+            .args(["hook", "user-prompt-submit"])
+            .env("LIBRA_GOVERNOR_STATE_DIR", self.state.path())
+            .env("HOME", self.home.path())
+            .env("LIBRA_GOVERNOR_NO_AUTOSPAWN", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let payload = serde_json::json!({"session_id": session, "cwd": repo, "prompt": "go"});
+        let _ = child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes());
+        text(&child.wait_with_output().unwrap().stdout)
     }
 
     fn start_daemon(&mut self) {
@@ -275,5 +297,37 @@ fn install_mentions_the_budget_only_when_none_is_configured() {
         !text(&second.stdout).contains("shared-budget init"),
         "{}",
         text(&second.stdout)
+    );
+}
+
+#[test]
+fn a_blocked_prompt_names_the_zone_the_reservation_and_the_remedy() {
+    let mut env = Env::new();
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
+    let mut args = init_args("0.99", "Asia/Taipei");
+    args.extend(["--turn-hold-usd", "0.50"]);
+    assert!(env.run(&args).status.success());
+    env.start_daemon();
+
+    // The first session's hold leaves $0.49, less than the $0.50 a turn needs.
+    assert!(!env.prompt("session-a", repo.path()).contains("\"block\""));
+    let blocked = env.prompt("session-b", repo.path());
+    let doc: Value = serde_json::from_str(blocked.trim()).expect("a block decision");
+    assert_eq!(doc["decision"], "block");
+    let reason = doc["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("$0.49 remaining is below the $0.50 a turn reserves"),
+        "{reason}"
+    );
+    assert!(reason.contains("(Asia/Taipei)"), "{reason}");
+    assert!(
+        reason.contains("+08:00"),
+        "period end is zone-local: {reason}"
+    );
+    assert!(
+        reason.contains("raise monthly_cap_usd_cents in")
+            && reason.contains("shared-budget.json (applies to the next prompt)"),
+        "{reason}"
     );
 }

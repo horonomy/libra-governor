@@ -594,7 +594,12 @@ fn cap_exhausted_reason_names_remaining_and_period_end() {
     });
     let reason = assert_block(&prompt(state.path(), "s", repo().path(), &[]));
     assert!(reason.contains("$5.00 remaining"), "{reason}");
-    assert!(reason.contains("2027-02-01T00:00:00Z"), "{reason}");
+    // The fixture's zone is UTC, so the zone-local end reads +00:00 (UTC).
+    assert!(
+        reason.contains("2027-02-01T00:00:00+00:00 (UTC)"),
+        "{reason}"
+    );
+    assert!(reason.contains("monthly_cap_usd_cents"), "{reason}");
     assert!(reason.contains("(cooperative)"), "{reason}");
 }
 
