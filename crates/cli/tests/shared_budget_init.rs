@@ -14,35 +14,60 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-mod support;
-
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_libra-governor")
 }
 
 struct Env {
-    state: support::DaemonState,
+    /// Private parent of the state dir. The host adapter registry refuses a
+    /// state dir whose parent is group/other-writable or not owned by the
+    /// user (`unsafe_state_parent`), which a bare `$TMPDIR/.tmpXXXX` is on
+    /// Linux (the shared sticky tmp). The state dir is `<parent>/state`,
+    /// created by the commands under test, as the other install tests do.
+    _parent: tempfile::TempDir,
+    state_dir: PathBuf,
     home: tempfile::TempDir,
     daemon: Option<Child>,
 }
 
+/// Mode applied to the private parent; the registry requires `mode & 0o022 == 0`.
+const PARENT_MODE: u32 = 0o700;
+
 impl Env {
     fn new() -> Self {
+        let parent = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(PARENT_MODE))
+            .unwrap();
+        let mode = std::fs::metadata(parent.path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o022,
+            0,
+            "state parent must not be group/other-writable"
+        );
+        let state_dir = parent.path().join("state");
         Self {
-            state: support::DaemonState::new(),
+            _parent: parent,
+            state_dir,
             home: tempfile::tempdir().unwrap(),
             daemon: None,
         }
     }
 
+    fn state_path(&self) -> &Path {
+        &self.state_dir
+    }
+
     fn file(&self) -> PathBuf {
-        self.state.path().join("shared-budget.json")
+        self.state_path().join("shared-budget.json")
     }
 
     fn run(&self, args: &[&str]) -> Output {
         Command::new(bin())
             .args(args)
-            .env("LIBRA_GOVERNOR_STATE_DIR", self.state.path())
+            .env("LIBRA_GOVERNOR_STATE_DIR", self.state_path())
             .env(
                 "LIBRA_GOVERNOR_CLAUDE_DIR",
                 self.home.path().join("dot-claude"),
@@ -58,7 +83,7 @@ impl Env {
     fn prompt(&self, session: &str, repo: &Path) -> String {
         let mut child = Command::new(bin())
             .args(["hook", "user-prompt-submit"])
-            .env("LIBRA_GOVERNOR_STATE_DIR", self.state.path())
+            .env("LIBRA_GOVERNOR_STATE_DIR", self.state_path())
             .env("HOME", self.home.path())
             .env("LIBRA_GOVERNOR_NO_AUTOSPAWN", "1")
             .stdin(Stdio::piped())
@@ -79,7 +104,7 @@ impl Env {
         self.daemon = Some(
             Command::new(bin())
                 .args(["daemon", "run"])
-                .env("LIBRA_GOVERNOR_STATE_DIR", self.state.path())
+                .env("LIBRA_GOVERNOR_STATE_DIR", self.state_path())
                 .env("HOME", self.home.path())
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -145,7 +170,7 @@ fn init_then_status_then_doctor_is_a_working_budget() {
 
     let mode = std::fs::metadata(env.file()).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
-    let dir_mode = std::fs::metadata(env.state.path())
+    let dir_mode = std::fs::metadata(env.state_path())
         .unwrap()
         .permissions()
         .mode()
@@ -198,7 +223,7 @@ fn init_rejects_bad_amounts_and_zones_without_creating_anything() {
         let out = env.run(&init_args(cap, zone));
         assert_eq!(out.status.code(), Some(2), "{cap} {zone}: {out:?}");
     }
-    assert!(!env.state.path().join("shared-budget.json").exists());
+    assert!(!env.state_path().join("shared-budget.json").exists());
     // A cap below the default $10 hold would be an invalid file: refused with advice.
     let out = env.run(&init_args("5", "UTC"));
     assert_eq!(out.status.code(), Some(1));
@@ -239,7 +264,7 @@ fn help_forms_print_usage_to_stdout_and_exit_zero() {
         assert!(out.stderr.is_empty(), "{form}: help is not an error");
     }
     // Asking for help must not create the state directory.
-    assert!(!env.state.path().join("shared-budget.json").exists());
+    assert!(!env.state_path().join("shared-budget.json").exists());
 }
 
 #[test]
