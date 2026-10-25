@@ -494,6 +494,9 @@ fn soft_warnings(
     }
     if let Some(threshold) = soft.per_agent_usd_cents {
         for e in &report.executors {
+            if e.executor_kind != ExecutorKind::Agent || e.agent_id.is_none() {
+                continue;
+            }
             if let Some((session, agent, kind)) = focus {
                 if e.session_id != session
                     || e.agent_id.as_deref() != agent

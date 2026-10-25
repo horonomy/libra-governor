@@ -912,6 +912,44 @@ fn soft_limits_warn_but_never_change_a_decision_or_mint_capacity() {
     assert!(fx.status().warnings.len() >= 2);
 }
 
+#[test]
+fn per_agent_warnings_exclude_main_lanes_without_hiding_session_usage() {
+    let mut fx = Fx::new(Some(&cfg_json_soft(9_000, "UTC", 1_000, 1, 1)), JAN);
+    let main = grant(fx.admit("main", None, None));
+    assert!(main
+        .warnings
+        .iter()
+        .any(|w| w.scope == SoftLimitScope::PerSession));
+    assert!(main
+        .warnings
+        .iter()
+        .all(|w| w.scope != SoftLimitScope::PerAgent));
+    let agent = grant(fx.admit("main", Some("worker"), None));
+    assert!(agent
+        .warnings
+        .iter()
+        .any(|w| w.scope == SoftLimitScope::PerAgent && w.agent_id.as_deref() == Some("worker")));
+    let renewed = grant(fx.admit("main", None, None));
+    assert!(renewed.reused);
+    assert!(renewed
+        .warnings
+        .iter()
+        .all(|w| w.scope != SoftLimitScope::PerAgent));
+    let status = fx.status();
+    assert_eq!(status.used_usd_cents + status.reserved_usd_cents, 2_000);
+    let agent_warnings: Vec<_> = status
+        .warnings
+        .iter()
+        .filter(|w| w.scope == SoftLimitScope::PerAgent)
+        .collect();
+    assert_eq!(agent_warnings.len(), 1);
+    assert_eq!(agent_warnings[0].agent_id.as_deref(), Some("worker"));
+    assert!(status
+        .warnings
+        .iter()
+        .any(|w| w.scope == SoftLimitScope::PerSession && w.used_plus_reserved_usd_cents == 2_000));
+}
+
 // ---------------------------------------------------------------------
 // Executor table and charges
 // ---------------------------------------------------------------------
