@@ -236,6 +236,24 @@ fn init_bytes(request: &InitRequest) -> Vec<u8> {
     bytes
 }
 
+/// A staging file name no earlier run can have left behind: process id,
+/// wall-clock nanoseconds and a per-process counter, so a stale temp file
+/// from a crashed run never makes `init` fail.
+fn unique_temp_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        ".{}.tmp-{}-{nanos}-{}",
+        libra_governor_daemon::shared_budget_file::SHARED_BUDGET_FILE_NAME,
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// Writes `shared-budget.json` into the existing directory `dir`.
 ///
 /// The bytes must parse as a valid configuration with the daemon's own
@@ -277,10 +295,7 @@ fn init_in(dir: &Path, request: &InitRequest) -> Result<InitReport, String> {
         Err(e) => return Err(format!("could not inspect {}: {e}", path.display())),
     };
 
-    let tmp = dir.join(format!(
-        ".{SHARED_BUDGET_FILE_NAME}.tmp-{}",
-        std::process::id()
-    ));
+    let tmp = dir.join(unique_temp_name());
     let staged = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -298,6 +313,11 @@ fn init_in(dir: &Path, request: &InitRequest) -> Result<InitReport, String> {
     };
     if !request.force {
         let _ = std::fs::remove_file(&tmp);
+    }
+    if placed.is_ok() {
+        // Best effort: make the new directory entry durable. Failure here
+        // does not undo a placed file, so it is ignored.
+        let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
     }
     if let Err(e) = placed {
         let _ = std::fs::remove_file(&tmp);
@@ -994,6 +1014,48 @@ mod tests {
         ] {
             assert_eq!(parse_usd_cents("--x", raw), Ok(cents), "{raw}");
         }
+    }
+
+    #[test]
+    fn usd_amount_boundaries() {
+        assert_eq!(parse_usd_cents("--x", "1000000.00"), Ok(MAX_INIT_USD_CENTS));
+        assert!(
+            parse_usd_cents("--x", "1000000.01").is_err(),
+            "max + 1 cent"
+        );
+        assert_eq!(
+            parse_usd_cents("--x", "007"),
+            Ok(700),
+            "leading zeros are plain digits"
+        );
+        for bad in [
+            "1.",
+            ".5",
+            "0.001",
+            "1e3",
+            "+5",
+            "-1",
+            "",
+            "18446744073709551616",
+            "184467440737095516150",
+            "99999999999999999999999999999999",
+        ] {
+            assert!(parse_usd_cents("--x", bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_stale_temp_file_from_an_earlier_run_does_not_block_init() {
+        let dir = tempfile::tempdir().unwrap();
+        // The old pid-only name, as a crashed run would have left it.
+        std::fs::write(
+            dir.path()
+                .join(format!(".shared-budget.json.tmp-{}", std::process::id())),
+            "stale",
+        )
+        .unwrap();
+        init_in(dir.path(), &req(20_000, "UTC", None, false)).unwrap();
+        assert_ne!(unique_temp_name(), unique_temp_name());
     }
 
     #[test]
