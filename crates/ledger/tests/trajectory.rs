@@ -17,6 +17,49 @@ fn now() -> OffsetDateTime {
 }
 
 #[test]
+fn receipt_existence_is_exact_persistent_read_only_and_does_not_hide_query_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite3");
+    let mut store = LedgerStore::open(&path).unwrap();
+    let task = TaskIdentity::new(None);
+    let contract = CompletionContract::first(vec![CompletionCriterion::required("tests pass")]);
+    let plan = ExecutionPlan::new(task.id, contract.revision, None, now());
+    store.insert_task(&task, now()).unwrap();
+    store.insert_contract(task.id, &contract, now()).unwrap();
+    store.insert_plan(&plan).unwrap();
+    assert!(!store.receipt_exists(task.id, plan.id).unwrap());
+    let receipt = ExecutionReceipt::new(
+        task.id,
+        contract.revision,
+        plan.id,
+        1,
+        vec![ResourceAmount::Tokens(12)],
+        ExecutionOutcome::Completed {
+            evidence: vec!["local test".into()],
+        },
+        now(),
+    );
+    store.insert_receipt(&receipt).unwrap();
+    let before = store.task_trajectory(task.id).unwrap();
+    assert!(store.receipt_exists(task.id, plan.id).unwrap());
+    assert!(!store
+        .receipt_exists(TaskIdentity::new(None).id, plan.id)
+        .unwrap());
+    assert!(!store
+        .receipt_exists(task.id, libra_governor_domain::PlanId(Uuid::new_v4()))
+        .unwrap());
+    assert_eq!(store.task_trajectory(task.id).unwrap(), before);
+    drop(store);
+    let reopened = LedgerStore::open_read_only(&path).unwrap();
+    assert!(reopened.receipt_exists(task.id, plan.id).unwrap());
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE receipts")
+        .unwrap();
+    assert!(reopened.receipt_exists(task.id, plan.id).is_err());
+}
+
+#[test]
 fn multiple_sessions_attach_to_one_stable_task_identity() {
     let mut store = LedgerStore::open_in_memory().unwrap();
     let identity = TaskIdentity::new(Some(ExternalRef::Jira("HORO-1124".to_string())));

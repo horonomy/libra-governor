@@ -475,6 +475,15 @@ impl LedgerStore {
         Ok(records)
     }
 
+    /// Checks one receipt identity without reading or changing its contents.
+    pub fn receipt_exists(&self, task_id: TaskId, plan_id: PlanId) -> Result<bool, LedgerError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM receipts WHERE task_id = ?1 AND plan_id = ?2)",
+            [task_id.0.to_string(), plan_id.0.to_string()],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Returns the currently `in_flight` plan for `session_id`, if any.
     /// Used by `Finalize` to find the estimate a Stop-hook receipt should
     /// be compared against.
