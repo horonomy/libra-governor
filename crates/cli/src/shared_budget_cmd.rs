@@ -51,7 +51,8 @@ use time::OffsetDateTime;
 
 const HELP: &str = "Usage:\n  \
     libra-governor shared-budget init --monthly-usd <amount> --time-zone <IANA> \
-    [--turn-hold-usd <amount>] [--force]\n  \
+    [--turn-hold-usd <amount>] [--per-session-soft-usd <amount>] \
+    [--per-agent-soft-usd <amount>] [--force]\n  \
     libra-governor shared-budget status [--json]\n  \
     libra-governor shared-budget prune --keep-months <n> --time-zone <IANA> [--apply]\n  \
     libra-governor shared-budget export --period <YYYY-MM> [--out <file>] [--time-zone <IANA>] \
@@ -60,7 +61,9 @@ const HELP: &str = "Usage:\n  \
     dollars (at most 2 decimals, e.g. 200 or 12.50). --time-zone is required: the budget period is \
     a calendar month in that zone and there is deliberately no UTC default. --turn-hold-usd is what \
     each prompt reserves (default 10; must not exceed the cap). Refuses to replace an existing \
-    file unless --force. A running daemon picks the file up on the next prompt.\n  \
+    file unless --force (which replaces the whole file). The optional per-session and per-agent \
+    soft limits are dollars, warn only, and never grant capacity or deny a prompt. A running \
+    daemon picks the file up on the next prompt.\n  \
     status   Read-only budget posture from the running daemon (never starts one): config state, \
     zone-local period, cap, settled, held, remaining (negative = overrun), per-executor table \
     reconciled against the pool total, soft-limit warnings (warn-only), flagged settlements and \
@@ -208,6 +211,8 @@ struct InitRequest {
     monthly_cap_usd_cents: u64,
     time_zone: String,
     turn_hold_usd_cents: Option<u64>,
+    per_session_soft_usd_cents: Option<u64>,
+    per_agent_soft_usd_cents: Option<u64>,
     force: bool,
 }
 
@@ -230,6 +235,16 @@ fn init_bytes(request: &InitRequest) -> Vec<u8> {
     doc.insert("time_zone".into(), json!(request.time_zone));
     if let Some(hold) = request.turn_hold_usd_cents {
         doc.insert("turn_hold_usd_cents".into(), json!(hold));
+    }
+    let mut soft = serde_json::Map::new();
+    if let Some(limit) = request.per_session_soft_usd_cents {
+        soft.insert("per_session_usd_cents".into(), json!(limit));
+    }
+    if let Some(limit) = request.per_agent_soft_usd_cents {
+        soft.insert("per_agent_usd_cents".into(), json!(limit));
+    }
+    if !soft.is_empty() {
+        doc.insert("soft_limits".into(), Value::Object(soft));
     }
     let mut bytes = serde_json::to_vec_pretty(&Value::Object(doc)).unwrap_or_default();
     bytes.push(b'\n');
@@ -352,7 +367,13 @@ fn init_invalid_message(reason: &str) -> String {
 fn run_init(args: &[String]) -> i32 {
     let flags = match Flags::parse(
         args,
-        &["monthly-usd", "time-zone", "turn-hold-usd"],
+        &[
+            "monthly-usd",
+            "time-zone",
+            "turn-hold-usd",
+            "per-session-soft-usd",
+            "per-agent-soft-usd",
+        ],
         &["force"],
     ) {
         Ok(f) => f,
@@ -383,10 +404,26 @@ fn run_init(args: &[String]) -> i32 {
         Ok(z) => z,
         Err(e) => return usage_error(&e),
     };
+    let soft_limit = |flag| {
+        flags
+            .value(flag)
+            .map(|raw| parse_usd_cents(&format!("--{flag}"), raw))
+            .transpose()
+    };
+    let per_session_soft_usd_cents = match soft_limit("per-session-soft-usd") {
+        Ok(limit) => limit,
+        Err(e) => return usage_error(&e),
+    };
+    let per_agent_soft_usd_cents = match soft_limit("per-agent-soft-usd") {
+        Ok(limit) => limit,
+        Err(e) => return usage_error(&e),
+    };
     let request = InitRequest {
         monthly_cap_usd_cents,
         time_zone: time_zone.as_str().to_string(),
         turn_hold_usd_cents,
+        per_session_soft_usd_cents,
+        per_agent_soft_usd_cents,
         force: flags.switch("force"),
     };
 
@@ -413,11 +450,23 @@ fn run_init(args: &[String]) -> i32 {
 fn render_init(report: &InitReport) -> String {
     use shared_budget_view::usd_u;
     let c = &report.config;
+    let mut soft = String::new();
+    for (label, limit) in [
+        ("Per-session", c.soft_limits.per_session_usd_cents),
+        ("Per-agent", c.soft_limits.per_agent_usd_cents),
+    ] {
+        if let Some(limit) = limit {
+            soft.push_str(&format!(
+                "  {label} soft limit: {} (warn only)\n",
+                usd_u(limit)
+            ));
+        }
+    }
     format!(
         "{} {}\n\
          \x20 Monthly cap:  {} (calendar month in {})\n\
          \x20 Turn hold:    {} reserved per prompt\n\
-         \x20 Guarantee:    admission-bounded (cooperative); Libra-accounted list-price-equivalent \
+         {soft}\x20 Guarantee:    admission-bounded (cooperative); Libra-accounted list-price-equivalent \
          USD, not a provider bill or quota\n\
          Next: run `libra-governor shared-budget status`. Edit or delete the file to change or \
          remove the budget; a running daemon applies it on the next prompt.\n",
@@ -998,6 +1047,8 @@ mod tests {
             monthly_cap_usd_cents: cap,
             time_zone: zone.to_string(),
             turn_hold_usd_cents: hold,
+            per_session_soft_usd_cents: None,
+            per_agent_soft_usd_cents: None,
             force,
         }
     }

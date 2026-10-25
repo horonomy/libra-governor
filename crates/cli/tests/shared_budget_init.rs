@@ -18,6 +18,55 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_libra-governor")
 }
 
+#[test]
+fn init_configures_warn_only_soft_limits_with_exact_cents() {
+    let env = Env::new();
+    let out = env.run(&[
+        "shared-budget",
+        "init",
+        "--monthly-usd",
+        "200",
+        "--time-zone",
+        "Asia/Taipei",
+        "--turn-hold-usd",
+        "1.25",
+        "--per-session-soft-usd",
+        "12.50",
+        "--per-agent-soft-usd",
+        "5.25",
+    ]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let doc: Value = serde_json::from_slice(&std::fs::read(env.file()).unwrap()).unwrap();
+    assert_eq!(doc["monthly_cap_usd_cents"], 20_000);
+    assert_eq!(doc["turn_hold_usd_cents"], 125);
+    assert_eq!(doc["soft_limits"]["per_session_usd_cents"], 1_250);
+    assert_eq!(doc["soft_limits"]["per_agent_usd_cents"], 525);
+    assert!(matches!(
+        libra_governor_daemon::shared_budget_file::parse(&std::fs::read(env.file()).unwrap()),
+        libra_governor_daemon::shared_budget_file::SharedBudgetFileState::Valid(_)
+    ));
+    for flag in ["--per-session-soft-usd", "--per-agent-soft-usd"] {
+        for bad in ["0", "-1", "NaN", "0.001"] {
+            let invalid = Env::new();
+            let out = invalid.run(&[
+                "shared-budget",
+                "init",
+                "--monthly-usd",
+                "200",
+                "--time-zone",
+                "UTC",
+                flag,
+                bad,
+            ]);
+            assert_eq!(out.status.code(), Some(2), "{flag} {bad}");
+            assert!(
+                !invalid.file().exists(),
+                "bad soft limit must not create config"
+            );
+        }
+    }
+}
+
 struct Env {
     /// Private parent of the state dir. The host adapter registry refuses a
     /// state dir whose parent is group/other-writable or not owned by the
