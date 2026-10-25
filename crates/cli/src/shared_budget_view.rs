@@ -33,6 +33,10 @@ pub const STATUS_SCHEMA: &str = "libra.shared-budget-status.v1";
 /// The limit's kind, as ADR-0026 words it.
 pub const GUARANTEE_LABEL: &str = "admission-bounded (cooperative)";
 
+/// How to turn the budget on; shown wherever "not configured" is reported.
+pub const ENABLE_HINT: &str = "To enable it: libra-governor shared-budget init --monthly-usd <n> \
+    --time-zone <IANA> (for example --monthly-usd 200 --time-zone America/New_York)";
+
 /// What a dollar figure means.
 pub const USD_MEANING: &str = "Libra-accounted list-price-equivalent USD at the pinned \
      PRICING_VERSION; never a provider bill or quota";
@@ -282,8 +286,9 @@ fn committed(status: &SharedBudgetStatus) -> u64 {
 // ---------------------------------------------------------------------
 
 /// The short statusline segment, e.g. `budget $12.30/$500 (2%)` with a
-/// ` WARN` marker when a soft limit is crossed or the pool is overrun.
-/// `None` for a state that has nothing useful to say in a few characters.
+/// ` WARN` marker when a soft limit is crossed or the pool is overrun, and
+/// a ` · budget low: new sessions blocked` marker once less than a turn hold
+/// remains. `None` for a state that has nothing useful to say in a few characters.
 pub fn statusline_segment(status: &SharedBudgetStatus) -> Option<String> {
     match status.config_state {
         SharedBudgetConfigState::Absent => return None,
@@ -306,8 +311,16 @@ pub fn statusline_segment(status: &SharedBudgetStatus) -> Option<String> {
     // At or below zero remaining, admission is closed (fully held or overrun).
     let closed = status.remaining_usd_cents.is_some_and(|r| r <= 0);
     let warn = !status.warnings.is_empty() || closed;
+    // Less than one turn hold left: a lane without a hold is denied. The
+    // statusline is per session and a lane that already holds budget is
+    // renewed, so this says "new sessions" rather than "your next prompt".
+    let blocked = if admission_closed(status) {
+        " · budget low: new sessions blocked"
+    } else {
+        ""
+    };
     Some(format!(
-        "budget {}/{} ({percent}%){}",
+        "budget {}/{} ({percent}%){}{blocked}",
         usd_u(spent),
         usd_short(cap),
         if warn { " WARN" } else { "" }
@@ -372,6 +385,7 @@ pub fn render_human(posture: &Posture, state_dir: Option<&Path>) -> String {
                     out.push_str("  No shared-budget.json; nothing was consulted or written.\n")
                 }
             }
+            out.push_str(&format!("  {ENABLE_HINT}\n"));
         }
         Posture::DaemonUnreachable { file, reason } => {
             out.push_str("Shared budget (local, this host and OS user)\n");
@@ -580,7 +594,11 @@ pub fn render_json(posture: &Posture, state_dir: Option<&Path>) -> Value {
         })
     };
     match posture {
-        Posture::NotConfigured => base("not_configured"),
+        Posture::NotConfigured => {
+            let mut v = base("not_configured");
+            v["how_to_enable"] = json!(ENABLE_HINT);
+            v
+        }
         Posture::DaemonUnreachable { file, reason } => {
             let mut v = base("daemon_unreachable");
             v["daemon_reason"] = json!(one_line(reason));
@@ -825,14 +843,45 @@ mod tests {
 
         let mut over = status();
         over.remaining_usd_cents = Some(-1);
-        assert!(statusline_segment(&over).unwrap().ends_with(" WARN"));
+        let over_segment = statusline_segment(&over).unwrap();
+        assert!(over_segment.contains(" WARN"), "{over_segment}");
+    }
+
+    #[test]
+    fn the_segment_says_when_new_sessions_would_be_denied() {
+        // The healthy fixture ($487.70 left, $10 hold) carries no marker.
+        assert!(!statusline_segment(&status()).unwrap().contains("blocked"));
+
+        // $9.99 left is below the $10 hold: not zero, but a prompt is denied.
+        let mut short = status();
+        short.remaining_usd_cents = Some(999);
+        assert_eq!(
+            statusline_segment(&short).as_deref(),
+            Some("budget $12.30/$500 (3%) · budget low: new sessions blocked")
+        );
+
+        // Exactly one hold left still admits.
+        let mut exact = status();
+        exact.remaining_usd_cents = Some(1_000);
+        assert!(!statusline_segment(&exact).unwrap().contains("blocked"));
+
+        // Unusable states keep their terse text.
+        let mut anomaly = status();
+        anomaly.clock_anomaly = true;
+        anomaly.remaining_usd_cents = Some(0);
+        assert_eq!(
+            statusline_segment(&anomaly).as_deref(),
+            Some("budget: clock anomaly")
+        );
     }
 
     #[test]
     fn the_segment_warns_when_nothing_remains_and_rounds_the_percent_up() {
         let mut full = status();
         full.remaining_usd_cents = Some(0);
-        assert!(statusline_segment(&full).unwrap().ends_with(" WARN"));
+        let full_segment = statusline_segment(&full).unwrap();
+        assert!(full_segment.contains(" WARN"), "{full_segment}");
+        assert!(full_segment.ends_with(" · budget low: new sessions blocked"));
 
         // 1 cent of a $500 cap is 0.002%: shown as 1%, not 0%.
         let mut tiny = status();
@@ -932,8 +981,13 @@ mod tests {
     fn not_configured_says_so_and_json_is_marked() {
         let text = render_human(&Posture::NotConfigured, Some(Path::new("/s")));
         assert!(text.starts_with("Shared budget: not configured"), "{text}");
+        assert!(
+            text.contains("shared-budget init --monthly-usd <n> --time-zone <IANA>"),
+            "the how-to-enable line is shown: {text}"
+        );
         let v = render_json(&Posture::NotConfigured, None);
         assert_eq!(v["state"], "not_configured");
+        assert_eq!(v["how_to_enable"], ENABLE_HINT);
         assert_eq!(v["schema"], STATUS_SCHEMA);
         assert_eq!(v["guarantee"], GUARANTEE_LABEL);
     }

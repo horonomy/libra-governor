@@ -206,6 +206,7 @@ Usage:
   libra-governor metered-pool settle --reservation <uuid> --owner <owner> --session <session-id> [--actual <n>]
   libra-governor metered-pool release --reservation <uuid> --owner <owner> --session <session-id>
   libra-governor metered-pool status --owner <owner> --pool <alias>
+  libra-governor shared-budget init --monthly-usd <amount> --time-zone <IANA> [--turn-hold-usd <amount>] [--force]
   libra-governor shared-budget status [--json]
   libra-governor shared-budget prune --keep-months <n> --time-zone <IANA> [--apply]
   libra-governor shared-budget export --period <YYYY-MM> [--out <file>] [--time-zone <IANA>] [--raw-ids] [--overwrite]

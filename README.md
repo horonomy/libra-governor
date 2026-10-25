@@ -13,7 +13,7 @@ one. See [`PRODUCT.md`](PRODUCT.md) for the full product North Star and
 
 **Product page and hosted docs:** [libra.horonom.com](https://libra.horonom.com) ([docs](https://libra.horonom.com/docs/)) — Developer Preview.
 
-**Release status.** The latest *published* release is v0.0.2. `main` is the unreleased **v0.0.4** development line (workspace version 0.0.4); a narrow Apple Silicon-only Preview is proposed in [`docs/adr/0025-v0-0-4-scope-evidence-and-exclusions.md`](docs/adr/0025-v0-0-4-scope-evidence-and-exclusions.md) and nothing is tagged or published. v0.0.3 is a separate line (`release/v0.0.3`, [ADR-0014](docs/adr/0014-v0-0-3-go-scope-and-exclusions.md)). The feature set below is the v0.0.3 baseline that `main` builds on: everything from v0.0.2 (the v0.0.1 MVP 3
+**Release status.** The latest *published* release is v0.0.2. `main` is the unreleased **v0.0.4** development line (workspace version 0.0.4); v0.0.4 is the Option 2 **local monthly shared budget** MVP ([ADR-0026](docs/adr/0026-local-monthly-shared-budget.md)); it is unreleased and untagged, nothing is published, and releasing it is a separate founder GO (evidence so far is `TestOwnedLive` only, see [ADR-0025](docs/adr/0025-v0-0-4-scope-evidence-and-exclusions.md)). v0.0.3 is a separate line (`release/v0.0.3`, [ADR-0014](docs/adr/0014-v0-0-3-go-scope-and-exclusions.md)). The feature set below is the v0.0.3 baseline that `main` builds on: everything from v0.0.2 (the v0.0.1 MVP 3
 local flow, Codex support, local extension points — see below) plus the
 Agent Execution Economics work (HORO-1666–1673, HORO-1689): hierarchical
 resource accounting, a progressive remaining-cost estimator with shadow
@@ -123,6 +123,46 @@ libra-governor doctor
 That's it — the `balanced` policy preset and no enforcement gateway are
 the defaults, and nothing here blocks or interrupts your normal Claude
 Code workflow (see "Safe defaults" below).
+
+## Local monthly budget (optional)
+
+On the unreleased v0.0.4 line you can cap what Claude Code may spend in a
+calendar month on this machine. It is off until you create the file:
+
+```bash
+libra-governor shared-budget init --monthly-usd 200 --time-zone America/New_York
+libra-governor shared-budget status
+```
+
+`--time-zone` is required, an IANA name: the month starts and ends in that
+zone and there is deliberately no UTC default. `--turn-hold-usd` (default
+`10`) is what each prompt reserves up front; it must fit inside the cap.
+Run `libra-governor install` first so the hooks are wired.
+
+**What it is.** An admission-bounded (cooperative) limit on Libra-accounted,
+list-price-equivalent USD, shared by every Claude Code session and subagent
+on this host and OS user. When less than one turn hold remains, a prompt from
+a session that holds no budget is blocked with a message that names the
+period end in your zone and how to raise the cap.
+
+**What it is not.** Not a provider bill, not provider quota and not a hard
+spending cap. With hooks only, spend *inside* a turn is seen after the fact,
+so a turn can cost more than its hold. Codex sessions have no budget gate.
+There is no gateway hard cap. Evidence is `TestOwnedLive` (real binaries,
+synthetic transcripts), not observed on a real host.
+
+**Where to look.** `libra-governor shared-budget status` (add `--json`),
+the `shared_budget_*` checks in `libra-governor doctor`, and a `budget $x/$y`
+segment on the statusline that adds `budget low: new sessions blocked` when less
+than one turn hold remains.
+
+**Change or remove it.** Edit `shared-budget.json` in the state directory
+(`status` prints its path) or delete it; the daemon re-reads it on every
+decision, so the change applies from the next prompt. To start over use
+`shared-budget init --force`.
+
+Details: [ADR-0026](docs/adr/0026-local-monthly-shared-budget.md) and
+[`integrations/claude-code/README.md`](integrations/claude-code/README.md).
 
 ## Your first preflight, walked through
 

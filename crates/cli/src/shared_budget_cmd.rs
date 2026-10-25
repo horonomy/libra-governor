@@ -1,6 +1,11 @@
-//! `libra-governor shared-budget <status|prune|export>`: a read-only status
-//! view (HORO-2217), retention and a local-only export (HORO-2219) for the
-//! local monthly shared budget (ADR-0026).
+//! `libra-governor shared-budget <init|status|prune|export>`: first-run
+//! configuration (HORO-2248), a read-only status view (HORO-2217), retention
+//! and a local-only export (HORO-2219) for the local monthly shared budget
+//! (ADR-0026).
+//!
+//! `init` is the only subcommand that writes `shared-budget.json`. It builds
+//! the file's bytes, proves the daemon's own parser accepts them, and only
+//! then puts them in place atomically (owner-only, never half-written).
 //!
 //! `status` asks a running daemon (never starts one) and, with no
 //! `shared-budget.json`, prints "not configured" without connecting or
@@ -45,10 +50,17 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 const HELP: &str = "Usage:\n  \
+    libra-governor shared-budget init --monthly-usd <amount> --time-zone <IANA> \
+    [--turn-hold-usd <amount>] [--force]\n  \
     libra-governor shared-budget status [--json]\n  \
     libra-governor shared-budget prune --keep-months <n> --time-zone <IANA> [--apply]\n  \
     libra-governor shared-budget export --period <YYYY-MM> [--out <file>] [--time-zone <IANA>] \
     [--raw-ids] [--overwrite]\n\n\
+    init     Writes <state-dir>/shared-budget.json to turn the monthly budget on. --monthly-usd is \
+    dollars (at most 2 decimals, e.g. 200 or 12.50). --time-zone is required: the budget period is \
+    a calendar month in that zone and there is deliberately no UTC default. --turn-hold-usd is what \
+    each prompt reserves (default 10; must not exceed the cap). Refuses to replace an existing \
+    file unless --force. A running daemon picks the file up on the next prompt.\n  \
     status   Read-only budget posture from the running daemon (never starts one): config state, \
     zone-local period, cap, settled, held, remaining (negative = overrun), per-executor table \
     reconciled against the pool total, soft-limit warnings (warn-only), flagged settlements and \
@@ -120,6 +132,11 @@ impl Flags {
 
 pub fn run(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
+        Some("--help" | "-h" | "help") => {
+            println!("{HELP}");
+            0
+        }
+        Some("init") => run_init(&args[1..]),
         Some("status") => run_status(&args[1..]),
         Some("prune") => run_prune(&args[1..]),
         Some("export") => run_export(&args[1..]),
@@ -137,6 +154,279 @@ fn ledger_path_or_report(command: &str) -> Result<PathBuf, i32> {
         eprintln!("libra-governor shared-budget {command}: could not resolve state dir: {e}");
         1
     })
+}
+
+// ---------------------------------------------------------------------
+// init
+// ---------------------------------------------------------------------
+
+/// Largest monthly cap or turn hold `init` accepts. A guard against a
+/// mistyped amount, not a product limit; edit the file for anything larger.
+const MAX_INIT_USD_CENTS: u64 = 100_000_000;
+
+/// Dollars (digits, optionally `.` and one or two decimals) -> cents.
+/// Rejects signs, exponents, `inf`/`NaN`, a third decimal, zero and anything
+/// above [`MAX_INIT_USD_CENTS`]. Integer arithmetic only: no float rounding.
+fn parse_usd_cents(flag: &str, raw: &str) -> Result<u64, String> {
+    let bad = || {
+        format!(
+            "{flag} must be a dollar amount with at most 2 decimals (e.g. 200 or 12.50), got {raw:?}"
+        )
+    };
+    let (whole, frac) = match raw.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (raw, ""),
+    };
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    let dangling_point = raw.contains('.') && frac.is_empty();
+    if whole.is_empty() || dangling_point || !digits(whole) || !digits(frac) || frac.len() > 2 {
+        return Err(bad());
+    }
+    let dollars: u64 = whole.parse().map_err(|_| bad())?;
+    let frac_cents: u64 = match frac.len() {
+        0 => 0,
+        1 => frac.parse::<u64>().map_err(|_| bad())? * 10,
+        _ => frac.parse::<u64>().map_err(|_| bad())?,
+    };
+    let cents = dollars
+        .checked_mul(100)
+        .and_then(|c| c.checked_add(frac_cents))
+        .ok_or_else(bad)?;
+    if cents == 0 {
+        return Err(format!("{flag} must be greater than 0"));
+    }
+    if cents > MAX_INIT_USD_CENTS {
+        return Err(format!(
+            "{flag} {raw} is above the {} sanity limit; edit shared-budget.json by hand for a larger value",
+            shared_budget_view::usd_u(MAX_INIT_USD_CENTS)
+        ));
+    }
+    Ok(cents)
+}
+
+struct InitRequest {
+    monthly_cap_usd_cents: u64,
+    time_zone: String,
+    turn_hold_usd_cents: Option<u64>,
+    force: bool,
+}
+
+#[derive(Debug)]
+struct InitReport {
+    path: PathBuf,
+    config: libra_governor_daemon::shared_budget_file::SharedBudgetConfig,
+    replaced: bool,
+}
+
+/// Serialises the request into the file's bytes. Only the fields the user
+/// chose are written, so the daemon's defaults keep applying to the rest.
+fn init_bytes(request: &InitRequest) -> Vec<u8> {
+    let mut doc = serde_json::Map::new();
+    doc.insert("schema_version".into(), json!(1));
+    doc.insert(
+        "monthly_cap_usd_cents".into(),
+        json!(request.monthly_cap_usd_cents),
+    );
+    doc.insert("time_zone".into(), json!(request.time_zone));
+    if let Some(hold) = request.turn_hold_usd_cents {
+        doc.insert("turn_hold_usd_cents".into(), json!(hold));
+    }
+    let mut bytes = serde_json::to_vec_pretty(&Value::Object(doc)).unwrap_or_default();
+    bytes.push(b'\n');
+    bytes
+}
+
+/// A staging file name no earlier run can have left behind: process id,
+/// wall-clock nanoseconds and a per-process counter, so a stale temp file
+/// from a crashed run never makes `init` fail.
+fn unique_temp_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        ".{}.tmp-{}-{nanos}-{}",
+        libra_governor_daemon::shared_budget_file::SHARED_BUDGET_FILE_NAME,
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Writes `shared-budget.json` into the existing directory `dir`.
+///
+/// The bytes must parse as a valid configuration with the daemon's own
+/// parser before anything is put in place, so an invalid file is never
+/// written. They go to an owner-only temp file in `dir` first; without
+/// `force` they are then linked into place (fails if anything exists, with
+/// no check-then-write race), with `force` they replace a regular file via
+/// rename. A reader therefore sees the old file or the new one, never a
+/// partial one.
+fn init_in(dir: &Path, request: &InitRequest) -> Result<InitReport, String> {
+    use libra_governor_daemon::shared_budget_file::{
+        parse, SharedBudgetFileState, SHARED_BUDGET_FILE_NAME,
+    };
+
+    let bytes = init_bytes(request);
+    let config = match parse(&bytes) {
+        SharedBudgetFileState::Valid(config) => config,
+        SharedBudgetFileState::Invalid(reason) => return Err(init_invalid_message(&reason)),
+        SharedBudgetFileState::Absent => return Err("internal error: empty configuration".into()),
+    };
+
+    let path = dir.join(SHARED_BUDGET_FILE_NAME);
+    let replaced = match std::fs::symlink_metadata(&path) {
+        Ok(meta) if !meta.file_type().is_file() => {
+            return Err(format!(
+                "{} exists and is not a regular file; refusing to touch it",
+                path.display()
+            ));
+        }
+        Ok(_) if !request.force => {
+            return Err(format!(
+                "{} already exists; refusing to overwrite it (pass --force to replace it, or edit \
+                 the file by hand)",
+                path.display()
+            ));
+        }
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(format!("could not inspect {}: {e}", path.display())),
+    };
+
+    let tmp = dir.join(unique_temp_name());
+    let staged = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut file| file.write_all(&bytes).and_then(|()| file.sync_all()));
+    if let Err(e) = staged {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("could not write {}: {e}", tmp.display()));
+    }
+    let placed = if request.force {
+        std::fs::rename(&tmp, &path)
+    } else {
+        std::fs::hard_link(&tmp, &path)
+    };
+    if !request.force {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    if placed.is_ok() {
+        // Best effort: make the new directory entry durable. Failure here
+        // does not undo a placed file, so it is ignored.
+        let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+    }
+    if let Err(e) = placed {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(if e.kind() == std::io::ErrorKind::AlreadyExists {
+            format!(
+                "{} already exists; refusing to overwrite it (pass --force to replace it)",
+                path.display()
+            )
+        } else {
+            format!("could not put {} in place: {e}", path.display())
+        });
+    }
+    Ok(InitReport {
+        path,
+        config,
+        replaced,
+    })
+}
+
+/// Turns a parser rejection into advice a first-time user can act on.
+fn init_invalid_message(reason: &str) -> String {
+    if reason.starts_with("turn_hold_usd_cents") {
+        format!(
+            "{reason}. Each prompt reserves a hold (default $10.00) that must fit inside the cap: \
+             pass a smaller --turn-hold-usd or a larger --monthly-usd"
+        )
+    } else {
+        reason.to_string()
+    }
+}
+
+fn run_init(args: &[String]) -> i32 {
+    let flags = match Flags::parse(
+        args,
+        &["monthly-usd", "time-zone", "turn-hold-usd"],
+        &["force"],
+    ) {
+        Ok(f) => f,
+        Err(e) => return usage_error(&e),
+    };
+    let Some(cap_raw) = flags.value("monthly-usd") else {
+        return usage_error("--monthly-usd <amount> is required (dollars, e.g. 200 or 12.50)");
+    };
+    let Some(zone_raw) = flags.value("time-zone") else {
+        return usage_error(
+            "--time-zone <IANA> is required (e.g. America/New_York or Asia/Taipei). The budget \
+             period is a calendar month in that zone and there is deliberately no UTC default",
+        );
+    };
+    let monthly_cap_usd_cents = match parse_usd_cents("--monthly-usd", cap_raw) {
+        Ok(c) => c,
+        Err(e) => return usage_error(&e),
+    };
+    let turn_hold_usd_cents = match flags
+        .value("turn-hold-usd")
+        .map(|raw| parse_usd_cents("--turn-hold-usd", raw))
+        .transpose()
+    {
+        Ok(h) => h,
+        Err(e) => return usage_error(&e),
+    };
+    let time_zone = match parse_time_zone(zone_raw) {
+        Ok(z) => z,
+        Err(e) => return usage_error(&e),
+    };
+    let request = InitRequest {
+        monthly_cap_usd_cents,
+        time_zone: time_zone.as_str().to_string(),
+        turn_hold_usd_cents,
+        force: flags.switch("force"),
+    };
+
+    // The directory is only created once every argument is known to be good.
+    let dir = match libra_governor_daemon::paths::ensure_state_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("libra-governor shared-budget init: could not prepare state dir: {e}");
+            return 1;
+        }
+    };
+    match init_in(&dir, &request) {
+        Ok(report) => {
+            print!("{}", render_init(&report));
+            0
+        }
+        Err(e) => {
+            eprintln!("libra-governor shared-budget init: {e}");
+            1
+        }
+    }
+}
+
+fn render_init(report: &InitReport) -> String {
+    use shared_budget_view::usd_u;
+    let c = &report.config;
+    format!(
+        "{} {}\n\
+         \x20 Monthly cap:  {} (calendar month in {})\n\
+         \x20 Turn hold:    {} reserved per prompt\n\
+         \x20 Guarantee:    admission-bounded (cooperative); Libra-accounted list-price-equivalent \
+         USD, not a provider bill or quota\n\
+         Next: run `libra-governor shared-budget status`. Edit or delete the file to change or \
+         remove the budget; a running daemon applies it on the next prompt.\n",
+        if report.replaced { "Replaced" } else { "Wrote" },
+        report.path.display(),
+        usd_u(c.monthly_cap_usd_cents),
+        c.time_zone.as_str(),
+        usd_u(c.turn_hold_usd_cents),
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -699,5 +989,177 @@ mod tests {
             assert_eq!(alias, "monthly-2026-09");
             assert!(e > s);
         }
+    }
+
+    // ----- init -----
+
+    fn req(cap: u64, zone: &str, hold: Option<u64>, force: bool) -> InitRequest {
+        InitRequest {
+            monthly_cap_usd_cents: cap,
+            time_zone: zone.to_string(),
+            turn_hold_usd_cents: hold,
+            force,
+        }
+    }
+
+    #[test]
+    fn usd_amounts_become_exact_cents() {
+        for (raw, cents) in [
+            ("200", 20_000),
+            ("12.50", 1_250),
+            ("12.5", 1_250),
+            ("0.01", 1),
+            ("0.5", 50),
+            ("1000000", MAX_INIT_USD_CENTS),
+        ] {
+            assert_eq!(parse_usd_cents("--x", raw), Ok(cents), "{raw}");
+        }
+    }
+
+    #[test]
+    fn usd_amount_boundaries() {
+        assert_eq!(parse_usd_cents("--x", "1000000.00"), Ok(MAX_INIT_USD_CENTS));
+        assert!(
+            parse_usd_cents("--x", "1000000.01").is_err(),
+            "max + 1 cent"
+        );
+        assert_eq!(
+            parse_usd_cents("--x", "007"),
+            Ok(700),
+            "leading zeros are plain digits"
+        );
+        for bad in [
+            "1.",
+            ".5",
+            "0.001",
+            "1e3",
+            "+5",
+            "-1",
+            "",
+            "18446744073709551616",
+            "184467440737095516150",
+            "99999999999999999999999999999999",
+        ] {
+            assert!(parse_usd_cents("--x", bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_stale_temp_file_from_an_earlier_run_does_not_block_init() {
+        let dir = tempfile::tempdir().unwrap();
+        // The old pid-only name, as a crashed run would have left it.
+        std::fs::write(
+            dir.path()
+                .join(format!(".shared-budget.json.tmp-{}", std::process::id())),
+            "stale",
+        )
+        .unwrap();
+        init_in(dir.path(), &req(20_000, "UTC", None, false)).unwrap();
+        assert_ne!(unique_temp_name(), unique_temp_name());
+    }
+
+    #[test]
+    fn usd_amounts_reject_everything_but_plain_dollars() {
+        for bad in [
+            "",
+            ".",
+            "0",
+            "0.00",
+            "-5",
+            "+5",
+            "5.",
+            ".5",
+            "1.234",
+            "1e3",
+            "inf",
+            "NaN",
+            "1,000",
+            "$5",
+            " 5",
+            "1000000.01",
+            "99999999999999999999999",
+        ] {
+            assert!(
+                parse_usd_cents("--x", bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn init_writes_a_file_the_daemons_parser_accepts() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = init_in(dir.path(), &req(20_000, "Asia/Taipei", None, false)).unwrap();
+        let bytes = std::fs::read(&report.path).unwrap();
+        match libra_governor_daemon::shared_budget_file::parse(&bytes) {
+            SharedBudgetFileState::Valid(c) => {
+                assert_eq!(c.monthly_cap_usd_cents, 20_000);
+                assert_eq!(c.time_zone.as_str(), "Asia/Taipei");
+                assert_eq!(c.turn_hold_usd_cents, 1_000, "the daemon default applies");
+            }
+            other => panic!("{other:?}"),
+        }
+        let mode = std::fs::metadata(&report.path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(!report.replaced);
+    }
+
+    #[test]
+    fn init_never_writes_an_invalid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // Default hold ($10) exceeds a $5 cap: the daemon's parser rejects it.
+        let err = init_in(dir.path(), &req(500, "UTC", None, false)).unwrap_err();
+        assert!(err.contains("--turn-hold-usd"), "{err}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        // An unknown zone is rejected by the same validation.
+        assert!(init_in(dir.path(), &req(5_000, "Mars/Olympus", None, false)).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn init_refuses_to_overwrite_without_force_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        init_in(dir.path(), &req(20_000, "UTC", None, false)).unwrap();
+        let before = std::fs::read(dir.path().join("shared-budget.json")).unwrap();
+        let err = init_in(dir.path(), &req(30_000, "UTC", None, false)).unwrap_err();
+        assert!(err.contains("--force"), "{err}");
+        assert_eq!(
+            std::fs::read(dir.path().join("shared-budget.json")).unwrap(),
+            before
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn init_force_replaces_atomically_and_keeps_owner_only_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        init_in(dir.path(), &req(20_000, "UTC", None, false)).unwrap();
+        let report = init_in(dir.path(), &req(30_000, "Asia/Taipei", Some(250), true)).unwrap();
+        assert!(report.replaced);
+        let loaded = LoadedSharedBudget::load(dir.path());
+        let c = loaded.config().expect("valid");
+        assert_eq!(c.monthly_cap_usd_cents, 30_000);
+        assert_eq!(c.turn_hold_usd_cents, 250);
+        let mode = std::fs::metadata(&report.path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn init_refuses_a_symlink_even_with_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, "keep").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("shared-budget.json")).unwrap();
+        assert!(init_in(dir.path(), &req(20_000, "UTC", None, true)).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
     }
 }

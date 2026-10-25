@@ -25,6 +25,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
+
+use libra_governor_domain::{format_local_rfc3339, IanaTimeZone};
 use libra_governor_protocol::{
     Request, Response, SharedBudgetCheckState, SharedBudgetDenyReason, SharedBudgetOutcome,
     SharedBudgetRequest, SoftLimitScope, SoftLimitWarning,
@@ -125,23 +129,89 @@ fn one_line(text: &str) -> String {
     }
 }
 
+/// What a denial message needs from `shared-budget.json` beyond the daemon's
+/// answer: where the file is (for the remedy), the configured zone (the
+/// period end is shown in it) and the per-turn hold (a turn needs that much
+/// left, which is why a positive remainder can still be "exhausted").
+///
+/// Read from the file at message time, only on the denial path, so the
+/// allow path and the wire protocol are untouched. When the file cannot be
+/// read, every field is `None` and the message degrades to the daemon's
+/// own facts (period end in UTC, no reservation figure).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BudgetContext {
+    pub file_path: Option<PathBuf>,
+    pub time_zone: Option<IanaTimeZone>,
+    pub turn_hold_usd_cents: Option<u64>,
+}
+
+impl BudgetContext {
+    pub fn load() -> Self {
+        use libra_governor_daemon::shared_budget_file::LoadedSharedBudget;
+        let Ok(dir) = libra_governor_daemon::paths::state_dir() else {
+            return Self::default();
+        };
+        let loaded = LoadedSharedBudget::load(&dir);
+        Self {
+            time_zone: loaded.config().map(|c| c.time_zone.clone()),
+            turn_hold_usd_cents: loaded.config().map(|c| c.turn_hold_usd_cents),
+            file_path: loaded.path,
+        }
+    }
+
+    /// `end` (an RFC 3339 instant from the daemon) in the configured zone,
+    /// with the zone name; unchanged when there is no zone or `end` does not
+    /// parse.
+    fn period_end_text(&self, end: &str) -> String {
+        let local = self.time_zone.as_ref().and_then(|tz| {
+            let instant = OffsetDateTime::parse(end, &Rfc3339).ok()?;
+            Some(format!(
+                "{} ({})",
+                format_local_rfc3339(instant, tz),
+                tz.as_str()
+            ))
+        });
+        local.unwrap_or_else(|| end.to_string())
+    }
+}
+
 fn denied_reason(
     reason: SharedBudgetDenyReason,
     remaining: Option<i64>,
     period_end: Option<&str>,
     detail: Option<&str>,
+    ctx: &BudgetContext,
 ) -> String {
     match reason {
         SharedBudgetDenyReason::CapExhausted => {
-            let left = match remaining {
-                Some(r) if r >= 0 => format!("{} remaining", usd(r)),
-                Some(r) => format!("over the cap by {}", usd(-r)),
-                None => "no budget remaining".to_string(),
+            let left = match (remaining, ctx.turn_hold_usd_cents) {
+                (Some(r), Some(hold)) if r >= 0 && (r as u64) < hold => {
+                    format!(
+                        "{} remaining is less than the {} a turn reserves",
+                        usd(r),
+                        usd_u(hold)
+                    )
+                }
+                (Some(r), _) if r >= 0 => format!("{} remaining", usd(r)),
+                (Some(r), _) => format!("over the cap by {}", usd(-r)),
+                (None, _) => "no budget remaining".to_string(),
             };
             let end = period_end
-                .map(|e| format!("; the period ends {e}"))
+                .map(|e| format!("; the period ends {}", ctx.period_end_text(e)))
                 .unwrap_or_default();
-            format!("Libra shared monthly budget exhausted: {left}{end} ({LABEL}).")
+            let file = ctx
+                .file_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "shared-budget.json".to_string());
+            // The remainder is net of other sessions' live holds and the
+            // denial does not say how much is held, so waiting for the
+            // period to end is not claimed as the way out.
+            format!(
+                "Libra shared monthly budget exhausted: {left}{end}. To continue, raise \
+                 monthly_cap_usd_cents in {file} (applies to the next prompt) or finish or stop \
+                 other active sessions whose in-flight turns hold part of the budget ({LABEL})."
+            )
         }
         SharedBudgetDenyReason::ConfigInvalid => {
             let why = detail
@@ -214,6 +284,10 @@ fn warning_line(warnings: &[SoftLimitWarning], unavailable: bool) -> Option<Stri
 
 /// Maps the daemon's answer to an `Admit` to the prompt hook's decision.
 pub fn decide_admit(outcome: &SharedBudgetOutcome) -> Admission {
+    decide_admit_in(outcome, &BudgetContext::load())
+}
+
+fn decide_admit_in(outcome: &SharedBudgetOutcome, ctx: &BudgetContext) -> Admission {
     match outcome {
         SharedBudgetOutcome::NotConfigured => Admission::Proceed { warning: None },
         SharedBudgetOutcome::Allowed {
@@ -234,6 +308,7 @@ pub fn decide_admit(outcome: &SharedBudgetOutcome) -> Admission {
                 *remaining_usd_cents,
                 period_end.as_deref(),
                 detail.as_deref(),
+                ctx,
             ),
         },
         // A refusal is driven purely by host-supplied identity, not by the
@@ -249,6 +324,10 @@ pub fn decide_admit(outcome: &SharedBudgetOutcome) -> Admission {
 /// Maps the daemon's answer to a `Check` to a PreToolUse denial reason.
 /// `None` (allow) for everything except exhausted / denied.
 pub fn decide_check(outcome: &SharedBudgetOutcome) -> Option<String> {
+    decide_check_in(outcome, &BudgetContext::load())
+}
+
+fn decide_check_in(outcome: &SharedBudgetOutcome, ctx: &BudgetContext) -> Option<String> {
     match outcome {
         SharedBudgetOutcome::Checked {
             state: SharedBudgetCheckState::Exhausted,
@@ -259,6 +338,7 @@ pub fn decide_check(outcome: &SharedBudgetOutcome) -> Option<String> {
             Some(*remaining_usd_cents),
             Some(period_end),
             None,
+            ctx,
         )),
         SharedBudgetOutcome::Denied {
             reason,
@@ -270,6 +350,7 @@ pub fn decide_check(outcome: &SharedBudgetOutcome) -> Option<String> {
             *remaining_usd_cents,
             period_end.as_deref(),
             detail.as_deref(),
+            ctx,
         )),
         _ => None,
     }
@@ -395,6 +476,101 @@ mod tests {
     use super::*;
     use libra_governor_domain::{ExecutorKind, SharedPoolReservationId};
     use libra_governor_protocol::SharedBudgetRefusal;
+
+    // The pure tests below see no budget file: they must not read the
+    // developer's real state dir.
+    fn decide_admit(outcome: &SharedBudgetOutcome) -> Admission {
+        decide_admit_in(outcome, &BudgetContext::default())
+    }
+
+    fn decide_check(outcome: &SharedBudgetOutcome) -> Option<String> {
+        decide_check_in(outcome, &BudgetContext::default())
+    }
+
+    fn taipei_ctx() -> BudgetContext {
+        BudgetContext {
+            file_path: Some(PathBuf::from("/state/shared-budget.json")),
+            time_zone: Some(IanaTimeZone::new("Asia/Taipei").unwrap()),
+            turn_hold_usd_cents: Some(50),
+        }
+    }
+
+    fn cap_denial(remaining: i64) -> SharedBudgetOutcome {
+        SharedBudgetOutcome::Denied {
+            reason: SharedBudgetDenyReason::CapExhausted,
+            remaining_usd_cents: Some(remaining),
+            period_end: Some("2026-10-31T16:00:00Z".into()),
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn the_block_message_shows_the_period_end_in_the_configured_zone() {
+        let Admission::Block { reason } = decide_admit_in(&cap_denial(49), &taipei_ctx()) else {
+            panic!("must block")
+        };
+        assert!(
+            reason.contains("2026-11-01T00:00:00+08:00 (Asia/Taipei)"),
+            "{reason}"
+        );
+        assert!(!reason.contains("2026-10-31T16:00:00Z"), "{reason}");
+    }
+
+    #[test]
+    fn the_block_message_explains_why_a_positive_remainder_is_exhausted() {
+        let Admission::Block { reason } = decide_admit_in(&cap_denial(49), &taipei_ctx()) else {
+            panic!("must block")
+        };
+        assert!(
+            reason.contains("$0.49 remaining is less than the $0.50 a turn reserves"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn the_block_message_names_the_remedy_and_keeps_the_label() {
+        for outcome in [cap_denial(49), cap_denial(-3)] {
+            let Admission::Block { reason } = decide_admit_in(&outcome, &taipei_ctx()) else {
+                panic!("must block")
+            };
+            assert!(
+                reason.contains(
+                    "raise monthly_cap_usd_cents in /state/shared-budget.json (applies to the \
+                     next prompt) or finish or stop other active sessions"
+                ),
+                "{reason}"
+            );
+            assert!(reason.contains("Libra-accounted USD, admission-bounded (cooperative)"));
+            assert!(!reason.contains('\n'), "a single paragraph: {reason}");
+        }
+    }
+
+    #[test]
+    fn pre_tool_use_denial_uses_the_same_zone_and_reservation_wording() {
+        let reason = decide_check_in(
+            &SharedBudgetOutcome::Checked {
+                state: SharedBudgetCheckState::Exhausted,
+                remaining_usd_cents: 49,
+                period_end: "2026-10-31T16:00:00Z".into(),
+            },
+            &taipei_ctx(),
+        )
+        .expect("exhausted denies");
+        assert!(reason.contains("+08:00 (Asia/Taipei)"), "{reason}");
+        assert!(reason.contains("a turn reserves"), "{reason}");
+    }
+
+    #[test]
+    fn without_a_readable_file_the_message_falls_back_to_the_daemons_own_facts() {
+        let Admission::Block { reason } =
+            decide_admit_in(&cap_denial(49), &BudgetContext::default())
+        else {
+            panic!("must block")
+        };
+        assert!(reason.contains("2026-10-31T16:00:00Z"), "{reason}");
+        assert!(reason.contains("$0.49 remaining"), "{reason}");
+        assert!(reason.contains("raise monthly_cap_usd_cents in shared-budget.json"));
+    }
 
     fn allowed(warnings: Vec<SoftLimitWarning>, unavailable: bool) -> SharedBudgetOutcome {
         SharedBudgetOutcome::Allowed {
