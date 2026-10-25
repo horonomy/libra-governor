@@ -1,13 +1,12 @@
 # ADR-0025: v0.0.4 scope, evidence class and explicit exclusions
 
-- **Status**: Proposed. This records what the repository can and cannot
-  honestly claim for v0.0.4. It is **not** a GO verdict: the final GO/NO-GO
-  and any tag or publication belong to the founder. **Update (HORO-2248):**
-  the founder accepted Option 2 for engineering, so v0.0.4 is the local
-  monthly shared-budget MVP ([ADR-0026](0026-local-monthly-shared-budget.md)).
-  It is unreleased and untagged, and releasing it stays a separate founder
-  GO. The "Apple Silicon macOS Preview" section below is the earlier narrow
-  proposal, kept as history; it does not describe what v0.0.4 contains.
+- **Status**: Superseded in scope for engineering by Option 2
+  ([ADR-0026](0026-local-monthly-shared-budget.md), HORO-2248): v0.0.4 is the
+  local monthly shared-budget MVP. The v0.0.4 release itself is unapproved,
+  untagged and unpublished, and any GO, tag or publication is a separate
+  founder decision; this record is not a GO verdict. The sections below keep
+  the evidence classes and the earlier narrow Apple Silicon Preview proposal
+  as history.
 - **Tickets**: HORO-1749 (epic), HORO-1768 (release gate), HORO-1727,
   HORO-1857, HORO-2160, HORO-2162. Modelled on
   [ADR-0014](0014-v0-0-3-go-scope-and-exclusions.md); `release/v0.0.3` is a
@@ -58,8 +57,7 @@ unless it says so.
 
 ## Proposed release target: Apple Silicon macOS Preview
 
-**Earlier proposal, kept as history (see the Status update above); this ADR
-remains Proposed.** The narrowest honest v0.0.4 is a *preview for `aarch64-apple-darwin` only*.
+**Earlier proposal, kept as history (see Status).** The narrowest honest v0.0.4 was a *preview for `aarch64-apple-darwin` only*.
 
 | Tier | Content | Status |
 |---|---|---|
@@ -87,9 +85,8 @@ data-loss risk: they are claims the Preview does not make.
 ## Consequence
 
 Until the items in "Explicitly NOT claimed" are closed or the founder
-accepts them as exclusions, the honest v0.0.4 statement is a **narrow
-preview with these limitations**, not an active-pacing release. Moving this
-ADR to Accepted requires the founder's decision; moving v0.0.4 to
-READY_FOR_RELEASE additionally requires HORO-1752 metadata, HORO-1768
+accepts them as exclusions, v0.0.4 makes no active-pacing claim (the
+earlier proposal was a narrow preview with these limitations). Moving
+v0.0.4 to READY_FOR_RELEASE additionally requires HORO-1752 metadata, HORO-1768
 acceptance and the HORO-1857 release checklist
 (`docs/quota-observation/release-checklist.md`).
