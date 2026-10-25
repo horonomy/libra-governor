@@ -146,6 +146,11 @@ pub enum SharedBudgetRefusal {
     /// under this budget: there is nothing to continue from, and charging
     /// the whole transcript history would be wrong.
     NoSettledLane,
+    /// The charge's `event_time` falls in a closed period older than the
+    /// oldest retained pool. Such a period was pruned (or never existed);
+    /// its idempotency memory is gone, so a charge booked there could not be
+    /// told from a replay of one already booked. Nothing is charged.
+    EventBeforeRetention,
 }
 
 /// State reported by `Check`.

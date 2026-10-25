@@ -284,4 +284,6 @@ pub use messages::{
 /// decoder rejects a `Finalize` that carries it, so a long-lived v23 daemon
 /// must be restarted after upgrading; the hook omits the field when the
 /// payload has none.
+/// `SharedBudgetRefusal` also gained `EventBeforeRetention` (a charge whose
+/// event time precedes every retained pool), which a v23 decoder cannot parse.
 pub const PROTOCOL_VERSION: u32 = 24;

@@ -863,6 +863,21 @@ fn book_charge(
                 clamped = true;
                 current.pool_id.clone()
             } else {
+                // `prune` deletes whole ended pools and with them the
+                // idempotency memory of the charges booked there, so a
+                // charge for an event older than every retained pool cannot
+                // be told from a replay of one already booked (HORO-2250):
+                // a re-swept subagent file after a restart, say. Refuse it
+                // rather than recreate the period and book it a second time.
+                // A period between retained pools is unaffected (a prune
+                // only ever removes the oldest ones).
+                let oldest_retained = ledger
+                    .shared_pool_ids_with_prefix(POOL_PREFIX)?
+                    .into_iter()
+                    .next();
+                if oldest_retained.is_some_and(|oldest| target.pool_id.0 < oldest.0) {
+                    return Ok(refused(SharedBudgetRefusal::EventBeforeRetention));
+                }
                 target.pool_id
             }
         }

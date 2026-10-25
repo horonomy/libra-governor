@@ -2689,3 +2689,88 @@ fn a_duplicate_stop_without_a_prompt_id_cannot_be_told_from_a_real_one() {
     fx.finalize("s1", Some(&s(&tx)));
     assert_eq!(totals(&fx.status()), (1_300, 0));
 }
+
+// ---------------------------------------------------------------------
+// M3 (HORO-2250): a charge older than the retention horizon is replay
+// ---------------------------------------------------------------------
+
+impl Fx {
+    /// `shared-budget prune --apply --keep-months 1`, as the CLI does it.
+    fn prune_keeping_one_month(&mut self) -> libra_governor_ledger::PruneReport {
+        use libra_governor_daemon::shared_budget::Clock as _;
+        let zone = libra_governor_domain::IanaTimeZone::new("UTC").unwrap();
+        self.ledger
+            .prune_closed_periods(libra_governor_ledger::PruneRequest {
+                keep_months: 1,
+                now: self.clock.now(),
+                time_zone: &zone,
+                dry_run: false,
+            })
+            .unwrap()
+    }
+}
+
+/// A session with a charged subagent file in January, whose January pool is
+/// then pruned while the session lives on into May.
+fn january_subagent_charged_then_pruned() -> (Fx, std::path::PathBuf, std::path::PathBuf) {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let sid = "s1";
+    let main = fx.path().join("s1.jsonl");
+    let dir = fx.path().join(sid).join("subagents");
+    std::fs::create_dir_all(&dir).unwrap();
+    let sub = dir.join("agent-aaa1.jsonl");
+    fx.admit_hold(sid);
+    write_lines(&main, &[rec(10, "m1", SONNET, mi(1), Some(sid), false)]);
+    write_lines(&sub, &[sub_rec(12, "s1a", mi(1), sid, "aaa1")]);
+    fx.clock.set(at(60));
+    fx.finalize(sid, Some(&s(&main)));
+    assert_eq!(fx.status().used_usd_cents, 600, "300 parent + 300 subagent");
+    assert_eq!(fx.pools().len(), 1);
+
+    // The session is resumed in May; the January pool is outside the window.
+    fx.clock.set(t("2027-05-10T12:00:00Z"));
+    fx.admit_hold(sid);
+    let report = fx.prune_keeping_one_month();
+    assert_eq!(report.pools_pruned, 1, "{report:?}");
+    assert_eq!(fx.pools().len(), 1, "only the May pool remains");
+    (fx, main, sub)
+}
+
+#[test]
+fn a_stop_sweep_does_not_recharge_a_subagent_file_whose_period_was_pruned() {
+    let (mut fx, main, sub) = january_subagent_charged_then_pruned();
+    // A daemon restart forgets which files it already swept; the same
+    // unchanged file is visited again at the next Stop.
+    let body = std::fs::read_to_string(&sub).unwrap();
+    std::fs::write(&sub, body).unwrap();
+    fx.clock.set(t("2027-05-10T12:05:00Z"));
+    fx.finalize("s1", Some(&s(&main)));
+    assert_eq!(
+        fx.pools().len(),
+        1,
+        "the pruned January pool was not recreated: {:?}",
+        fx.pools()
+    );
+    assert!(
+        fx.status()
+            .executors
+            .iter()
+            .all(|e| e.agent_id.as_deref() != Some("aaa1")),
+        "the May pool carries no replayed January subagent spend"
+    );
+}
+
+#[test]
+fn a_charge_agent_replay_into_a_pruned_period_is_refused() {
+    let (mut fx, _main, _sub) = january_subagent_charged_then_pruned();
+    let outcome = fx.sb(SharedBudgetRequest::ChargeAgent {
+        session_id: "s1".into(),
+        agent_id: Some("aaa1".into()),
+        amount_usd_cents: 300,
+        idempotency_key: "k1".into(),
+        charge_source: libra_governor_domain::ChargeSource::SubagentTranscript,
+        event_time: Some("2027-01-15T12:00:12Z".into()),
+    });
+    expect_refused(outcome, SharedBudgetRefusal::EventBeforeRetention);
+    assert_eq!(fx.pools().len(), 1);
+}

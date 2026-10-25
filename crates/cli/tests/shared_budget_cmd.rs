@@ -762,13 +762,13 @@ fn prune_note_carries_the_export_first_and_replay_warning() {
         assert!(note.contains("Export before prune"), "{note}");
         assert!(note.contains("can no longer be exported"), "{note}");
         assert!(
-            note.contains("older than the retention window is treated as new"),
+            note.contains("older than the oldest retained period is refused by the daemon"),
             "{note}"
         );
     }
     let help = sandbox.run(&["shared-budget"]);
     let text = String::from_utf8_lossy(&help.stderr).to_string();
-    assert!(text.contains("treated as new"));
+    assert!(text.contains("is refused by the daemon"));
     assert!(text.contains("pseudonymised"));
     assert!(text.contains("not safe to publish"));
 }

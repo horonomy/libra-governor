@@ -475,14 +475,20 @@ id, path or content).
   a re-prompt renewed the hold (no `Stop` between), only the first prompt's id
   is recorded on the hold, so a later duplicate of the *second* prompt's `Stop`
   is not recognised. The legacy task `Finalize` is unchanged.
-- *S10 prune re-charge (M3).* `shared-budget prune` deletes whole closed
-  pools, including the rows the watermark and the subagent already-charged
-  sum are read from. Scenario: a subagent file charged in a pruned month is
-  swept again in the current month and its full cumulative is charged again
-  (over-charge); a lane whose marks were pruned falls back to its oldest
-  remaining hold. Proposed mitigation: an `event_time` horizon clamp so a
-  charge older than the retained pools is dropped or booked to a fixed
-  archive row, and keeping watermark rows out of the prune.
+- *S10 prune re-charge (M3), fixed by HORO-2250.* Reproduced through the real
+  request path: `shared-budget prune` deleted a closed pool and with it the
+  idempotency memory of the charges booked there, so a subagent file charged in
+  that month and swept again later (the `Stop` sweep re-checks every file once
+  after a daemon restart, and a resumed session can be months old) was charged
+  a second time, recreating the pruned pool. A charge whose event time falls in
+  a period **older than the oldest retained pool** is now refused
+  (`EventBeforeRetention`, protocol v24) and books nothing; a retry of a charge
+  that already exists still resolves to its own pool first. Month accounting is
+  unchanged. **Residual:** a hand-made `ChargeAgent` for an event before the
+  first pool the budget ever created is refused too (it predates the budget);
+  the caller sees the refusal, and the sweep retries it harmlessly at each
+  `Stop`. A watermark lost to a prune still falls back to the lane's oldest
+  remaining hold.
 - Flush lag costs a flat hold when an entire Stop window is still unflushed
   after the `Stop` hook's bounded wait (it settles at the hold amount, an
   over-count that is not reconciled later). The wait makes this rare on the
@@ -749,11 +755,10 @@ a **separate, versioned workstream and is not delivered** by this ADR.
   open the ledger read-only (no migration, no WAL checkpoint) and refuse a
   schema that is not current.
 - **Export before prune.** Pruned periods can no longer be exported, and a
-  pruned period also drops its idempotency-key memory: replaying a charge
-  older than the retention window is treated as new (a backdated charge
-  whose event time falls in a pruned period would recreate the pool and
-  book again). Follow-up, not done here: the daemon should refuse or clamp
-  an `event_time` older than the retention horizon.
+  pruned period also drops its idempotency-key memory. Since HORO-2250 the
+  daemon refuses (`EventBeforeRetention`, books nothing) a charge whose event
+  time falls in a period older than the oldest retained pool, so a replay of an
+  old charge cannot recreate the pruned pool and book again.
 - `export --period YYYY-MM` writes a local `0600` file (schema
   `libra.shared-budget-export.v1`, per-executor aggregates plus pool
   totals, SHA-256 over the canonical body, no content). Session and agent
