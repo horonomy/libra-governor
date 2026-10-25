@@ -2774,3 +2774,70 @@ fn a_charge_agent_replay_into_a_pruned_period_is_refused() {
     expect_refused(outcome, SharedBudgetRefusal::EventBeforeRetention);
     assert_eq!(fx.pools().len(), 1);
 }
+
+fn charge_agent_at(fx: &mut Fx, key: &str, event: &str) -> SharedBudgetOutcome {
+    fx.sb(SharedBudgetRequest::ChargeAgent {
+        session_id: "s1".into(),
+        agent_id: Some("aaa1".into()),
+        amount_usd_cents: 300,
+        idempotency_key: key.into(),
+        charge_source: libra_governor_domain::ChargeSource::SubagentTranscript,
+        event_time: Some(event.into()),
+    })
+}
+
+#[test]
+fn pruning_every_pool_does_not_reopen_the_guard() {
+    // Prune with NO later admit: the January pool is the only one and goes.
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    grant(fx.admit("s1", None, Some("p1")));
+    fx.clock.set(at(60));
+    fx.finalize_for_prompt("s1", None, Some("p1"));
+    fx.clock.set(t("2027-05-10T12:00:00Z"));
+    let report = fx.prune_keeping_one_month();
+    assert_eq!(report.pools_pruned, 1, "{report:?}");
+    assert!(fx.pools().is_empty(), "no pool remains");
+
+    expect_refused(
+        charge_agent_at(&mut fx, "k1", "2027-01-15T12:00:12Z"),
+        SharedBudgetRefusal::EventBeforeRetention,
+    );
+    assert!(fx.pools().is_empty(), "January was not recreated");
+    // The current period still works with no pool at all.
+    let ok = charge_agent_at(&mut fx, "k2", "2027-05-10T11:00:00Z");
+    assert!(matches!(ok, SharedBudgetOutcome::Charged { .. }), "{ok:?}");
+    assert_eq!(fx.pools().len(), 1);
+}
+
+#[test]
+fn an_event_in_the_oldest_retained_period_is_allowed_and_a_refusal_changes_nothing() {
+    let (mut fx, _main, _sub) = january_subagent_charged_then_pruned();
+    // Pools: May only. Keep-1 means April would be retained; add it by a
+    // charge into the current period first, then check the boundary.
+    let before = fx.fingerprint();
+    expect_refused(
+        charge_agent_at(&mut fx, "k1", "2027-04-30T23:00:00Z"),
+        SharedBudgetRefusal::EventBeforeRetention,
+    );
+    expect_refused(
+        charge_agent_at(&mut fx, "k1", "2027-04-30T23:00:00Z"),
+        SharedBudgetRefusal::EventBeforeRetention,
+    );
+    assert_eq!(fx.fingerprint(), before, "refusals write nothing");
+    // Exactly the oldest retained period (May) is allowed.
+    let ok = charge_agent_at(&mut fx, "k2", "2027-05-01T00:00:00Z");
+    assert!(matches!(ok, SharedBudgetOutcome::Charged { .. }), "{ok:?}");
+    // A retry of an existing key still resolves to its own row.
+    let again = charge_agent_at(&mut fx, "k2", "2027-05-01T00:00:00Z");
+    assert!(
+        matches!(
+            again,
+            SharedBudgetOutcome::Charged {
+                already_charged: true,
+                ..
+            }
+        ),
+        "{again:?}"
+    );
+}
+

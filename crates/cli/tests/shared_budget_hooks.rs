@@ -634,7 +634,7 @@ fn stop_finalize_carries_the_prompt_id_the_host_named() {
     let finalize = fake
         .requests()
         .into_iter()
-        .find(|r| r["type"] == "finalize" || r["kind"] == "finalize")
+        .find(|r| r["kind"] == "finalize")
         .expect("a Finalize was sent");
     assert_eq!(finalize["prompt_id"], "pid-7", "{finalize}");
 
@@ -648,7 +648,7 @@ fn stop_finalize_carries_the_prompt_id_the_host_named() {
     let finalize = fake
         .requests()
         .into_iter()
-        .find(|r| r["type"] == "finalize" || r["kind"] == "finalize")
+        .find(|r| r["kind"] == "finalize")
         .expect("a Finalize was sent");
     assert!(finalize.get("prompt_id").is_none(), "{finalize}");
 }
