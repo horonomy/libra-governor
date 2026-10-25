@@ -308,6 +308,103 @@ fn fraction_left(posture: Option<BudgetPosture>) -> f64 {
     }
 }
 
+#[test]
+fn duplicate_legacy_stop_is_a_persistent_no_op_without_consuming_another_lane() {
+    let mut h = Harness::new();
+    let first = h.turn("duplicate-stop", SMALL_TURN_TOKENS).receipt;
+    let before = h.ledger.task_trajectory(first.task_id).unwrap();
+    let reservations = h.ledger.reservations_for_task(first.task_id).unwrap();
+    for reopened in [false, true] {
+        if reopened {
+            h.ledger = LedgerStore::open_in_memory().unwrap();
+            h.ledger = LedgerStore::open(&h.config.ledger_path).unwrap();
+        }
+        let duplicate = h.send(Request::Finalize {
+            agent_id: None,
+            prompt_id: None,
+            session_id: "duplicate-stop".into(),
+            model: None,
+            provider: None,
+            transcript_path: None,
+        });
+        assert!(
+            matches!(duplicate, Response::Finalize(FinalizeOutcome::NoActiveTask)),
+            "{duplicate:?}"
+        );
+        assert_eq!(h.ledger.task_trajectory(first.task_id).unwrap(), before);
+        assert_eq!(
+            h.ledger.reservations_for_task(first.task_id).unwrap(),
+            reservations
+        );
+    }
+    let second = h.turn("duplicate-stop", SMALL_TURN_TOKENS).receipt;
+    assert_ne!(second.plan_id, first.plan_id);
+    let receipts = h.ledger.task_trajectory(first.task_id).unwrap().receipts;
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(
+        receipts[0], first,
+        "duplicate must not advance the usage boundary or replace history"
+    );
+
+    let parent = h.preflight("parent");
+    Harness::assert_admitted(&parent);
+    let child = match h.send(Request::Preflight {
+        agent_id: Some("child".into()),
+        provider: None,
+        task_hint: "fix the login bug".into(),
+        cwd: fixture_repo(),
+        session_id: "parent".into(),
+    }) {
+        Response::Preflight(result) => *result,
+        other => panic!("expected child preflight: {other:?}"),
+    };
+    Harness::assert_admitted(&child);
+    for repeat in [false, true] {
+        let result = h.send(Request::Finalize {
+            agent_id: Some("child".into()),
+            prompt_id: None,
+            session_id: "parent".into(),
+            model: None,
+            provider: None,
+            transcript_path: None,
+        });
+        if repeat {
+            assert!(matches!(
+                result,
+                Response::Finalize(FinalizeOutcome::NoActiveTask)
+            ));
+        } else {
+            assert!(matches!(
+                result,
+                Response::Finalize(FinalizeOutcome::Finalized(_))
+            ));
+        }
+        assert!(h
+            .ledger
+            .task_trajectory(parent.task_id)
+            .unwrap()
+            .receipts
+            .is_empty());
+    }
+    assert_eq!(
+        h.ledger
+            .task_trajectory(child.task_id)
+            .unwrap()
+            .receipts
+            .len(),
+        1
+    );
+    let _ = h.finalize("parent", None);
+    assert_eq!(
+        h.ledger
+            .task_trajectory(parent.task_id)
+            .unwrap()
+            .receipts
+            .len(),
+        1
+    );
+}
+
 // --- AC 6: settlement records a measurement, or says it did not -------
 
 /// The defect itself, at its narrowest: a receipt from a turn whose host

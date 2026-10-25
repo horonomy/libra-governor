@@ -700,9 +700,10 @@ pub enum ReplanState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum FinalizeOutcome {
-    /// `session_id` has no task bound to it — e.g. `Stop` fired with no
-    /// preceding `Preflight`/`UserPromptSubmit` for this session. Not an
-    /// error: finalizing is a safe no-op.
+    /// No pending legacy receipt: no task/preflight for this session, or
+    /// the selected task/plan already has a receipt. Not an error; legacy
+    /// finalization is a safe no-op. Independent shared-budget processing
+    /// may still have run before this outcome.
     NoActiveTask,
     /// Boxed: `FinalizeResult` embeds a full `ExecutionReceipt`, which
     /// made this enum's largest variant ~336 bytes against `NoActiveTask`'s

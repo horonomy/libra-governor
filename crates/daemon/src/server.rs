@@ -2368,6 +2368,16 @@ fn handle_finalize_for_lane(
         }
     }
     let lane = resolve_finalize_lane(ledger, session_id, lane)?;
+    // Legacy preflights remain in_flight after their receipt is recorded.
+    // A replay has no new legacy receipt to write, but must still run the
+    // independent shared-budget settlement and sweep above.
+    if let Some(task_id) = ledger.task_id_for_session(lane)? {
+        if let Some(plan_id) = ledger.in_flight_plan_for_session(lane)? {
+            if ledger.receipt_exists(task_id, plan_id)? {
+                return Ok(FinalizeOutcome::NoActiveTask);
+            }
+        }
+    }
     finalize_with_usage(
         lane,
         model,
