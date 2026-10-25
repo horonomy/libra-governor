@@ -111,6 +111,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 23,
         sql: include_str!("../migrations/0023_shared_charge_floor.sql"),
     },
+    Migration {
+        version: 24,
+        sql: include_str!("../migrations/0024_shared_hold_prompts.sql"),
+    },
 ];
 
 /// The highest migration version this build of the crate knows about
@@ -424,8 +428,8 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 23);
-        assert_eq!(latest_known_version(), 23);
+        assert_eq!(version, 24);
+        assert_eq!(latest_known_version(), 24);
         // Re-applying is a no-op.
         apply_all(&mut conn).unwrap();
     }

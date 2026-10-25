@@ -755,3 +755,158 @@ fn a_prune_that_fails_midway_leaves_no_floor_and_no_horizon() {
     assert_eq!(count("shared_charge_floor"), 1);
     assert_eq!(count("shared_retention_horizon"), 1);
 }
+
+#[test]
+fn a_renewal_records_its_prompt_atomically_and_a_prune_keeps_it() {
+    use libra_governor_ledger::SharedPoolRenewOutcome;
+    let (_dir, mut store) = new_store();
+    let id = pool("monthly-2026-07");
+    ensure(&mut store, &id);
+    let h = hold(
+        &mut store,
+        &id,
+        "s1",
+        10,
+        "hold-1",
+        (now(), 3600),
+        ExecutorAttribution::default(),
+    );
+    let renew = |store: &mut LedgerStore, prompt: &str| {
+        store
+            .renew_shared_for_prompt(h, &owner(), "s1", now(), 3600, Some(prompt))
+            .unwrap()
+    };
+    assert!(matches!(
+        renew(&mut store, "p2"),
+        SharedPoolRenewOutcome::Renewed(_)
+    ));
+    assert!(matches!(
+        renew(&mut store, "p3"),
+        SharedPoolRenewOutcome::Renewed(_)
+    ));
+    let got = |store: &LedgerStore, p: &str| store.hold_for_prompt(&owner(), "s1", p).unwrap();
+    assert_eq!((got(&store, "p2"), got(&store, "p3")), (Some(h), Some(h)));
+    assert_eq!(got(&store, "p9"), None);
+    assert_eq!(
+        store.hold_for_prompt(&owner(), "other", "p2").unwrap(),
+        None,
+        "scoped to the session"
+    );
+
+    // A refused renewal (the hold is no longer active) records nothing.
+    store.release_shared(h, now()).unwrap();
+    assert!(matches!(
+        renew(&mut store, "p4"),
+        SharedPoolRenewOutcome::Refused(_)
+    ));
+    assert_eq!(got(&store, "p4"), None, "a refused renewal leaves no row");
+
+    // The mapping outlives the pruned hold.
+    assert_eq!(prune(&mut store, 1, false).pools_pruned, 1);
+    assert_eq!(row_count(&store, &id), 0);
+    assert_eq!(got(&store, "p2"), Some(h));
+}
+
+#[test]
+fn a_grant_records_its_prompt_in_its_own_transaction_and_a_refusal_records_nothing() {
+    let (_dir, mut store) = new_store();
+    let id = pool("monthly-2026-10");
+    ensure(&mut store, &id);
+    let reserve = |store: &mut LedgerStore, amount: u64, key: &str, prompt: &str| {
+        store
+            .reserve_shared_metered_for_prompt(
+                MeteredReserveRequest {
+                    base: SharedPoolReserveRequest {
+                        pool_id: &id,
+                        principal_id: &owner(),
+                        session_id: "s1",
+                        amount,
+                        unit: &QuotaUnit::UsdCents,
+                        idempotency_key: key,
+                        now: now(),
+                        ttl_secs: 3600,
+                        attribution: ExecutorAttribution::default(),
+                    },
+                    session_cap: None,
+                    capacity_source: cap(),
+                },
+                Some(prompt),
+            )
+            .unwrap()
+    };
+    let granted = match reserve(&mut store, 10, "k1", "p1") {
+        MeteredReserveOutcome::Granted(h) => h.id,
+        other => panic!("{other:?}"),
+    };
+    let got = |store: &LedgerStore, p: &str| store.hold_for_prompt(&owner(), "s1", p).unwrap();
+    assert_eq!(got(&store, "p1"), Some(granted));
+    // A retry of the same key resolves to the same live hold.
+    assert!(matches!(
+        reserve(&mut store, 10, "k1", "p1b"),
+        MeteredReserveOutcome::AlreadyGranted(_)
+    ));
+    assert_eq!(got(&store, "p1b"), Some(granted));
+    // Over the cap: refused, and no prompt row is left behind.
+    assert!(matches!(
+        reserve(&mut store, 5_000_000, "k2", "p2"),
+        MeteredReserveOutcome::Insufficient { .. }
+    ));
+    assert_eq!(got(&store, "p2"), None);
+}
+
+#[test]
+fn a_failed_prompt_insert_rolls_the_whole_grant_back_and_leaves_the_store_usable() {
+    let (dir, mut store) = new_store();
+    let id = pool("monthly-2026-10");
+    ensure(&mut store, &id);
+    let raw = rusqlite::Connection::open(dir.path().join("ledger.sqlite3")).unwrap();
+    raw.execute_batch(
+        "CREATE TRIGGER boom BEFORE INSERT ON shared_hold_prompts
+         BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+    )
+    .unwrap();
+    let reserve = |store: &mut LedgerStore, key: &str, prompt: &str| {
+        store.reserve_shared_metered_for_prompt(
+            MeteredReserveRequest {
+                base: SharedPoolReserveRequest {
+                    pool_id: &id,
+                    principal_id: &owner(),
+                    session_id: "s1",
+                    amount: 10,
+                    unit: &QuotaUnit::UsdCents,
+                    idempotency_key: key,
+                    now: now(),
+                    ttl_secs: 3600,
+                    attribution: ExecutorAttribution::default(),
+                },
+                session_cap: None,
+                capacity_source: cap(),
+            },
+            Some(prompt),
+        )
+    };
+    assert!(
+        reserve(&mut store, "k1", "p1").is_err(),
+        "the insert failure surfaces"
+    );
+    let count = |table: &str| -> i64 {
+        raw.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(
+        count("shared_pool_reservations"),
+        0,
+        "the hold was rolled back"
+    );
+    assert_eq!(count("shared_hold_prompts"), 0);
+    assert_eq!(row_count(&store, &id), 0);
+
+    // The connection is back in autocommit: a later grant works and is durable.
+    raw.execute_batch("DROP TRIGGER boom").unwrap();
+    assert!(matches!(
+        reserve(&mut store, "k1", "p1").unwrap(),
+        MeteredReserveOutcome::Granted(_)
+    ));
+    assert_eq!(count("shared_pool_reservations"), 1);
+    assert_eq!(count("shared_hold_prompts"), 1);
+}

@@ -469,12 +469,36 @@ id, path or content).
   empty window (the hold amount), booking a turn that had not happened. Now
   `Finalize` carries the `Stop`'s optional `prompt_id` (protocol v24, relayed by
   `hook stop`), and a `Stop` naming a prompt whose own hold has already settled
-  settles nothing. **Residual:** the guard needs the id. A `Stop` without one
-  (an older hook, a host that omits it) is indistinguishable from a real `Stop`
-  whose transcript has not flushed and still settles the pending hold; and when
-  a re-prompt renewed the hold (no `Stop` between), only the first prompt's id
-  is recorded on the hold, so a later duplicate of the *second* prompt's `Stop`
-  is not recognised. The legacy task `Finalize` is unchanged.
+  settles nothing. Every prompt id a hold accepts is recorded, in the same
+  transaction as the admit or renewal, in `shared_hold_prompts` (migration 0024,
+  keyed by principal, session and prompt id, pointing at the hold). A re-prompt
+  renews the hold and keeps its first idempotency key, so the table is what
+  makes a replayed `Stop(p2)` recognisable after the lane's next hold exists
+  (a `Stop` whose prompt maps to a hold other than the pending one settles
+  nothing). The row is not tied to the hold or its pool, so it survives a
+  retention prune of the hold, and it is durable across daemon restarts; a
+  re-sent prompt id re-points to the newest hold. The first-prompt key check is
+  only the fallback for a prompt with no mapping (a hold admitted before
+  migration 0024); when a mapping exists it alone decides, so a re-sent id still
+  settles its newest hold. Only the **main** lane records or renews a mapping: a
+  subagent `Admit` carrying the parent's prompt id cannot take it over. The
+  grant and its row commit together (`reserve_shared_metered_for_prompt`, one
+  outer transaction), as does a renewal. No session-erase or export path reads
+  or deletes this table, `shared_charge_floor` or `shared_retention_horizon`
+  (export is per pool; nothing erases sessions), so nothing needs to cover them.
+  **Residual:** the guard needs the id. A `Stop` without one (an older hook, a
+  host that omits it) is indistinguishable from a real `Stop` whose transcript
+  has not flushed and still settles the pending hold. The table grows by one
+  small row per prompt and is not pruned. A prompt id longer than 256 bytes is
+  treated as absent (never truncated, so two ids cannot collide), which bounds
+  that row's size. A duplicate or late replay of `Admit(p1)` after `p2` is
+  admitted re-points `p1` to the newest hold: a re-sent id means "a new turn
+  for this id" and the host id cannot say otherwise, so a later `Stop(p1)` then
+  settles that newest hold. A late `Stop` for an older hold that never settled
+  is skipped without touching the newer hold; its spend is not lost, because the
+  next hold's transcript window starts at the lane watermark, which that
+  settlement never advanced, and so counts those records. The legacy task
+  `Finalize` is unchanged.
   **Host assumption, unproven:** that the `prompt_id` on a `Stop` equals the
   one on that turn's `UserPromptSubmit` (ADR evidence lists both payloads as
   carrying `prompt_id`; their equality has not been observed on a real host).

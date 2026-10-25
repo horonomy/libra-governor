@@ -2902,3 +2902,339 @@ fn replaying_the_pruned_subagent_total_books_zero() {
     assert_eq!(subagent_used(&mut fx), 0, "nothing was re-booked");
     assert_eq!(fx.pools().len(), 1);
 }
+
+// ---------------------------------------------------------------------
+// HORO-2250 follow-up: a RENEWED prompt's Stop replayed after the next Admit
+// ---------------------------------------------------------------------
+
+impl Fx {
+    /// A daemon restart: the ledger file is reopened, every in-memory fact lost.
+    fn restart(&mut self) {
+        self.ledger = LedgerStore::open(&self.config.ledger_path).unwrap();
+    }
+}
+
+fn state_of(
+    h: &libra_governor_domain::SharedPoolReservation,
+) -> libra_governor_domain::ReservationState {
+    h.state
+}
+
+/// p1 admits H1, a re-prompt p2 renews it, `Stop(p2)` settles it at 300c.
+fn renewed_then_settled(restart: bool) -> (Fx, std::path::PathBuf) {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    grant(fx.admit("s1", None, Some("p1")));
+    fx.clock.set(at(5));
+    grant(fx.admit("s1", None, Some("p2")));
+    assert_eq!(fx.lane("s1").len(), 1, "p2 renewed H1");
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    if restart {
+        fx.restart();
+    }
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p2"));
+    assert_eq!(totals(&fx.status()), (300, 0));
+    (fx, tx)
+}
+
+fn assert_h3_untouched(fx: &mut Fx) {
+    let lane = fx.lane("s1");
+    assert_eq!(lane.len(), 2, "H1 and H3 only");
+    assert_eq!(
+        state_of(&lane[0]),
+        libra_governor_domain::ReservationState::Settled
+    );
+    assert_eq!(lane[0].settled_amount, Some(300));
+    assert_eq!(
+        state_of(&lane[1]),
+        libra_governor_domain::ReservationState::Active
+    );
+    assert_eq!(lane[1].settled_amount, None, "H3 was never settled");
+    assert_eq!(totals(&fx.status()), (300, 1_000));
+}
+
+#[test]
+fn a_replayed_stop_of_a_renewed_prompt_does_not_settle_the_next_hold() {
+    let (mut fx, tx) = renewed_then_settled(false);
+    fx.clock.set(at(100));
+    grant(fx.admit("s1", None, Some("p3")));
+    let before = fx.fingerprint();
+    fx.clock.set(at(110));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p2"));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p2"));
+    assert_h3_untouched(&mut fx);
+    assert_eq!(fx.fingerprint(), before, "the replays wrote nothing");
+}
+
+#[test]
+fn after_a_replay_the_real_stop_for_the_next_prompt_settles_exactly_once() {
+    let (mut fx, tx) = renewed_then_settled(false);
+    fx.clock.set(at(100));
+    grant(fx.admit("s1", None, Some("p3")));
+    fx.clock.set(at(110));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p2"));
+    append_lines(&tx, &[rec(120, "m2", SONNET, mi(2), Some("s1"), false)]);
+    fx.clock.set(at(150));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p3"));
+    assert_eq!(totals(&fx.status()), (900, 0), "300 + 600, each once");
+    let before = fx.fingerprint();
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p3"));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p2"));
+    assert_eq!(fx.fingerprint(), before);
+}
+
+#[test]
+fn the_renewed_prompt_identity_survives_a_daemon_restart() {
+    let (mut fx, tx) = renewed_then_settled(true);
+    fx.clock.set(at(100));
+    grant(fx.admit("s1", None, Some("p3")));
+    fx.restart();
+    fx.clock.set(at(110));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p2"));
+    assert_h3_untouched(&mut fx);
+    fx.restart();
+    append_lines(&tx, &[rec(120, "m2", SONNET, mi(2), Some("s1"), false)]);
+    fx.clock.set(at(150));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p3"));
+    assert_eq!(totals(&fx.status()), (900, 0));
+}
+
+#[test]
+fn every_prompt_a_hold_renewed_through_is_recognised_as_a_replay() {
+    // p1 -> p2 -> p3 all land on H1; Stop(p3) settles it.
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    for (secs, p) in [(0, "p1"), (3, "p2"), (6, "p3")] {
+        fx.clock.set(at(secs));
+        grant(fx.admit("s1", None, Some(p)));
+    }
+    assert_eq!(fx.lane("s1").len(), 1);
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p3"));
+    assert_eq!(totals(&fx.status()), (300, 0));
+    fx.clock.set(at(100));
+    grant(fx.admit("s1", None, Some("p4")));
+    for p in ["p1", "p2", "p3"] {
+        fx.clock.set(at(110));
+        fx.finalize_for_prompt("s1", Some(&s(&tx)), Some(p));
+        assert_h3_untouched(&mut fx);
+    }
+}
+
+#[test]
+fn a_renewed_prompts_own_stop_still_settles_its_active_hold() {
+    // The guard must not swallow the legitimate case: Stop(p2) for the hold
+    // p2 renewed, with no later hold.
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    grant(fx.admit("s1", None, Some("p1")));
+    fx.clock.set(at(5));
+    grant(fx.admit("s1", None, Some("p2")));
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p2"));
+    assert_eq!(totals(&fx.status()), (300, 0));
+}
+
+#[test]
+fn the_renewed_prompt_identity_survives_a_prune_of_its_settled_hold() {
+    // H1 (renewed through p2) settles in January and its pool is pruned;
+    // H3 is in May. Replaying Stop(p2) must not consume H3.
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    grant(fx.admit("s1", None, Some("p1")));
+    fx.clock.set(at(5));
+    grant(fx.admit("s1", None, Some("p2")));
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p2"));
+    fx.clock.set(t("2027-05-10T12:00:00Z"));
+    grant(fx.admit("s1", None, Some("p3")));
+    let report = fx.prune_keeping_one_month();
+    assert_eq!(report.pools_pruned, 1, "{report:?}");
+    assert_eq!(fx.lane("s1").len(), 1, "only H3 remains");
+    let before = fx.fingerprint();
+    fx.clock.set(t("2027-05-10T12:05:00Z"));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p2"));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p1"));
+    assert_eq!(
+        fx.fingerprint(),
+        before,
+        "replays after the prune write nothing"
+    );
+    let lane = fx.lane("s1");
+    assert_eq!(
+        state_of(&lane[0]),
+        libra_governor_domain::ReservationState::Active
+    );
+    assert_eq!(lane[0].settled_amount, None);
+}
+
+// ---------------------------------------------------------------------
+// HORO-2250 review round 1: lanes, sessions, expiry, upgrade
+// ---------------------------------------------------------------------
+
+fn lane_states(fx: &Fx) -> Vec<(libra_governor_domain::ReservationState, Option<u64>)> {
+    fx.lane("s1")
+        .iter()
+        .map(|h| (h.state, h.settled_amount))
+        .collect()
+}
+
+#[test]
+fn a_subagent_admit_carrying_the_parents_prompt_id_does_not_take_over_the_mapping() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    grant(fx.admit("s1", None, Some("p1")));
+    // The subagent lane is admitted, then renewed, both naming the parent's p1.
+    fx.clock.set(at(3));
+    grant(fx.admit("s1", Some("aaa1"), Some("p1")));
+    fx.clock.set(at(6));
+    grant(fx.admit("s1", Some("aaa1"), Some("p1")));
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p1"));
+    let main = fx.lane("s1");
+    assert_eq!(main.len(), 1);
+    assert_eq!(
+        (main[0].state, main[0].settled_amount),
+        (libra_governor_domain::ReservationState::Settled, Some(300)),
+        "the main Stop still settles the main hold"
+    );
+}
+
+#[test]
+fn a_re_sent_prompt_id_points_at_its_newest_hold_and_that_stop_settles() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    grant(fx.admit("s1", None, Some("p1")));
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p1"));
+    // The same prompt id arrives again for a new turn (a second hold).
+    fx.clock.set(at(100));
+    grant(fx.admit("s1", None, Some("p1")));
+    assert_eq!(fx.lane("s1").len(), 2);
+    append_lines(&tx, &[rec(110, "m2", SONNET, mi(2), Some("s1"), false)]);
+    fx.clock.set(at(150));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p1"));
+    assert_eq!(
+        totals(&fx.status()),
+        (900, 0),
+        "the new hold settled at 600"
+    );
+}
+
+#[test]
+fn a_replayed_stop_does_not_settle_an_expired_pending_hold_but_its_own_stop_does() {
+    let (mut fx, tx) = after_turn_one_and_the_next_admit();
+    // H2 outlives its TTL unswept; Stop(p1) is replayed.
+    fx.clock.set(at(100 + 24 * 3600));
+    let before = fx.fingerprint();
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p1"));
+    assert_eq!(fx.fingerprint(), before, "the replay wrote nothing");
+    // A late real Stop for p2 still settles that hold in its own row.
+    append_lines(&tx, &[rec(120, "m2", SONNET, mi(2), Some("s1"), false)]);
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p2"));
+    assert_eq!(fx.lane("s1")[1].settled_amount, Some(600));
+}
+
+#[test]
+fn the_same_prompt_id_in_two_sessions_never_interacts() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let t1 = fx.path().join("s1.jsonl");
+    let t2 = fx.path().join("s2.jsonl");
+    grant(fx.admit("s1", None, Some("p1")));
+    write_lines(&t1, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize_for_prompt("s1", Some(&s(&t1)), Some("p1"));
+    grant(fx.admit("s2", None, Some("p1")));
+    write_lines(&t2, &[rec(70, "m2", SONNET, mi(2), Some("s2"), false)]);
+    // Replaying s1's Stop leaves s2's hold alone; s2's own Stop settles it.
+    fx.clock.set(at(80));
+    fx.finalize_for_prompt("s1", Some(&s(&t1)), Some("p1"));
+    assert_eq!(totals(&fx.status()), (300, 1_000));
+    fx.finalize_for_prompt("s2", Some(&s(&t2)), Some("p1"));
+    assert_eq!(totals(&fx.status()), (900, 0));
+}
+
+#[test]
+fn holds_admitted_before_the_prompt_table_existed_keep_the_first_prompt_guard() {
+    let (mut fx, tx) = after_turn_one_and_the_next_admit();
+    // Simulate a ledger written before migration 0024: no prompt rows.
+    {
+        let raw = rusqlite::Connection::open(&fx.config.ledger_path).unwrap();
+        raw.execute_batch("DELETE FROM shared_hold_prompts")
+            .unwrap();
+    }
+    fx.restart();
+    fx.clock.set(at(110));
+    let before = fx.fingerprint();
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p1"));
+    assert_eq!(
+        fx.fingerprint(),
+        before,
+        "the first-prompt key still catches p1"
+    );
+    // Without a mapping, Stop(p2) proceeds as before and settles H2.
+    append_lines(&tx, &[rec(120, "m2", SONNET, mi(2), Some("s1"), false)]);
+    fx.clock.set(at(150));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p2"));
+    assert_eq!(totals(&fx.status()), (900, 0));
+}
+
+#[test]
+fn a_late_stop_for_an_older_unsettled_hold_does_not_settle_the_newer_pending_one() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    grant(fx.admit("s1", None, Some("p1")));
+    // H1's Stop never arrives; its TTL lapses and the next Admit sweeps it.
+    fx.clock.set(at(24 * 3600));
+    grant(fx.admit("s1", None, Some("p2")));
+    let states = lane_states(&fx);
+    assert_eq!(states.len(), 2);
+    assert_eq!(
+        states[0].0,
+        libra_governor_domain::ReservationState::Expired
+    );
+    write_lines(
+        &tx,
+        &[rec(24 * 3600 + 5, "m1", SONNET, mi(1), Some("s1"), false)],
+    );
+    fx.clock.set(at(24 * 3600 + 10));
+    let before = fx.fingerprint();
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p1"));
+    assert_eq!(fx.fingerprint(), before, "the newer hold is not consumed");
+    assert_eq!(
+        fx.lane("s1")[1].state,
+        libra_governor_domain::ReservationState::Active
+    );
+}
+
+#[test]
+fn an_over_long_prompt_id_is_treated_as_absent_and_never_truncated() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let long = "x".repeat(257);
+    let tx = fx.path().join("s1.jsonl");
+    grant(fx.admit("s1", None, Some(&long)));
+    let rows: i64 = rusqlite::Connection::open(&fx.config.ledger_path)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM shared_hold_prompts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "nothing was stored for it");
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    // With the id ignored, the Stop settles like an id-less one.
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some(&long));
+    assert_eq!(totals(&fx.status()), (300, 0));
+    // The longest accepted id (256 bytes) is kept.
+    let edge = "y".repeat(256);
+    grant(fx.admit("s1", None, Some(&edge)));
+    let rows: i64 = rusqlite::Connection::open(&fx.config.ledger_path)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM shared_hold_prompts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1);
+}

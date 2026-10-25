@@ -1658,6 +1658,40 @@ impl LedgerStore {
         }
     }
 
+    /// [`Self::reserve_shared_metered`] that also records `prompt_id` as
+    /// accepted by the granted (or live, retried) hold, in one transaction
+    /// with the grant (HORO-2250). `None` is exactly `reserve_shared_metered`.
+    pub fn reserve_shared_metered_for_prompt(
+        &mut self,
+        req: MeteredReserveRequest<'_>,
+        prompt_id: Option<&str>,
+    ) -> Result<MeteredReserveOutcome, LedgerError> {
+        let Some(prompt) = prompt_id else {
+            return self.reserve_shared_metered(req);
+        };
+        let principal = req.base.principal_id.clone();
+        let session = req.base.session_id.to_string();
+        // One outer transaction (rollback on error or failed COMMIT, panic
+        // safe): the reserve's own `begin` nests as a savepoint, so the grant
+        // and its prompt row commit or roll back together.
+        self.with_immediate_transaction(|store| {
+            let outcome = store.reserve_shared_metered(req)?;
+            let hold = match &outcome {
+                MeteredReserveOutcome::Granted(h) => Some(h),
+                MeteredReserveOutcome::AlreadyGranted(h)
+                    if h.state == ReservationState::Active && h.session_id == session =>
+                {
+                    Some(h)
+                }
+                _ => None,
+            };
+            if let Some(h) = hold {
+                Self::record_hold_prompt_tx(&store.conn, &principal, &session, prompt, h.id)?;
+            }
+            Ok::<_, LedgerError>(outcome)
+        })
+    }
+
     /// Shared reserve mechanics for both [`Self::reserve_shared`] (no
     /// `metered` gate) and [`Self::reserve_shared_metered`] (`Some` gate).
     /// See module docs for the transaction/idempotency guarantees that
@@ -2122,6 +2156,21 @@ impl LedgerStore {
         now: OffsetDateTime,
         ttl_secs: u64,
     ) -> Result<SharedPoolRenewOutcome, LedgerError> {
+        self.renew_shared_for_prompt(id, principal_id, session_id, now, ttl_secs, None)
+    }
+
+    /// [`Self::renew_shared`] that also records `prompt_id` as accepted by the
+    /// hold, in the same transaction and only when the renewal succeeds
+    /// (HORO-2250). See [`Self::record_hold_prompt`].
+    pub fn renew_shared_for_prompt(
+        &mut self,
+        id: SharedPoolReservationId,
+        principal_id: &PrincipalId,
+        session_id: &str,
+        now: OffsetDateTime,
+        ttl_secs: u64,
+        prompt_id: Option<&str>,
+    ) -> Result<SharedPoolRenewOutcome, LedgerError> {
         let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
         let Some(reservation) = Self::get_shared_reservation_tx(&tx, id)? else {
             tx.commit()?;
@@ -2166,10 +2215,73 @@ impl LedgerStore {
         }
         let updated_reservation = Self::get_shared_reservation_tx(&tx, id)?
             .expect("row just updated in this same transaction");
+        if let Some(prompt) = prompt_id {
+            Self::record_hold_prompt_tx(&tx, principal_id, session_id, prompt, id)?;
+        }
         tx.commit()?;
         Ok(SharedPoolRenewOutcome::Renewed(Box::new(
             updated_reservation,
         )))
+    }
+
+    fn record_hold_prompt_tx(
+        tx: &rusqlite::Connection,
+        principal_id: &PrincipalId,
+        session_id: &str,
+        prompt_id: &str,
+        reservation: SharedPoolReservationId,
+    ) -> Result<(), LedgerError> {
+        tx.execute(
+            "INSERT INTO shared_hold_prompts (principal_id, session_id, prompt_id, reservation_id)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (principal_id, session_id, prompt_id)
+             DO UPDATE SET reservation_id = excluded.reservation_id",
+            rusqlite::params![
+                principal_id.0,
+                session_id,
+                prompt_id,
+                reservation.0.to_string()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Records that the hold `reservation` accepted the host prompt
+    /// `prompt_id` (HORO-2250). A re-sent id re-points to the newest hold.
+    /// The row outlives the hold: a retention prune does not touch it.
+    pub fn record_hold_prompt(
+        &mut self,
+        principal_id: &PrincipalId,
+        session_id: &str,
+        prompt_id: &str,
+        reservation: SharedPoolReservationId,
+    ) -> Result<(), LedgerError> {
+        Self::record_hold_prompt_tx(&self.conn, principal_id, session_id, prompt_id, reservation)
+    }
+
+    /// The hold that accepted `prompt_id` for this session, if one was recorded.
+    pub fn hold_for_prompt(
+        &self,
+        principal_id: &PrincipalId,
+        session_id: &str,
+        prompt_id: &str,
+    ) -> Result<Option<SharedPoolReservationId>, LedgerError> {
+        let found: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT reservation_id FROM shared_hold_prompts
+                 WHERE principal_id = ?1 AND session_id = ?2 AND prompt_id = ?3",
+                rusqlite::params![principal_id.0, session_id, prompt_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        found
+            .map(|s| {
+                uuid::Uuid::parse_str(&s)
+                    .map(SharedPoolReservationId)
+                    .map_err(|_| invalid())
+            })
+            .transpose()
     }
 
     /// Reclaims every `active` shared-pool hold whose `expires_at <= now`
