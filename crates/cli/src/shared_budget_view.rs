@@ -287,7 +287,7 @@ fn committed(status: &SharedBudgetStatus) -> u64 {
 
 /// The short statusline segment, e.g. `budget $12.30/$500 (2%)` with a
 /// ` WARN` marker when a soft limit is crossed or the pool is overrun, and
-/// a ` · blocked: next prompt denied` marker once less than a turn hold
+/// a ` · budget low: new sessions blocked` marker once less than a turn hold
 /// remains. `None` for a state that has nothing useful to say in a few characters.
 pub fn statusline_segment(status: &SharedBudgetStatus) -> Option<String> {
     match status.config_state {
@@ -311,10 +311,11 @@ pub fn statusline_segment(status: &SharedBudgetStatus) -> Option<String> {
     // At or below zero remaining, admission is closed (fully held or overrun).
     let closed = status.remaining_usd_cents.is_some_and(|r| r <= 0);
     let warn = !status.warnings.is_empty() || closed;
-    // Less than one turn hold left: the next prompt for a lane without a hold
-    // is denied, which the spend figures alone do not show.
+    // Less than one turn hold left: a lane without a hold is denied. The
+    // statusline is per session and a lane that already holds budget is
+    // renewed, so this says "new sessions" rather than "your next prompt".
     let blocked = if admission_closed(status) {
-        " · blocked: next prompt denied"
+        " · budget low: new sessions blocked"
     } else {
         ""
     };
@@ -847,7 +848,7 @@ mod tests {
     }
 
     #[test]
-    fn the_segment_says_when_the_next_prompt_would_be_denied() {
+    fn the_segment_says_when_new_sessions_would_be_denied() {
         // The healthy fixture ($487.70 left, $10 hold) carries no marker.
         assert!(!statusline_segment(&status()).unwrap().contains("blocked"));
 
@@ -856,7 +857,7 @@ mod tests {
         short.remaining_usd_cents = Some(999);
         assert_eq!(
             statusline_segment(&short).as_deref(),
-            Some("budget $12.30/$500 (3%) · blocked: next prompt denied")
+            Some("budget $12.30/$500 (3%) · budget low: new sessions blocked")
         );
 
         // Exactly one hold left still admits.
@@ -880,7 +881,7 @@ mod tests {
         full.remaining_usd_cents = Some(0);
         let full_segment = statusline_segment(&full).unwrap();
         assert!(full_segment.contains(" WARN"), "{full_segment}");
-        assert!(full_segment.ends_with(" · blocked: next prompt denied"));
+        assert!(full_segment.ends_with(" · budget low: new sessions blocked"));
 
         // 1 cent of a $500 cap is 0.002%: shown as 1%, not 0%.
         let mut tiny = status();

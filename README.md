@@ -141,9 +141,9 @@ Run `libra-governor install` first so the hooks are wired.
 
 **What it is.** An admission-bounded (cooperative) limit on Libra-accounted,
 list-price-equivalent USD, shared by every Claude Code session and subagent
-on this host and OS user. When less than one turn hold remains, the next
-prompt is blocked with a message that names the period end in your zone and
-how to raise the cap.
+on this host and OS user. When less than one turn hold remains, a prompt from
+a session that holds no budget is blocked with a message that names the
+period end in your zone and how to raise the cap.
 
 **What it is not.** Not a provider bill, not provider quota and not a hard
 spending cap. With hooks only, spend *inside* a turn is seen after the fact,
@@ -153,8 +153,8 @@ synthetic transcripts), not observed on a real host.
 
 **Where to look.** `libra-governor shared-budget status` (add `--json`),
 the `shared_budget_*` checks in `libra-governor doctor`, and a `budget $x/$y`
-segment on the statusline that adds `blocked: next prompt denied` when the
-next prompt would be refused.
+segment on the statusline that adds `budget low: new sessions blocked` when less
+than one turn hold remains.
 
 **Change or remove it.** Edit `shared-budget.json` in the state directory
 (`status` prints its path) or delete it; the daemon re-reads it on every

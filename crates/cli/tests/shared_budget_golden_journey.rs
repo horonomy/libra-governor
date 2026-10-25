@@ -681,7 +681,7 @@ fn an_exhausted_pool_denies_with_the_documented_reason_and_a_raised_cap_hot_relo
     assert!(!is_block(&journey.prompt("e-2")));
     let line = journey.statusline();
     assert!(
-        line.ends_with("budget $20.00/$20 (100%) WARN · blocked: next prompt denied"),
+        line.ends_with("budget $20.00/$20 (100%) WARN · budget low: new sessions blocked"),
         "{line}"
     );
 
