@@ -501,8 +501,18 @@ id, path or content).
   treated as absent (never truncated, so two ids cannot collide), which bounds
   that row's size. Holds admitted before migration 0024 have no mapping, so a
   replayed `Admit` of their first prompt is not refused by the contract above
-  (legacy behaviour). An admit that fails after its grant releases the hold and
-  forgets its prompt rows, so the host's retry is not refused. A retry of a
+  (legacy behaviour). An admit that fails after its fresh grant (the capacity
+  read errors) releases the hold and forgets its prompt rows in **one
+  transaction** (`release_and_forget_unstarted_shared`), so the host's retry is
+  neither refused as a replay nor left bound to a released hold. Only an
+  `active` hold is touched; a final hold keeps its rows. If that cleanup itself
+  fails nothing changed: the hold stays active and bound to its prompt (a retry
+  of that prompt reuses it; its capacity stays reserved and frees only when the
+  hold expires, so no capacity is created and no spend dropped), and the daemon
+  log records both errors (`GrantCleanupFailed`). The host sees only the generic
+  internal-error response, so whether it saw the grant is unknown; a retry made
+  after that stranded hold has expired is refused as `key_conflict` (rare,
+  fail-closed, expiry is one hour). A retry of a
   live prompt that straddles a month rollover looks up the lane's hold in the
   new period's pool, finds none, and is refused; the old hold expires on its
   own (rare, fail-closed). A late `Stop` for an older hold that never settled
