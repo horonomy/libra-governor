@@ -138,7 +138,10 @@ pub enum SharedBudgetRefusal {
     InvalidIdempotencyKey,
     /// `event_time` is not RFC 3339.
     InvalidEventTime,
-    /// The idempotency key already names a different charge or a hold.
+    /// The idempotency key already names a different charge or a hold. Also
+    /// returned for an `Admit` whose `prompt_id` a finished hold already
+    /// accepted: a prompt id names one turn, so a delayed or re-sent `Admit`
+    /// is refused rather than rebound to a later hold (HORO-2250).
     KeyConflict,
     /// The period's pool exists in a unit other than USD cents.
     PoolUnitMismatch,

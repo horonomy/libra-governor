@@ -574,18 +574,25 @@ fn a_reprompt_on_the_same_lane_reuses_the_hold_instead_of_reserving_again() {
 }
 
 #[test]
-fn a_finished_hold_is_not_reused_and_a_resent_prompt_id_gets_a_fresh_hold() {
+fn a_finished_hold_is_not_reused_and_a_resent_prompt_id_is_refused() {
     let mut fx = Fx::new(Some(&cfg_json(5_000, "UTC", 1_000)), JAN);
     let first = grant(fx.admit("s1", None, Some("p1")));
     fx.ledger
         .settle_shared(first.id, Some(300), t(JAN))
         .unwrap();
-    let again = grant(fx.admit("s1", None, Some("p1")));
-    assert!(!again.reused);
-    assert_ne!(
-        again.id, first.id,
-        "the finished turn's hold is never revived"
-    );
+    // A prompt id names one turn: re-sending p1 after its hold finished is a
+    // replay, not new work (HORO-2250).
+    match fx.admit("s1", None, Some("p1")) {
+        SharedBudgetOutcome::Refused { reason } => {
+            assert_eq!(reason, SharedBudgetRefusal::KeyConflict)
+        }
+        other => panic!("expected Refused KeyConflict, got {other:?}"),
+    }
+    assert_eq!(fx.status().reserved_usd_cents, 0, "nothing was reserved");
+    // The next real prompt gets a fresh hold; the finished one is not revived.
+    let next = grant(fx.admit("s1", None, Some("p2")));
+    assert!(!next.reused);
+    assert_ne!(next.id, first.id);
     let status = fx.status();
     assert_eq!(status.used_usd_cents, 300);
     assert_eq!(status.reserved_usd_cents, 1_000);

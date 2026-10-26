@@ -3072,6 +3072,192 @@ fn the_renewed_prompt_identity_survives_a_prune_of_its_settled_hold() {
     assert_eq!(lane[0].settled_amount, None);
 }
 
+/// H1 (p1 renewed by p2) settled; H3 admitted for p3 and still active.
+fn h1_settled_and_h3_active(restart: bool) -> (Fx, std::path::PathBuf) {
+    let (mut fx, tx) = renewed_then_settled(false);
+    fx.clock.set(at(100));
+    grant(fx.admit("s1", None, Some("p3")));
+    if restart {
+        fx.restart();
+    }
+    (fx, tx)
+}
+
+#[test]
+fn a_delayed_admit_of_a_settled_renewed_prompt_never_rebinds_it_to_the_next_hold() {
+    // QA 29119: Admit(r1) Admit(r2) Finalize(r2) Admit(r3) Admit(r2)' Finalize(r2)'.
+    let (mut fx, tx) = h1_settled_and_h3_active(false);
+    let before = fx.fingerprint();
+    fx.clock.set(at(105));
+    expect_refused(
+        fx.admit("s1", None, Some("p2")),
+        SharedBudgetRefusal::KeyConflict,
+    );
+    assert_eq!(fx.fingerprint(), before, "the delayed Admit wrote nothing");
+    fx.clock.set(at(110));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p2"));
+    assert_h3_untouched(&mut fx);
+    assert_eq!(fx.fingerprint(), before, "the stale Stop wrote nothing");
+}
+
+#[test]
+fn a_delayed_admit_of_the_first_prompt_of_a_renewed_hold_is_refused_too() {
+    let (mut fx, tx) = h1_settled_and_h3_active(false);
+    let before = fx.fingerprint();
+    fx.clock.set(at(105));
+    expect_refused(
+        fx.admit("s1", None, Some("p1")),
+        SharedBudgetRefusal::KeyConflict,
+    );
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p1"));
+    assert_h3_untouched(&mut fx);
+    assert_eq!(fx.fingerprint(), before);
+}
+
+#[test]
+fn after_a_refused_delayed_admit_the_successors_own_stop_settles_exactly_once() {
+    let (mut fx, tx) = h1_settled_and_h3_active(false);
+    fx.clock.set(at(105));
+    expect_refused(
+        fx.admit("s1", None, Some("p2")),
+        SharedBudgetRefusal::KeyConflict,
+    );
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p2"));
+    append_lines(&tx, &[rec(120, "m2", SONNET, mi(2), Some("s1"), false)]);
+    fx.clock.set(at(150));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p3"));
+    assert_eq!(totals(&fx.status()), (900, 0), "300 + 600, each once");
+    let before = fx.fingerprint();
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p3"));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p2"));
+    assert_eq!(fx.fingerprint(), before);
+}
+
+#[test]
+fn a_delayed_admit_is_refused_after_a_daemon_restart() {
+    let (mut fx, tx) = h1_settled_and_h3_active(true);
+    let before = fx.fingerprint();
+    fx.clock.set(at(105));
+    expect_refused(
+        fx.admit("s1", None, Some("p2")),
+        SharedBudgetRefusal::KeyConflict,
+    );
+    fx.restart();
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p2"));
+    assert_h3_untouched(&mut fx);
+    assert_eq!(fx.fingerprint(), before);
+}
+
+#[test]
+fn a_delayed_admit_with_no_successor_hold_does_not_open_one() {
+    // Nothing to rebind, but a stale Admit must not authorize unreserved work.
+    let (mut fx, _tx) = renewed_then_settled(false);
+    let before = fx.fingerprint();
+    fx.clock.set(at(100));
+    expect_refused(
+        fx.admit("s1", None, Some("p2")),
+        SharedBudgetRefusal::KeyConflict,
+    );
+    assert_eq!(fx.fingerprint(), before);
+    assert_eq!(fx.lane("s1").len(), 1);
+    assert_eq!(totals(&fx.status()), (300, 0));
+}
+
+#[test]
+fn a_re_sent_admit_for_the_live_renewed_hold_is_still_idempotent() {
+    // The accepted-prompt check must not swallow a retry while the hold is
+    // still the lane's active one.
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    grant(fx.admit("s1", None, Some("p1")));
+    fx.clock.set(at(5));
+    grant(fx.admit("s1", None, Some("p2")));
+    fx.clock.set(at(8));
+    let h1 = fx.lane("s1")[0].id;
+    assert_eq!(grant(fx.admit("s1", None, Some("p2"))).id, h1);
+    assert_eq!(grant(fx.admit("s1", None, Some("p1"))).id, h1);
+    assert_eq!(fx.lane("s1").len(), 1);
+    assert_eq!(totals(&fx.status()), (0, 1_000));
+}
+
+#[test]
+fn a_delayed_admit_after_the_hold_expired_unsettled_does_not_rebind_the_successor() {
+    // H1 (p1, renewed by p2) expires with no Stop; H3 is admitted for p3.
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    grant(fx.admit("s1", None, Some("p1")));
+    fx.clock.set(at(5));
+    grant(fx.admit("s1", None, Some("p2")));
+    fx.clock.set(at(100 + 24 * 3600));
+    grant(fx.admit("s1", None, Some("p3")));
+    let before = fx.fingerprint();
+    fx.clock.set(at(110 + 24 * 3600));
+    expect_refused(
+        fx.admit("s1", None, Some("p2")),
+        SharedBudgetRefusal::KeyConflict,
+    );
+    assert_eq!(fx.fingerprint(), before);
+}
+
+#[test]
+fn a_delayed_admit_is_refused_after_a_prune_of_its_settled_hold() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    grant(fx.admit("s1", None, Some("p1")));
+    fx.clock.set(at(5));
+    grant(fx.admit("s1", None, Some("p2")));
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p2"));
+    fx.clock.set(t("2027-05-10T12:00:00Z"));
+    grant(fx.admit("s1", None, Some("p3")));
+    let report = fx.prune_keeping_one_month();
+    assert_eq!(report.pools_pruned, 1, "{report:?}");
+    let before = fx.fingerprint();
+    fx.clock.set(t("2027-05-10T12:05:00Z"));
+    expect_refused(
+        fx.admit("s1", None, Some("p2")),
+        SharedBudgetRefusal::KeyConflict,
+    );
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p2"));
+    assert_eq!(fx.fingerprint(), before);
+    assert_eq!(fx.lane("s1").len(), 1, "H3 only, still active");
+}
+
+#[test]
+fn a_delayed_admit_in_one_session_never_touches_another_sessions_hold() {
+    let (mut fx, _tx) = h1_settled_and_h3_active(false);
+    grant(fx.admit("s2", None, Some("p2")));
+    let before = fx.fingerprint();
+    fx.clock.set(at(105));
+    expect_refused(
+        fx.admit("s1", None, Some("p2")),
+        SharedBudgetRefusal::KeyConflict,
+    );
+    assert_eq!(fx.fingerprint(), before);
+    assert_eq!(fx.lane("s2").len(), 1, "s2's own p2 is a different turn");
+}
+
+#[test]
+fn a_delayed_admit_cannot_consume_the_cap_when_the_pool_is_full() {
+    // Cap 2,000, hold 1,000: H1 settled at 300, H3 active, 700 free. A
+    // delayed Admit must neither be granted nor change the books.
+    let mut fx = Fx::new(Some(&cfg_json(2_000, "UTC", 1_000)), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    grant(fx.admit("s1", None, Some("p1")));
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p1"));
+    fx.clock.set(at(100));
+    grant(fx.admit("s1", None, Some("p3")));
+    let before = fx.fingerprint();
+    fx.clock.set(at(105));
+    expect_refused(
+        fx.admit("s1", None, Some("p1")),
+        SharedBudgetRefusal::KeyConflict,
+    );
+    assert_eq!(fx.fingerprint(), before);
+    assert_eq!(totals(&fx.status()), (300, 1_000));
+}
+
 // ---------------------------------------------------------------------
 // HORO-2250 review round 1: lanes, sessions, expiry, upgrade
 // ---------------------------------------------------------------------
@@ -3106,25 +3292,24 @@ fn a_subagent_admit_carrying_the_parents_prompt_id_does_not_take_over_the_mappin
 }
 
 #[test]
-fn a_re_sent_prompt_id_points_at_its_newest_hold_and_that_stop_settles() {
+fn a_re_sent_prompt_id_after_its_hold_settled_is_refused_not_a_new_turn() {
+    // A prompt id names one turn. Once its hold settled, an Admit carrying it
+    // is a replay: it must not open a second hold (HORO-2250, QA 29119).
     let mut fx = Fx::new(Some(&cfg()), BASE);
     let tx = fx.path().join("s1.jsonl");
     grant(fx.admit("s1", None, Some("p1")));
     write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
     fx.clock.set(at(60));
     fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p1"));
-    // The same prompt id arrives again for a new turn (a second hold).
+    let before = fx.fingerprint();
     fx.clock.set(at(100));
-    grant(fx.admit("s1", None, Some("p1")));
-    assert_eq!(fx.lane("s1").len(), 2);
-    append_lines(&tx, &[rec(110, "m2", SONNET, mi(2), Some("s1"), false)]);
-    fx.clock.set(at(150));
-    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p1"));
-    assert_eq!(
-        totals(&fx.status()),
-        (900, 0),
-        "the new hold settled at 600"
+    expect_refused(
+        fx.admit("s1", None, Some("p1")),
+        SharedBudgetRefusal::KeyConflict,
     );
+    assert_eq!(fx.fingerprint(), before, "the refused Admit wrote nothing");
+    assert_eq!(fx.lane("s1").len(), 1, "no second hold");
+    assert_eq!(totals(&fx.status()), (300, 0));
 }
 
 #[test]
