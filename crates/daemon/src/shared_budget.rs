@@ -548,6 +548,8 @@ fn allowed(
         Err(e) => {
             if !reused {
                 let _ = ledger.release_shared(hold.id, now);
+                // The turn never started: let the host retry this prompt.
+                let _ = ledger.forget_hold_prompts(hold.id);
             }
             return Err(e);
         }
@@ -610,16 +612,34 @@ pub fn admit(
     ensure_period_pool(ledger, &period.pool_id, cfg, now)?;
     ledger.expire_stale_shared_pool_reservations(now)?;
 
-    // One active hold per lane: a re-prompt (Stop does not fire on
-    // interrupt) renews the existing hold instead of reserving again.
-    if let Some(existing) = ledger.active_shared_hold_for_lane(
+    let live_hold = ledger.active_shared_hold_for_lane(
         &period.pool_id,
         &principal(),
         session_id,
         agent_id,
         kind,
         now,
-    )? {
+    )?;
+    // A main-lane prompt id names one turn. When a hold already accepted it
+    // and that hold is not the lane's live one, this Admit is a delayed
+    // replay: renewing or reserving would rebind the prompt to a later hold,
+    // so its stale Stop would then settle a turn that never ran (HORO-2250).
+    // Refuse without writing; a retry against the still-live hold falls
+    // through and stays idempotent.
+    if let Some(p) = prompt_id
+        .filter(|p| !p.trim().is_empty())
+        .filter(|_| agent_id.is_none())
+    {
+        if let Some(accepted) = ledger.hold_for_prompt(&principal(), session_id, p)? {
+            if live_hold.as_ref().is_none_or(|h| h.id != accepted) {
+                return Ok(refused(SharedBudgetRefusal::KeyConflict));
+            }
+        }
+    }
+
+    // One active hold per lane: a re-prompt (Stop does not fire on
+    // interrupt) renews the existing hold instead of reserving again.
+    if let Some(existing) = live_hold {
         // The prompt joins the hold's accepted set in the renewal's own
         // transaction (HORO-2250). A renewal drops the idempotency key, so
         // without this a replayed Stop for the renewed prompt is unknown.
@@ -646,8 +666,9 @@ pub fn admit(
         None => prompt_key("n", &Uuid::new_v4().to_string()),
     };
     // At most one retry: the first key may name a hold that already
-    // finished (the prompt was re-sent after its turn ended), which is a
-    // new turn and needs a new hold.
+    // finished. A main-lane prompt id never reaches here in that case (the
+    // check above refuses it); this covers subagent lanes and holds admitted
+    // before migration 0024, where a finished key means a new turn.
     let main_prompt = prompt_id
         .filter(|p| !p.trim().is_empty())
         .filter(|_| agent_id.is_none());
