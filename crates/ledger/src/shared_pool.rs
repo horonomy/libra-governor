@@ -2259,18 +2259,52 @@ impl LedgerStore {
         Self::record_hold_prompt_tx(&self.conn, principal_id, session_id, prompt_id, reservation)
     }
 
-    /// Forgets every prompt recorded for a hold that never carried a turn
-    /// (an admit that failed after the grant and was released). Without this
-    /// the host's retry of the same prompt would be refused as a replay.
-    pub fn forget_hold_prompts(
+    /// Atomically releases a hold this call is certain never carried a turn
+    /// (an admit that failed after its fresh grant) and forgets every prompt
+    /// it accepted, in one transaction (HORO-2250). Without the forget the
+    /// host's retry of the same prompt would be refused as a replay; without
+    /// atomicity a release that committed before a failed delete would strand
+    /// that retry, and a delete that committed before a failed release would
+    /// lose a binding the still-active hold needs.
+    ///
+    /// Only an `active` hold is touched. A hold that is already final keeps
+    /// its prompt rows: they are the historical binding a delayed Admit or
+    /// Stop is checked against. On any error nothing is changed.
+    pub fn release_and_forget_unstarted_shared(
         &mut self,
-        reservation: SharedPoolReservationId,
-    ) -> Result<(), LedgerError> {
-        self.conn.execute(
-            "DELETE FROM shared_hold_prompts WHERE reservation_id = ?1",
-            rusqlite::params![reservation.0.to_string()],
+        id: SharedPoolReservationId,
+        now: OffsetDateTime,
+    ) -> Result<SharedPoolReleaseOutcome, LedgerError> {
+        let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
+        let Some(reservation) = Self::get_shared_reservation_tx(&tx, id)? else {
+            tx.commit()?;
+            return Ok(SharedPoolReleaseOutcome::NotFound);
+        };
+        if reservation.state != ReservationState::Active {
+            tx.commit()?;
+            return Ok(SharedPoolReleaseOutcome::AlreadyFinal(Box::new(
+                reservation,
+            )));
+        }
+        let updated = tx.execute(
+            "UPDATE shared_pool_reservations SET state = 'released', released_at = ?1
+             WHERE id = ?2 AND state = 'active'",
+            rusqlite::params![rfc3339(now)?, id.0.to_string()],
         )?;
-        Ok(())
+        if updated == 0 {
+            let current = Self::get_shared_reservation_tx(&tx, id)?
+                .expect("row existed moments ago under the same write lock");
+            tx.commit()?;
+            return Ok(SharedPoolReleaseOutcome::AlreadyFinal(Box::new(current)));
+        }
+        tx.execute(
+            "DELETE FROM shared_hold_prompts WHERE reservation_id = ?1",
+            rusqlite::params![id.0.to_string()],
+        )?;
+        let released = Self::get_shared_reservation_tx(&tx, id)?
+            .expect("row just updated in this same transaction");
+        tx.commit()?;
+        Ok(SharedPoolReleaseOutcome::Released(Box::new(released)))
     }
 
     /// The hold that accepted `prompt_id` for this session, if one was recorded.

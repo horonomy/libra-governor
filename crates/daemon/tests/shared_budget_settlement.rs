@@ -3423,3 +3423,267 @@ fn an_over_long_prompt_id_is_treated_as_absent_and_never_truncated() {
         .unwrap();
     assert_eq!(rows, 1);
 }
+
+// ---------------------------------------------------------------------
+// HORO-2250: post-grant compensation (release + forget) is one atomic step
+// ---------------------------------------------------------------------
+
+/// SQL fault injection through a separate connection, as the ledger tests do.
+fn raw_exec(fx: &Fx, sql: &str) {
+    rusqlite::Connection::open(&fx.config.ledger_path)
+        .unwrap()
+        .execute_batch(sql)
+        .unwrap();
+}
+
+/// Makes the capacity read that follows a fresh grant fail: the grant's last
+/// write (the prompt row) corrupts the pool's stored capacity, so the hold is
+/// committed and the `remaining` read in `allowed()` then errors.
+fn inject_post_grant_read_fault(fx: &Fx) {
+    raw_exec(
+        fx,
+        "CREATE TRIGGER fault_read AFTER INSERT ON shared_hold_prompts
+         BEGIN UPDATE quota_pools SET capacity = 'corrupt'; END;",
+    );
+}
+
+fn inject_forget_fault(fx: &Fx) {
+    raw_exec(
+        fx,
+        "CREATE TRIGGER fault_forget BEFORE DELETE ON shared_hold_prompts
+         BEGIN SELECT RAISE(ABORT, 'forget boom'); END;",
+    );
+}
+
+fn inject_release_fault(fx: &Fx) {
+    raw_exec(
+        fx,
+        "CREATE TRIGGER fault_release BEFORE UPDATE ON shared_pool_reservations
+         WHEN NEW.state = 'released'
+         BEGIN SELECT RAISE(ABORT, 'release boom'); END;",
+    );
+}
+
+/// Removes every injected fault and restores the pool's configured capacity.
+fn clear_faults(fx: &Fx, capacity: u64) {
+    raw_exec(
+        fx,
+        &format!(
+            "DROP TRIGGER IF EXISTS fault_read;
+             DROP TRIGGER IF EXISTS fault_forget;
+             DROP TRIGGER IF EXISTS fault_release;
+             UPDATE quota_pools SET capacity = {capacity};"
+        ),
+    );
+}
+
+fn prompt_rows(fx: &Fx, session: &str) -> Vec<String> {
+    let conn = rusqlite::Connection::open(&fx.config.ledger_path).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT prompt_id FROM shared_hold_prompts WHERE session_id = ?1 ORDER BY prompt_id",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([session], |r| r.get::<_, String>(0))
+        .unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
+fn admit_error(fx: &mut Fx, session: &str, prompt: &str) -> String {
+    let response = fx.call(Request::SharedBudget {
+        shared_budget: SharedBudgetRequest::Admit {
+            session_id: session.to_string(),
+            agent_id: None,
+            prompt_id: Some(prompt.to_string()),
+        },
+    });
+    match response {
+        Response::Error { message } => message,
+        other => panic!("expected an error response, got {other:?}"),
+    }
+}
+
+fn daemon_log(fx: &Fx) -> String {
+    std::fs::read_to_string(&fx.config.log_path).unwrap_or_default()
+}
+
+/// A settled p0 turn in s1, so a historical binding exists before the fault.
+fn settled_p0() -> (Fx, std::path::PathBuf) {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    grant(fx.admit("s1", None, Some("p0")));
+    write_lines(&tx, &[rec(10, "m0", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p0"));
+    assert_eq!(totals(&fx.status()), (300, 0));
+    (fx, tx)
+}
+
+#[test]
+fn a_failed_post_grant_read_releases_the_unstarted_hold_and_frees_the_prompt_for_a_retry() {
+    let (mut fx, tx) = settled_p0();
+    // Another session's equal prompt id must survive s1's compensation.
+    grant(fx.admit("s2", None, Some("p1")));
+    fx.clock.set(at(100));
+    inject_post_grant_read_fault(&fx);
+    admit_error(&mut fx, "s1", "p1");
+    clear_faults(&fx, 100_000);
+
+    let lane = fx.lane("s1");
+    assert_eq!(lane.len(), 2);
+    assert_eq!(
+        state_of(&lane[1]),
+        libra_governor_domain::ReservationState::Released
+    );
+    assert_eq!(
+        prompt_rows(&fx, "s1"),
+        vec!["p0".to_string()],
+        "only p1 was forgotten"
+    );
+    assert_eq!(prompt_rows(&fx, "s2"), vec!["p1".to_string()]);
+    assert_eq!(
+        state_of(&fx.lane("s2")[0]),
+        libra_governor_domain::ReservationState::Active
+    );
+    // Only s2's hold still reserves capacity.
+    assert_eq!(totals(&fx.status()), (300, 1_000));
+
+    // The host's retry of the same prompt is a fresh grant, not a replay.
+    fx.clock.set(at(110));
+    let retry = grant(fx.admit("s1", None, Some("p1")));
+    assert_ne!(retry.id, lane[1].id);
+    assert_eq!(totals(&fx.status()), (300, 2_000));
+    // Its legitimate Stop settles exactly once.
+    append_lines(&tx, &[rec(120, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(150));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p1"));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p1"));
+    assert_eq!(totals(&fx.status()), (600, 1_000));
+    // The historical p0 turn stays bound.
+    expect_refused(
+        fx.admit("s1", None, Some("p0")),
+        SharedBudgetRefusal::KeyConflict,
+    );
+}
+
+#[test]
+fn a_failed_forget_rolls_the_release_back_and_keeps_hold_and_binding_together() {
+    let (mut fx, tx) = settled_p0();
+    fx.clock.set(at(100));
+    inject_post_grant_read_fault(&fx);
+    inject_forget_fault(&fx);
+    admit_error(&mut fx, "s1", "p1");
+    let log = daemon_log(&fx);
+    clear_faults(&fx, 100_000);
+
+    // Nothing half-applied: the hold is still active and still bound to p1.
+    let lane = fx.lane("s1");
+    assert_eq!(
+        state_of(&lane[1]),
+        libra_governor_domain::ReservationState::Active
+    );
+    assert_eq!(
+        prompt_rows(&fx, "s1"),
+        vec!["p0".to_string(), "p1".to_string()]
+    );
+    assert_eq!(
+        totals(&fx.status()),
+        (300, 1_000),
+        "no capacity created or lost"
+    );
+
+    // A restart loses nothing; the retry reuses the same hold.
+    fx.restart();
+    fx.clock.set(at(110));
+    let before = fx.fingerprint();
+    match fx.admit("s1", None, Some("p1")) {
+        SharedBudgetOutcome::Allowed {
+            reservation_id,
+            hold_reused,
+            ..
+        } => {
+            assert_eq!(reservation_id, lane[1].id);
+            assert!(hold_reused);
+        }
+        other => panic!("expected the same hold, got {other:?}"),
+    }
+    assert_eq!(fx.lane("s1").len(), 2, "no second hold");
+    assert_ne!(
+        fx.fingerprint(),
+        before,
+        "the renewal extended the expiry only"
+    );
+    assert_eq!(totals(&fx.status()), (300, 1_000));
+    append_lines(&tx, &[rec(120, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(150));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p1"));
+    assert_eq!(totals(&fx.status()), (600, 0), "settles once");
+    expect_refused(
+        fx.admit("s1", None, Some("p0")),
+        SharedBudgetRefusal::KeyConflict,
+    );
+    // The cleanup failure is reported, not swallowed.
+    assert!(
+        log.contains("forget boom"),
+        "cleanup error in the log: {log}"
+    );
+}
+
+#[test]
+fn a_failed_release_leaves_the_binding_so_the_retry_stays_idempotent() {
+    let (mut fx, _tx) = settled_p0();
+    fx.clock.set(at(100));
+    inject_post_grant_read_fault(&fx);
+    inject_release_fault(&fx);
+    admit_error(&mut fx, "s1", "p1");
+    let log = daemon_log(&fx);
+    clear_faults(&fx, 100_000);
+
+    let lane = fx.lane("s1");
+    assert_eq!(
+        state_of(&lane[1]),
+        libra_governor_domain::ReservationState::Active
+    );
+    assert_eq!(
+        prompt_rows(&fx, "s1"),
+        vec!["p0".to_string(), "p1".to_string()],
+        "the binding was not discarded with the failed release"
+    );
+    fx.clock.set(at(110));
+    match fx.admit("s1", None, Some("p1")) {
+        SharedBudgetOutcome::Allowed {
+            reservation_id,
+            hold_reused,
+            ..
+        } => {
+            assert_eq!(reservation_id, lane[1].id);
+            assert!(hold_reused);
+        }
+        other => panic!("expected the same hold, got {other:?}"),
+    }
+    assert_eq!(totals(&fx.status()), (300, 1_000));
+    assert!(
+        log.contains("release boom"),
+        "cleanup error in the log: {log}"
+    );
+}
+
+#[test]
+fn an_unreleased_unstarted_hold_keeps_its_capacity_reserved_until_it_expires() {
+    // Cap 1,000 = exactly one hold. A compensation that fails must not create
+    // capacity; the stranded hold frees it only by expiring.
+    let mut fx = Fx::new(Some(&cfg_json(1_000, "UTC", 1_000)), BASE);
+    inject_post_grant_read_fault(&fx);
+    inject_release_fault(&fx);
+    admit_error(&mut fx, "s1", "p1");
+    clear_faults(&fx, 1_000);
+    expect_denied(
+        fx.admit("s2", None, Some("q1")),
+        SharedBudgetDenyReason::CapExhausted,
+    );
+    assert_eq!(totals(&fx.status()), (0, 1_000));
+    fx.clock.set(at(2 * 3600));
+    grant(fx.admit("s2", None, Some("q1")));
+    assert_eq!(totals(&fx.status()), (0, 1_000), "never above the hard cap");
+}

@@ -757,9 +757,9 @@ fn a_prune_that_fails_midway_leaves_no_floor_and_no_horizon() {
 }
 
 #[test]
-fn forgetting_a_holds_prompts_frees_the_id_for_a_retry_and_touches_no_other_hold() {
-    use libra_governor_ledger::SharedPoolRenewOutcome;
-    let (_dir, mut store) = new_store();
+fn releasing_an_unstarted_hold_forgets_its_prompts_atomically_and_touches_no_other_hold() {
+    use libra_governor_ledger::{SharedPoolReleaseOutcome, SharedPoolRenewOutcome};
+    let (dir, mut store) = new_store();
     let id = pool("monthly-2026-07");
     ensure(&mut store, &id);
     let mk = |store: &mut LedgerStore, session: &str, key: &str| {
@@ -775,7 +775,8 @@ fn forgetting_a_holds_prompts_frees_the_id_for_a_retry_and_touches_no_other_hold
     };
     let h1 = mk(&mut store, "s1", "hold-1");
     let h2 = mk(&mut store, "s2", "hold-2");
-    for (h, session) in [(h1, "s1"), (h2, "s2")] {
+    let h3 = mk(&mut store, "s3", "hold-3");
+    for (h, session) in [(h1, "s1"), (h2, "s2"), (h3, "s3")] {
         assert!(matches!(
             store
                 .renew_shared_for_prompt(h, &owner(), session, now(), 3600, Some("p1"))
@@ -783,13 +784,64 @@ fn forgetting_a_holds_prompts_frees_the_id_for_a_retry_and_touches_no_other_hold
             SharedPoolRenewOutcome::Renewed(_)
         ));
     }
-    store.forget_hold_prompts(h1).unwrap();
+    // A hold that already finished keeps its binding: it is the history a
+    // delayed Admit or Stop is checked against.
+    store.settle_shared(h3, Some(5), now()).unwrap();
+    assert!(matches!(
+        store
+            .release_and_forget_unstarted_shared(h3, now())
+            .unwrap(),
+        SharedPoolReleaseOutcome::AlreadyFinal(_)
+    ));
+    assert_eq!(
+        store.hold_for_prompt(&owner(), "s3", "p1").unwrap(),
+        Some(h3)
+    );
+
+    // A failure after the release statement rolls the release back too.
+    let raw = rusqlite::Connection::open(dir.path().join("ledger.sqlite3")).unwrap();
+    raw.execute_batch(
+        "CREATE TRIGGER boom BEFORE DELETE ON shared_hold_prompts
+         BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+    )
+    .unwrap();
+    assert!(store
+        .release_and_forget_unstarted_shared(h1, now())
+        .is_err());
+    let state: String = raw
+        .query_row(
+            "SELECT state FROM shared_pool_reservations WHERE id = ?1",
+            [h1.0.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "active", "the release was rolled back");
+    assert_eq!(
+        store.hold_for_prompt(&owner(), "s1", "p1").unwrap(),
+        Some(h1)
+    );
+    raw.execute_batch("DROP TRIGGER boom").unwrap();
+
+    // Without the failure it releases and forgets in one step.
+    assert!(matches!(
+        store
+            .release_and_forget_unstarted_shared(h1, now())
+            .unwrap(),
+        SharedPoolReleaseOutcome::Released(_)
+    ));
     assert_eq!(store.hold_for_prompt(&owner(), "s1", "p1").unwrap(), None);
     assert_eq!(
         store.hold_for_prompt(&owner(), "s2", "p1").unwrap(),
         Some(h2),
         "another hold's mapping is untouched"
     );
+    // Idempotent: a second call finds it final and changes nothing.
+    assert!(matches!(
+        store
+            .release_and_forget_unstarted_shared(h1, now())
+            .unwrap(),
+        SharedPoolReleaseOutcome::AlreadyFinal(_)
+    ));
 }
 
 #[test]

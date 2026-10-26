@@ -296,6 +296,21 @@ pub enum SharedBudgetError {
     Ledger(#[from] LedgerError),
     #[error("internal invariant violated: {0}")]
     Internal(&'static str),
+    /// A fresh grant could not be answered and releasing it also failed. The
+    /// release and the prompt forget are one transaction, so the hold is then
+    /// still active and still bound to its prompt (a retry of that prompt
+    /// reuses it and it frees its capacity by expiring); only whether the
+    /// host saw the grant is unknown.
+    #[error(
+        "post-grant read failed ({read}); releasing the unstarted hold {} also failed \
+         ({cleanup}); the hold stays active and bound to its prompt until it expires",
+        .hold.0
+    )]
+    GrantCleanupFailed {
+        hold: libra_governor_domain::SharedPoolReservationId,
+        read: Box<LedgerError>,
+        cleanup: Box<LedgerError>,
+    },
 }
 
 fn rfc(t: OffsetDateTime) -> String {
@@ -545,14 +560,23 @@ fn allowed(
     // read, a hold this call just created is released before the error.
     let remaining = match remaining_of(ledger, &hold.pool_id, cfg, now) {
         Ok(remaining) => remaining,
-        Err(e) => {
-            if !reused {
-                let _ = ledger.release_shared(hold.id, now);
-                // The turn never started: let the host retry this prompt.
-                let _ = ledger.forget_hold_prompts(hold.id);
-            }
-            return Err(e);
+        Err(SharedBudgetError::Ledger(read)) if !reused => {
+            // The turn never started. Release and forget the prompt in one
+            // transaction so the host's retry is neither refused as a replay
+            // nor left bound to a released hold; if that fails nothing changed
+            // and the unknown is reported, not discarded.
+            return Err(
+                match ledger.release_and_forget_unstarted_shared(hold.id, now) {
+                    Ok(_) => SharedBudgetError::Ledger(read),
+                    Err(cleanup) => SharedBudgetError::GrantCleanupFailed {
+                        hold: hold.id,
+                        read: Box::new(read),
+                        cleanup: Box::new(cleanup),
+                    },
+                },
+            );
         }
+        Err(e) => return Err(e),
     };
     let (warnings, warnings_unavailable) = if cfg.soft_limits == SoftLimits::default() {
         (Vec::new(), false)
