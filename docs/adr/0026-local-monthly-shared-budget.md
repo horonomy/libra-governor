@@ -476,11 +476,19 @@ id, path or content).
   makes a replayed `Stop(p2)` recognisable after the lane's next hold exists
   (a `Stop` whose prompt maps to a hold other than the pending one settles
   nothing). The row is not tied to the hold or its pool, so it survives a
-  retention prune of the hold, and it is durable across daemon restarts; a
-  re-sent prompt id re-points to the newest hold. The first-prompt key check is
-  only the fallback for a prompt with no mapping (a hold admitted before
-  migration 0024); when a mapping exists it alone decides, so a re-sent id still
-  settles its newest hold. Only the **main** lane records or renews a mapping: a
+  retention prune of the hold, and it is durable across daemon restarts. The
+  first-prompt key check is only the fallback for a prompt with no mapping (a
+  hold admitted before migration 0024); when a mapping exists it alone decides.
+  **Occurrence contract (QA 29119):** a main-lane prompt id names one turn, and
+  its binding is stable. An `Admit` whose id a hold already accepted is served
+  only while that hold is still the lane's live one (an idempotent retry or
+  renewal). Otherwise (the hold settled, expired, was released or pruned, and a
+  successor may exist) the `Admit` is a delayed or re-sent replay: it is
+  refused as `key_conflict`, writes nothing, neither renews nor reserves, and
+  never rebinds the id to the successor, so a stale `Stop` cannot settle a turn
+  that never ran. This is a fail-closed change: a host that reused one prompt id
+  for two real turns would have its second `Admit` refused (observed host ids
+  are unique per prompt; interactive reuse is unobserved). Only the **main** lane records or renews a mapping: a
   subagent `Admit` carrying the parent's prompt id cannot take it over. The
   grant and its row commit together (`reserve_shared_metered_for_prompt`, one
   outer transaction), as does a renewal. No session-erase or export path reads
@@ -491,10 +499,9 @@ id, path or content).
   has not flushed and still settles the pending hold. The table grows by one
   small row per prompt and is not pruned. A prompt id longer than 256 bytes is
   treated as absent (never truncated, so two ids cannot collide), which bounds
-  that row's size. A duplicate or late replay of `Admit(p1)` after `p2` is
-  admitted re-points `p1` to the newest hold: a re-sent id means "a new turn
-  for this id" and the host id cannot say otherwise, so a later `Stop(p1)` then
-  settles that newest hold. A late `Stop` for an older hold that never settled
+  that row's size. Holds admitted before migration 0024 have no mapping, so a
+  replayed `Admit` of their first prompt is not refused by the contract above
+  (legacy behaviour). A late `Stop` for an older hold that never settled
   is skipped without touching the newer hold; its spend is not lost, because the
   next hold's transcript window starts at the lane watermark, which that
   settlement never advanced, and so counts those records. The legacy task
