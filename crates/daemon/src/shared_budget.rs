@@ -548,6 +548,8 @@ fn allowed(
         Err(e) => {
             if !reused {
                 let _ = ledger.release_shared(hold.id, now);
+                // The turn never started: let the host retry this prompt.
+                let _ = ledger.forget_hold_prompts(hold.id);
             }
             return Err(e);
         }

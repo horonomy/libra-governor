@@ -2259,6 +2259,20 @@ impl LedgerStore {
         Self::record_hold_prompt_tx(&self.conn, principal_id, session_id, prompt_id, reservation)
     }
 
+    /// Forgets every prompt recorded for a hold that never carried a turn
+    /// (an admit that failed after the grant and was released). Without this
+    /// the host's retry of the same prompt would be refused as a replay.
+    pub fn forget_hold_prompts(
+        &mut self,
+        reservation: SharedPoolReservationId,
+    ) -> Result<(), LedgerError> {
+        self.conn.execute(
+            "DELETE FROM shared_hold_prompts WHERE reservation_id = ?1",
+            rusqlite::params![reservation.0.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// The hold that accepted `prompt_id` for this session, if one was recorded.
     pub fn hold_for_prompt(
         &self,

@@ -757,6 +757,42 @@ fn a_prune_that_fails_midway_leaves_no_floor_and_no_horizon() {
 }
 
 #[test]
+fn forgetting_a_holds_prompts_frees_the_id_for_a_retry_and_touches_no_other_hold() {
+    use libra_governor_ledger::SharedPoolRenewOutcome;
+    let (_dir, mut store) = new_store();
+    let id = pool("monthly-2026-07");
+    ensure(&mut store, &id);
+    let mk = |store: &mut LedgerStore, session: &str, key: &str| {
+        hold(
+            store,
+            &id,
+            session,
+            10,
+            key,
+            (now(), 3600),
+            ExecutorAttribution::default(),
+        )
+    };
+    let h1 = mk(&mut store, "s1", "hold-1");
+    let h2 = mk(&mut store, "s2", "hold-2");
+    for (h, session) in [(h1, "s1"), (h2, "s2")] {
+        assert!(matches!(
+            store
+                .renew_shared_for_prompt(h, &owner(), session, now(), 3600, Some("p1"))
+                .unwrap(),
+            SharedPoolRenewOutcome::Renewed(_)
+        ));
+    }
+    store.forget_hold_prompts(h1).unwrap();
+    assert_eq!(store.hold_for_prompt(&owner(), "s1", "p1").unwrap(), None);
+    assert_eq!(
+        store.hold_for_prompt(&owner(), "s2", "p1").unwrap(),
+        Some(h2),
+        "another hold's mapping is untouched"
+    );
+}
+
+#[test]
 fn a_renewal_records_its_prompt_atomically_and_a_prune_keeps_it() {
     use libra_governor_ledger::SharedPoolRenewOutcome;
     let (_dir, mut store) = new_store();
