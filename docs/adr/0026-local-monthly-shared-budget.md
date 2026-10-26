@@ -501,7 +501,11 @@ id, path or content).
   treated as absent (never truncated, so two ids cannot collide), which bounds
   that row's size. Holds admitted before migration 0024 have no mapping, so a
   replayed `Admit` of their first prompt is not refused by the contract above
-  (legacy behaviour). A late `Stop` for an older hold that never settled
+  (legacy behaviour). An admit that fails after its grant releases the hold and
+  forgets its prompt rows, so the host's retry is not refused. A retry of a
+  live prompt that straddles a month rollover looks up the lane's hold in the
+  new period's pool, finds none, and is refused; the old hold expires on its
+  own (rare, fail-closed). A late `Stop` for an older hold that never settled
   is skipped without touching the newer hold; its spend is not lost, because the
   next hold's transcript window starts at the lane watermark, which that
   settlement never advanced, and so counts those records. The legacy task
