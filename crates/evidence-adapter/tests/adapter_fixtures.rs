@@ -295,6 +295,15 @@ fn dropped_count_zero_is_provable_no_eviction_path_exists_in_ledger() {
                 }
                 continue;
             }
+            if entry.file_name().and_then(|n| n.to_str()) == Some("shared_pool.rs") {
+                // HORO-2250: a released, never-started admit forgets its own
+                // prompt rows. `shared_hold_prompts` feeds no DogFood evidence
+                // event. Pinned to that one table.
+                if drops || targets.iter().any(|t| t != "shared_hold_prompts") {
+                    offending.push(entry);
+                }
+                continue;
+            }
             if !targets.is_empty() || drops {
                 offending.push(entry);
             }
