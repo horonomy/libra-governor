@@ -841,6 +841,53 @@ a **separate, versioned workstream and is not delivered** by this ADR.
 Upload is **not built**: no transport, retry, resume or de-duplicated
 delivery exists; that remains the separate, versioned workstream above.
 
+### Founder version-scope decision (HORO-2261, 2026-10-27)
+
+The founder approved this scope for **v0.0.4** (recorded in HORO-2261):
+
+- v0.0.4 ships the existing Claude Code shared monthly pool as an explicitly
+  labelled **Cooperative Preview**, subject to its remaining original
+  applicable QA and release gates.
+- S11 gateway `governor_held` enforcement and the Codex budget gate are
+  **not required to be enabled** for v0.0.4. They stay off by default and
+  must not be enabled in v0.0.4.
+- This is a founder-approved scope adjustment. It is **not** a claim that the
+  original hard-budget guarantee has been delivered.
+- The accepted HORO-2250 (comment 29205, PR #227) and HORO-2258 QA evidence
+  is preserved unchanged.
+- No new OpenAI Responses gateway is authorised; it needs its own decision.
+- No publication, production deployment, new egress route or paid model test
+  is authorised by this decision. v0.0.4 is not released.
+
+**Release disclosure (required wording content).** The v0.0.4 release notes
+and in-product text must state that the pool is:
+
+1. admission-bounded (cooperative), not a strict monetary hard cap;
+2. subject to in-turn overshoot, because spend is visible only at Stop;
+3. not applied to Codex, which remains ungated;
+4. not a guarantee of matching the actual provider bill (amounts are
+   list-price-equivalent estimates or flat holds, never billed USD);
+5. limited to the supported executor and subagent accounting boundaries
+   described in `docs/execution-owner-contract.md`; unsupported executors and
+   subagent spend are not covered.
+
+**Policy for future off-by-default work** (design:
+`docs/design/s11-gateway-governor-held-hard-cap.md`,
+`docs/design/codex-shared-budget-gate.md`; not shipped):
+
+- S11 hard mode must not silently admit server-tool costs it cannot measure,
+  and must fail closed on request shapes it has not verified. The existing
+  cooperative mode keeps normal WebSearch behaviour.
+- Interrupted or orphaned gateway requests keep a conservative bounded
+  reservation until reliable reconciliation exists. Reserved or estimated
+  amounts are never presented as provider billing.
+- The input bound must be a verified conservative bound; bytes/3 is not
+  treated as a mathematical guarantee.
+- The Codex gate has no automatic activation, does not assume hooks are
+  trusted, does not claim subagent cost is covered when it is not, and
+  distinguishes list-price-equivalent spend from billed USD. Real-host Codex
+  runs are authorised separately.
+
 ## Consequences
 
 - Once slices S4-S8 land (design intent), refusal before spend at prompt
@@ -864,5 +911,5 @@ delivery exists; that remains the separate, versioned workstream above.
 
 ## Not decided here
 
-Release GO/NO-GO, remote upload, gateway `governor_held` (S11, not built), a Codex budget gate, any provider-bill
+Release GO/NO-GO, remote upload, enabling gateway `governor_held` (S11, designed, not built; not enabled in v0.0.4 per the founder scope decision above), enabling a Codex budget gate (designed, not built; same), any provider-bill
 reconciliation, and any change to the ADR-0023 production-feed ban.
