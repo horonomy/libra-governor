@@ -1079,6 +1079,7 @@ fn doctor_reports_the_live_budget_and_never_prints_the_host_traffic_value() {
         "in-turn overshoot",
         "Codex route has no budget gate",
         "no gateway hard cap",
+        "accounting boundary",
         "never a provider bill or quota",
     ] {
         assert!(limits.contains(needle), "{needle}: {limits}");
