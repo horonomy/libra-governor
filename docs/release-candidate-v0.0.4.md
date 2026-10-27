@@ -62,7 +62,7 @@ labels are not blanket security waivers; none is treated as one here.
 | 11 | `ensure_state_dir` chmod follows a symlink | approved future work | Same-user only on the default path (`~/.local/state`); a non-default `LIBRA_GOVERNOR_STATE_DIR` into a shared location could make the user chmod a symlink target they own to 0700. No symlink test. Fix: `symlink_metadata` plus an owner check. |
 | 12 | Interactive TTY flush timing unmeasured | accepted limitation, disclosure added (PR #244) | Not "fails safe": a partly flushed turn settles short and the remainder is recovered only by a later Stop or SettleTail, and is lost if neither runs. Measured only with `-p`. A real TTY sample needs authorization. |
 | 13 | No `clock_anomaly` repair command | accepted limitation, message corrected (PR #244) | Fails closed with no money effect, but "correct the clock" is not actionable once the clock is right; the real remedies (ADR-0026 recovery, or removing `shared-budget.json` to pause the budget) are not named. A forward clock jump also opens next month's pool with a full cap and is undisclosed. |
-| 14 | **New: re-prompt renews a live hold with no capacity check** | **blocking until PR #240 merges** | After an interrupt (Stop does not fire) the hold stays live; a new prompt renewed it without the check a fresh reservation applies, so turns could continue after other sessions overdrew the pool. Failing-first tests ran red on hosted CI; fix pending in PR #240. The trigger relies on interrupt behaviour not observed on a real host. |
+| 14 | **New: re-prompt renews a live hold with no capacity check** | **fixed: PR #240 merged (`98b112a`)** | After an interrupt (Stop does not fire) the hold stays live; a new prompt renewed it without the check a fresh reservation applies, so turns could continue after other sessions overdrew the pool. Failing-first tests ran red on hosted CI (101 passed, 1 failed); the fix applies the fresh-reservation test to a renewal that names a new prompt id (a prompt-less retry is unchanged, per ADR-0026 "a lower cap never revokes existing holds"); ADR-0026 documents it; two independent review passes; hosted CI green on the PR head. The trigger relies on interrupt behaviour not observed on a real host. |
 
 Other undisclosed or partly disclosed ways spend can exceed the cap (audit,
 cited in HORO-2186): a 32 MiB subagent file is permanently booked at the
@@ -113,8 +113,8 @@ and internal dogfood threshold 60 are met. This is an evidence-weighted
 judgment, not a user-study statistic. Overall QA stays **PARTIAL**
 (`INDEPENDENT_EXPERIENCE_QA_SIGNED_OFF=true` for the bounded scope,
 `FULL_RELEASE_QA_SIGNED_OFF=false`). Passing 70 does not override an
-unresolved critical defect; item 14 above is such a candidate until PR #240
-merges.
+unresolved critical defect; item 14 was such a candidate and is fixed by
+PR #240 (no independent re-test yet).
 
 What keeps B at 8/20 and what would raise it: a current-head real-host run,
 an interactive TTY and partial-flush sample, post-/compact coverage, and a
@@ -169,6 +169,22 @@ none of it is attested):
   `settings.json` to semantically equal JSON (not byte-identical: it is
   re-serialized). It also printed that the binary "was installed via `cargo
   install`" for a copied binary, a cosmetic misclassification.
+
+Local evidence at code SHA `98b112a16ac79cd4a04b1466ce6e81603d3bfc4c` (under
+SPE-109 admission; not CI-produced, not attested, not an independent QA
+result):
+
+- `cargo build --release --locked -p libra-governor-cli --bin libra-governor`
+  succeeded (aarch64, 21,855,584 bytes, sha256 prefix `8399db17b73dce78`);
+  `--version` prints `libra-governor 0.0.4`.
+- CLI suites on that tree: `shared_budget_golden_journey` 11/11,
+  `shared_budget_flush_wait` 9/9, `shared_budget_hooks` 32/32,
+  `shared_budget_init` 11/11, `shared_budget_cmd` 18/18.
+- Sandboxed lifecycle with the release binary (isolated HOME and state dir, a
+  foreign `Stop` hook pre-seeded): install from a path containing a space is
+  refused and `settings.json` is untouched; install from a plain path adds 6
+  hooks; `doctor` shows all six wired and the new limits text; `uninstall`
+  restores `settings.json` to semantically equal JSON.
 
 Still not done on the final SHA: the attested `workflow_dispatch` run,
 attestation verification, a clean-machine install, and rollback on a
