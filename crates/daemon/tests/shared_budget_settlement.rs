@@ -2792,18 +2792,29 @@ fn a_main_turn_stop_replay_after_its_period_was_pruned_charges_nothing() {
     assert_eq!(report.pools_pruned, 1, "{report:?}");
     assert!(fx.pools().is_empty(), "no pool remains");
 
+    // The session carries on in May: a new turn holds the May pool. The
+    // January Stop replayed now must neither recreate January nor settle
+    // the May hold (the old prompt's hold row is gone, but its prompt
+    // mapping survives), so the May hold must be untouched.
+    fx.clock.set(t("2027-05-10T12:03:00Z"));
+    grant(fx.admit("s1", None, Some("p2")));
+    assert_eq!(totals(&fx.status()), (0, 1_000), "May holds one turn");
+    let before = fx.fingerprint();
+
     fx.clock.set(t("2027-05-10T12:05:00Z"));
     fx.finalize_for_prompt("s1", Some(&s(&main)), Some("p1"));
-    assert!(
-        fx.pools().is_empty(),
-        "the pruned January pool was not recreated: {:?}",
+    assert_eq!(
+        fx.pools().len(),
+        1,
+        "only the May pool exists; January was not recreated: {:?}",
         fx.pools()
     );
     assert_eq!(
-        fx.status().used_usd_cents,
-        0,
-        "the replayed January turn was not booked into May"
+        totals(&fx.status()),
+        (0, 1_000),
+        "the replayed January turn did not settle the May hold or book into May"
     );
+    assert_eq!(fx.fingerprint(), before, "the replay wrote nothing at all");
 }
 
 fn charge_agent_at(fx: &mut Fx, key: &str, event: &str) -> SharedBudgetOutcome {
