@@ -64,7 +64,10 @@ product sees repeated use — see HORO-1154.
 
 - A Rust toolchain (`cargo`, `rustc`) — see <https://rustup.rs> if you
   do not have one.
-- macOS or Linux. Claude Code with hook and statusline support, and/or
+- Supported platform for the v0.0.4 Cooperative Preview: Apple Silicon
+  macOS (aarch64). Linux builds and runs in CI; Intel macOS is not built or
+  tested. Both are unsupported and unverified for the local monthly budget;
+  Windows is unsupported. Claude Code with hook and statusline support, and/or
   Codex with its hooks support (run `libra-governor install --agent
   codex`) — see `integrations/codex/README.md` for Codex-specific setup
   and capability-tier differences.
@@ -168,6 +171,14 @@ original strict hard-cap guarantee.
   readable transcript or agent id, and spend outside Claude Code. Such spend
   can settle at the flat hold, be recorded unattributed, or be missed. See
   `docs/execution-owner-contract.md`.
+- *Known unmeasured or early-opening cases.* Turns around `/compact`, a
+  partly flushed interactive turn that settles before its last record is
+  written, a subagent file over 32 MiB, and a hook that fails open while the
+  daemon is down can be under-counted or missed. A forward clock jump or a
+  time-zone change near a month edge opens the next month's budget early.
+  `shared-budget init --force` replaces the whole file and keeps no backup,
+  dropping `pricing_overrides`, the subagent fallback and unrepeated soft
+  limits.
 
 **Where to look.** `libra-governor shared-budget status` (add `--json`),
 the `shared_budget_*` checks in `libra-governor doctor`, and a `budget $x/$y`

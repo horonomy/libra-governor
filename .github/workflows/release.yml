@@ -68,15 +68,13 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             runnable: true
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            # Cross-compiled on an arm64 runner; not executed here. The
-            # smoke-test step below is skipped for this target and the
-            # provenance record discloses it as build-only, not run-verified.
-            runnable: false
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            runnable: true
+          # v0.0.4 Cooperative Preview supports Apple Silicon macOS only
+          # (ADR-0025 item 7, founder artifact-matrix decision). The
+          # x86_64-apple-darwin and x86_64-unknown-linux-gnu targets are
+          # deliberately not built here: this workflow publishes every leg
+          # as a release asset with no per-asset "unsupported" label, so an
+          # unverified target would read as officially supported. Restore a
+          # leg only together with its install evidence and support claim.
     runs-on: ${{ matrix.os }}
     # No id-token/attestations:write here deliberately: this job runs
     # `cargo build` over third-party dependency source (build.rs/proc-macro
@@ -189,8 +187,6 @@ jobs:
       matrix:
         target:
           - aarch64-apple-darwin
-          - x86_64-apple-darwin
-          - x86_64-unknown-linux-gnu
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -230,9 +226,9 @@ jobs:
           merge-multiple: true
 
       # Re-verify each tarball's attestation against this exact repo before
-      # ever publishing it. The attest step above ran once per matrix leg,
-      # right after that leg's own build; this is the one place all three
-      # results are checked together, immediately before the artifacts
+      # ever publishing it. The attest step above ran right after the build
+      # (currently aarch64-apple-darwin only); this is the one place every
+      # attested tarball is checked together, immediately before the artifacts
       # become public, so a provenance gap can never reach a GitHub Release
       # unnoticed.
       - name: verify provenance before publishing

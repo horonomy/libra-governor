@@ -565,7 +565,7 @@ fn prompt_denials_block_without_calling_preflight() {
         (denied(SharedBudgetDenyReason::ConfigInvalid), "invalid"),
         (
             denied(SharedBudgetDenyReason::ClockAnomaly),
-            "clock anomaly",
+            "clock is already correct",
         ),
     ];
     for (outcome, needle) in cases {
