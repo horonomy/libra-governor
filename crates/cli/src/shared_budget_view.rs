@@ -51,7 +51,10 @@ pub const NOT_COVERED: [&str; 4] = [
     "accounting boundary (v0.0.4 Cooperative Preview): only Claude Code sessions and subagents \
      whose settlement hooks run and whose transcripts can be read and attributed are counted; \
      other executors and unreadable or unattributed spend can settle at the flat hold, be \
-     recorded as unattributed, or be missed",
+     recorded as unattributed, or be missed. Turns around /compact, partly flushed \
+     interactive turns, subagent files over 32 MiB and a hook that fails open when the daemon \
+     is down can also be missed. A forward clock or time-zone change opens the next month's \
+     budget early",
 ];
 
 /// How long the statusline segment may wait for the daemon. The shared
