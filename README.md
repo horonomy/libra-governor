@@ -124,7 +124,7 @@ That's it — the `balanced` policy preset and no enforcement gateway are
 the defaults, and nothing here blocks or interrupts your normal Claude
 Code workflow (see "Safe defaults" below).
 
-## Local monthly budget (optional)
+## Local monthly budget (optional, Cooperative Preview)
 
 On the unreleased v0.0.4 line you can cap what Claude Code may spend in a
 calendar month on this machine. It is off until you create the file:
@@ -150,6 +150,24 @@ spending cap. With hooks only, spend *inside* a turn is seen after the fact,
 so a turn can cost more than its hold. Codex sessions have no budget gate.
 There is no gateway hard cap. Evidence is `TestOwnedLive` (real binaries,
 synthetic transcripts), not observed on a real host.
+
+**Cooperative Preview: what to expect.** v0.0.4 ships this as a preview of
+cooperative admission, by founder scope decision (ADR-0026). It is not the
+original strict hard-cap guarantee.
+
+- *Not a strict monetary cap.* A prompt is admitted or refused up front;
+  nothing stops spend once a turn is running, so in-turn overshoot is possible.
+- *Codex is ungated.* The gateway hard cap and a Codex budget gate are designed
+  but off by default and not enabled in v0.0.4.
+- *Not your bill.* Amounts are Libra's list-price-equivalent estimates, or the
+  flat turn hold when a turn cannot be measured. Pricing gaps drift both ways
+  (for example the 1-hour cache tier is under-counted); see ADR-0026.
+- *Accounting boundary.* Counted: Claude Code sessions and subagents whose
+  settlement hooks run and whose transcripts can be read and attributed.
+  Not counted or not attributable: any other executor, a subagent without a
+  readable transcript or agent id, and spend outside Claude Code. Such spend
+  can settle at the flat hold, be recorded unattributed, or be missed. See
+  `docs/execution-owner-contract.md`.
 
 **Where to look.** `libra-governor shared-budget status` (add `--json`),
 the `shared_budget_*` checks in `libra-governor doctor`, and a `budget $x/$y`
