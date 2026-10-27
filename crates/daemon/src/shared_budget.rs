@@ -672,17 +672,19 @@ pub fn admit(
         let renewing = prompt_id
             .filter(|p| !p.trim().is_empty())
             .filter(|_| agent_id.is_none());
-        // Only a retry of the prompt this hold already accepted is
-        // idempotent. Any other renewal starts another turn (Stop does not
-        // fire on interrupt, so the hold is still live), and a fresh
-        // reservation would have needed the pool to cover a whole hold with
-        // this one not counted. Apply the same test so an interrupted turn
-        // cannot bypass the cap once other sessions have overdrawn the pool.
-        let retry = match renewing {
-            Some(p) => ledger.hold_for_prompt(&principal(), session_id, p)? == Some(existing.id),
+        // A renewal that names a prompt this hold has not accepted starts
+        // another turn (Stop does not fire on interrupt, so the hold is
+        // still live). A fresh reservation would have needed the pool to
+        // cover a whole hold with this one not counted; apply the same test
+        // so an interrupted turn cannot bypass the cap once other sessions
+        // have overdrawn the pool. Without a prompt id a retry cannot be
+        // told from a new turn, so it keeps the idempotent behaviour
+        // ("a lower cap never revokes existing holds", ADR-0026).
+        let new_turn = match renewing {
+            Some(p) => ledger.hold_for_prompt(&principal(), session_id, p)? != Some(existing.id),
             None => false,
         };
-        if !retry {
+        if new_turn {
             let remaining = remaining_of(ledger, &period.pool_id, cfg, now)?;
             let held = i64::try_from(existing.amount).unwrap_or(i64::MAX);
             let needed = i64::try_from(cfg.turn_hold_usd_cents).unwrap_or(i64::MAX);
