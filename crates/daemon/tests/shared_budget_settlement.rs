@@ -2775,6 +2775,37 @@ fn a_charge_agent_replay_into_a_pruned_period_is_refused() {
     assert_eq!(fx.pools().len(), 1);
 }
 
+#[test]
+fn a_main_turn_stop_replay_after_its_period_was_pruned_charges_nothing() {
+    // HORO-2250 M3: the January turn settled, January was pruned, and the
+    // host then re-delivers that turn's Stop (same prompt, same transcript).
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let main = fx.path().join("s1.jsonl");
+    grant(fx.admit("s1", None, Some("p1")));
+    write_lines(&main, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize_for_prompt("s1", Some(&s(&main)), Some("p1"));
+    assert_eq!(fx.status().used_usd_cents, 300, "January turn measured");
+
+    fx.clock.set(t("2027-05-10T12:00:00Z"));
+    let report = fx.prune_keeping_one_month();
+    assert_eq!(report.pools_pruned, 1, "{report:?}");
+    assert!(fx.pools().is_empty(), "no pool remains");
+
+    fx.clock.set(t("2027-05-10T12:05:00Z"));
+    fx.finalize_for_prompt("s1", Some(&s(&main)), Some("p1"));
+    assert!(
+        fx.pools().is_empty(),
+        "the pruned January pool was not recreated: {:?}",
+        fx.pools()
+    );
+    assert_eq!(
+        fx.status().used_usd_cents,
+        0,
+        "the replayed January turn was not booked into May"
+    );
+}
+
 fn charge_agent_at(fx: &mut Fx, key: &str, event: &str) -> SharedBudgetOutcome {
     fx.sb(SharedBudgetRequest::ChargeAgent {
         session_id: "s1".into(),
