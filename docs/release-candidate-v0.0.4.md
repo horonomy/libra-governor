@@ -152,6 +152,28 @@ steps 1-7. Its cited SHAs (`5aec5a1`, `fae8309`) are stale.
 | Rollback on a published artifact | partial |
 | Founder GO / ADR-0025 acceptance | not granted |
 
+Local-equivalent evidence gathered on 2026-10-27 (not a final-SHA result, and
+none of it is attested):
+
+- `scripts/check-release-tag.sh v0.0.4` on `main` `6183602`: exit 0
+  ("matches workspace version 0.0.4"); `v0.0.5`: exit 1, as designed.
+- CI-built aarch64 artifact from the PR #238 build-only run 40481551611
+  (source `34c9b33`, `macos-latest`): `shasum -c` OK, `--version` prints
+  `libra-governor 0.0.4`, Mach-O arm64. `gh attestation verify` returns 404,
+  as designed: pull-request runs skip attestation.
+- Sandboxed lifecycle with that binary, isolated HOME and state dir, a
+  foreign `Stop` hook pre-seeded: `install --hooks-only` added 6 hooks and
+  wrote a backup; `doctor` reported the hooks wired; `shared-budget init`
+  and `status` worked (daemon not started, reported as such); `uninstall`
+  removed the hooks, left the state dir (no `--yes`) and restored
+  `settings.json` to semantically equal JSON (not byte-identical: it is
+  re-serialized). It also printed that the binary "was installed via `cargo
+  install`" for a copied binary, a cosmetic misclassification.
+
+Still not done on the final SHA: the attested `workflow_dispatch` run,
+attestation verification, a clean-machine install, and rollback on a
+published artifact.
+
 Runnable now without publishing: the tag-check script, and a local
 `--release --locked` aarch64 build with `--version` and a sandboxed install
 smoke. That is local-equivalent evidence, not a CI-produced artifact.
