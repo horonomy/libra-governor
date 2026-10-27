@@ -42,12 +42,16 @@ pub const USD_MEANING: &str = "Libra-accounted list-price-equivalent USD at the 
      PRICING_VERSION; never a provider bill or quota";
 
 /// What the budget does not cover. Stated by `status` and `doctor` alike.
-pub const NOT_COVERED: [&str; 3] = [
+pub const NOT_COVERED: [&str; 4] = [
     "in-turn overshoot in hooks-only mode: spend inside a turn is visible only after the fact \
      (at Stop), so a turn can cost more than its hold",
     "the Codex route has no budget gate: Codex sessions are not admitted or charged by this budget",
     "there is no gateway hard cap: the per-request hard cap (gateway governor_held mode) is not \
      built",
+    "accounting boundary (v0.0.4 Cooperative Preview): only Claude Code sessions and subagents \
+     whose settlement hooks run and whose transcripts can be read and attributed are counted; \
+     other executors and unreadable or unattributed spend can settle at the flat hold, be \
+     recorded as unattributed, or be missed",
 ];
 
 /// How long the statusline segment may wait for the daemon. The shared
