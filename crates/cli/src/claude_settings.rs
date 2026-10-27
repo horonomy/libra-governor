@@ -428,11 +428,29 @@ pub fn apply_hooks_only(path: &Path, binary: &Path) -> Result<Applied, SettingsE
     with_write_lock(path, || apply_locked(path, binary, false))
 }
 
+/// Whether `text`, written unquoted into a command a shell runs, would be
+/// split or interpreted instead of naming one program.
+fn has_shell_unsafe_char(text: &str) -> bool {
+    text.chars()
+        .any(|c| c.is_whitespace() || "\"'\\$`;&|<>()*?[]{}!#^".contains(c))
+}
+
+/// A command `command_is_ours` recognises whose binary part the shell would
+/// split (an install from before PR 242). Ownership is unchanged; this only
+/// says the command cannot run, so `doctor` must not call it healthy.
+fn command_is_unusable(command: &str) -> bool {
+    command_is_ours(command)
+        && OWNED_COMMAND_SUFFIXES.iter().any(|suffix| {
+            command
+                .strip_suffix(suffix)
+                .map(str::trim_end)
+                .is_some_and(has_shell_unsafe_char)
+        })
+}
+
 /// The hook command is `{binary} {subcommand}` run by a shell, unquoted.
 fn reject_unsafe_binary(binary: &Path) -> Result<(), SettingsError> {
-    let text = binary.to_string_lossy();
-    let unsafe_char = |c: char| c.is_whitespace() || "\"'\\$`;&|<>()*?[]{}!#^".contains(c);
-    if text.chars().any(unsafe_char) {
+    if has_shell_unsafe_char(&binary.to_string_lossy()) {
         return Err(SettingsError::UnsafeBinaryPath {
             binary: binary.to_path_buf(),
         });
@@ -718,6 +736,11 @@ pub struct Inspection {
     pub api_key_helper_wired: bool,
     pub base_url_present: bool,
     pub base_url_is_loopback: bool,
+    /// Recognised Governor commands (hooks and statusLine) whose binary
+    /// path would be split by the shell that runs them, so they exit 127
+    /// before Libra starts. Ownership recognition (`command_is_ours`) is
+    /// deliberately unchanged: this only says the command cannot run.
+    pub unusable_commands: usize,
 }
 
 /// Read-only inspection of `path` for `doctor`. A missing or unparsable
@@ -766,12 +789,36 @@ pub fn inspect(path: &Path) -> Inspection {
     let hooks_wired = HOOK_EVENTS.map(wired);
     let shared_budget_hooks_wired = SHARED_BUDGET_HOOK_EVENTS.map(wired);
 
+    // Every recognised Governor command in an all-tools group, plus the
+    // statusLine, that the shell would split.
+    let mut unusable_commands = hooks_obj
+        .map(|hooks| {
+            hooks
+                .values()
+                .filter_map(Value::as_array)
+                .flatten()
+                .filter(|group| matcher_is_all_tools(group))
+                .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+                .flatten()
+                .filter_map(|h| h.get("command").and_then(Value::as_str))
+                .filter(|command| command_is_unusable(command))
+                .count()
+        })
+        .unwrap_or(0);
+
     let statusline_wired = root
         .get("statusLine")
         .and_then(|v| v.get("command"))
         .and_then(Value::as_str)
         .map(command_is_ours)
         .unwrap_or(false);
+
+    unusable_commands += usize::from(
+        root.get("statusLine")
+            .and_then(|v| v.get("command"))
+            .and_then(Value::as_str)
+            .is_some_and(command_is_unusable),
+    );
 
     let api_key_helper_wired = root
         .get("apiKeyHelper")
@@ -794,6 +841,7 @@ pub fn inspect(path: &Path) -> Inspection {
         api_key_helper_wired,
         base_url_present,
         base_url_is_loopback,
+        unusable_commands,
     }
 }
 
@@ -855,6 +903,26 @@ mod tests {
             }
             assert!(!path.exists(), "{bad}: nothing may be written");
         }
+    }
+
+    #[test]
+    fn inspect_flags_a_recognised_command_whose_path_the_shell_would_split() {
+        // A settings file written by a version that did not refuse such a
+        // path: still recognised as ours (so uninstall removes it), but it
+        // exits 127 before Libra runs, which `inspect` must not hide.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        apply(&path, &binary()).unwrap();
+        assert_eq!(inspect(&path).unusable_commands, 0, "valid install");
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replace("/opt/libra/bin", "/opt/legacy path")).unwrap();
+        let inspection = inspect(&path);
+        assert_eq!(inspection.hooks_wired, [true, true, true], "still ours");
+        assert_eq!(inspection.shared_budget_hooks_wired, [true, true, true]);
+        assert_eq!(
+            inspection.unusable_commands, 7,
+            "six hooks and the statusLine"
+        );
     }
 
     #[test]
