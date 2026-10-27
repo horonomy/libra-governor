@@ -64,7 +64,10 @@ product sees repeated use — see HORO-1154.
 
 - A Rust toolchain (`cargo`, `rustc`) — see <https://rustup.rs> if you
   do not have one.
-- macOS or Linux. Claude Code with hook and statusline support, and/or
+- Supported platform for the v0.0.4 Cooperative Preview: Apple Silicon
+  macOS (aarch64). Linux builds and runs in CI; Intel macOS is not built or
+  tested. Both are unsupported and unverified for the local monthly budget;
+  Windows is unsupported. Claude Code with hook and statusline support, and/or
   Codex with its hooks support (run `libra-governor install --agent
   codex`) — see `integrations/codex/README.md` for Codex-specific setup
   and capability-tier differences.

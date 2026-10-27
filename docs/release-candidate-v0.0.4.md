@@ -123,7 +123,7 @@ steps 1-7. Its cited SHAs (`5aec5a1`, `fae8309`) are stale.
 | `workflow_dispatch` pre-verify of `release.yml` | not done; needs a SHA-named GO (public attestations) |
 | aarch64 artifact checks (sha256, attestation, `--version`) | not done on the final SHA |
 | Clean-machine install smoke (Apple Silicon) | not done on the final SHA |
-| x86_64 and Linux install tests | out of scope for an Apple Silicon Preview; assets must be labelled unsupported-unverified, or the matrix restricted by a reviewed change |
+| x86_64 and Linux install tests | out of scope for an Apple Silicon Preview; the release matrix is restricted to aarch64 (PR #238, pending merge) |
 | Release notes | draft below; no CHANGELOG file exists |
 | Rollback on a published artifact | partial |
 | Founder GO / ADR-0025 acceptance | not granted |
