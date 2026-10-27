@@ -121,6 +121,24 @@ an interactive TTY and partial-flush sample, post-/compact coverage, and a
 real-provider session, each needing separate authorization. C and the rest
 are bounded by a warm private fixture rather than a clean-machine install.
 
+## Security gate (2026-10-27)
+
+Separate from the hardening table. Evidence is local or hosted-CI unless
+stated; none of it is independent QA.
+
+| Check | Result |
+|---|---|
+| `cargo audit` on `98b112a` | **failed**: 7 RustSec advisories in the shipped binary (rustls 0.23.45: RUSTSEC-2026-0346/0347/0348/0349; rustls-webpki 0.103.15: -0382; webpki-roots 1.0.9: -0381; ctutils 0.4.2: -0385) and an `unsound` warning on tokio 1.53.2 (-0386) |
+| Exposure | rustls and webpki are reached only through `libra-governor-gateway` (hyper-rustls), the optional gateway that is off by default and not used by the shared budget; ctutils through hmac/sha2. Linked into the release binary either way |
+| Fix | PR #248 (merged `ee42bca`): `Cargo.lock` only, five packages to patched releases, `Cargo.toml` unchanged; one independent review, no findings |
+| `cargo audit` on `ee42bca` | exit 0, no vulnerabilities or warnings (197 crates, advisory DB of 2026-10-27) |
+| Secret scan | `gitleaks detect --redact` over the last 133 commits: no leaks |
+| Dependabot alerts | 3 open, all Python `filelock` in `experiments/phase0/uv.lock` (not in the shipped binary). Open Dependabot PRs (#187-#195) are bot PRs that need an owner-approved review; #188 (tokio) is superseded by #248 |
+| Binary hash | the lockfile change alters the binary: earlier hashes do not apply to `ee42bca`; local aarch64 release `sha256 aac36394…ba71` (not CI-produced, not attested) |
+
+Product SHA for QA is `ee42bca93fbf89a4e2e804eeb570cf40bf4a428a`; later `main`
+commits are docs-only unless stated.
+
 ## Known limitations (user-facing)
 
 - Admission-bounded (cooperative), not a strict monetary cap; in-turn
@@ -170,7 +188,9 @@ none of it is attested):
   re-serialized). It also printed that the binary "was installed via `cargo
   install`" for a copied binary, a cosmetic misclassification.
 
-Local evidence at code SHA `98b112a16ac79cd4a04b1466ce6e81603d3bfc4c` (under
+Local evidence at code SHA `98b112a16ac79cd4a04b1466ce6e81603d3bfc4c`, repeated at
+`ee42bca` after the lockfile bump with the same results (CLI suites 81/81, the
+unsafe-path refusal, install, `doctor`, `uninstall` round trip) (under
 SPE-109 admission; not CI-produced, not attested, not an independent QA
 result):
 
