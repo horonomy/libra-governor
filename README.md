@@ -500,8 +500,8 @@ Run `libra-governor doctor` afterward to confirm — it will report
   the real install path.
 - **No Team Alpha / hosted control plane.** Shared team policy, a
   management console, and any cloud component are unbuilt — see
-  HORO-1154/1159/1163/1165. Everything in this release runs entirely on
-  your machine.
+  HORO-1154/1159/1163/1165. Everything in the published releases runs
+  entirely on your machine; v0.0.4 is unreleased.
 - **Upgrading directly from v0.0.1 needs one manual daemon restart** if
   Claude Code was already running before you upgraded. Try
   `libra-governor daemon stop` first; if it refuses because no pid record
