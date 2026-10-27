@@ -100,6 +100,13 @@ const SETTLEMENT_HOOK_TIMEOUT_SECS: u64 = 10;
 pub enum SettingsError {
     #[error("could not determine home directory (HOME env var unset)")]
     NoHomeDir,
+    #[error(
+        "refusing to wire hooks to {binary}: the path contains whitespace or a shell \
+         metacharacter, and Claude Code runs a hook command through a shell, so the hook \
+         would silently not run and prompts would pass ungated (nothing was changed) — \
+         install the binary to a plain path such as ~/.cargo/bin and re-run"
+    )]
+    UnsafeBinaryPath { binary: PathBuf },
     #[error("io error at {path}: {source}")]
     Io {
         path: PathBuf,
@@ -410,13 +417,27 @@ pub struct Applied {
 /// in `settings.json` would only work when Claude Code happens to be
 /// launched from the right working directory).
 pub fn apply(path: &Path, binary: &Path) -> Result<Applied, SettingsError> {
+    reject_unsafe_binary(binary)?;
     with_write_lock(path, || apply_locked(path, binary, true))
 }
 
 /// Adds only this integration's three hooks, leaving `statusLine` untouched
 /// whether it is absent, foreign, or has an unrecognized shape.
 pub fn apply_hooks_only(path: &Path, binary: &Path) -> Result<Applied, SettingsError> {
+    reject_unsafe_binary(binary)?;
     with_write_lock(path, || apply_locked(path, binary, false))
+}
+
+/// The hook command is `{binary} {subcommand}` run by a shell, unquoted.
+fn reject_unsafe_binary(binary: &Path) -> Result<(), SettingsError> {
+    let text = binary.to_string_lossy();
+    let unsafe_char = |c: char| c.is_whitespace() || "\"'\\$`;&|<>()*?[]{}!#^".contains(c);
+    if text.chars().any(unsafe_char) {
+        return Err(SettingsError::UnsafeBinaryPath {
+            binary: binary.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 fn apply_locked(
@@ -809,6 +830,31 @@ mod tests {
         let inspection = inspect(&path);
         assert_eq!(inspection.hooks_wired, [true, true, true]);
         assert!(inspection.statusline_wired);
+    }
+
+    #[test]
+    fn apply_refuses_a_binary_path_the_hook_shell_would_split_and_writes_nothing() {
+        // Claude Code runs a hook command through a shell. An unquoted path
+        // with a space runs the wrong program (exit 127, a non-blocking
+        // error), so every prompt would pass ungated while `doctor` still
+        // saw the hooks as wired.
+        let dir = tempfile::tempdir().unwrap();
+        for bad in [
+            "/tmp/libra gov/libra-governor",
+            "/tmp/a;b/libra-governor",
+            "/tmp/$HOME/libra-governor",
+            "/tmp/a\"b/libra-governor",
+        ] {
+            let path = dir.path().join("settings.json");
+            let binary = std::path::PathBuf::from(bad);
+            for result in [apply(&path, &binary), apply_hooks_only(&path, &binary)] {
+                assert!(
+                    matches!(result, Err(SettingsError::UnsafeBinaryPath { .. })),
+                    "{bad}: {result:?}"
+                );
+            }
+            assert!(!path.exists(), "{bad}: nothing may be written");
+        }
     }
 
     #[test]
