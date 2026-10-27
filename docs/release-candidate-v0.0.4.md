@@ -25,12 +25,12 @@ cap) and the Codex budget gate are designed, off by default, and not enabled.
 |---|---|---|
 | Stale-Admit / replay chain | ACCEPTED | HORO-2250 c29181 (PR #224/#226), c29205 (PR #227 SCOPED PASS) |
 | Four UX fixes | ACCEPTED | HORO-2258 c29093 (PR #223) |
-| HORO-2248 first run, denial, statusline | ACCEPTED (scoped functional) | Codex QA HORO-2186 c29269 PASS on `a3e9ec9`; the >=70 experience gate is met by c29293 (73) |
+| HORO-2248 first run, denial, statusline | ACCEPTED (scoped functional) | Codex QA HORO-2186 c29269 PASS on `a3e9ec9`; the >=70 experience gate is met (73 historical c29293, re-evaluated 71 c29341) |
 | HORO-2246 bounded Stop flush wait | ACCEPTED (bounded orchestration only) | c29269: delayed Stop measured once, missing transcript waits ~1.5 s then flat hold once. Not a fresh real-host sample; interactive TTY unmeasured |
 | HORO-2250 M3 prune then replay | ACCEPTED (reused evidence) | c29269 PASS_REUSED from earlier coordinator logs, not newly run; main-turn Stop replay after prune is covered by a test in PR #239 that first ran green on hosted CI but could not tell the guard from its absence (independent review), so it was strengthened; the strengthened form ran green on macOS and Ubuntu and is merged (PR #239, `b9cf2b8`) |
 | In-product disclosure | ACCEPTED | c29269: `status` and `doctor` show all four limitations |
 | Whole-feature Cooperative Preview | ACCEPTED (scoped functional PASS) | c29269 "scoped functional PASS; overall PARTIAL / no release sign-off"; no FAIL. c29269 verifies warn-only soft limits. DST gap and fold at a month's first midnight are covered by domain unit tests (`calendar.rs`, America/Asuncion and America/Havana), not by an end-to-end Codex run. Not covered: multi-daemon writers; power-loss/mid-COMMIT |
-| Independent Product Experience score | ACCEPTED (bounded scope) | **73/100**, Codex c29293 on `c38750d`; Preview threshold 70 met; overall verdict stays PARTIAL; see the Product Experience gate |
+| Independent Product Experience score | ACCEPTED (bounded scope) | **71/100**, Codex c29341 on the changed code (73/100 in c29293 on `c38750d` is historical); Preview threshold 70 met but cannot override open defect QA242-DOC-01; overall verdict stays PARTIAL; see the Product Experience gate |
 | Jira Fix Version / Goal (HORO-1752) | OWNER_AUTHORIZATION_REQUIRED | Jira admin must create it (comments 28544, 28725) |
 | Release checklist (HORO-1857) | REQUIRED_OPEN | see below |
 | S11, Codex gate, OpenAI gateway, remote upload | APPROVED_FUTURE_VERSION | provenance-limited, see ADR-0026 |
@@ -106,15 +106,27 @@ upstream, isolated HOME), recorded in the producer reports on HORO-2258 and
 HORO-2186. B has no interactive TTY, real-provider or clean-machine evidence.
 That evidence is not new; no points were added after it.
 
-**Independent score: 73/100** (Codex, HORO-2186 comment 29293, on `main`
-`c38750d`; evidence `coordinator/20261027-libra-preview-score/`, all hashes
-verified). A 24/30, B 8/20, C 20/25, D 12/15, E 9/10. Preview threshold 70
-and internal dogfood threshold 60 are met. This is an evidence-weighted
-judgment, not a user-study statistic. Overall QA stays **PARTIAL**
-(`INDEPENDENT_EXPERIENCE_QA_SIGNED_OFF=true` for the bounded scope,
-`FULL_RELEASE_QA_SIGNED_OFF=false`). Passing 70 does not override an
-unresolved critical defect; item 14 was such a candidate and is fixed by
-PR #240 (no independent re-test yet).
+**Independent score: 71/100** (Codex re-evaluation, HORO-2186 comment 29341,
+on `main` `ea927d5`, product `98b112a` plus the lockfile bump). A 24/30,
+B 8/20, C 20/25, D 11/15, E 8/10. Preview threshold 70 and internal dogfood
+threshold 60 are met, but the score cannot override the open defect below. The
+earlier **73/100** (comment 29293, on `c38750d`, D 12 and E 9) is kept as
+historical evidence only; it is not sign-off for the changed code. Both are
+evidence-weighted judgments, not user-study statistics. Overall QA stays
+**PARTIAL**: `FUNCTIONAL_QA_PASS=false` and `SECURITY_QA_PASS=false` until
+the diagnostic criterion is re-run; `FULL_RELEASE_QA_SIGNED_OFF=false`.
+
+**QA242-DOC-01 (Medium, Codex HORO-2250 c29337):** a settings file written
+before PR #242 keeps unquoted hook commands under a path the shell splits
+(exit 127 before Libra runs) while `doctor` reported the hooks ok; D and E each
+lost one point for that false assurance. Fixed by PR #250 (merged
+`4e56fbd086e8234aec52f0185df8a3b5fa62c271`): `doctor` reports such commands
+as an error (a warning with no budget configured) and names the remedy
+(`uninstall`, move the binary to a plain path, `install`); ownership matching,
+install and uninstall are unchanged. Independent re-run of the
+legacy-negative and valid-positive cases is requested (comment 29342); the
+criterion stays open until then. Item 14 (PR #240) was independently retested
+by Codex in c29341 (PASS).
 
 What keeps B at 8/20 and what would raise it: a current-head real-host run,
 an interactive TTY and partial-flush sample, post-/compact coverage, and a
@@ -136,8 +148,9 @@ stated; none of it is independent QA.
 | Dependabot alerts | 3 open, all Python `filelock` in `experiments/phase0/uv.lock` (not in the shipped binary). Open Dependabot PRs (#187-#195) are bot PRs that need an owner-approved review; #188 (tokio) is superseded by #248 |
 | Binary hash | the lockfile change alters the binary: earlier hashes do not apply to `ee42bca`; local aarch64 release `sha256 aac36394…ba71` (not CI-produced, not attested) |
 
-Product SHA for QA is `ee42bca93fbf89a4e2e804eeb570cf40bf4a428a`; later `main`
-commits are docs-only unless stated.
+Product SHA for QA is now `4e56fbd086e8234aec52f0185df8a3b5fa62c271` (PR #250;
+`ee42bca` added the lockfile fix); later `main` commits are docs-only unless
+stated. The lockfile and the doctor change each alter the binary bytes.
 
 ## Known limitations (user-facing)
 
