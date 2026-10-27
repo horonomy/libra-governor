@@ -428,11 +428,29 @@ pub fn apply_hooks_only(path: &Path, binary: &Path) -> Result<Applied, SettingsE
     with_write_lock(path, || apply_locked(path, binary, false))
 }
 
+/// Whether `text`, written unquoted into a command a shell runs, would be
+/// split or interpreted instead of naming one program.
+fn has_shell_unsafe_char(text: &str) -> bool {
+    text.chars()
+        .any(|c| c.is_whitespace() || "\"'\\$`;&|<>()*?[]{}!#^".contains(c))
+}
+
+/// A command `command_is_ours` recognises whose binary part the shell would
+/// split (an install from before PR 242). Ownership is unchanged; this only
+/// says the command cannot run, so `doctor` must not call it healthy.
+fn command_is_unusable(command: &str) -> bool {
+    command_is_ours(command)
+        && OWNED_COMMAND_SUFFIXES.iter().any(|suffix| {
+            command
+                .strip_suffix(suffix)
+                .map(str::trim_end)
+                .is_some_and(has_shell_unsafe_char)
+        })
+}
+
 /// The hook command is `{binary} {subcommand}` run by a shell, unquoted.
 fn reject_unsafe_binary(binary: &Path) -> Result<(), SettingsError> {
-    let text = binary.to_string_lossy();
-    let unsafe_char = |c: char| c.is_whitespace() || "\"'\\$`;&|<>()*?[]{}!#^".contains(c);
-    if text.chars().any(unsafe_char) {
+    if has_shell_unsafe_char(&binary.to_string_lossy()) {
         return Err(SettingsError::UnsafeBinaryPath {
             binary: binary.to_path_buf(),
         });
@@ -771,12 +789,36 @@ pub fn inspect(path: &Path) -> Inspection {
     let hooks_wired = HOOK_EVENTS.map(wired);
     let shared_budget_hooks_wired = SHARED_BUDGET_HOOK_EVENTS.map(wired);
 
+    // Every recognised Governor command in an all-tools group, plus the
+    // statusLine, that the shell would split.
+    let mut unusable_commands = hooks_obj
+        .map(|hooks| {
+            hooks
+                .values()
+                .filter_map(Value::as_array)
+                .flatten()
+                .filter(|group| matcher_is_all_tools(group))
+                .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+                .flatten()
+                .filter_map(|h| h.get("command").and_then(Value::as_str))
+                .filter(|command| command_is_unusable(command))
+                .count()
+        })
+        .unwrap_or(0);
+
     let statusline_wired = root
         .get("statusLine")
         .and_then(|v| v.get("command"))
         .and_then(Value::as_str)
         .map(command_is_ours)
         .unwrap_or(false);
+
+    unusable_commands += usize::from(
+        root.get("statusLine")
+            .and_then(|v| v.get("command"))
+            .and_then(Value::as_str)
+            .is_some_and(command_is_unusable),
+    );
 
     let api_key_helper_wired = root
         .get("apiKeyHelper")
@@ -799,7 +841,7 @@ pub fn inspect(path: &Path) -> Inspection {
         api_key_helper_wired,
         base_url_present,
         base_url_is_loopback,
-        unusable_commands: 0,
+        unusable_commands,
     }
 }
 

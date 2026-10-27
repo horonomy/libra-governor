@@ -396,7 +396,26 @@ fn budget_hooks_finding(
     let essential_missing = missing
         .iter()
         .any(|name| matches!(*name, "UserPromptSubmit" | "Stop"));
-    if missing.is_empty() {
+    if missing.is_empty() && inspection.unusable_commands > 0 {
+        // Ownership is recognised but the shell would split the command:
+        // it exits 127 before Libra runs, so nothing is admitted or settled
+        // and prompts pass ungated.
+        Finding {
+            id: "shared_budget_hooks",
+            severity: if configured {
+                Severity::Error
+            } else {
+                Severity::Warn
+            },
+            message: format!(
+                "{} installed hook command(s) cannot run: the binary path contains whitespace \
+                 or a shell metacharacter and was written unquoted, so the shell splits it \
+                 and exits 127 before Libra starts (prompts pass ungated) — move the binary \
+                 to a plain path such as ~/.cargo/bin and re-run `libra-governor install`",
+                inspection.unusable_commands
+            ),
+        }
+    } else if missing.is_empty() {
         Finding {
             id: "shared_budget_hooks",
             severity: Severity::Ok,
@@ -757,6 +776,19 @@ fn claude_settings_finding() -> Finding {
     };
     let inspection = claude_settings::inspect(&path);
     let all_hooks_wired = inspection.hooks_wired.iter().all(|w| *w);
+    if all_hooks_wired && inspection.unusable_commands > 0 {
+        return Finding {
+            id: "claude_settings",
+            severity: Severity::Error,
+            message: format!(
+                "{} installed command(s) in {} cannot run: the binary path contains \
+                 whitespace or a shell metacharacter and was written unquoted — move the \
+                 binary to a plain path such as ~/.cargo/bin and re-run `libra-governor install`",
+                inspection.unusable_commands,
+                path.display()
+            ),
+        };
+    }
     if !inspection.file_present || (!all_hooks_wired && !inspection.statusline_wired) {
         Finding {
             id: "claude_settings",
