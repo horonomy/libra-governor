@@ -718,6 +718,11 @@ pub struct Inspection {
     pub api_key_helper_wired: bool,
     pub base_url_present: bool,
     pub base_url_is_loopback: bool,
+    /// Recognised Governor commands (hooks and statusLine) whose binary
+    /// path would be split by the shell that runs them, so they exit 127
+    /// before Libra starts. Ownership recognition (`command_is_ours`) is
+    /// deliberately unchanged: this only says the command cannot run.
+    pub unusable_commands: usize,
 }
 
 /// Read-only inspection of `path` for `doctor`. A missing or unparsable
@@ -794,6 +799,7 @@ pub fn inspect(path: &Path) -> Inspection {
         api_key_helper_wired,
         base_url_present,
         base_url_is_loopback,
+        unusable_commands: 0,
     }
 }
 
@@ -855,6 +861,27 @@ mod tests {
             }
             assert!(!path.exists(), "{bad}: nothing may be written");
         }
+    }
+
+    #[test]
+    fn inspect_flags_a_recognised_command_whose_path_the_shell_would_split() {
+        // A settings file written by a version that did not refuse such a
+        // path: still recognised as ours (so uninstall removes it), but it
+        // exits 127 before Libra runs, which `inspect` must not hide.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        apply(&path, &binary()).unwrap();
+        assert_eq!(inspect(&path).unusable_commands, 0, "valid install");
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replace("/opt/libra/bin", "/opt/legacy path")).unwrap();
+        let inspection = inspect(&path);
+        assert_eq!(inspection.hooks_wired, [true, true, true], "still ours");
+        assert_eq!(inspection.shared_budget_hooks_wired, [true, true, true]);
+        assert!(
+            inspection.unusable_commands >= 6,
+            "{}",
+            inspection.unusable_commands
+        );
     }
 
     #[test]

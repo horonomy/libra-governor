@@ -1228,6 +1228,34 @@ fn render_json(findings: &[Finding], daemon: Option<&Result<DoctorResult, String
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn budget_hooks_finding_is_not_ok_when_a_wired_command_cannot_run() {
+        let wired = claude_settings::Inspection {
+            file_present: true,
+            hooks_wired: [true; 3],
+            shared_budget_hooks_wired: [true; 3],
+            unusable_commands: 6,
+            ..Default::default()
+        };
+        let configured = budget_hooks_finding(true, Some(&wired));
+        assert_eq!(configured.severity, Severity::Error, "{configured:?}");
+        assert!(configured.message.contains("cannot run"), "{configured:?}");
+        assert!(
+            configured.message.contains("plain path"),
+            "names the remedy: {configured:?}"
+        );
+        let unconfigured = budget_hooks_finding(false, Some(&wired));
+        assert_eq!(unconfigured.severity, Severity::Warn, "{unconfigured:?}");
+        let healthy = claude_settings::Inspection {
+            unusable_commands: 0,
+            ..wired
+        };
+        assert_eq!(
+            budget_hooks_finding(true, Some(&healthy)).severity,
+            Severity::Ok
+        );
+    }
     use super::*;
 
     fn ok(id: &'static str) -> Finding {
