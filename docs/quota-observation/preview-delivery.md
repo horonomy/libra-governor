@@ -69,8 +69,8 @@ file. Both checks apply.
 | Target | Built in CI | Install tested |
 |---|---|---|
 | `aarch64-apple-darwin` | yes | yes (one manual run, Jira HORO-1857 comment 27560) |
-| `x86_64-apple-darwin` | yes (cross-compiled, not executed) | **UNVERIFIED** |
-| `x86_64-unknown-linux-gnu` | yes | **UNVERIFIED** |
+| `x86_64-apple-darwin` | no (removed from `release.yml`; unsupported) | **UNVERIFIED** |
+| `x86_64-unknown-linux-gnu` | no (removed from `release.yml`; unsupported; source builds still run in `ci.yml`) | **UNVERIFIED** |
 | Windows | no | unsupported |
 
 See [`release-checklist.md`](release-checklist.md) for the artifact manifest
