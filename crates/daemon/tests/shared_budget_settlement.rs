@@ -2679,6 +2679,60 @@ fn a_stop_for_a_re_prompted_turn_still_settles_the_renewed_hold() {
     assert_eq!(totals(&fx.status()), (300, 0));
 }
 
+/// Cap 2500, hold 1000: s2's turn settles at 3000 while s1's interrupted
+/// turn still holds 1000, leaving the pool at 2500 - 3000 - 1000 = -1500.
+fn overdrawn_pool_with_s1_holding_an_interrupted_turn() -> Fx {
+    let mut fx = Fx::new(Some(&cfg_json(2_500, "UTC", 1_000)), BASE);
+    let tx = fx.path().join("s2.jsonl");
+    grant(fx.admit("s1", None, Some("p1")));
+    grant(fx.admit("s2", None, Some("q1")));
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(10), Some("s2"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize_for_prompt("s2", Some(&s(&tx)), Some("q1"));
+    assert_eq!(totals(&fx.status()), (3_000, 1_000));
+    fx
+}
+
+#[test]
+fn a_re_prompt_cannot_renew_a_hold_while_the_pool_is_overdrawn() {
+    // Stop does not fire on interrupt, so s1's hold is still live. Renewing
+    // it for a NEW prompt starts another turn with no capacity check, which
+    // a fresh reservation (needs remaining >= hold) would have refused.
+    let mut fx = overdrawn_pool_with_s1_holding_an_interrupted_turn();
+    fx.clock.set(at(70));
+    expect_cap_exhausted(fx.admit("s1", None, Some("p2")), -1_500);
+    assert_eq!(totals(&fx.status()), (3_000, 1_000), "nothing was written");
+}
+
+#[test]
+fn a_re_prompt_may_renew_a_hold_when_the_pool_just_covers_one_hold() {
+    // Boundary: remaining + the lane's own hold == turn hold is admitted on
+    // both the fresh-reserve and the renewal path. s2 settles at 1500, so the
+    // pool is 2500 - 1500 - 1000 = 0 with s1's interrupted hold live.
+    let mut fx = Fx::new(Some(&cfg_json(2_500, "UTC", 1_000)), BASE);
+    let tx = fx.path().join("s2.jsonl");
+    let first = grant(fx.admit("s1", None, Some("p1")));
+    grant(fx.admit("s2", None, Some("q1")));
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(5), Some("s2"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize_for_prompt("s2", Some(&s(&tx)), Some("q1"));
+    assert_eq!(totals(&fx.status()), (1_500, 1_000));
+    fx.clock.set(at(70));
+    let renewed = grant(fx.admit("s1", None, Some("p2")));
+    assert_eq!(
+        renewed.id, first.id,
+        "the live hold was renewed, not replaced"
+    );
+}
+
+#[test]
+fn a_retry_of_the_prompt_a_live_hold_already_accepted_stays_allowed_when_overdrawn() {
+    // Idempotent: the same prompt id is not a new turn.
+    let mut fx = overdrawn_pool_with_s1_holding_an_interrupted_turn();
+    fx.clock.set(at(70));
+    grant(fx.admit("s1", None, Some("p1")));
+}
+
 #[test]
 fn a_duplicate_stop_without_a_prompt_id_cannot_be_told_from_a_real_one() {
     // Residual, pinned so it is not mistaken for a guarantee: with no
