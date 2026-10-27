@@ -7,5 +7,6 @@
   "stop_hook_active": false,
   "last_assistant_message": "done",
   "permission_mode": "auto",
-  "hook_event_name": "Stop"
+  "hook_event_name": "Stop",
+  "transcript_path": "/tmp/codex-does-not-matter.jsonl"
 }
