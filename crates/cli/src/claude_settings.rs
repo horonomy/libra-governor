@@ -919,10 +919,9 @@ mod tests {
         let inspection = inspect(&path);
         assert_eq!(inspection.hooks_wired, [true, true, true], "still ours");
         assert_eq!(inspection.shared_budget_hooks_wired, [true, true, true]);
-        assert!(
-            inspection.unusable_commands >= 6,
-            "{}",
-            inspection.unusable_commands
+        assert_eq!(
+            inspection.unusable_commands, 7,
+            "six hooks and the statusLine"
         );
     }
 

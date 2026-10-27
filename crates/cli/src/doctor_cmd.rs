@@ -408,10 +408,12 @@ fn budget_hooks_finding(
                 Severity::Warn
             },
             message: format!(
-                "{} installed hook command(s) cannot run: the binary path contains whitespace \
+                "{} installed command(s) (hooks and statusLine) cannot run: the binary path contains whitespace \
                  or a shell metacharacter and was written unquoted, so the shell splits it \
-                 and exits 127 before Libra starts (prompts pass ungated) — move the binary \
-                 to a plain path such as ~/.cargo/bin and re-run `libra-governor install`",
+                 and exits 127 before Libra starts, so these hooks do not run — run \
+                 `libra-governor uninstall` (it removes them), move the binary to a plain \
+                 path such as ~/.cargo/bin, then run `libra-governor install` (re-running \
+                 install alone leaves the old entries in place)",
                 inspection.unusable_commands
             ),
         }
@@ -782,8 +784,9 @@ fn claude_settings_finding() -> Finding {
             severity: Severity::Error,
             message: format!(
                 "{} installed command(s) in {} cannot run: the binary path contains \
-                 whitespace or a shell metacharacter and was written unquoted — move the \
-                 binary to a plain path such as ~/.cargo/bin and re-run `libra-governor install`",
+                 whitespace or a shell metacharacter and was written unquoted — run \
+                 `libra-governor uninstall`, move the binary to a plain path such as \
+                 ~/.cargo/bin, then run `libra-governor install`",
                 inspection.unusable_commands,
                 path.display()
             ),
@@ -1274,8 +1277,8 @@ mod tests {
         assert_eq!(configured.severity, Severity::Error, "{configured:?}");
         assert!(configured.message.contains("cannot run"), "{configured:?}");
         assert!(
-            configured.message.contains("plain path"),
-            "names the remedy: {configured:?}"
+            configured.message.contains("plain path") && configured.message.contains("uninstall"),
+            "names the remedy that actually clears it: {configured:?}"
         );
         let unconfigured = budget_hooks_finding(false, Some(&wired));
         assert_eq!(unconfigured.severity, Severity::Warn, "{unconfigured:?}");
