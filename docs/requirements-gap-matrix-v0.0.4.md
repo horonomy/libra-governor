@@ -70,3 +70,23 @@ Real-host evidence is NONE for every row.
 v0.0.4 as an Observation Preview remains honest only if it is labelled as such and the promised journey is not
 claimed. It must not be called complete against the original Golden Journey. Alternatives, cost and risk are in the
 founder packet under HORO-2186.
+
+## Acceptance scope reconciliation (2026-10-27, `main` after PR #231)
+
+The matrix above is a historical snapshot at `5fd7209`. It is superseded for
+scope by the founder decisions below. No accepted evidence is changed.
+
+| Decision | Record | Effect on this matrix |
+|---|---|---|
+| Option 2: local-first Shared-Pool MVP (D1 local monthly USD budget, D3 one global hard budget, per-executor soft limits warn-only) | HORO-2186 c28778, ADR-0026 | Rows A and C move from NOT_IMPLEMENTED/PARTIAL to the ADR-0026 slices S2-S10, shipped as the cooperative pool. Remote upload stays a separate workstream (row I stays NOT_IMPLEMENTED). |
+| v0.0.4 ships as a labelled **Cooperative Preview**; S11 gateway cap and the Codex gate are not required to be enabled and must not be enabled in v0.0.4 | HORO-2261 c29248, ADR-0026 "Founder version-scope decision", README | The original hard-cap guarantee is **not** delivered. It is a founder-approved scope adjustment, not an equivalence claim. Row J Codex budget gating stays unavailable. |
+
+Accepted evidence preserved unchanged: HORO-2250 c29205 (PR #227 SCOPED PASS)
+and HORO-2258. Nothing is `ProductionObserved`; evidence remains
+`TestOwnedLive` at best. Release disclosures required by the founder are in the
+README section "Local monthly budget (optional, Cooperative Preview)".
+
+Still open for release readiness (not decided here): remaining original
+applicable QA and release gates, the producer score (72/100 provisional), and
+the separate founder publication approval. `READY_FOR_RELEASE=false`.
+
