@@ -224,7 +224,9 @@ fn denied_reason(
         }
         SharedBudgetDenyReason::ClockAnomaly => format!(
             "Libra shared budget paused: the system clock is earlier than a recorded \
-             budget period (clock anomaly); correct the clock to continue ({LABEL})."
+             budget period (clock anomaly); correct the clock to continue. If the clock is already \
+             correct, a pool from a later month was recorded: remove shared-budget.json to pause \
+             the budget, or see ADR-0026 recovery ({LABEL})."
         ),
     }
 }

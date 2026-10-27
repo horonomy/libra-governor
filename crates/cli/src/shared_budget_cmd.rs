@@ -61,7 +61,9 @@ const HELP: &str = "Usage:\n  \
     dollars (at most 2 decimals, e.g. 200 or 12.50). --time-zone is required: the budget period is \
     a calendar month in that zone and there is deliberately no UTC default. --turn-hold-usd is what \
     each prompt reserves (default 10; must not exceed the cap). Refuses to replace an existing \
-    file unless --force (which replaces the whole file). The optional per-session and per-agent \
+    file unless --force (which replaces the whole file: pricing_overrides, \
+    subagent_unmeasured_charge_usd_cents and any soft limit not repeated are dropped, and no backup \
+    is kept; the ledger is untouched). The optional per-session and per-agent \
     soft limits are dollars, warn only, and never grant capacity or deny a prompt. A running \
     daemon picks the file up on the next prompt.\n  \
     status   Read-only budget posture from the running daemon (never starts one): config state, \
