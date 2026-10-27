@@ -417,13 +417,27 @@ pub struct Applied {
 /// in `settings.json` would only work when Claude Code happens to be
 /// launched from the right working directory).
 pub fn apply(path: &Path, binary: &Path) -> Result<Applied, SettingsError> {
+    reject_unsafe_binary(binary)?;
     with_write_lock(path, || apply_locked(path, binary, true))
 }
 
 /// Adds only this integration's three hooks, leaving `statusLine` untouched
 /// whether it is absent, foreign, or has an unrecognized shape.
 pub fn apply_hooks_only(path: &Path, binary: &Path) -> Result<Applied, SettingsError> {
+    reject_unsafe_binary(binary)?;
     with_write_lock(path, || apply_locked(path, binary, false))
+}
+
+/// The hook command is `{binary} {subcommand}` run by a shell, unquoted.
+fn reject_unsafe_binary(binary: &Path) -> Result<(), SettingsError> {
+    let text = binary.to_string_lossy();
+    let unsafe_char = |c: char| c.is_whitespace() || "\"'\\$`;&|<>()*?[]{}!#^".contains(c);
+    if text.chars().any(unsafe_char) {
+        return Err(SettingsError::UnsafeBinaryPath {
+            binary: binary.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 fn apply_locked(
