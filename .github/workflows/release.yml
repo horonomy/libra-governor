@@ -226,9 +226,9 @@ jobs:
           merge-multiple: true
 
       # Re-verify each tarball's attestation against this exact repo before
-      # ever publishing it. The attest step above ran once per matrix leg,
-      # right after that leg's own build; this is the one place all three
-      # results are checked together, immediately before the artifacts
+      # ever publishing it. The attest step above ran right after the build
+      # (currently aarch64-apple-darwin only); this is the one place every
+      # attested tarball is checked together, immediately before the artifacts
       # become public, so a provenance gap can never reach a GitHub Release
       # unnoticed.
       - name: verify provenance before publishing

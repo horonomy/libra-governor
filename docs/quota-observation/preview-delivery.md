@@ -11,11 +11,12 @@ exercises.
 
 ## Platform matrix
 
-| Platform | Supported |
-|---|---|
-| Linux (`ubuntu-latest` in CI) | Yes |
-| macOS (`macos-latest` in CI) | Yes |
-| Windows | **No** |
+| Platform | CI-tested | Supported for the v0.0.4 Preview |
+|---|---|---|
+| macOS Apple Silicon (`macos-latest`, arm64) | Yes | **Yes** (only supported platform) |
+| Linux (`ubuntu-latest`) | Yes | **No** (CI only; unverified for the budget) |
+| Intel macOS | No | **No** |
+| Windows | No | **No** |
 
 This repository's CI (`.github/workflows/ci.yml`, `build-and-test` job)
 runs exactly this matrix — `os: [ubuntu-latest, macos-latest]` — no
@@ -49,7 +50,7 @@ that as a hard stop, not a value to silently reconcile.
 ## Build provenance and release status
 
 `.github/workflows/release.yml` (HORO-1857) builds the `libra-governor`
-binary for three targets, writes a `.sha256` per tarball, attests each build
+binary for `aarch64-apple-darwin` only, writes a `.sha256` per tarball, attests each build
 in a separate job that compiles nothing, re-verifies every attestation
 before publishing, and — since HORO-2162 — refuses a `v*` tag that does not
 equal the workspace version. The publish job runs **only on a real tag
@@ -58,7 +59,7 @@ artifacts and never a public release.
 
 Attestations are also created by `workflow_dispatch` runs, and they are
 public and permanent, so dispatch only SHAs you are content to have named.
-The CI `--version` smoke on the Linux runner is a build check, not an
+The CI `--version` smoke on the macOS arm64 runner is a build check, not an
 install test.
 
 **Status: unreleased.** No release has been published and no tag has been
