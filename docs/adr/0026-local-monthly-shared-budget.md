@@ -182,7 +182,7 @@ file changed or was just modified), not only at start:
 | File after start | Result |
 |---|---|
 | Created | Enforced from the next decision |
-| Edited, valid | New cap applies to the next decision. A lower cap never revokes existing holds; it denies new ones while `remaining < hold` |
+| Edited, valid | New cap applies to the next decision. A lower cap never revokes existing holds; it denies new ones while `remaining < hold`. A re-prompt (an `Admit` naming a prompt the live hold has not accepted) is a new turn: it renews the hold only while `remaining + that hold >= turn_hold`, otherwise `cap_exhausted` |
 | Edited, invalid or half-written | `config_invalid` (deny) until it is valid again; existing holds are kept |
 | Deleted | Treated as absent (`not_configured`): deleting the file is read as the operator removing the budget. `Status` shows `config_state: absent` and `config_changed_since_start: true` |
 
@@ -566,6 +566,16 @@ id, path or content).
   over-count that is not reconciled later). The wait makes this rare on the
   observed host; see *Flush lag at Stop* for the measurement and residuals.
 - The post-`/compact` transcript is unverified.
+
+  **Re-prompt capacity (HORO-2250):** a main-lane `Admit` with a new prompt id
+  renews the lane's live hold only if a fresh reservation would be admitted
+  with that hold released; otherwise it is denied `cap_exhausted`, writes
+  nothing, does not extend the hold (it expires at its TTL) and records no
+  prompt mapping. A retry of an accepted prompt, or an `Admit` without a
+  prompt id (a retry cannot be told from a new turn), is still renewed
+  unconditionally. Stop does not fire on interrupt, so without this check an
+  interrupted turn could keep starting turns after other sessions overdrew
+  the pool.
 
 **Not done in S5** (S7 delivered the installer and `SessionEnd` wiring, S8
 the `status` command and `doctor` checks): no gateway path (S11). `Finalize` itself returns
