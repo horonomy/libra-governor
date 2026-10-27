@@ -859,6 +859,22 @@ The founder approved this scope for **v0.0.4** (recorded in HORO-2261):
 - No publication, production deployment, new egress route or paid model test
   is authorised by this decision. v0.0.4 is not released.
 
+**Provenance of this decision.** Kept separate so no record is mistaken for
+independent proof.
+
+| Kind | Item |
+|---|---|
+| Explicit instruction | A human-origin message headed "FOUNDER DECISION - LIBRA HORO-2261" in the v0.0.4 release-owner Claude Code session, 2026-10-27 02:03:01Z (10:03 +08). It approves the scope above in its own words. The session transcript records it with origin `human`. |
+| Jira relay | HORO-2261 comment 29248, written by the release-owner agent session. The Jira author field is the same Atlassian account as agent comments, so it cannot separate founder from agent. It is a relay, not proof. |
+| Agent interpretation | The five disclosure wordings and the README text. The instruction lists the disclosure topics; the exact wording is the agent's. |
+| Agent proposal | The earlier A/A recommendation and the S11/Codex designs (PR #228, #229). Proposals, never approvals. |
+| Actual version acceptance | None. v0.0.4 is not accepted or released. The decision sets scope only. |
+
+Limit: the instruction arrived on the session's interactive human channel,
+the same channel as the earlier Option 2 directive (HORO-2186 comment 28778).
+No out-of-band confirmation that the sender is the founder exists. If the
+founder did not send it, restore S11 and the Codex gate to Proposed/Pending.
+
 **Release disclosure (required wording content).** The v0.0.4 release notes
 and in-product text must state that the pool is:
 
