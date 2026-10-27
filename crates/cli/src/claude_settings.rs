@@ -926,6 +926,56 @@ mod tests {
     }
 
     #[test]
+    fn inspect_never_counts_or_wires_through_a_corrupt_or_unsupported_shape() {
+        // Static validation reads JSON only; nothing is executed. Shapes that
+        // are corrupt, unsupported or not Governor's own must neither panic
+        // nor be reported as wired, and must not inflate the unusable count.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let unsafe_cmd = "/opt/legacy path/libra-governor hook stop";
+        let cases: Vec<(&str, String)> = vec![
+            ("unparsable", "{ not json".to_string()),
+            ("top-level array", "[1,2,3]".to_string()),
+            ("hooks is a string", r#"{"hooks":"x"}"#.to_string()),
+            ("event is not an array", r#"{"hooks":{"Stop":{"a":1}}}"#.to_string()),
+            ("group without hooks", r#"{"hooks":{"Stop":[{"matcher":""}]}}"#.to_string()),
+            ("command is not a string", r#"{"hooks":{"Stop":[{"hooks":[{"command":7}]}]}}"#.to_string()),
+            (
+                "non-all-tools group",
+                format!(r#"{{"hooks":{{"Stop":[{{"matcher":"Bash","hooks":[{{"command":"{unsafe_cmd}"}}]}}]}}}}"#),
+            ),
+            (
+                "hand-quoted command (not recognised as ours)",
+                r#"{"hooks":{"Stop":[{"hooks":[{"command":"\"/opt/legacy path/libra-governor\" hook stop"}]}]}}"#.to_string(),
+            ),
+            (
+                "lookalike binary name",
+                r#"{"hooks":{"Stop":[{"hooks":[{"command":"/opt/a b/libra-governor-tools hook stop"}]}]}}"#.to_string(),
+            ),
+            (
+                "foreign command with a space",
+                r#"{"hooks":{"Stop":[{"hooks":[{"command":"/usr/local/my tools/lint --all"}]}]}}"#.to_string(),
+            ),
+        ];
+        for (name, body) in cases {
+            std::fs::write(&path, body).unwrap();
+            let inspection = inspect(&path);
+            assert_eq!(inspection.unusable_commands, 0, "{name}");
+            assert_eq!(inspection.hooks_wired, [false; 3], "{name}");
+            assert_eq!(inspection.shared_budget_hooks_wired, [false; 3], "{name}");
+        }
+        // An unsafe legacy statusLine alone is counted, and is not a hook.
+        std::fs::write(
+            &path,
+            r#"{"statusLine":{"type":"command","command":"/opt/legacy path/libra-governor statusline"}}"#,
+        )
+        .unwrap();
+        let inspection = inspect(&path);
+        assert_eq!(inspection.unusable_commands, 1);
+        assert_eq!(inspection.hooks_wired, [false; 3]);
+    }
+
+    #[test]
     fn apply_twice_does_not_duplicate_hook_entries() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
