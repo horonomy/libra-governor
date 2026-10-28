@@ -65,6 +65,56 @@ fn ensure_state_dir_tightens_an_existing_directory_created_with_a_looser_mode() 
 }
 
 #[test]
+fn ensure_state_dir_never_chmods_a_file_reached_through_a_symlink() {
+    // HORO-2303: `exists()` and `set_permissions` follow symlinks, so a state
+    // path that is a symlink to a regular file used to turn that file into
+    // mode 0700 (owner-executable, group/other access dropped). A state dir
+    // must be a directory; anything else is refused and left untouched.
+    let _guard = ENV_LOCK.lock().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let file = parent.path().join("someone-elses-file");
+    std::fs::write(&file, b"data").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let link = parent.path().join("state-link");
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+
+    std::env::set_var("LIBRA_GOVERNOR_STATE_DIR", &link);
+    let result = libra_governor_daemon::paths::ensure_state_dir();
+    std::env::remove_var("LIBRA_GOVERNOR_STATE_DIR");
+
+    assert!(
+        result.is_err(),
+        "a non-directory state path must be refused"
+    );
+    assert_eq!(
+        mode_of(&file),
+        0o644,
+        "the symlink target must not be chmodded"
+    );
+}
+
+#[test]
+fn ensure_state_dir_still_follows_a_symlink_to_a_directory_it_owns() {
+    // Compatibility control: relocating the state dir with a symlink to a
+    // directory the user owns is legitimate and keeps working (and is
+    // tightened to 0700, as for a direct path).
+    let _guard = ENV_LOCK.lock().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let real = parent.path().join("real-state");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let link = parent.path().join("state-link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    std::env::set_var("LIBRA_GOVERNOR_STATE_DIR", &link);
+    let dir = libra_governor_daemon::paths::ensure_state_dir();
+    std::env::remove_var("LIBRA_GOVERNOR_STATE_DIR");
+
+    assert_eq!(dir.unwrap(), link);
+    assert_eq!(mode_of(&real), 0o700);
+}
+
+#[test]
 fn a_real_daemon_startup_hardens_the_socket_and_ledger_file_modes() {
     let dir = tempfile::tempdir().unwrap();
     let socket_path = dir.path().join("daemon.sock");
