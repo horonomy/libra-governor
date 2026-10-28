@@ -38,6 +38,8 @@ Two tiers, so the founder can approve the cheap one without the paid one.
 
 ### A1. Real Claude Code binary, isolated, no network, no spend
 
+**Status: approved by the founder and executed on 2026-10-28; results in `release-candidate-v0.0.4.md`, "Packet A1". A2, B and C are not approved.**
+
 Local isolated testing is already within the founder's standing authorization
 (no paid inference, no live-host config). It is listed here because it spawns
 an interactive `claude` process; reply "A1 go" and the release owner runs it.
