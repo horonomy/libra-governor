@@ -32,13 +32,13 @@ clean-machine install and rollback (B), attested artifact pre-verification
 **Closes:** `REAL_HOST_QA_PASS` (currently NOT_VERIFIED): interactive terminal
 Stop flush timing, a partly flushed turn, post-/compact behaviour, and the live
 denial/statusline experience on the current code. Cap on the experience score:
-B stays 8/20 without this.
+B was 8/20 before A1; A1 raised it to 10/20 (Codex c29404). It cannot rise further without A2.
 
 Two tiers, so the founder can approve the cheap one without the paid one.
 
 ### A1. Real Claude Code binary, isolated, no network, no spend
 
-**Status: approved by the founder and executed on 2026-10-28; results in `release-candidate-v0.0.4.md`, "Packet A1". A2, B and C are not approved.**
+**Status: approved by the founder and executed on 2026-10-28; results in `release-candidate-v0.0.4.md`, "Packet A1". Independent review (Codex c29404): Packet A1 PARTIAL, scoped interactive-host evidence ACCEPTED, experience score 75/100, `REAL_HOST_QA_PASS` still NOT_VERIFIED. A1 is not to be repeated without a demonstrated evidence gap. The original wildcard-localhost `setup.sh` is superseded (it leaked); the corrected exact-port profile is in the evidence directory. A2, B and C are not approved.**
 
 Local isolated testing is already within the founder's standing authorization
 (no paid inference, no live-host config). It is listed here because it spawns
@@ -68,9 +68,16 @@ an interactive `claude` process; reply "A1 go" and the release owner runs it.
 
 ### A2. Founder's real host, real provider (live-host change and paid inference)
 
-Needs explicit approval of every line below. Not required for the Preview if
-the founder accepts A1 as the interactive evidence and records that
-`ProductionObserved` evidence does not exist.
+Needs explicit approval of every line below. **A2 is not automatically a paid
+Preview prerequisite.** Founder decision, two options:
+
+1. Approve A2 (bounds below) to obtain `ProductionObserved` evidence; or
+2. Accept A1 (`TestOwnedLive`, score 75/100) as the interactive evidence for the
+   Preview and record that `ProductionObserved` evidence does not exist; the
+   release notes then keep the "test-owned runs, not real-host observation"
+   label, and `REAL_HOST_QA_PASS` stays NOT_VERIFIED for the full contract.
+
+A2 is separate from B, C and D; approving one approves none of the others.
 
 - **Before install:** record whether `~/.local/state/libra-governor` and Libra
   hooks already exist on the host. If they do, back up the state directory, or

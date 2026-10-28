@@ -30,7 +30,7 @@ cap) and the Codex budget gate are designed, off by default, and not enabled.
 | HORO-2250 M3 prune then replay | ACCEPTED (reused evidence) | c29269 PASS_REUSED from earlier coordinator logs, not newly run; main-turn Stop replay after prune is covered by a test in PR #239 that first ran green on hosted CI but could not tell the guard from its absence (independent review), so it was strengthened; the strengthened form ran green on macOS and Ubuntu and is merged (PR #239, `b9cf2b8`) |
 | In-product disclosure | ACCEPTED | c29269: `status` and `doctor` show all four limitations |
 | Whole-feature Cooperative Preview | ACCEPTED (scoped functional PASS) | c29269 "scoped functional PASS; overall PARTIAL / no release sign-off"; no FAIL. c29269 verifies warn-only soft limits. DST gap and fold at a month's first midnight are covered by domain unit tests (`calendar.rs`, America/Asuncion and America/Havana), not by an end-to-end Codex run. Not covered: multi-daemon writers; power-loss/mid-COMMIT |
-| Independent Product Experience score | ACCEPTED (bounded scope) | **73/100**, Codex c29344 on main `ec43a5b` (product `4e56fbd`); history: 73 (c29293, `c38750d`) then 71 (c29341, open defect QA242-DOC-01) then 73 (c29344, defect closed, D and E each +1 for observed evidence, not automatic restoration); Preview threshold 70 met; overall verdict stays PARTIAL; see the Product Experience gate |
+| Independent Product Experience score | ACCEPTED (bounded scope) | **75/100**, Codex c29404 (A1 review; B +2 for the corroborated interactive host evidence only); history: 73 (c29293, `c38750d`), 71 (c29341, open defect QA242-DOC-01), 73 (c29344, defect closed), 75 (c29404); Preview threshold 70 met; overall verdict stays PARTIAL; see the Product Experience gate |
 | Jira Fix Version / Goal (HORO-1752) | OWNER_AUTHORIZATION_REQUIRED | Jira admin must create it (comments 28544, 28725) |
 | Release checklist (HORO-1857) | REQUIRED_OPEN | see below |
 | S11, Codex gate, OpenAI gateway, remote upload | APPROVED_FUTURE_VERSION | provenance-limited, see ADR-0026 |
@@ -106,11 +106,14 @@ upstream, isolated HOME), recorded in the producer reports on HORO-2258 and
 HORO-2186. B has no interactive TTY, real-provider or clean-machine evidence.
 That evidence is not new; no points were added after it.
 
-**Independent score: 73/100** (Codex, HORO-2186 comment 29344, on main
-`ec43a5b`, product merge `4e56fbd`): A 24/30, B 8/20, C 20/25, D 12/15,
-E 9/10. Preview threshold 70 and internal dogfood threshold 60 are met. The
+**Independent score: 75/100** (Codex, HORO-2186 comment 29404, qualified
+product `4e56fbd`): A 24/30, B 10/20, C 20/25, D 12/15, E 9/10. B rose two
+points for the newly corroborated interactive-host Stop, flush and denial
+behaviour only; there is no credit for a real provider, real latency, natural
+workload or `ProductionObserved` evidence (the fake usage and protocol sleeps
+are synthetic). The 73/100 of comment 29344 (B 8) is kept as history. Preview threshold 70 and internal dogfood threshold 60 are met. The
 history is kept: 73 (comment 29293, on `c38750d`), then 71 (comment 29341,
-D 11 and E 8, after the open defect below), then 73 (comment 29344). D and E
+D 11 and E 8, after the open defect below), then 73 (comment 29344), then 75 (comment 29404). D and E
 were each raised one point for observed evidence (false healthy assurance
 removed without mutation or ownership change; the stated repair actually
 executed and install-alone verified insufficient), not restored
@@ -168,31 +171,63 @@ test-only PR #252 (`694427f`). The lockfile and the doctor change each alter the
 ## Packet A1: isolated interactive acceptance (2026-10-28)
 
 Founder-approved for A1 only (not A2, B, C, release). Producer evidence,
-class `TestOwnedLive`; it is not independent QA and not `ProductionObserved`.
+class `TestOwnedLive`, not `ProductionObserved`. **Independent review (Codex
+comment 29404): scoped interactive-host evidence ACCEPTED; Packet A1 overall
+PARTIAL** (complete isolation and closeout custody is partly
+producer-attested); no new product Bug confirmed;
+`REAL_HOST_QA_PASS` remains NOT_VERIFIED for the full contract; real-provider
+A2 is not automatically a paid Preview prerequisite.
 Evidence (not in the repo; it holds daemon logs and a harness copy):
 `~/Bryant-Developments/horonomy/libra-release-evidence/20261028-a1-interactive/`,
-index `SHA256SUMS.txt` sha256 `60aa941368a589e473467c1a9441ef3351c6136db1c9f08f3effbc0cf1b24c23`
-(15 files, all verify), handed to Codex for independent review.
+index `SHA256SUMS.txt` sha256 `13be07fda41ec2c895db0cb7dae053b84255359c24f140aea5619b8ddde29fec`
+(17 files, all verify). The first index (`60aa9413…`, 15 files) is what Codex
+reviewed; this one adds the corrected sandbox profile template,
+producer-transcribed receipts (labelled as such) and renames the superseded
+wildcard `setup.sh`.
+
+**Corrections after the Codex review (c29404), all verified against the logs:**
+
+- 15 UserPromptSubmit log lines are attempts, including the blocked prompt; there
+  were 14 allowed ordinary turns plus the blocked one. `/compact` produced no
+  admission line of its own. "15 admissions" was wrong.
+- Accounting: 14 measured Stops = 315c; three `SettleTail` recoveries (one at
+  each `/exit`) = 63c; one unmeasured subagent fallback = 200c; **gross logged
+  578c**. The 557c in `status.json` is the snapshot taken before the final
+  `/exit` (315 + 42 + 200). No post-exit status snapshot exists, so the final
+  reconciliation and the absence of a double charge for the third tail are
+  unverified; this is not a proven accounting bug.
+- 25 POST requests (plus 2 GET health checks) reached the fake upstream; they are
+  not 25 completed billable messages.
+- The stale-`$50` statusline is producer-observed; the retained final frame shows
+  `$5.57/$50`, and the denial-time frame was not retained.
+- The first sandbox profile (wildcard localhost allow) let external traffic
+  through and was discarded; the superseded `setup.sh` is kept for custody and
+  must not be replayed or used to certify no egress. The corrected exact-port
+  profile is `CORRECTED-sandbox.sb.template`. Egress-probe and cleanup receipts
+  are transcribed from the producer session (`PRODUCER-TRANSCRIBED-RECEIPTS.txt`,
+  producer-attested). Not captured: global-state before/after hashes, per-PID
+  exit codes, the cap-edit timeline against frames, argv receipts for the two
+  `--continue` launches.
 
 | Item | Value |
 |---|---|
 | Libra binary | CI-built aarch64, hosted run 40516615874, source `263a7a6`, product `4e56fbd`; binary sha256 `fb2376a5…050d` |
 | Host | real `claude` 2.1.306 in a `tmux` pseudo-terminal (private tmux server), macOS arm64 |
 | Isolation | temp HOME and state dir, dummy sentinel API key, loopback fake Messages-API upstream, `sandbox-exec` denying all network except the fake upstream port and unix sockets |
-| Egress check | `curl` to example.com and 1.1.1.1 and another loopback port failed inside the sandbox; Claude Code's own start-up check of `api.anthropic.com` was refused until onboarding was pre-seeded; the fake upstream saw only the sentinel key (25 requests, no bearer token) |
+| Egress check | `curl` to example.com and 1.1.1.1 and another loopback port failed inside the sandbox; Claude Code's own start-up check of `api.anthropic.com` was refused until onboarding was pre-seeded; the fake upstream saw only the sentinel key (25 POST requests plus 2 GET health checks, no bearer token) |
 | Real host | not touched: real `~/.claude/settings.json` (last modified 2026-10-23) and `~/.local/state/libra-governor` (2026-10-25) are older than the run; the Libra entries there predate it (a dev-build install) |
 | Teardown | `/exit`, `daemon stop`, private tmux server and fake upstream killed; no leftover process; isolated trees removed |
 
-Prompts: 14 ordinary interactive turns over 3 sessions (2 resumed with
-`--continue`), 4 of them executing a `Bash` tool, plus one `/compact` (15
-allowed prompts, 15 UserPromptSubmit admissions), then 1 prompt blocked by an
-exhausted cap and a recovery prompt (counted among the 14).
+Prompts: 14 allowed ordinary interactive turns over 3 sessions (2 resumed with
+`--continue`), 4 of them executing a `Bash` tool, plus one `/compact` (no
+admission line of its own), and 1 prompt blocked by an exhausted cap (the
+recovery prompt is among the 14); 15 UserPromptSubmit log lines in total.
 
 | Observation | Result |
 |---|---|
-| Stop settlements | 14 of 14 measured, 0 flat-hold fallbacks, 0 binding mismatches; ledger reconciles (settled 557c, held 0, remaining consistent) |
+| Stop settlements | 14 of 14 measured, 0 flat-hold fallbacks, 0 binding mismatches; 315c across the 14 Stops; status snapshot before the final `/exit` settled 557c with held 0 and consistent remaining; gross logged 578c (see corrections) |
 | Stop flush wait | 4 of 14 Stops waited for the transcript: 76, 107, 118, 124 ms (5 to 6 probes); the other 10 were ready at the first probe; none reached the cap. The fake upstream answers instantly and streams in 120 ms steps, so real model latency is still unmeasured |
-| Records after the last Stop | 2 `SettleTail` recoveries at `/exit` (21c each, `already_charged=false`, no double charge) |
+| Records after the last Stop | 3 `SettleTail` recoveries, one at each `/exit` (21c each, `already_charged=false`); the first two are in the 557c snapshot, the third was charged after it |
 | `/compact` | surfaced as a `SubagentStop` and was booked as an **unmeasured subagent charge at the 200c flat fallback** (the fake spend was about 21c); `doctor` showed the flagged-settlements warning. This is an over-count here; with a large real context a compaction could cost more than the fallback (under-count). It was not missed, which the current `NOT_COVERED` text ("can be missed") does not say |
 | Denial in the real UI | with remaining $0.64 below the $2.00 hold, `UserPromptSubmit operation blocked by hook` showed the period end in the configured zone, the raise-the-cap remedy and the "not provider quota" wording |
 | Recovery | raising the cap applied to the very next prompt with no restart |
