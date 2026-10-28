@@ -165,6 +165,47 @@ Product SHA for QA is `4e56fbd086e8234aec52f0185df8a3b5fa62c271` (PR #250;
 `ee42bca` added the lockfile fix); later `main` commits are docs-only, except
 test-only PR #252 (`694427f`). The lockfile and the doctor change each alter the binary bytes.
 
+## Packet A1: isolated interactive acceptance (2026-10-28)
+
+Founder-approved for A1 only (not A2, B, C, release). Producer evidence,
+class `TestOwnedLive`; it is not independent QA and not `ProductionObserved`.
+Evidence index: `coordinator`-style directory `a1/evidence/` in the release
+owner's scratchpad (`SHA256SUMS.txt` sha256 `76519a37…c93`; not in the repo, it
+holds daemon logs and a harness copy), to be handed to Codex.
+
+| Item | Value |
+|---|---|
+| Libra binary | CI-built aarch64, hosted run 40516615874, source `263a7a6`, product `4e56fbd`; binary sha256 `fb2376a5…050d` |
+| Host | real `claude` 2.1.306 in a `tmux` pseudo-terminal (private tmux server), macOS arm64 |
+| Isolation | temp HOME and state dir, dummy sentinel API key, loopback fake Messages-API upstream, `sandbox-exec` denying all network except the fake upstream port and unix sockets |
+| Egress check | `curl` to example.com and 1.1.1.1 and another loopback port failed inside the sandbox; Claude Code's own start-up check of `api.anthropic.com` was refused until onboarding was pre-seeded; the fake upstream saw only the sentinel key (25 requests, no bearer token) |
+| Real host | not touched: real `~/.claude/settings.json` (last modified 2026-10-23) and `~/.local/state/libra-governor` (2026-10-25) are older than the run; the Libra entries there predate it (a dev-build install) |
+| Teardown | `/exit`, `daemon stop`, private tmux server and fake upstream killed; no leftover process; isolated trees removed |
+
+Turns: 14 interactive turns over 3 sessions (2 resumed with `--continue`),
+4 of them executing a `Bash` tool, one `/compact`, then cap exhaustion and
+recovery.
+
+| Observation | Result |
+|---|---|
+| Stop settlements | 14 of 14 measured, 0 flat-hold fallbacks, 0 binding mismatches; ledger reconciles (settled 557c, held 0, remaining consistent) |
+| Stop flush wait | 4 of 14 Stops waited for the transcript: 76, 107, 118, 124 ms (5 to 6 probes); the other 10 were ready at the first probe; none reached the cap. The fake upstream answers instantly and streams in 120 ms steps, so real model latency is still unmeasured |
+| Records after the last Stop | 2 `SettleTail` recoveries at `/exit` (21c each, `already_charged=false`, no double charge) |
+| `/compact` | surfaced as a `SubagentStop` and was booked as an **unmeasured subagent charge at the 200c flat fallback** (the fake spend was about 21c); `doctor` showed the flagged-settlements warning. This is an over-count here; with a large real context a compaction could cost more than the fallback (under-count). It was not missed, which the current `NOT_COVERED` text ("can be missed") does not say |
+| Denial in the real UI | with remaining $0.64 below the $2.00 hold, `UserPromptSubmit operation blocked by hook` showed the period end in the configured zone, the raise-the-cap remedy and the "not provider quota" wording |
+| Recovery | raising the cap applied to the very next prompt with no restart |
+| Statusline | the command itself reported `budget $5.36/$6 (90%) · budget low: new sessions blocked`, but the TUI line still showed `/$50` after the denial and only updated after the next model turn (Claude Code does not re-run the statusline after a hook-blocked prompt; Libra sets no refresh interval) |
+| Daemon log noise | 4 `connection error ... Broken pipe` lines, one per tool turn: the PostToolUse hook closes before reading the daemon reply; harmless in this run |
+| `doctor` | exit 0 with two warnings: no Codex hooks installed (expected) and the flagged settlement from `/compact` |
+
+Not covered by A1: real model latency, a real provider, the founder's real
+host, a partly flushed turn under a slow real model (the only partial-flush
+evidence is the two `SettleTail` recoveries), subagent spawns by the model, and
+independent verification. Classification: no new Preview blocker. The
+`/compact` booking and the stale TUI statusline are observed limitations; a
+wording change to `NOT_COVERED` or a statusline refresh interval would change
+product code and is not made here.
+
 ## Known limitations (user-facing)
 
 - Admission-bounded (cooperative), not a strict monetary cap; in-turn
