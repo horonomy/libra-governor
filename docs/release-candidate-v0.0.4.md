@@ -25,12 +25,12 @@ cap) and the Codex budget gate are designed, off by default, and not enabled.
 |---|---|---|
 | Stale-Admit / replay chain | ACCEPTED | HORO-2250 c29181 (PR #224/#226), c29205 (PR #227 SCOPED PASS) |
 | Four UX fixes | ACCEPTED | HORO-2258 c29093 (PR #223) |
-| HORO-2248 first run, denial, statusline | ACCEPTED (scoped functional) | Codex QA HORO-2186 c29269 PASS on `a3e9ec9`; the >=70 experience gate is met (73 historical c29293, re-evaluated 71 c29341) |
+| HORO-2248 first run, denial, statusline | ACCEPTED (scoped functional) | Codex QA HORO-2186 c29269 PASS on `a3e9ec9`; the >=70 experience gate is met (73 c29293 on `c38750d`, 71 c29341, 73 c29344 after the fix) |
 | HORO-2246 bounded Stop flush wait | ACCEPTED (bounded orchestration only) | c29269: delayed Stop measured once, missing transcript waits ~1.5 s then flat hold once. Not a fresh real-host sample; interactive TTY unmeasured |
 | HORO-2250 M3 prune then replay | ACCEPTED (reused evidence) | c29269 PASS_REUSED from earlier coordinator logs, not newly run; main-turn Stop replay after prune is covered by a test in PR #239 that first ran green on hosted CI but could not tell the guard from its absence (independent review), so it was strengthened; the strengthened form ran green on macOS and Ubuntu and is merged (PR #239, `b9cf2b8`) |
 | In-product disclosure | ACCEPTED | c29269: `status` and `doctor` show all four limitations |
 | Whole-feature Cooperative Preview | ACCEPTED (scoped functional PASS) | c29269 "scoped functional PASS; overall PARTIAL / no release sign-off"; no FAIL. c29269 verifies warn-only soft limits. DST gap and fold at a month's first midnight are covered by domain unit tests (`calendar.rs`, America/Asuncion and America/Havana), not by an end-to-end Codex run. Not covered: multi-daemon writers; power-loss/mid-COMMIT |
-| Independent Product Experience score | ACCEPTED (bounded scope) | **71/100**, Codex c29341 on the changed code (73/100 in c29293 on `c38750d` is historical); Preview threshold 70 met but cannot override open defect QA242-DOC-01; overall verdict stays PARTIAL; see the Product Experience gate |
+| Independent Product Experience score | ACCEPTED (bounded scope) | **73/100**, Codex c29344 on main `ec43a5b` (product `4e56fbd`); history: 73 (c29293, `c38750d`) then 71 (c29341, open defect QA242-DOC-01) then 73 (c29344, defect closed, D and E each +1 for observed evidence, not automatic restoration); Preview threshold 70 met; overall verdict stays PARTIAL; see the Product Experience gate |
 | Jira Fix Version / Goal (HORO-1752) | OWNER_AUTHORIZATION_REQUIRED | Jira admin must create it (comments 28544, 28725) |
 | Release checklist (HORO-1857) | REQUIRED_OPEN | see below |
 | S11, Codex gate, OpenAI gateway, remote upload | APPROVED_FUTURE_VERSION | provenance-limited, see ADR-0026 |
@@ -106,27 +106,40 @@ upstream, isolated HOME), recorded in the producer reports on HORO-2258 and
 HORO-2186. B has no interactive TTY, real-provider or clean-machine evidence.
 That evidence is not new; no points were added after it.
 
-**Independent score: 71/100** (Codex re-evaluation, HORO-2186 comment 29341,
-on `main` `ea927d5`, product `98b112a` plus the lockfile bump). A 24/30,
-B 8/20, C 20/25, D 11/15, E 8/10. Preview threshold 70 and internal dogfood
-threshold 60 are met, but the score cannot override the open defect below. The
-earlier **73/100** (comment 29293, on `c38750d`, D 12 and E 9) is kept as
-historical evidence only; it is not sign-off for the changed code. Both are
-evidence-weighted judgments, not user-study statistics. Overall QA stays
-**PARTIAL**: `FUNCTIONAL_QA_PASS=false` and `SECURITY_QA_PASS=false` until
-the diagnostic criterion is re-run; `FULL_RELEASE_QA_SIGNED_OFF=false`.
+**Independent score: 73/100** (Codex, HORO-2186 comment 29344, on main
+`ec43a5b`, product merge `4e56fbd`): A 24/30, B 8/20, C 20/25, D 12/15,
+E 9/10. Preview threshold 70 and internal dogfood threshold 60 are met. The
+history is kept: 73 (comment 29293, on `c38750d`), then 71 (comment 29341,
+D 11 and E 8, after the open defect below), then 73 (comment 29344). D and E
+were each raised one point for observed evidence (false healthy assurance
+removed without mutation or ownership change; the stated repair actually
+executed and install-alone verified insufficient), not restored
+automatically. B gains nothing without current-host, terminal or provider
+evidence. These are evidence-weighted judgments, not user-study statistics.
+Verified by me: `QA-RESULTS.json` in `coordinator/20261027-libra-pr250-closeout/`
+(finding verdict `PASS_CLOSED_SCOPED`, 60 assertions passed, 0 failed,
+artifact hashes equal to handoff 29342) and its `SHA256SUMS.txt` (all entries
+verify).
 
-**QA242-DOC-01 (Medium, Codex HORO-2250 c29337):** a settings file written
-before PR #242 keeps unquoted hook commands under a path the shell splits
-(exit 127 before Libra runs) while `doctor` reported the hooks ok; D and E each
-lost one point for that false assurance. Fixed by PR #250 (merged
-`4e56fbd086e8234aec52f0185df8a3b5fa62c271`): `doctor` reports such commands
-as an error (a warning with no budget configured) and names the remedy
-(`uninstall`, move the binary to a plain path, `install`); ownership matching,
-install and uninstall are unchanged. Independent re-run of the
-legacy-negative and valid-positive cases is requested (comment 29342); the
-criterion stays open until then. Item 14 (PR #240) was independently retested
-by Codex in c29341 (PASS).
+**QA242-DOC-01 (Medium, Codex HORO-2250 c29337): CLOSED, scoped.** A settings
+file written before PR #242 keeps unquoted hook commands under a path the
+shell splits (exit 127 before Libra runs) while `doctor` reported the hooks
+ok. Fixed by PR #250 (merged `4e56fbd086e8234aec52f0185df8a3b5fa62c271`):
+`doctor` reports such commands as an error (`shared_budget_hooks` a warning,
+`claude_settings` still an error, with no budget configured) and names the
+remedy (`uninstall`, move the binary to a plain path, `install`); ownership
+matching, install and uninstall are unchanged. Codex c29344 reproduced the
+original false ok with the prior binary, then on the CI artifact (run
+40516615874) found both findings ERROR with 7 commands counted, the generated
+command still exiting 127, install-alone still negative, the remedy working,
+and five valid path controls healthy. With it: `FUNCTIONAL_QA_PASS=true` and
+`SECURITY_QA_PASS=true`, both scoped to the offline, owned-runtime Cooperative
+Preview (no universal security certification); `REAL_HOST_QA_PASS` is
+NOT_VERIFIED; `RELEASE_CHECKLIST_PASS=false`;
+`FULL_RELEASE_QA_SIGNED_OFF=false`; READY_FOR_RELEASE=false. Item 14 (PR #240)
+was independently retested by Codex in c29341 (PASS).
+
+**PR #252 (`694427f`, test-only) post-dates that verdict.** It adds characterization tests for corrupt and unsupported settings shapes. Its only product-file hunk in `crates/cli/src/claude_settings.rs` starts at line 928, after the `#[cfg(test)]` boundary at line 860 of `4e56fbd`, so runtime and release-binary inputs are unchanged. It is producer-tested (hosted CI 15/15) and not independently re-run, which a test-only change does not require.
 
 What keeps B at 8/20 and what would raise it: a current-head real-host run,
 an interactive TTY and partial-flush sample, post-/compact coverage, and a
@@ -148,9 +161,9 @@ stated; none of it is independent QA.
 | Dependabot alerts | 3 open, all Python `filelock` in `experiments/phase0/uv.lock` (not in the shipped binary). Open Dependabot PRs (#187-#195) are bot PRs that need an owner-approved review; #188 (tokio) is superseded by #248 |
 | Binary hash | the lockfile change alters the binary: earlier hashes do not apply to `ee42bca`; local aarch64 release `sha256 aac36394…ba71` (not CI-produced, not attested) |
 
-Product SHA for QA is now `4e56fbd086e8234aec52f0185df8a3b5fa62c271` (PR #250;
-`ee42bca` added the lockfile fix); later `main` commits are docs-only unless
-stated. The lockfile and the doctor change each alter the binary bytes.
+Product SHA for QA is `4e56fbd086e8234aec52f0185df8a3b5fa62c271` (PR #250;
+`ee42bca` added the lockfile fix); later `main` commits are docs-only, except
+test-only PR #252 (`694427f`). The lockfile and the doctor change each alter the binary bytes.
 
 ## Known limitations (user-facing)
 
