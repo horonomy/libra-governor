@@ -70,6 +70,10 @@ Needs explicit approval of every line below. Not required for the Preview if
 the founder accepts A1 as the interactive evidence and records that
 `ProductionObserved` evidence does not exist.
 
+- **Before install:** record whether `~/.local/state/libra-governor` and Libra
+  hooks already exist on the host. If they do, back up the state directory, or
+  abort and use a scoped `LIBRA_GOVERNOR_STATE_DIR` so the test spend does not
+  enter an existing ledger.
 - **Actions:** back up `~/.claude/settings.json` (install also writes a
   `.libra-backup-*` file), `libra-governor install --hooks-only`, `shared-budget
   init --monthly-usd <CAP> --time-zone <ZONE>`, run **at most N interactive
@@ -83,7 +87,9 @@ the founder accepts A1 as the interactive evidence and records that
   provider as usual (Libra stores no prompt text); the hook set runs on the
   founder's sessions for the duration.
 - **Rollback:** `uninstall`, restore `settings.json` from the backup, delete
-  `~/.local/state/libra-governor` only with explicit confirmation.
+  `~/.local/state/libra-governor` only with explicit confirmation, and remove
+  the binary (`cargo uninstall libra-governor-cli` for a source install, or
+  delete the copied file for a tarball install; `uninstall` does not remove it).
 
 **Authorization reply (A1):** `A1 go: run the isolated interactive acceptance on FINAL.`
 **Authorization reply (A2):** `A2 go: CAP=<..>, N=<..>, model=<..>, spend ceiling=<..>, window=<..>.`
@@ -93,7 +99,7 @@ the founder accepts A1 as the interactive evidence and records that
 ## B. Clean-machine installation and rollback
 
 **Closes:** the clean-machine rows of the release checklist (`release-checklist.md`
-rows 7 and 10; rows 5 and 6 are out of scope for the aarch64-only Preview), `RELEASE_CHECKLIST_PASS` in part. The warm private fixtures used
+row 10 and the install/rollback part of row 7; rows 5 and 6 are out of scope for the aarch64-only Preview), `RELEASE_CHECKLIST_PASS` in part. Row 7 is the extension journey (validate, approve, inspect, upgrade/invalidate/re-approve): these packets do not run it, so row 7 stays PARTIAL unless the founder asks to add those steps or accepts it as outside the budget feature. The warm private fixtures used
 so far are not a clean machine.
 
 There is no VM tooling on this Mac and only one user account (`bryant`). The
@@ -110,15 +116,26 @@ options, all of which need an authorization:
      (needs a Rust toolchain; record its absence/presence), then `doctor`,
      `shared-budget init`, `status`.
   2. Tarball path (only after packet C produced an attested artifact):
-     `shasum -c`, `gh attestation verify`, `--version`, copy to a plain path,
+     `shasum -c`, attestation verification, `--version`, copy to a plain path,
      `install --hooks-only`, `doctor`, `init`, `status`.
   3. Rollback: `uninstall`, then compare `settings.json` with the pre-install
      copy; confirm foreign hooks untouched and the state dir left in place
      without `--yes`; then `uninstall --yes` and confirm removal.
+- **Attestation verification without credentials:** the release owner downloads
+  the attestation bundle (`gh attestation download <tar> --repo horonomy/libra-governor`)
+  under their own authenticated account; the clean user then runs
+  `gh attestation verify <tar> --bundle <file> --repo horonomy/libra-governor`
+  (whether that works unauthenticated is to be confirmed and recorded), or the
+  verification is recorded from the owner account. The clean user is never
+  given the founder's token.
 - **Does not:** publish anything; use the founder's credentials or any paid
   service; touch the founder's own account (B1/B2).
-- **Rollback of the test itself (B1):** `sudo sysadminctl -deleteUser <name> -secure`
-  and delete `/Users/<name>`; recorded in the evidence.
+- **B1 notes:** create the account with `sysadminctl -addUser <name> -password -`
+  (prompted, never a password on the command line); an admin-created user can
+  receive a SecureToken and appear on the FileVault unlock screen until
+  deleted. Rollback of the test itself: `sudo sysadminctl -deleteUser <name>`
+  (removes the home directory by default; `-secure` is meaningless on APFS);
+  recorded in the evidence.
 - **Cost/risk:** an admin action on the host (B1); a few GiB of disk; SPE-109
   admission applies.
 
@@ -136,7 +153,8 @@ produce an attested artifact without a tag.
 
   ```bash
   gh workflow run release.yml --repo horonomy/libra-governor --ref main
-  gh run list --repo horonomy/libra-governor --workflow release.yml --limit 1 --json databaseId,headSha,event
+  gh run list --repo horonomy/libra-governor --workflow release.yml --event workflow_dispatch --branch main --limit 3 --json databaseId,headSha,createdAt
+  # take the run created after the dispatch, not an older one
   # the run's headSha must equal FINAL; if not, cancel the run and stop
   ```
 - **What the workflow does on dispatch (read from `release.yml`):** the
@@ -149,19 +167,23 @@ produce an attested artifact without a tag.
 - **Irreversible effects (the reason this needs approval):** the repository is
   **public**, so the attestation is recorded in the **public Sigstore Rekor
   transparency log, permanently**, naming this repository, the workflow, the
-  commit `FINAL` and the tarball digest. It also creates a GitHub attestation
-  record. It cannot be withdrawn from Rekor.
+  commit `FINAL` (ref `refs/heads/main`) and the tarball digest: Rekor
+  permanently holds the signing certificate and the signed attestation entry.
+  It also creates a publicly readable GitHub attestation record, which a
+  repository admin may be able to delete through the attestations API
+  (unverified); the Rekor entry cannot be withdrawn.
 - **Does not:** create a tag, a GitHub Release, a deployment, or any package; it
   spends only a few hosted macOS-runner minutes.
 - **Known risk to record:** `release.yml` uses `toolchain: stable` (unpinned),
   so the compiler at the later tag build may differ from the one used here and
-  the bytes may differ. The evidence therefore compares `rustc -Vv` in each
+  the bytes may differ; `runs-on: macos-latest` and the cache action are also
+  unpinned, so the runner image is recorded from `PROVENANCE.txt`. The evidence therefore compares `rustc -Vv` in each
   `PROVENANCE.txt`; pinning the toolchain is an optional, separately reviewed
   change and is not part of this packet.
 - **Verification after the run (release owner, no further authorization):**
   `gh run download <id>`; `shasum -c`; `gh attestation verify <tar> --repo
   horonomy/libra-governor`; `--version`; hash compared with the
-  independently qualified artifact `fb2376a5…` and explained if different
+  independently qualified artifact `fb2376a5…` (binary of hosted run 40516615874, verified by Codex in HORO-2186 c29344) and explained if different
   (different source commit, toolchain). Codex then verifies the attested
   artifact (sha256, version, sandboxed lifecycle); the release owner does not
   self-certify it.
@@ -183,7 +205,7 @@ Things only an authorized person can do, or that wait on A-C:
 | Jira Fix Version | Jira project admin (the release owner's tooling cannot create versions; HORO-1752 c29291) | create an unreleased version named `Agent Execution Economics v0.0.4 / Quota-Aware Execution Pacing`, then the release owner sets it on HORO-1752 and HORO-1857 and reads it back |
 | Jira Goal | Jira admin / founder | create the v0.0.4 Goal requested in HORO-1752 comments 28544 and 28725 and link it |
 | Checklist rows 3, 4, 9 | release owner, after C | run URL, digests, manifest, attestation result |
-| Checklist rows 7 and 10 | release owner, after B | install and rollback transcripts |
+| Checklist row 10 and the install/rollback part of row 7 | release owner, after B | install and rollback transcripts |
 | Row 8 byte-identical config | release owner | `settings.json` is re-serialized by install/uninstall, so semantic equality is the evidence unless the founder wants a byte-preserving change (future work, not planned) |
 | Row 11 offline isolation bundle | already recorded (c28714/28715); stale SHAs | confirm still applicable to `FINAL` or drop |
 | Release notes | release owner, founder review | the draft in `release-candidate-v0.0.4.md`; there is no CHANGELOG file and `generate_release_notes: true` is set on the real release |
