@@ -169,9 +169,10 @@ test-only PR #252 (`694427f`). The lockfile and the doctor change each alter the
 
 Founder-approved for A1 only (not A2, B, C, release). Producer evidence,
 class `TestOwnedLive`; it is not independent QA and not `ProductionObserved`.
-Evidence index: `coordinator`-style directory `a1/evidence/` in the release
-owner's scratchpad (`SHA256SUMS.txt` sha256 `76519a37…c93`; not in the repo, it
-holds daemon logs and a harness copy), to be handed to Codex.
+Evidence (not in the repo; it holds daemon logs and a harness copy):
+`~/Bryant-Developments/horonomy/libra-release-evidence/20261028-a1-interactive/`,
+index `SHA256SUMS.txt` sha256 `60aa941368a589e473467c1a9441ef3351c6136db1c9f08f3effbc0cf1b24c23`
+(15 files, all verify), handed to Codex for independent review.
 
 | Item | Value |
 |---|---|
