@@ -182,9 +182,10 @@ holds daemon logs and a harness copy), to be handed to Codex.
 | Real host | not touched: real `~/.claude/settings.json` (last modified 2026-10-23) and `~/.local/state/libra-governor` (2026-10-25) are older than the run; the Libra entries there predate it (a dev-build install) |
 | Teardown | `/exit`, `daemon stop`, private tmux server and fake upstream killed; no leftover process; isolated trees removed |
 
-Turns: 14 interactive turns over 3 sessions (2 resumed with `--continue`),
-4 of them executing a `Bash` tool, one `/compact`, then cap exhaustion and
-recovery.
+Prompts: 14 ordinary interactive turns over 3 sessions (2 resumed with
+`--continue`), 4 of them executing a `Bash` tool, plus one `/compact` (15
+allowed prompts, 15 UserPromptSubmit admissions), then 1 prompt blocked by an
+exhausted cap and a recovery prompt (counted among the 14).
 
 | Observation | Result |
 |---|---|
@@ -194,7 +195,7 @@ recovery.
 | `/compact` | surfaced as a `SubagentStop` and was booked as an **unmeasured subagent charge at the 200c flat fallback** (the fake spend was about 21c); `doctor` showed the flagged-settlements warning. This is an over-count here; with a large real context a compaction could cost more than the fallback (under-count). It was not missed, which the current `NOT_COVERED` text ("can be missed") does not say |
 | Denial in the real UI | with remaining $0.64 below the $2.00 hold, `UserPromptSubmit operation blocked by hook` showed the period end in the configured zone, the raise-the-cap remedy and the "not provider quota" wording |
 | Recovery | raising the cap applied to the very next prompt with no restart |
-| Statusline | the command itself reported `budget $5.36/$6 (90%) · budget low: new sessions blocked`, but the TUI line still showed `/$50` after the denial and only updated after the next model turn (Claude Code does not re-run the statusline after a hook-blocked prompt; Libra sets no refresh interval) |
+| Statusline | the command itself reported `budget $5.36/$6 (90%) · budget low: new sessions blocked`, but the TUI line still showed `/$50` after the denial and only updated after the next model turn (not refreshed after a hook-blocked prompt; whether Claude Code re-runs the statusline only on assistant messages was not established, and Libra sets no refresh interval) |
 | Daemon log noise | 4 `connection error ... Broken pipe` lines, one per tool turn: the PostToolUse hook closes before reading the daemon reply; harmless in this run |
 | `doctor` | exit 0 with two warnings: no Codex hooks installed (expected) and the flagged settlement from `/compact` |
 
