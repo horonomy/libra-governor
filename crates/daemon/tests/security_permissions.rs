@@ -26,7 +26,9 @@ fn mode_of(path: &std::path::Path) -> u32 {
 
 #[test]
 fn ensure_state_dir_creates_the_directory_owner_only() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let parent = tempfile::tempdir().unwrap();
     let target = parent.path().join("fresh-state-dir");
     std::env::set_var("LIBRA_GOVERNOR_STATE_DIR", &target);
@@ -43,7 +45,9 @@ fn ensure_state_dir_creates_the_directory_owner_only() {
 
 #[test]
 fn ensure_state_dir_tightens_an_existing_directory_created_with_a_looser_mode() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let parent = tempfile::tempdir().unwrap();
     let target = parent.path().join("preexisting-state-dir");
     // Simulate a pre-HORO-1146 install: the directory already exists at
@@ -70,7 +74,9 @@ fn ensure_state_dir_never_chmods_a_file_reached_through_a_symlink() {
     // path that is a symlink to a regular file used to turn that file into
     // mode 0700 (owner-executable, group/other access dropped). A state dir
     // must be a directory; anything else is refused and left untouched.
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let parent = tempfile::tempdir().unwrap();
     let file = parent.path().join("someone-elses-file");
     std::fs::write(&file, b"data").unwrap();
@@ -98,7 +104,9 @@ fn ensure_state_dir_still_follows_a_symlink_to_a_directory_it_owns() {
     // Compatibility control: relocating the state dir with a symlink to a
     // directory the user owns is legitimate and keeps working (and is
     // tightened to 0700, as for a direct path).
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let parent = tempfile::tempdir().unwrap();
     let real = parent.path().join("real-state");
     std::fs::create_dir(&real).unwrap();
