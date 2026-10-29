@@ -1636,3 +1636,15 @@ fn the_generic_metered_pool_rpc_refuses_the_local_budget_owner_on_every_op() {
 fn protocol_version_is_bumped_past_the_shared_budget_shape_change() {
     assert_eq!(PROTOCOL_VERSION, 24);
 }
+
+#[test]
+fn a_client_session_in_the_provider_lane_namespace_is_refused_with_zero_writes() {
+    let mut fx = Fx::new(Some(&cfg_json(2_000, "UTC", 1_000)), JAN);
+    let before = fx.fingerprint();
+    expect_refused(
+        fx.admit("shared-budget-provider-v1:[\"codex\",\"s\"]", None, None),
+        SharedBudgetRefusal::ReservedSessionScope,
+    );
+    assert!(fx.pools().is_empty(), "a refusal creates no pool");
+    assert_eq!(fx.fingerprint(), before, "nothing moved");
+}
