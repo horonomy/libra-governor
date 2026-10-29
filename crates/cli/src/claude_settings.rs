@@ -498,8 +498,19 @@ fn apply_locked(
                 continue;
             };
             for h in inner.iter_mut() {
-                if h.get("command").and_then(Value::as_str) != Some(command.as_str()) {
-                    continue;
+                let existing = h.get("command").and_then(Value::as_str);
+                if existing != Some(command.as_str()) {
+                    // Our hook for this subcommand installed from another
+                    // binary path: repoint it so a reinstall does not leave
+                    // two sets firing (HORO-2303). A foreign command never
+                    // passes `command_is_ours`.
+                    let ours_elsewhere =
+                        existing.is_some_and(|c| c.ends_with(subcommand) && command_is_ours(c));
+                    if !ours_elsewhere {
+                        continue;
+                    }
+                    h["command"] = Value::String(command.clone());
+                    upgraded = true;
                 }
                 already_present = true;
                 if wants_timeout && h.get("timeout").is_none() {
