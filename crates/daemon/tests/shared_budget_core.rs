@@ -1634,7 +1634,7 @@ fn the_generic_metered_pool_rpc_refuses_the_local_budget_owner_on_every_op() {
 
 #[test]
 fn protocol_version_is_bumped_past_the_shared_budget_shape_change() {
-    assert_eq!(PROTOCOL_VERSION, 24);
+    assert_eq!(PROTOCOL_VERSION, 25);
 }
 
 #[test]
