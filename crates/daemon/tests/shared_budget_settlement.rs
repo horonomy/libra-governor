@@ -3809,3 +3809,23 @@ fn a_codex_finalize_does_not_settle_the_claude_hold_of_the_same_session_id() {
     }
     assert_eq!(fx.fingerprint(), before, "the Claude hold was not settled");
 }
+
+/// HORO-2281: a Codex tool event must not keep a Claude hold of the same raw
+/// session id alive. The Claude hold's rows are identical afterwards.
+#[test]
+fn a_codex_tool_event_does_not_renew_the_claude_hold_of_the_same_session_id() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    fx.admit_hold("s1");
+    let before = format!("{:?}", fx.lane("s1"));
+    fx.clock.set(at(600));
+    match fx.call(Request::ToolInvoked {
+        session_id: "s1".to_string(),
+        tool_name: "Bash".to_string(),
+        agent_id: None,
+        provider: Some("codex".to_string()),
+    }) {
+        Response::Ack => {}
+        other => panic!("expected Ack, got {other:?}"),
+    }
+    assert_eq!(format!("{:?}", fx.lane("s1")), before);
+}
