@@ -989,6 +989,38 @@ mod tests {
     }
 
     #[test]
+    fn apply_from_a_different_binary_path_repoints_our_hooks_instead_of_adding_a_second_set() {
+        // HORO-2303: a reinstall from another path (new install prefix, moved
+        // checkout) used to leave the old hooks and append a second full set,
+        // so every event fired twice, once through a possibly dead path.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let moved = PathBuf::from("/usr/local/bin/libra-governor");
+        apply(&path, &binary()).unwrap();
+        apply(&path, &moved).unwrap();
+
+        let root: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let mut owned = Vec::new();
+        for groups in root["hooks"].as_object().unwrap().values() {
+            for group in groups.as_array().unwrap() {
+                for hook in group["hooks"].as_array().unwrap() {
+                    let command = hook["command"].as_str().unwrap();
+                    if command_is_ours(command) {
+                        owned.push(command.to_string());
+                    }
+                }
+            }
+        }
+        assert_eq!(owned.len(), HOOK_SUBCOMMANDS.len(), "one hook per event");
+        assert!(
+            owned
+                .iter()
+                .all(|c| c.starts_with("/usr/local/bin/libra-governor ")),
+            "every owned hook points at the newest path: {owned:?}"
+        );
+    }
+
+    #[test]
     fn apply_refuses_and_writes_nothing_when_hooks_is_not_an_object() {
         // HORO-1380 S2 / HORO-998 UNKNOWN_FUTURE_FIELDS_ARE_PRESERVED: a
         // top-level "hooks" field of an unexpected shape (a newer Claude
