@@ -12,3 +12,10 @@ fn a_claude_lane_keeps_the_raw_session_id_byte_for_byte() {
         "sess-1"
     );
 }
+
+#[test]
+fn a_codex_lane_is_a_reserved_prefix_derived_key_apart_from_the_claude_lane() {
+    let codex = budget_lane("sess-1", Some("codex")).unwrap();
+    assert!(codex.starts_with(PROVIDER_LANE_PREFIX));
+    assert_ne!(codex, budget_lane("sess-1", None).unwrap());
+}
