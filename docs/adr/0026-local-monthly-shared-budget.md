@@ -921,6 +921,15 @@ and in-product text must state that the pool is:
   distinguishes list-price-equivalent spend from billed USD. Real-host Codex
   runs are authorised separately.
 
+### Provider-namespaced lanes (HORO-2281, v0.0.5, dark)
+
+The executor key in this ADR is `(host_id, provider, session_id, agent_id | null)`, but until v0.0.5 the budget keyed its holds on the raw `session_id` alone, so a request from another provider that reused a Claude session id could renew or settle a Claude hold. v0.0.5 closes that without changing any Claude row or byte:
+
+- `Admit` and `Check` carry an optional `provider` (protocol v25). Absent or `"claude-code"` keeps the raw session id as the lane key. `"codex"` derives a reserved-prefix key `shared-budget-provider-v1:` plus the JSON array `["codex", session_id]`, which is injective. Any other value is refused as `UnsupportedProvider` and never falls back to the Claude lane. A client session that starts with the reserved prefix is refused as `ReservedSessionScope`.
+- The tool-event heartbeat renews the lane its request's provider maps to. `Finalize` runs the Claude turn settlement and subagent sweep for the Claude lane only.
+- A Codex-provider `Admit` or `Check` is answered `not_configured` and writes nothing. No Codex hold is created, charged or enforced; enabling a Codex budget gate remains a founder decision (see "Not decided here").
+- The guarantee label is unchanged: admission-bounded (cooperative).
+
 ## Consequences
 
 - Once slices S4-S8 land (design intent), refusal before spend at prompt
