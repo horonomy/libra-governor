@@ -1648,3 +1648,18 @@ fn a_client_session_in_the_provider_lane_namespace_is_refused_with_zero_writes()
     assert!(fx.pools().is_empty(), "a refusal creates no pool");
     assert_eq!(fx.fingerprint(), before, "nothing moved");
 }
+
+#[test]
+fn an_unknown_provider_is_refused_with_zero_writes() {
+    let mut fx = Fx::new(Some(&cfg_json(2_000, "UTC", 1_000)), JAN);
+    let before = fx.fingerprint();
+    let outcome = fx.sb(SharedBudgetRequest::Admit {
+        session_id: "s".to_string(),
+        agent_id: None,
+        prompt_id: None,
+        provider: Some("gemini".to_string()),
+    });
+    expect_refused(outcome, SharedBudgetRefusal::UnsupportedProvider);
+    assert!(fx.pools().is_empty(), "a refusal creates no pool");
+    assert_eq!(fx.fingerprint(), before, "nothing moved");
+}
