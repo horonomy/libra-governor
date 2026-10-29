@@ -704,4 +704,21 @@ mod tests {
             r#"{"op":"check","session_id":"s","agent_id":"a"}"#
         );
     }
+
+    #[test]
+    fn a_v24_request_without_provider_deserializes_to_none() {
+        let admit: SharedBudgetRequest = serde_json::from_str(
+            r#"{"op":"admit","session_id":"s","agent_id":null,"prompt_id":"p"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            admit,
+            SharedBudgetRequest::Admit {
+                session_id: "s".into(),
+                agent_id: None,
+                prompt_id: Some("p".into()),
+                provider: None,
+            }
+        );
+    }
 }
