@@ -721,4 +721,19 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn a_codex_provider_is_serialized_and_round_trips() {
+        let check = SharedBudgetRequest::Check {
+            session_id: "s".into(),
+            agent_id: None,
+            provider: Some("codex".into()),
+        };
+        let json = serde_json::to_value(&check).unwrap();
+        assert_eq!(json["provider"], "codex");
+        assert_eq!(
+            serde_json::from_value::<SharedBudgetRequest>(json).unwrap(),
+            check
+        );
+    }
 }
