@@ -55,3 +55,35 @@ Some(2) if handler.can_apply_control_effects() => { if let Some(reason) = trimme
 
 ## Q6. transcript_path vs rollout file
 - transcript_path = `sess.hook_transcript_path()` = `current_rollout_path()` of the same session (mod.rs:5078-5090), i.e. the live thread's rollout JSONL that receives RolloutItem::TokenUsageRecord (same live_thread). YES for UPS and root Stop. Exceptions: None if thread store is non-local/no path (test session/tests.rs:11372-11377); SubagentStop uses the PARENT's rollout path as transcript_path and the child's as agent_transcript_path (hook_runtime.rs:404-432), so for subagents the token records live in agent_transcript_path, not transcript_path. Rollout file lives under ~/.codex/sessions/YYYY/MM/DD (recorder.rs:1727-1741).
+
+## Recheck at rust-v0.163.0, v0.164.0 and v0.165.0 (HORO-2280, v0.0.5)
+
+> **Status: source-derived, nothing executed, no real Codex host run.** Read from the public tag tarballs by a read-only agent; not independently re-read by a second reviewer yet. The installed CLI on the development machine is `codex-cli 0.163.0` (`/opt/homebrew/Caskroom/codex/0.163.0/bin/codex`, sha256 `8813367285524ac798dd96d1b071aea30d58708c7226fd236cd275cf1cfdee31`). The version string matches the tag; the build provenance of the binary was not verified.
+
+| Tag | Commit |
+|---|---|
+| rust-v0.160.0 | a956835d020762cb2b570053af06f643a11c0ecc |
+| rust-v0.163.0 | 83086188ae0614bd882818ff1aa23f3194962012 |
+| rust-v0.164.0 | 6aaac694803004a63c6f393d153c96d22521a6b9 |
+| rust-v0.165.0 | 360319d8dee62d87e2d59fc0c21805d79519cfed |
+
+Q1 to Q6 above hold at 0.163.0, 0.164.0 and 0.165.0. Only line numbers moved (for example the usage record call is now `record_response_token_usage`, `core/src/session/mod.rs`). No id source, block semantics, flush ordering or subagent-transcript claim changed between 0.163 and 0.165. Blocked-turn lifecycle events remain UNKNOWN.
+
+### What a `token_usage_record` is (source-derived, 0.163 to 0.165)
+
+- `usage`: incremental, one response.
+- `turn_token_usage`: cumulative for the record's `turn_id`; restarts when the `turn_id` changes.
+- `thread_token_usage`: cumulative for the thread.
+- Records are append-only. Several records per `turn_id` is the normal case (one per response, tool-loop iteration, Stop-block continuation or compaction).
+- A failed or incomplete response writes a record only when it carries a `response_id`; that record holds partial spend.
+- An aborted or stream-failed request writes **no** record, and Stop does not run on abort. That spend is not visible to any rollout reader.
+- Resume does not re-append old records. A fork drops the parent's records.
+- Safe turn total: the last record's `turn_token_usage`, or the sum of `usage` de-duplicated by `response_id`. Never sum the cumulative fields.
+
+### Hooks disabled or untrusted
+
+With the `hooks` feature off, non-managed command hooks are dropped silently. Untrusted or modified hooks do not run unless `--dangerously-bypass-hook-trust` is set. Non-interactive `exec` and the app-server show no trust prompt, so an untrusted Libra hook is silently ungated there. Enterprise pinning of the feature was not traced and is UNVERIFIED.
+
+### New in 0.165
+
+Per-environment hooks and an `interrupt` hook event. Neither touches ids or usage records; neither is handled by Libra.
