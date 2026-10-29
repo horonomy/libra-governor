@@ -3829,3 +3829,24 @@ fn a_codex_tool_event_does_not_renew_the_claude_hold_of_the_same_session_id() {
     }
     assert_eq!(format!("{:?}", fx.lane("s1")), before);
 }
+
+/// HORO-2281 positive control for the test above: without a provider the same
+/// tool event still renews the Claude hold, so the Codex test is not passing
+/// merely because heartbeats never touch the lane.
+#[test]
+fn a_claude_tool_event_still_renews_its_own_hold() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    fx.admit_hold("s1");
+    let before = format!("{:?}", fx.lane("s1"));
+    fx.clock.set(at(600));
+    match fx.call(Request::ToolInvoked {
+        session_id: "s1".to_string(),
+        tool_name: "Bash".to_string(),
+        agent_id: None,
+        provider: None,
+    }) {
+        Response::Ack => {}
+        other => panic!("expected Ack, got {other:?}"),
+    }
+    assert_ne!(format!("{:?}", fx.lane("s1")), before);
+}
