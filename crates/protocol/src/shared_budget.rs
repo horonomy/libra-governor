@@ -139,6 +139,9 @@ pub enum SharedBudgetRefusal {
     ReservedSessionScope,
     /// `agent_id` is present but empty.
     InvalidAgentId,
+    /// `provider` names a host the budget does not serve. Never mapped onto
+    /// another provider's lane (HORO-2281).
+    UnsupportedProvider,
     InvalidAmount,
     /// One charge above ten times the monthly cap, or one that would push
     /// the pool's total past the range the ledger can add safely.
@@ -734,6 +737,14 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<SharedBudgetRequest>(json).unwrap(),
             check
+        );
+    }
+
+    #[test]
+    fn unsupported_provider_uses_the_snake_case_wire_name() {
+        assert_eq!(
+            serde_json::to_value(SharedBudgetRefusal::UnsupportedProvider).unwrap(),
+            "unsupported_provider"
         );
     }
 }
