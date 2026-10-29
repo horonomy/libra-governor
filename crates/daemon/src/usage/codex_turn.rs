@@ -1019,4 +1019,20 @@ mod tests {
             "the last record's running total, not 100+300+350 input"
         );
     }
+
+    /// Characterization (HORO-2282): an incomplete or failed response that
+    /// carries a `response_id` writes a record of partial spend that rolls
+    /// into the turn's running total. Real spend, so it is charged.
+    #[test]
+    fn a_partial_incomplete_response_record_is_charged_with_the_turn() {
+        let f = write_lines(&[
+            task_started(T1),
+            usage_record(T1, THREAD, SESSION, 40, 0, 0, 0, 0, 40, 0, 0, 0, 0),
+            usage_record(T1, THREAD, SESSION, 100, 0, 0, 10, 0, 140, 0, 0, 10, 0),
+        ]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().expect("partial then complete response");
+        assert_eq!(usage.records, 2);
+        assert_eq!(usage.fresh_tokens(), 140 + 10);
+    }
 }
