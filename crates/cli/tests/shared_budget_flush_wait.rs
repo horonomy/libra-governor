@@ -371,6 +371,7 @@ impl Live {
             session_id: session.to_string(),
             agent_id: None,
             prompt_id: None,
+            provider: None,
         })
         .expect("daemon answers")
     }

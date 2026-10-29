@@ -135,6 +135,7 @@ impl Fx {
             session_id: session.to_string(),
             agent_id: agent.map(String::from),
             prompt_id: prompt.map(String::from),
+            provider: None,
         })
     }
 
@@ -142,6 +143,7 @@ impl Fx {
         self.sb(SharedBudgetRequest::Check {
             session_id: session.to_string(),
             agent_id: agent.map(String::from),
+            provider: None,
         })
     }
 

@@ -129,6 +129,7 @@ impl Fx {
             session_id: session.to_string(),
             agent_id: agent.map(String::from),
             prompt_id: prompt.map(String::from),
+            provider: None,
         })
     }
 
@@ -3592,6 +3593,7 @@ fn admit_error(fx: &mut Fx, session: &str, prompt: &str) -> String {
             session_id: session.to_string(),
             agent_id: None,
             prompt_id: Some(prompt.to_string()),
+            provider: None,
         },
     });
     match response {

@@ -38,12 +38,20 @@ pub enum SharedBudgetRequest {
         /// Makes a retried `Admit` idempotent. When absent a fresh nonce
         /// is used.
         prompt_id: Option<String>,
+        /// The host this lane belongs to. Absent or `"claude-code"` is the
+        /// Claude Code lane and serializes to exactly the v24 bytes; any
+        /// other provider is never mapped onto a Claude lane (HORO-2281).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
     },
     /// Cheap read for tool-time checks: remaining budget and state only.
     /// Never creates a pool and never reserves.
     Check {
         session_id: String,
         agent_id: Option<String>,
+        /// See [`SharedBudgetRequest::Admit`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
     },
     /// Record spend that already happened (a subagent's transcript usage,
     /// for example) as settled spend attributed to an executor. Never
@@ -444,6 +452,7 @@ mod tests {
             session_id: "s".into(),
             agent_id: None,
             prompt_id: Some("p".into()),
+            provider: None,
         };
         let json = serde_json::to_value(&admit).unwrap();
         assert_eq!(json["op"], "admit");
@@ -461,7 +470,8 @@ mod tests {
             minimal,
             SharedBudgetRequest::Check {
                 session_id: "s".into(),
-                agent_id: None
+                agent_id: None,
+                provider: None,
             }
         );
         let status: SharedBudgetRequest = serde_json::from_str(r#"{"op":"status"}"#).unwrap();
@@ -678,6 +688,7 @@ mod tests {
             session_id: "s".into(),
             agent_id: None,
             prompt_id: Some("p".into()),
+            provider: None,
         };
         assert_eq!(
             serde_json::to_string(&admit).unwrap(),
@@ -686,6 +697,7 @@ mod tests {
         let check = SharedBudgetRequest::Check {
             session_id: "s".into(),
             agent_id: Some("a".into()),
+            provider: None,
         };
         assert_eq!(
             serde_json::to_string(&check).unwrap(),
