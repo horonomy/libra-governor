@@ -1795,4 +1795,13 @@ mod tests {
             "\"/opt/my tools/libra-governor\" hook stop"
         ));
     }
+
+    /// Quoting never makes a lookalike ours: the unquoted path's final
+    /// component must still be exactly `libra-governor`, and the quotes must
+    /// match.
+    #[test]
+    fn quoting_does_not_make_a_lookalike_or_a_mismatched_quote_ours() {
+        assert!(!command_is_ours("'/opt/libra-governor-tools/x' hook stop"));
+        assert!(!command_is_ours("'/opt/libra-governor\" hook stop"));
+    }
 }
