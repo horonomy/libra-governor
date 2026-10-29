@@ -668,4 +668,28 @@ mod tests {
             "no_settled_lane"
         );
     }
+
+    /// Claude-visible wire bytes are frozen (HORO-2281, C1): adding a
+    /// provider to the protocol must not change what a Claude Admit or
+    /// Check serializes to.
+    #[test]
+    fn claude_admit_and_check_serialize_to_the_v24_bytes() {
+        let admit = SharedBudgetRequest::Admit {
+            session_id: "s".into(),
+            agent_id: None,
+            prompt_id: Some("p".into()),
+        };
+        assert_eq!(
+            serde_json::to_string(&admit).unwrap(),
+            r#"{"op":"admit","session_id":"s","agent_id":null,"prompt_id":"p"}"#
+        );
+        let check = SharedBudgetRequest::Check {
+            session_id: "s".into(),
+            agent_id: Some("a".into()),
+        };
+        assert_eq!(
+            serde_json::to_string(&check).unwrap(),
+            r#"{"op":"check","session_id":"s","agent_id":"a"}"#
+        );
+    }
 }
