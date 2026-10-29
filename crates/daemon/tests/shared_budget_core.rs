@@ -1663,3 +1663,18 @@ fn an_unknown_provider_is_refused_with_zero_writes() {
     assert!(fx.pools().is_empty(), "a refusal creates no pool");
     assert_eq!(fx.fingerprint(), before, "nothing moved");
 }
+
+#[test]
+fn a_codex_admit_is_inert_until_the_codex_settlement_exists() {
+    let mut fx = Fx::new(Some(&cfg_json(2_000, "UTC", 1_000)), JAN);
+    let before = fx.fingerprint();
+    let outcome = fx.sb(SharedBudgetRequest::Admit {
+        session_id: "s".to_string(),
+        agent_id: None,
+        prompt_id: Some("turn-1".to_string()),
+        provider: Some("codex".to_string()),
+    });
+    assert_eq!(outcome, SharedBudgetOutcome::NotConfigured);
+    assert!(fx.pools().is_empty(), "no pool for an inert lane");
+    assert_eq!(fx.fingerprint(), before, "nothing moved");
+}
