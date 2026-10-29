@@ -31,7 +31,7 @@ cap) and the Codex budget gate are designed, off by default, and not enabled.
 | In-product disclosure | ACCEPTED | c29269: `status` and `doctor` show all four limitations |
 | Whole-feature Cooperative Preview | ACCEPTED (scoped functional PASS) | c29269 "scoped functional PASS; overall PARTIAL / no release sign-off"; no FAIL. c29269 verifies warn-only soft limits. DST gap and fold at a month's first midnight are covered by domain unit tests (`calendar.rs`, America/Asuncion and America/Havana), not by an end-to-end Codex run. Not covered: multi-daemon writers; power-loss/mid-COMMIT |
 | Independent Product Experience score | ACCEPTED (bounded scope) | **75/100**, Codex c29404 (A1 review; B +2 for the corroborated interactive host evidence only); history: 73 (c29293, `c38750d`), 71 (c29341, open defect QA242-DOC-01), 73 (c29344, defect closed), 75 (c29404); Preview threshold 70 met; overall verdict stays PARTIAL; see the Product Experience gate |
-| Jira Fix Version / Goal (HORO-1752) | OWNER_AUTHORIZATION_REQUIRED | Jira admin must create it (comments 28544, 28725) |
+| Jira Fix Version / Goal (HORO-1752) | DONE (2026-10-28) | Fix Version 10315 on 36 issues and Goal CBLPCRLM-71 linked to Epic HORO-1749, created through the Jira REST and Goals APIs (HORO-1752 comment 29444); the earlier "admin must create it" premise was wrong |
 | Release checklist (HORO-1857) | REQUIRED_OPEN | see below |
 | S11, Codex gate, OpenAI gateway, remote upload | APPROVED_FUTURE_VERSION | provenance-limited, see ADR-0026 |
 | Real-host / ProductionObserved evidence | OWNER_AUTHORIZATION_REQUIRED | all evidence is `TestOwnedLive` |
@@ -46,6 +46,21 @@ classification is not proof of completion. Vocabulary: **blocking**,
 means a defect found by the audit with a PR open; it blocks the Preview until
 that PR merges and passes review. Codex c29293 notes the producer's future
 labels are not blanket security waivers; none is treated as one here.
+
+**Founder confirmation of this classification:** conditionally confirmed on
+2026-10-29 (D5, recorded in HORO-2186) for the narrow Cooperative Preview only.
+It is not a blanket security waiver; no row verdict was changed; unresolved
+items stay traceable to Jira (HORO-2303 and HORO-2250). Rows 5 and 11 were
+reassessed against source on 2026-10-29; see the note after the table.
+
+Updates since this table was written (2026-10-29), each a clarification, no
+verdict changes: row 1: A1 booked `/compact` as an unmeasured subagent at the
+flat hold against a fake upstream; real-provider behaviour is still unverified.
+Row 4: `doctor` now reports unusable legacy hook commands (PR #250, merged);
+quote-aware ownership stays HORO-2303. Row 11: the fix is draft PR #254
+(HORO-2303), held for v0.0.5. Row 12: A1 measured four flush waits of
+76/107/118/124 ms against a fake upstream (Codex-accepted, scoped); real
+provider timing is unmeasured.
 
 | # | Item | Verdict | Evidence and impact |
 |---|---|---|---|
@@ -63,6 +78,41 @@ labels are not blanket security waivers; none is treated as one here.
 | 12 | Interactive TTY flush timing unmeasured | accepted limitation, disclosure added (PR #244) | Not "fails safe": a partly flushed turn settles short and the remainder is recovered only by a later Stop or SettleTail, and is lost if neither runs. Measured only with `-p`. A real TTY sample needs authorization. |
 | 13 | No `clock_anomaly` repair command | accepted limitation, message corrected (PR #244) | Fails closed with no money effect, but "correct the clock" is not actionable once the clock is right; the real remedies (ADR-0026 recovery, or removing `shared-budget.json` to pause the budget) are not named. A forward clock jump also opens next month's pool with a full cap and is undisclosed. |
 | 14 | **New: re-prompt renews a live hold with no capacity check** | **fixed: PR #240 merged (`98b112a`)** | After an interrupt (Stop does not fire) the hold stays live; a new prompt renewed it without the check a fresh reservation applies, so turns could continue after other sessions overdrew the pool. Failing-first tests ran red on hosted CI (101 passed, 1 failed); the fix applies the fresh-reservation test to a renewal that names a new prompt id (a prompt-less retry is unchanged, per ADR-0026 "a lower cap never revokes existing holds"); ADR-0026 documents it; two independent review passes; hosted CI green on the PR head. The trigger relies on interrupt behaviour not observed on a real host. |
+
+**Reassessment of rows 5 and 11 (2026-10-29, founder condition; source review
+at FINAL, no new dynamic test; the verdicts above are unchanged).**
+Row 5, subagent transcript path: the table text names a FIFO. At FINAL
+`reject_non_regular_file` (`crates/daemon/src/usage.rs`, introduced in
+`c3fc094`, 2026-10-12) runs a `stat` that never opens the path, and
+`scan_lines_backward` calls it before any `open`. By source inspection only,
+that refuses a FIFO, device or directory path as unreadable; this has not been
+verified by any executable test or QA of the subagent path, so the FIFO part of
+the row text is not proven superseded (test gap, to HORO-2303). Residual: a `stat` on a hung network or FUSE mount
+can block the single-threaded daemon, and a same-user swap between the `stat`
+and the `open` is theoretically possible. A stalled daemon makes prompt
+admission refuse and the other hooks fail open (release-notes disclosure 6);
+the read precedes the charge in `charge_transcript_inner`. A same-user
+process, including the governed agent, can already stop the daemon or edit the
+budget file (ADR-0026, "Trust boundary of the file"), so this adds no new
+capability, secret exposure or ledger-write path found in source.
+Row 11, state-directory symlink: `exists()` and `set_permissions` in
+`crates/daemon/src/paths.rs` follow symlinks. On the default path under the
+user's own home, only that user (or root) can plant the link, and the effect is
+a mode change to 0700 on something that user owns. With a non-default
+`LIBRA_GOVERNOR_STATE_DIR` or `XDG_STATE_HOME` in a location other users can
+write, a planted link could change the mode of a victim-owned target and could
+redirect the ledger, socket and gateway capability token into a
+directory the planter controls (inferred from source, untested). That is
+outside the default supported path and is disclosed in release-notes
+disclosure 7. The fix is draft PR #254 (HORO-2303), held for v0.0.5, and no
+symlink test exists at FINAL.
+Conclusion (founder D5 closeout, 2026-10-29): both rows are accepted
+conditionally for the narrow Preview, within the documented default
+private-state and same-user trust boundaries only. No protection is claimed
+against an active same-UID adversarial agent, and users are warned not to place
+the state directory in a shared or other-user-writable location (release-notes
+disclosure 7). This is not a security waiver; HORO-2303 and its follow-up work
+stay open.
 
 Other undisclosed or partly disclosed ways spend can exceed the cap (audit,
 cited in HORO-2186): a 32 MiB subagent file is permanently booked at the
@@ -249,14 +299,19 @@ product code and is not made here.
   overshoot is possible.
 - Codex is ungated; there is no gateway hard cap.
 - Amounts are Libra-accounted list-price-equivalent USD, never the provider
-  bill; the 1-hour cache tier is under-counted and some Haiku prompts are
-  over-counted (ADR-0026, "Known pricing limitations").
+  bill; the 1-hour cache tier, the fast-mode premium and the `inference_geo`
+  multiplier are under-counted and Haiku 5.5 prompts under 100k tokens are
+  over-counted by about 5x (ADR-0026, "Known pricing limitations").
 - Only Claude Code sessions and subagents whose settlement hooks run and
   whose transcripts can be read and attributed are counted.
 - Evidence is `TestOwnedLive` (real binaries, synthetic transcripts); nothing
   is observed on a real host.
 
 ## Release checklist state
+
+**Superseded on 2026-10-29.** The table below is the pre-candidate state and
+is kept as history. The current state of each step is in
+`docs/quota-observation/release-checklist.md` (as amended) and HORO-2186.
 
 State comes from `docs/quota-observation/release-checklist.md` and ADR-0025
 steps 1-7. Its cited SHAs (`5aec5a1`, `fae8309`) are stale.
@@ -272,7 +327,7 @@ steps 1-7. Its cited SHAs (`5aec5a1`, `fae8309`) are stale.
 | x86_64 and Linux install tests | out of scope for an Apple Silicon Preview; the release matrix is restricted to aarch64 (PR #238, pending merge) |
 | Release notes | draft below; no CHANGELOG file exists |
 | Rollback on a published artifact | partial |
-| Founder GO / ADR-0025 acceptance | not granted |
+| Founder GO / ADR-0025 acceptance | granted 2026-10-29 for 313d26a09407c8a77d2b4cc7685ea694a822905a (HORO-2186 comment 29520) |
 
 Local-equivalent evidence gathered on 2026-10-27 (not a final-SHA result, and
 none of it is attested):
@@ -319,6 +374,9 @@ Runnable now without publishing: the tag-check script, and a local
 smoke. That is local-equivalent evidence, not a CI-produced artifact.
 
 ## Release notes draft
+
+**Superseded on 2026-10-29.** The founder-reviewed release notes are DRAFT 6,
+recorded with its sha256 in HORO-2186; the short draft below is history.
 
 > **Libra Governor v0.0.4 — Cooperative Preview (Apple Silicon macOS).**
 > A local monthly budget shared by your Claude Code sessions and subagents.

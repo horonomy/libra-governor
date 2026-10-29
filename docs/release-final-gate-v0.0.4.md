@@ -54,7 +54,7 @@ waive it.
 | Artifact manifest (row 9) | not done | after C |
 | Release notes carrying the five ADR-0026 disclosures | draft in `release-candidate-v0.0.4.md`; in-product text merged | founder review |
 | Hardening classification confirmed; ADR-0025 and ADR-0026 accepted | pending | founder |
-| SHA-named GO (row 12) | not granted | founder, Packet E |
+| SHA-named GO (row 12) | granted 2026-10-29 for 313d26a09407c8a77d2b4cc7685ea694a822905a (HORO-2186 comment 29520) | founder, Packet E |
 
 ### Optional but explicitly unverified
 
