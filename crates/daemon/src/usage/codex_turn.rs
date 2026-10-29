@@ -1050,4 +1050,20 @@ mod tests {
             UsageObservation::Unavailable(UsageUnavailable::Inconsistent)
         );
     }
+
+    /// Characterization (HORO-2282): an aborted or stream-failed request
+    /// writes no `token_usage_record` (codex-rs, 0.163 to 0.165), so an
+    /// interrupted turn with no completed response has no usage to read.
+    #[test]
+    fn an_interrupted_turn_without_any_record_has_no_usage_in_window() {
+        let aborted = format!(
+            r#"{{"type":"event_msg","payload":{{"type":"turn_aborted","turn_id":"{T1}"}}}}"#
+        );
+        let f = write_lines(&[task_started(T1), aborted]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        assert_eq!(
+            observed,
+            UsageObservation::Unavailable(UsageUnavailable::NoUsageInWindow)
+        );
+    }
 }
