@@ -1089,4 +1089,21 @@ mod tests {
         assert_eq!(usage.records, 1);
         assert_eq!(usage.fresh_tokens(), 110);
     }
+
+    /// Characterization (HORO-2282): a Stop-block continuation writes more
+    /// records for the same `turn_id` after an earlier `task_complete`. The
+    /// reader ignores `task_complete`, so they are counted.
+    #[test]
+    fn records_written_after_a_task_complete_for_the_same_turn_are_counted() {
+        let f = write_lines(&[
+            task_started(T1),
+            usage_record(T1, THREAD, SESSION, 100, 0, 0, 10, 0, 100, 0, 0, 10, 0),
+            task_complete(T1),
+            usage_record(T1, THREAD, SESSION, 200, 0, 0, 20, 0, 300, 0, 0, 30, 0),
+        ]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().expect("continuation records agree");
+        assert_eq!(usage.records, 2);
+        assert_eq!(usage.fresh_tokens(), 300 + 30);
+    }
 }
