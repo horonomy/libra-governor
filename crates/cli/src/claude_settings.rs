@@ -205,11 +205,28 @@ fn command_is_ours(command: &str) -> bool {
             .strip_suffix(suffix)
             .map(str::trim_end)
             .is_some_and(|binary| {
+                let binary = unquote(binary).unwrap_or(binary);
                 Path::new(binary)
                     .file_name()
                     .is_some_and(|name| name == "libra-governor")
             })
     })
+}
+
+/// The path inside one pair of matching shell quotes around the whole binary
+/// part (`'/a b/libra-governor'`), or `None` when it is not wrapped in a
+/// matching pair. A user may quote the path by hand so the shell does not
+/// split it (HORO-2303); the quotes are not part of the file name.
+fn unquote(binary: &str) -> Option<&str> {
+    let inner = binary
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+        .or_else(|| {
+            binary
+                .strip_prefix('"')
+                .and_then(|rest| rest.strip_suffix('"'))
+        })?;
+    (!inner.contains(['\'', '"'])).then_some(inner)
 }
 
 /// `true` only for a loopback host — see module docs on why
@@ -444,8 +461,23 @@ fn command_is_unusable(command: &str) -> bool {
             command
                 .strip_suffix(suffix)
                 .map(str::trim_end)
-                .is_some_and(has_shell_unsafe_char)
+                .is_some_and(|binary| {
+                    // A hand-quoted path is split by no shell; only an unquoted
+                    // (or malformed) one with unsafe characters is unusable.
+                    !is_hand_quoted_and_runnable(binary) && has_shell_unsafe_char(binary)
+                })
         })
+}
+
+/// `true` for a binary part wrapped in matching single quotes, or in matching
+/// double quotes whose content holds no `$`, backtick or backslash, so the
+/// shell passes it to the program as one word.
+fn is_hand_quoted_and_runnable(binary: &str) -> bool {
+    match unquote(binary) {
+        Some(inner) if binary.starts_with('\'') => !inner.is_empty(),
+        Some(inner) => !inner.is_empty() && !inner.contains(['$', '`', '\\']),
+        None => false,
+    }
 }
 
 /// The hook command is `{binary} {subcommand}` run by a shell, unquoted.
