@@ -1035,4 +1035,19 @@ mod tests {
         assert_eq!(usage.records, 2);
         assert_eq!(usage.fresh_tokens(), 140 + 10);
     }
+
+    /// Characterization (HORO-2282): the reader does not de-duplicate by
+    /// `response_id`. A replayed or concatenated record makes the summed
+    /// usage exceed the turn's running total, so the read is refused (the
+    /// caller falls back to the flat hold) instead of double charging.
+    #[test]
+    fn a_duplicated_record_is_inconsistent_not_double_charged() {
+        let record = usage_record(T1, THREAD, SESSION, 100, 0, 0, 10, 0, 100, 0, 0, 10, 0);
+        let f = write_lines(&[task_started(T1), record.clone(), record]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        assert_eq!(
+            observed,
+            UsageObservation::Unavailable(UsageUnavailable::Inconsistent)
+        );
+    }
 }
