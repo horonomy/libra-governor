@@ -26,3 +26,15 @@ fn codex_lane_keys_are_injective_in_the_session_id() {
     let b = budget_lane("a", Some("codex")).unwrap();
     assert_ne!(a, b);
 }
+
+#[test]
+fn an_unknown_provider_is_refused_and_never_falls_back_to_claude() {
+    assert_eq!(
+        budget_lane("sess-1", Some("gemini")),
+        Err(SharedBudgetRefusal::UnsupportedProvider)
+    );
+    assert_eq!(
+        budget_lane("sess-1", Some("")),
+        Err(SharedBudgetRefusal::UnsupportedProvider)
+    );
+}
