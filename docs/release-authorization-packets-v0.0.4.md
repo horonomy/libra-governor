@@ -1,5 +1,7 @@
 # v0.0.4 release authorization packets (Cooperative Preview)
 
+> **Historical planning document.** v0.0.4 was published from `313d26a09407c8a77d2b4cc7685ea694a822905a` (tag `v0.0.4`, release run 40843550017). The status lines and tables below record the state when this document was written, before the founder GO (HORO-2186 comment 29520) and the tag push; they are not the current release status. Post-publication verification by the release owner is recorded in HORO-2186; no independent post-publication QA is claimed here.
+
 Status: **requests, not approvals.** Nothing here is authorized until the
 founder replies with the exact text under "Authorization reply" for that
 packet. Nothing is tagged, published or deployed. `READY_FOR_RELEASE=false`,
@@ -211,14 +213,14 @@ Things only an authorized person can do, or that wait on A-C:
 
 | Item | Who | Exact content |
 |---|---|---|
-| Jira Fix Version | Jira project admin (the release owner's tooling cannot create versions; HORO-1752 c29291) | create an unreleased version named `Agent Execution Economics v0.0.4 / Quota-Aware Execution Pacing`, then the release owner sets it on HORO-1752 and HORO-1857 and reads it back |
-| Jira Goal | Jira admin / founder | create the v0.0.4 Goal requested in HORO-1752 comments 28544 and 28725 and link it |
+| Jira Fix Version | Jira project admin (the release owner's tooling cannot create versions; HORO-1752 c29291) | create an unreleased version named `Agent Execution Economics v0.0.4 / Quota-Aware Execution Pacing`, then the release owner sets it on HORO-1752 and HORO-1857 and reads it back. **Done 2026-10-28:** version 10315 created through the Jira REST API and set on 36 issues, read back (HORO-1752 comment 29444). The "cannot create" premise above was wrong. |
+| Jira Goal | Jira admin / founder | create the v0.0.4 Goal requested in HORO-1752 comments 28544 and 28725 and link it. **Done 2026-10-28:** Goal CBLPCRLM-71 created through the Goals gateway and linked to Epic HORO-1749. |
 | Checklist rows 3, 4, 9 | release owner, after C | run URL, digests, manifest, attestation result |
 | Checklist row 10 and the install/rollback part of row 7 | release owner, after B | install and rollback transcripts |
 | Row 8 byte-identical config | release owner | `settings.json` is re-serialized by install/uninstall, so semantic equality is the evidence unless the founder wants a byte-preserving change (future work, not planned) |
 | Row 11 offline isolation bundle | already recorded (c28714/28715); stale SHAs | confirm still applicable to `FINAL` or drop |
-| Release notes | release owner, founder review | the draft in `release-candidate-v0.0.4.md`; there is no CHANGELOG file and `generate_release_notes: true` is set on the real release |
-| ADR-0025 / ADR-0026 status | founder | move to Accepted in the same change as the GO |
+| Release notes | release owner, founder review | the draft in `release-candidate-v0.0.4.md`; there is no CHANGELOG file and `generate_release_notes: true` is set on the real release. **Superseded:** the founder-reviewed release notes are DRAFT 6 (HORO-2186 comment recording its sha256). **Gate closed by PR #259 (HORO-2322):** at the frozen SHA `release.yml` publishes `docs/release-notes/<tag>.md` as the first body with `generate_release_notes: false` and fails closed; a manual edit after creation remains not accepted as sufficient. See the checklist note. |
+| ADR-0025 / ADR-0026 status | founder | move to Accepted in the same change as the GO. **Not met in the tagged tree (preserved).** Founder D5 exception 2026-10-29: the HORO-2186 decision record and the SHA-specific D8 GO are the authoritative pre-tag decision; the ADR text follows in a docs-only commit after a separately authorized tag (ADR-0025, "Release dispositions"). |
 | Dependabot PRs #187-#195 | founder (owner approval is required; none is fabricated) | decide per PR; #191-#195 touch the release actions (`attest-build-provenance` 2 to 4, `upload/download-artifact` 4 to 7/8) and should be evaluated for the release path before any tag, not merged blindly |
 | Approved future work (HORO-2303, draft PR #254) | founder | recommended: hold for v0.0.5; not a Preview blocker |
 

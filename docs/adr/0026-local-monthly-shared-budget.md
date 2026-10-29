@@ -3,8 +3,15 @@
 ## Status
 
 Accepted by founder decision for **engineering** (Option 2, decisions D1 and
-D3, recorded at HORO-2186 Jira comment 28778). This is **not a release GO**:
-tagging or publishing v0.0.4 stays a separate founder decision (ADR-0025).
+D3, recorded at HORO-2186 Jira comment 28778), and for the **v0.0.4
+Cooperative Preview release scope and disclosure wording** effective only with
+the SHA-named founder GO recorded under ADR-0025 (HORO-2186 comment 29520, SHA
+`313d26a09407c8a77d2b4cc7685ea694a822905a`). This ADR is **not itself a release GO**: tagging or
+publishing v0.0.4 stays a separate founder decision (ADR-0025). The required
+disclosures (the five listed under "Release disclosure" below, plus the
+additional fail-open, pricing, trust-boundary and limitation disclosures in the
+v0.0.4 release notes) are final for the release notes; the release dispositions
+D2/D3/D4/D5/D7 are recorded in ADR-0025.
 Builds on [ADR-0023](0023-metered-shared-pool.md) and amends
 [ADR-0003](0003-gateway-enforcement-boundary.md) for the local budget only.
 Slice S2 delivers this record and `calendar_month_bounds`; later slices wire it.
