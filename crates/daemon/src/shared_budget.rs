@@ -408,6 +408,13 @@ fn configured(state: &SharedBudgetFileState) -> Result<SharedBudgetConfig, Share
     }
 }
 
+/// Whether a request's provider is the Claude Code lane (absent or
+/// `"claude-code"`). The Claude settlement and subagent sweep read Claude
+/// transcripts and must never run for another provider's request (HORO-2281).
+pub fn is_claude_provider(provider: Option<&str>) -> bool {
+    matches!(provider, None | Some(CLAUDE_PROVIDER))
+}
+
 /// The budget lane session key for a wire `(provider, session_id)`.
 ///
 /// `None` or `"claude-code"` keep the raw session id, so existing rows and
