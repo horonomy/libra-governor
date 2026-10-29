@@ -1,5 +1,7 @@
 # v0.0.4 release-candidate packet (Cooperative Preview)
 
+> **Historical planning document.** v0.0.4 was published from `313d26a09407c8a77d2b4cc7685ea694a822905a` (tag `v0.0.4`, release run 40843550017). The status lines and tables below record the state when this document was written, before the founder GO (HORO-2186 comment 29520) and the tag push; they are not the current release status. Independent post-publication QA is recorded in HORO-2186, not here.
+
 Status: **draft, not a release decision.** Nothing is tagged, published or
 deployed. `READY_FOR_RELEASE=false`, `RELEASE_APPROVED=false`,
 `RELEASED=false`. Independent QA evaluated code at
