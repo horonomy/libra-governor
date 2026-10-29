@@ -1066,4 +1066,27 @@ mod tests {
             UsageObservation::Unavailable(UsageUnavailable::NoUsageInWindow)
         );
     }
+
+    /// Characterization (HORO-2282), a KNOWN under-count: when a turn is
+    /// interrupted after some responses completed, the aborted request left
+    /// no record, so the read is `Measured` over the recorded responses
+    /// only. The reader cannot see the missing spend. This test pins that
+    /// limit so Codex coverage is never claimed complete for interrupts.
+    #[test]
+    fn an_interrupted_turn_measures_only_the_recorded_responses() {
+        let aborted = format!(
+            r#"{{"type":"event_msg","payload":{{"type":"turn_aborted","turn_id":"{T1}"}}}}"#
+        );
+        let f = write_lines(&[
+            task_started(T1),
+            usage_record(T1, THREAD, SESSION, 100, 0, 0, 10, 0, 100, 0, 0, 10, 0),
+            aborted,
+        ]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed
+            .measured()
+            .expect("the recorded response is consistent");
+        assert_eq!(usage.records, 1);
+        assert_eq!(usage.fresh_tokens(), 110);
+    }
 }
