@@ -799,6 +799,10 @@ fn build_body(
             "pool_id": export.pool_id.0,
             "unit": unit,
             "capacity": export.capacity,
+            // The export reads the ledger offline: this is the pool row's
+            // stored capacity, which can lag a cap raised in the budget file
+            // (`status` and admission use the live configured cap).
+            "capacity_source": "pool_row",
         },
         "totals": {
             "used": export.total_used,
