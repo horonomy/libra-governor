@@ -997,4 +997,26 @@ mod tests {
         );
         assert_eq!(usage.fresh_tokens(), 110);
     }
+
+    /// Characterization (HORO-2282): Codex writes `usage` per response and
+    /// `turn_token_usage` as a running total (codex-rs state/session.rs,
+    /// 0.163 to 0.165). The turn total is the sum of `usage`, never the sum
+    /// of the cumulative field.
+    #[test]
+    fn cumulative_turn_totals_are_not_summed_across_records() {
+        let f = write_lines(&[
+            task_started(T1),
+            usage_record(T1, THREAD, SESSION, 100, 0, 0, 10, 0, 100, 0, 0, 10, 0),
+            usage_record(T1, THREAD, SESSION, 200, 0, 0, 20, 0, 300, 0, 0, 30, 0),
+            usage_record(T1, THREAD, SESSION, 50, 0, 0, 5, 0, 350, 0, 0, 35, 0),
+        ]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().expect("three consistent records");
+        assert_eq!(usage.records, 3);
+        assert_eq!(
+            usage.fresh_tokens(),
+            350 + 35,
+            "the last record's running total, not 100+300+350 input"
+        );
+    }
 }
