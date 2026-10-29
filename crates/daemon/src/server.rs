@@ -2328,6 +2328,8 @@ fn handle_finalize_for_lane(
     current_task: &mut Option<TaskSummary>,
     config: &DaemonConfig,
 ) -> Result<FinalizeOutcome, DaemonError> {
+    // Claude Code lane only (HORO-2281): a Codex `Finalize` carrying the same raw
+    // session id must not settle or sweep a Claude hold with a Claude reader.
     // The local monthly shared budget (HORO-2196, ADR-0026): settle the
     // session's turn hold from the priced transcript window. It needs no
     // preflight task, so it runs before and independently of the legacy
@@ -2336,7 +2338,9 @@ fn handle_finalize_for_lane(
     // behaves exactly as it did. A failure is logged and never fails the
     // receipt: the unsettled hold simply stays reserved until its TTL
     // reclaims it, which over-reserves and never under-reserves.
-    if config.shared_budget.is_configured() {
+    if config.shared_budget.is_configured()
+        && crate::shared_budget::is_claude_provider(provider.as_deref())
+    {
         match crate::shared_budget::settle_turn(
             ledger,
             &config.shared_budget,
