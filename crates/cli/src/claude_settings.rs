@@ -1783,4 +1783,16 @@ mod tests {
         );
         assert_eq!(apply_hooks_only(&path, &binary()).unwrap().hooks_added, 0);
     }
+
+    /// HORO-2303 item 1: a hand-quoted binary path is still our command, so
+    /// uninstall removes it and install does not add a duplicate beside it.
+    /// RED before the quote-aware `command_is_ours` (the trailing quote made
+    /// the file name `libra-governor'`); NOT_RUN.
+    #[test]
+    fn a_hand_quoted_binary_path_is_recognised_as_ours() {
+        assert!(command_is_ours("'/opt/my tools/libra-governor' hook stop"));
+        assert!(command_is_ours(
+            "\"/opt/my tools/libra-governor\" hook stop"
+        ));
+    }
 }
