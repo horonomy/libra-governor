@@ -220,6 +220,39 @@ jobs:
       contents: write
       attestations: read
     steps:
+      # The approved release-notes body lives in the tagged tree and is the
+      # body of the first publicly visible Release. The checkout pins the
+      # tag's own commit, so the notes cannot differ from the code released.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      # softprops/action-gh-release only warns and falls back to an empty
+      # body when body_path cannot be read, which would publish a Release
+      # with no notes. Fail before anything is created instead.
+      - name: require the approved release-notes body
+        env:
+          NOTES: docs/release-notes/${{ github.ref_name }}.md
+        run: |
+          set -euo pipefail
+          test -s "$NOTES" || { echo "::error::missing or empty $NOTES"; exit 1; }
+          test "$(wc -c < "$NOTES")" -lt 100000 || { echo "::error::$NOTES too large"; exit 1; }
+          # One marker per mandatory disclosure (ADR-0026 items 1-5, fail-open,
+          # known pricing errors, same-user trust boundary).
+          for marker in \
+            'not a hard spending cap' \
+            'Admission-bounded (cooperative)' \
+            'In-turn overshoot' \
+            'Codex is not gated' \
+            'never your provider bill' \
+            'Accounting boundary' \
+            'Fail-open behaviour' \
+            'over-accounted by approximately 5x' \
+            'NOT a security boundary'; do
+            grep -qF -- "$marker" "$NOTES" || { echo "::error::$NOTES lacks the required disclosure: $marker"; exit 1; }
+          done
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
@@ -245,4 +278,5 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.sha256
-          generate_release_notes: true
+          body_path: docs/release-notes/${{ github.ref_name }}.md
+          generate_release_notes: false
