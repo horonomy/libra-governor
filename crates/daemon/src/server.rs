@@ -699,13 +699,14 @@ pub(crate) fn dispatch(
             tool_name,
             agent_id,
             provider,
-        } => match handle_tool_invoked_for_lane(
+        } => match handle_tool_invoked_for_provider_lane(
             &session_id,
             &crate::legacy_executor::lane_key(
                 &session_id,
                 agent_id.as_deref(),
                 provider.as_deref(),
             ),
+            provider.as_deref(),
             &tool_name,
             ledger,
             current_task,
@@ -1890,12 +1891,40 @@ fn handle_tool_invoked_for_lane(
     current_task: &mut Option<TaskSummary>,
     config: &DaemonConfig,
 ) -> Result<(), DaemonError> {
+    handle_tool_invoked_for_provider_lane(
+        session_id,
+        lane,
+        None,
+        tool_name,
+        ledger,
+        current_task,
+        config,
+    )
+}
+
+/// As [`handle_tool_invoked_for_lane`], for a request that names its
+/// `provider`. The shared-budget heartbeat renews the hold of the budget lane
+/// that provider maps to (HORO-2281), never another provider's hold that
+/// happens to share the raw session id.
+fn handle_tool_invoked_for_provider_lane(
+    session_id: &str,
+    lane: &str,
+    provider: Option<&str>,
+    tool_name: &str,
+    ledger: &mut LedgerStore,
+    current_task: &mut Option<TaskSummary>,
+    config: &DaemonConfig,
+) -> Result<(), DaemonError> {
     let now = time::OffsetDateTime::now_utc();
     // Best-effort keep-alive for the session's shared-budget holds. It runs
     // before the early returns below (the local budget needs no
-    // pre-established session) and can never fail the tool event.
-    if let Err(e) = crate::shared_budget::heartbeat(ledger, &config.shared_budget, session_id) {
-        log::append_line(&config.log_path, &format!("shared budget heartbeat: {e}"));
+    // pre-established session) and can never fail the tool event. A provider
+    // the budget does not serve renews nothing.
+    if let Ok(budget_lane) = crate::shared_budget::budget_lane(session_id, provider) {
+        if let Err(e) = crate::shared_budget::heartbeat(ledger, &config.shared_budget, &budget_lane)
+        {
+            log::append_line(&config.log_path, &format!("shared budget heartbeat: {e}"));
+        }
     }
     ledger.increment_tool_call_count(lane)?;
     let same_tool_streak = ledger.record_tool_invocation(lane, tool_name, now)?;
