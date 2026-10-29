@@ -894,35 +894,30 @@ pub(crate) fn dispatch(
             use libra_governor_protocol::{SharedBudgetOutcome, SharedBudgetRequest};
             let rt = &config.shared_budget;
             let outcome = match shared_budget {
-                // Until the provider-namespaced lanes exist (HORO-2281), only the
-                // Claude Code lane is served. A request for any other provider is
-                // answered `not_configured` and writes nothing; it must never be
-                // mapped onto a Claude lane.
-                SharedBudgetRequest::Admit {
-                    provider: Some(provider),
-                    ..
-                }
-                | SharedBudgetRequest::Check {
-                    provider: Some(provider),
-                    ..
-                } if provider != "claude-code" => SharedBudgetOutcome::NotConfigured,
                 SharedBudgetRequest::Admit {
                     session_id,
                     agent_id,
                     prompt_id,
-                    provider: _,
+                    provider,
                 } => crate::shared_budget::admit(
                     ledger,
                     rt,
                     &session_id,
                     agent_id.as_deref(),
                     prompt_id.as_deref(),
+                    provider.as_deref(),
                 ),
                 SharedBudgetRequest::Check {
                     session_id,
                     agent_id,
-                    provider: _,
-                } => crate::shared_budget::check(ledger, rt, &session_id, agent_id.as_deref()),
+                    provider,
+                } => crate::shared_budget::check(
+                    ledger,
+                    rt,
+                    &session_id,
+                    agent_id.as_deref(),
+                    provider.as_deref(),
+                ),
                 SharedBudgetRequest::ChargeAgent {
                     session_id,
                     agent_id,

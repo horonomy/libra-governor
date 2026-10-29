@@ -645,6 +645,7 @@ pub fn admit(
     session_id: &str,
     agent_id: Option<&str>,
     prompt_id: Option<&str>,
+    provider: Option<&str>,
 ) -> Result<SharedBudgetOutcome, SharedBudgetError> {
     let prompt_id = usable_prompt(prompt_id);
     let state = rt.effective().state;
@@ -655,6 +656,16 @@ pub fn admit(
         Ok(kind) => kind,
         Err(reason) => return Ok(refused(reason)),
     };
+    let lane = match budget_lane(session_id, provider) {
+        Ok(lane) => lane,
+        Err(reason) => return Ok(refused(reason)),
+    };
+    if provider == Some(CODEX_PROVIDER) {
+        // Inert until the Codex settlement exists (HORO-2282): nothing is
+        // read, reserved or written for a Codex lane.
+        return Ok(SharedBudgetOutcome::NotConfigured);
+    }
+    let session_id = lane.as_str();
     let cfg = match configured(&state) {
         Ok(cfg) => cfg,
         Err(outcome) => return Ok(outcome),
@@ -833,6 +844,7 @@ pub fn check(
     rt: &SharedBudgetRuntime,
     session_id: &str,
     agent_id: Option<&str>,
+    provider: Option<&str>,
 ) -> Result<SharedBudgetOutcome, SharedBudgetError> {
     let state = rt.effective().state;
     if matches!(state, SharedBudgetFileState::Absent) {
@@ -842,6 +854,14 @@ pub fn check(
         Ok(kind) => kind,
         Err(reason) => return Ok(refused(reason)),
     };
+    let lane = match budget_lane(session_id, provider) {
+        Ok(lane) => lane,
+        Err(reason) => return Ok(refused(reason)),
+    };
+    if provider == Some(CODEX_PROVIDER) {
+        return Ok(SharedBudgetOutcome::NotConfigured);
+    }
+    let session_id = lane.as_str();
     let cfg = match configured(&state) {
         Ok(cfg) => cfg,
         Err(outcome) => return Ok(outcome),
