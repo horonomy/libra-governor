@@ -82,6 +82,14 @@ const POOL_PREFIX: &str = "metered:local-budget/monthly-";
 /// Holds of this owner, across periods, share this prefix.
 const OWNER_POOL_PREFIX: &str = "metered:local-budget/";
 const RESERVED_SESSION_PREFIX: &str = "execution-owner-v1:";
+/// Reserved prefix of a derived non-Claude budget lane key. A client may
+/// never name a session that starts with it (see [`validate_identity`]), so
+/// no native session id can collide with a derived key (HORO-2281).
+pub const PROVIDER_LANE_PREFIX: &str = "shared-budget-provider-v1:";
+/// The provider whose lane keys are the raw session id, byte for byte.
+const CLAUDE_PROVIDER: &str = "claude-code";
+/// The one other provider the budget derives a lane for.
+const CODEX_PROVIDER: &str = "codex";
 
 /// A source of "now". Injectable so rollover and timezone-boundary tests
 /// are deterministic without sleeping.
@@ -400,6 +408,28 @@ fn configured(state: &SharedBudgetFileState) -> Result<SharedBudgetConfig, Share
     }
 }
 
+/// The budget lane session key for a wire `(provider, session_id)`.
+///
+/// `None` or `"claude-code"` keep the raw session id, so existing rows and
+/// every Claude byte are unchanged. `"codex"` gets a derived, reserved-prefix
+/// key built from the JSON array `["codex", session_id]`, which is injective
+/// in `(provider, session_id)`. Any other provider is refused and never
+/// falls back to the Claude lane.
+pub fn budget_lane(
+    session_id: &str,
+    provider: Option<&str>,
+) -> Result<String, SharedBudgetRefusal> {
+    match provider {
+        None | Some(CLAUDE_PROVIDER) => Ok(session_id.to_string()),
+        Some(CODEX_PROVIDER) => {
+            let tuple = serde_json::to_string(&[CODEX_PROVIDER, session_id])
+                .map_err(|_| SharedBudgetRefusal::UnsupportedProvider)?;
+            Ok(format!("{PROVIDER_LANE_PREFIX}{tuple}"))
+        }
+        Some(_) => Err(SharedBudgetRefusal::UnsupportedProvider),
+    }
+}
+
 fn validate_identity(
     session_id: &str,
     agent_id: Option<&str>,
@@ -407,7 +437,9 @@ fn validate_identity(
     if session_id.trim().is_empty() {
         return Err(SharedBudgetRefusal::EmptySessionId);
     }
-    if session_id.trim_start().starts_with(RESERVED_SESSION_PREFIX) {
+    if session_id.trim_start().starts_with(RESERVED_SESSION_PREFIX)
+        || session_id.trim_start().starts_with(PROVIDER_LANE_PREFIX)
+    {
         return Err(SharedBudgetRefusal::ReservedSessionScope);
     }
     match agent_id {
