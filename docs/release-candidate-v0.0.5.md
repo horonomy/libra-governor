@@ -104,3 +104,42 @@ candidate SHA, and no real-host result. Gate fields are **TBD**:
 | Jira Fix Version and Goal for v0.0.5 | NOT CREATED (see matrix) |
 | Open dependency PRs (#187 to #195, #260 to #262) | TBD, not reviewed; #192 to #195 change the release workflow actions |
 | Founder SHA-specific GO | NOT GIVEN |
+
+## Release notes draft
+
+Deliberately kept here and **not** at `docs/release-notes/v0.0.5.md`: the
+release workflow publishes `docs/release-notes/<tag>.md` as the first Release
+body and fails closed, so a placeholder file at that path must not exist until
+the founder-named SHA is frozen. There is no CHANGELOG file in this repository.
+
+> # Libra Governor v0.0.5 (Cooperative Preview) - DRAFT, TBD
+>
+> Builds on v0.0.4. Still a **Cooperative Preview, not a hard spending cap.**
+>
+> Added or changed (final list TBD, only merged and verified items):
+> - TBD: shared-budget lanes are namespaced by provider so Claude Code and
+>   Codex sessions that reuse a session id no longer interact (protocol v25;
+>   TBD compatibility statement with v24 components).
+> - TBD: hardening items from the v0.0.4 audit (HORO-2303), each only if
+>   merged.
+> - TBD: `shared-budget export` labels the capacity source (HORO-2293), only
+>   if merged.
+>
+> Not in this release (unchanged): Codex budget enforcement and the S11
+> gateway cap are off and not enabled; no OpenAI gateway; no remote upload; no
+> strict cross-host cap. Codex support was checked by reading source only; it
+> has not been run against a real provider. Amounts remain Libra's
+> list-price-equivalent estimates, not your provider bill.
+>
+> All v0.0.4 disclosures that are not explicitly removed above still apply.
+> Platform: TBD (Apple Silicon macOS in v0.0.4).
+> Artifact and checksum: TBD.
+
+## Rollback
+
+Unchanged from v0.0.4: the budget is opt-in and file-driven. Delete
+`shared-budget.json` in the state directory to turn it off (the daemon re-reads
+it on every decision); `libra-governor uninstall` removes the hooks. If the
+protocol v25 bump ships, a mixed v24/v25 install is **TBD** (not yet tested);
+reinstall both binaries from the same release. Rollback of a published
+artifact is not yet evidenced.
