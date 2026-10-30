@@ -1229,6 +1229,31 @@ mod tests {
     }
 
     #[test]
+    fn init_force_keeps_the_previous_file_as_an_owner_only_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        init_in(dir.path(), &req(20_000, "UTC", None, false)).unwrap();
+        let original = std::fs::read(dir.path().join("shared-budget.json")).unwrap();
+        init_in(dir.path(), &req(30_000, "UTC", None, true)).unwrap();
+        let backup = dir.path().join("shared-budget.json.bak");
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        let mode = std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn init_force_backup_holds_only_the_most_recent_previous_file() {
+        let dir = tempfile::tempdir().unwrap();
+        init_in(dir.path(), &req(20_000, "UTC", None, false)).unwrap();
+        init_in(dir.path(), &req(30_000, "UTC", None, true)).unwrap();
+        let second = std::fs::read(dir.path().join("shared-budget.json")).unwrap();
+        init_in(dir.path(), &req(40_000, "UTC", None, true)).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("shared-budget.json.bak")).unwrap(),
+            second
+        );
+    }
+
+    #[test]
     fn init_refuses_a_symlink_even_with_force() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("elsewhere");
