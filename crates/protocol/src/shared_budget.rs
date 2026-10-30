@@ -708,6 +708,91 @@ mod tests {
         );
     }
 
+    /// HORO-2282 (C2 prerequisites): the lane-taking request kinds gain the
+    /// same optional `provider`; a Claude request must stay byte-exact.
+    #[test]
+    fn claude_charge_settle_tail_and_transcript_ready_serialize_to_the_v24_bytes() {
+        let charge = SharedBudgetRequest::ChargeAgent {
+            session_id: "s".into(),
+            agent_id: Some("a".into()),
+            amount_usd_cents: 7,
+            idempotency_key: "k".into(),
+            charge_source: ChargeSource::SubagentTranscript,
+            event_time: None,
+            provider: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&charge).unwrap(),
+            r#"{"op":"charge_agent","session_id":"s","agent_id":"a","amount_usd_cents":7,"idempotency_key":"k","charge_source":"subagent_transcript","event_time":null}"#
+        );
+        let tail = SharedBudgetRequest::SettleTail {
+            session_id: "s".into(),
+            transcript_path: "/x/s.jsonl".into(),
+            provider: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&tail).unwrap(),
+            r#"{"op":"settle_tail","session_id":"s","transcript_path":"/x/s.jsonl"}"#
+        );
+        let ready = SharedBudgetRequest::TranscriptReady {
+            session_id: "s".into(),
+            transcript_path: "/x/s.jsonl".into(),
+            provider: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&ready).unwrap(),
+            r#"{"op":"transcript_ready","session_id":"s","transcript_path":"/x/s.jsonl"}"#
+        );
+    }
+
+    #[test]
+    fn a_v24_lane_request_without_provider_deserializes_to_none() {
+        let tail: SharedBudgetRequest = serde_json::from_str(
+            r#"{"op":"settle_tail","session_id":"s","transcript_path":"/p"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            tail,
+            SharedBudgetRequest::SettleTail {
+                session_id: "s".into(),
+                transcript_path: "/p".into(),
+                provider: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_codex_provider_on_the_lane_requests_serializes_and_round_trips() {
+        for req in [
+            SharedBudgetRequest::ChargeAgent {
+                session_id: "s".into(),
+                agent_id: None,
+                amount_usd_cents: 1,
+                idempotency_key: "k".into(),
+                charge_source: ChargeSource::TurnHold,
+                event_time: None,
+                provider: Some("codex".into()),
+            },
+            SharedBudgetRequest::SettleTail {
+                session_id: "s".into(),
+                transcript_path: "/p".into(),
+                provider: Some("codex".into()),
+            },
+            SharedBudgetRequest::TranscriptReady {
+                session_id: "s".into(),
+                transcript_path: "/p".into(),
+                provider: Some("codex".into()),
+            },
+        ] {
+            let json = serde_json::to_value(&req).unwrap();
+            assert_eq!(json["provider"], "codex");
+            assert_eq!(
+                serde_json::from_value::<SharedBudgetRequest>(json).unwrap(),
+                req
+            );
+        }
+    }
+
     #[test]
     fn a_v24_request_without_provider_deserializes_to_none() {
         let admit: SharedBudgetRequest = serde_json::from_str(
