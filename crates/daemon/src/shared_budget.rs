@@ -499,6 +499,35 @@ pub fn budget_lane(
     }
 }
 
+fn validate_agent(agent_id: Option<&str>) -> Result<(), SharedBudgetRefusal> {
+    match agent_id {
+        Some(a) if a.trim().is_empty() => Err(SharedBudgetRefusal::InvalidAgentId),
+        _ => Ok(()),
+    }
+}
+
+/// Validates a client-supplied session id and derives the lane key its holds
+/// live on. The one door from a wire `(provider, session_id)` to the
+/// lane-taking functions, which take the returned key as-is (HORO-2282).
+pub fn client_lane(
+    session_id: &str,
+    provider: Option<&str>,
+) -> Result<String, SharedBudgetRefusal> {
+    validate_identity(session_id, None)?;
+    budget_lane(session_id, provider)
+}
+
+/// What the lane-taking functions check on a key their caller already
+/// derived: only that there is one. The reserved prefix is rightly present
+/// on a derived key, so it is refused for *client* ids by
+/// [`validate_identity`] and never here.
+fn validate_lane_key(lane: &str) -> Result<(), SharedBudgetRefusal> {
+    if lane.trim().is_empty() {
+        return Err(SharedBudgetRefusal::EmptySessionId);
+    }
+    Ok(())
+}
+
 fn validate_identity(
     session_id: &str,
     agent_id: Option<&str>,
@@ -938,9 +967,43 @@ pub fn check(
 /// arithmetic is only specified for real clocks.
 const EVENT_YEARS: std::ops::RangeInclusive<i32> = 2000..=2200;
 
-/// Handles `SharedBudgetRequest::ChargeAgent`.
+/// Handles `SharedBudgetRequest::ChargeAgent` for a client-supplied
+/// `(provider, session_id)`. A Codex lane stays inert (HORO-2282).
 #[allow(clippy::too_many_arguments)]
 pub fn charge(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    session_id: &str,
+    agent_id: Option<&str>,
+    amount_usd_cents: u64,
+    idempotency_key: &str,
+    charge_source: ChargeSource,
+    event_time: Option<&str>,
+    provider: Option<&str>,
+) -> Result<SharedBudgetOutcome, SharedBudgetError> {
+    if matches!(rt.effective().state, SharedBudgetFileState::Absent) {
+        return Ok(SharedBudgetOutcome::NotConfigured);
+    }
+    let lane = match admission_lane(session_id, agent_id, provider) {
+        Ok((_, lane)) => lane,
+        Err(outcome) => return Ok(outcome),
+    };
+    charge_on_lane(
+        ledger,
+        rt,
+        &lane,
+        agent_id,
+        amount_usd_cents,
+        idempotency_key,
+        charge_source,
+        event_time,
+    )
+}
+
+/// [`charge`] on an already-derived lane key, which is not re-validated as a
+/// client identity. `agent_id` is still a client value and is checked.
+#[allow(clippy::too_many_arguments)]
+pub fn charge_on_lane(
     ledger: &mut LedgerStore,
     rt: &SharedBudgetRuntime,
     session_id: &str,
@@ -955,7 +1018,7 @@ pub fn charge(
         return Ok(SharedBudgetOutcome::NotConfigured);
     }
     // Same precedence as before the split: identity, amount, key.
-    if let Err(reason) = validate_identity(session_id, agent_id) {
+    if let Err(reason) = validate_lane_key(session_id).and_then(|()| validate_agent(agent_id)) {
         return Ok(refused(reason));
     }
     if amount_usd_cents == 0 || i64::try_from(amount_usd_cents).is_err() {
@@ -1015,7 +1078,9 @@ fn book_charge(
         usage_known,
         watermark,
     } = charge;
-    if let Err(reason) = validate_identity(session_id, agent_id) {
+    // Every caller has already validated the identity (a client id or a
+    // derived lane key); this is only the empty-key backstop.
+    if let Err(reason) = validate_lane_key(session_id).and_then(|()| validate_agent(agent_id)) {
         return Ok(refused(reason));
     }
     if amount_usd_cents == 0 || i64::try_from(amount_usd_cents).is_err() {
@@ -1390,6 +1455,9 @@ fn pending_hold(holds: &[SharedPoolReservation]) -> Option<&SharedPoolReservatio
 ///   `Stop`): nothing, even when a newer hold is pending. Without a
 ///   `prompt_id` a duplicate cannot be told from a real `Stop` whose
 ///   transcript has not flushed, and settles the pending hold.
+///
+/// `session_id` is the lane key, already derived by [`client_lane`]; it is
+/// not re-validated as a client identity (HORO-2282).
 pub fn settle_turn(
     ledger: &mut LedgerStore,
     rt: &SharedBudgetRuntime,
@@ -1402,7 +1470,7 @@ pub fn settle_turn(
     if matches!(state, SharedBudgetFileState::Absent) {
         return Ok(TurnSettlement::NotConfigured);
     }
-    if validate_identity(session_id, None).is_err() {
+    if validate_lane_key(session_id).is_err() {
         return Ok(TurnSettlement::NotApplicable);
     }
     let holds = ledger.shared_lane_holds(
@@ -2005,8 +2073,28 @@ fn remember_swept(rt: &SharedBudgetRuntime, key: (String, String), stamp: (u64, 
     seen.insert(key, stamp);
 }
 
-/// Handles `SharedBudgetRequest::SettleTail` (HORO-2196). See the request.
+/// Handles `SharedBudgetRequest::SettleTail` (HORO-2196) for a
+/// client-supplied `(provider, session_id)`. A Codex lane stays inert.
 pub fn settle_tail(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    session_id: &str,
+    transcript_path: &str,
+    provider: Option<&str>,
+) -> Result<SharedBudgetOutcome, SharedBudgetError> {
+    if matches!(rt.effective().state, SharedBudgetFileState::Absent) {
+        return Ok(SharedBudgetOutcome::NotConfigured);
+    }
+    let lane = match admission_lane(session_id, None, provider) {
+        Ok((_, lane)) => lane,
+        Err(outcome) => return Ok(outcome),
+    };
+    settle_tail_on_lane(ledger, rt, &lane, transcript_path)
+}
+
+/// [`settle_tail`] on an already-derived lane key, which is not re-validated
+/// as a client identity.
+pub fn settle_tail_on_lane(
     ledger: &mut LedgerStore,
     rt: &SharedBudgetRuntime,
     session_id: &str,
@@ -2016,7 +2104,7 @@ pub fn settle_tail(
     if matches!(state, SharedBudgetFileState::Absent) {
         return Ok(SharedBudgetOutcome::NotConfigured);
     }
-    if let Err(reason) = validate_identity(session_id, None) {
+    if let Err(reason) = validate_lane_key(session_id) {
         return Ok(refused(reason));
     }
     let cfg = match configured(&state) {
@@ -2225,6 +2313,29 @@ pub fn transcript_ready(
     rt: &SharedBudgetRuntime,
     session_id: &str,
     transcript_path: &str,
+    provider: Option<&str>,
+) -> Result<SharedBudgetOutcome, SharedBudgetError> {
+    match rt.effective().state {
+        SharedBudgetFileState::Absent => return Ok(SharedBudgetOutcome::NotConfigured),
+        SharedBudgetFileState::Invalid(_) => {
+            return Ok(SharedBudgetOutcome::TranscriptReadiness { ready: true })
+        }
+        SharedBudgetFileState::Valid(_) => {}
+    }
+    let lane = match admission_lane(session_id, None, provider) {
+        Ok((_, lane)) => lane,
+        Err(outcome) => return Ok(outcome),
+    };
+    transcript_ready_on_lane(ledger, rt, &lane, transcript_path)
+}
+
+/// [`transcript_ready`] on an already-derived lane key, which is not
+/// re-validated as a client identity.
+pub fn transcript_ready_on_lane(
+    ledger: &LedgerStore,
+    rt: &SharedBudgetRuntime,
+    session_id: &str,
+    transcript_path: &str,
 ) -> Result<SharedBudgetOutcome, SharedBudgetError> {
     let state = rt.effective().state;
     let cfg = match &state {
@@ -2234,7 +2345,7 @@ pub fn transcript_ready(
         }
         SharedBudgetFileState::Valid(cfg) => cfg,
     };
-    if let Err(reason) = validate_identity(session_id, None) {
+    if let Err(reason) = validate_lane_key(session_id) {
         return Ok(refused(reason));
     }
     let holds = ledger.shared_lane_holds(
@@ -2404,6 +2515,7 @@ pub fn status(
 /// of `session_id` in the current period's pool, whichever lane it belongs
 /// to (a tool event carries no agent id, so the lane cannot be preferred). Returns how many were renewed. Does nothing -- not even a
 /// ledger read -- unless a valid shared-budget file is loaded.
+/// `session_id` is the lane key, already derived by [`client_lane`].
 pub fn heartbeat(
     ledger: &mut LedgerStore,
     rt: &SharedBudgetRuntime,
@@ -2413,7 +2525,7 @@ pub fn heartbeat(
     let SharedBudgetFileState::Valid(cfg) = &state else {
         return Ok(0);
     };
-    if validate_identity(session_id, None).is_err() {
+    if validate_lane_key(session_id).is_err() {
         return Ok(0);
     }
     let now = rt.now();
