@@ -1679,3 +1679,146 @@ fn a_codex_admit_is_inert_until_the_codex_settlement_exists() {
     assert!(fx.pools().is_empty(), "no pool for an inert lane");
     assert_eq!(fx.fingerprint(), before, "nothing moved");
 }
+
+// ---- HORO-2282 (C2 prerequisites): lane-taking entry points ----
+
+const LANE_PROVIDERS: [&str; 2] = ["codex", "gemini"];
+
+fn lane_requests(session: &str, provider: Option<&str>) -> Vec<SharedBudgetRequest> {
+    let provider = provider.map(String::from);
+    vec![
+        SharedBudgetRequest::ChargeAgent {
+            session_id: session.to_string(),
+            agent_id: None,
+            amount_usd_cents: 5,
+            idempotency_key: "k".to_string(),
+            charge_source: ChargeSource::TurnHold,
+            event_time: None,
+            provider: provider.clone(),
+        },
+        SharedBudgetRequest::SettleTail {
+            session_id: session.to_string(),
+            transcript_path: "/nope.jsonl".to_string(),
+            provider: provider.clone(),
+        },
+        SharedBudgetRequest::TranscriptReady {
+            session_id: session.to_string(),
+            transcript_path: "/nope.jsonl".to_string(),
+            provider,
+        },
+    ]
+}
+
+#[test]
+fn a_codex_lane_request_is_inert_and_writes_nothing() {
+    let mut fx = Fx::new(Some(&cfg_json(2_000, "UTC", 1_000)), JAN);
+    let before = fx.fingerprint();
+    for request in lane_requests("s", Some("codex")) {
+        assert_eq!(
+            fx.sb(request.clone()),
+            SharedBudgetOutcome::NotConfigured,
+            "{request:?}"
+        );
+    }
+    assert!(fx.pools().is_empty(), "no pool for a dark provider");
+    assert_eq!(fx.fingerprint(), before, "nothing moved");
+}
+
+#[test]
+fn an_unknown_provider_on_a_lane_request_is_refused_and_never_a_claude_lane() {
+    let mut fx = Fx::new(Some(&cfg_json(2_000, "UTC", 1_000)), JAN);
+    let before = fx.fingerprint();
+    for request in lane_requests("s", Some("gemini")) {
+        expect_refused(fx.sb(request), SharedBudgetRefusal::UnsupportedProvider);
+    }
+    assert_eq!(fx.fingerprint(), before, "nothing moved");
+}
+
+#[test]
+fn a_client_supplied_derived_key_is_refused_for_every_lane_request_and_provider() {
+    let mut fx = Fx::new(Some(&cfg_json(2_000, "UTC", 1_000)), JAN);
+    let before = fx.fingerprint();
+    let forged = "shared-budget-provider-v1:[\"codex\",\"s\"]";
+    for provider in [None, Some("claude-code"), Some("codex")] {
+        for request in lane_requests(forged, provider) {
+            expect_refused(fx.sb(request), SharedBudgetRefusal::ReservedSessionScope);
+        }
+    }
+    assert_eq!(fx.fingerprint(), before, "nothing moved");
+}
+
+#[test]
+fn client_lane_validates_the_client_id_then_derives_the_key() {
+    use libra_governor_daemon::shared_budget::{budget_lane, client_lane};
+    assert_eq!(client_lane("s", None).unwrap(), "s");
+    assert_eq!(
+        client_lane("s", Some("codex")).unwrap(),
+        budget_lane("s", Some("codex")).unwrap()
+    );
+    let forged = budget_lane("s", Some("codex")).unwrap();
+    assert_eq!(
+        client_lane(&forged, Some("codex")),
+        Err(SharedBudgetRefusal::ReservedSessionScope)
+    );
+    assert_eq!(
+        client_lane(" ", None),
+        Err(SharedBudgetRefusal::EmptySessionId)
+    );
+    assert_eq!(
+        client_lane("s", Some("gemini")),
+        Err(SharedBudgetRefusal::UnsupportedProvider)
+    );
+}
+
+#[test]
+fn the_internal_lane_functions_accept_an_already_derived_key() {
+    use libra_governor_daemon::shared_budget as sb;
+    let mut fx = Fx::new(Some(&cfg_json(2_000, "UTC", 1_000)), JAN);
+    let lane = sb::budget_lane("s", Some("codex")).unwrap();
+    let rt = &fx.config.shared_budget;
+    assert_eq!(
+        sb::transcript_ready_on_lane(&fx.ledger, rt, &lane, "/nope.jsonl").unwrap(),
+        SharedBudgetOutcome::TranscriptReadiness { ready: true },
+        "no hold on the lane: nothing to wait for"
+    );
+    expect_refused(
+        sb::settle_tail_on_lane(&mut fx.ledger, rt, &lane, "/nope.jsonl").unwrap(),
+        SharedBudgetRefusal::NoSettledLane,
+    );
+    assert!(matches!(
+        sb::settle_turn(&mut fx.ledger, rt, &lane, None, None).unwrap(),
+        sb::TurnSettlement::NoHold
+    ));
+    assert_eq!(sb::heartbeat(&mut fx.ledger, rt, &lane).unwrap(), 0);
+    assert!(
+        !matches!(
+            sb::charge_on_lane(
+                &mut fx.ledger,
+                rt,
+                &lane,
+                None,
+                5,
+                "k",
+                ChargeSource::TurnHold,
+                None
+            )
+            .unwrap(),
+            SharedBudgetOutcome::Refused {
+                reason: SharedBudgetRefusal::ReservedSessionScope
+            }
+        ),
+        "a derived key is not re-validated as a client identity"
+    );
+}
+
+#[test]
+fn the_internal_lane_functions_still_refuse_an_empty_lane() {
+    use libra_governor_daemon::shared_budget as sb;
+    let mut fx = Fx::new(Some(&cfg_json(2_000, "UTC", 1_000)), JAN);
+    let rt = &fx.config.shared_budget;
+    expect_refused(
+        sb::settle_tail_on_lane(&mut fx.ledger, rt, " ", "/nope.jsonl").unwrap(),
+        SharedBudgetRefusal::EmptySessionId,
+    );
+    assert_eq!(sb::heartbeat(&mut fx.ledger, rt, " ").unwrap(), 0);
+}
