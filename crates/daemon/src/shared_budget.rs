@@ -390,6 +390,23 @@ fn denied(
     }
 }
 
+/// Validates a client identity and derives the budget lane its holds live
+/// on. `Err` is the outcome to return unchanged: a refusal, or `NotConfigured`
+/// for a Codex lane, which stays inert until the Codex settlement exists
+/// (HORO-2282): nothing is read, reserved or written for it.
+fn admission_lane(
+    session_id: &str,
+    agent_id: Option<&str>,
+    provider: Option<&str>,
+) -> Result<(ExecutorKind, String), SharedBudgetOutcome> {
+    let kind = validate_identity(session_id, agent_id).map_err(refused)?;
+    let lane = budget_lane(session_id, provider).map_err(refused)?;
+    if provider == Some(CODEX_PROVIDER) {
+        return Err(SharedBudgetOutcome::NotConfigured);
+    }
+    Ok((kind, lane))
+}
+
 fn refused(reason: SharedBudgetRefusal) -> SharedBudgetOutcome {
     SharedBudgetOutcome::Refused { reason }
 }
@@ -659,19 +676,10 @@ pub fn admit(
     if matches!(state, SharedBudgetFileState::Absent) {
         return Ok(SharedBudgetOutcome::NotConfigured);
     }
-    let kind = match validate_identity(session_id, agent_id) {
-        Ok(kind) => kind,
-        Err(reason) => return Ok(refused(reason)),
+    let (kind, lane) = match admission_lane(session_id, agent_id, provider) {
+        Ok(admitted) => admitted,
+        Err(outcome) => return Ok(outcome),
     };
-    let lane = match budget_lane(session_id, provider) {
-        Ok(lane) => lane,
-        Err(reason) => return Ok(refused(reason)),
-    };
-    if provider == Some(CODEX_PROVIDER) {
-        // Inert until the Codex settlement exists (HORO-2282): nothing is
-        // read, reserved or written for a Codex lane.
-        return Ok(SharedBudgetOutcome::NotConfigured);
-    }
     let session_id = lane.as_str();
     let cfg = match configured(&state) {
         Ok(cfg) => cfg,
@@ -857,17 +865,10 @@ pub fn check(
     if matches!(state, SharedBudgetFileState::Absent) {
         return Ok(SharedBudgetOutcome::NotConfigured);
     }
-    let kind = match validate_identity(session_id, agent_id) {
-        Ok(kind) => kind,
-        Err(reason) => return Ok(refused(reason)),
+    let (kind, lane) = match admission_lane(session_id, agent_id, provider) {
+        Ok(admitted) => admitted,
+        Err(outcome) => return Ok(outcome),
     };
-    let lane = match budget_lane(session_id, provider) {
-        Ok(lane) => lane,
-        Err(reason) => return Ok(refused(reason)),
-    };
-    if provider == Some(CODEX_PROVIDER) {
-        return Ok(SharedBudgetOutcome::NotConfigured);
-    }
     let session_id = lane.as_str();
     let cfg = match configured(&state) {
         Ok(cfg) => cfg,
