@@ -411,6 +411,51 @@ fn refused(reason: SharedBudgetRefusal) -> SharedBudgetOutcome {
     SharedBudgetOutcome::Refused { reason }
 }
 
+/// What `admit` and `check` both establish before touching the ledger.
+struct GateContext {
+    kind: ExecutorKind,
+    lane: String,
+    cfg: SharedBudgetConfig,
+    now: OffsetDateTime,
+    period: Period,
+}
+
+/// Runs the checks `admit` and `check` share: the budget is configured, the
+/// identity and lane are valid, and no later pool has superseded the current
+/// period. The inner `Err` is the outcome to return unchanged.
+fn gate_context(
+    rt: &SharedBudgetRuntime,
+    ledger: &LedgerStore,
+    session_id: &str,
+    agent_id: Option<&str>,
+    provider: Option<&str>,
+) -> Result<Result<GateContext, SharedBudgetOutcome>, SharedBudgetError> {
+    let state = rt.effective().state;
+    if matches!(state, SharedBudgetFileState::Absent) {
+        return Ok(Err(SharedBudgetOutcome::NotConfigured));
+    }
+    let (kind, lane) = match admission_lane(session_id, agent_id, provider) {
+        Ok(admitted) => admitted,
+        Err(outcome) => return Ok(Err(outcome)),
+    };
+    let cfg = match configured(&state) {
+        Ok(cfg) => cfg,
+        Err(outcome) => return Ok(Err(outcome)),
+    };
+    let now = rt.now();
+    let period = period_at(&cfg, now)?;
+    if let Some(later) = later_pool(ledger, &period)? {
+        return Ok(Err(anomaly(&later, &period)));
+    }
+    Ok(Ok(GateContext {
+        kind,
+        lane,
+        cfg,
+        now,
+        period,
+    }))
+}
+
 /// Either the usable configuration or the outcome that ends the request.
 fn configured(state: &SharedBudgetFileState) -> Result<SharedBudgetConfig, SharedBudgetOutcome> {
     match state {
@@ -672,25 +717,18 @@ pub fn admit(
     provider: Option<&str>,
 ) -> Result<SharedBudgetOutcome, SharedBudgetError> {
     let prompt_id = usable_prompt(prompt_id);
-    let state = rt.effective().state;
-    if matches!(state, SharedBudgetFileState::Absent) {
-        return Ok(SharedBudgetOutcome::NotConfigured);
-    }
-    let (kind, lane) = match admission_lane(session_id, agent_id, provider) {
-        Ok(admitted) => admitted,
+    let GateContext {
+        kind,
+        lane,
+        cfg,
+        now,
+        period,
+    } = match gate_context(rt, ledger, session_id, agent_id, provider)? {
+        Ok(context) => context,
         Err(outcome) => return Ok(outcome),
     };
     let session_id = lane.as_str();
-    let cfg = match configured(&state) {
-        Ok(cfg) => cfg,
-        Err(outcome) => return Ok(outcome),
-    };
     let cfg = &cfg;
-    let now = rt.now();
-    let period = period_at(cfg, now)?;
-    if let Some(later) = later_pool(ledger, &period)? {
-        return Ok(anomaly(&later, &period));
-    }
     ensure_period_pool(ledger, &period.pool_id, cfg, now)?;
     ledger.expire_stale_shared_pool_reservations(now)?;
 
@@ -861,25 +899,18 @@ pub fn check(
     agent_id: Option<&str>,
     provider: Option<&str>,
 ) -> Result<SharedBudgetOutcome, SharedBudgetError> {
-    let state = rt.effective().state;
-    if matches!(state, SharedBudgetFileState::Absent) {
-        return Ok(SharedBudgetOutcome::NotConfigured);
-    }
-    let (kind, lane) = match admission_lane(session_id, agent_id, provider) {
-        Ok(admitted) => admitted,
+    let GateContext {
+        kind,
+        lane,
+        cfg,
+        now,
+        period,
+    } = match gate_context(rt, ledger, session_id, agent_id, provider)? {
+        Ok(context) => context,
         Err(outcome) => return Ok(outcome),
     };
     let session_id = lane.as_str();
-    let cfg = match configured(&state) {
-        Ok(cfg) => cfg,
-        Err(outcome) => return Ok(outcome),
-    };
     let cfg = &cfg;
-    let now = rt.now();
-    let period = period_at(cfg, now)?;
-    if let Some(later) = later_pool(ledger, &period)? {
-        return Ok(anomaly(&later, &period));
-    }
     let remaining = remaining_of(ledger, &period.pool_id, cfg, now)?;
     let lane_hold = ledger.active_shared_hold_for_lane(
         &period.pool_id,
