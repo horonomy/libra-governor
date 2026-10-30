@@ -69,6 +69,10 @@ pub enum SharedBudgetRequest {
         idempotency_key: String,
         charge_source: ChargeSource,
         event_time: Option<String>,
+        /// See [`SharedBudgetRequest::Admit`]. Absent keeps the Claude lane
+        /// and the v24 bytes (HORO-2282).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
     },
     /// Charge a subagent's own transcript (HORO-2196). The daemon reads
     /// `agent_transcript_path` itself (the caller supplies a path, never an
@@ -98,6 +102,10 @@ pub enum SharedBudgetRequest {
     SettleTail {
         session_id: String,
         transcript_path: String,
+        /// See [`SharedBudgetRequest::Admit`]. Absent keeps the Claude lane
+        /// and the v24 bytes (HORO-2282).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
     },
     /// Is the host's transcript for this session's pending turn readable
     /// yet? (HORO-2246.) Claude Code writes its transcript asynchronously,
@@ -112,6 +120,10 @@ pub enum SharedBudgetRequest {
     TranscriptReady {
         session_id: String,
         transcript_path: String,
+        /// See [`SharedBudgetRequest::Admit`]. Absent keeps the Claude lane
+        /// and the v24 bytes (HORO-2282).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
     },
     /// Read-only budget posture.
     Status {},
@@ -639,6 +651,7 @@ mod tests {
         let req = SharedBudgetRequest::SettleTail {
             session_id: "s".into(),
             transcript_path: "/x/s.jsonl".into(),
+            provider: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["op"], "settle_tail");

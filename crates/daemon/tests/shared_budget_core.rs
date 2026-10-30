@@ -163,6 +163,7 @@ impl Fx {
             idempotency_key: key.to_string(),
             charge_source: source,
             event_time: event_time.map(String::from),
+            provider: None,
         })
     }
 

@@ -926,6 +926,7 @@ pub(crate) fn dispatch(
                     idempotency_key,
                     charge_source,
                     event_time,
+                    provider: _,
                 } => crate::shared_budget::charge(
                     ledger,
                     rt,
@@ -960,6 +961,7 @@ pub(crate) fn dispatch(
                 SharedBudgetRequest::SettleTail {
                     session_id,
                     transcript_path,
+                    provider: _,
                 } => {
                     let outcome = crate::shared_budget::settle_tail(
                         ledger,
@@ -978,6 +980,7 @@ pub(crate) fn dispatch(
                 SharedBudgetRequest::TranscriptReady {
                     session_id,
                     transcript_path,
+                    provider: _,
                 } => crate::shared_budget::transcript_ready(
                     ledger,
                     rt,

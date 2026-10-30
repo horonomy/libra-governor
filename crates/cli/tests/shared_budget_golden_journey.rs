@@ -630,6 +630,7 @@ fn a_crossed_soft_limit_warns_in_status_and_statusline_but_never_denies() {
         idempotency_key: "busy-1".into(),
         charge_source: ChargeSource::SubagentTranscript,
         event_time: None,
+        provider: None,
     }) {
         SharedBudgetOutcome::Charged { .. } => {}
         other => panic!("{other:?}"),
@@ -750,6 +751,7 @@ fn charge_700(journey: &Journey) -> SharedBudgetOutcome {
         idempotency_key: "f-charge".into(),
         charge_source: ChargeSource::SubagentTranscript,
         event_time: None,
+        provider: None,
     })
 }
 
