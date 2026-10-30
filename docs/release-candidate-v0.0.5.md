@@ -28,7 +28,7 @@ the branch state observed on 2026-10-30.
 | Area | Ticket | Observed state (2026-10-30) |
 |---|---|---|
 | Codex source verification (C0) | HORO-2280 | Docs-only draft PR #264; source-derived at Codex 0.160/0.163/0.164/0.165, nothing run |
-| Provider lanes, protocol v24 to v25 (C1) | HORO-2281 | Branch only, no PR; `cargo check`, protocol and daemon shared-budget tests reported green at `49e13f0`; full-suite gate not complete |
+| Provider lanes, protocol v24 to v25 (C1) | HORO-2281 | Draft PR #265, **open, not merged** (head `2ca5b11` at time of writing); earlier `cargo check`, protocol and daemon shared-budget tests were reported green at `49e13f0`, not re-verified here; full-suite gate not complete |
 | Turn-scoped Codex settle (C2) | HORO-2282 | Six characterization tests written, not run; settle wiring not built |
 | Codex admit/settle wiring (C3), recovery (C4), status/doctor (C5) | HORO-2283, 2284, 2285 | Not started |
 | Hardening from the v0.0.4 audit | HORO-2303 | Draft PR #254 (state-dir symlink); four further one-item branches, not run |
@@ -41,9 +41,11 @@ at the founder-named SHA.
 
 ## Dark by default (off; not enabled by this release)
 
-- **Codex budget enforcement (C1 to C5).** Any Codex admission or settlement is
-  gated by a marker file that is absent by default. Without it, Codex sessions
-  are neither admitted nor charged, exactly as in v0.0.4.
+- **Codex budget enforcement (C3 to C5, not built).** The intent is that any
+  Codex admission or settlement stays gated off by default, so Codex sessions
+  are neither admitted nor charged, as in v0.0.4. The gating mechanism is a
+  design intent only; it is not implemented or verified yet. C1 (PR #265, open)
+  changes lane namespacing only and does not enable Codex enforcement.
 - **S11 gateway per-request cap (HORO-2273 to 2279).** Dark engineering only;
   no gateway enforcement is on by default and none is enabled by this release.
 - Enabling either is a separate founder decision with its own packet.
