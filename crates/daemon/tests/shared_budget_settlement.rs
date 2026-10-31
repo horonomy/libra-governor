@@ -129,6 +129,7 @@ impl Fx {
             session_id: session.to_string(),
             agent_id: agent.map(String::from),
             prompt_id: prompt.map(String::from),
+            provider: None,
         })
     }
 
@@ -3592,6 +3593,7 @@ fn admit_error(fx: &mut Fx, session: &str, prompt: &str) -> String {
             session_id: session.to_string(),
             agent_id: None,
             prompt_id: Some(prompt.to_string()),
+            provider: None,
         },
     });
     match response {
@@ -3782,4 +3784,69 @@ fn an_unreleased_unstarted_hold_keeps_its_capacity_reserved_until_it_expires() {
     fx.clock.set(at(2 * 3600));
     grant(fx.admit("s2", None, Some("q1")));
     assert_eq!(totals(&fx.status()), (0, 1_000), "never above the hard cap");
+}
+
+/// HORO-2281: a Codex `Finalize` that carries the same raw session id as a
+/// Claude hold must not settle that hold. Before the provider guard in
+/// `handle_finalize_for_lane` it ran the Claude settlement (and subagent
+/// sweep) for any provider.
+#[test]
+fn a_codex_finalize_does_not_settle_the_claude_hold_of_the_same_session_id() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    fx.admit_hold("s1");
+    fx.clock.set(at(60));
+    let before = fx.fingerprint();
+    match fx.call(Request::Finalize {
+        agent_id: None,
+        prompt_id: None,
+        session_id: "s1".to_string(),
+        model: None,
+        provider: Some("codex".to_string()),
+        transcript_path: None,
+    }) {
+        Response::Finalize(FinalizeOutcome::NoActiveTask) => {}
+        other => panic!("expected Finalize(NoActiveTask), got {other:?}"),
+    }
+    assert_eq!(fx.fingerprint(), before, "the Claude hold was not settled");
+}
+
+/// HORO-2281: a Codex tool event must not keep a Claude hold of the same raw
+/// session id alive. The Claude hold's rows are identical afterwards.
+#[test]
+fn a_codex_tool_event_does_not_renew_the_claude_hold_of_the_same_session_id() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    fx.admit_hold("s1");
+    let before = format!("{:?}", fx.lane("s1"));
+    fx.clock.set(at(600));
+    match fx.call(Request::ToolInvoked {
+        session_id: "s1".to_string(),
+        tool_name: "Bash".to_string(),
+        agent_id: None,
+        provider: Some("codex".to_string()),
+    }) {
+        Response::Ack => {}
+        other => panic!("expected Ack, got {other:?}"),
+    }
+    assert_eq!(format!("{:?}", fx.lane("s1")), before);
+}
+
+/// HORO-2281 positive control for the test above: without a provider the same
+/// tool event still renews the Claude hold, so the Codex test is not passing
+/// merely because heartbeats never touch the lane.
+#[test]
+fn a_claude_tool_event_still_renews_its_own_hold() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    fx.admit_hold("s1");
+    let before = format!("{:?}", fx.lane("s1"));
+    fx.clock.set(at(600));
+    match fx.call(Request::ToolInvoked {
+        session_id: "s1".to_string(),
+        tool_name: "Bash".to_string(),
+        agent_id: None,
+        provider: None,
+    }) {
+        Response::Ack => {}
+        other => panic!("expected Ack, got {other:?}"),
+    }
+    assert_ne!(format!("{:?}", fx.lane("s1")), before);
 }
