@@ -82,6 +82,13 @@ impl Env {
         cmd
     }
 
+    /// Claude's six hooks too, so an exit code isolates the Codex findings
+    /// (an unwired Claude hook under a budget file is itself an Error).
+    fn install_claude_hooks(&self) {
+        let out = self.command(&["install"]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
     fn install_codex_hooks(&self) {
         let out = self.command(&["install", "--agent", "codex"]).output().unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -400,6 +407,7 @@ fn the_probe_is_exactly_one_read_only_codex_check() {
 #[test]
 fn an_unreachable_daemon_stays_a_warning_and_exits_zero() {
     let env = Env::new(Some(GPT_OVERRIDE), true);
+    env.install_claude_hooks();
     env.install_codex_hooks();
     let doctor = env.doctor();
     let (severity, message) = doctor.expect("codex_daemon_admission");
