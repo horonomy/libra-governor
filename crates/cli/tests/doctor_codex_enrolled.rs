@@ -484,3 +484,40 @@ fn unenrolled_status_json_keeps_the_original_list() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(v["not_covered"].to_string().contains("no budget gate"));
 }
+
+/// HORO-2285 C5.AC: enrolment is reporting only. It never promotes the
+/// guarantee label, and the Codex shared-budget capability row stays
+/// `unavailable` (activation by default is a founder decision).
+#[test]
+fn codex_enrolment_leaves_the_guarantee_label_and_the_unavailable_agents_row_unchanged() {
+    let mut labels = Vec::new();
+    for marker in [false, true] {
+        let env = Env::new(Some(GPT_OVERRIDE), marker);
+        let status = env
+            .command(&["shared-budget", "status", "--json"])
+            .output()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(v["guarantee"], "admission-bounded (cooperative)", "{v}");
+        labels.push(v["guarantee"].clone());
+
+        let agents = env.command(&["agents", "--json"]).output().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&agents.stdout).unwrap();
+        let codex = v["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["agent"] == "codex")
+            .unwrap_or_else(|| panic!("no codex row: {v}"));
+        let gate = &codex["shared_budget_admission_gate"];
+        assert!(
+            gate.get("unavailable").is_some(),
+            "marker={marker}: the Codex gate row must stay unavailable: {gate}"
+        );
+        assert!(
+            gate.get("available").is_none() && gate != "available",
+            "{gate}"
+        );
+    }
+    assert_eq!(labels[0], labels[1], "the marker does not change the label");
+}
