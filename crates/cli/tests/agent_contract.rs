@@ -144,6 +144,62 @@ fn normalize_recon_time(input: &str) -> String {
     out
 }
 
+/// Replaces the whole-seconds token of the Stop summary's `Actual:   Ns`
+/// line with `Actual:   <E>s`. The elapsed time is a real wall-clock
+/// measurement taken across several subprocesses, so it is 0 on a quiet
+/// machine and 1 or more on a loaded one (HORO-2343). Only the digits that
+/// directly follow that exact prefix and precede `s` are rewritten; every
+/// other byte, including the spacing and the rest of the line, stays pinned.
+fn normalize_elapsed_seconds(input: &str) -> String {
+    const PREFIX: &str = "Actual:   ";
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(idx) = rest.find(PREFIX) {
+        out.push_str(&rest[..idx + PREFIX.len()]);
+        rest = &rest[idx + PREFIX.len()..];
+        let digits = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        let (number, after) = rest.split_at(digits);
+        if !number.is_empty() && after.starts_with('s') {
+            out.push_str("<E>s");
+            rest = &after[1..];
+        } else {
+            out.push_str(number);
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+#[test]
+fn normalize_elapsed_seconds_rewrites_only_the_actual_line_token() {
+    let line = |secs: &str| {
+        format!(
+            "Estimate: cold start (confidence: Low, n=0)\n\
+             Actual:   {secs}s / unknown (harness does not expose cost/usage data)\n\
+             Tool calls: 2\nrecon: 0s\n"
+        )
+    };
+    let golden = normalize_elapsed_seconds(&line("0"));
+    assert!(
+        golden.contains("Actual:   <E>s / unknown (harness"),
+        "{golden}"
+    );
+    // The old comparison (no elapsed normalizer) differs for 1s; the new one
+    // is identical for any elapsed value.
+    assert_ne!(line("0"), line("1"));
+    for secs in ["1", "37", "100"] {
+        assert_eq!(normalize_elapsed_seconds(&line(secs)), golden, "{secs}");
+    }
+    // Other digit-and-`s` text, and a malformed token, are left alone.
+    assert!(golden.contains("n=0)") && golden.contains("Tool calls: 2"));
+    assert!(golden.contains("recon: 0s"));
+    let odd = "Actual:   unknown\nActual:  5s\nActual:   7 s\n";
+    assert_eq!(normalize_elapsed_seconds(odd), odd);
+}
+
 fn additional_context(stdout: &[u8]) -> String {
     let value: serde_json::Value = serde_json::from_slice(stdout)
         .unwrap_or_else(|e| panic!("hook stdout was not valid JSON: {e}\nstdout: {stdout:?}"));
@@ -267,12 +323,12 @@ fn claude_stop_stderr_summary_golden() {
     );
 
     let summary = String::from_utf8_lossy(&stop_output.stderr);
-    let normalized = normalize_recon_time(&normalize_ids(&summary));
+    let normalized = normalize_elapsed_seconds(&normalize_recon_time(&normalize_ids(&summary)));
 
     let expected = "[libra-governor] Execution Receipt (task <ID>)\n\
                      Estimate: cold start — insufficient local history: no ExecutionReceipt \
                      rows recorded yet (confidence: Low, n=0)\n\
-                     Actual:   0s / unknown (harness does not expose cost/usage data)\n\
+                     Actual:   <E>s / unknown (harness does not expose cost/usage data)\n\
                      Outcome:  Unknown (no automated completion verification in MVP 1)\n\
                      Tool calls: 2\n\
                      Inside P90: n/a (cold start)\n";
