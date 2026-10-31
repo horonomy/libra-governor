@@ -264,9 +264,12 @@ impl AgentCapabilities {
             AgentKind::ClaudeCode => Capability::Available,
             AgentKind::Codex => Capability::Unavailable {
                 gap: CapabilityGap::NotWiredByLibra {
-                    detail: "the shared monthly budget gate is wired to Claude Code hooks only; \
-                              the Codex hook route neither asks the daemon to admit a prompt nor \
-                              denies tool calls on budget state"
+                    detail: "the shared monthly budget gate is wired to Claude Code hooks; the \
+                              Codex hook route takes part only behind the experimental, off by \
+                              default shared-budget.codex marker (HORO-2283), where it admits a \
+                              prompt at UserPromptSubmit and settles at Stop; it never denies a \
+                              tool call, and activating it by default is a founder decision, so \
+                              this stays unavailable"
                         .to_string(),
                     follow_up: None,
                 },
