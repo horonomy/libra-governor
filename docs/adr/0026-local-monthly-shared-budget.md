@@ -3,8 +3,15 @@
 ## Status
 
 Accepted by founder decision for **engineering** (Option 2, decisions D1 and
-D3, recorded at HORO-2186 Jira comment 28778). This is **not a release GO**:
-tagging or publishing v0.0.4 stays a separate founder decision (ADR-0025).
+D3, recorded at HORO-2186 Jira comment 28778), and for the **v0.0.4
+Cooperative Preview release scope and disclosure wording** effective only with
+the SHA-named founder GO recorded under ADR-0025 (HORO-2186 comment 29520, SHA
+`313d26a09407c8a77d2b4cc7685ea694a822905a`). This ADR is **not itself a release GO**: tagging or
+publishing v0.0.4 stays a separate founder decision (ADR-0025). The required
+disclosures (the five listed under "Release disclosure" below, plus the
+additional fail-open, pricing, trust-boundary and limitation disclosures in the
+v0.0.4 release notes) are final for the release notes; the release dispositions
+D2/D3/D4/D5/D7 are recorded in ADR-0025.
 Builds on [ADR-0023](0023-metered-shared-pool.md) and amends
 [ADR-0003](0003-gateway-enforcement-boundary.md) for the local budget only.
 Slice S2 delivers this record and `calendar_month_bounds`; later slices wire it.
@@ -913,6 +920,15 @@ and in-product text must state that the pool is:
   trusted, does not claim subagent cost is covered when it is not, and
   distinguishes list-price-equivalent spend from billed USD. Real-host Codex
   runs are authorised separately.
+
+### Provider-namespaced lanes (HORO-2281, v0.0.5, dark)
+
+The executor key in this ADR is `(host_id, provider, session_id, agent_id | null)`, but until v0.0.5 the budget keyed its holds on the raw `session_id` alone, so a request from another provider that reused a Claude session id could renew or settle a Claude hold. v0.0.5 closes that without changing any Claude row or byte:
+
+- `Admit` and `Check` carry an optional `provider` (protocol v25). Absent or `"claude-code"` keeps the raw session id as the lane key. `"codex"` derives a reserved-prefix key `shared-budget-provider-v1:` plus the JSON array `["codex", session_id]`, which is injective. Any other value is refused as `UnsupportedProvider` and never falls back to the Claude lane; this applies when a budget file is present, and an absent budget file still answers `not_configured` before the provider is examined, and a Codex request under an invalid budget file answers `not_configured` rather than `config_invalid` because the Codex answer precedes the configuration check. A client session that starts with the reserved prefix is refused as `ReservedSessionScope` for every provider, a deliberate tightening: no Claude host mints such ids.
+- The tool-event heartbeat is routed by the request's provider, and `Finalize` runs the Claude turn settlement and subagent sweep for the Claude lane only. Only the Claude lane is renewable or settleable in v0.0.5: the lane-taking entry points (`heartbeat`, `settle_turn`, `settle_tail`, `transcript_ready`, `charge`) still validate their session argument as a client identity, so they refuse a derived Codex key, and `SettleTail`, `TranscriptReady`, `Charge` and `ChargeAgent` carry no `provider` and key on the raw session id, so a non-Claude client that reuses a Claude session id could still reach the Claude lane through them (the cooperative trust model; not a regression). Both are prerequisites for the Codex slice (C2) and must be addressed there; no Codex hold exists to renew or charge until then.
+- A Codex-provider `Admit` or `Check` is answered `not_configured` and writes nothing. No Codex hold is created, charged or enforced; enabling a Codex budget gate remains a founder decision (see "Not decided here").
+- The guarantee label is unchanged: admission-bounded (cooperative).
 
 ## Consequences
 
