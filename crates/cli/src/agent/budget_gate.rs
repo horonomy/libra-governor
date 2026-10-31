@@ -380,6 +380,7 @@ pub fn admit(
             session_id: session_id.to_string(),
             agent_id: None,
             prompt_id: prompt_id.clone(),
+            provider: None,
         },
     };
     // Two attempts: a daemon from an older release answers once with an
@@ -443,6 +444,7 @@ pub fn check_denial(
         shared_budget: SharedBudgetRequest::Check {
             session_id: session_id.to_string(),
             agent_id: agent_id.map(str::to_owned),
+            provider: None,
         },
     };
     // One overall deadline around connect + write + read: a daemon that
