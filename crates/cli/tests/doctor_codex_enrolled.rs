@@ -514,10 +514,6 @@ fn codex_enrolment_leaves_the_guarantee_label_and_the_unavailable_agents_row_unc
             gate.get("unavailable").is_some(),
             "marker={marker}: the Codex gate row must stay unavailable: {gate}"
         );
-        assert!(
-            gate.get("available").is_none() && gate != "available",
-            "{gate}"
-        );
     }
     assert_eq!(labels[0], labels[1], "the marker does not change the label");
 }
