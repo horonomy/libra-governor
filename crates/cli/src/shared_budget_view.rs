@@ -57,6 +57,19 @@ pub const NOT_COVERED: [&str; 4] = [
      budget early",
 ];
 
+/// Is Codex enrolled in the budget, judged from what this report was built
+/// from: a budget exists (`posture`) and a regular `shared-budget.codex` file
+/// sits in `state_dir`? (HORO-2285)
+pub fn codex_enrolled_in(_posture: &Posture, _state_dir: Option<&Path>) -> bool {
+    false
+}
+
+/// The "does NOT cover" list for a report. Without Codex enrolment it is
+/// exactly [`NOT_COVERED`].
+pub fn not_covered_for(_codex_enrolled: bool) -> Vec<&'static str> {
+    NOT_COVERED.to_vec()
+}
+
 /// How long the statusline segment may wait for the daemon. The shared
 /// statusline host kills a provider after 250 ms.
 pub const SEGMENT_BUDGET: Duration = Duration::from_millis(200);
@@ -926,6 +939,79 @@ mod tests {
             statusline_segment(&anomaly).as_deref(),
             Some("budget: clock anomaly")
         );
+    }
+
+    // ---- HORO-2285 (C5): the Codex-enrolled "does NOT cover" list ----
+
+    fn enrolled_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shared-budget.codex"), b"").unwrap();
+        dir
+    }
+
+    #[test]
+    fn codex_is_enrolled_only_with_a_budget_and_a_regular_marker_file() {
+        let reported = Posture::Reported(Box::new(status()));
+        let marked = enrolled_dir();
+        assert!(codex_enrolled_in(&reported, Some(marked.path())));
+
+        let unmarked = tempfile::tempdir().unwrap();
+        assert!(!codex_enrolled_in(&reported, Some(unmarked.path())));
+        assert!(!codex_enrolled_in(&reported, None));
+        // No budget file: a marker alone enrols nothing.
+        assert!(!codex_enrolled_in(&Posture::NotConfigured, Some(marked.path())));
+
+        // A symlink does not count, as for the hook and the daemon.
+        let linked = tempfile::tempdir().unwrap();
+        let target = linked.path().join("elsewhere");
+        std::fs::write(&target, b"").unwrap();
+        std::os::unix::fs::symlink(&target, linked.path().join("shared-budget.codex")).unwrap();
+        assert!(!codex_enrolled_in(&reported, Some(linked.path())));
+    }
+
+    #[test]
+    fn not_covered_without_codex_enrolment_is_the_unchanged_const() {
+        assert_eq!(not_covered_for(false), NOT_COVERED.to_vec());
+    }
+
+    #[test]
+    fn enrolled_not_covered_names_the_remaining_codex_gaps_not_a_missing_gate() {
+        let items = not_covered_for(true);
+        let joined = items.join(" | ");
+        assert!(
+            !joined.contains("Codex route has no budget gate"),
+            "an enrolled Codex route is gated at prompt admission: {joined}"
+        );
+        for needle in ["subagent", "PreToolUse", "/hooks", "pricing", "heartbeat"] {
+            assert!(joined.contains(needle), "{needle}: {joined}");
+        }
+        // The Claude-side limits are still listed.
+        assert!(joined.contains("in-turn overshoot"), "{joined}");
+        assert!(joined.contains("no gateway hard cap"), "{joined}");
+    }
+
+    #[test]
+    fn status_json_and_text_switch_the_list_only_when_enrolled() {
+        let reported = Posture::Reported(Box::new(status()));
+        let plain = tempfile::tempdir().unwrap();
+        let marked = enrolled_dir();
+
+        let base = render_json(&reported, Some(plain.path()));
+        assert_eq!(base["not_covered"], serde_json::json!(NOT_COVERED));
+        let enrolled = render_json(&reported, Some(marked.path()));
+        assert_eq!(
+            enrolled["not_covered"],
+            serde_json::json!(not_covered_for(true))
+        );
+        assert_eq!(enrolled["guarantee"], base["guarantee"]);
+
+        let text = render_human(&reported, Some(marked.path()));
+        for item in not_covered_for(true) {
+            assert!(text.contains(item), "{item}");
+        }
+        assert!(!text.contains("Codex route has no budget gate"), "{text}");
+        let plain_text = render_human(&reported, Some(plain.path()));
+        assert!(plain_text.contains("Codex route has no budget gate"));
     }
 
     #[test]
