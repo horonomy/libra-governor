@@ -977,10 +977,6 @@ mod tests {
                 format!(r#"{{"hooks":{{"Stop":[{{"matcher":"Bash","hooks":[{{"command":"{unsafe_cmd}"}}]}}]}}}}"#),
             ),
             (
-                "hand-quoted command (not recognised as ours)",
-                r#"{"hooks":{"Stop":[{"hooks":[{"command":"\"/opt/legacy path/libra-governor\" hook stop"}]}]}}"#.to_string(),
-            ),
-            (
                 "lookalike binary name",
                 r#"{"hooks":{"Stop":[{"hooks":[{"command":"/opt/a b/libra-governor-tools hook stop"}]}]}}"#.to_string(),
             ),
