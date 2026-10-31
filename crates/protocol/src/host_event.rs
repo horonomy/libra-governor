@@ -75,6 +75,11 @@ impl<'de> Deserialize<'de> for UniqueValue {
     }
 }
 
+/// Required-but-nullable: the host-capability-snapshot v1 schema lists
+/// `host.version` in `required` with type `["string","null"]`, so the key must
+/// be present and may be an explicit `null`. Deliberately NOT
+/// `#[serde(default)]`, which would accept a snapshot the contract rejects.
+/// Pinned by `snapshot_host_version_is_required_but_nullable`.
 fn nullable_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
@@ -899,7 +904,7 @@ pub struct HostCapabilitySnapshotAdapter {
 pub struct HostCapabilitySnapshotHost {
     pub tool_provider: String,
     #[serde(deserialize_with = "nullable_string")]
-    pub version: Option<String>,
+    pub version: Option<String>, // NOSONAR rust:S9334 required-nullable by contract, see `nullable_string`
     pub version_source: HostVersionSource,
 }
 
@@ -1408,6 +1413,34 @@ mod tests {
         invalid_limit["capabilities"][0]["limits"]["execution_mode"] =
             serde_json::json!("optimistic");
         assert!(validate_host_snapshot(invalid_limit.to_string().as_bytes()).is_err());
+    }
+
+    #[test]
+    fn snapshot_host_version_is_required_but_nullable() {
+        // Present string round-trips.
+        let mut with_value = snapshot();
+        with_value["host"]["version"] = serde_json::json!("1.2.3");
+        let validated = validate_host_snapshot(with_value.to_string().as_bytes()).unwrap();
+        assert_eq!(validated.snapshot().host.version.as_deref(), Some("1.2.3"));
+
+        // Explicit null is accepted and yields None (the sample fixture).
+        let with_null = snapshot();
+        assert!(with_null["host"]["version"].is_null());
+        let validated = validate_host_snapshot(with_null.to_string().as_bytes()).unwrap();
+        assert_eq!(validated.snapshot().host.version, None);
+
+        // Omission is rejected by the public validator and by the serde type alone.
+        let mut omitted = snapshot();
+        omitted["host"].as_object_mut().unwrap().remove("version");
+        assert!(validate_host_snapshot(omitted.to_string().as_bytes()).is_err());
+        assert!(
+            serde_json::from_value::<HostCapabilitySnapshotHost>(omitted["host"].clone()).is_err()
+        );
+        let host = serde_json::json!({"tool_provider": "codex", "version": null, "version_source": "unknown"});
+        assert!(serde_json::from_value::<HostCapabilitySnapshotHost>(host)
+            .unwrap()
+            .version
+            .is_none());
     }
 
     #[test]

@@ -690,7 +690,11 @@ impl TrustedConfigGuard {
         assert_disposable();
         std::fs::write(path, spec.to_json()).unwrap_or_else(|e| panic!("write {path}: {e}"));
         chown(Path::new(path), "0:0");
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
+        // ADR-0019 section 1 (filesystem layout table) requires this file
+        // root-owned and 0644: readable by the agent principal, never group- or
+        // other-writable. `x_startup_refuses_group_writable_config` uses
+        // `install_with` to prove a looser mode is rejected.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)) // NOSONAR rust:S2612 root-owned 0644 required by ADR-0019
             .unwrap_or_else(|e| panic!("chmod {path}: {e}"));
         Self {
             path: PathBuf::from(path),
