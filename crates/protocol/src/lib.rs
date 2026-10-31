@@ -286,4 +286,13 @@ pub use messages::{
 /// payload has none.
 /// `SharedBudgetRefusal` also gained `EventBeforeRetention` (a charge whose
 /// event time precedes every retained pool), which a v23 decoder cannot parse.
-pub const PROTOCOL_VERSION: u32 = 24;
+///
+/// v25 (HORO-2281): `SharedBudgetRequest::Admit` and `Check` gained an
+/// optional `provider`, and `SharedBudgetRefusal` gained `UnsupportedProvider`,
+/// so the shared budget can key a lane by `(provider, session)` instead of the
+/// raw session id. The field is omitted from the wire when absent, so Claude
+/// Code traffic is byte-identical to v24. A v24 daemon's `deny_unknown_fields`
+/// decoder rejects an `Admit` or `Check` that carries it, so a long-lived v24
+/// daemon must be restarted after upgrading; the hook's one-retry stale-daemon
+/// path covers that.
+pub const PROTOCOL_VERSION: u32 = 25;
