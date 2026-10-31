@@ -204,6 +204,25 @@ fn command_is_ours(command: &str) -> bool {
         .any(|suffix| command_is_ours_with_suffix(command, suffix, true))
 }
 
+/// One unquoted word: no whitespace or shell metacharacter, no leading `~`.
+fn is_plain_token(binary: &str) -> bool {
+    !binary.is_empty() && !has_shell_unsafe_char(binary) && !binary.starts_with('~')
+}
+
+/// What installers before PR 242 wrote: an absolute path whose only
+/// shell-significant character is a plain space, with no `VAR=x` or `-flag`
+/// word (which would mean an `env`/option prefix around someone else's
+/// command).
+fn is_legacy_unquoted_space_path(binary: &str) -> bool {
+    binary.starts_with('/')
+        && !binary.contains(|c: char| {
+            c != ' ' && (c.is_whitespace() || "\"'\\$`;&|<>()*?[]{}!#^~".contains(c))
+        })
+        && !binary
+            .split(' ')
+            .any(|word| word.contains('=') || word.starts_with('-'))
+}
+
 /// The one ownership rule shared by the Claude and Codex installers.
 ///
 /// `command` is ours only if it is `<binary> <suffix>` with whitespace
@@ -240,16 +259,8 @@ pub(crate) fn command_is_ours_with_suffix(
             return false;
         }
         inner
-    } else if !has_shell_unsafe_char(binary) && !binary.starts_with('~') && !binary.is_empty() {
-        binary
-    } else if allow_legacy_unquoted_space
-        && binary.starts_with('/')
-        && !binary.contains(|c: char| {
-            c != ' ' && (c.is_whitespace() || "\"'\\$`;&|<>()*?[]{}!#^~".contains(c))
-        })
-        && !binary
-            .split(' ')
-            .any(|word| word.contains('=') || word.starts_with('-'))
+    } else if is_plain_token(binary)
+        || (allow_legacy_unquoted_space && is_legacy_unquoted_space_path(binary))
     {
         binary
     } else {
