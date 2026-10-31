@@ -1020,11 +1020,14 @@ mod tests {
         );
     }
 
-    /// Characterization (HORO-2282): an incomplete or failed response that
-    /// carries a `response_id` writes a record of partial spend that rolls
-    /// into the turn's running total. Real spend, so it is charged.
+    /// Characterization (HORO-2282): codex-rs writes a record for an
+    /// incomplete or failed response that carries a `response_id`, and it
+    /// rolls into the turn's running total. The fixture cannot mark a record
+    /// as incomplete, so this pins only that a low-output first record is
+    /// summed with the later ones and read against the running total. It
+    /// documents current behavior and changes only deliberately.
     #[test]
-    fn a_partial_incomplete_response_record_is_charged_with_the_turn() {
+    fn a_first_record_with_little_output_is_summed_with_the_turn() {
         let f = write_lines(&[
             task_started(T1),
             usage_record(T1, THREAD, SESSION, 40, 0, 0, 0, 0, 40, 0, 0, 0, 0),
