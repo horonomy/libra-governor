@@ -417,7 +417,7 @@ fn classify_codex_probe(answer: Result<SharedBudgetOutcome, String>) -> CodexPro
 }
 
 /// Asks the running daemon one Codex `Check` for a synthetic session. `Check`
-/// is a read: it never creates a pool, reserves, sweeps or logs a decision.
+/// is a read: it never creates a pool, reserves or sweeps (daemon test).
 /// Bounded by one overall deadline; never spawns a daemon.
 fn probe_codex_admission(socket: &Path, budget: Duration) -> Result<SharedBudgetOutcome, String> {
     let socket = socket.to_path_buf();
