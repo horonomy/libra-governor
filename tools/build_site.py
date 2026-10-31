@@ -9,6 +9,7 @@ import html
 import re
 import shutil
 import subprocess
+from collections.abc import Callable, Iterable, Iterator
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -33,13 +34,141 @@ CHAPTERS: tuple[tuple[str, str, str], ...] = (
     ("Security and supported versions", "SECURITY.md", "security.md"),
 )
 
-# `[^)]*` already absorbs whitespace, so the title needs exactly one leading `\s`;
-# `\s+[^)]*` made the two quantifiers overlap and backtrack quadratically.
-INLINE_LINK = re.compile(r"(?P<prefix>!?)\[(?P<label>[^]]+)\]\((?P<target>[^\s)]+)(?P<title>\s[^)]*)?\)")
-# Leading indentation excludes `\n`: a `\s*` that crossed newlines was retried from every
-# blank line of a whitespace run (quadratic). Blank lines before a reference are left
-# untouched by the rewrite either way, so the substituted text is unchanged.
-REFERENCE_LINK = re.compile(r"^(?P<prefix>[^\S\n]*\[[^]]+\]:\s*)(?P<target>\S+)(?P<suffix>.*)$", re.MULTILINE)
+
+class _Next:
+    """First index >= p where `find(text, p)` hits, remembered between queries.
+
+    Queries arrive in non-decreasing order, so a cached hit (or a cached miss) answers
+    every later query without rescanning; that is what keeps the scanners below linear.
+    """
+
+    def __init__(self, text: str, find: Callable[[str, int], int]) -> None:
+        self._text = text
+        self._find = find
+        self._from = -1
+        self._hit = -1
+
+    def __call__(self, p: int) -> int:
+        if self._from < 0 or p < self._from or (self._hit >= 0 and p > self._hit):
+            self._from = p
+            self._hit = self._find(self._text, p)
+        return self._hit
+
+
+_STOP = re.compile(r"[\s)]")  # whitespace or ")"
+_NON_SPACE = re.compile(r"\S")
+
+
+def _search(pattern: re.Pattern[str]) -> Callable[[str, int], int]:
+    def find(text: str, p: int) -> int:
+        match = pattern.search(text, p)
+        return match.start() if match else -1
+
+    return find
+
+
+def inline_links(text: str) -> Iterator[tuple[int, int, str, str, str, str]]:
+    """Yield (start, end, prefix, label, target, title) for `!?[label](target title?)`.
+
+    Single left-to-right pass with the exact semantics of the former regex
+    `(!?)\\[([^]]+)\\]\\(([^\\s)]+)(\\s[^)]*)?\\)` under `finditer`, but each failed
+    candidate reuses the cached next-"]" / next-stop / next-")" lookups instead of
+    rescanning to the end of the input (the regex was quadratic: python:S8786).
+    """
+
+    next_close = _Next(text, lambda t, p: t.find("]", p))
+    next_paren = _Next(text, lambda t, p: t.find(")", p))
+    next_stop = _Next(text, _search(_STOP))
+    tails: dict[int, tuple[int, str, str] | None] = {}
+    size = len(text)
+    pos = 0
+    while True:
+        j = text.find("[", pos)
+        if j < 0:
+            return
+        k = next_close(j + 1)
+        if k < 0:
+            return  # no "]" anywhere later: no further candidate can match
+        if k == j + 1 or text[k + 1 : k + 2] != "(":
+            pos = j + 1
+            continue
+        if k not in tails:
+            tails.clear()
+            e = next_stop(k + 2)
+            if e < 0 or e == k + 2:
+                tails[k] = None  # empty target, or target runs to the end of the input
+            elif text[e] == ")":
+                tails[k] = (e + 1, text[k + 2 : e], "")
+            else:  # whitespace after the target: title runs to the next ")"
+                q = next_paren(e)
+                tails[k] = None if q < 0 else (q + 1, text[k + 2 : e], text[e:q])
+        tail = tails[k]
+        if tail is None:
+            pos = j + 1
+            continue
+        end, target, title = tail
+        start = j - 1 if j > pos and text[j - 1] == "!" else j
+        yield start, end, text[start:j], text[j + 1 : k], target, title
+        pos = end
+        if pos >= size:
+            return
+
+
+def reference_links(text: str) -> Iterator[tuple[int, int, str, str, str]]:
+    """Yield (start, end, prefix, target, suffix) for a `[label]: target rest` line.
+
+    Exact semantics of the former `^(\\s*\\[[^]]+\\]:\\s*)(\\S+)(.*)$` under
+    re.MULTILINE: the prefix may begin at an earlier blank line and the target may sit
+    on a following line. Line starts inside one whitespace run all reach the same
+    "[" and so succeed or fail together; a failure skips the whole run.
+    """
+
+    next_non_space = _Next(text, _search(_NON_SPACE))
+    next_close = _Next(text, lambda t, p: t.find("]", p))
+    size = len(text)
+    p = 0
+    while p <= size:
+        w = next_non_space(p)
+        if w < 0 or text[w] != "[":
+            if w < 0:
+                return
+            nl = text.find("\n", w)
+            if nl < 0:
+                return
+            p = nl + 1
+            continue
+        k = next_close(w + 1)
+        if k < 0:
+            return
+        u = -1
+        if k > w + 1 and text[k + 1 : k + 2] == ":":
+            u = next_non_space(k + 2)
+        if u < 0:
+            nl = text.find("\n", w)
+            if nl < 0:
+                return
+            p = nl + 1
+            continue
+        v = u
+        while v < size and not text[v].isspace():
+            v += 1
+        nl = text.find("\n", v)
+        end = size if nl < 0 else nl
+        yield p, end, text[p:u], text[u:v], text[v:end]
+        if nl < 0:
+            return
+        p = nl + 1
+
+
+def _splice(text: str, replacements: Iterable[tuple[int, int, str]]) -> str:
+    out: list[str] = []
+    last = 0
+    for start, end, replacement in replacements:
+        out.append(text[last:start])
+        out.append(replacement)
+        last = end
+    out.append(text[last:])
+    return "".join(out)
 
 
 class InlineScriptParser(HTMLParser):
@@ -113,16 +242,16 @@ def repository_target(source_path: str, raw_target: str) -> str:
 
 
 def rewrite_links(markdown: str, source_path: str) -> str:
-    def inline(match: re.Match[str]) -> str:
-        target = repository_target(source_path, match.group("target"))
-        title = match.group("title") or ""
-        return f'{match.group("prefix")}[{match.group("label")}]({target}{title})'
-
-    def reference(match: re.Match[str]) -> str:
-        target = repository_target(source_path, match.group("target"))
-        return f'{match.group("prefix")}{target}{match.group("suffix")}'
-
-    return REFERENCE_LINK.sub(reference, INLINE_LINK.sub(inline, markdown))
+    inline = (
+        (start, end, f"{prefix}[{label}]({repository_target(source_path, target)}{title})")
+        for start, end, prefix, label, target, title in inline_links(markdown)
+    )
+    rewritten = _splice(markdown, inline)
+    reference = (
+        (start, end, f"{prefix}{repository_target(source_path, target)}{suffix}")
+        for start, end, prefix, target, suffix in reference_links(rewritten)
+    )
+    return _splice(rewritten, reference)
 
 
 def prepare_book() -> None:
