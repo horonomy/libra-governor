@@ -197,3 +197,44 @@ fn uninstall_agent_codex_on_a_missing_hooks_file_is_a_safe_no_op() {
     assert!(output.status.success());
     assert!(!sandbox.hooks_path().exists());
 }
+
+/// HORO-2303: a reinstall run from a different binary path repoints our
+/// hooks instead of appending a second group per event.
+#[test]
+fn install_agent_codex_from_another_binary_path_repoints_instead_of_duplicating() {
+    let sandbox = Sandbox::new();
+    let first = sandbox.run(&["install", "--agent", "codex"]);
+    assert!(first.status.success());
+
+    let other_dir = tempfile::tempdir().unwrap();
+    let other_bin = other_dir.path().join("libra-governor");
+    std::fs::copy(bin(), &other_bin).unwrap();
+    let output = Command::new(&other_bin)
+        .args(["install", "--agent", "codex"])
+        .env("LIBRA_GOVERNOR_STATE_DIR", &sandbox.state_dir)
+        .env("LIBRA_GOVERNOR_CODEX_HOME", &sandbox.codex_dir)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(sandbox.hooks_path()).unwrap()).unwrap();
+    let prefix = format!("{} ", other_bin.display());
+    for event in ["UserPromptSubmit", "PostToolUse", "Stop"] {
+        let groups = value["hooks"][event].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "{event}: exactly one Libra group");
+        let command = groups[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(command.starts_with(&prefix), "{event}: {command}");
+    }
+
+    let uninstall = sandbox.run(&["uninstall", "--agent", "codex", "--yes"]);
+    assert!(uninstall.status.success());
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(sandbox.hooks_path()).unwrap()).unwrap();
+    assert!(after.as_object().unwrap().is_empty(), "{after}");
+}

@@ -1226,4 +1226,249 @@ mod tests {
             "the foreign group stays at its original index 0, unaffected"
         );
     }
+
+    // --- HORO-2303: reinstall from a different binary path ---------------
+
+    const OLD: &str = "/old/bin/libra-governor";
+
+    fn old_command(subcommand: &str) -> String {
+        format!("{OLD} {subcommand}")
+    }
+
+    /// Every event wired from `OLD`, in the shape `apply` writes.
+    fn seed_wired_from_old(path: &Path) {
+        apply(path, Path::new(OLD)).unwrap();
+    }
+
+    fn read_value(path: &Path) -> Value {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    /// Our commands (loose predicate) per event, in file order.
+    fn owned_commands(root: &Value, event: &str) -> Vec<String> {
+        root["hooks"][event]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|g| g["hooks"].as_array().into_iter().flatten())
+            .filter_map(|h| h["command"].as_str())
+            .filter(|c| command_is_ours(c))
+            .map(str::to_string)
+            .collect()
+    }
+
+    const EVENT_SUBCOMMANDS: [(&str, &str); 3] = [
+        ("UserPromptSubmit", "codex-hook user-prompt-submit"),
+        ("PostToolUse", "codex-hook post-tool-use"),
+        ("Stop", "codex-hook stop"),
+    ];
+
+    #[test]
+    fn reinstall_from_another_path_leaves_exactly_one_group_per_event_with_the_new_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        seed_wired_from_old(&path);
+
+        let applied = apply(&path, &binary()).unwrap();
+
+        let root = read_value(&path);
+        for (event, subcommand) in EVENT_SUBCOMMANDS {
+            assert_eq!(root["hooks"][event].as_array().unwrap().len(), 1, "{event}");
+            assert_eq!(
+                owned_commands(&root, event),
+                vec![format!("{} {subcommand}", binary().display())],
+                "{event}"
+            );
+        }
+        assert_eq!(applied.hooks_added, 3, "three repoints reported");
+        // Timeout and the async flag of the repointed entries survive.
+        assert_eq!(
+            root["hooks"]["Stop"][0]["hooks"][0]["timeout"],
+            HOOK_TIMEOUT_SECS
+        );
+        assert_eq!(root["hooks"]["PostToolUse"][0]["hooks"][0]["async"], true);
+    }
+
+    #[test]
+    fn reinstall_repoints_in_place_and_leaves_foreign_lookalike_and_unknown_entries_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let foreign = serde_json::json!({ "hooks": [{ "type": "command", "command": "/usr/local/bin/fornax stop" }] });
+        let lookalike = serde_json::json!({ "hooks": [{ "type": "command", "command": "/opt/libra-governor-tools/x codex-hook stop" }] });
+        let scoped = serde_json::json!({
+            "matcher": "Bash",
+            "hooks": [{ "type": "command", "command": old_command("codex-hook stop") }]
+        });
+        let ours = serde_json::json!({
+            "unknownGroupKey": 7,
+            "hooks": [
+                { "type": "command", "command": "/usr/local/bin/before stop" },
+                {
+                    "type": "command",
+                    "command": old_command("codex-hook stop"),
+                    "timeout": 99,
+                    "statusMessage": "keep me"
+                },
+                { "type": "command", "command": "/usr/local/bin/after stop" }
+            ]
+        });
+        let seed = serde_json::json!({
+            "description": "mine",
+            "hooks": { "Stop": [foreign, lookalike, scoped, ours] }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+
+        apply(&path, &binary()).unwrap();
+
+        let root = read_value(&path);
+        let stop = root["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(root["description"], "mine");
+        assert_eq!(stop.len(), 4, "no group added or removed for Stop");
+        assert_eq!(stop[0], seed["hooks"]["Stop"][0], "foreign byte-preserved");
+        assert_eq!(
+            stop[1], seed["hooks"]["Stop"][1],
+            "lookalike byte-preserved"
+        );
+        assert_eq!(
+            stop[2], seed["hooks"]["Stop"][2],
+            "a matcher-scoped group is not an every-tool install and is left alone"
+        );
+        let mut expected = seed["hooks"]["Stop"][3].clone();
+        expected["hooks"][1]["command"] =
+            Value::String(format!("{} codex-hook stop", binary().display()));
+        assert_eq!(stop[3], expected, "only the command changed, in place");
+    }
+
+    #[test]
+    fn reinstall_repoints_a_hand_quoted_old_path_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let seed = serde_json::json!({
+            "hooks": {
+                "UserPromptSubmit": [{ "hooks": [{ "type": "command",
+                    "command": "'/opt/my tools/libra-governor' codex-hook user-prompt-submit" }] }],
+                "Stop": [{ "hooks": [{ "type": "command",
+                    "command": "\"/opt/my tools/libra-governor\" codex-hook stop" }] }]
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+
+        apply(&path, &binary()).unwrap();
+
+        let root = read_value(&path);
+        for event in ["UserPromptSubmit", "Stop"] {
+            assert_eq!(root["hooks"][event].as_array().unwrap().len(), 1, "{event}");
+        }
+        assert_eq!(
+            owned_commands(&root, "Stop"),
+            vec![format!("{} codex-hook stop", binary().display())]
+        );
+        assert_eq!(owned_commands(&root, "UserPromptSubmit").len(), 1);
+        assert_eq!(owned_commands(&root, "PostToolUse").len(), 1);
+    }
+
+    #[test]
+    fn reinstall_collapses_pre_existing_duplicate_entries_to_one_and_keeps_user_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        // The state the earlier installer produced: a second Libra group per
+        // event, plus one more in the same group as a user hook.
+        let user = serde_json::json!({ "hooks": [{ "type": "command", "command": "/usr/local/bin/fornax stop" }] });
+        let seed = serde_json::json!({
+            "hooks": { "Stop": [
+                { "hooks": [{ "type": "command", "command": old_command("codex-hook stop"), "timeout": 15 }] },
+                user,
+                { "hooks": [
+                    { "type": "command", "command": "/usr/local/bin/mine stop" },
+                    { "type": "command", "command": format!("{} codex-hook stop", binary().display()), "timeout": 15 }
+                ] },
+                { "hooks": [{ "type": "command", "command": "/third/libra-governor codex-hook stop", "timeout": 15 }] }
+            ] }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+
+        apply(&path, &binary()).unwrap();
+
+        let root = read_value(&path);
+        assert_eq!(
+            owned_commands(&root, "Stop"),
+            vec![format!("{} codex-hook stop", binary().display())],
+            "one Libra entry, kept at the position of the first"
+        );
+        let stop = root["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(
+            stop[0]["hooks"][0]["command"],
+            format!("{} codex-hook stop", binary().display())
+        );
+        assert_eq!(stop[1], seed["hooks"]["Stop"][1], "user group untouched");
+        assert_eq!(
+            stop[2],
+            serde_json::json!({ "hooks": [{ "type": "command", "command": "/usr/local/bin/mine stop" }] }),
+            "a user hook sharing a group with a duplicate stays"
+        );
+        assert_eq!(
+            stop.len(),
+            3,
+            "the emptied tail group is dropped (nothing after it shifts)"
+        );
+    }
+
+    #[test]
+    fn collapsing_a_duplicate_before_a_later_group_leaves_a_tombstone_not_an_index_shift() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let later = serde_json::json!({ "hooks": [{ "type": "command", "command": "/usr/local/bin/fornax stop" }] });
+        let seed = serde_json::json!({
+            "hooks": { "Stop": [
+                { "hooks": [{ "type": "command", "command": old_command("codex-hook stop") }] },
+                { "hooks": [{ "type": "command", "command": "/third/libra-governor codex-hook stop" }] },
+                later
+            ] }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+
+        apply(&path, &binary()).unwrap();
+
+        let stop = read_value(&path)["hooks"]["Stop"].clone();
+        let stop = stop.as_array().unwrap();
+        assert_eq!(stop.len(), 3);
+        assert_eq!(stop[1], serde_json::json!({ "hooks": [] }));
+        assert_eq!(
+            stop[2], seed["hooks"]["Stop"][2],
+            "later group keeps its index"
+        );
+    }
+
+    #[test]
+    fn second_identical_install_is_a_byte_for_byte_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        seed_wired_from_old(&path);
+        apply(&path, &binary()).unwrap();
+        let first = std::fs::read(&path).unwrap();
+
+        let second = apply(&path, &binary()).unwrap();
+
+        assert_eq!(second.hooks_added, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+    }
+
+    #[test]
+    fn uninstall_after_a_reinstall_from_another_path_removes_ours_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let foreign = serde_json::json!({ "hooks": [{ "type": "command", "command": "/usr/local/bin/fornax stop" }] });
+        let seed = serde_json::json!({ "hooks": { "Stop": [foreign.clone()] } });
+        std::fs::write(&path, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+        seed_wired_from_old(&path);
+        apply(&path, &binary()).unwrap();
+
+        let removed = remove(&path).unwrap();
+
+        assert_eq!(
+            removed.hook_commands_removed, 3,
+            "one per event, no leftover"
+        );
+        assert_eq!(read_value(&path), seed);
+    }
 }
