@@ -225,6 +225,24 @@ impl CodexUsageFields {
         field.unwrap_or(0).max(0)
     }
 
+    /// A negative count is impossible for a real turn. `get` would clamp it
+    /// to 0 before any consistency check, letting an unmeasurable turn read
+    /// as `Measured` and book zero instead of the flat hold, so it must be
+    /// rejected before the clamp is applied.
+    fn has_negative(&self) -> bool {
+        [
+            self.input_tokens,
+            self.cached_input_tokens,
+            self.cache_write_input_tokens,
+            self.output_tokens,
+            self.reasoning_output_tokens,
+            self.total_tokens,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|count| count < 0)
+    }
+
     /// The per-record self-consistency invariants this module's docs claim
     /// always hold for real Codex output. A violation here is a format-
     /// drift signal, not something to silently clamp away.
@@ -524,6 +542,9 @@ fn step(
                 }
                 Some(_) => {}
                 None => *seen_thread_id = Some(payload.thread_id.clone()),
+            }
+            if payload.usage.has_negative() || payload.turn_token_usage.has_negative() {
+                return ControlFlow::Break(StepOutcome::Inconsistent);
             }
             if !payload.usage.internally_consistent() {
                 return ControlFlow::Break(StepOutcome::Inconsistent);
