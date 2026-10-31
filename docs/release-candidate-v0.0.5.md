@@ -7,12 +7,10 @@ occurs without a **separate, SHA-specific founder GO**; that GO names the
 exact commit, and any later merge invalidates it.
 
 Baseline: the immutable `v0.0.4` tag (`313d26a`, Cooperative Preview). Tracking
-epic: HORO-2325. Candidate code SHA: **`819b558`** is the `main` after the last
-code PR (#288) merged (2026-10-31); it is only a candidate until the
+epic: HORO-2325. Candidate code SHA: **`f9746b7`** is the `main` after the last
+code PR (#291) merged (2026-10-31); it is only a candidate until the
 founder names a SHA, and any later merge, including this docs-only packet,
-changes `main`. The packet merge changes no source file; the founder-named SHA
-is the post-packet `main` and the final-candidate evidence is re-checked against it.
-The packet PR adds three docs files (this packet, its notes draft and `docs/release-procedure-v0.0.5.md`) and no source file.
+changes `main`. Documentation-only merges (this packet, its notes draft, README wording) change no source file, so the source-level evidence below stays valid for them; the founder-named SHA is the then-current `main`, and CI/SonarCloud are re-read on it.
 
 Facts below come from the release-evidence directory
 (`PHASE0-RECONCILIATION.md`, `CAMPAIGN-CHECKPOINT.md`,
@@ -29,7 +27,7 @@ admission-bounded (not hard-cap) model of
 
 In scope (approved by the 2026-10-29 founder directive and the 2026-10-31
 "Option 1" confirmation, recorded in HORO-2325). Merge state as of 2026-10-31,
-code `main` = `819b558` (before this packet merges). Every PR below had an exact-head independent AI review
+code `main` = `f9746b7`. Every PR below had an exact-head independent AI review
 (reviewer id `claude-independent-agent`, run id and findings in the PR's
 `OWNER-MERGE-REVIEW` comment), required hosted checks and SonarCloud green, and
 a runner-gated merge commit verified in a separate call.
@@ -43,6 +41,7 @@ a runner-gated merge commit verified in a separate call.
 | Orphan recovery and true-up (C4) | HORO-2284 | **Merged** (#278 `5a3ba7b`). Dark; never refunds |
 | Status/doctor Codex reporting (C5) | HORO-2285 | **Merged** (#280 `ed4a0a3`). Reporting only |
 | Hardening from the v0.0.4 audit | HORO-2303 | **Merged**: state-dir symlink chmod refusal (#254 `9e5036c`), Claude reinstall from another path repoints our hooks (#272 `2ca0526`), hand-quoted hook recognised as ours (#274 `060970f`), FIFO transcript pin (#273 `99e394f`), Stop-without-agent pin (#275 `a2a7f13`), statusline id-absence pin (#276 `d509f71`). Found by QA preflight and fixed after the first candidate: Codex reinstall no longer adds a second hook group, and the shared hook-ownership predicate no longer treats wrapped user commands (`env X=1 ...`, `cd && ...`, pipelines, `nohup`, `sudo`) as ours (#288 `819b558`, three independent review rounds). Remaining items: see Known limitations |
+| Codex negative rollout counters | HORO-2325 | **Merged** (#291 `f9746b7`): found by independent dynamic QA (defect D-1): a rollout with negative token counters booked 0 cents; it now books the flat hold like every other unmeasurable turn. Codex turn-scoped reader only; Claude path, protocol and goldens untouched |
 | Export capacity label | HORO-2293 | **Merged** (#271 `04e41fa`). Labels the field; does not fix the stale value |
 | Test pins for the C4/C5 review follow-ups | HORO-2340 | **Merged** (#281 `ac5538b`): 16-hold orphan cap, newest-only true-up, C5 label tests. The other HORO-2340 review follow-ups stay open (Known limitations) |
 | SonarCloud findings behind the main gate | HORO-2325 | **Merged**: shell guards (#283 `df5f9c3`), linear-time site link scanners (#282 `ee866e5`), required-nullable pins with justified suppressions (#284 `2441ef1`). No wire or deserialization behavior changed |
@@ -135,21 +134,22 @@ ticket-backed limit below stays open until its fix is merged and verified.
 
 ## Acceptance state
 
-Candidate code SHA: `819b5585404db9d9e4eca5764a7718e863ef2e0b` (`main` after the last
-code PR, #288). Per-ticket criteria are in `ACCEPTANCE-C2-C5.md`. This
+Candidate code SHA: `f9746b71615bd3be3fdf441c1755cb4ff62548e9` (`main` after the last
+code PR, #291). Per-ticket criteria are in `ACCEPTANCE-C2-C5.md`. This
 packet is itself an open draft PR (#266); merging it changes `main`, so the
 founder-named SHA must be chosen after that decision.
 
-| Gate | State at `819b558` |
+| Gate | State at `f9746b7` (docs-only `6bf668f` re-read for CI) |
 |---|---|
-| Candidate integration check (clean detached worktree, isolated `CARGO_TARGET_DIR`, deleted afterwards) | **PASS**: `cargo fmt --all -- --check` rc 0; `cargo clippy --workspace --all-targets -j 4 -- -D warnings` rc 0; `cargo nextest run --workspace -j 4 --no-fail-fast` 2984 run, 2984 passed (2 leaky), 40 skipped, rc 0. Log: `CANDIDATE-GATE-819b558.log`. The 40 skipped are exactly the 40 `#[ignore]` tests (28 container-only two-principal harness tests, 8 isolated-process helpers, 4 fixture generators); the 2 leaky tests deliberately spawn decoy processes. Neither is release-relevant. The earlier `fe14978` run (2957 passed) is superseded |
-| Hosted CI required checks (`cargo fmt`, `cargo clippy`, `cargo build & test` ubuntu and macos, `Analyze` actions/python/rust) | **success** on `819b558` (push): `CI` and `CodeQL` workflows completed success |
-| Two-principal harness (disposable container; the 28 container-only tests the local run skips) | **success** on `819b558` via `workflow_dispatch` (run 41210232729); the job does not run on push to `main`, so it was dispatched manually |
-| SonarCloud quality gate on `main` | Was **FAIL** at `fe14978` (`new_security_rating` C, `new_reliability_rating` D). Cause established from the SonarCloud analysis history: the analysis at `b851381` (#265) was the first to analyze Rust at all (per-language lines of code: no Rust before, 149,120 after; quality profile "Sonar way comprehensive (rust)" first applied), so 11 older new-code issues surfaced at once; no repository or workflow change caused it. Findings were classified and fixed, not waived: shell S7688 x3 and python S8786 x2 were real and are fixed (#283, #282); rust S9334 x5 and S2612 are false positives with evidence (required-but-nullable fields fixed by `host-capability-snapshot.schema.json`, a mandated 0644 mode per ADR-0019) and are pinned by tests with justified `NOSONAR` (#284). The new-code definition was not changed and no issue was accepted. Gate on `main` read **OK** at `bd510d8` with all five new-code conditions OK; re-read after the `819b558` analysis: **OK**, all five new-code conditions OK. SonarCloud still lists 128 open issues on `main` in total; the gate conditions are OK with them open. Among them are 11 pre-existing new-code findings (GitHub Actions rules in `phase0-ci.yml`/`ci.yml`, two float comparisons in `experiments/phase0/src/phase0/runner.py`, created 2026-09-17), ticketed as HORO-2344, and older maintainability findings (for example cognitive-complexity and redundant-closure rules), some on code added by v0.0.5 PRs; those are not triaged individually and are not a v0.0.5 release criterion |
+| Candidate integration check (clean detached worktree, isolated `CARGO_TARGET_DIR`, deleted afterwards) | **PASS**: `cargo fmt --all -- --check` rc 0; `cargo clippy --workspace --all-targets -j 4 -- -D warnings` rc 0; `cargo nextest run --workspace -j 4 --no-fail-fast` 2986 run, 2986 passed (2 leaky), 40 skipped, rc 0, plus a release-profile build of the binary used for QA (sha256 `5d6f7d6d283bae9f6465f4512f338d3a350c7f72b8d9fb2da30a28b892512c9c`, `libra-governor 0.0.5`; a local QA build, not the release artifact). Log: `CANDIDATE-GATE-f9746b7.log`. The 40 skipped are exactly the 40 `#[ignore]` tests (28 container-only two-principal harness tests, 8 isolated-process helpers, 4 fixture generators); the 2 leaky tests deliberately spawn decoy processes. Neither is release-relevant. The earlier `fe14978` run (2957 passed) is superseded |
+| Hosted CI required checks (`cargo fmt`, `cargo clippy`, `cargo build & test` ubuntu and macos, `Analyze` actions/python/rust) | **success** on `f9746b7` (push): `CI` and `CodeQL`; **success** on docs-only `6bf668f` (push): `CI`, `CodeQL` and `Positioning guard` (that workflow is path-filtered and did not run on `f9746b7`) |
+| Two-principal harness (disposable container; the 28 container-only tests the local run skips) | **success** on `819b558` via `workflow_dispatch` (run 41210232729); re-dispatched on `6bf668f` (run 41219030766): **success** (the container job, both trusted-principal feature builds); the job does not run on push to `main`, so it was dispatched manually |
+| SonarCloud quality gate on `main` | Was **FAIL** at `fe14978` (`new_security_rating` C, `new_reliability_rating` D). Cause established from the SonarCloud analysis history: the analysis at `b851381` (#265) was the first to analyze Rust at all (per-language lines of code: no Rust before, 149,120 after; quality profile "Sonar way comprehensive (rust)" first applied), so 11 older new-code issues surfaced at once; no repository or workflow change caused it. Findings were classified and fixed, not waived: shell S7688 x3 and python S8786 x2 were real and are fixed (#283, #282); rust S9334 x5 and S2612 are false positives with evidence (required-but-nullable fields fixed by `host-capability-snapshot.schema.json`, a mandated 0644 mode per ADR-0019) and are pinned by tests with justified `NOSONAR` (#284). The new-code definition was not changed and no issue was accepted. Gate on `main` read **OK** at `bd510d8` with all five new-code conditions OK; re-read after the `f9746b7` and `6bf668f` analyses: **OK**, all five new-code conditions OK. SonarCloud still lists 128 open issues on `main` in total; the gate conditions are OK with them open. Among them are 11 pre-existing new-code findings (GitHub Actions rules in `phase0-ci.yml`/`ci.yml`, two float comparisons in `experiments/phase0/src/phase0/runner.py`, created 2026-09-17), ticketed as HORO-2344, and older maintainability findings (for example cognitive-complexity and redundant-closure rules), some on code added by v0.0.5 PRs; those are not triaged individually and are not a v0.0.5 release criterion |
 | Independent code review | Every merged v0.0.5 PR has an exact-head `OWNER-MERGE-REVIEW` record; no Critical/High open. Reviews were static AI reviews (`claude-independent-agent`), not human reviews |
-| Independent product QA | **NOT DONE.** No Codex QA request has been made; no real-host result exists |
+| Independent product QA, provider-free (dynamic, executors who did not write the candidate, tests or preflight) | **DONE against the pinned binaries, with three executors**: QA-1 (operator journey, docs-versus-behaviour, privacy sweep, migration over v0.0.4-written hooks, hand-quoted and wrapped commands): re-run at `f9746b7` gave 38 PASS (36 plus E16b and E21c, newly runnable), 2 FAIL, 4 NOT RUN, plus 5 added cases all PASS; both FAILs were documentation wording (Codex hooks without the marker, and `doctor --verify-trust` visible in `--help`), since corrected in #292; no Critical or High defect, and the remaining findings are Low and not fixed in this candidate (for example a no-op reinstall still writes a backup file, a broken-pipe panic on `install | head`, a binary renamed away from `libra-governor` is misreported by `doctor`, a protocol-skew hook message says "daemon unreachable"), tracked in HORO-2349; QA-2 (adversarial hooks and rollouts, lane isolation, multi-session restart, 238-cent arithmetic): found D-1, fixed in #291 and re-verified (10 negative-counter cases book the flat hold; no regressions); re-run result 6 PASS, 1 FAIL, 1 NOT RUN: the FAIL is D-2 (Low, unchanged: Codex Stop writes the execution receipt block to stderr, documented), and orphan recovery after the 3600 s hold TTL was not run (no clock injection); QA-3 (Claude differential against the published v0.0.4 binary): 13 rows plus the Codex negative-counter cases, zero unexpected differences (QA-3 rated the missing settlement ceiling High; it is identical on v0.0.4, disclosed and tracked in HORO-2350). Results: `qa/results/QA1-QA3`, matrix `qa/ACCEPTANCE-TO-EVIDENCE-MATRIX.md`, pins in the matrix. Developer tests and static reviews are separate columns there and never stand in for these runs |
+| Independent product QA, real host (Codex and Claude Code) | **NOT RUN.** No real Codex or Claude Code host process has been run and no real provider usage observed; the claims that depend on one are listed as not verified in the notes. Needs the owner's login to a dedicated QA home |
 | Protocol v25 compatibility statement | Daemon and CLI must come from the same release; a v24 daemon rejects a request carrying `provider`, and a pre-C3 v25 daemon rejects `SettleTurn` (an enrolled install is then ungated until the daemon restarts; `doctor` probes this) |
-| Jira Fix Version and Goal for v0.0.5 | **NOT CREATED.** No create-version tool exists in the connected Atlassian tools and the REST attempt was not authorized; the exact contents are in `JIRA-METADATA-HANDOFF.md` for the authorized Jira administrator |
+| Jira Fix Version and Goal for v0.0.5 | **NOT CREATED.** No create-version tool exists in the connected Atlassian tools, and the REST attempt authenticated but was refused (404: the account cannot create versions in HORO); the exact contents are in `JIRA-METADATA-HANDOFF.md` for the authorized Jira administrator |
 | Open dependency PRs (#187 to #195, #260 to #262) | None required for v0.0.5 (`DEPENDENCY-DISPOSITION.md`); #192 to #195 change the release workflow actions and are deliberately not in this release |
 | Founder SHA-specific GO | NOT GIVEN |
 
@@ -157,11 +157,12 @@ founder-named SHA must be chosen after that decision.
 
 1. **Jira Fix Version and Goal (R8).** Administrator step, contents handed over in
    `JIRA-METADATA-HANDOFF.md`; no authorized tool path exists in this environment.
-2. **Independent product QA (a baseline requirement, not an R-criterion).** Dynamic QA plan and a model-free preflight exist
-   (`qa/`); provider-free groups run without further approval. The real-host Codex
-   group needs the owner to log in to a dedicated QA `CODEX_HOME` and trust the hooks,
-   and costs real model tokens; that is an owner approval, not yet given.
-3. **Founder SHA-specific GO.** Not given; tagging, publication and deployment stay gated.
+2. **Real-host independent product QA (a baseline requirement, not an R-criterion).** The provider-free groups are done (above). The
+   real-host group needs the owner to log in to dedicated QA homes and trust the hooks; one consolidated owner action is prepared in
+   `qa/realhost/`. Until it runs, the not-verified list stays in the notes.
+3. **Two pre-existing behaviours (HORO-2350), disclosed, not changed:** settlement of measured usage has no per-charge ceiling, and a Claude
+   `SessionEnd` without a `Stop` leaves its hold until it expires. Whether to change either is an accounting-semantics decision for the founder.
+4. **Founder SHA-specific GO.** Not given; tagging, publication and deployment stay gated.
 
 ## Release notes draft
 
