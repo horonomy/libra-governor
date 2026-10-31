@@ -1238,12 +1238,15 @@ fn prune_then_replay_books_zero() {
 
 #[test]
 fn recovery_writes_nothing_without_the_marker() {
-    let mut fx = fx_with_hold(HOLD, true, false);
+    // Admit while enrolled (the real `admit` honours the marker), then remove
+    // the marker so the settle sees an un-enrolled install with holds present.
+    let mut fx = fx_with_hold(HOLD, true, true);
     let killed = fx.admit("turn-a");
     fx.clock.set(t("2027-01-15T14:00:00Z"));
     fx.admit("turn-b");
     let lines = [turn_lines("turn-a", TURN_BIG), grown_lines("turn-b")].concat();
     let path = fx.rollout("r.jsonl", &lines);
+    std::fs::remove_file(fx.dir.path().join("shared-budget.codex")).unwrap();
     let before = fx.fingerprint();
     let out = fx.settle("turn-b", Some(MODEL), Some(&path));
     assert!(matches!(out, CodexSettlement::NotConfigured), "{out:?}");
