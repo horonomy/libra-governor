@@ -57,6 +57,8 @@ pub fn state_dir() -> Result<PathBuf, PathsError> {
 pub fn ensure_state_dir() -> Result<PathBuf, PathsError> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
+    use std::os::unix::fs::MetadataExt;
+
     let dir = state_dir()?;
     if !dir.exists() {
         std::fs::DirBuilder::new()
@@ -68,6 +70,24 @@ pub fn ensure_state_dir() -> Result<PathBuf, PathsError> {
         // directory that predates this hardening (or was otherwise
         // created with a looser mode) is tightened here idempotently,
         // rather than only ever protecting a fresh install.
+        //
+        // `metadata` follows a symlink, so a state path that is a link to a
+        // file (or to a directory someone else owns) would otherwise be
+        // chmodded through it. Only a directory the effective user owns is
+        // tightened; a symlink to such a directory (a relocated state dir)
+        // keeps working.
+        let meta = std::fs::metadata(&dir)?;
+        // SAFETY: geteuid reads this process's effective user identity.
+        if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } {
+            return Err(PathsError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "state dir {} is not a directory owned by the current user; \
+                     refusing to change its permissions",
+                    dir.display()
+                ),
+            )));
+        }
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(dir)

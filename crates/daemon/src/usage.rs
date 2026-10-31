@@ -1275,4 +1275,34 @@ mod tests {
         );
         assert_eq!(usage.fresh_tokens(), 100 - 80 + 10);
     }
+
+    /// HORO-2303 item 3, characterization: a transcript path that is a FIFO
+    /// with no writer must read as unreadable instead of blocking the
+    /// single-threaded daemon in `File::open`. The `reject_non_regular_file`
+    /// stat guard already prevents it; this pins that so it stays prevented.
+    #[test]
+    fn a_fifo_transcript_is_unreadable_and_never_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("subagent.jsonl");
+        // This only creates an inert FIFO test fixture.
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo test utility is available");
+        assert!(made.success());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let observed = observe_transcript_window(&path, epoch_plus(0), DEFAULT_SCAN_CAP_BYTES);
+            let _ = tx.send(observed);
+        });
+        let observed = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reading a FIFO transcript must not block");
+        assert_eq!(
+            observed,
+            UsageObservation::Unavailable(UsageUnavailable::Unreadable)
+        );
+    }
 }
