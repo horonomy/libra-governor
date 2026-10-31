@@ -955,6 +955,10 @@ Residuals, disclosed:
 - The last turn of a killed session that is never resumed stays unsettled: the under-count is bounded by its real spend (the same class as Claude's killed-host residual).
 - Only the lane's newest measured settled hold is re-measured per settle; an older hold with a late record that was not the newest at the time of a settle is not trued up.
 - The model and rollout path used are the `Stop` payload's, host-claimed as for the settlement itself.
+- **Serialized settles.** The true-up reads its baseline (settled amount plus prior true-ups) and then books the charge in separate ledger calls, which is safe only if settles of one lane do not interleave. In the daemon this holds: the accept loop is single-threaded and serial (`crates/daemon/src/server.rs`, module header), so one `SettleTurn` finishes before the next starts. Another process writing the same ledger could interleave; the cumulative-keyed idempotency key then protects a repeat of the same measurement but not two different ones, so the baseline read and the charge must move into one transaction before the daemon is ever made concurrent.
+- **A still-running turn can be settled early.** Orphan recovery settles a hold that expired after one hour with no `Stop`, which includes a turn that is still running (a tool-free turn longer than an hour). It then settles on the partial measurement available. The true-up can correct that only while the hold is the lane's newest measured settled hold; once a later hold settles, the earlier one is not re-measured and any further spend on that turn is not booked.
+- **Failures are isolated.** A hold whose late settle fails is counted (`SharedBudgetRuntime::codex_recovery_errors`, volatile) and skipped; the remaining holds and the true-up still run and the failed hold is retried at the next settle. The 16-hold cap counts only holds with a turn mapping.
+- The transcript path is host-claimed: the `task_complete` check refuses a non-regular file and opens without blocking, as the reader does.
 
 ## Consequences
 
