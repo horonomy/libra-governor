@@ -13,7 +13,7 @@ one. See [`PRODUCT.md`](PRODUCT.md) for the full product North Star and
 
 **Product page and hosted docs:** [libra.horonom.com](https://libra.horonom.com) ([docs](https://libra.horonom.com/docs/)) — Developer Preview.
 
-**Release status.** The latest *published* release is v0.0.2. `main` is the unreleased **v0.0.4** development line (workspace version 0.0.4); v0.0.4 is the Option 2 **local monthly shared budget** MVP ([ADR-0026](docs/adr/0026-local-monthly-shared-budget.md)); it is unreleased and untagged, nothing is published, and releasing it is a separate founder GO (evidence so far is `TestOwnedLive` only, see [ADR-0025](docs/adr/0025-v0-0-4-scope-evidence-and-exclusions.md)). v0.0.3 is a separate line (`release/v0.0.3`, [ADR-0014](docs/adr/0014-v0-0-3-go-scope-and-exclusions.md)). The feature set below is the v0.0.3 baseline that `main` builds on: everything from v0.0.2 (the v0.0.1 MVP 3
+**Release status.** The latest *published* release is v0.0.4, the Option 2 **local monthly shared budget** Cooperative Preview ([ADR-0026](docs/adr/0026-local-monthly-shared-budget.md), [ADR-0025](docs/adr/0025-v0-0-4-scope-evidence-and-exclusions.md)); Apple Silicon macOS only. `main` is the **v0.0.5 candidate** line: unreleased and untagged, nothing is published from it, and releasing it is a separate founder GO. v0.0.5 adds **opt-in, off-by-default Codex accounting** against the same shared budget (see "Local monthly budget" below); it is still a Cooperative Preview, not a hard cap. v0.0.3 is a separate line (`release/v0.0.3`, [ADR-0014](docs/adr/0014-v0-0-3-go-scope-and-exclusions.md)). The feature set below is the v0.0.3 baseline that `main` builds on: everything from v0.0.2 (the v0.0.1 MVP 3
 local flow, Codex support, local extension points — see below) plus the
 Agent Execution Economics work (HORO-1666–1673, HORO-1689): hierarchical
 resource accounting, a progressive remaining-cost estimator with shadow
@@ -64,7 +64,7 @@ product sees repeated use — see HORO-1154.
 
 - A Rust toolchain (`cargo`, `rustc`) — see <https://rustup.rs> if you
   do not have one.
-- Supported platform for the v0.0.4 Cooperative Preview: Apple Silicon
+- Supported platform for the Cooperative Preview (v0.0.4, and the v0.0.5 candidate): Apple Silicon
   macOS (aarch64). Linux builds and runs in CI; Intel macOS is not built or
   tested. Both are unsupported and unverified for the local monthly budget;
   Windows is unsupported. Claude Code with hook and statusline support, and/or
@@ -129,8 +129,9 @@ Code workflow (see "Safe defaults" below).
 
 ## Local monthly budget (optional, Cooperative Preview)
 
-On the unreleased v0.0.4 line you can cap what Claude Code may spend in a
-calendar month on this machine. It is off until you create the file:
+You can cap what Claude Code may spend in a calendar month on this machine
+(and, from the v0.0.5 candidate, optionally Codex too; see below). It is off
+until you create the file:
 
 ```bash
 libra-governor shared-budget init --monthly-usd 200 --time-zone America/New_York
@@ -150,24 +151,27 @@ period end in your zone and how to raise the cap.
 
 **What it is not.** Not a provider bill, not provider quota and not a hard
 spending cap. With hooks only, spend *inside* a turn is seen after the fact,
-so a turn can cost more than its hold. Codex sessions have no budget gate.
+so a turn can cost more than its hold. Codex sessions are not counted unless
+you opt in (see "Codex accounting" below).
 There is no gateway hard cap. Evidence is `TestOwnedLive` (real binaries,
 synthetic transcripts), not observed on a real host.
 
-**Cooperative Preview: what to expect.** v0.0.4 ships this as a preview of
+**Cooperative Preview: what to expect.** v0.0.4 shipped this, and the v0.0.5 candidate keeps it, as a preview of
 cooperative admission, by founder scope decision (ADR-0026). It is not the
 original strict hard-cap guarantee.
 
 - *Not a strict monetary cap.* A prompt is admitted or refused up front;
   nothing stops spend once a turn is running, so in-turn overshoot is possible.
-- *Codex is ungated.* The gateway hard cap and a Codex budget gate are designed
-  but off by default and not enabled in v0.0.4.
+- *Codex is not counted unless you opt in.* The gateway hard cap is designed
+  but off by default and not enabled. Codex accounting (v0.0.5 candidate) is
+  opt-in and off by default; see "Codex accounting" below.
 - *Not your bill.* Amounts are Libra's list-price-equivalent estimates, or the
   flat turn hold when a turn cannot be measured. Pricing gaps drift both ways
   (for example the 1-hour cache tier is under-counted); see ADR-0026.
 - *Accounting boundary.* Counted: Claude Code sessions and subagents whose
-  settlement hooks run and whose transcripts can be read and attributed.
-  Not counted or not attributable: any other executor, a subagent without a
+  settlement hooks run and whose transcripts can be read and attributed, plus
+  Codex main-lane turns only if you opted in. Not counted or not attributable:
+  any other executor, Codex subagents, a subagent without a
   readable transcript or agent id, and spend outside Claude Code. Such spend
   can settle at the flat hold, be recorded unattributed, or be missed. See
   `docs/execution-owner-contract.md`.
@@ -179,6 +183,27 @@ original strict hard-cap guarantee.
   `shared-budget init --force` replaces the whole file, dropping `pricing_overrides`, the subagent
   fallback and unrepeated soft limits; the previous file is kept as
   `shared-budget.json.bak`.
+
+**Codex accounting (v0.0.5 candidate; opt-in, off by default).** Codex is not
+admitted or charged unless **both** a configured `shared-budget.json` **and**
+the marker file `<state-dir>/shared-budget.codex` exist; delete the marker to
+switch it off again (it is checked on every call). Without the marker the Codex
+hooks send nothing and the ledger is unchanged. When enrolled:
+
+- Codex hooks run only after you trust them in Codex's `/hooks`. Untrusted
+  hooks are skipped silently and leave an enrolled install ungated; `doctor`
+  can report trust as "likely not yet trusted" or "unknown", never "trusted".
+- With no `gpt-*` price in `pricing_overrides`, every Codex turn books the flat
+  hold, unmeasured, and is never trued up.
+- A turn Codex interrupts or aborts writes no usage record, so that spend is
+  under-counted. A turn longer than the one-hour hold is settled late on
+  partial usage.
+- Codex subagents are neither admitted nor settled.
+- Run the daemon and the CLI from the same release; a daemon built before the
+  Codex hooks leaves an enrolled install ungated until it is restarted.
+- Support was derived from reading Codex source at 0.160, 0.163, 0.164 and
+  0.165 and from synthetic fixtures. It has not been run against a real Codex
+  host or provider. Setup: `integrations/codex/README.md`.
 
 **Where to look.** `libra-governor shared-budget status` (add `--json`),
 the `shared_budget_*` checks in `libra-governor doctor`, and a `budget $x/$y`
