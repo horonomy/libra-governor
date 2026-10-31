@@ -180,6 +180,7 @@ use serde::Deserialize;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+pub mod codex_priced;
 mod codex_turn;
 pub use codex_turn::observe_codex_turn;
 pub mod priced;
