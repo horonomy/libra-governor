@@ -881,6 +881,7 @@ fn charge_in_period(journey: &Journey, label: &str, key: &str, amount: u64) {
         idempotency_key: key.to_string(),
         charge_source: ChargeSource::SubagentTranscript,
         event_time: Some(format!("{}-15T12:00:00Z", &label["monthly-".len()..])),
+        provider: None,
     }) {
         SharedBudgetOutcome::Charged {
             event_time_clamped: false,
