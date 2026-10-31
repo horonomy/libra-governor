@@ -205,11 +205,28 @@ fn command_is_ours(command: &str) -> bool {
             .strip_suffix(suffix)
             .map(str::trim_end)
             .is_some_and(|binary| {
+                let binary = unquote(binary).unwrap_or(binary);
                 Path::new(binary)
                     .file_name()
                     .is_some_and(|name| name == "libra-governor")
             })
     })
+}
+
+/// The path inside one pair of matching shell quotes around the whole binary
+/// part (`'/a b/libra-governor'`), or `None` when it is not wrapped in a
+/// matching pair. A user may quote the path by hand so the shell does not
+/// split it (HORO-2303); the quotes are not part of the file name.
+fn unquote(binary: &str) -> Option<&str> {
+    let inner = binary
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+        .or_else(|| {
+            binary
+                .strip_prefix('"')
+                .and_then(|rest| rest.strip_suffix('"'))
+        })?;
+    (!inner.contains(['\'', '"'])).then_some(inner)
 }
 
 /// `true` only for a loopback host — see module docs on why
@@ -444,8 +461,23 @@ fn command_is_unusable(command: &str) -> bool {
             command
                 .strip_suffix(suffix)
                 .map(str::trim_end)
-                .is_some_and(has_shell_unsafe_char)
+                .is_some_and(|binary| {
+                    // A hand-quoted path is split by no shell; only an unquoted
+                    // (or malformed) one with unsafe characters is unusable.
+                    !is_hand_quoted_and_runnable(binary) && has_shell_unsafe_char(binary)
+                })
         })
+}
+
+/// `true` for a binary part wrapped in matching single quotes, or in matching
+/// double quotes whose content holds no `$`, backtick or backslash, so the
+/// shell passes it to the program as one word.
+fn is_hand_quoted_and_runnable(binary: &str) -> bool {
+    match unquote(binary) {
+        Some(inner) if binary.starts_with('\'') => !inner.is_empty(),
+        Some(inner) => !inner.is_empty() && !inner.contains(['$', '`', '\\']),
+        None => false,
+    }
 }
 
 /// The hook command is `{binary} {subcommand}` run by a shell, unquoted.
@@ -954,10 +986,6 @@ mod tests {
             (
                 "non-all-tools group",
                 format!(r#"{{"hooks":{{"Stop":[{{"matcher":"Bash","hooks":[{{"command":"{unsafe_cmd}"}}]}}]}}}}"#),
-            ),
-            (
-                "hand-quoted command (not recognised as ours)",
-                r#"{"hooks":{"Stop":[{"hooks":[{"command":"\"/opt/legacy path/libra-governor\" hook stop"}]}]}}"#.to_string(),
             ),
             (
                 "lookalike binary name",
@@ -1825,5 +1853,26 @@ mod tests {
             "4 added (3 legacy + PreToolUse), SubagentStop upgraded"
         );
         assert_eq!(apply_hooks_only(&path, &binary()).unwrap().hooks_added, 0);
+    }
+
+    /// HORO-2303 item 1: a hand-quoted binary path is still our command, so
+    /// uninstall removes it and install does not add a duplicate beside it.
+    /// RED before the quote-aware `command_is_ours` (the trailing quote made
+    /// the file name `libra-governor'`); NOT_RUN.
+    #[test]
+    fn a_hand_quoted_binary_path_is_recognised_as_ours() {
+        assert!(command_is_ours("'/opt/my tools/libra-governor' hook stop"));
+        assert!(command_is_ours(
+            "\"/opt/my tools/libra-governor\" hook stop"
+        ));
+    }
+
+    /// Quoting never makes a lookalike ours: the unquoted path's final
+    /// component must still be exactly `libra-governor`, and the quotes must
+    /// match.
+    #[test]
+    fn quoting_does_not_make_a_lookalike_or_a_mismatched_quote_ours() {
+        assert!(!command_is_ours("'/opt/libra-governor-tools/x' hook stop"));
+        assert!(!command_is_ours("'/opt/libra-governor\" hook stop"));
     }
 }
