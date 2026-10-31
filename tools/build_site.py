@@ -57,6 +57,7 @@ class _Next:
 
 _STOP = re.compile(r"[\s)]")  # whitespace or ")"
 _NON_SPACE = re.compile(r"\S")
+_SPACE = re.compile(r"\s")
 
 
 def _search(pattern: re.Pattern[str]) -> Callable[[str, int], int]:
@@ -65,6 +66,54 @@ def _search(pattern: re.Pattern[str]) -> Callable[[str, int], int]:
         return match.start() if match else -1
 
     return find
+
+
+def _find_char(char: str) -> Callable[[str, int], int]:
+    return lambda text, p: text.find(char, p)
+
+
+class _InlineScanner:
+    """Finds `[label](target title?)` candidates; each lookup is cached (see `_Next`)."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self._next_close = _Next(text, _find_char("]"))
+        self._next_paren = _Next(text, _find_char(")"))
+        self._next_stop = _Next(text, _search(_STOP))
+        self._tail_for = -1
+        self._tail: tuple[int, str, str] | None = None
+
+    def tail(self, k: int) -> tuple[int, str, str] | None:
+        """(end, target, title) of what follows the label's closing "]" at k, if a link."""
+        if self._tail_for != k:
+            self._tail_for = k
+            self._tail = self._parse_tail(k)
+        return self._tail
+
+    def _parse_tail(self, k: int) -> tuple[int, str, str] | None:
+        text = self.text
+        e = self._next_stop(k + 2)
+        if e < 0 or e == k + 2:
+            return None  # empty target, or the target runs to the end of the input
+        if text[e] == ")":
+            return e + 1, text[k + 2 : e], ""
+        q = self._next_paren(e)  # whitespace after the target: the title runs to ")"
+        return None if q < 0 else (q + 1, text[k + 2 : e], text[e:q])
+
+    def first_from(self, pos: int) -> tuple[int, int, tuple[int, str, str]] | None:
+        """First `[` at or after pos that starts a link: (j, k, tail)."""
+        text = self.text
+        j = text.find("[", pos)
+        while j >= 0:
+            k = self._next_close(j + 1)
+            if k < 0:
+                return None  # no "]" anywhere later: no further candidate can match
+            if k > j + 1 and text[k + 1 : k + 2] == "(":
+                tail = self.tail(k)
+                if tail is not None:
+                    return j, k, tail
+            j = text.find("[", j + 1)
+        return None
 
 
 def inline_links(text: str) -> Iterator[tuple[int, int, str, str, str, str]]:
@@ -76,42 +125,49 @@ def inline_links(text: str) -> Iterator[tuple[int, int, str, str, str, str]]:
     rescanning to the end of the input (the regex was quadratic: python:S8786).
     """
 
-    next_close = _Next(text, lambda t, p: t.find("]", p))
-    next_paren = _Next(text, lambda t, p: t.find(")", p))
-    next_stop = _Next(text, _search(_STOP))
-    tails: dict[int, tuple[int, str, str] | None] = {}
-    size = len(text)
+    scanner = _InlineScanner(text)
     pos = 0
-    while True:
-        j = text.find("[", pos)
-        if j < 0:
-            return
-        k = next_close(j + 1)
-        if k < 0:
-            return  # no "]" anywhere later: no further candidate can match
-        if k == j + 1 or text[k + 1 : k + 2] != "(":
-            pos = j + 1
-            continue
-        if k not in tails:
-            tails.clear()
-            e = next_stop(k + 2)
-            if e < 0 or e == k + 2:
-                tails[k] = None  # empty target, or target runs to the end of the input
-            elif text[e] == ")":
-                tails[k] = (e + 1, text[k + 2 : e], "")
-            else:  # whitespace after the target: title runs to the next ")"
-                q = next_paren(e)
-                tails[k] = None if q < 0 else (q + 1, text[k + 2 : e], text[e:q])
-        tail = tails[k]
-        if tail is None:
-            pos = j + 1
-            continue
-        end, target, title = tail
+    while (found := scanner.first_from(pos)) is not None:
+        j, k, (end, target, title) = found
         start = j - 1 if j > pos and text[j - 1] == "!" else j
         yield start, end, text[start:j], text[j + 1 : k], target, title
         pos = end
-        if pos >= size:
-            return
+
+
+class _ReferenceScanner:
+    """Finds `[label]: target` lines, tolerating leading blank lines and a next-line target."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self._next_non_space = _Next(text, _search(_NON_SPACE))
+        self._next_close = _Next(text, _find_char("]"))
+
+    def _target_start(self, w: int) -> int:
+        """Index of the target after `[label]:` whose "[" is at w, or -1."""
+        text = self.text
+        if text[w] != "[":
+            return -1
+        k = self._next_close(w + 1)
+        if k <= w + 1 or text[k + 1 : k + 2] != ":":
+            return -1
+        return self._next_non_space(k + 2)
+
+    def first_from(self, p: int) -> tuple[int, int] | None:
+        """First line start at or after p whose line begins a reference: (start, target)."""
+        text = self.text
+        while p <= len(text):
+            w = self._next_non_space(p)
+            if w < 0:
+                return None
+            u = self._target_start(w)
+            if u >= 0:
+                return p, u
+            # Every line start up to w reaches the same "[" and fails with it: skip the run.
+            nl = text.find("\n", w)
+            if nl < 0:
+                return None
+            p = nl + 1
+        return None
 
 
 def reference_links(text: str) -> Iterator[tuple[int, int, str, str, str]]:
@@ -119,42 +175,18 @@ def reference_links(text: str) -> Iterator[tuple[int, int, str, str, str]]:
 
     Exact semantics of the former `^(\\s*\\[[^]]+\\]:\\s*)(\\S+)(.*)$` under
     re.MULTILINE: the prefix may begin at an earlier blank line and the target may sit
-    on a following line. Line starts inside one whitespace run all reach the same
-    "[" and so succeed or fail together; a failure skips the whole run.
+    on a following line.
     """
 
-    next_non_space = _Next(text, _search(_NON_SPACE))
-    next_close = _Next(text, lambda t, p: t.find("]", p))
-    size = len(text)
+    scanner = _ReferenceScanner(text)
     p = 0
-    while p <= size:
-        w = next_non_space(p)
-        if w < 0 or text[w] != "[":
-            if w < 0:
-                return
-            nl = text.find("\n", w)
-            if nl < 0:
-                return
-            p = nl + 1
-            continue
-        k = next_close(w + 1)
-        if k < 0:
-            return
-        u = -1
-        if k > w + 1 and text[k + 1 : k + 2] == ":":
-            u = next_non_space(k + 2)
-        if u < 0:
-            nl = text.find("\n", w)
-            if nl < 0:
-                return
-            p = nl + 1
-            continue
-        v = u
-        while v < size and not text[v].isspace():
-            v += 1
+    while (found := scanner.first_from(p)) is not None:
+        start, u = found
+        match = _SPACE.search(text, u)
+        v = match.start() if match else len(text)
         nl = text.find("\n", v)
-        end = size if nl < 0 else nl
-        yield p, end, text[p:u], text[u:v], text[v:end]
+        end = len(text) if nl < 0 else nl
+        yield start, end, text[start:u], text[u:v], text[v:end]
         if nl < 0:
             return
         p = nl + 1
