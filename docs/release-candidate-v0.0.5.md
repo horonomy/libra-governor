@@ -12,7 +12,7 @@ approved v0.0.5 PR merged (2026-10-31); it is only a candidate until the
 founder names a SHA, and any later merge changes it. Facts below come from the release-evidence directory
 (`PHASE0-RECONCILIATION.md`, `CAMPAIGN-CHECKPOINT.md`,
 `PENDING-VALIDATION-QUEUE.md`, `ACCEPTANCE-MATRIX.md`) and Jira; anything not
-yet known is marked **TBD**. No result is claimed that was not executed.
+yet known is marked as open. No result is claimed that was not executed.
 
 ## Scope
 
@@ -81,8 +81,11 @@ C2 to C5 acceptance criteria are mapped to named tests in the evidence file
   only.
 - No protection against an active same-user adversarial agent (ADR-0026 trust
   boundary).
-- Platform support is unchanged from v0.0.4 (Apple Silicon macOS only) and is
-  **TBD** until re-verified for this build.
+- Platform support is unchanged from v0.0.4: Apple Silicon (aarch64) macOS only.
+  The release workflow builds one target, `aarch64-apple-darwin`; hosted CI also
+  builds and tests on ubuntu and macOS runners, which is test coverage and not a
+  support statement. A clean-machine install of this build was not repeated for
+  v0.0.5.
 - Turns that Codex interrupts or aborts write no usage record; that spend is an
   undetectable under-count and is not covered (pinned by tests as a known
   limit).
@@ -94,7 +97,7 @@ C2 to C5 acceptance criteria are mapped to named tests in the evidence file
 - A long-lived daemon built before C3 rejects `SettleTurn`; an enrolled install
   is then ungated until the daemon restarts. `doctor` probes for this.
 
-## Known limitations (user-facing, TBD against final scope)
+## Known limitations (user-facing)
 
 Carried forward from v0.0.4 unless a merged v0.0.5 change removes them; each
 ticket-backed limit below stays open until its fix is merged and verified.
@@ -146,39 +149,99 @@ release workflow publishes `docs/release-notes/<tag>.md` as the first Release
 body and fails closed, so a placeholder file at that path must not exist until
 the founder-named SHA is frozen. There is no CHANGELOG file in this repository.
 
-> # Libra Governor v0.0.5 (Cooperative Preview) - DRAFT, TBD
+Fields that cannot exist before freeze (and are the only open ones): the
+frozen SHA, the QA result line, and the artifact checksum. The checksum is
+produced by the release workflow when the tag is built
+(`shasum -a 256 libra-governor-aarch64-apple-darwin.tar.gz`, written next to the
+tarball as `.sha256`) and is recorded in the Release; a pre-tag candidate build
+of the same workflow does not fix it, because the tagged build is the shipped
+artifact and bit-for-bit reproducibility is not claimed.
+
+> # Libra Governor v0.0.5 - Cooperative Preview (Apple Silicon macOS) - DRAFT
 >
 > Builds on v0.0.4. Still a **Cooperative Preview, not a hard spending cap.**
+> Every v0.0.4 disclosure still applies except where this text changes it:
+> admission-bounded and cooperative only; in-turn overshoot is possible;
+> amounts are Libra's list-price-equivalent estimates (or flat holds), never
+> your provider bill; only executors whose settlement hooks run and whose
+> records can be read are counted; an unreachable daemon refuses prompts when a
+> budget is configured; Libra is not a security boundary against an agent
+> running as the same operating-system user.
 >
-> Added or changed (final list TBD, only merged and verified items):
-> - Shared-budget lanes are namespaced by provider so Claude Code and Codex
->   sessions that reuse a session id no longer interact (protocol v25;
->   TBD compatibility statement with v24 components).
-> - Opt-in, off by default: Codex turns can be admitted and settled against
->   the shared budget when you create the Codex marker file. Accounting is
->   list-price-equivalent and uses the turn's recorded usage; unmeasured turns
->   book the flat hold. `doctor` reports enrolment, hook trust ("unknown /
->   likely not trusted") and pricing state.
-> - Hardening: `shared-budget` no longer chmods through a state-directory
->   symlink; reinstalling from a different binary path repoints our hooks
->   instead of duplicating them; hand-quoted hook commands are recognised.
-> - `shared-budget export` labels the capacity as the pool-row value.
+> **What is new**
+> - **Opt-in Codex accounting, off by default.** v0.0.4 said Codex is not gated.
+>   In v0.0.5 you can enrol Codex by creating the marker file
+>   `<state-dir>/shared-budget.codex` next to a configured shared budget. Until you
+>   do, Codex behaves exactly as before: nothing is admitted, nothing is charged,
+>   and the ledger is unchanged (covered by named tests). When enrolled, Codex
+>   prompts are admitted against the monthly budget, and each turn is settled
+>   from the turn's recorded usage; a turn that cannot be measured books the flat
+>   hold, never zero. A turn Codex kills or whose final usage record arrives late
+>   is settled or topped up at the next settle, and Libra never refunds.
+>   `libra-governor doctor` and `shared-budget status` report enrolment, whether
+>   the Codex hooks are installed, pricing state and the gaps below.
+> - **Provider-namespaced budget lanes** (protocol v25). Claude Code and Codex
+>   sessions that reuse a session id no longer interact. Run the daemon and the
+>   CLI from the same release: a v24 daemon rejects a request that carries a
+>   provider, and a v25 daemon built before the Codex hooks rejects the new
+>   settle request, which leaves an enrolled install ungated until the daemon is
+>   restarted (`doctor` probes for this).
+> - **Hardening.** `shared-budget` refuses to chmod through a state-directory
+>   symlink; reinstalling the hooks from a different binary path repoints Libra's
+>   own hooks instead of adding a second set; a hand-quoted hook command is
+>   recognised as Libra's; `shared-budget export` labels its capacity as the
+>   pool-row value.
 >
-> Not in this release (unchanged): Codex budget enforcement and the S11
-> gateway cap are off and not enabled; no OpenAI gateway; no remote upload; no
-> strict cross-host cap. Codex support was checked by reading source only; it
-> has not been run against a real provider. Amounts remain Libra's
-> list-price-equivalent estimates, not your provider bill.
+> **Codex limits you should know about**
+> - Codex hooks run only after you trust them in Codex's `/hooks`. Untrusted
+>   hooks are skipped silently and leave an enrolled install ungated; `doctor`
+>   can only say trust is "likely not yet trusted" or "unknown", never "trusted".
+> - Without a `gpt-*` price in `pricing_overrides`, every Codex turn books the
+>   flat hold (unmeasured) and is never trued up.
+> - A Codex turn that is interrupted or aborted writes no usage record, so that
+>   spend is not visible and is under-counted. A turn longer than the one-hour
+>   hold is settled late on partial usage. Codex subagents are neither admitted
+>   nor settled.
+> - Codex support was derived from reading Codex source at tags 0.160, 0.163,
+>   0.164 and 0.165 and from synthetic fixtures. It has not been run against a
+>   real Codex host or provider.
 >
-> All v0.0.4 disclosures that are not explicitly removed above still apply.
-> Platform: TBD (Apple Silicon macOS in v0.0.4).
-> Artifact and checksum: TBD.
+> **Also unchanged and still true:** `shared-budget init --force` replaces the
+> whole budget file with no backup; there is no repair command after a forward
+> clock jump; the end-of-turn sweep has the v0.0.4 file-count and size limits.
+>
+> **Not in this release:** the S11 gateway hard cap, an OpenAI gateway, remote
+> upload, a strict cross-host cap. Enabling any Codex budget control beyond the
+> marker is not part of this release.
+>
+> **What was tested, and what was not.** Automated: 2957 tests passed on the
+> release candidate (fmt, clippy with warnings denied, the full workspace test
+> run), with the disabled-by-default behavior shown by named tests rather than
+> asserted. Each change was reviewed by an independent AI reviewer on its exact
+> head; that is static review, not human review and not a runtime test.
+> **Independent product QA result:** to be recorded at freeze. **Not verified:**
+> a real Codex host, real-provider billing, quota or latency, a fresh-machine
+> install, rollback of a published artifact, and Intel macOS, Linux and Windows.
+>
+> **Platform:** Apple Silicon (aarch64) macOS only. The release workflow builds
+> exactly one target, `aarch64-apple-darwin` (the x86_64 macOS and Linux targets
+> were removed on purpose, ADR-0025 item 7); other platforms are neither
+> supported nor verified.
+>
+> **Artifact:** `libra-governor-aarch64-apple-darwin.tar.gz` with its `.sha256`
+> and a GitHub build-provenance attestation
+> (`gh attestation verify <file> --repo horonomy/libra-governor`). Checksum and
+> frozen SHA: recorded in the Release at publication.
 
 ## Rollback
 
-Unchanged from v0.0.4: the budget is opt-in and file-driven. Delete
-`shared-budget.json` in the state directory to turn it off (the daemon re-reads
-it on every decision); `libra-governor uninstall` removes the hooks. If the
-protocol v25 bump ships, a mixed v24/v25 install is **TBD** (not yet tested);
-reinstall both binaries from the same release. Rollback of a published
-artifact is not yet evidenced.
+Unchanged in mechanism from v0.0.4: the budget is opt-in and file-driven.
+- To turn Codex accounting off, delete the marker `<state-dir>/shared-budget.codex`;
+  the daemon and the hooks re-check it on every call, so settlement and admission
+  return to inert immediately (covered by named tests).
+- To turn the whole budget off, delete `shared-budget.json` (the daemon re-reads
+  it on every decision). `libra-governor uninstall` removes Libra's hooks.
+- A mixed install of v0.0.4 and v0.0.5 components is not supported: reinstall
+  both binaries from the same release. A v24 daemon rejects any request carrying
+  `provider`; a v25 daemon built before the Codex hooks rejects `SettleTurn`.
+- Rollback of a published artifact is not evidenced.
