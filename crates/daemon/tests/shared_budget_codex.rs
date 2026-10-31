@@ -973,3 +973,51 @@ fn an_early_stop_for_t1_on_a_shared_hold_under_charges_t2_until_the_c4_true_up()
         "T2's 276 cents are not booked"
     );
 }
+
+// ---------------------------------------------------------------------
+// HORO-2285 (C5): the doctor's stale-daemon probe is a Codex Check.
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_codex_check_under_the_marker_answers_for_real_and_writes_nothing() {
+    let mut f = fx();
+    // Give the ledger a period pool first so the comparison is of a live
+    // ledger, not an empty one.
+    f.admit("turn-seed");
+    let before = f.fingerprint();
+    let outcome = {
+        let rt = &f.rt;
+        let ledger = f.ledger.as_mut().unwrap();
+        libra_governor_daemon::shared_budget::check(
+            ledger,
+            rt,
+            "libra-doctor-codex-probe",
+            None,
+            Some("codex"),
+        )
+        .unwrap()
+    };
+    assert!(
+        matches!(outcome, SharedBudgetOutcome::Checked { .. }),
+        "an enrolled current daemon answers a real outcome: {outcome:?}"
+    );
+    assert_eq!(f.fingerprint(), before, "Check must write nothing");
+}
+
+#[test]
+fn a_codex_check_without_the_marker_is_not_configured_and_writes_nothing() {
+    let mut f = fx_with_hold(HOLD, true, false);
+    let before = f.fingerprint();
+    let rt = &f.rt;
+    let ledger = f.ledger.as_mut().unwrap();
+    let outcome = libra_governor_daemon::shared_budget::check(
+        ledger,
+        rt,
+        "libra-doctor-codex-probe",
+        None,
+        Some("codex"),
+    )
+    .unwrap();
+    assert!(matches!(outcome, SharedBudgetOutcome::NotConfigured));
+    assert_eq!(f.fingerprint(), before);
+}

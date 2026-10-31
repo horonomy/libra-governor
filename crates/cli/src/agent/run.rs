@@ -38,7 +38,7 @@ use crate::client;
 /// Code never uses this route regardless of the flag: its byte-exact
 /// contract with the legacy path (`crates/cli/tests/agent_contract.rs`)
 /// stays untouched.
-fn codex_owner_route_enabled() -> bool {
+pub(crate) fn codex_owner_route_enabled() -> bool {
     std::env::var("LIBRA_GOVERNOR_CODEX_EXECUTION_OWNER")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)

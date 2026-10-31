@@ -952,6 +952,14 @@ The executor key in this ADR is `(host_id, provider, session_id, agent_id | null
   - **No heartbeat.** Codex has no PostToolUse hold renewal here; a turn longer than the 1 h hold expires and C4 orphan recovery settles it.
   - **Serial daemon.** `SettleTurn` runs `settle_codex_turn` inside the daemon's serial request loop with the ledger borrowed, like the Claude `Stop` settlement; the rollout read is bounded by the reader's caps (C2). It is not measured outside the ledger borrow in this slice.
 
+### Codex operator surfaces (HORO-2285, C5, v0.0.5, dark)
+
+- Reporting only; no admission or settlement semantics, no protocol field and no wire byte change (`PROTOCOL_VERSION` stays 25). With the `shared-budget.codex` marker absent, `doctor` and `status` print exactly what they printed before (pinned by byte goldens recorded from the C3-head binary for a budget-present, marker-absent fixture and a no-budget fixture; the claim covers those fixtures).
+- `doctor`, enrolled only: `codex_enrolment` (marker state; marker without a budget file is a Warn; marker plus `LIBRA_GOVERNOR_CODEX_EXECUTION_OWNER` in doctor's own environment is an Error), `codex_enrolled_hooks` (wiring and trust, a Warn because trust cannot be proven locally), `codex_pricing` (Warn when no `pricing_overrides` model id starts with `gpt`, since the pinned table prices no OpenAI model and every turn books the flat hold), `codex_daemon_admission` and `codex_limits`.
+- **Stale-daemon probe.** The running daemon is asked one Codex-provider `Check` with the synthetic session `libra-doctor-codex-probe`, `agent_id` absent. `Check` is a read (`check` takes `&LedgerStore`: no pool is created, nothing is reserved or swept; pinned by a daemon test that compares every ledger table before and after). A current daemon answers a real outcome under the marker; a v25 build that predates C3 answers `not_configured`, reported as an Error. An unreachable daemon is a Warn and doctor never starts one. The Error is judged from the local stat of the budget file and the marker (the same facts the hook uses), not from the `Status` answer, so it still fires when `Status` fails.
+- `status`: the not-covered list is the unchanged const unless a budget exists and the regular marker file sits in the state directory; then the "Codex route has no budget gate" line is replaced by the remaining Codex gaps. The `agents` capability row stays Unavailable; its detail names the experimental marker.
+- Follow-up, not done here: the C4 `codex_recovery_errors` telemetry (and `unadmitted_turns`) is not a `SharedBudgetStatus` field; surfacing it needs an additive optional protocol field on the C4 branch.
+
 ## Consequences
 
 - Once slices S4-S8 land (design intent), refusal before spend at prompt

@@ -102,7 +102,8 @@ pub fn budget_file_present() -> bool {
 
 /// Marker file name under the daemon state directory (the daemon owns the
 /// meaning; the hook only stats it).
-const CODEX_MARKER_FILE_NAME: &str = libra_governor_daemon::shared_budget::CODEX_MARKER_FILE_NAME;
+pub(crate) const CODEX_MARKER_FILE_NAME: &str =
+    libra_governor_daemon::shared_budget::CODEX_MARKER_FILE_NAME;
 
 /// Hard wall-clock budget for the Codex `Stop` settlement round trip. Stop is
 /// never denied and must not stall the host behind the budget.

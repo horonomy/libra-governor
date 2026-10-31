@@ -70,6 +70,32 @@ hook schemas vs. what remains unverified.
     `/hooks`.** Untrusted (or changed-since-trusted) hooks are skipped by
     Codex without any signal, so an enrolled but untrusted install is
     silently **ungated**. `doctor` cannot prove trust (see "Trust gate").
+  - **`doctor` and `shared-budget status` while enrolled (HORO-2285).**
+    With no marker, `doctor` prints nothing Codex-enrolment-related and its
+    output is byte-identical to before. With the marker it adds, by finding id:
+    - `codex_enrolment`: the marker state (Ok), a marker with no
+      `shared-budget.json` (Warn, nothing is enrolled), or the marker together
+      with `LIBRA_GOVERNOR_CODEX_EXECUTION_OWNER` in doctor's own environment
+      (Error, every Codex prompt is blocked);
+    - `codex_enrolled_hooks`: whether the three hooks are wired and the trust
+      state (likely not yet trusted / unknown / disabled), always a Warn
+      because doctor cannot prove trust;
+    - `codex_pricing`: a Warn when no `pricing_overrides` model id starts with
+      `gpt` (every turn then books the flat hold; a Codex model id that does
+      not start with `gpt` is not recognised by this check);
+    - `codex_daemon_admission`: a read-only Codex `Check` with a synthetic
+      session probes the running daemon. `not_configured` is an **Error**
+      ("enrolled but the running daemon is not honouring Codex admission
+      (restart/upgrade the daemon)"), a real answer is Ok, an unreachable
+      daemon stays a Warn and the daemon is never started;
+    - `codex_limits`: the known limits listed above.
+
+    `shared-budget status` swaps the "Codex route has no budget gate" line of
+    its not-covered list for the remaining Codex gaps (subagents, no
+    PreToolUse, no heartbeat, unmapped no-`turn_id` prompts, untrusted hooks
+    ungated, unpriced models at the flat hold). The guarantee label stays
+    `admission-bounded (cooperative)`, and the `agents` capability row stays
+    Unavailable.
 - `libra-governor agents [--json]` — the capability matrix for both
   agents this integration knows about (see "Capability tiers" below).
 
