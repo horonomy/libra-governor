@@ -20,7 +20,8 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use libra_governor_daemon::shared_budget::{
-    budget_lane, settle_codex_turn, status, CodexSettlement, ManualClock, SharedBudgetRuntime,
+    budget_lane, settle_codex_turn, status, Clock, CodexSettlement, ManualClock,
+    SharedBudgetRuntime,
 };
 use libra_governor_daemon::shared_budget_file::SHARED_BUDGET_FILE_NAME;
 use libra_governor_daemon::usage::codex_priced::price_codex_turn;
@@ -90,7 +91,7 @@ impl Fx {
         }
         let clock = Arc::new(ManualClock::new(t(BASE)));
         let rt = SharedBudgetRuntime::load(dir.path()).with_clock(clock.clone());
-        let ledger = Some(LedgerStore::open(&dir.path().join("ledger.sqlite3")).unwrap());
+        let ledger = Some(LedgerStore::open(dir.path().join("ledger.sqlite3")).unwrap());
         Self {
             hold,
             dir,
@@ -109,7 +110,7 @@ impl Fx {
     fn restart(&mut self) {
         self.ledger = None;
         self.rt = SharedBudgetRuntime::load(self.dir.path()).with_clock(self.clock.clone());
-        self.ledger = Some(LedgerStore::open(&self.dir.path().join("ledger.sqlite3")).unwrap());
+        self.ledger = Some(LedgerStore::open(self.dir.path().join("ledger.sqlite3")).unwrap());
     }
 
     /// What `admit` does for a main-lane prompt, on the derived Codex lane:
@@ -504,7 +505,10 @@ fn a_replayed_settle_turn_writes_nothing() {
     fx.settle("turn-a", Some(MODEL), Some(&path));
     let before = fx.fingerprint();
     let again = fx.settle("turn-a", Some(MODEL), Some(&path));
-    assert!(matches!(again, CodexSettlement::AlreadySettled), "{again:?}");
+    assert!(
+        matches!(again, CodexSettlement::AlreadySettled),
+        "{again:?}"
+    );
     assert_eq!(fx.fingerprint(), before, "a replay writes no row");
 }
 
@@ -522,7 +526,10 @@ fn settle_turn_for_t1_after_admit_of_t2_leaves_the_t2_hold_untouched() {
     let before = fx.fingerprint();
     // A late or duplicate Stop for T1 must not settle T2's pending hold.
     let again = fx.settle("turn-1", Some(MODEL), Some(&path));
-    assert!(matches!(again, CodexSettlement::AlreadySettled), "{again:?}");
+    assert!(
+        matches!(again, CodexSettlement::AlreadySettled),
+        "{again:?}"
+    );
     assert_eq!(fx.fingerprint(), before);
     let pending: Vec<_> = fx
         .holds()
@@ -642,7 +649,9 @@ fn a_post_hoc_charge_is_idempotent_on_retry() {
     let before = fx.fingerprint();
     let again = fx.settle("turn-x", Some(MODEL), Some(&path));
     match again {
-        CodexSettlement::Unadmitted { already_charged, .. } => assert!(already_charged),
+        CodexSettlement::Unadmitted {
+            already_charged, ..
+        } => assert!(already_charged),
         other => panic!("expected Unadmitted, got {other:?}"),
     }
     assert_eq!(fx.fingerprint(), before);
@@ -690,7 +699,10 @@ fn a_restart_between_admit_and_settle_settles_exactly_once() {
     assert_eq!(settled(&first), (BIG_CENTS, true, None));
     fx.restart();
     let second = fx.settle("turn-a", Some(MODEL), Some(&path));
-    assert!(matches!(second, CodexSettlement::AlreadySettled), "{second:?}");
+    assert!(
+        matches!(second, CodexSettlement::AlreadySettled),
+        "{second:?}"
+    );
     assert_eq!(fx.holds().len(), 1);
     assert_eq!(fx.used_reserved(), (BIG_CENTS, 0));
 }
@@ -755,7 +767,7 @@ fn without_the_marker_every_codex_settle_is_not_configured_and_writes_zero_rows(
 
 #[test]
 fn the_marker_is_read_on_every_call_so_removing_it_switches_the_path_off() {
-    let mut fx = fx();
+    let fx = fx();
     assert!(fx.rt.codex_enrolled());
     std::fs::remove_file(fx.dir.path().join("shared-budget.codex")).unwrap();
     assert!(!fx.rt.codex_enrolled());
@@ -771,4 +783,75 @@ fn an_unusable_turn_id_is_not_applicable_and_writes_nothing() {
         assert!(matches!(out, CodexSettlement::NotApplicable), "{out:?}");
     }
     assert_eq!(fx.fingerprint(), before);
+}
+
+#[test]
+fn a_codex_request_answers_not_configured_and_writes_nothing_with_or_without_the_marker() {
+    use libra_governor_daemon::shared_budget::{admit, charge, check};
+    use libra_governor_protocol::SharedBudgetOutcome;
+    for marker in [false, true] {
+        let mut fx = fx_with_hold(HOLD, true, marker);
+        let before = fx.fingerprint();
+        let rt = &fx.rt;
+        let ledger = fx.ledger.as_mut().unwrap();
+        let admitted = admit(ledger, rt, SESSION, None, Some("turn-a"), Some("codex")).unwrap();
+        assert!(
+            matches!(admitted, SharedBudgetOutcome::NotConfigured),
+            "{admitted:?}"
+        );
+        let checked = check(ledger, rt, SESSION, None, Some("codex")).unwrap();
+        assert!(
+            matches!(checked, SharedBudgetOutcome::NotConfigured),
+            "{checked:?}"
+        );
+        let charged = charge(
+            ledger,
+            rt,
+            SESSION,
+            None,
+            5,
+            "k",
+            ChargeSource::TurnHold,
+            None,
+            Some("codex"),
+        )
+        .unwrap();
+        assert!(
+            matches!(charged, SharedBudgetOutcome::NotConfigured),
+            "{charged:?}"
+        );
+        assert_eq!(
+            fx.fingerprint(),
+            before,
+            "marker={marker}: nothing reserved or charged"
+        );
+    }
+}
+
+#[test]
+fn removing_the_marker_after_enabling_returns_settlement_to_inert() {
+    let mut fx = fx();
+    fx.admit("turn-a");
+    fx.admit("turn-b");
+    let path = fx.rollout("r.jsonl", &turn_lines("turn-a", TURN_BIG));
+    // Enrolled: an unadmitted turn is charged.
+    let on = fx.settle("turn-x", Some(MODEL), None);
+    assert!(matches!(on, CodexSettlement::Unadmitted { .. }), "{on:?}");
+    std::fs::remove_file(fx.dir.path().join("shared-budget.codex")).unwrap();
+    let before = fx.fingerprint();
+    let off_hold = fx.settle("turn-a", Some(MODEL), Some(&path));
+    let off_charge = fx.settle("turn-y", Some(MODEL), None);
+    assert!(
+        matches!(off_hold, CodexSettlement::NotConfigured),
+        "{off_hold:?}"
+    );
+    assert!(
+        matches!(off_charge, CodexSettlement::NotConfigured),
+        "{off_charge:?}"
+    );
+    assert_eq!(
+        fx.fingerprint(),
+        before,
+        "whole ledger unchanged once inert"
+    );
 }
