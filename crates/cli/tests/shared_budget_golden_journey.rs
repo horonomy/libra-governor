@@ -221,6 +221,7 @@ impl Journey {
             session_id: session.to_string(),
             agent_id: None,
             prompt_id: None,
+            provider: None,
         })
     }
 
@@ -412,6 +413,7 @@ fn golden_admit_worker_entrypoint() {
             session_id: session.to_string(),
             agent_id: None,
             prompt_id: None,
+            provider: None,
         },
     )
     .expect("daemon answered");
