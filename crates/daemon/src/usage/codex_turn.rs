@@ -225,6 +225,24 @@ impl CodexUsageFields {
         field.unwrap_or(0).max(0)
     }
 
+    /// A negative count is impossible for a real turn. `get` would clamp it
+    /// to 0 before any consistency check, letting an unmeasurable turn read
+    /// as `Measured` and book zero instead of the flat hold, so it must be
+    /// rejected before the clamp is applied.
+    fn has_negative(&self) -> bool {
+        [
+            self.input_tokens,
+            self.cached_input_tokens,
+            self.cache_write_input_tokens,
+            self.output_tokens,
+            self.reasoning_output_tokens,
+            self.total_tokens,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|count| count < 0)
+    }
+
     /// The per-record self-consistency invariants this module's docs claim
     /// always hold for real Codex output. A violation here is a format-
     /// drift signal, not something to silently clamp away.
@@ -525,6 +543,9 @@ fn step(
                 Some(_) => {}
                 None => *seen_thread_id = Some(payload.thread_id.clone()),
             }
+            if payload.usage.has_negative() || payload.turn_token_usage.has_negative() {
+                return ControlFlow::Break(StepOutcome::Inconsistent);
+            }
             if !payload.usage.internally_consistent() {
                 return ControlFlow::Break(StepOutcome::Inconsistent);
             }
@@ -796,6 +817,48 @@ mod tests {
         let f = write_lines(&[
             task_started(T1),
             usage_record(T1, THREAD, SESSION, 10, 0, 0, 5, 0, 999, 0, 0, 999, 0),
+        ]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        assert_eq!(
+            observed,
+            UsageObservation::Unavailable(UsageUnavailable::Inconsistent)
+        );
+    }
+
+    #[test]
+    fn negative_counters_are_inconsistent_not_zero() {
+        // (label, usage = input, cached, write, output, reasoning). The
+        // running total mirrors `usage` so only the negative is wrong.
+        let cases: [(&str, [i64; 5]); 5] = [
+            ("negative input and output", [-5, 0, 0, -7, 0]),
+            ("negative input", [-5, 0, 0, 7, 0]),
+            ("negative output", [10, 0, 0, -7, 0]),
+            ("negative cached", [10, -3, 0, 5, 0]),
+            (
+                "negative cache write in otherwise consistent usage",
+                [10, 2, -4, 5, 1],
+            ),
+        ];
+        for (label, [i, c, w, o, r]) in cases {
+            let f = write_lines(&[
+                task_started(T1),
+                usage_record(T1, THREAD, SESSION, i, c, w, o, r, i, c, w, o, r),
+            ]);
+            let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+            assert_eq!(
+                observed,
+                UsageObservation::Unavailable(UsageUnavailable::Inconsistent),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn negative_running_total_is_inconsistent_not_zero() {
+        // `usage` is valid; only the turn's running total is negative.
+        let f = write_lines(&[
+            task_started(T1),
+            usage_record(T1, THREAD, SESSION, 0, 0, 0, 0, 0, -5, 0, 0, -7, 0),
         ]);
         let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
         assert_eq!(
