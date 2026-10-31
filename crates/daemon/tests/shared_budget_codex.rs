@@ -75,6 +75,8 @@ fn lane() -> String {
 }
 
 struct Fx {
+    /// The configured per-turn hold, for helpers that reserve directly.
+    hold: u64,
     dir: tempfile::TempDir,
     clock: Arc<ManualClock>,
     rt: SharedBudgetRuntime,
@@ -92,6 +94,7 @@ impl Fx {
         let rt = SharedBudgetRuntime::load(dir.path()).with_clock(clock.clone());
         let ledger = Some(LedgerStore::open(dir.path().join("ledger.sqlite3")).unwrap());
         Self {
+            hold: HOLD,
             dir,
             clock,
             rt,
@@ -197,7 +200,9 @@ impl Fx {
 }
 
 fn fx_with_hold(hold: u64, overrides: bool, marker: bool) -> Fx {
-    Fx::new(&cfg_json(hold, overrides), marker)
+    let mut fx = Fx::new(&cfg_json(hold, overrides), marker);
+    fx.hold = hold;
+    fx
 }
 
 fn fx() -> Fx {
