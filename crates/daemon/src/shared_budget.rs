@@ -82,6 +82,14 @@ const POOL_PREFIX: &str = "metered:local-budget/monthly-";
 /// Holds of this owner, across periods, share this prefix.
 const OWNER_POOL_PREFIX: &str = "metered:local-budget/";
 const RESERVED_SESSION_PREFIX: &str = "execution-owner-v1:";
+/// Reserved prefix of a derived non-Claude budget lane key. A client may
+/// never name a session that starts with it (see [`validate_identity`]), so
+/// no native session id can collide with a derived key (HORO-2281).
+pub const PROVIDER_LANE_PREFIX: &str = "shared-budget-provider-v1:";
+/// The provider whose lane keys are the raw session id, byte for byte.
+const CLAUDE_PROVIDER: &str = "claude-code";
+/// The one other provider the budget derives a lane for.
+const CODEX_PROVIDER: &str = "codex";
 
 /// A source of "now". Injectable so rollover and timezone-boundary tests
 /// are deterministic without sleeping.
@@ -382,8 +390,70 @@ fn denied(
     }
 }
 
+/// Validates a client identity and derives the budget lane its holds live
+/// on. `Err` is the outcome to return unchanged: a refusal, or `NotConfigured`
+/// for a Codex lane, which stays inert until the Codex settlement exists
+/// (HORO-2282): nothing is read, reserved or written for it.
+fn admission_lane(
+    session_id: &str,
+    agent_id: Option<&str>,
+    provider: Option<&str>,
+) -> Result<(ExecutorKind, String), SharedBudgetOutcome> {
+    let kind = validate_identity(session_id, agent_id).map_err(refused)?;
+    let lane = budget_lane(session_id, provider).map_err(refused)?;
+    if provider == Some(CODEX_PROVIDER) {
+        return Err(SharedBudgetOutcome::NotConfigured);
+    }
+    Ok((kind, lane))
+}
+
 fn refused(reason: SharedBudgetRefusal) -> SharedBudgetOutcome {
     SharedBudgetOutcome::Refused { reason }
+}
+
+/// What `admit` and `check` both establish before touching the ledger.
+struct GateContext {
+    kind: ExecutorKind,
+    lane: String,
+    cfg: SharedBudgetConfig,
+    now: OffsetDateTime,
+    period: Period,
+}
+
+/// Runs the checks `admit` and `check` share: the budget is configured, the
+/// identity and lane are valid, and no later pool has superseded the current
+/// period. The inner `Err` is the outcome to return unchanged.
+fn gate_context(
+    rt: &SharedBudgetRuntime,
+    ledger: &LedgerStore,
+    session_id: &str,
+    agent_id: Option<&str>,
+    provider: Option<&str>,
+) -> Result<Result<GateContext, SharedBudgetOutcome>, SharedBudgetError> {
+    let state = rt.effective().state;
+    if matches!(state, SharedBudgetFileState::Absent) {
+        return Ok(Err(SharedBudgetOutcome::NotConfigured));
+    }
+    let (kind, lane) = match admission_lane(session_id, agent_id, provider) {
+        Ok(admitted) => admitted,
+        Err(outcome) => return Ok(Err(outcome)),
+    };
+    let cfg = match configured(&state) {
+        Ok(cfg) => cfg,
+        Err(outcome) => return Ok(Err(outcome)),
+    };
+    let now = rt.now();
+    let period = period_at(&cfg, now)?;
+    if let Some(later) = later_pool(ledger, &period)? {
+        return Ok(Err(anomaly(&later, &period)));
+    }
+    Ok(Ok(GateContext {
+        kind,
+        lane,
+        cfg,
+        now,
+        period,
+    }))
 }
 
 /// Either the usable configuration or the outcome that ends the request.
@@ -400,6 +470,35 @@ fn configured(state: &SharedBudgetFileState) -> Result<SharedBudgetConfig, Share
     }
 }
 
+/// Whether a request's provider is the Claude Code lane (absent or
+/// `"claude-code"`). The Claude settlement and subagent sweep read Claude
+/// transcripts and must never run for another provider's request (HORO-2281).
+pub fn is_claude_provider(provider: Option<&str>) -> bool {
+    matches!(provider, None | Some(CLAUDE_PROVIDER))
+}
+
+/// The budget lane session key for a wire `(provider, session_id)`.
+///
+/// `None` or `"claude-code"` keep the raw session id, so existing rows and
+/// every Claude byte are unchanged. `"codex"` gets a derived, reserved-prefix
+/// key built from the JSON array `["codex", session_id]`, which is injective
+/// in `(provider, session_id)`. Any other provider is refused and never
+/// falls back to the Claude lane.
+pub fn budget_lane(
+    session_id: &str,
+    provider: Option<&str>,
+) -> Result<String, SharedBudgetRefusal> {
+    match provider {
+        None | Some(CLAUDE_PROVIDER) => Ok(session_id.to_string()),
+        Some(CODEX_PROVIDER) => {
+            let tuple = serde_json::to_string(&[CODEX_PROVIDER, session_id])
+                .map_err(|_| SharedBudgetRefusal::UnsupportedProvider)?;
+            Ok(format!("{PROVIDER_LANE_PREFIX}{tuple}"))
+        }
+        Some(_) => Err(SharedBudgetRefusal::UnsupportedProvider),
+    }
+}
+
 fn validate_identity(
     session_id: &str,
     agent_id: Option<&str>,
@@ -407,7 +506,9 @@ fn validate_identity(
     if session_id.trim().is_empty() {
         return Err(SharedBudgetRefusal::EmptySessionId);
     }
-    if session_id.trim_start().starts_with(RESERVED_SESSION_PREFIX) {
+    if session_id.trim_start().starts_with(RESERVED_SESSION_PREFIX)
+        || session_id.trim_start().starts_with(PROVIDER_LANE_PREFIX)
+    {
         return Err(SharedBudgetRefusal::ReservedSessionScope);
     }
     match agent_id {
@@ -613,26 +714,21 @@ pub fn admit(
     session_id: &str,
     agent_id: Option<&str>,
     prompt_id: Option<&str>,
+    provider: Option<&str>,
 ) -> Result<SharedBudgetOutcome, SharedBudgetError> {
     let prompt_id = usable_prompt(prompt_id);
-    let state = rt.effective().state;
-    if matches!(state, SharedBudgetFileState::Absent) {
-        return Ok(SharedBudgetOutcome::NotConfigured);
-    }
-    let kind = match validate_identity(session_id, agent_id) {
-        Ok(kind) => kind,
-        Err(reason) => return Ok(refused(reason)),
-    };
-    let cfg = match configured(&state) {
-        Ok(cfg) => cfg,
+    let GateContext {
+        kind,
+        lane,
+        cfg,
+        now,
+        period,
+    } = match gate_context(rt, ledger, session_id, agent_id, provider)? {
+        Ok(context) => context,
         Err(outcome) => return Ok(outcome),
     };
+    let session_id = lane.as_str();
     let cfg = &cfg;
-    let now = rt.now();
-    let period = period_at(cfg, now)?;
-    if let Some(later) = later_pool(ledger, &period)? {
-        return Ok(anomaly(&later, &period));
-    }
     ensure_period_pool(ledger, &period.pool_id, cfg, now)?;
     ledger.expire_stale_shared_pool_reservations(now)?;
 
@@ -801,25 +897,20 @@ pub fn check(
     rt: &SharedBudgetRuntime,
     session_id: &str,
     agent_id: Option<&str>,
+    provider: Option<&str>,
 ) -> Result<SharedBudgetOutcome, SharedBudgetError> {
-    let state = rt.effective().state;
-    if matches!(state, SharedBudgetFileState::Absent) {
-        return Ok(SharedBudgetOutcome::NotConfigured);
-    }
-    let kind = match validate_identity(session_id, agent_id) {
-        Ok(kind) => kind,
-        Err(reason) => return Ok(refused(reason)),
-    };
-    let cfg = match configured(&state) {
-        Ok(cfg) => cfg,
+    let GateContext {
+        kind,
+        lane,
+        cfg,
+        now,
+        period,
+    } = match gate_context(rt, ledger, session_id, agent_id, provider)? {
+        Ok(context) => context,
         Err(outcome) => return Ok(outcome),
     };
+    let session_id = lane.as_str();
     let cfg = &cfg;
-    let now = rt.now();
-    let period = period_at(cfg, now)?;
-    if let Some(later) = later_pool(ledger, &period)? {
-        return Ok(anomaly(&later, &period));
-    }
     let remaining = remaining_of(ledger, &period.pool_id, cfg, now)?;
     let lane_hold = ledger.active_shared_hold_for_lane(
         &period.pool_id,

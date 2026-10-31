@@ -699,13 +699,14 @@ pub(crate) fn dispatch(
             tool_name,
             agent_id,
             provider,
-        } => match handle_tool_invoked_for_lane(
+        } => match handle_tool_invoked_for_provider_lane(
             &session_id,
             &crate::legacy_executor::lane_key(
                 &session_id,
                 agent_id.as_deref(),
                 provider.as_deref(),
             ),
+            provider.as_deref(),
             &tool_name,
             ledger,
             current_task,
@@ -898,17 +899,26 @@ pub(crate) fn dispatch(
                     session_id,
                     agent_id,
                     prompt_id,
+                    provider,
                 } => crate::shared_budget::admit(
                     ledger,
                     rt,
                     &session_id,
                     agent_id.as_deref(),
                     prompt_id.as_deref(),
+                    provider.as_deref(),
                 ),
                 SharedBudgetRequest::Check {
                     session_id,
                     agent_id,
-                } => crate::shared_budget::check(ledger, rt, &session_id, agent_id.as_deref()),
+                    provider,
+                } => crate::shared_budget::check(
+                    ledger,
+                    rt,
+                    &session_id,
+                    agent_id.as_deref(),
+                    provider.as_deref(),
+                ),
                 SharedBudgetRequest::ChargeAgent {
                     session_id,
                     agent_id,
@@ -1881,12 +1891,40 @@ fn handle_tool_invoked_for_lane(
     current_task: &mut Option<TaskSummary>,
     config: &DaemonConfig,
 ) -> Result<(), DaemonError> {
+    handle_tool_invoked_for_provider_lane(
+        session_id,
+        lane,
+        None,
+        tool_name,
+        ledger,
+        current_task,
+        config,
+    )
+}
+
+/// As [`handle_tool_invoked_for_lane`], for a request that names its
+/// `provider`. The shared-budget heartbeat renews the hold of the budget lane
+/// that provider maps to (HORO-2281), never another provider's hold that
+/// happens to share the raw session id.
+fn handle_tool_invoked_for_provider_lane(
+    session_id: &str,
+    lane: &str,
+    provider: Option<&str>,
+    tool_name: &str,
+    ledger: &mut LedgerStore,
+    current_task: &mut Option<TaskSummary>,
+    config: &DaemonConfig,
+) -> Result<(), DaemonError> {
     let now = time::OffsetDateTime::now_utc();
     // Best-effort keep-alive for the session's shared-budget holds. It runs
     // before the early returns below (the local budget needs no
-    // pre-established session) and can never fail the tool event.
-    if let Err(e) = crate::shared_budget::heartbeat(ledger, &config.shared_budget, session_id) {
-        log::append_line(&config.log_path, &format!("shared budget heartbeat: {e}"));
+    // pre-established session) and can never fail the tool event. A provider
+    // the budget does not serve renews nothing.
+    if let Ok(budget_lane) = crate::shared_budget::budget_lane(session_id, provider) {
+        if let Err(e) = crate::shared_budget::heartbeat(ledger, &config.shared_budget, &budget_lane)
+        {
+            log::append_line(&config.log_path, &format!("shared budget heartbeat: {e}"));
+        }
     }
     ledger.increment_tool_call_count(lane)?;
     let same_tool_streak = ledger.record_tool_invocation(lane, tool_name, now)?;
@@ -2319,6 +2357,8 @@ fn handle_finalize_for_lane(
     current_task: &mut Option<TaskSummary>,
     config: &DaemonConfig,
 ) -> Result<FinalizeOutcome, DaemonError> {
+    // Claude Code lane only (HORO-2281): a Codex `Finalize` carrying the same raw
+    // session id must not settle or sweep a Claude hold with a Claude reader.
     // The local monthly shared budget (HORO-2196, ADR-0026): settle the
     // session's turn hold from the priced transcript window. It needs no
     // preflight task, so it runs before and independently of the legacy
@@ -2327,7 +2367,9 @@ fn handle_finalize_for_lane(
     // behaves exactly as it did. A failure is logged and never fails the
     // receipt: the unsettled hold simply stays reserved until its TTL
     // reclaims it, which over-reserves and never under-reserves.
-    if config.shared_budget.is_configured() {
+    if config.shared_budget.is_configured()
+        && crate::shared_budget::is_claude_provider(provider.as_deref())
+    {
         match crate::shared_budget::settle_turn(
             ledger,
             &config.shared_budget,

@@ -38,12 +38,20 @@ pub enum SharedBudgetRequest {
         /// Makes a retried `Admit` idempotent. When absent a fresh nonce
         /// is used.
         prompt_id: Option<String>,
+        /// The host this lane belongs to. Absent or `"claude-code"` is the
+        /// Claude Code lane and serializes to exactly the v24 bytes; any
+        /// other provider is never mapped onto a Claude lane (HORO-2281).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
     },
     /// Cheap read for tool-time checks: remaining budget and state only.
     /// Never creates a pool and never reserves.
     Check {
         session_id: String,
         agent_id: Option<String>,
+        /// See [`SharedBudgetRequest::Admit`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
     },
     /// Record spend that already happened (a subagent's transcript usage,
     /// for example) as settled spend attributed to an executor. Never
@@ -131,6 +139,9 @@ pub enum SharedBudgetRefusal {
     ReservedSessionScope,
     /// `agent_id` is present but empty.
     InvalidAgentId,
+    /// `provider` names a host the budget does not serve. Never mapped onto
+    /// another provider's lane (HORO-2281).
+    UnsupportedProvider,
     InvalidAmount,
     /// One charge above ten times the monthly cap, or one that would push
     /// the pool's total past the range the ledger can add safely.
@@ -444,6 +455,7 @@ mod tests {
             session_id: "s".into(),
             agent_id: None,
             prompt_id: Some("p".into()),
+            provider: None,
         };
         let json = serde_json::to_value(&admit).unwrap();
         assert_eq!(json["op"], "admit");
@@ -461,7 +473,8 @@ mod tests {
             minimal,
             SharedBudgetRequest::Check {
                 session_id: "s".into(),
-                agent_id: None
+                agent_id: None,
+                provider: None,
             }
         );
         let status: SharedBudgetRequest = serde_json::from_str(r#"{"op":"status"}"#).unwrap();
@@ -666,6 +679,72 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&refused).unwrap()["reason"],
             "no_settled_lane"
+        );
+    }
+
+    /// Claude-visible wire bytes are frozen (HORO-2281, C1): adding a
+    /// provider to the protocol must not change what a Claude Admit or
+    /// Check serializes to.
+    #[test]
+    fn claude_admit_and_check_serialize_to_the_v24_bytes() {
+        let admit = SharedBudgetRequest::Admit {
+            session_id: "s".into(),
+            agent_id: None,
+            prompt_id: Some("p".into()),
+            provider: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&admit).unwrap(),
+            r#"{"op":"admit","session_id":"s","agent_id":null,"prompt_id":"p"}"#
+        );
+        let check = SharedBudgetRequest::Check {
+            session_id: "s".into(),
+            agent_id: Some("a".into()),
+            provider: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&check).unwrap(),
+            r#"{"op":"check","session_id":"s","agent_id":"a"}"#
+        );
+    }
+
+    #[test]
+    fn a_v24_request_without_provider_deserializes_to_none() {
+        let admit: SharedBudgetRequest = serde_json::from_str(
+            r#"{"op":"admit","session_id":"s","agent_id":null,"prompt_id":"p"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            admit,
+            SharedBudgetRequest::Admit {
+                session_id: "s".into(),
+                agent_id: None,
+                prompt_id: Some("p".into()),
+                provider: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_codex_provider_is_serialized_and_round_trips() {
+        let check = SharedBudgetRequest::Check {
+            session_id: "s".into(),
+            agent_id: None,
+            provider: Some("codex".into()),
+        };
+        let json = serde_json::to_value(&check).unwrap();
+        assert_eq!(json["provider"], "codex");
+        assert_eq!(
+            serde_json::from_value::<SharedBudgetRequest>(json).unwrap(),
+            check
+        );
+    }
+
+    #[test]
+    fn unsupported_provider_uses_the_snake_case_wire_name() {
+        assert_eq!(
+            serde_json::to_value(SharedBudgetRefusal::UnsupportedProvider).unwrap(),
+            "unsupported_provider"
         );
     }
 }
