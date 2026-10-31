@@ -1385,6 +1385,103 @@ fn unmapped_expired_holds_do_not_starve_a_mapped_orphan() {
 }
 
 // ---------------------------------------------------------------------
+// HORO-2340: C4 acceptance gaps (orphan cap, newest-only true-up)
+// ---------------------------------------------------------------------
+
+#[test]
+fn orphan_recovery_settles_at_most_sixteen_holds_per_settle_and_the_rest_on_the_next() {
+    const ORPHANS: usize = 20;
+    let mut fx = fx();
+    let mut lines = Vec::new();
+    let mut ids = Vec::new();
+    // Each prompt comes two hours after the last, so every earlier hold has
+    // expired (1 h TTL) with its Stop never delivered.
+    for i in 0..ORPHANS {
+        let turn = format!("turn-{i}");
+        ids.push(fx.admit(&turn));
+        lines.extend(turn_lines(&turn, TURN_SMALL));
+        fx.clock
+            .set(t(BASE) + time::Duration::hours(2 * (i as i64 + 1)));
+    }
+    fx.admit("turn-live");
+    lines.extend(turn_lines("turn-live", TURN_SMALL));
+    let path = fx.rollout("r.jsonl", &lines);
+    let expired = |fx: &Fx| {
+        ids.iter()
+            .filter(|id| fx.hold_row(**id).state == ReservationState::Expired)
+            .count()
+    };
+    assert_eq!(expired(&fx), ORPHANS);
+
+    let out = fx.settle("turn-live", Some(MODEL), Some(&path));
+    assert_eq!(settled(&out), (SMALL_CENTS, true, None));
+    assert_eq!(expired(&fx), 4, "exactly 16 of 20 settled late");
+    for id in &ids {
+        let row = fx.hold_row(*id);
+        if row.state == ReservationState::Settled {
+            assert_eq!(row.settled_amount, Some(SMALL_CENTS), "its own row");
+            assert_eq!(row.usage_known, Some(true));
+        } else {
+            assert_eq!(row.settled_amount, None, "left unsettled");
+        }
+    }
+    assert_eq!(fx.used_reserved(), (17 * SMALL_CENTS, 0));
+
+    fx.settle("turn-live", Some(MODEL), Some(&path));
+    assert_eq!(expired(&fx), 0, "the next settle takes the remainder");
+    assert_eq!(fx.used_reserved(), (21 * SMALL_CENTS, 0));
+
+    let before = fx.fingerprint();
+    fx.settle("turn-live", Some(MODEL), Some(&path));
+    assert_eq!(fx.fingerprint(), before, "replay books 0");
+    assert_eq!(fx.used_reserved(), (21 * SMALL_CENTS, 0), "no double count");
+}
+
+#[test]
+fn only_the_newest_measured_hold_is_re_measured_by_the_true_up() {
+    let mut fx = fx();
+    let older = fx.admit("turn-a");
+    let path = fx.rollout("r.jsonl", &turn_lines("turn-a", TURN_SMALL));
+    fx.settle("turn-a", Some(MODEL), Some(&path));
+    fx.clock.set(t("2027-01-15T12:10:00Z"));
+    let newest = fx.admit("turn-b");
+    assert_ne!(older, newest);
+    let both = [
+        turn_lines("turn-a", TURN_SMALL),
+        turn_lines("turn-b", TURN_SMALL),
+    ]
+    .concat();
+    fx.rollout("r.jsonl", &both);
+    fx.clock.set(t("2027-01-15T12:20:00Z"));
+    fx.settle("turn-b", Some(MODEL), Some(&path));
+    assert_eq!(fx.hold_row(older).usage_known, Some(true));
+    assert_eq!(fx.hold_row(newest).usage_known, Some(true));
+    // Both turns' final records are flushed late.
+    let grown = [grown_lines("turn-a"), grown_lines("turn-b")].concat();
+    fx.rollout("r.jsonl", &grown);
+    fx.clock.set(t("2027-01-15T12:30:00Z"));
+    fx.settle("turn-b", Some(MODEL), Some(&path));
+    assert_eq!(
+        fx.trueup_total(newest),
+        LATE_DELTA,
+        "the newest is trued up"
+    );
+    assert!(fx.trueup_row(newest, BIG_CENTS).is_some());
+    assert_eq!(
+        fx.trueup_total(older),
+        0,
+        "the older hold is not re-measured"
+    );
+    assert!(fx.trueup_row(older, BIG_CENTS).is_none());
+    assert_eq!(fx.used_reserved(), (SMALL_CENTS + BIG_CENTS, 0));
+    let before = fx.fingerprint();
+    fx.settle("turn-b", Some(MODEL), Some(&path));
+    fx.restart();
+    fx.settle("turn-b", Some(MODEL), Some(&path));
+    assert_eq!(fx.fingerprint(), before, "replay books 0");
+}
+
+// ---------------------------------------------------------------------
 // HORO-2285 (C5): the doctor's stale-daemon probe is a Codex Check.
 // ---------------------------------------------------------------------
 
