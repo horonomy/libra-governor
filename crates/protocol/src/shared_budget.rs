@@ -760,10 +760,9 @@ mod tests {
 
     #[test]
     fn a_v24_lane_request_without_provider_deserializes_to_none() {
-        let tail: SharedBudgetRequest = serde_json::from_str(
-            r#"{"op":"settle_tail","session_id":"s","transcript_path":"/p"}"#,
-        )
-        .unwrap();
+        let tail: SharedBudgetRequest =
+            serde_json::from_str(r#"{"op":"settle_tail","session_id":"s","transcript_path":"/p"}"#)
+                .unwrap();
         assert_eq!(
             tail,
             SharedBudgetRequest::SettleTail {
