@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-"""Regression tests for the link-rewriting patterns in `build_site.py` (Sonar python:S8786).
+"""Regression tests for the link scanners in `build_site.py` (Sonar python:S8786).
 
-The previous patterns are kept below as literals so the rewrite stays provably
-behaviour-preserving, and a bounded-time check keeps the quadratic backtracking
-from coming back. Stdlib only.
+The original regexes are kept below as literals (the oracle): the linear scanners that
+replaced them must return exactly the same spans and groups for every input, and a
+bounded-time check keeps super-linear rescanning from coming back. Stdlib only.
 
 Run with: python3 tools/test_build_site.py -v
 """
 
 from __future__ import annotations
 
+import random
 import re
 import sys
 import time
 import unittest
 from pathlib import Path
-from unittest import mock
+from typing import ClassVar
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -82,120 +83,124 @@ def _repository_markdown() -> list[Path]:
     )
 
 
-def _blank_prefix_ok(text: str, old: re.Match[str], new: re.Match[str]) -> bool:
-    """The old prefix may only add whole leading blank lines to the new one."""
-    extra = text[old.start() : new.start()]
-    return (
-        old.start() <= new.start()
-        and extra.strip() == ""
-        and (extra == "" or extra.endswith("\n"))
-        and old.group("prefix")[len(extra) :] == new.group("prefix")
-    )
+def old_inline(text: str) -> list[tuple[int, int, str, str, str, str]]:
+    return [
+        (m.start(), m.end(), m["prefix"], m["label"], m["target"], m["title"] or "")
+        for m in OLD_INLINE_LINK.finditer(text)
+    ]
 
 
-class InlineLinkEquivalence(unittest.TestCase):
-    def assert_same(self, text: str) -> None:
-        old = [(m.span(), m.groupdict()) for m in OLD_INLINE_LINK.finditer(text)]
-        new = [(m.span(), m.groupdict()) for m in build_site.INLINE_LINK.finditer(text)]
-        self.assertEqual(old, new, repr(text[:200]))
+def old_reference(text: str) -> list[tuple[int, int, str, str, str]]:
+    return [
+        (m.start(), m.end(), m["prefix"], m["target"], m["suffix"])
+        for m in OLD_REFERENCE_LINK.finditer(text)
+    ]
+
+
+FUZZ_ALPHABET = ["[", "]", "(", ")", ":", " ", "\n", "\r", "\t", "!", "a", "x", '"', "\u2003", "\x85", "\x1f", "](", "]:", "[a", "(b", "\n\n", "[a]: ", "![", "[a](b", "[a](b ", ")"]
+
+
+def fuzz_corpus(count: int = 60_000) -> list[str]:
+    rng = random.Random(8786)  # fixed seed: deterministic
+    return ["".join(rng.choices(FUZZ_ALPHABET, k=rng.randint(0, 16))) for _ in range(count)]
+
+
+class LinkScannerEquivalence(unittest.TestCase):
+    """Scanners vs the original regexes: identical spans and groups, no restrictions."""
+
+    def check(self, text: str) -> None:
+        self.assertEqual(old_inline(text), list(build_site.inline_links(text)), repr(text))
+        self.assertEqual(old_reference(text), list(build_site.reference_links(text)), repr(text))
 
     def test_hand_written_cases(self) -> None:
-        for text in INLINE_CASES:
+        for text in INLINE_CASES + REFERENCE_CASES:
             with self.subTest(text=text):
-                self.assert_same(text)
+                self.check(text)
+
+    def test_every_prefix_of_cases(self) -> None:
+        for text in INLINE_CASES + REFERENCE_CASES:
+            for end in range(len(text) + 1):
+                self.check(text[:end])
+
+    def test_multiline_labels_titles_and_next_line_targets_are_kept(self) -> None:
+        self.assertEqual(len(list(build_site.inline_links("[a\nb](c)"))), 1)
+        self.assertEqual(len(list(build_site.inline_links('[a](c "t\nu")'))), 1)
+        self.assertEqual(len(list(build_site.reference_links("[a]:\n\n  c"))), 1)
+        self.assertEqual(len(list(build_site.reference_links("\n\n[a\nb]: c"))), 1)
+
+    def test_random_inputs(self) -> None:
+        for text in fuzz_corpus():
+            self.check(text)
 
     def test_repository_markdown(self) -> None:
         files = _repository_markdown()
         self.assertTrue(files)
         for path in files:
             with self.subTest(path=path.name):
-                self.assert_same(path.read_text(encoding="utf-8"))
-
-    def test_every_prefix_of_cases_agrees(self) -> None:
-        for text in INLINE_CASES:
-            for end in range(len(text) + 1):
-                self.assert_same(text[:end])
-
-
-class ReferenceLinkEquivalence(unittest.TestCase):
-    def assert_same(self, text: str) -> None:
-        old = list(OLD_REFERENCE_LINK.finditer(text))
-        new = list(build_site.REFERENCE_LINK.finditer(text))
-        self.assertEqual(len(old), len(new), repr(text[:200]))
-        for o, n in zip(old, new):
-            self.assertEqual(o.end(), n.end())
-            self.assertEqual(o.span("target"), n.span("target"))
-            self.assertEqual(o.span("suffix"), n.span("suffix"))
-            self.assertTrue(_blank_prefix_ok(text, o, n), repr(text[:200]))
-
-    def test_hand_written_cases(self) -> None:
-        for text in REFERENCE_CASES:
-            with self.subTest(text=text):
-                self.assert_same(text)
-
-    def test_repository_markdown(self) -> None:
-        for path in _repository_markdown():
-            with self.subTest(path=path.name):
-                self.assert_same(path.read_text(encoding="utf-8"))
-
-    def test_every_prefix_of_cases_agrees(self) -> None:
-        for text in REFERENCE_CASES:
-            for end in range(len(text) + 1):
-                self.assert_same(text[:end])
+                self.check(path.read_text(encoding="utf-8"))
 
 
 class RewriteLinksOutput(unittest.TestCase):
     """The rewritten Markdown (what the site is built from) must not change."""
 
-    def old_rewrite(self, text: str, source: str) -> str:
-        with mock.patch.object(build_site, "INLINE_LINK", OLD_INLINE_LINK), mock.patch.object(
-            build_site, "REFERENCE_LINK", OLD_REFERENCE_LINK
-        ):
-            return build_site.rewrite_links(text, source)
+    @staticmethod
+    def old_rewrite(text: str, source: str) -> str:
+        def inline(m: re.Match[str]) -> str:
+            target = build_site.repository_target(source, m["target"])
+            return f'{m["prefix"]}[{m["label"]}]({target}{m["title"] or ""})'
 
-    def test_hand_written_cases(self) -> None:
-        for text in INLINE_CASES + REFERENCE_CASES:
-            with self.subTest(text=text):
-                self.assertEqual(
-                    self.old_rewrite(text, "docs/x.md"),
-                    build_site.rewrite_links(text, "docs/x.md"),
-                )
+        def reference(m: re.Match[str]) -> str:
+            target = build_site.repository_target(source, m["target"])
+            return f'{m["prefix"]}{target}{m["suffix"]}'
+
+        return OLD_REFERENCE_LINK.sub(reference, OLD_INLINE_LINK.sub(inline, text))
+
+    def test_hand_written_and_random_cases(self) -> None:
+        for text in INLINE_CASES + REFERENCE_CASES + fuzz_corpus(5_000):
+            self.assertEqual(
+                self.old_rewrite(text, "docs/x.md"), build_site.rewrite_links(text, "docs/x.md"), repr(text)
+            )
 
     def test_chapters(self) -> None:
         for _, canonical, _ in build_site.CHAPTERS:
             text = (build_site.ROOT / canonical).read_text(encoding="utf-8")
             with self.subTest(chapter=canonical):
                 self.assertEqual(
-                    self.old_rewrite(text, canonical),
-                    build_site.rewrite_links(text, canonical),
+                    self.old_rewrite(text, canonical), build_site.rewrite_links(text, canonical)
                 )
 
 
 class PathologicalInputsStayFast(unittest.TestCase):
-    """Each input took minutes with the old patterns (quadratic); now ~10 ms.
+    """Each input took seconds to minutes with the old regexes (quadratic); now ~10-100 ms.
 
     The 3 s cap is a very generous multiple so a slow CI runner cannot flake.
     """
 
     SIZE = 200_000
     CAP_SECONDS = 3.0
+    CASES: ClassVar[dict[str, str]] = {
+        "whitespace run in a title": "[a](b" + " " * SIZE,
+        "blank lines": "\n" * SIZE + "x",
+        "CRLF blank lines": "\r\n" * SIZE + "x",
+        "whitespace-only lines": "  \n" * SIZE + "x",
+        "repeated unclosed inline links": "[a](b " * SIZE,
+        "repeated unclosed multi-line labels": "[a\n" * SIZE,
+        "repeated unclosed one-line labels": "[a" * SIZE,
+        "label start run then one target": "[" * SIZE + "](" + "b" * SIZE,
+        "reference marker then whitespace": "[a]:" + " " * SIZE,
+        "reference marker then blank lines": "[a]:" + "\n" * SIZE,
+        "repeated reference markers": "[a]: " * SIZE,
+        "repeated reference lines without target": "[a]:\n" * SIZE,
+        "repeated reference lines with unclosed labels": "[a\n" * SIZE + "]: x",
+    }
 
-    def assert_fast(self, pattern: re.Pattern[str], text: str) -> None:
-        started = time.perf_counter()
-        list(pattern.finditer(text))
-        self.assertLess(time.perf_counter() - started, self.CAP_SECONDS)
-
-    def test_inline_link_whitespace_run_in_title(self) -> None:
-        self.assert_fast(build_site.INLINE_LINK, "[a](b" + " " * self.SIZE)
-
-    def test_reference_link_blank_lines(self) -> None:
-        self.assert_fast(build_site.REFERENCE_LINK, "\n" * self.SIZE + "x")
-
-    def test_reference_link_crlf_blank_lines(self) -> None:
-        self.assert_fast(build_site.REFERENCE_LINK, "\r\n" * self.SIZE + "x")
-
-    def test_reference_link_whitespace_only_lines(self) -> None:
-        self.assert_fast(build_site.REFERENCE_LINK, "  \n" * self.SIZE + "x")
+    def test_each_scanner_is_fast(self) -> None:
+        for name, text in self.CASES.items():
+            for scanner in (build_site.inline_links, build_site.reference_links):
+                with self.subTest(case=name, scanner=scanner.__name__):
+                    started = time.perf_counter()
+                    list(scanner(text))
+                    self.assertLess(time.perf_counter() - started, self.CAP_SECONDS)
 
 
 if __name__ == "__main__":
