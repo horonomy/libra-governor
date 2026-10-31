@@ -33,8 +33,13 @@ CHAPTERS: tuple[tuple[str, str, str], ...] = (
     ("Security and supported versions", "SECURITY.md", "security.md"),
 )
 
-INLINE_LINK = re.compile(r"(?P<prefix>!?)\[(?P<label>[^]]+)\]\((?P<target>[^\s)]+)(?P<title>\s+[^)]*)?\)")
-REFERENCE_LINK = re.compile(r"^(?P<prefix>\s*\[[^]]+\]:\s*)(?P<target>\S+)(?P<suffix>.*)$", re.MULTILINE)
+# `[^)]*` already absorbs whitespace, so the title needs exactly one leading `\s`;
+# `\s+[^)]*` made the two quantifiers overlap and backtrack quadratically.
+INLINE_LINK = re.compile(r"(?P<prefix>!?)\[(?P<label>[^]]+)\]\((?P<target>[^\s)]+)(?P<title>\s[^)]*)?\)")
+# Leading indentation excludes `\n`: a `\s*` that crossed newlines was retried from every
+# blank line of a whitespace run (quadratic). Blank lines before a reference are left
+# untouched by the rewrite either way, so the substituted text is unchanged.
+REFERENCE_LINK = re.compile(r"^(?P<prefix>[^\S\n]*\[[^]]+\]:\s*)(?P<target>\S+)(?P<suffix>.*)$", re.MULTILINE)
 
 
 class InlineScriptParser(HTMLParser):
