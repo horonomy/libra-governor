@@ -11,7 +11,6 @@
 - **Block semantics are source-confirmed:** a blocked prompt is not recorded in history and the model request is skipped when no other input is accepted. Lifecycle events for a blocked turn are UNKNOWN.
 - **Flush ordering is inferred, not tested:** the final usage record is very likely on disk when Stop runs, but a runtime probe is still required before the under-count residual is dropped.
 
-
 Tag: rust-v0.160.0 (exists; tag object 79b1b666f2e8551f8abbbca34957227f67f3f553; commit a956835d020762cb2b570053af06f643a11c0ecc).
 Note: rust-v0.160.1 also exists (not used). Paths below are repo-relative; all under codex-rs/. Source read from the tag tarball only; nothing executed.
 "codex-cli 0.160.0" is assumed to correspond to rust-v0.160.0 (not independently verified).
@@ -87,3 +86,25 @@ With the `hooks` feature off, non-managed command hooks are dropped silently. Un
 ### New in 0.165
 
 Per-environment hooks and an `interrupt` hook event. Neither touches ids or usage records; neither is handled by Libra.
+
+### Evidence status of the 0.163 to 0.165 claims (added after independent review, 2026-10-31)
+
+An independent read-only reviewer re-read `openai/codex` at `rust-v0.165.0` only (not 0.163 or 0.164) through summarised fetches, so line numbers were not re-checked.
+
+| Claim | Status |
+|---|---|
+| Hook `turn_id` is the turn context id and `session_id` the session id, for UserPromptSubmit and Stop (`core/src/hook_runtime.rs`) | second read at 0.165: CONFIRMED |
+| Root turns use Stop; thread-spawned child turns use SubagentStop with `agent_transcript_path` (`hook_runtime.rs`) | second read at 0.165: CONFIRMED |
+| `TokenUsageRecord` fields (`protocol/src/protocol.rs`) | second read at 0.165: CONFIRMED |
+| `turn_token_usage` resets on a new `turn_id`, `thread_token_usage` accumulates, `usage` is incremental (`core/src/state/session.rs`) | second read at 0.165: CONFIRMED |
+| Exit 2 with stderr blocks; empty stderr or a `decision:block` with no reason is a failure; a blocked prompt skips recording the input and Stop runs once (`hooks/src/events/user_prompt_submit.rs`, `core/src/session/turn.rs`) | second read at 0.165: CONFIRMED |
+| The `interrupt` hook event exists (`hooks/src/engine/mod.rs`) | second read at 0.165: CONFIRMED |
+| A failed or incomplete response writes a record only with a `response_id`; an aborted request writes none and Stop does not run on abort | single read, uncited; the second reader could not reach the write path |
+| Resume does not re-append records; a fork drops the parent's records | single read, uncited; the second reader found the resume/fork seeding consistent but not proof |
+| Untrusted hooks are skipped unless `--dangerously-bypass-hook-trust` is set; hooks are dropped silently when the feature is off | single read, uncited; the second reader saw only a `bypass_hook_trust` parameter, not the skip logic or the flag spelling |
+| The results at 0.163 and 0.164 match 0.165 | single read, not re-checked by the second reader |
+
+Not covered by this document at any tag: `task_complete` ordering relative to Stop. `docs/design/codex-shared-budget-gate.md` says it is written after Stop returns (from `codex_turn.rs`); C3 and C4 depend on it for true-up gating.
+
+Flush ordering: Q5 infers that the final `token_usage_record` is very likely on disk before Stop runs. That is an inference from source reading, not a run. The design doc takes the pessimistic reading (the final record may still be in the writer's channel at Stop, an undetectable under-count) and the C2 to C4 code keeps that reading until a runtime probe exists.
+
