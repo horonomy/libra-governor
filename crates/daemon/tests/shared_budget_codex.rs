@@ -1125,3 +1125,130 @@ fn recovery_writes_nothing_without_the_marker() {
     assert_eq!(fx.fingerprint(), before, "whole ledger unchanged");
     assert_eq!(fx.hold_row(killed).state, ReservationState::Expired);
 }
+
+// ---------------------------------------------------------------------
+// HORO-2284 review follow-ups: FIFO guard, per-hold isolation, cap order
+// ---------------------------------------------------------------------
+
+impl Fx {
+    /// A hold with no prompt mapping (admitted without a turn id).
+    fn admit_unmapped(&mut self, tag: &str) {
+        let now = self.clock.now();
+        let pool = PoolId(POOL_JAN.to_string());
+        let lane = lane();
+        let hold = self.hold;
+        let ledger = self.ledger();
+        ledger
+            .ensure_pool(&pool, &QuotaUnit::UsdCents, CAP, now)
+            .unwrap();
+        let key = format!("hold:{}|-|u{tag}", lp(&lane));
+        let outcome = ledger
+            .reserve_shared_metered_for_prompt(
+                MeteredReserveRequest {
+                    base: SharedPoolReserveRequest {
+                        pool_id: &pool,
+                        principal_id: &principal(),
+                        session_id: &lane,
+                        amount: hold,
+                        unit: &QuotaUnit::UsdCents,
+                        idempotency_key: &key,
+                        now,
+                        ttl_secs: 3600,
+                        attribution: ExecutorAttribution::main_executor(Some(
+                            ChargeSource::TurnHold,
+                        )),
+                    },
+                    session_cap: None,
+                    capacity_source: CapacitySource::LocalConfigured { cap: CAP },
+                },
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            libra_governor_ledger::MeteredReserveOutcome::Granted(_)
+        ));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fifo_transcript_path_never_blocks_the_true_up() {
+    let mut fx = fx();
+    let h = fx.admit("turn-a");
+    let path = fx.rollout("r.jsonl", &turn_lines("turn-a", TURN_SMALL));
+    fx.settle("turn-a", Some(MODEL), Some(&path));
+    let fifo = fx.dir.path().join("fifo");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let (tx, rx) = std::sync::mpsc::channel();
+    // A regression blocks in `open`; the timeout turns that into a failure
+    // instead of a hung test run.
+    std::thread::spawn(move || {
+        let out = fx.settle("turn-a", Some(MODEL), Some(&fifo));
+        let _ = tx.send((fx, format!("{out:?}")));
+    });
+    let (fx, out) = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the settle blocked opening a FIFO transcript path");
+    assert!(out.contains("AlreadySettled"), "{out}");
+    assert_eq!(fx.trueup_total(h), 0);
+}
+
+#[test]
+fn one_persistently_failing_orphan_does_not_stop_a_later_orphan_or_the_trueup() {
+    let mut fx = fx();
+    let target = fx.admit("turn-0");
+    let path = fx.rollout("r.jsonl", &turn_lines("turn-0", TURN_SMALL));
+    fx.settle("turn-0", Some(MODEL), Some(&path));
+    fx.clock.set(t("2027-01-15T14:00:00Z"));
+    let bad = fx.admit("turn-a");
+    fx.clock.set(t("2027-01-15T16:00:00Z"));
+    let good = fx.admit("turn-b");
+    fx.clock.set(t("2027-01-15T18:00:00Z"));
+    fx.admit("turn-c");
+    // Settling `bad` fails at the database, every time.
+    let conn = rusqlite::Connection::open(fx.dir.path().join("ledger.sqlite3")).unwrap();
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER fail_one BEFORE UPDATE ON shared_pool_reservations
+         WHEN NEW.id = '{}' BEGIN SELECT RAISE(ABORT, 'induced'); END;",
+        bad.0
+    ))
+    .unwrap();
+    drop(conn);
+    let lines = [
+        grown_lines("turn-0"),
+        turn_lines("turn-a", TURN_BIG),
+        turn_lines("turn-b", TURN_SMALL),
+        turn_lines("turn-c", TURN_SMALL),
+    ]
+    .concat();
+    fx.rollout("r.jsonl", &lines);
+    let out = fx.settle("turn-c", Some(MODEL), Some(&path));
+    assert_eq!(settled(&out), (SMALL_CENTS, true, None));
+    assert_eq!(fx.hold_row(bad).state, ReservationState::Expired);
+    assert_eq!(fx.hold_row(good).settled_amount, Some(SMALL_CENTS));
+    assert_eq!(fx.trueup_total(target), LATE_DELTA, "the true-up still ran");
+}
+
+#[test]
+fn unmapped_expired_holds_do_not_starve_a_mapped_orphan() {
+    let mut fx = fx();
+    for i in 0..17 {
+        fx.admit_unmapped(&i.to_string());
+    }
+    fx.clock.set(t("2027-01-15T14:00:00Z"));
+    let mapped = fx.admit("turn-a");
+    fx.clock.set(t("2027-01-15T16:00:00Z"));
+    fx.admit("turn-b");
+    let lines = [
+        turn_lines("turn-a", TURN_BIG),
+        turn_lines("turn-b", TURN_SMALL),
+    ]
+    .concat();
+    let path = fx.rollout("r.jsonl", &lines);
+    fx.settle("turn-b", Some(MODEL), Some(&path));
+    let row = fx.hold_row(mapped);
+    assert_eq!(row.state, ReservationState::Settled);
+    assert_eq!(row.settled_amount, Some(BIG_CENTS));
+}
