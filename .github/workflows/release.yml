@@ -197,7 +197,7 @@ jobs:
         with:
           name: ${{ env.RELEASE_BIN }}-${{ matrix.target }}
           path: dist
-      - uses: actions/attest-build-provenance@bd77c077858b8d561b7a36cbe48ef4cc642ca39d # v2.2.2
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: "dist/${{ env.RELEASE_BIN }}-${{ matrix.target }}.tar.gz"
 
