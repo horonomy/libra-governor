@@ -1925,11 +1925,16 @@ fn handle_tool_invoked_for_provider_lane(
     // Best-effort keep-alive for the session's shared-budget holds. It runs
     // before the early returns below (the local budget needs no
     // pre-established session) and can never fail the tool event. A provider
-    // the budget does not serve renews nothing.
-    if let Ok(budget_lane) = crate::shared_budget::client_lane(session_id, provider) {
-        if let Err(e) = crate::shared_budget::heartbeat(ledger, &config.shared_budget, &budget_lane)
-        {
-            log::append_line(&config.log_path, &format!("shared budget heartbeat: {e}"));
+    // the budget does not serve renews nothing, and the Codex lane stays inert
+    // here until its settlement exists (HORO-2282): no Codex hold can exist,
+    // and this keeps that from resting on that invariant alone.
+    if crate::shared_budget::is_claude_provider(provider) {
+        if let Ok(budget_lane) = crate::shared_budget::client_lane(session_id, provider) {
+            if let Err(e) =
+                crate::shared_budget::heartbeat(ledger, &config.shared_budget, &budget_lane)
+            {
+                log::append_line(&config.log_path, &format!("shared budget heartbeat: {e}"));
+            }
         }
     }
     ledger.increment_tool_call_count(lane)?;
