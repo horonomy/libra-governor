@@ -264,9 +264,12 @@ impl AgentCapabilities {
             AgentKind::ClaudeCode => Capability::Available,
             AgentKind::Codex => Capability::Unavailable {
                 gap: CapabilityGap::NotWiredByLibra {
-                    detail: "the shared monthly budget gate is wired to Claude Code hooks only; \
-                              the Codex hook route neither asks the daemon to admit a prompt nor \
-                              denies tool calls on budget state"
+                    detail: "the shared monthly budget gate is wired to Claude Code hooks; the \
+                              Codex hook route takes part only behind the experimental, off by \
+                              default shared-budget.codex marker (HORO-2283), where it admits a \
+                              prompt at UserPromptSubmit and settles at Stop; it never denies a \
+                              tool call, and activating it by default is a founder decision, so \
+                              this stays unavailable"
                         .to_string(),
                     follow_up: None,
                 },
@@ -503,6 +506,24 @@ mod tests {
             }
         ));
         assert!(!codex.claims_pre_spend_refusal());
+    }
+
+    /// HORO-2285: the Codex row stays Unavailable (activation is a founder
+    /// decision) but no longer claims the route never asks the daemon: it
+    /// names the experimental, off-by-default marker.
+    #[test]
+    fn codex_shared_budget_row_stays_unavailable_and_names_the_experimental_marker() {
+        let codex = AgentCapabilities::for_agent(AgentKind::Codex);
+        let Capability::Unavailable {
+            gap: CapabilityGap::NotWiredByLibra { detail, .. },
+        } = codex.shared_budget_admission_gate
+        else {
+            panic!("the Codex shared-budget row must stay Unavailable until activation");
+        };
+        assert!(detail.contains("shared-budget.codex"), "{detail}");
+        assert!(detail.contains("experimental"), "{detail}");
+        assert!(detail.contains("off by default"), "{detail}");
+        assert!(!detail.contains("neither asks the daemon"), "{detail}");
     }
 
     #[test]
