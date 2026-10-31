@@ -926,6 +926,7 @@ pub(crate) fn dispatch(
                     idempotency_key,
                     charge_source,
                     event_time,
+                    provider,
                 } => crate::shared_budget::charge(
                     ledger,
                     rt,
@@ -935,6 +936,7 @@ pub(crate) fn dispatch(
                     &idempotency_key,
                     charge_source,
                     event_time.as_deref(),
+                    provider.as_deref(),
                 ),
                 SharedBudgetRequest::ChargeAgentTranscript {
                     session_id,
@@ -960,12 +962,14 @@ pub(crate) fn dispatch(
                 SharedBudgetRequest::SettleTail {
                     session_id,
                     transcript_path,
+                    provider,
                 } => {
                     let outcome = crate::shared_budget::settle_tail(
                         ledger,
                         rt,
                         &session_id,
                         &transcript_path,
+                        provider.as_deref(),
                     );
                     if let Ok(o) = &outcome {
                         log::append_line(
@@ -978,11 +982,13 @@ pub(crate) fn dispatch(
                 SharedBudgetRequest::TranscriptReady {
                     session_id,
                     transcript_path,
+                    provider,
                 } => crate::shared_budget::transcript_ready(
                     ledger,
                     rt,
                     &session_id,
                     &transcript_path,
+                    provider.as_deref(),
                 ),
                 SharedBudgetRequest::Status {} => crate::shared_budget::status(ledger, rt)
                     .map(|status| SharedBudgetOutcome::Status(Box::new(status))),
@@ -1919,11 +1925,16 @@ fn handle_tool_invoked_for_provider_lane(
     // Best-effort keep-alive for the session's shared-budget holds. It runs
     // before the early returns below (the local budget needs no
     // pre-established session) and can never fail the tool event. A provider
-    // the budget does not serve renews nothing.
-    if let Ok(budget_lane) = crate::shared_budget::budget_lane(session_id, provider) {
-        if let Err(e) = crate::shared_budget::heartbeat(ledger, &config.shared_budget, &budget_lane)
-        {
-            log::append_line(&config.log_path, &format!("shared budget heartbeat: {e}"));
+    // the budget does not serve renews nothing, and the Codex lane stays inert
+    // here until its settlement exists (HORO-2282): no Codex hold can exist,
+    // and this keeps that from resting on that invariant alone.
+    if crate::shared_budget::is_claude_provider(provider) {
+        if let Ok(budget_lane) = crate::shared_budget::client_lane(session_id, provider) {
+            if let Err(e) =
+                crate::shared_budget::heartbeat(ledger, &config.shared_budget, &budget_lane)
+            {
+                log::append_line(&config.log_path, &format!("shared budget heartbeat: {e}"));
+            }
         }
     }
     ledger.increment_tool_call_count(lane)?;
@@ -2370,13 +2381,18 @@ fn handle_finalize_for_lane(
     if config.shared_budget.is_configured()
         && crate::shared_budget::is_claude_provider(provider.as_deref())
     {
-        match crate::shared_budget::settle_turn(
-            ledger,
-            &config.shared_budget,
-            session_id,
-            transcript_path,
-            prompt_id,
-        ) {
+        // `settle_turn` takes a lane key, so the client id is validated here.
+        let settled = match crate::shared_budget::client_lane(session_id, provider.as_deref()) {
+            Ok(lane) => crate::shared_budget::settle_turn(
+                ledger,
+                &config.shared_budget,
+                &lane,
+                transcript_path,
+                prompt_id,
+            ),
+            Err(_) => Ok(crate::shared_budget::TurnSettlement::NotApplicable),
+        };
+        match settled {
             Ok(settlement) => log::append_line(
                 &config.log_path,
                 &format!(
