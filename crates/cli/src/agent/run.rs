@@ -258,9 +258,15 @@ pub(crate) fn run_prompt_submit_with_input(agent: AgentKind, raw: &str) {
 
     // HORO-2215: the local shared budget gates Claude Code prompts. With no
     // shared-budget.json nothing below this block differs from before it
-    // existed (no extra connection, no extra output byte).
+    // existed (no extra connection, no extra output byte). HORO-2283: Codex
+    // takes the same gate only when enrolled (budget file + marker); without
+    // the marker this block is skipped exactly as for a missing budget file.
     let mut budget_warning: Option<String> = None;
-    if agent == AgentKind::ClaudeCode && budget_gate::budget_file_present() {
+    let gated = match agent {
+        AgentKind::ClaudeCode => budget_gate::budget_file_present(),
+        AgentKind::Codex => budget_gate::codex_enrolled(),
+    };
+    if gated {
         // A session id the daemon would refuse purely for what the host sent
         // is the existing skipped path: no Admit, never a block.
         if budget_gate::session_id_unusable(&session_id) {
@@ -272,14 +278,44 @@ pub(crate) fn run_prompt_submit_with_input(agent: AgentKind, raw: &str) {
             print_context("[libra-governor] preflight skipped: missing or reserved session id.");
             return;
         }
-        match budget_gate::admit(&socket_path, &session_id, prompt_id, &|m| {
-            log(&log_path, agent, m)
-        }) {
-            Admission::Block { reason } => {
-                println!("{}", render::render_prompt_block(&reason));
-                return;
+        // The owner route would record the same Codex turn without the
+        // budget's hold: refuse to run both rather than leave one ungated.
+        if agent == AgentKind::Codex && codex_owner_route_enabled() {
+            log(
+                &log_path,
+                agent,
+                "preflight: codex enrolled together with the execution-owner route, blocking",
+            );
+            println!(
+                "{}",
+                render::render_prompt_block(&budget_gate::codex_owner_route_conflict_reason())
+            );
+            return;
+        }
+        if agent == AgentKind::Codex && agent_id.is_some() {
+            // A subagent turn is not the lane's main turn: admitting it would
+            // reserve a second hold for work the parent's hold already covers.
+            log(
+                &log_path,
+                agent,
+                "preflight: codex subagent prompt not admitted against the shared budget",
+            );
+        } else {
+            // Codex names its turn; that id is the prompt the hold is keyed by
+            // and the one `Stop` settles.
+            let (admit_prompt_id, provider) = match agent {
+                AgentKind::ClaudeCode => (prompt_id, None),
+                AgentKind::Codex => (turn_id.clone(), Some(super::label(agent))),
+            };
+            match budget_gate::admit(&socket_path, &session_id, admit_prompt_id, provider, &|m| {
+                log(&log_path, agent, m)
+            }) {
+                Admission::Block { reason } => {
+                    println!("{}", render::render_prompt_block(&reason));
+                    return;
+                }
+                Admission::Proceed { warning } => budget_warning = warning,
             }
-            Admission::Proceed { warning } => budget_warning = warning,
         }
     }
     let print_context = |message: &str| match budget_warning.as_deref() {
@@ -779,6 +815,41 @@ pub(crate) fn run_turn_completed_with_input(agent: AgentKind, raw: &str) {
             return;
         }
     };
+
+    // HORO-2283: an enrolled Codex main-lane turn settles its hold before the
+    // Finalize / owner Stop below. Best effort and silent: Stop is never
+    // denied and prints nothing here.
+    if agent == AgentKind::Codex && budget_gate::codex_enrolled() {
+        match turn_id.as_deref() {
+            _ if budget_gate::session_id_unusable(&session_id) => log(
+                &log_path,
+                agent,
+                "stop: unusable session id, codex turn not settled",
+            ),
+            _ if agent_id.is_some() => log(
+                &log_path,
+                agent,
+                "stop: codex subagent turn not settled against the shared budget",
+            ),
+            None => log(
+                &log_path,
+                agent,
+                "stop: no turn id in hook payload, codex turn not settled",
+            ),
+            Some(turn_id) => budget_gate::settle_codex_turn(
+                &socket_path,
+                &session_id,
+                turn_id,
+                model.as_deref(),
+                // Relayed verbatim, never opened here (HORO-1725).
+                transcript_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .as_deref(),
+                &|m| log(&log_path, agent, m),
+            ),
+        }
+    }
 
     let stream = match client::connect_only(&socket_path) {
         Ok(stream) => stream,
