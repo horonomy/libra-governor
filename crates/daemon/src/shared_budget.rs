@@ -95,11 +95,13 @@ const CODEX_PROVIDER: &str = "codex";
 /// (HORO-2282). Absent, every Codex settlement is `not_configured` and writes
 /// nothing. Its contents are never read.
 pub const CODEX_MARKER_FILE_NAME: &str = "shared-budget.codex";
-/// Most turns one Codex hold is measured over. A hold lives an hour and each
-/// tool event renews it, so a re-prompt storm could name arbitrarily many
-/// turns; past this the hold settles unmeasured rather than rescanning the
-/// rollout without bound.
-const MAX_CODEX_HOLD_TURNS: usize = 64;
+/// Most turns one Codex hold is measured over. A hold normally maps 1-3 turns
+/// (a re-prompt renews it), but a hold lives an hour and each tool event renews
+/// it, so a re-prompt storm could name many more. Each turn is one backward
+/// rollout scan of up to `BUDGET_SCAN_CAP_BYTES`, so this bounds the work of
+/// one settlement to 16 scans. Past it the first turns are measured and the
+/// hold settles at `max(priced_sum, hold)` labelled `scan_cap_reached`.
+const MAX_CODEX_HOLD_TURNS: usize = 16;
 /// Longest recovery failure line kept in telemetry.
 const MAX_RECOVERY_ERROR_LEN: usize = 160;
 
@@ -1833,9 +1835,8 @@ fn measure_codex_turns(
     let Some(path) = transcript_path else {
         return (None, Some("no_transcript_path"));
     };
-    if turn_ids.len() > MAX_CODEX_HOLD_TURNS {
-        return (None, Some("scan_cap_reached"));
-    }
+    let capped = turn_ids.len() > MAX_CODEX_HOLD_TURNS;
+    let turn_ids = &turn_ids[..turn_ids.len().min(MAX_CODEX_HOLD_TURNS)];
     let mut priced_sum: u64 = 0;
     let mut reason: Option<&'static str> = None;
     for turn in turn_ids {
@@ -1855,6 +1856,9 @@ fn measure_codex_turns(
                 reason.get_or_insert(codex_unavailable_reason(why));
             }
         }
+    }
+    if capped {
+        reason = Some("scan_cap_reached");
     }
     match reason {
         None => (Some(priced_sum), None),
@@ -1892,6 +1896,14 @@ fn measure_codex_turns(
 /// never at 0. An invalid budget file settles the hold amount without its
 /// overrides. A late settle of an expired hold lands in the hold's own row and
 /// period.
+///
+/// # Cost and locking
+///
+/// Reading the rollout is blocking file I/O: up to 16 backward scans of at
+/// most `BUDGET_SCAN_CAP_BYTES` each, performed while the caller holds the
+/// `&mut LedgerStore`. C3 must not call this while holding the ledger/server
+/// lock any longer than the request needs, and should do the cheap checks
+/// (marker, ids) before taking it.
 ///
 /// The post-hoc charge is booked to the period of the settle time: the reader
 /// returns no record timestamps, so the record's own event time is not used.
@@ -2080,27 +2092,15 @@ fn recover_codex_lane(
 /// the `Stop` hook), so a true-up checks for itself that the turn is over.
 fn codex_turn_complete(path: &str, turn_id: &str) -> bool {
     use std::io::{Read, Seek, SeekFrom};
-    use std::os::unix::fs::OpenOptionsExt;
     // `path` is host-claimed: a FIFO with no writer would block `open` and
-    // with it the daemon's serial accept loop. Stat first (never blocks), then
-    // open without blocking and check the handle actually opened.
-    if crate::usage::reject_non_regular_file(std::path::Path::new(path)).is_err() {
-        return false;
-    }
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-    else {
+    // with it the daemon's serial accept loop. The shared opener opens without
+    // blocking and refuses anything that is not a regular file on the handle.
+    let Ok(mut file) = crate::usage::open_regular_file(std::path::Path::new(path)) else {
         return false;
     };
-    let Ok(meta) = file.metadata() else {
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
         return false;
     };
-    if !meta.is_file() {
-        return false;
-    }
-    let len = meta.len();
     let start = len.saturating_sub(BUDGET_SCAN_CAP_BYTES);
     if file.seek(SeekFrom::Start(start)).is_err() {
         return false;
@@ -2304,7 +2304,7 @@ fn settle_codex_hold(
             settled_usd_cents: reservation.settled_amount.unwrap_or(reservation.amount),
             usage_known: reservation.usage_known.unwrap_or(false),
             overrun_usd_cents: overrun.unwrap_or(0),
-            turns: turns.len(),
+            turns: turns.len().min(MAX_CODEX_HOLD_TURNS),
             unmeasured_reason: reason,
         },
         SharedPoolSettleOutcome::AlreadyFinal(_) | SharedPoolSettleOutcome::NotFound => {

@@ -857,6 +857,175 @@ fn removing_the_marker_after_enabling_returns_settlement_to_inert() {
 }
 
 // ---------------------------------------------------------------------
+// Turn cap (HORO-2282 review follow-up)
+// ---------------------------------------------------------------------
+
+fn many_turn_hold(fx: &mut Fx, turns: usize) -> PathBuf {
+    let mut lines = Vec::new();
+    for i in 0..turns {
+        let id = format!("turn-{i:02}");
+        fx.admit(&id);
+        lines.extend(turn_lines(&id, TURN_SMALL));
+    }
+    fx.rollout("r.jsonl", &lines)
+}
+
+#[test]
+fn a_hold_over_the_turn_cap_measures_the_first_turns_and_books_the_larger_of_priced_and_hold() {
+    // 20 turns on one hold; only the first 16 are measured: 16 * 179 = 2864,
+    // above the 1,000 hold, so it is booked as measured with the cap label.
+    let mut fx = fx();
+    let path = many_turn_hold(&mut fx, 20);
+    let out = fx.settle("turn-19", Some(MODEL), Some(&path));
+    assert_eq!(
+        settled(&out),
+        (16 * SMALL_CENTS, true, Some("scan_cap_reached"))
+    );
+}
+
+#[test]
+fn a_hold_over_the_turn_cap_never_books_below_the_flat_hold() {
+    // 16 * 179 = 2864 is under a 50,000 hold: the hold stands, unmeasured.
+    let mut fx = fx_with_hold(50_000, true, true);
+    let path = many_turn_hold(&mut fx, 20);
+    let out = fx.settle("turn-19", Some(MODEL), Some(&path));
+    assert_eq!(settled(&out), (50_000, false, Some("scan_cap_reached")));
+}
+
+// ---------------------------------------------------------------------
+// Pins for judgement calls (HORO-2282 review follow-up)
+// ---------------------------------------------------------------------
+
+const TURN_ZERO: [i64; 5] = [0, 0, 0, 0, 0];
+
+#[test]
+fn a_measured_zero_unadmitted_turn_books_no_row() {
+    let mut fx = fx();
+    let path = fx.rollout("r.jsonl", &turn_lines("turn-x", TURN_ZERO));
+    let before = fx.fingerprint();
+    let out = fx.settle("turn-x", Some(MODEL), Some(&path));
+    assert!(
+        matches!(out, CodexSettlement::Unbooked("measured_zero")),
+        "{out:?}"
+    );
+    assert_eq!(fx.fingerprint(), before);
+    assert_eq!(fx.rt.unadmitted_turns(), 0);
+}
+
+#[test]
+fn a_hold_whose_turns_all_measure_zero_settles_at_zero_as_measured() {
+    let mut fx = fx();
+    fx.admit("turn-a");
+    let path = fx.rollout("r.jsonl", &turn_lines("turn-a", TURN_ZERO));
+    let out = fx.settle("turn-a", Some(MODEL), Some(&path));
+    assert_eq!(settled(&out), (0, true, None));
+}
+
+#[test]
+fn a_released_hold_is_already_settled_and_writes_nothing() {
+    let mut fx = fx();
+    let h = fx.admit("turn-a");
+    let now = fx.clock.now();
+    fx.ledger().release_shared(h, now).unwrap();
+    let path = fx.rollout("r.jsonl", &turn_lines("turn-a", TURN_BIG));
+    let before = fx.fingerprint();
+    let out = fx.settle("turn-a", Some(MODEL), Some(&path));
+    assert!(matches!(out, CodexSettlement::AlreadySettled), "{out:?}");
+    assert_eq!(fx.fingerprint(), before);
+}
+
+#[test]
+fn a_pruned_hold_row_with_a_surviving_mapping_is_already_settled_and_writes_nothing() {
+    let mut fx = fx();
+    let h = fx.admit("turn-a");
+    let path = fx.rollout("r.jsonl", &turn_lines("turn-a", TURN_BIG));
+    // A retention prune deletes the hold row but keeps its prompt mapping.
+    let conn = rusqlite::Connection::open(fx.dir.path().join("ledger.sqlite3")).unwrap();
+    let n = conn
+        .execute(
+            "DELETE FROM shared_pool_reservations WHERE id = ?1",
+            [h.0.to_string()],
+        )
+        .unwrap();
+    assert_eq!(n, 1);
+    drop(conn);
+    let before = fx.fingerprint();
+    let out = fx.settle("turn-a", Some(MODEL), Some(&path));
+    assert!(matches!(out, CodexSettlement::AlreadySettled), "{out:?}");
+    assert_eq!(fx.fingerprint(), before);
+}
+
+#[test]
+fn an_unadmitted_turn_with_an_invalid_config_books_nothing() {
+    let mut fx = fx();
+    let path = fx.rollout("r.jsonl", &turn_lines("turn-x", TURN_BIG));
+    std::fs::write(fx.dir.path().join(SHARED_BUDGET_FILE_NAME), "{ not json").unwrap();
+    let before = fx.fingerprint();
+    let out = fx.settle("turn-x", Some(MODEL), Some(&path));
+    assert!(
+        matches!(out, CodexSettlement::Unbooked("config_invalid")),
+        "{out:?}"
+    );
+    assert_eq!(fx.fingerprint(), before);
+}
+
+#[test]
+fn a_turn_charged_unmeasured_is_never_re_priced_by_a_later_measured_retry() {
+    let mut fx = fx();
+    // First attempt: no rollout path yet, so the flat hold is charged.
+    let first = fx.settle("turn-x", Some(MODEL), None);
+    assert!(
+        matches!(
+            first,
+            CodexSettlement::Unadmitted {
+                charged_usd_cents: HOLD,
+                usage_known: false,
+                ..
+            }
+        ),
+        "{first:?}"
+    );
+    let path = fx.rollout("r.jsonl", &turn_lines("turn-x", TURN_BIG));
+    let before = fx.fingerprint();
+    let retry = fx.settle("turn-x", Some(MODEL), Some(&path));
+    assert!(
+        matches!(retry, CodexSettlement::Unbooked("already_charged")),
+        "{retry:?}"
+    );
+    assert_eq!(fx.fingerprint(), before, "booked once, never re-priced");
+    assert_eq!(fx.used_reserved(), (HOLD, 0));
+}
+
+#[test]
+fn an_early_stop_for_t1_on_a_shared_hold_under_charges_t2_until_the_c4_true_up() {
+    // Documented residual, pinned so a change is deliberate: T1 and T2 share
+    // one hold; T1's Stop arrives while T2 has not reached the rollout. The
+    // hold settles on what is there (T1, 276 > the 100 hold), and T2's own
+    // Stop is then a replay, so T2's spend is not booked. The C4 true-up
+    // (re-measure a settled turn once its rollout is complete and book the
+    // positive delta) is what closes this; C2 does not.
+    let mut fx = fx_with_hold(100, true, true);
+    fx.admit("turn-1");
+    fx.admit("turn-2");
+    let mut lines = turn_lines("turn-1", TURN_BIG);
+    let path = fx.rollout("r.jsonl", &lines);
+    let early = fx.settle("turn-1", Some(MODEL), Some(&path));
+    assert_eq!(
+        settled(&early),
+        (BIG_CENTS, true, Some("transcript_inconsistent"))
+    );
+    lines.extend(turn_lines("turn-2", TURN_BIG));
+    let path = fx.rollout("r.jsonl", &lines);
+    let late = fx.settle("turn-2", Some(MODEL), Some(&path));
+    assert!(matches!(late, CodexSettlement::AlreadySettled), "{late:?}");
+    assert_eq!(
+        fx.used_reserved(),
+        (BIG_CENTS, 0),
+        "T2's 276 cents are not booked"
+    );
+}
+
+// ---------------------------------------------------------------------
 // HORO-2284 (C4): orphan recovery and true-up
 // ---------------------------------------------------------------------
 
