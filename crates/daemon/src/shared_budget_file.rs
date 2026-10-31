@@ -103,6 +103,12 @@ impl PricingOverrides {
         self.0.is_empty()
     }
 
+    /// The model ids the operator priced, in order. Read-only; `doctor` uses
+    /// it to tell whether any Codex (`gpt-*`) model is priced.
+    pub fn models(&self) -> impl Iterator<Item = &str> {
+        self.0.keys().map(String::as_str)
+    }
+
     /// The pinned table with these overrides applied on top.
     pub fn table(&self) -> PricingTable {
         if self.0.is_empty() {
@@ -672,6 +678,20 @@ mod tests {
                 .unwrap()
                 .input_usd_per_mtok,
             2.0
+        );
+    }
+
+    #[test]
+    fn override_model_ids_are_listed_in_order() {
+        let json = with_overrides(&format!(
+            r#"{{"gpt-5-codex":{FLAT_PRICE},"claude-sonnet-4-5":{FLAT_PRICE}}}"#
+        ));
+        let SharedBudgetFileState::Valid(c) = parse(json.as_bytes()) else {
+            panic!("expected valid");
+        };
+        assert_eq!(
+            c.pricing_overrides.models().collect::<Vec<_>>(),
+            ["claude-sonnet-4-5", "gpt-5-codex"]
         );
     }
 

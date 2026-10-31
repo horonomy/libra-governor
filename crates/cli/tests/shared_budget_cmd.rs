@@ -512,8 +512,15 @@ fn export_writes_the_documented_schema_with_a_verifiable_hash_and_private_perms(
         ])
     );
     assert_eq!(body["period"]["label"], period);
-    assert_eq!(keys(&body["pool"]), set(&["capacity", "pool_id", "unit"]));
+    assert_eq!(
+        keys(&body["pool"]),
+        set(&["capacity", "capacity_source", "pool_id", "unit"])
+    );
     assert_eq!(body["pool"]["capacity"], 100_000);
+    // HORO-2293: the export is read offline from the ledger, so `capacity` is
+    // the pool row's stored value, not the live configured cap that `status`
+    // and admission use. The field says so.
+    assert_eq!(body["pool"]["capacity_source"], "pool_row");
     assert_eq!(body["totals"]["used"], 147);
     assert_eq!(body["totals"]["reserved"], 0);
     assert_eq!(body["totals"]["executors"], 3);

@@ -402,7 +402,7 @@ fn ends_with_newline(path: &Path) -> Result<bool, UsageUnavailable> {
     use std::io::{Read, Seek, SeekFrom};
 
     super::reject_non_regular_file(path)?;
-    let mut file = std::fs::File::open(path).map_err(|_| UsageUnavailable::Unreadable)?;
+    let mut file = super::open_regular_file(path)?;
     let len = file
         .seek(SeekFrom::End(0))
         .map_err(|_| UsageUnavailable::Unreadable)?;
@@ -996,5 +996,117 @@ mod tests {
             "the subagent's record (turn_id T2, root_turn_id T1) must never be counted toward T1"
         );
         assert_eq!(usage.fresh_tokens(), 110);
+    }
+
+    /// Characterization (HORO-2282): Codex writes `usage` per response and
+    /// `turn_token_usage` as a running total (codex-rs state/session.rs,
+    /// 0.163 to 0.165). The turn total is the sum of `usage`, never the sum
+    /// of the cumulative field.
+    #[test]
+    fn cumulative_turn_totals_are_not_summed_across_records() {
+        let f = write_lines(&[
+            task_started(T1),
+            usage_record(T1, THREAD, SESSION, 100, 0, 0, 10, 0, 100, 0, 0, 10, 0),
+            usage_record(T1, THREAD, SESSION, 200, 0, 0, 20, 0, 300, 0, 0, 30, 0),
+            usage_record(T1, THREAD, SESSION, 50, 0, 0, 5, 0, 350, 0, 0, 35, 0),
+        ]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().expect("three consistent records");
+        assert_eq!(usage.records, 3);
+        assert_eq!(
+            usage.fresh_tokens(),
+            350 + 35,
+            "the last record's running total, not 100+300+350 input"
+        );
+    }
+
+    /// Characterization (HORO-2282): codex-rs writes a record for an
+    /// incomplete or failed response that carries a `response_id`, and it
+    /// rolls into the turn's running total. The fixture cannot mark a record
+    /// as incomplete, so this pins only that a low-output first record is
+    /// summed with the later ones and read against the running total. It
+    /// documents current behavior and changes only deliberately.
+    #[test]
+    fn a_first_record_with_little_output_is_summed_with_the_turn() {
+        let f = write_lines(&[
+            task_started(T1),
+            usage_record(T1, THREAD, SESSION, 40, 0, 0, 0, 0, 40, 0, 0, 0, 0),
+            usage_record(T1, THREAD, SESSION, 100, 0, 0, 10, 0, 140, 0, 0, 10, 0),
+        ]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().expect("partial then complete response");
+        assert_eq!(usage.records, 2);
+        assert_eq!(usage.fresh_tokens(), 140 + 10);
+    }
+
+    /// Characterization (HORO-2282): the reader does not de-duplicate by
+    /// `response_id`. A replayed or concatenated record makes the summed
+    /// usage exceed the turn's running total, so the read is refused (the
+    /// caller falls back to the flat hold) instead of double charging.
+    #[test]
+    fn a_duplicated_record_is_inconsistent_not_double_charged() {
+        let record = usage_record(T1, THREAD, SESSION, 100, 0, 0, 10, 0, 100, 0, 0, 10, 0);
+        let f = write_lines(&[task_started(T1), record.clone(), record]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        assert_eq!(
+            observed,
+            UsageObservation::Unavailable(UsageUnavailable::Inconsistent)
+        );
+    }
+
+    /// Characterization (HORO-2282): an aborted or stream-failed request
+    /// writes no `token_usage_record` (codex-rs, 0.163 to 0.165), so an
+    /// interrupted turn with no completed response has no usage to read.
+    #[test]
+    fn an_interrupted_turn_without_any_record_has_no_usage_in_window() {
+        let aborted = format!(
+            r#"{{"type":"event_msg","payload":{{"type":"turn_aborted","turn_id":"{T1}"}}}}"#
+        );
+        let f = write_lines(&[task_started(T1), aborted]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        assert_eq!(
+            observed,
+            UsageObservation::Unavailable(UsageUnavailable::NoUsageInWindow)
+        );
+    }
+
+    /// Characterization (HORO-2282), a KNOWN under-count: when a turn is
+    /// interrupted after some responses completed, the aborted request left
+    /// no record, so the read is `Measured` over the recorded responses
+    /// only. The reader cannot see the missing spend. This test pins that
+    /// limit so Codex coverage is never claimed complete for interrupts.
+    #[test]
+    fn an_interrupted_turn_measures_only_the_recorded_responses() {
+        let aborted = format!(
+            r#"{{"type":"event_msg","payload":{{"type":"turn_aborted","turn_id":"{T1}"}}}}"#
+        );
+        let f = write_lines(&[
+            task_started(T1),
+            usage_record(T1, THREAD, SESSION, 100, 0, 0, 10, 0, 100, 0, 0, 10, 0),
+            aborted,
+        ]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed
+            .measured()
+            .expect("the recorded response is consistent");
+        assert_eq!(usage.records, 1);
+        assert_eq!(usage.fresh_tokens(), 110);
+    }
+
+    /// Characterization (HORO-2282): a Stop-block continuation writes more
+    /// records for the same `turn_id` after an earlier `task_complete`. The
+    /// reader ignores `task_complete`, so they are counted.
+    #[test]
+    fn records_written_after_a_task_complete_for_the_same_turn_are_counted() {
+        let f = write_lines(&[
+            task_started(T1),
+            usage_record(T1, THREAD, SESSION, 100, 0, 0, 10, 0, 100, 0, 0, 10, 0),
+            task_complete(T1),
+            usage_record(T1, THREAD, SESSION, 200, 0, 0, 20, 0, 300, 0, 0, 30, 0),
+        ]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        let usage = observed.measured().expect("continuation records agree");
+        assert_eq!(usage.records, 2);
+        assert_eq!(usage.fresh_tokens(), 300 + 30);
     }
 }

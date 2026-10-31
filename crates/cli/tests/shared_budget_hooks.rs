@@ -1188,3 +1188,426 @@ fn pre_tool_use_has_one_overall_deadline_even_against_a_trickling_daemon() {
         ran.elapsed
     );
 }
+
+// =====================================================================
+// (f) HORO-2283 (C3): Codex hooks behind the `shared-budget.codex` marker.
+//
+// Codex enforcement is OFF unless the marker file sits beside
+// `shared-budget.json`. These tests pin both sides: without the marker the
+// hook sends no `Admit` and no `SettleTurn` (recorded by the scripted
+// daemon); with it the hook speaks the same gate as Claude Code, keyed by
+// `provider:"codex"` and `prompt_id := turn_id`.
+// =====================================================================
+
+fn enrol(state: &Path) {
+    std::fs::write(state.join("shared-budget.codex"), b"").unwrap();
+}
+
+fn codex_prompt_payload(session: &str, turn: Option<&str>, agent: Option<&str>) -> String {
+    let mut v = serde_json::json!({
+        "session_id": session, "cwd": repo().path(), "prompt": "SECRET PROMPT TEXT",
+        "hook_event_name": "UserPromptSubmit",
+    });
+    if let Some(t) = turn {
+        v["turn_id"] = t.into();
+    }
+    if let Some(a) = agent {
+        v["agent_id"] = a.into();
+    }
+    v.to_string()
+}
+
+fn codex_prompt(
+    state: &Path,
+    session: &str,
+    turn: Option<&str>,
+    agent: Option<&str>,
+    env: &[(&str, &str)],
+) -> Ran {
+    run_hook(
+        &["codex-hook", "user-prompt-submit"],
+        state,
+        &codex_prompt_payload(session, turn, agent),
+        env,
+    )
+}
+
+fn codex_stop_payload(session: &str, turn: Option<&str>, agent: Option<&str>) -> String {
+    let mut v = serde_json::json!({
+        "session_id": session, "hook_event_name": "Stop", "model": "gpt-5-codex",
+        "transcript_path": "/h/codex/rollout-1.jsonl", "stop_hook_active": false,
+    });
+    if let Some(t) = turn {
+        v["turn_id"] = t.into();
+    }
+    if let Some(a) = agent {
+        v["agent_id"] = a.into();
+    }
+    v.to_string()
+}
+
+fn codex_stop(state: &Path, payload: &str) -> Ran {
+    run_hook(&["codex-hook", "stop"], state, payload, &[])
+}
+
+fn is_settle_turn(req: &Request) -> bool {
+    matches!(
+        req,
+        Request::SharedBudget {
+            shared_budget: SharedBudgetRequest::SettleTurn { .. }
+        }
+    )
+}
+
+fn settled() -> SharedBudgetOutcome {
+    SharedBudgetOutcome::CodexTurnSettled {
+        disposition: "settled".into(),
+    }
+}
+
+fn daemon_log(state: &Path) -> String {
+    std::fs::read_to_string(state.join("daemon.log")).unwrap_or_default()
+}
+
+#[test]
+fn codex_without_the_marker_sends_no_admit_and_no_settle_turn() {
+    // A budget file but no marker: the Codex route is exactly today's.
+    let state = tempfile::tempdir().unwrap();
+    write_budget(state.path(), &config(5_000, ""));
+    let fake = Fake::start(state.path(), |req| match req {
+        Request::SharedBudget { .. } => reply(denied(SharedBudgetDenyReason::CapExhausted)),
+        _ => err("scripted"),
+    });
+    let ran = codex_prompt(state.path(), "codex-s", Some("turn-1"), None, &[]);
+    assert!(!ran.stdout.contains("decision"), "{}", ran.stdout);
+    let stop = codex_stop(
+        state.path(),
+        &codex_stop_payload("codex-s", Some("turn-1"), None),
+    );
+    assert_eq!((stop.code, stop.stdout.as_str()), (Some(0), ""));
+    assert_eq!(
+        fake.kinds(),
+        vec!["preflight".to_string(), "finalize".to_string()],
+        "{:?}",
+        fake.requests()
+    );
+}
+
+#[test]
+fn a_marker_without_a_budget_file_changes_nothing_for_codex() {
+    let state = tempfile::tempdir().unwrap();
+    enrol(state.path());
+    let fake = Fake::start(state.path(), |_| err("scripted"));
+    codex_prompt(state.path(), "codex-s", Some("turn-1"), None, &[]);
+    codex_stop(
+        state.path(),
+        &codex_stop_payload("codex-s", Some("turn-1"), None),
+    );
+    assert_eq!(
+        fake.kinds(),
+        vec!["preflight".to_string(), "finalize".to_string()]
+    );
+}
+
+#[test]
+fn an_enrolled_codex_prompt_is_blocked_when_the_cap_is_exhausted() {
+    let state = tempfile::tempdir().unwrap();
+    write_budget(state.path(), &config(5_000, ""));
+    enrol(state.path());
+    let fake = Fake::start(state.path(), |_| {
+        reply(denied(SharedBudgetDenyReason::CapExhausted))
+    });
+    let ran = codex_prompt(state.path(), "codex-s", Some("turn-1"), None, &[]);
+    let v = ran.json();
+    assert_eq!(v["decision"], "block", "{v}");
+    assert_block(&ran);
+    assert_eq!(
+        fake.kinds(),
+        vec!["shared_budget:admit".to_string()],
+        "a blocked prompt must not reach Preflight"
+    );
+    let admit = &fake.requests()[0]["shared_budget"];
+    assert_eq!(admit["session_id"], "codex-s");
+    assert_eq!(admit["prompt_id"], "turn-1");
+    assert_eq!(admit["provider"], "codex");
+    assert!(admit["agent_id"].is_null(), "{admit}");
+}
+
+#[test]
+fn an_enrolled_codex_prompt_that_is_allowed_adds_context_and_the_soft_limit_warning() {
+    let state = tempfile::tempdir().unwrap();
+    write_budget(state.path(), &config(5_000, ""));
+    enrol(state.path());
+    let warning = SoftLimitWarning {
+        scope: SoftLimitScope::PerSession,
+        session_id: "codex-s".into(),
+        agent_id: None,
+        used_plus_reserved_usd_cents: 1_000,
+        threshold_usd_cents: 500,
+    };
+    let fake = Fake::start(state.path(), move |req| match req {
+        Request::SharedBudget { .. } => reply(allowed(vec![warning.clone()])),
+        _ => err("scripted"),
+    });
+    let ran = codex_prompt(state.path(), "codex-s", Some("turn-1"), None, &[]);
+    let ctx = outer_context(&ran);
+    assert!(!ran.stdout.contains("\"decision\""), "{}", ran.stdout);
+    assert_eq!(
+        ctx.lines().last().unwrap(),
+        "[libra-governor] budget soft limit: per-session $10.00 of $5.00 (warn only; \
+         Libra-accounted USD, admission-bounded)."
+    );
+    assert_eq!(
+        fake.kinds(),
+        vec!["shared_budget:admit".to_string(), "preflight".to_string()]
+    );
+}
+
+#[test]
+fn an_enrolled_codex_prompt_blocks_when_the_daemon_is_unreachable() {
+    let state = tempfile::tempdir().unwrap();
+    write_budget(state.path(), &config(5_000, ""));
+    enrol(state.path());
+    let ran = codex_prompt(
+        state.path(),
+        "codex-s",
+        Some("turn-1"),
+        None,
+        &[("LIBRA_GOVERNOR_NO_AUTOSPAWN", "1")],
+    );
+    let reason = assert_block(&ran);
+    assert!(
+        reason.contains("budget enforcement unavailable: daemon unreachable"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn an_enrolled_codex_subagent_prompt_is_not_admitted_and_is_logged() {
+    let state = tempfile::tempdir().unwrap();
+    write_budget(state.path(), &config(5_000, ""));
+    enrol(state.path());
+    let fake = Fake::start(state.path(), |req| match req {
+        Request::SharedBudget { .. } => reply(denied(SharedBudgetDenyReason::CapExhausted)),
+        _ => err("scripted"),
+    });
+    let ran = codex_prompt(
+        state.path(),
+        "codex-s",
+        Some("turn-1"),
+        Some("agent-7"),
+        &[],
+    );
+    assert!(!ran.stdout.contains("\"decision\""), "{}", ran.stdout);
+    assert_eq!(fake.kinds(), vec!["preflight".to_string()]);
+    let log = daemon_log(state.path());
+    assert!(
+        log.contains("subagent") && log.contains("not admitted"),
+        "{log}"
+    );
+}
+
+#[test]
+fn owner_route_together_with_the_marker_blocks_with_an_explicit_reason() {
+    let state = tempfile::tempdir().unwrap();
+    write_budget(state.path(), &config(5_000, ""));
+    enrol(state.path());
+    let fake = Fake::start(state.path(), |_| err("scripted"));
+    let ran = codex_prompt(
+        state.path(),
+        "codex-s",
+        Some("turn-1"),
+        None,
+        &[("LIBRA_GOVERNOR_CODEX_EXECUTION_OWNER", "1")],
+    );
+    let reason = assert_block(&ran);
+    assert!(
+        reason.contains("LIBRA_GOVERNOR_CODEX_EXECUTION_OWNER")
+            && reason.contains("shared-budget.codex"),
+        "{reason}"
+    );
+    assert!(fake.kinds().is_empty(), "{:?}", fake.requests());
+}
+
+#[test]
+fn owner_route_without_the_marker_is_untouched() {
+    let state = tempfile::tempdir().unwrap();
+    write_budget(state.path(), &config(5_000, ""));
+    let fake = Fake::start(state.path(), |_| err("scripted"));
+    let ran = codex_prompt(
+        state.path(),
+        "codex-s",
+        Some("turn-1"),
+        None,
+        &[("LIBRA_GOVERNOR_CODEX_EXECUTION_OWNER", "1")],
+    );
+    assert!(!ran.stdout.contains("\"decision\""), "{}", ran.stdout);
+    assert!(
+        fake.kinds().iter().all(|k| !k.starts_with("shared_budget")),
+        "{:?}",
+        fake.requests()
+    );
+}
+
+#[test]
+fn an_enrolled_codex_prompt_with_a_blank_or_reserved_session_is_skipped() {
+    for session in ["", "   ", "execution-owner-v1:abc"] {
+        let state = tempfile::tempdir().unwrap();
+        write_budget(state.path(), &config(5_000, ""));
+        enrol(state.path());
+        let fake = Fake::start(state.path(), |_| {
+            reply(denied(SharedBudgetDenyReason::CapExhausted))
+        });
+        let ran = codex_prompt(state.path(), session, Some("turn-1"), None, &[]);
+        assert!(
+            !ran.stdout.contains("\"decision\""),
+            "{session:?}: {}",
+            ran.stdout
+        );
+        assert!(
+            fake.kinds().iter().all(|k| !k.starts_with("shared_budget")),
+            "{session:?}: {:?}",
+            fake.requests()
+        );
+    }
+}
+
+#[test]
+fn an_enrolled_codex_prompt_without_a_turn_id_is_admitted_with_no_prompt_id() {
+    let state = tempfile::tempdir().unwrap();
+    write_budget(state.path(), &config(5_000, ""));
+    enrol(state.path());
+    let fake = Fake::start(state.path(), |req| match req {
+        Request::SharedBudget { .. } => reply(allowed(vec![])),
+        _ => err("scripted"),
+    });
+    codex_prompt(state.path(), "codex-s", None, None, &[]);
+    let admit = &fake.requests()[0]["shared_budget"];
+    assert_eq!(admit["provider"], "codex");
+    assert!(admit["prompt_id"].is_null(), "{admit}");
+}
+
+#[test]
+fn the_marker_never_changes_the_claude_admit_bytes() {
+    let state = tempfile::tempdir().unwrap();
+    write_budget(state.path(), &config(5_000, ""));
+    enrol(state.path());
+    let fake = Fake::start(state.path(), |_| reply(SharedBudgetOutcome::NotConfigured));
+    prompt(state.path(), "claude-s", repo().path(), &[]);
+    let admit = &fake.requests()[0]["shared_budget"];
+    assert!(admit.get("provider").is_none(), "{admit}");
+}
+
+#[test]
+fn an_enrolled_codex_stop_sends_settle_turn_before_finalize_and_prints_nothing() {
+    let state = tempfile::tempdir().unwrap();
+    write_budget(state.path(), &config(5_000, ""));
+    enrol(state.path());
+    let fake = Fake::start(state.path(), |req| match req {
+        Request::SharedBudget { .. } => reply(settled()),
+        _ => err("scripted"),
+    });
+    let ran = codex_stop(
+        state.path(),
+        &codex_stop_payload("codex-s", Some("turn-1"), None),
+    );
+    assert_eq!(
+        (ran.code, ran.stdout.as_str()),
+        (Some(0), ""),
+        "{}",
+        ran.stderr
+    );
+    assert_eq!(
+        fake.kinds(),
+        vec![
+            "shared_budget:settle_turn".to_string(),
+            "finalize".to_string()
+        ]
+    );
+    let settle = &fake.requests()[0]["shared_budget"];
+    assert_eq!(settle["session_id"], "codex-s");
+    assert_eq!(settle["turn_id"], "turn-1");
+    assert_eq!(settle["transcript_path"], "/h/codex/rollout-1.jsonl");
+    assert_eq!(settle["model"], "gpt-5-codex");
+    assert!(settle.get("provider").is_none(), "{settle}");
+}
+
+#[test]
+fn an_enrolled_codex_stop_never_blocks_or_prints_on_a_denial_or_error() {
+    for answer in [
+        reply(denied(SharedBudgetDenyReason::CapExhausted)),
+        err("scripted"),
+    ] {
+        let state = tempfile::tempdir().unwrap();
+        write_budget(state.path(), &config(5_000, ""));
+        enrol(state.path());
+        let slot = Mutex::new(Some(answer));
+        let _fake = Fake::start(state.path(), move |req| {
+            if is_settle_turn(req) {
+                slot.lock().unwrap().take().unwrap_or_else(|| err("again"))
+            } else {
+                err("scripted")
+            }
+        });
+        let ran = codex_stop(
+            state.path(),
+            &codex_stop_payload("codex-s", Some("turn-1"), None),
+        );
+        assert_eq!((ran.code, ran.stdout.as_str()), (Some(0), ""));
+        assert!(!ran.stderr.contains("decision"), "{}", ran.stderr);
+    }
+}
+
+#[test]
+fn an_enrolled_codex_stop_waits_at_most_five_seconds_for_settle_turn() {
+    let state = tempfile::tempdir().unwrap();
+    write_budget(state.path(), &config(5_000, ""));
+    enrol(state.path());
+    let fake = Fake::start(state.path(), |req| {
+        if is_settle_turn(req) {
+            Answer::Stall
+        } else {
+            err("scripted")
+        }
+    });
+    let ran = codex_stop(
+        state.path(),
+        &codex_stop_payload("codex-s", Some("turn-1"), None),
+    );
+    assert_eq!((ran.code, ran.stdout.as_str()), (Some(0), ""));
+    assert!(
+        ran.elapsed < Duration::from_secs(9),
+        "a stalled SettleTurn must be bounded: {:?}",
+        ran.elapsed
+    );
+    assert!(
+        fake.kinds()
+            .contains(&"shared_budget:settle_turn".to_string()),
+        "the stalled request was sent: {:?}",
+        fake.requests()
+    );
+    assert!(fake.kinds().contains(&"finalize".to_string()));
+}
+
+#[test]
+fn an_enrolled_codex_stop_skips_settle_turn_for_subagents_missing_turns_and_bad_sessions() {
+    let cases = [
+        codex_stop_payload("codex-s", Some("turn-1"), Some("agent-7")),
+        codex_stop_payload("codex-s", None, None),
+        codex_stop_payload("   ", Some("turn-1"), None),
+        codex_stop_payload("execution-owner-v1:abc", Some("turn-1"), None),
+    ];
+    for payload in cases {
+        let state = tempfile::tempdir().unwrap();
+        write_budget(state.path(), &config(5_000, ""));
+        enrol(state.path());
+        let fake = Fake::start(state.path(), |_| err("scripted"));
+        let ran = codex_stop(state.path(), &payload);
+        assert_eq!((ran.code, ran.stdout.as_str()), (Some(0), ""));
+        assert!(
+            fake.kinds().iter().all(|k| !k.starts_with("shared_budget")),
+            "{payload}: {:?}",
+            fake.requests()
+        );
+    }
+}

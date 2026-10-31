@@ -2332,6 +2332,33 @@ impl LedgerStore {
             .transpose()
     }
 
+    /// Every host prompt (turn) id the hold `reservation` accepted for this
+    /// session, sorted (HORO-2282). A renewed hold names the first prompt and
+    /// each re-prompt that joined it, so a settlement can measure every turn
+    /// the hold covered instead of only the one a `Stop` names. A prompt
+    /// re-pointed to a newer hold is no longer listed under this one.
+    pub fn prompts_for_hold(
+        &self,
+        principal_id: &PrincipalId,
+        session_id: &str,
+        reservation: SharedPoolReservationId,
+    ) -> Result<Vec<String>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT prompt_id FROM shared_hold_prompts
+             WHERE principal_id = ?1 AND session_id = ?2 AND reservation_id = ?3
+             ORDER BY prompt_id",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![principal_id.0, session_id, reservation.0.to_string()],
+            |row| row.get::<_, String>(0),
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// Reclaims every `active` shared-pool hold whose `expires_at <= now`
     /// in one transaction — the crash/restart reconciliation path (AC2):
     /// a hold issued by a process that then crashed without settling

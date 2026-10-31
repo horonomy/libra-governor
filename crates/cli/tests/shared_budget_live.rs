@@ -379,6 +379,7 @@ fn a_restarted_daemon_keeps_settled_totals_and_active_holds() {
         idempotency_key: "c1".into(),
         charge_source: ChargeSource::SubagentTranscript,
         event_time: None,
+        provider: None,
     }) {
         SharedBudgetOutcome::Charged {
             already_charged: false,
@@ -425,6 +426,7 @@ fn a_restarted_daemon_keeps_settled_totals_and_active_holds() {
         idempotency_key: "c1".into(),
         charge_source: ChargeSource::SubagentTranscript,
         event_time: None,
+        provider: None,
     }) {
         SharedBudgetOutcome::Charged {
             already_charged: true,

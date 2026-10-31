@@ -163,6 +163,7 @@ impl Fx {
             idempotency_key: key.to_string(),
             charge_source: source,
             event_time: event_time.map(String::from),
+            provider: None,
         })
     }
 
@@ -1677,4 +1678,300 @@ fn a_codex_admit_is_inert_until_the_codex_settlement_exists() {
     assert_eq!(outcome, SharedBudgetOutcome::NotConfigured);
     assert!(fx.pools().is_empty(), "no pool for an inert lane");
     assert_eq!(fx.fingerprint(), before, "nothing moved");
+}
+
+// ---- HORO-2282 (C2 prerequisites): lane-taking entry points ----
+
+fn lane_requests(session: &str, provider: Option<&str>) -> Vec<SharedBudgetRequest> {
+    let provider = provider.map(String::from);
+    vec![
+        SharedBudgetRequest::ChargeAgent {
+            session_id: session.to_string(),
+            agent_id: None,
+            amount_usd_cents: 5,
+            idempotency_key: "k".to_string(),
+            charge_source: ChargeSource::TurnHold,
+            event_time: None,
+            provider: provider.clone(),
+        },
+        SharedBudgetRequest::SettleTail {
+            session_id: session.to_string(),
+            transcript_path: "/nope.jsonl".to_string(),
+            provider: provider.clone(),
+        },
+        SharedBudgetRequest::TranscriptReady {
+            session_id: session.to_string(),
+            transcript_path: "/nope.jsonl".to_string(),
+            provider,
+        },
+    ]
+}
+
+#[test]
+fn a_codex_lane_request_is_inert_and_writes_nothing() {
+    let mut fx = Fx::new(Some(&cfg_json(2_000, "UTC", 1_000)), JAN);
+    let before = fx.fingerprint();
+    for request in lane_requests("s", Some("codex")) {
+        assert_eq!(
+            fx.sb(request.clone()),
+            SharedBudgetOutcome::NotConfigured,
+            "{request:?}"
+        );
+    }
+    assert!(fx.pools().is_empty(), "no pool for a dark provider");
+    assert_eq!(fx.fingerprint(), before, "nothing moved");
+}
+
+#[test]
+fn an_unknown_provider_on_a_lane_request_is_refused_and_never_a_claude_lane() {
+    let mut fx = Fx::new(Some(&cfg_json(2_000, "UTC", 1_000)), JAN);
+    let before = fx.fingerprint();
+    for request in lane_requests("s", Some("gemini")) {
+        expect_refused(fx.sb(request), SharedBudgetRefusal::UnsupportedProvider);
+    }
+    assert_eq!(fx.fingerprint(), before, "nothing moved");
+}
+
+#[test]
+fn a_client_supplied_derived_key_is_refused_for_every_lane_request_and_provider() {
+    let mut fx = Fx::new(Some(&cfg_json(2_000, "UTC", 1_000)), JAN);
+    let before = fx.fingerprint();
+    let forged = "shared-budget-provider-v1:[\"codex\",\"s\"]";
+    for provider in [None, Some("claude-code"), Some("codex")] {
+        for request in lane_requests(forged, provider) {
+            expect_refused(fx.sb(request), SharedBudgetRefusal::ReservedSessionScope);
+        }
+    }
+    assert_eq!(fx.fingerprint(), before, "nothing moved");
+}
+
+#[test]
+fn client_lane_validates_the_client_id_then_derives_the_key() {
+    use libra_governor_daemon::shared_budget::{budget_lane, client_lane};
+    assert_eq!(client_lane("s", None).unwrap(), "s");
+    assert_eq!(
+        client_lane("s", Some("codex")).unwrap(),
+        budget_lane("s", Some("codex")).unwrap()
+    );
+    let forged = budget_lane("s", Some("codex")).unwrap();
+    assert_eq!(
+        client_lane(&forged, Some("codex")),
+        Err(SharedBudgetRefusal::ReservedSessionScope)
+    );
+    assert_eq!(
+        client_lane(" ", None),
+        Err(SharedBudgetRefusal::EmptySessionId)
+    );
+    assert_eq!(
+        client_lane("s", Some("gemini")),
+        Err(SharedBudgetRefusal::UnsupportedProvider)
+    );
+}
+
+#[test]
+fn the_internal_lane_functions_accept_an_already_derived_key() {
+    use libra_governor_daemon::shared_budget as sb;
+    let mut fx = Fx::new(Some(&cfg_json(2_000, "UTC", 1_000)), JAN);
+    let lane = sb::budget_lane("s", Some("codex")).unwrap();
+    let rt = &fx.config.shared_budget;
+    assert_eq!(
+        sb::transcript_ready_on_lane(&fx.ledger, rt, &lane, "/nope.jsonl").unwrap(),
+        SharedBudgetOutcome::TranscriptReadiness { ready: true },
+        "no hold on the lane: nothing to wait for"
+    );
+    expect_refused(
+        sb::settle_tail_on_lane(&mut fx.ledger, rt, &lane, "/nope.jsonl").unwrap(),
+        SharedBudgetRefusal::NoSettledLane,
+    );
+    assert!(matches!(
+        sb::settle_turn(&mut fx.ledger, rt, &lane, None, None).unwrap(),
+        sb::TurnSettlement::NoHold
+    ));
+    assert_eq!(sb::heartbeat(&mut fx.ledger, rt, &lane).unwrap(), 0);
+    assert!(
+        !matches!(
+            sb::charge_on_lane(
+                &mut fx.ledger,
+                rt,
+                &lane,
+                None,
+                5,
+                "k",
+                ChargeSource::TurnHold,
+                None
+            )
+            .unwrap(),
+            SharedBudgetOutcome::Refused {
+                reason: SharedBudgetRefusal::ReservedSessionScope
+            }
+        ),
+        "a derived key is not re-validated as a client identity"
+    );
+}
+
+#[test]
+fn the_internal_lane_functions_still_refuse_an_empty_lane() {
+    use libra_governor_daemon::shared_budget as sb;
+    let mut fx = Fx::new(Some(&cfg_json(2_000, "UTC", 1_000)), JAN);
+    let rt = &fx.config.shared_budget;
+    expect_refused(
+        sb::settle_tail_on_lane(&mut fx.ledger, rt, " ", "/nope.jsonl").unwrap(),
+        SharedBudgetRefusal::EmptySessionId,
+    );
+    assert_eq!(sb::heartbeat(&mut fx.ledger, rt, " ").unwrap(), 0);
+}
+
+// ---- HORO-2283 (C3): the Codex marker turns Codex Admit/Check/SettleTurn on ----
+
+fn enrol_codex(fx: &Fx) {
+    std::fs::write(fx.path().join("shared-budget.codex"), b"").unwrap();
+}
+
+fn codex_admit(fx: &mut Fx, session: &str, turn: Option<&str>) -> SharedBudgetOutcome {
+    fx.sb(SharedBudgetRequest::Admit {
+        session_id: session.to_string(),
+        agent_id: None,
+        prompt_id: turn.map(String::from),
+        provider: Some("codex".to_string()),
+    })
+}
+
+fn settle_turn(fx: &mut Fx, session: &str, turn: &str) -> SharedBudgetOutcome {
+    fx.sb(SharedBudgetRequest::SettleTurn {
+        session_id: session.to_string(),
+        turn_id: turn.to_string(),
+        model: None,
+        transcript_path: None,
+    })
+}
+
+#[test]
+fn an_enrolled_codex_admit_holds_on_the_codex_lane_apart_from_the_claude_lane() {
+    let mut fx = Fx::new(Some(&cfg_json(2_000, "UTC", 1_000)), JAN);
+    enrol_codex(&fx);
+
+    let codex = grant(codex_admit(&mut fx, "s", Some("turn-1")));
+    assert_eq!(codex.hold, 1_000);
+    assert!(!codex.reused);
+    assert_eq!(fx.pools().len(), 1);
+
+    // The same raw session id on the Claude lane is a different hold.
+    let claude = grant(fx.admit("s", None, Some("p-1")));
+    assert!(!claude.reused);
+    assert_ne!(claude.id, codex.id);
+    assert_eq!(fx.status().reserved_usd_cents, 2_000);
+}
+
+#[test]
+fn an_enrolled_codex_admit_is_denied_when_the_cap_is_exhausted() {
+    let mut fx = Fx::new(Some(&cfg_json(1_500, "UTC", 1_000)), JAN);
+    enrol_codex(&fx);
+    grant(codex_admit(&mut fx, "s1", Some("t1")));
+    let before = fx.fingerprint();
+    expect_cap_exhausted(codex_admit(&mut fx, "s2", Some("t2")), 500);
+    assert_eq!(fx.fingerprint(), before, "a denial writes nothing");
+}
+
+#[test]
+fn a_replayed_enrolled_codex_admit_reuses_its_hold() {
+    let mut fx = Fx::new(Some(&cfg_json(5_000, "UTC", 1_000)), JAN);
+    enrol_codex(&fx);
+    let first = grant(codex_admit(&mut fx, "s", Some("turn-1")));
+    let again = grant(codex_admit(&mut fx, "s", Some("turn-1")));
+    assert!(again.reused);
+    assert_eq!(again.id, first.id);
+}
+
+#[test]
+fn an_enrolled_codex_check_reads_the_codex_lane() {
+    let mut fx = Fx::new(Some(&cfg_json(5_000, "UTC", 1_000)), JAN);
+    enrol_codex(&fx);
+    let check = |fx: &mut Fx| {
+        fx.sb(SharedBudgetRequest::Check {
+            session_id: "s".to_string(),
+            agent_id: None,
+            provider: Some("codex".to_string()),
+        })
+    };
+    assert!(matches!(
+        check(&mut fx),
+        SharedBudgetOutcome::Checked {
+            state: SharedBudgetCheckState::Available,
+            ..
+        }
+    ));
+    grant(codex_admit(&mut fx, "s", Some("t1")));
+    assert!(matches!(
+        check(&mut fx),
+        SharedBudgetOutcome::Checked {
+            state: SharedBudgetCheckState::Admitted,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn removing_the_marker_switches_codex_admission_back_off_without_a_restart() {
+    let mut fx = Fx::new(Some(&cfg_json(5_000, "UTC", 1_000)), JAN);
+    enrol_codex(&fx);
+    grant(codex_admit(&mut fx, "s", Some("t1")));
+    std::fs::remove_file(fx.path().join("shared-budget.codex")).unwrap();
+    let before = fx.fingerprint();
+    assert_eq!(
+        codex_admit(&mut fx, "s", Some("t2")),
+        SharedBudgetOutcome::NotConfigured
+    );
+    assert_eq!(fx.fingerprint(), before, "nothing moved");
+}
+
+#[test]
+fn the_marker_does_not_revive_any_other_codex_lane_request() {
+    let mut fx = Fx::new(Some(&cfg_json(2_000, "UTC", 1_000)), JAN);
+    enrol_codex(&fx);
+    let before = fx.fingerprint();
+    for request in lane_requests("s", Some("codex")) {
+        assert_eq!(
+            fx.sb(request.clone()),
+            SharedBudgetOutcome::NotConfigured,
+            "{request:?}"
+        );
+    }
+    assert_eq!(fx.fingerprint(), before, "nothing moved");
+}
+
+#[test]
+fn settle_turn_without_the_marker_is_inert_and_writes_nothing() {
+    let mut fx = Fx::new(Some(&cfg_json(2_000, "UTC", 1_000)), JAN);
+    let before = fx.fingerprint();
+    assert_eq!(
+        settle_turn(&mut fx, "s", "turn-1"),
+        SharedBudgetOutcome::NotConfigured
+    );
+    assert_eq!(fx.fingerprint(), before, "nothing moved");
+}
+
+#[test]
+fn settle_turn_settles_the_admitted_turn_hold_exactly_once() {
+    let mut fx = Fx::new(Some(&cfg_json(5_000, "UTC", 1_000)), JAN);
+    enrol_codex(&fx);
+    grant(codex_admit(&mut fx, "s", Some("turn-1")));
+    assert_eq!(fx.status().reserved_usd_cents, 1_000);
+
+    // No transcript: the flat hold is the settled amount, never 0.
+    assert!(matches!(
+        settle_turn(&mut fx, "s", "turn-1"),
+        SharedBudgetOutcome::CodexTurnSettled { .. }
+    ));
+    let settled = fx.status();
+    assert_eq!(
+        (settled.used_usd_cents, settled.reserved_usd_cents),
+        (1_000, 0)
+    );
+
+    let before = fx.fingerprint();
+    assert!(matches!(
+        settle_turn(&mut fx, "s", "turn-1"),
+        SharedBudgetOutcome::CodexTurnSettled { .. }
+    ));
+    assert_eq!(fx.fingerprint(), before, "a replay writes nothing");
 }

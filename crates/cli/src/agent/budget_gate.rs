@@ -21,6 +21,11 @@
 //! | PreToolUse | absent | (not asked, no connect) | empty output |
 //! | PreToolUse | present | exhausted / denied | deny JSON |
 //! | PreToolUse | present | anything else, incl. timeout | empty output |
+//!
+//! Codex (HORO-2283) takes the UserPromptSubmit rows only when the budget file
+//! **and** the `shared-budget.codex` marker exist ([`codex_enrolled`]); with
+//! either missing its route is exactly what it was before this module knew
+//! Codex. Codex has no PreToolUse gate here.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -93,6 +98,29 @@ pub fn budget_file_present() -> bool {
             path.parent().map(dir_searchable).unwrap_or(false)
         }
     }
+}
+
+/// Marker file name under the daemon state directory (the daemon owns the
+/// meaning; the hook only stats it).
+pub(crate) const CODEX_MARKER_FILE_NAME: &str =
+    libra_governor_daemon::shared_budget::CODEX_MARKER_FILE_NAME;
+
+/// Hard wall-clock budget for the Codex `Stop` settlement round trip. Stop is
+/// never denied and must not stall the host behind the budget.
+pub const SETTLE_BUDGET: Duration = Duration::from_secs(5);
+
+/// Is Codex enrolled in the shared budget? True only when a budget file is
+/// present and a regular `shared-budget.codex` file sits beside it, judged by
+/// stat alone like [`budget_file_present`] and like the daemon (a symlink does
+/// not count). The hook sends no Codex `Admit` and no `SettleTurn` otherwise.
+pub fn codex_enrolled() -> bool {
+    if !budget_file_present() {
+        return false;
+    }
+    libra_governor_daemon::paths::state_dir()
+        .ok()
+        .map(|dir| dir.join(CODEX_MARKER_FILE_NAME))
+        .is_some_and(|path| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()))
 }
 
 /// Session ids the daemon would refuse purely because of what the host
@@ -373,6 +401,7 @@ pub fn admit(
     socket_path: &Path,
     session_id: &str,
     prompt_id: Option<String>,
+    provider: Option<&str>,
     log: &dyn Fn(&str),
 ) -> Admission {
     let request = || Request::SharedBudget {
@@ -380,7 +409,7 @@ pub fn admit(
             session_id: session_id.to_string(),
             agent_id: None,
             prompt_id: prompt_id.clone(),
-            provider: None,
+            provider: provider.map(str::to_owned),
         },
     };
     // Two attempts: a daemon from an older release answers once with an
@@ -427,6 +456,60 @@ pub fn admit(
     }
     Admission::Block {
         reason: unusable_reason(),
+    }
+}
+
+/// Why an enrolled Codex prompt cannot be admitted: the owner route would
+/// record the same Codex turn without the budget's hold.
+pub fn codex_owner_route_conflict_reason() -> String {
+    format!(
+        "Libra shared budget: Codex is enrolled (shared-budget.codex) while \
+         LIBRA_GOVERNOR_CODEX_EXECUTION_OWNER is set, and the two cannot be combined, so this \
+         prompt cannot be admitted. Unset LIBRA_GOVERNOR_CODEX_EXECUTION_OWNER or remove \
+         shared-budget.codex ({LABEL})."
+    )
+}
+
+/// Best-effort settlement of one Codex turn at `Stop`. Never spawns a daemon,
+/// never prints, never blocks the host: every failure (no daemon, timeout,
+/// error, odd answer) is logged and swallowed. Bounded by [`SETTLE_BUDGET`].
+pub fn settle_codex_turn(
+    socket_path: &Path,
+    session_id: &str,
+    turn_id: &str,
+    model: Option<&str>,
+    transcript_path: Option<&str>,
+    log: &dyn Fn(&str),
+) {
+    let socket = socket_path.to_path_buf();
+    let request = Request::SharedBudget {
+        shared_budget: SharedBudgetRequest::SettleTurn {
+            session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
+            model: model.map(str::to_owned),
+            transcript_path: transcript_path.map(str::to_owned),
+        },
+    };
+    // One overall deadline around connect + write + read, as `check_denial`.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let outcome = client::connect_only_with_budget(&socket, SETTLE_BUDGET)
+            .and_then(|stream| client::roundtrip(&stream, request));
+        let _ = tx.send(outcome);
+    });
+    match rx.recv_timeout(SETTLE_BUDGET) {
+        Ok(Ok(Response::SharedBudget(outcome))) => match *outcome {
+            SharedBudgetOutcome::CodexTurnSettled { disposition } => {
+                log(&format!("stop: codex turn settlement: {disposition}"))
+            }
+            SharedBudgetOutcome::NotConfigured => {
+                log("stop: codex turn settlement: daemon reports codex not enrolled")
+            }
+            _ => log("stop: codex turn settlement: unexpected answer, ignored"),
+        },
+        Ok(Ok(_)) => log("stop: codex turn settlement: unexpected response kind, ignored"),
+        Ok(Err(e)) => log(&format!("stop: codex turn settlement failed, ignored: {e}")),
+        Err(_) => log("stop: codex turn settlement timed out, ignored"),
     }
 }
 
