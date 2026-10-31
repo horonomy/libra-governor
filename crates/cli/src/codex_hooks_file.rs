@@ -62,7 +62,7 @@
 //! [`command_is_ours`] (which also accepts a legacy unquoted path with
 //! spaces) decides what `remove`, `inspect` and `wired_commands` act on.
 //!
-//! `apply` rewrites a command, so it uses the stricter
+//! `apply` rewrites a command, so it uses
 //! [`command_is_ours_for`], which has no legacy leniency (HORO-2303). Both
 //! use `claude_settings::command_is_ours_with_suffix`, the one shared rule:
 //! the text before the event's exact suffix must be ONE path token whose
@@ -215,10 +215,12 @@ fn command_is_ours(command: &str) -> bool {
         .any(|suffix| crate::claude_settings::command_is_ours_with_suffix(command, suffix, true))
 }
 
-/// Install-side ownership: only an unambiguous single-path-token command is
-/// repointed or collapsed; a wrapped or legacy-space command is left alone.
+/// Install-side ownership for one event: the same rule as `remove`, so a
+/// reinstall repoints (and collapses) exactly the entries uninstall would
+/// remove -- including a v0.0.4-shape unquoted spaced or bare path -- and
+/// nothing the rule rejects (wrapped user commands, lookalikes).
 fn command_is_ours_for(command: &str, subcommand: &str) -> bool {
-    crate::claude_settings::command_is_ours_with_suffix(command, subcommand, false)
+    crate::claude_settings::command_is_ours_with_suffix(command, subcommand, true)
 }
 
 /// `true` when `group` applies to every tool (no matcher, or an empty / `*`
@@ -1564,7 +1566,7 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_unquoted_space_path_is_still_removed_by_uninstall_but_not_rewritten_by_install() {
+    fn a_legacy_unquoted_space_path_is_repointed_by_install_and_still_removed_by_uninstall() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hooks.json");
         let legacy = "/opt/legacy path/libra-governor codex-hook stop";
@@ -1576,10 +1578,11 @@ mod tests {
         apply(&path, &binary()).unwrap();
         let root = read_value(&path);
         assert_eq!(
-            root["hooks"]["Stop"][0], seed["hooks"]["Stop"][0],
-            "not rewritten"
+            root["hooks"]["Stop"],
+            serde_json::json!([{ "hooks": [{ "type": "command",
+                "command": format!("{} codex-hook stop", binary().display()) }] }]),
+            "repointed in place, no second hook beside the shell-split one"
         );
-        assert_eq!(root["hooks"]["Stop"].as_array().unwrap().len(), 2);
 
         remove(&path).unwrap();
         assert!(
@@ -1631,9 +1634,10 @@ mod tests {
     /// v0.0.4 wrote `{current_exe} {sub}` with no path check and recognised
     /// any command containing `libra-governor`, so a parenthesised or
     /// apostrophe directory is a real upgrade case: uninstall must still
-    /// remove it, install must not rewrite it.
+    /// remove it, and a reinstall must repoint it rather than add a second hook.
     #[test]
-    fn a_v004_style_command_with_parens_and_apostrophe_is_removed_by_uninstall_but_not_rewritten() {
+    fn a_v004_style_command_with_parens_and_apostrophe_is_repointed_by_install_and_removed_by_uninstall(
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hooks.json");
         let old = "/Users/o'neil/Tools (old)/libra-governor codex-hook stop";
@@ -1642,14 +1646,64 @@ mod tests {
         ] } });
         std::fs::write(&path, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
         assert!(command_is_ours(old));
-        assert!(!command_is_ours_for(old, "codex-hook stop"));
+        assert!(command_is_ours_for(old, "codex-hook stop"));
 
         apply(&path, &binary()).unwrap();
         assert_eq!(
-            read_value(&path)["hooks"]["Stop"][0],
-            seed["hooks"]["Stop"][0]
+            owned_commands(&read_value(&path), "Stop"),
+            vec![format!("{} codex-hook stop", binary().display())]
+        );
+        assert_eq!(
+            read_value(&path)["hooks"]["Stop"].as_array().unwrap().len(),
+            1
         );
 
+        remove(&path).unwrap();
+        assert!(read_value(&path).get("hooks").is_none());
+    }
+
+    #[test]
+    fn legacy_shape_and_current_entries_coexisting_collapse_to_one_and_a_second_install_is_a_no_op()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let user = serde_json::json!({ "hooks": [{ "type": "command", "command": "/usr/local/bin/fornax stop" }] });
+        let new = format!("{} codex-hook stop", binary().display());
+        let seed = serde_json::json!({ "hooks": { "Stop": [
+            user.clone(),
+            { "hooks": [{ "type": "command", "command": "/Users/John Smith/.cargo/bin/libra-governor codex-hook stop" }] },
+            { "hooks": [{ "type": "command", "command": new, "timeout": 15 }] },
+            { "hooks": [{ "type": "command", "command": "libra-governor codex-hook stop" }] }
+        ] } });
+        std::fs::write(&path, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+
+        apply(&path, &binary()).unwrap();
+        let first = std::fs::read(&path).unwrap();
+        let root = read_value(&path);
+        assert_eq!(owned_commands(&root, "Stop"), vec![new]);
+        assert_eq!(root["hooks"]["Stop"][0], user, "user entry untouched");
+
+        assert_eq!(apply(&path, &binary()).unwrap().hooks_added, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+    }
+
+    #[test]
+    fn a_bare_binary_name_is_repointed_by_install_and_removed_by_uninstall() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let seed = serde_json::json!({ "hooks": { "Stop": [
+            { "hooks": [{ "type": "command", "command": "libra-governor codex-hook stop" }] }
+        ] } });
+        std::fs::write(&path, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+        apply(&path, &binary()).unwrap();
+        assert_eq!(
+            read_value(&path)["hooks"]["Stop"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            owned_commands(&read_value(&path), "Stop"),
+            vec![format!("{} codex-hook stop", binary().display())]
+        );
         remove(&path).unwrap();
         assert!(read_value(&path).get("hooks").is_none());
     }

@@ -270,7 +270,9 @@ const SYSTEM_BIN_DIRS: &[&str] = &[
 /// (`; & | < > $` backtick, control characters). It is rejected when it looks
 /// like a launcher around someone else's command: a first word that is a
 /// known launcher or lives in a system bin dir, any later word starting with
-/// `/`, or a `VAR=x` / `-flag` word.
+/// `/`, `~` or `.`, or a `VAR=x` / `-flag` word. Residual, accepted: an
+/// interpreter given a relative script (`/x/python tools/libra-governor ...`)
+/// is indistinguishable from a spaced install directory.
 fn is_legacy_unquoted_path(binary: &str) -> bool {
     if !binary.starts_with('/')
         || binary.contains(|c: char| c.is_control() || ";&|<>$`".contains(c))
@@ -293,7 +295,7 @@ fn is_legacy_unquoted_path(binary: &str) -> bool {
         && !binary
             .split(' ')
             .any(|word| word.contains('=') || word.starts_with('-'))
-        && !words.any(|word| word.starts_with('/'))
+        && !words.any(|word| word.starts_with(['/', '~', '.']))
 }
 
 /// The one ownership rule shared by the Claude and Codex installers.
@@ -310,9 +312,8 @@ fn is_legacy_unquoted_path(binary: &str) -> bool {
 ///
 /// `allow_legacy_unquoted_space` additionally accepts what older installers
 /// pasted unquoted (see [`is_legacy_unquoted_path`]). It is `true` only for the read/remove side
-/// (`remove`, `inspect`, `doctor`) so Libra's own old hooks are still found
-/// and removed; install passes `false` and so never rewrites or deletes a
-/// command that is not unambiguously ours.
+/// (`remove`, `inspect`, `doctor`) and by install's repoint/collapse, so Libra's
+/// own old hooks are found, removed or repointed. `false` is the strict form.
 pub(crate) fn command_is_ours_with_suffix(
     command: &str,
     suffix: &str,
@@ -656,25 +657,37 @@ fn apply_locked(
         // timeout gets it added.
         let mut already_present = false;
         let mut upgraded = false;
-        for group in entries_arr.iter_mut() {
+        let mut emptied_groups = Vec::new();
+        for (idx, group) in entries_arr.iter_mut().enumerate() {
             if !matcher_is_all_tools(group) {
                 continue;
             }
             let Some(inner) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
                 continue;
             };
-            for h in inner.iter_mut() {
+            let mut removed_any = false;
+            let mut i = 0;
+            while i < inner.len() {
+                let h = &mut inner[i];
                 let existing = h.get("command").and_then(Value::as_str);
+                // Ours at any path, quoted, or in a legacy shape the read side
+                // still recognises (spaced unquoted path, bare name): repoint
+                // the first in place, drop later ones, so a reinstall never
+                // leaves two sets firing (HORO-2303). A foreign command never
+                // passes the ownership rule.
+                let is_ours = existing == Some(command.as_str())
+                    || existing.is_some_and(|c| command_is_ours_with_suffix(c, subcommand, true));
+                if !is_ours {
+                    i += 1;
+                    continue;
+                }
+                if already_present {
+                    inner.remove(i);
+                    removed_any = true;
+                    upgraded = true;
+                    continue;
+                }
                 if existing != Some(command.as_str()) {
-                    // Our hook for this subcommand installed from another
-                    // binary path: repoint it so a reinstall does not leave
-                    // two sets firing (HORO-2303). A foreign command never
-                    // passes `command_is_ours`.
-                    let ours_elsewhere =
-                        existing.is_some_and(|c| command_is_ours_with_suffix(c, subcommand, false));
-                    if !ours_elsewhere {
-                        continue;
-                    }
                     h["command"] = Value::String(command.clone());
                     upgraded = true;
                 }
@@ -688,7 +701,14 @@ fn apply_locked(
                         upgraded = true;
                     }
                 }
+                i += 1;
             }
+            if removed_any && inner.is_empty() {
+                emptied_groups.push(idx);
+            }
+        }
+        for idx in emptied_groups.into_iter().rev() {
+            entries_arr.remove(idx);
         }
         if upgraded {
             hooks_added += 1;
@@ -2075,6 +2095,9 @@ mod tests {
             format!("/opt/my tool; rm x/libra-governor {sub}"),
             format!("/opt/my tool $(x)/libra-governor {sub}"),
             format!("/opt/my tool\u{0}x/libra-governor {sub}"),
+            format!("/Users/me/.cargo/bin/rtk proxy ~/.cargo/bin/libra-governor {sub}"),
+            format!("/Users/me/bin/uv run ./bin/libra-governor {sub}"),
+            format!("/Users/me/bin/uv run ../bin/libra-governor {sub}"),
         ] {
             assert!(!command_is_ours(&rejected), "{rejected}");
         }
@@ -2118,5 +2141,62 @@ mod tests {
         ));
         assert!(has_shell_unsafe_char("/p/a\u{0}b"));
         assert!(has_shell_unsafe_char("/p/a\u{7}b"));
+    }
+
+    fn command_at(root: &Value, event: &str) -> Vec<String> {
+        root["hooks"][event]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|g| g["hooks"].as_array().into_iter().flatten())
+            .filter_map(|h| h["command"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// HORO-2303: a reinstall repoints legacy-shape entries (spaced unquoted
+    /// path that the shell splits, bare name) in place, collapses them with a
+    /// current entry, and leaves user entries byte-identical; a second
+    /// install is then a no-op.
+    #[test]
+    fn reinstall_repoints_legacy_shape_entries_collapses_with_current_and_is_idempotent() {
+        for legacy in [
+            "/opt/legacy path/libra-governor hook stop",
+            "libra-governor hook stop",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settings.json");
+            let user = serde_json::json!({ "hooks": [{ "type": "command", "command": "/usr/local/bin/mine stop" }] });
+            let new = format!("{} hook stop", binary().display());
+            let seed = serde_json::json!({ "hooks": { "Stop": [
+                user.clone(),
+                { "hooks": [{ "type": "command", "command": legacy }] },
+                { "hooks": [{ "type": "command", "command": new }] }
+            ] } });
+            std::fs::write(&path, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+
+            apply(&path, &binary()).unwrap();
+            let first = std::fs::read(&path).unwrap();
+            let root: Value = serde_json::from_slice(&first).unwrap();
+            let ours: Vec<String> = command_at(&root, "Stop")
+                .into_iter()
+                .filter(|c| command_is_ours(c))
+                .collect();
+            assert_eq!(
+                ours,
+                vec![new.clone()],
+                "{legacy}: exactly one entry, repointed"
+            );
+            assert_eq!(
+                root["hooks"]["Stop"][0], user,
+                "{legacy}: user entry byte-identical"
+            );
+
+            apply(&path, &binary()).unwrap();
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                first,
+                "{legacy}: second install is a no-op"
+            );
+        }
     }
 }
