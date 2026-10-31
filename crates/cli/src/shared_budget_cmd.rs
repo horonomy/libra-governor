@@ -62,9 +62,9 @@ const HELP: &str = "Usage:\n  \
     a calendar month in that zone and there is deliberately no UTC default. --turn-hold-usd is what \
     each prompt reserves (default 10; must not exceed the cap). Refuses to replace an existing \
     file unless --force (which replaces the whole file: pricing_overrides, \
-    subagent_unmeasured_charge_usd_cents and any soft limit not repeated are dropped, and no backup \
-    is kept; the ledger is untouched). The optional per-session and per-agent \
-    soft limits are dollars, warn only, and never grant capacity or deny a prompt. A running \
+    subagent_unmeasured_charge_usd_cents and any soft limit not repeated are dropped, but the \
+    previous file is kept as shared-budget.json.bak; the ledger is untouched). The optional \
+    per-session and per-agent soft limits are dollars, warn only, and never grant capacity or deny a prompt. A running \
     daemon picks the file up on the next prompt.\n  \
     status   Read-only budget posture from the running daemon (never starts one): config state, \
     zone-local period, cap, settled, held, remaining (negative = overrun), per-executor table \
@@ -279,8 +279,8 @@ fn unique_temp_name() -> String {
 /// written. They go to an owner-only temp file in `dir` first; without
 /// `force` they are then linked into place (fails if anything exists, with
 /// no check-then-write race), with `force` they replace a regular file via
-/// rename. A reader therefore sees the old file or the new one, never a
-/// partial one.
+/// rename, after the old file is kept as `shared-budget.json.bak`. A reader
+/// therefore sees the old file or the new one, never a partial one.
 fn init_in(dir: &Path, request: &InitRequest) -> Result<InitReport, String> {
     use libra_governor_daemon::shared_budget_file::{
         parse, SharedBudgetFileState, SHARED_BUDGET_FILE_NAME,
@@ -312,6 +312,21 @@ fn init_in(dir: &Path, request: &InitRequest) -> Result<InitReport, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => return Err(format!("could not inspect {}: {e}", path.display())),
     };
+
+    if replaced {
+        // A hard link keeps the old inode (and its owner-only mode) alive
+        // under the .bak name, and the rename over an existing .bak is
+        // atomic. Done before anything is replaced so a failure here leaves
+        // the original untouched.
+        let link = dir.join(unique_temp_name());
+        let backed_up = std::fs::hard_link(&path, &link).and_then(|()| {
+            std::fs::rename(&link, dir.join(format!("{SHARED_BUDGET_FILE_NAME}.bak")))
+        });
+        if let Err(e) = backed_up {
+            let _ = std::fs::remove_file(&link);
+            return Err(format!("could not back up {}: {e}", path.display()));
+        }
+    }
 
     let tmp = dir.join(unique_temp_name());
     let staged = std::fs::OpenOptions::new()
@@ -1225,7 +1240,33 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        // The config plus the .bak of the file it replaced.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn init_force_keeps_the_previous_file_as_an_owner_only_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        init_in(dir.path(), &req(20_000, "UTC", None, false)).unwrap();
+        let original = std::fs::read(dir.path().join("shared-budget.json")).unwrap();
+        init_in(dir.path(), &req(30_000, "UTC", None, true)).unwrap();
+        let backup = dir.path().join("shared-budget.json.bak");
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        let mode = std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn init_force_backup_holds_only_the_most_recent_previous_file() {
+        let dir = tempfile::tempdir().unwrap();
+        init_in(dir.path(), &req(20_000, "UTC", None, false)).unwrap();
+        init_in(dir.path(), &req(30_000, "UTC", None, true)).unwrap();
+        let second = std::fs::read(dir.path().join("shared-budget.json")).unwrap();
+        init_in(dir.path(), &req(40_000, "UTC", None, true)).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("shared-budget.json.bak")).unwrap(),
+            second
+        );
     }
 
     #[test]
