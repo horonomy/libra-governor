@@ -998,3 +998,61 @@ fn a_failed_prompt_insert_rolls_the_whole_grant_back_and_leaves_the_store_usable
     assert_eq!(count("shared_pool_reservations"), 1);
     assert_eq!(count("shared_hold_prompts"), 1);
 }
+
+/// HORO-2284 (C4): a Codex true-up family survives a prune like a subagent
+/// family does, and the new prefix handling changes nothing for Claude rows.
+#[test]
+fn prune_keeps_each_codex_trueup_family_total_and_leaves_claude_families_alone() {
+    let (_dir, mut store) = new_store();
+    let old = pool("monthly-2026-07");
+    ensure(&mut store, &old);
+    let trueup = "codex-trueup:5:lane1|36:hold-id-1|";
+    let sub = "subagent-transcript:2:s1|4:aaa1|";
+    for (key, amount) in [(format!("{trueup}c100"), 40), (format!("{trueup}c130"), 30)] {
+        charge(
+            &mut store,
+            &old,
+            "lane1",
+            amount,
+            &key,
+            ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+        );
+    }
+    charge(
+        &mut store,
+        &old,
+        "s1",
+        120,
+        &format!("{sub}c120"),
+        ExecutorAttribution::main_executor(Some(ChargeSource::SubagentTranscript)),
+    );
+    // A post-hoc Codex turn charge and an ordinary charge are not families.
+    charge(
+        &mut store,
+        &old,
+        "lane1",
+        9,
+        "codex-turn:5:lane1|2:t1",
+        ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+    );
+    charge(
+        &mut store,
+        &old,
+        "s1",
+        7,
+        "charge:2:s1|2:k1",
+        ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+    );
+    let total = |store: &LedgerStore, prefix: &str| {
+        store
+            .shared_charges_total_by_key_prefix(&owner(), prefix, "metered:local-budget/")
+            .unwrap()
+    };
+    assert_eq!(total(&store, trueup), 70);
+    assert_eq!(prune(&mut store, 1, false).pools_pruned, 1);
+    assert_eq!(row_count(&store, &old), 0);
+    assert_eq!(total(&store, trueup), 70, "the true-up total survives");
+    assert_eq!(total(&store, sub), 120, "Claude family total unchanged");
+    assert_eq!(total(&store, "codex-turn:5:lane1|"), 0, "not a family");
+    assert_eq!(total(&store, "charge:2:s1|"), 0, "not a family");
+}
