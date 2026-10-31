@@ -21,9 +21,9 @@ fail() {
     exit 1
 }
 
-[ "$(id -u)" = "0" ] || fail "must run as uid 0 (got uid $(id -u))"
-[ -e /.dockerenv ] || fail "/.dockerenv not present — this does not look like a container"
-[ "${LG_TWO_PRINCIPAL_DISPOSABLE:-}" = "1" ] || fail "LG_TWO_PRINCIPAL_DISPOSABLE != 1 (got '${LG_TWO_PRINCIPAL_DISPOSABLE:-<unset>}')"
+[[ "$(id -u)" = "0" ]] || fail "must run as uid 0 (got uid $(id -u))"
+[[ -e /.dockerenv ]] || fail "/.dockerenv not present — this does not look like a container"
+[[ "${LG_TWO_PRINCIPAL_DISPOSABLE:-}" = "1" ]] || fail "LG_TWO_PRINCIPAL_DISPOSABLE != 1 (got '${LG_TWO_PRINCIPAL_DISPOSABLE:-<unset>}')"
 
 echo "provision.sh: disposability gate passed (uid 0, /.dockerenv present, LG_TWO_PRINCIPAL_DISPOSABLE=1)."
 

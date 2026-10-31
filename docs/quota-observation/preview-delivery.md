@@ -11,7 +11,7 @@ exercises.
 
 ## Platform matrix
 
-| Platform | CI-tested | Supported for the v0.0.4 Preview |
+| Platform | CI-tested | Supported for the Cooperative Preview (v0.0.4; v0.0.5 candidate) |
 |---|---|---|
 | macOS Apple Silicon (`macos-latest`, arm64) | Yes | **Yes** (only supported platform) |
 | Linux (`ubuntu-latest`) | Yes | **No** (CI only; unverified for the budget) |
@@ -62,8 +62,7 @@ public and permanent, so dispatch only SHAs you are content to have named.
 The CI `--version` smoke on the macOS arm64 runner is a build check, not an
 install test.
 
-**Status: unreleased.** No release has been published and no tag has been
-pushed. The attestation proves where and how a file was built; it does not
+**Status.** v0.0.4 was published (tag `v0.0.4`, `release-candidate-v0.0.4.md`); the v0.0.5 candidate on `main` is unreleased and no `v0.0.5` tag has been pushed. The attestation proves where and how a file was built; it does not
 replace the approval digest above, which is byte-identity of one specific
 file. Both checks apply.
 

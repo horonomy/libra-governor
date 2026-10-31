@@ -194,30 +194,165 @@ fn matcher_is_all_tools(group: &Value) -> bool {
     }
 }
 
-/// Ours only if the command is `<path>/libra-governor <exact suffix>`: the
-/// text before the suffix must be a path whose final component is exactly
-/// `libra-governor`. A merely similar name (`libra-governor-tools/x`,
-/// `my-libra-governor-wrapper`) or a directory called `libra-governor`
-/// holding some other binary is a foreign command and is never touched.
+/// Ours only if the command is `<one path token> <exact suffix>` where the
+/// path token's final component is exactly `libra-governor` (see
+/// [`command_is_ours_with_suffix`]). Used by `remove` and `inspect`, so it
+/// also accepts the legacy unquoted-space install.
 fn command_is_ours(command: &str) -> bool {
-    OWNED_COMMAND_SUFFIXES.iter().any(|suffix| {
-        command
-            .strip_suffix(suffix)
-            .map(str::trim_end)
-            .is_some_and(|binary| {
-                let binary = unquote(binary).unwrap_or(binary);
-                Path::new(binary)
-                    .file_name()
-                    .is_some_and(|name| name == "libra-governor")
-            })
-    })
+    OWNED_COMMAND_SUFFIXES
+        .iter()
+        .any(|suffix| command_is_ours_with_suffix(command, suffix, true))
+}
+
+/// One unquoted word: no whitespace or shell metacharacter, no leading `~`.
+fn is_plain_token(binary: &str) -> bool {
+    !binary.is_empty() && !has_shell_unsafe_char(binary) && !binary.starts_with('~')
+}
+
+/// Programs that run another command given as arguments. A legacy-looking
+/// `<launcher> ... /p/libra-governor <suffix>` is someone else's command.
+const LAUNCHER_BASENAMES: &[&str] = &[
+    "env",
+    "sudo",
+    "doas",
+    "su",
+    "runuser",
+    "nice",
+    "ionice",
+    "nohup",
+    "time",
+    "timeout",
+    "stdbuf",
+    "xargs",
+    "exec",
+    "command",
+    "builtin",
+    "eval",
+    "setsid",
+    "caffeinate",
+    "arch",
+    "taskpolicy",
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "ksh",
+    "fish",
+    "watch",
+    "strace",
+    "ltrace",
+    "chroot",
+    "flock",
+    "nsenter",
+    "parallel",
+    "unbuffer",
+    "script",
+    "firejail",
+    "sandbox-exec",
+    "systemd-run",
+    "open",
+    "osascript",
+];
+
+const SYSTEM_BIN_DIRS: &[&str] = &[
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
+];
+
+/// What installers before PR 242 (Claude) and before HORO-2303 (Codex, which
+/// never checked the path) wrote: `current_exe()` pasted unquoted. An absolute
+/// path that may hold spaces and benign punctuation (`'`, `(`, `)`, ...) but
+/// nothing that can chain, redirect, substitute or break a command
+/// (`; & | < > $` backtick, control characters). It is rejected when it looks
+/// like a launcher around someone else's command: a first word that is a
+/// known launcher or lives in a system bin dir, any later word starting with
+/// `/`, `~` or `.`, or a `VAR=x` / `-flag` word. Residual, accepted: an
+/// interpreter given a relative script (`/x/python tools/libra-governor ...`)
+/// is indistinguishable from a spaced install directory.
+fn is_legacy_unquoted_path(binary: &str) -> bool {
+    if !binary.starts_with('/')
+        || binary.contains(|c: char| c.is_control() || ";&|<>$`".contains(c))
+    {
+        return false;
+    }
+    let mut words = binary.split(' ');
+    let first = words.next().unwrap_or_default();
+    let first_path = Path::new(first);
+    let launcher = first_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| LAUNCHER_BASENAMES.contains(&n));
+    let system_dir = first_path
+        .parent()
+        .and_then(|d| d.to_str())
+        .is_some_and(|d| SYSTEM_BIN_DIRS.contains(&d));
+    !launcher
+        && !system_dir
+        && !binary
+            .split(' ')
+            .any(|word| word.contains('=') || word.starts_with('-'))
+        && !words.any(|word| word.starts_with(['/', '~', '.']))
+}
+
+/// The one ownership rule shared by the Claude and Codex installers.
+///
+/// `command` is ours only if it is `<binary> <suffix>` with whitespace
+/// between them, and `<binary>` is exactly ONE path token whose final
+/// component is exactly `libra-governor`:
+/// - unquoted: no whitespace and no shell metacharacter, no leading `~`, no
+///   trailing `/` (so `env X=1 /p/libra-governor`, `cd /x && /p/libra-governor`,
+///   `a | /p/libra-governor`, `/p/libra-governor/` + a script named like the
+///   suffix are all someone else's command);
+/// - or wrapped whole in ONE matching pair of hand-written quotes
+///   (HORO-2303, PR 274), whose content a shell would pass as one word.
+///
+/// `allow_legacy_unquoted_space` additionally accepts what older installers
+/// pasted unquoted (see [`is_legacy_unquoted_path`]). It is `true` only for the read/remove side
+/// (`remove`, `inspect`, `doctor`) and by install's repoint/collapse, so Libra's
+/// own old hooks are found, removed or repointed. `false` is the strict form.
+pub(crate) fn command_is_ours_with_suffix(
+    command: &str,
+    suffix: &str,
+    allow_legacy_unquoted_space: bool,
+) -> bool {
+    let Some(before) = command.strip_suffix(suffix) else {
+        return false;
+    };
+    if !before.ends_with([' ', '\t']) {
+        return false;
+    }
+    let binary = before.trim_end_matches([' ', '\t']);
+    let path = if let Some(inner) = unquote(binary) {
+        if !is_hand_quoted_and_runnable(binary) || inner.contains(['\n', '\t']) {
+            return false;
+        }
+        inner
+    } else if is_plain_token(binary)
+        || (allow_legacy_unquoted_space && is_legacy_unquoted_path(binary))
+    {
+        binary
+    } else {
+        return false;
+    };
+    // A bare `libra-governor` (PATH lookup) was written by an early legacy
+    // install, so the legacy-tolerant rule (uninstall, repoint) accepts it; the
+    // strict form never treats it as ours (current installers always write an absolute path).
+    (path.contains('/') || allow_legacy_unquoted_space)
+        && !path.ends_with('/')
+        && Path::new(path)
+            .file_name()
+            .is_some_and(|name| name == "libra-governor")
 }
 
 /// The path inside one pair of matching shell quotes around the whole binary
 /// part (`'/a b/libra-governor'`), or `None` when it is not wrapped in a
 /// matching pair. A user may quote the path by hand so the shell does not
 /// split it (HORO-2303); the quotes are not part of the file name.
-fn unquote(binary: &str) -> Option<&str> {
+pub(crate) fn unquote(binary: &str) -> Option<&str> {
     let inner = binary
         .strip_prefix('\'')
         .and_then(|rest| rest.strip_suffix('\''))
@@ -447,9 +582,9 @@ pub fn apply_hooks_only(path: &Path, binary: &Path) -> Result<Applied, SettingsE
 
 /// Whether `text`, written unquoted into a command a shell runs, would be
 /// split or interpreted instead of naming one program.
-fn has_shell_unsafe_char(text: &str) -> bool {
+pub(crate) fn has_shell_unsafe_char(text: &str) -> bool {
     text.chars()
-        .any(|c| c.is_whitespace() || "\"'\\$`;&|<>()*?[]{}!#^".contains(c))
+        .any(|c| c.is_whitespace() || c.is_control() || "\"'\\$`;&|<>()*?[]{}!#^".contains(c))
 }
 
 /// A command `command_is_ours` recognises whose binary part the shell would
@@ -522,25 +657,37 @@ fn apply_locked(
         // timeout gets it added.
         let mut already_present = false;
         let mut upgraded = false;
-        for group in entries_arr.iter_mut() {
+        let mut emptied_groups = Vec::new();
+        for (idx, group) in entries_arr.iter_mut().enumerate() {
             if !matcher_is_all_tools(group) {
                 continue;
             }
             let Some(inner) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
                 continue;
             };
-            for h in inner.iter_mut() {
+            let mut removed_any = false;
+            let mut i = 0;
+            while i < inner.len() {
+                let h = &mut inner[i];
                 let existing = h.get("command").and_then(Value::as_str);
+                // Ours at any path, quoted, or in a legacy shape the read side
+                // still recognises (spaced unquoted path, bare name): repoint
+                // the first in place, drop later ones, so a reinstall never
+                // leaves two sets firing (HORO-2303). A foreign command never
+                // passes the ownership rule.
+                let is_ours = existing == Some(command.as_str())
+                    || existing.is_some_and(|c| command_is_ours_with_suffix(c, subcommand, true));
+                if !is_ours {
+                    i += 1;
+                    continue;
+                }
+                if already_present {
+                    inner.remove(i);
+                    removed_any = true;
+                    upgraded = true;
+                    continue;
+                }
                 if existing != Some(command.as_str()) {
-                    // Our hook for this subcommand installed from another
-                    // binary path: repoint it so a reinstall does not leave
-                    // two sets firing (HORO-2303). A foreign command never
-                    // passes `command_is_ours`.
-                    let ours_elsewhere =
-                        existing.is_some_and(|c| c.ends_with(subcommand) && command_is_ours(c));
-                    if !ours_elsewhere {
-                        continue;
-                    }
                     h["command"] = Value::String(command.clone());
                     upgraded = true;
                 }
@@ -554,7 +701,14 @@ fn apply_locked(
                         upgraded = true;
                     }
                 }
+                i += 1;
             }
+            if removed_any && inner.is_empty() {
+                emptied_groups.push(idx);
+            }
+        }
+        for idx in emptied_groups.into_iter().rev() {
+            entries_arr.remove(idx);
         }
         if upgraded {
             hooks_added += 1;
@@ -1874,5 +2028,175 @@ mod tests {
     fn quoting_does_not_make_a_lookalike_or_a_mismatched_quote_ours() {
         assert!(!command_is_ours("'/opt/libra-governor-tools/x' hook stop"));
         assert!(!command_is_ours("'/opt/libra-governor\" hook stop"));
+    }
+
+    /// HORO-2303: wrapped, pipelined, lookalike or trailing-slash commands are
+    /// not ours, so install never rewrites them and uninstall never removes
+    /// them; the legacy unquoted-space install still is ours for uninstall.
+    #[test]
+    fn wrapped_and_lookalike_commands_are_left_alone_and_legacy_space_path_is_still_ours() {
+        let sub = "hook stop";
+        let others = [
+            format!("env X=1 /p/libra-governor {sub}"),
+            format!("/usr/bin/env LIBRA_GOVERNOR_STATE_DIR=/s /p/libra-governor {sub}"),
+            format!("cd /x && /p/libra-governor {sub}"),
+            format!("a | /p/libra-governor {sub}"),
+            format!("/p/libra-governor/{sub}"),
+            format!("/p/libra-governor/ {sub}"),
+            format!("/opt/libra-governor-tools/x {sub}"),
+            format!("/p/other-tool {sub}"),
+        ];
+        for c in &others {
+            assert!(!command_is_ours(c), "{c}");
+        }
+        assert!(command_is_ours("/opt/legacy path/libra-governor hook stop"));
+        assert!(!command_is_ours_with_suffix(
+            "/opt/legacy path/libra-governor hook stop",
+            "hook stop",
+            false
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let groups: Vec<Value> = others
+            .iter()
+            .map(|c| serde_json::json!({ "hooks": [{ "type": "command", "command": c }] }))
+            .collect();
+        let seed = serde_json::json!({ "hooks": { "Stop": groups.clone() } });
+        std::fs::write(&path, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+        apply(&path, &binary()).unwrap();
+        let root: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            &root["hooks"]["Stop"].as_array().unwrap()[..groups.len()],
+            &groups[..]
+        );
+        remove(&path).unwrap();
+        let root: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(root["hooks"]["Stop"], Value::Array(groups));
+    }
+
+    /// The legacy (read/remove-side) rule is narrow: launcher-wrapped commands
+    /// are never ours, a real spaced install path still is.
+    #[test]
+    fn the_legacy_rule_rejects_launcher_wrapped_commands_and_keeps_real_spaced_paths() {
+        let sub = "hook stop";
+        for rejected in [
+            format!("/usr/bin/env FOO bar /p/libra-governor {sub}"),
+            format!("/usr/bin/env /p/libra-governor {sub}"),
+            format!("/usr/bin/nohup /p/libra-governor {sub}"),
+            format!("/usr/bin/time /p/libra-governor {sub}"),
+            format!("/usr/bin/timeout 5 /p/libra-governor {sub}"),
+            format!("/usr/bin/sudo /p/libra-governor {sub}"),
+            format!("/opt/tools/nice -n5 /p/libra-governor {sub}"),
+            format!("/opt/my tools/xargs /p/libra-governor {sub}"),
+            format!("/opt/homebrew/bin/foo bar/libra-governor {sub}"),
+            format!("/opt/my tools -x/libra-governor {sub}"),
+            format!("/opt/my X=1/libra-governor {sub}"),
+            format!("/opt/my tool; rm x/libra-governor {sub}"),
+            format!("/opt/my tool $(x)/libra-governor {sub}"),
+            format!("/opt/my tool\u{0}x/libra-governor {sub}"),
+            format!("/Users/me/.cargo/bin/rtk proxy ~/.cargo/bin/libra-governor {sub}"),
+            format!("/Users/me/bin/uv run ./bin/libra-governor {sub}"),
+            format!("/Users/me/bin/uv run ../bin/libra-governor {sub}"),
+        ] {
+            assert!(!command_is_ours(&rejected), "{rejected}");
+        }
+        for accepted in [
+            format!("/Users/me/My Tools/bin/libra-governor {sub}"),
+            format!("/Users/me/Tools (old)/it's/libra-governor {sub}"),
+        ] {
+            assert!(command_is_ours(&accepted), "{accepted}");
+            assert!(
+                !command_is_ours_with_suffix(&accepted, sub, false),
+                "{accepted}"
+            );
+        }
+    }
+
+    #[test]
+    fn separator_must_be_space_or_tab_and_a_bare_name_or_control_char_is_not_ours() {
+        let sub = "hook stop";
+        assert!(command_is_ours_with_suffix(
+            "/p/libra-governor\thook stop",
+            sub,
+            false
+        ));
+        for rejected in [
+            "/p/libra-governor\nhook stop".to_string(),
+            "/p/libra-governor\u{a0}hook stop".to_string(),
+            "/p/libra\u{0}-governor hook stop".to_string(),
+        ] {
+            assert!(!command_is_ours(&rejected), "{rejected:?}");
+        }
+        assert!(!command_is_ours_with_suffix(
+            "'libra-governor' hook stop",
+            sub,
+            false
+        ));
+        assert!(command_is_ours("libra-governor hook stop"));
+        assert!(!command_is_ours_with_suffix(
+            "libra-governor hook stop",
+            sub,
+            false
+        ));
+        assert!(has_shell_unsafe_char("/p/a\u{0}b"));
+        assert!(has_shell_unsafe_char("/p/a\u{7}b"));
+    }
+
+    fn command_at(root: &Value, event: &str) -> Vec<String> {
+        root["hooks"][event]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|g| g["hooks"].as_array().into_iter().flatten())
+            .filter_map(|h| h["command"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// HORO-2303: a reinstall repoints legacy-shape entries (spaced unquoted
+    /// path that the shell splits, bare name) in place, collapses them with a
+    /// current entry, and leaves user entries byte-identical; a second
+    /// install is then a no-op.
+    #[test]
+    fn reinstall_repoints_legacy_shape_entries_collapses_with_current_and_is_idempotent() {
+        for legacy in [
+            "/opt/legacy path/libra-governor hook stop",
+            "libra-governor hook stop",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settings.json");
+            let user = serde_json::json!({ "hooks": [{ "type": "command", "command": "/usr/local/bin/mine stop" }] });
+            let new = format!("{} hook stop", binary().display());
+            let seed = serde_json::json!({ "hooks": { "Stop": [
+                user.clone(),
+                { "hooks": [{ "type": "command", "command": legacy }] },
+                { "hooks": [{ "type": "command", "command": new }] }
+            ] } });
+            std::fs::write(&path, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+
+            apply(&path, &binary()).unwrap();
+            let first = std::fs::read(&path).unwrap();
+            let root: Value = serde_json::from_slice(&first).unwrap();
+            let ours: Vec<String> = command_at(&root, "Stop")
+                .into_iter()
+                .filter(|c| command_is_ours(c))
+                .collect();
+            assert_eq!(
+                ours,
+                vec![new.clone()],
+                "{legacy}: exactly one entry, repointed"
+            );
+            assert_eq!(
+                root["hooks"]["Stop"][0], user,
+                "{legacy}: user entry byte-identical"
+            );
+
+            apply(&path, &binary()).unwrap();
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                first,
+                "{legacy}: second install is a no-op"
+            );
+        }
     }
 }

@@ -48,7 +48,7 @@ pub const NOT_COVERED: [&str; 4] = [
     "the Codex route has no budget gate: Codex sessions are not admitted or charged by this budget",
     "there is no gateway hard cap: the per-request hard cap (gateway governor_held mode) is not \
      built",
-    "accounting boundary (v0.0.4 Cooperative Preview): only Claude Code sessions and subagents \
+    "accounting boundary (Cooperative Preview): only Claude Code sessions and subagents \
      whose settlement hooks run and whose transcripts can be read and attributed are counted; \
      other executors and unreadable or unattributed spend can settle at the flat hold, be \
      recorded as unattributed, or be missed. Turns around /compact, partly flushed \
