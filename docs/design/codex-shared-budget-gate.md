@@ -63,6 +63,8 @@ binary (sandboxed, no auth). **V-fix**: a real serializer output fixture. **I**:
 | Custom model provider is `wire_api="responses"` only; the Libra gateway speaks only `/v1/messages` | V-src | ADR-0004:169-174; README:211 |
 | Auth mode (API key vs ChatGPT login) of a given user | U per user | ChatGPT-login traffic does not go to `api.openai.com` with an API key, so a gateway cannot cover it without custody of the OAuth credential (I) |
 
+> C0 update (2026-10-31): the rows above for hook `turn_id` equality, UserPromptSubmit and Stop `turn_id`, `session_id` equality, `transcript_path` and the subagent usage location are now source-derived (V-src, not run on a real host) in `docs/design/codex-c0-source-verification.md`, which also lists which of its claims were re-read by a second reader and which are single-read. `task_complete` ordering is not covered by C0, and the final-record flush ordering stays the pessimistic reading above until a runtime probe exists.
+
 Repo behaviour today ("Codex ungated"):
 - Prompt gate is Claude-only (`crates/cli/src/agent/run.rs:263`).
 - PreToolUse returns early for Codex (run.rs:436-439).
