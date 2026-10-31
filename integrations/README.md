@@ -25,7 +25,7 @@ disagree, trust the command.
 | Preflight gate (`UserPromptSubmit`) | Available | Available |
 | Tool observation (`PostToolUse`) | Available | Available |
 | Tool gate (hard pre-call refusal) | Unavailable — MVP 1.0 hooks are advisory; the gateway is the only hard-enforcement point (ADR 0003) | Unavailable — same reason |
-| Shared budget admission gate and settlement (`UserPromptSubmit` block, `PreToolUse` deny, `SubagentStop` charge, `SessionEnd` tail settle; installed by `libra-governor install`; ADR-0026 S6/S7) | Available — cooperative (admission-bounded), Libra-accounted USD; only acts when `shared-budget.json` exists. Not host-verified: no real Claude Code host has run the installed hooks | **Off by default; opt-in (v0.0.5 candidate)** — only when `shared-budget.json` and the marker `<state_dir>/shared-budget.codex` both exist; hooks must also be trusted in Codex's `/hooks`. Main-lane turns only, no `PreToolUse` gate, no subagents; unpriced models settle at the flat hold. Source-derived (Codex 0.160–0.165), not run against a real Codex host. The `agents` capability row stays Unavailable. See `integrations/codex/README.md` |
+| Shared budget admission gate and settlement (`UserPromptSubmit` block, `PreToolUse` deny, `SubagentStop` charge, `SessionEnd` tail settle; installed by `libra-governor install`; ADR-0026 S6/S7) | Available — cooperative (admission-bounded), Libra-accounted USD; only acts when `shared-budget.json` exists. Not host-verified: no real Claude Code host has run the installed hooks | **Off by default; opt-in (v0.0.5 candidate)** — only when `shared-budget.json` and the marker `<state_dir>/shared-budget.codex` both exist; hooks must also be trusted in Codex's `/hooks`. Main-lane turns only, no `PreToolUse` gate, no subagents; unpriced models settle at the flat hold. Source-derived (Codex tags 0.160, 0.163, 0.164 and 0.165 only), not run against a real Codex host. The `agents` capability row stays Unavailable. See `integrations/codex/README.md` |
 | Completion receipt (`Stop`) | Available | Available |
 | Model event observation (token/cost/provider per request) | Unavailable — no hook payload exposes this | Unavailable — same |
 | Model gateway | Available | **Unavailable — incompatible wire format** (`responses` vs. `messages`) |
@@ -43,8 +43,10 @@ and the shared-budget checks in `doctor` are read-only and host-neutral, and
 the legacy statusline appends a short budget segment only while
 `shared-budget.json` exists (Claude Code only; Codex has no statusline). They
 report Claude Code's budgeted spend; Codex spend is neither admitted nor
-charged, and `doctor` says so, along with the lack of a gateway hard cap and
-of in-turn overshoot protection.
+charged unless the operator opted in (opt-in, off by default; v0.0.5
+candidate), and when opted in `doctor` and `shared-budget status` list the
+remaining Codex gaps. They also report the lack of a gateway hard cap and of
+in-turn overshoot protection.
 
 Every "Unavailable" row names a concrete reason (a missing host
 primitive, a deliberate Libra scoping decision, or a real

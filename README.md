@@ -147,6 +147,7 @@ Run `libra-governor install` first so the hooks are wired.
 
 **What it is.** An admission-bounded (cooperative) limit on Libra-accounted,
 list-price-equivalent USD, shared by every Claude Code session and subagent
+(and, if you opted in, Codex main-lane turns; no Codex subagents)
 on this host and OS user. When less than one turn hold remains, a prompt from
 a session that holds no budget is blocked with a message that names the
 period end in your zone and how to raise the cap.
@@ -201,6 +202,11 @@ hooks send nothing and the ledger is unchanged. When enrolled:
   under-counted. A turn longer than the one-hour hold is settled late on
   partial usage.
 - Codex subagents are neither admitted nor settled.
+- The marker must be a regular file; a symlinked marker does not count.
+- There is no Codex `PreToolUse` gate and no mid-turn hold renewal.
+- A flat hold is never refunded by a later true-up.
+- The marker together with `LIBRA_GOVERNOR_CODEX_EXECUTION_OWNER=1` blocks the
+  prompt with an explicit reason; unset one of them.
 - Run the daemon and the CLI from the same release; a daemon built before the
   Codex hooks leaves an enrolled install ungated until it is restarted.
 - Support was derived from reading Codex source at 0.160, 0.163, 0.164 and
