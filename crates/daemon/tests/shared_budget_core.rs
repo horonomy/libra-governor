@@ -1682,8 +1682,6 @@ fn a_codex_admit_is_inert_until_the_codex_settlement_exists() {
 
 // ---- HORO-2282 (C2 prerequisites): lane-taking entry points ----
 
-const LANE_PROVIDERS: [&str; 2] = ["codex", "gemini"];
-
 fn lane_requests(session: &str, provider: Option<&str>) -> Vec<SharedBudgetRequest> {
     let provider = provider.map(String::from);
     vec![
