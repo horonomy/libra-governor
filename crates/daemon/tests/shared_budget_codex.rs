@@ -856,7 +856,6 @@ fn removing_the_marker_after_enabling_returns_settlement_to_inert() {
     );
 }
 
-
 // ---------------------------------------------------------------------
 // HORO-2284 (C4): orphan recovery and true-up
 // ---------------------------------------------------------------------
@@ -916,13 +915,21 @@ fn a_killed_turn_is_settled_at_the_next_settle_by_its_own_turn_id() {
     let live = fx.admit("turn-b");
     assert_ne!(killed, live);
     assert_eq!(fx.hold_row(killed).state, ReservationState::Expired);
-    let lines = [turn_lines("turn-a", TURN_BIG), turn_lines("turn-b", TURN_SMALL)].concat();
+    let lines = [
+        turn_lines("turn-a", TURN_BIG),
+        turn_lines("turn-b", TURN_SMALL),
+    ]
+    .concat();
     let path = fx.rollout("r.jsonl", &lines);
     let out = fx.settle("turn-b", Some(MODEL), Some(&path));
     assert_eq!(settled(&out), (SMALL_CENTS, true, None));
     let orphan = fx.hold_row(killed);
     assert_eq!(orphan.state, ReservationState::Settled);
-    assert_eq!(orphan.settled_amount, Some(BIG_CENTS), "its own turn, not turn-b");
+    assert_eq!(
+        orphan.settled_amount,
+        Some(BIG_CENTS),
+        "its own turn, not turn-b"
+    );
     assert_eq!(orphan.usage_known, Some(true));
     assert_eq!(orphan.pool_id.0, POOL_JAN);
     assert_eq!(fx.used_reserved(), (BIG_CENTS + SMALL_CENTS, 0));
@@ -962,7 +969,11 @@ fn a_final_record_appended_after_settle_books_exactly_the_delta_and_replay_books
     let row = fx.trueup_row(h, BIG_CENTS).expect("keyed by cumulative");
     assert_eq!(row.settled_amount, Some(LATE_DELTA));
     assert_eq!(row.pool_id.0, POOL_JAN);
-    assert_eq!(fx.hold_row(h).settled_amount, Some(SMALL_CENTS), "hold row untouched");
+    assert_eq!(
+        fx.hold_row(h).settled_amount,
+        Some(SMALL_CENTS),
+        "hold row untouched"
+    );
     assert_eq!(fx.used_reserved(), (BIG_CENTS, 0));
     let before = fx.fingerprint();
     fx.settle("turn-a", Some(MODEL), Some(&path));
@@ -1026,7 +1037,11 @@ fn the_trueup_key_does_not_change_when_a_smaller_turn_id_joins_the_hold() {
     // turn-m creates the hold; turn-a (sorts first) re-prompts into it.
     let h = fx.admit("turn-m");
     assert_eq!(fx.admit("turn-a"), h);
-    let first_lines = [turn_lines("turn-a", TURN_SMALL), turn_lines("turn-m", TURN_SMALL)].concat();
+    let first_lines = [
+        turn_lines("turn-a", TURN_SMALL),
+        turn_lines("turn-m", TURN_SMALL),
+    ]
+    .concat();
     let path = fx.rollout("r.jsonl", &first_lines);
     let out = fx.settle("turn-m", Some(MODEL), Some(&path));
     assert_eq!(settled(&out), (2 * SMALL_CENTS, true, None));
@@ -1034,7 +1049,10 @@ fn the_trueup_key_does_not_change_when_a_smaller_turn_id_joins_the_hold() {
     fx.rollout("r.jsonl", &grown);
     fx.settle("turn-m", Some(MODEL), Some(&path));
     let cumulative = SMALL_CENTS + BIG_CENTS;
-    assert!(fx.trueup_row(h, cumulative).is_some(), "keyed by the hold id");
+    assert!(
+        fx.trueup_row(h, cumulative).is_some(),
+        "keyed by the hold id"
+    );
     assert_eq!(fx.trueup_total(h), LATE_DELTA);
     let before = fx.fingerprint();
     fx.settle("turn-a", Some(MODEL), Some(&path));

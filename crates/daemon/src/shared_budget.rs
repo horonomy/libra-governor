@@ -1867,6 +1867,14 @@ fn measure_codex_turns(
 ///
 /// The post-hoc charge is booked to the period of the settle time: the reader
 /// returns no record timestamps, so the record's own event time is not used.
+///
+/// # Recovery (HORO-2284)
+///
+/// After the `Stop`'s own outcome, and only past the same marker gate, the
+/// lane is recovered: every `expired`, unsettled hold with a turn mapping is
+/// settled late by its own turn ids in its own row and period (measured, else
+/// the hold amount, never zero), and the lane's newest measured settled hold
+/// is trued up by [`trueup_codex_hold`]. Neither changes this call's result.
 pub fn settle_codex_turn(
     ledger: &mut LedgerStore,
     rt: &SharedBudgetRuntime,
@@ -1885,7 +1893,10 @@ pub fn settle_codex_turn(
     let Ok(lane) = client_lane(session_id, Some(CODEX_PROVIDER)) else {
         return Ok(CodexSettlement::NotApplicable);
     };
-    match ledger.hold_for_prompt(&principal(), &lane, turn_id)? {
+    // The hold to true up is the lane's newest settled one as of *before*
+    // this call, so a hold settled by this very call is not re-read at once.
+    let trueup_target = trueup_candidate(ledger, &lane).ok().flatten();
+    let primary = match ledger.hold_for_prompt(&principal(), &lane, turn_id)? {
         Some(hold_id) => settle_codex_hold(
             ledger,
             rt,
@@ -1907,7 +1918,249 @@ pub fn settle_codex_turn(
             model,
             transcript_path,
         ),
+    };
+    // Recovery is best effort and never changes the outcome of this `Stop`:
+    // whatever it could not do (a busy ledger, say) is retried, idempotently,
+    // at the lane's next settle.
+    let _ = recover_codex_lane(
+        ledger,
+        rt,
+        &state,
+        session_id,
+        &lane,
+        trueup_target,
+        model,
+        transcript_path,
+    );
+    primary
+}
+
+/// Most expired, unsettled holds one settle recovers; the rest wait for the
+/// lane's next settle.
+const MAX_CODEX_RECOVERIES_PER_SETTLE: usize = 16;
+
+/// The lane's newest settled hold whose cents were measured. A hold settled
+/// at the flat hold amount (`usage_known=false`) is never re-measured: a
+/// true-up only ever adds to a measurement.
+fn trueup_candidate(
+    ledger: &LedgerStore,
+    lane: &str,
+) -> Result<Option<libra_governor_domain::SharedPoolReservationId>, SharedBudgetError> {
+    let holds = ledger.shared_lane_holds(
+        &principal(),
+        lane,
+        None,
+        ExecutorKind::AgentAbsent,
+        OWNER_POOL_PREFIX,
+    )?;
+    Ok(holds
+        .iter()
+        .filter(|h| {
+            h.state == ReservationState::Settled
+                && h.usage_known == Some(true)
+                && h.settled_amount.is_some()
+        })
+        .max_by_key(|h| (h.settled_at, h.created_at))
+        .map(|h| h.id))
+}
+
+/// Recovers a Codex lane at its next settle (HORO-2284): settles every
+/// expired, unsettled hold by its own turn ids, then trues up
+/// `trueup_target`. See [`settle_codex_turn`].
+#[allow(clippy::too_many_arguments)]
+fn recover_codex_lane(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    state: &SharedBudgetFileState,
+    session_id: &str,
+    lane: &str,
+    trueup_target: Option<libra_governor_domain::SharedPoolReservationId>,
+    model: Option<&str>,
+    transcript_path: Option<&str>,
+) -> Result<(), SharedBudgetError> {
+    let holds = ledger.shared_lane_holds(
+        &principal(),
+        lane,
+        None,
+        ExecutorKind::AgentAbsent,
+        OWNER_POOL_PREFIX,
+    )?;
+    let orphans: Vec<_> = holds
+        .iter()
+        .filter(|h| h.state == ReservationState::Expired && h.settled_amount.is_none())
+        .take(MAX_CODEX_RECOVERIES_PER_SETTLE)
+        .map(|h| h.id)
+        .collect();
+    for id in orphans {
+        let turns = ledger.prompts_for_hold(&principal(), lane, id)?;
+        // Never the foreign-turn fallback: only a hold with a recorded turn
+        // mapping is a Codex turn of this lane.
+        let Some(first) = turns.first() else { continue };
+        settle_codex_hold(
+            ledger,
+            rt,
+            state,
+            session_id,
+            lane,
+            first,
+            id,
+            model,
+            transcript_path,
+        )?;
     }
+    if let Some(id) = trueup_target {
+        trueup_codex_hold(
+            ledger,
+            rt,
+            state,
+            session_id,
+            lane,
+            id,
+            model,
+            transcript_path,
+        )?;
+    }
+    Ok(())
+}
+
+/// Whether the rollout's tail holds a `task_complete` line for `turn_id`.
+/// The reader that settles a turn does not require one (it is written after
+/// the `Stop` hook), so a true-up checks for itself that the turn is over.
+fn codex_turn_complete(path: &str, turn_id: &str) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return false;
+    };
+    let start = len.saturating_sub(BUDGET_SCAN_CAP_BYTES);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return false;
+    }
+    let mut buf = Vec::new();
+    if file
+        .take(BUDGET_SCAN_CAP_BYTES)
+        .read_to_end(&mut buf)
+        .is_err()
+    {
+        return false;
+    }
+    let mut lines = buf.split(|b| *b == b'\n');
+    if start > 0 {
+        // The window opens mid-line.
+        lines.next();
+    }
+    lines.any(|line| {
+        std::str::from_utf8(line)
+            .ok()
+            .filter(|l| l.contains("task_complete"))
+            .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .is_some_and(|v| {
+                v["type"] == "event_msg"
+                    && v["payload"]["type"] == "task_complete"
+                    && v["payload"]["turn_id"] == turn_id
+            })
+    })
+}
+
+/// Books what a settled, measured Codex hold under-counted (HORO-2284).
+///
+/// The final `token_usage_record` can still sit in Codex's writer queue when
+/// `Stop` settles, which the reader cannot detect, so the hold settles short.
+/// Once every turn of the hold has its `task_complete` line, the hold is
+/// measured again and the difference is booked as a charge keyed
+/// `codex-trueup:<lane>|<hold id>|c<cumulative cents>`.
+///
+/// - The baseline is the hold's settled amount plus every true-up already
+///   booked for the hold (summed by key prefix across periods, plus what a
+///   prune folded into the charge floor). Only `measured - baseline > 0` is
+///   booked: a smaller measurement books nothing and nothing is ever
+///   refunded.
+/// - The key names the hold's own row id, which cannot change, not a turn id:
+///   a turn that joined the hold later could otherwise change the key and let
+///   a replay book twice.
+/// - The delta lands in the hold's own period (the pool it was admitted
+///   into), even when that month has closed. If that pool or the hold row has
+///   been pruned, nothing is booked.
+#[allow(clippy::too_many_arguments)]
+fn trueup_codex_hold(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    state: &SharedBudgetFileState,
+    session_id: &str,
+    lane: &str,
+    hold_id: libra_governor_domain::SharedPoolReservationId,
+    model: Option<&str>,
+    transcript_path: Option<&str>,
+) -> Result<(), SharedBudgetError> {
+    let SharedBudgetFileState::Valid(cfg) = state else {
+        return Ok(());
+    };
+    let (Some(model), Some(path)) = (model, transcript_path) else {
+        return Ok(());
+    };
+    let holds = ledger.shared_lane_holds(
+        &principal(),
+        lane,
+        None,
+        ExecutorKind::AgentAbsent,
+        OWNER_POOL_PREFIX,
+    )?;
+    let Some(hold) = holds.iter().find(|h| h.id == hold_id) else {
+        return Ok(());
+    };
+    let (ReservationState::Settled, Some(true), Some(settled)) =
+        (hold.state, hold.usage_known, hold.settled_amount)
+    else {
+        return Ok(());
+    };
+    let turns = ledger.prompts_for_hold(&principal(), lane, hold.id)?;
+    if turns.is_empty() || !turns.iter().all(|t| codex_turn_complete(path, t)) {
+        return Ok(());
+    }
+    let (Some(measured), None) = measure_codex_turns(
+        rt,
+        cfg,
+        session_id,
+        &turns,
+        Some(model),
+        Some(path),
+        hold.amount,
+    ) else {
+        return Ok(());
+    };
+    let prefix = format!("codex-trueup:{}|{}|", lp(lane), hold.id.0);
+    let prior =
+        ledger.shared_charges_total_by_key_prefix(&principal(), &prefix, OWNER_POOL_PREFIX)?;
+    let delta = measured.saturating_sub(settled.saturating_add(prior));
+    if delta == 0 {
+        return Ok(());
+    }
+    // The charge books by event time. The hold's creation time falls in the
+    // pool it was admitted into; if the configured zone has changed since,
+    // the two disagree and nothing is booked rather than booking elsewhere.
+    if period_at(cfg, hold.created_at)?.pool_id != hold.pool_id {
+        return Ok(());
+    }
+    let key = format!("{prefix}c{measured}");
+    let event_time = rfc(hold.created_at);
+    book_charge(
+        ledger,
+        rt,
+        state,
+        BookedCharge {
+            session_id: lane,
+            agent_id: None,
+            amount_usd_cents: delta,
+            key: &key,
+            charge_source: ChargeSource::TurnHold,
+            event_time: Some(&event_time),
+            usage_known: true,
+            watermark: None,
+        },
+    )?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
