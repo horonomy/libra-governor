@@ -990,6 +990,25 @@ pub(crate) fn dispatch(
                     &transcript_path,
                     provider.as_deref(),
                 ),
+                SharedBudgetRequest::SettleTurn {
+                    session_id,
+                    turn_id,
+                    model,
+                    transcript_path,
+                } => crate::shared_budget::settle_codex_request(
+                    ledger,
+                    rt,
+                    &session_id,
+                    &turn_id,
+                    model.as_deref(),
+                    transcript_path.as_deref(),
+                )
+                .map(|(outcome, label)| {
+                    if let Some(label) = label {
+                        log::append_line(&config.log_path, &label);
+                    }
+                    outcome
+                }),
                 SharedBudgetRequest::Status {} => crate::shared_budget::status(ledger, rt)
                     .map(|status| SharedBudgetOutcome::Status(Box::new(status))),
             };
