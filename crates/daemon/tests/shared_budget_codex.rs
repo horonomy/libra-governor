@@ -997,15 +997,14 @@ fn a_turn_charged_unmeasured_is_never_re_priced_by_a_later_measured_retry() {
 }
 
 #[test]
-fn an_early_stop_for_t1_on_a_shared_hold_under_charges_t2_until_the_c4_true_up() {
-    // Documented residual, pinned so a change is deliberate: T1 and T2 share
-    // one hold; T1's Stop arrives while T2 has not reached the rollout. The
-    // hold settles on what is there (T1, 276 > the 100 hold), and T2's own
-    // Stop is then a replay, so T2's spend is not booked. The C4 true-up
-    // (re-measure a settled turn once its rollout is complete and book the
-    // positive delta) is what closes this; C2 does not.
+fn an_early_stop_for_t1_on_a_shared_hold_is_closed_by_the_c4_true_up() {
+    // T1 and T2 share one hold; T1's Stop arrives while T2 has not reached
+    // the rollout. The hold settles on what is there (T1, 276 > the 100
+    // hold), and T2's own Stop is then a replay. C2 left T2's spend unbooked;
+    // the C4 true-up re-measures the settled hold once the rollout is
+    // complete and books the positive delta.
     let mut fx = fx_with_hold(100, true, true);
-    fx.admit("turn-1");
+    let h = fx.admit("turn-1");
     fx.admit("turn-2");
     let mut lines = turn_lines("turn-1", TURN_BIG);
     let path = fx.rollout("r.jsonl", &lines);
@@ -1018,11 +1017,11 @@ fn an_early_stop_for_t1_on_a_shared_hold_under_charges_t2_until_the_c4_true_up()
     let path = fx.rollout("r.jsonl", &lines);
     let late = fx.settle("turn-2", Some(MODEL), Some(&path));
     assert!(matches!(late, CodexSettlement::AlreadySettled), "{late:?}");
-    assert_eq!(
-        fx.used_reserved(),
-        (BIG_CENTS, 0),
-        "T2's 276 cents are not booked"
-    );
+    assert_eq!(fx.trueup_total(h), BIG_CENTS, "T2's spend is booked once");
+    assert_eq!(fx.used_reserved(), (2 * BIG_CENTS, 0));
+    let before = fx.fingerprint();
+    fx.settle("turn-2", Some(MODEL), Some(&path));
+    assert_eq!(fx.fingerprint(), before, "replay books 0");
 }
 
 // ---------------------------------------------------------------------
