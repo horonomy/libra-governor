@@ -307,6 +307,9 @@ fn enrolled_with_codex_hooks_not_installed_warns_ungated() {
 fn wired_but_unproven_trust_is_likely_not_trusted_and_never_ok() {
     let env = Env::new(Some(""), true);
     env.install_codex_hooks();
+    // A readable config with no [hooks.state] section: Codex has nowhere to
+    // have recorded trust. (An absent config.toml is `unknown`, not this.)
+    std::fs::write(env.codex_home.join("config.toml"), "[features]\n").unwrap();
     let (severity, message) = env.doctor().expect("codex_enrolled_hooks");
     assert_eq!(severity, "warn", "{message}");
     assert!(message.contains("likely not yet trusted"), "{message}");
@@ -390,7 +393,7 @@ fn the_probe_is_exactly_one_read_only_codex_check() {
     let checks: Vec<serde_json::Value> = fake
         .requests()
         .into_iter()
-        .filter(|r| r["shared_budget"]["op"].is_string())
+        .filter(|r| r["shared_budget"]["op"] == "check")
         .collect();
     assert_eq!(checks.len(), 1, "{checks:?}");
     let check = &checks[0]["shared_budget"];
