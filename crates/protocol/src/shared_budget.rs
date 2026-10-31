@@ -125,6 +125,20 @@ pub enum SharedBudgetRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
     },
+    /// Settle one Codex turn's hold from its rollout (HORO-2283), sent by the
+    /// Codex `Stop` hook. Codex-only: there is no `provider` field, and the
+    /// daemon answers `not_configured` and writes nothing unless the Codex
+    /// marker file exists. `turn_id` is the hook's `turn_id`, the same value
+    /// `Admit` received as `prompt_id`. The daemon opens `transcript_path`
+    /// itself; the hook never does.
+    SettleTurn {
+        session_id: String,
+        turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transcript_path: Option<String>,
+    },
     /// Read-only budget posture.
     Status {},
 }
@@ -454,6 +468,11 @@ pub enum SharedBudgetOutcome {
         /// would not change what `Finalize` books.
         ready: bool,
     },
+    /// Answer to `SettleTurn` when Codex is enrolled. `disposition` is the
+    /// daemon's short, content-free label for what happened (settled, already
+    /// settled, charged after the fact, not applicable); it is for logs and
+    /// carries no amount a client may act on.
+    CodexTurnSettled { disposition: String },
     Status(Box<SharedBudgetStatus>),
 }
 
@@ -843,5 +862,38 @@ mod tests {
             serde_json::to_value(SharedBudgetRefusal::UnsupportedProvider).unwrap(),
             "unsupported_provider"
         );
+    }
+
+    #[test]
+    fn settle_turn_omits_absent_optionals_and_rejects_unknown_fields() {
+        let bare = SharedBudgetRequest::SettleTurn {
+            session_id: "s".into(),
+            turn_id: "t".into(),
+            model: None,
+            transcript_path: None,
+        };
+        let json = serde_json::to_value(&bare).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"op":"settle_turn","session_id":"s","turn_id":"t"})
+        );
+        assert_eq!(
+            serde_json::from_value::<SharedBudgetRequest>(json).unwrap(),
+            bare
+        );
+        assert!(serde_json::from_str::<SharedBudgetRequest>(
+            r#"{"op":"settle_turn","session_id":"s","turn_id":"t","provider":"codex"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn codex_turn_settled_outcome_round_trips() {
+        let o = SharedBudgetOutcome::CodexTurnSettled {
+            disposition: "settled".into(),
+        };
+        let back: SharedBudgetOutcome =
+            serde_json::from_value(serde_json::to_value(&o).unwrap()).unwrap();
+        assert_eq!(back, o);
     }
 }

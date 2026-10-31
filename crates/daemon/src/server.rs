@@ -990,6 +990,9 @@ pub(crate) fn dispatch(
                     &transcript_path,
                     provider.as_deref(),
                 ),
+                // Wired to the Codex settlement in the next commit; until then
+                // the request is accepted and inert.
+                SharedBudgetRequest::SettleTurn { .. } => Ok(SharedBudgetOutcome::NotConfigured),
                 SharedBudgetRequest::Status {} => crate::shared_budget::status(ledger, rt)
                     .map(|status| SharedBudgetOutcome::Status(Box::new(status))),
             };
