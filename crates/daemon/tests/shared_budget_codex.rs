@@ -1385,6 +1385,152 @@ fn unmapped_expired_holds_do_not_starve_a_mapped_orphan() {
 }
 
 // ---------------------------------------------------------------------
+// HORO-2340: C4 acceptance gaps (orphan cap, newest-only true-up)
+// ---------------------------------------------------------------------
+
+/// A turn of `n` output tokens only. Under [`OVERRIDES`] an output token is
+/// 25,001 micro-dollars, so every `n` below prices to a different cent amount.
+fn output_only(n: i64) -> [i64; 5] {
+    [0, 0, 0, n, 0]
+}
+
+fn output_only_cents(n: i64) -> u64 {
+    (n as u64 * 25_001).div_ceil(10_000)
+}
+
+#[test]
+fn orphan_recovery_settles_at_most_sixteen_holds_per_settle_and_the_rest_on_the_next() {
+    const ORPHANS: usize = 20;
+    let mut fx = fx();
+    let mut lines = Vec::new();
+    // (hold id, the cents its own turn measures to)
+    let mut orphans = Vec::new();
+    // Each prompt comes two hours after the last, so every earlier hold has
+    // expired (1 h TTL) with its Stop never delivered. Every turn has its
+    // own usage, so a settled amount identifies the turn that was read.
+    for i in 0..ORPHANS {
+        let turn = format!("turn-{i}");
+        let n = 10 * (i as i64 + 1);
+        orphans.push((fx.admit(&turn), output_only_cents(n)));
+        lines.extend(turn_lines(&turn, output_only(n)));
+        fx.clock
+            .set(t(BASE) + time::Duration::hours(2 * (i as i64 + 1)));
+    }
+    fx.admit("turn-live");
+    let live_cents = output_only_cents(1_000);
+    lines.extend(turn_lines("turn-live", output_only(1_000)));
+    let path = fx.rollout("r.jsonl", &lines);
+    let all: Vec<u64> = orphans.iter().map(|(_, c)| *c).collect();
+    assert_eq!(
+        all.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        ORPHANS,
+        "the fixture's amounts identify their turns"
+    );
+
+    // Splits the orphans into (settled amounts, still expired), checking that
+    // every settled row carries exactly its own turn's amount.
+    let split = |fx: &Fx| {
+        let mut booked = 0;
+        let mut waiting = 0;
+        for (id, own) in &orphans {
+            let row = fx.hold_row(*id);
+            match row.state {
+                ReservationState::Settled => {
+                    assert_eq!(row.settled_amount, Some(*own), "its own turn's amount");
+                    assert_eq!(row.usage_known, Some(true));
+                    booked += *own;
+                }
+                ReservationState::Expired => {
+                    assert_eq!(row.settled_amount, None, "left unsettled");
+                    waiting += 1;
+                }
+                other => panic!("unexpected state {other:?}"),
+            }
+        }
+        (booked, waiting)
+    };
+
+    let out = fx.settle("turn-live", Some(MODEL), Some(&path));
+    assert_eq!(settled(&out), (live_cents, true, None));
+    let (booked, waiting) = split(&fx);
+    assert_eq!(waiting, 4, "exactly 16 of 20 settled late");
+    assert_eq!(fx.used_reserved(), (live_cents + booked, 0));
+
+    fx.settle("turn-live", Some(MODEL), Some(&path));
+    let (booked, waiting) = split(&fx);
+    assert_eq!(waiting, 0, "the next settle takes the remainder");
+    let total = live_cents + all.iter().sum::<u64>();
+    assert_eq!(booked, all.iter().sum::<u64>());
+    assert_eq!(fx.used_reserved(), (total, 0), "no double count");
+
+    let before = fx.fingerprint();
+    fx.settle("turn-live", Some(MODEL), Some(&path));
+    assert_eq!(fx.fingerprint(), before, "replay books 0");
+}
+
+#[test]
+fn only_the_newest_measured_hold_is_re_measured_by_the_true_up() {
+    let mut fx = fx();
+    // `older` is created first but settled last; `newer` is created second
+    // and settled first. "Newest" is by settle time, not creation time.
+    let older = fx.admit("turn-a");
+    fx.clock.set(t("2027-01-15T13:30:00Z"));
+    let newer = fx.admit("turn-b");
+    assert_ne!(older, newer);
+    let both = [
+        turn_lines("turn-a", TURN_SMALL),
+        turn_lines("turn-b", TURN_SMALL),
+    ]
+    .concat();
+    let path = fx.rollout("r.jsonl", &both);
+    // `older` has expired, so settling turn-b would recover it in the same
+    // call. Block that update so it settles only on turn-a's own Stop.
+    let conn = rusqlite::Connection::open(fx.dir.path().join("ledger.sqlite3")).unwrap();
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER hold_older_back BEFORE UPDATE ON shared_pool_reservations
+         WHEN NEW.id = '{}' BEGIN SELECT RAISE(ABORT, 'induced'); END;",
+        older.0
+    ))
+    .unwrap();
+    fx.clock.set(t("2027-01-15T13:35:00Z"));
+    fx.settle("turn-b", Some(MODEL), Some(&path));
+    assert_eq!(fx.hold_row(older).state, ReservationState::Expired);
+    conn.execute_batch("DROP TRIGGER hold_older_back;").unwrap();
+    drop(conn);
+    fx.clock.set(t("2027-01-15T13:40:00Z"));
+    fx.settle("turn-a", Some(MODEL), Some(&path));
+
+    let (o, n) = (fx.hold_row(older), fx.hold_row(newer));
+    assert_eq!((o.usage_known, n.usage_known), (Some(true), Some(true)));
+    assert!(o.created_at < n.created_at, "older was created first");
+    assert!(o.settled_at > n.settled_at, "but it was settled last");
+
+    // Both turns' final records are flushed late.
+    let grown = [grown_lines("turn-a"), grown_lines("turn-b")].concat();
+    fx.rollout("r.jsonl", &grown);
+    fx.clock.set(t("2027-01-15T13:50:00Z"));
+    fx.settle("turn-b", Some(MODEL), Some(&path));
+    assert_eq!(
+        fx.trueup_total(older),
+        LATE_DELTA,
+        "the newest-settled hold is trued up"
+    );
+    assert!(fx.trueup_row(older, BIG_CENTS).is_some());
+    assert_eq!(
+        fx.trueup_total(newer),
+        0,
+        "the newer-created, earlier-settled hold is not re-measured"
+    );
+    assert!(fx.trueup_row(newer, BIG_CENTS).is_none());
+    assert_eq!(fx.used_reserved(), (SMALL_CENTS + BIG_CENTS, 0));
+    let before = fx.fingerprint();
+    fx.settle("turn-b", Some(MODEL), Some(&path));
+    fx.restart();
+    fx.settle("turn-b", Some(MODEL), Some(&path));
+    assert_eq!(fx.fingerprint(), before, "replay books 0");
+}
+
+// ---------------------------------------------------------------------
 // HORO-2285 (C5): the doctor's stale-daemon probe is a Codex Check.
 // ---------------------------------------------------------------------
 
