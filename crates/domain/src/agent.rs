@@ -505,6 +505,24 @@ mod tests {
         assert!(!codex.claims_pre_spend_refusal());
     }
 
+    /// HORO-2285: the Codex row stays Unavailable (activation is a founder
+    /// decision) but no longer claims the route never asks the daemon: it
+    /// names the experimental, off-by-default marker.
+    #[test]
+    fn codex_shared_budget_row_stays_unavailable_and_names_the_experimental_marker() {
+        let codex = AgentCapabilities::for_agent(AgentKind::Codex);
+        let Capability::Unavailable {
+            gap: CapabilityGap::NotWiredByLibra { detail, .. },
+        } = codex.shared_budget_admission_gate
+        else {
+            panic!("the Codex shared-budget row must stay Unavailable until activation");
+        };
+        assert!(detail.contains("shared-budget.codex"), "{detail}");
+        assert!(detail.contains("experimental"), "{detail}");
+        assert!(detail.contains("off by default"), "{detail}");
+        assert!(!detail.contains("neither asks the daemon"), "{detail}");
+    }
+
     #[test]
     fn every_agent_emits_the_same_three_wired_event_kinds() {
         for agent in all_agents() {
