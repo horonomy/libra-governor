@@ -26,13 +26,10 @@ use libra_governor_daemon::shared_budget_file::SHARED_BUDGET_FILE_NAME;
 use libra_governor_daemon::usage::codex_priced::price_codex_turn;
 use libra_governor_daemon::usage::TurnUsage;
 use libra_governor_domain::{
-    ChargeSource, ExecutorKind, PoolId, PrincipalId, QuotaUnit, ReservationState,
-    SharedPoolReservation, SharedPoolReservationId, LOCAL_BUDGET_OWNER,
+    ChargeSource, ExecutorKind, PrincipalId, ReservationState, SharedPoolReservation,
+    SharedPoolReservationId, LOCAL_BUDGET_OWNER,
 };
-use libra_governor_ledger::{
-    CapacitySource, ExecutorAttribution, LedgerStore, MeteredReserveRequest,
-    SharedPoolReserveRequest,
-};
+use libra_governor_ledger::LedgerStore;
 use libra_governor_protocol::SharedBudgetOutcome;
 
 const BASE: &str = "2027-01-15T12:00:00Z";
@@ -75,7 +72,6 @@ fn lane() -> String {
 }
 
 struct Fx {
-    hold: u64,
     dir: tempfile::TempDir,
     clock: Arc<ManualClock>,
     rt: SharedBudgetRuntime,
@@ -83,7 +79,7 @@ struct Fx {
 }
 
 impl Fx {
-    fn new(hold: u64, config: &str, marker: bool) -> Self {
+    fn new(config: &str, marker: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(SHARED_BUDGET_FILE_NAME), config).unwrap();
         if marker {
@@ -93,7 +89,6 @@ impl Fx {
         let rt = SharedBudgetRuntime::load(dir.path()).with_clock(clock.clone());
         let ledger = Some(LedgerStore::open(dir.path().join("ledger.sqlite3")).unwrap());
         Self {
-            hold,
             dir,
             clock,
             rt,
@@ -199,7 +194,7 @@ impl Fx {
 }
 
 fn fx_with_hold(hold: u64, overrides: bool, marker: bool) -> Fx {
-    Fx::new(hold, &cfg_json(hold, overrides), marker)
+    Fx::new(&cfg_json(hold, overrides), marker)
 }
 
 fn fx() -> Fx {
@@ -697,9 +692,10 @@ fn a_codex_settle_never_touches_the_claude_hold_of_the_same_raw_session_id() {
 
 #[test]
 fn without_the_marker_every_codex_settle_is_not_configured_and_writes_zero_rows() {
-    let mut fx = fx_with_hold(HOLD, true, false);
-    // A hold that would have been settled, and a measurable rollout.
+    // A hold that would have been settled, then the marker is withdrawn.
+    let mut fx = fx_with_hold(HOLD, true, true);
     fx.admit("turn-a");
+    std::fs::remove_file(fx.dir.path().join("shared-budget.codex")).unwrap();
     let path = fx.rollout("r.jsonl", &turn_lines("turn-a", TURN_BIG));
     let other = fx.rollout("o.jsonl", &turn_lines("turn-x", TURN_BIG));
     let before = fx.fingerprint();
