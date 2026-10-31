@@ -1817,6 +1817,7 @@ fn tail(fx: &mut Fx, session: &str, path: &str) -> SharedBudgetOutcome {
     fx.sb(SharedBudgetRequest::SettleTail {
         session_id: session.to_string(),
         transcript_path: path.to_string(),
+        provider: None,
     })
 }
 
@@ -2306,6 +2307,7 @@ impl Fx {
         match self.sb(SharedBudgetRequest::TranscriptReady {
             session_id: session.to_string(),
             transcript_path: s(path),
+            provider: None,
         }) {
             SharedBudgetOutcome::TranscriptReadiness { ready } => ready,
             other => panic!("expected TranscriptReadiness, got {other:?}"),
@@ -2316,6 +2318,7 @@ impl Fx {
         self.sb(SharedBudgetRequest::SettleTail {
             session_id: session.to_string(),
             transcript_path: s(path),
+            provider: None,
         })
     }
 }
@@ -2427,6 +2430,7 @@ fn a_probe_refuses_a_bad_session_and_answers_not_configured_without_a_file() {
         fx.sb(SharedBudgetRequest::TranscriptReady {
             session_id: String::new(),
             transcript_path: "/x".into(),
+            provider: None,
         }),
         SharedBudgetRefusal::EmptySessionId,
     );
@@ -2436,6 +2440,7 @@ fn a_probe_refuses_a_bad_session_and_answers_not_configured_without_a_file() {
         off.sb(SharedBudgetRequest::TranscriptReady {
             session_id: "s1".into(),
             transcript_path: "/x".into(),
+            provider: None,
         }),
         SharedBudgetOutcome::NotConfigured
     ));
@@ -2825,6 +2830,7 @@ fn a_charge_agent_replay_into_a_pruned_period_is_refused() {
         idempotency_key: "k1".into(),
         charge_source: libra_governor_domain::ChargeSource::SubagentTranscript,
         event_time: Some("2027-01-15T12:00:12Z".into()),
+        provider: None,
     });
     expect_refused(outcome, SharedBudgetRefusal::EventBeforeRetention);
     assert_eq!(fx.pools().len(), 1);
@@ -2880,6 +2886,7 @@ fn charge_agent_at(fx: &mut Fx, key: &str, event: &str) -> SharedBudgetOutcome {
         idempotency_key: key.into(),
         charge_source: libra_governor_domain::ChargeSource::SubagentTranscript,
         event_time: Some(event.into()),
+        provider: None,
     })
 }
 
