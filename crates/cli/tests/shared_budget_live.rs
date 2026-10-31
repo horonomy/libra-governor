@@ -162,6 +162,7 @@ impl Live {
             session_id: session.to_string(),
             agent_id: None,
             prompt_id: None,
+            provider: None,
         })
     }
 
@@ -254,6 +255,7 @@ fn shared_budget_admit_worker_entrypoint() {
             session_id: session.to_string(),
             agent_id: None,
             prompt_id: None,
+            provider: None,
         },
     )
     .expect("daemon answered");
