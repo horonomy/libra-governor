@@ -339,8 +339,8 @@ pub(crate) fn command_is_ours_with_suffix(
         return false;
     };
     // A bare `libra-governor` (PATH lookup) was written by an early legacy
-    // install, so uninstall still removes it; the strict install rule never
-    // treats it as ours (current installers always write an absolute path).
+    // install, so the legacy-tolerant rule (uninstall, repoint) accepts it; the
+    // strict form never treats it as ours (current installers always write an absolute path).
     (path.contains('/') || allow_legacy_unquoted_space)
         && !path.ends_with('/')
         && Path::new(path)

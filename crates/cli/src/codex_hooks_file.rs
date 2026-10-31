@@ -55,20 +55,21 @@
 //!
 //! # Ownership predicate
 //!
-//! A hook command string is "ours" only if it both contains
-//! `libra-governor` *and* ends with one of the exact `codex-hook`
-//! subcommand invocations this integration documents
-//! (`integrations/codex/README.md`) — see [`OWNED_COMMAND_SUFFIXES`].
-//! [`command_is_ours`] (which also accepts a legacy unquoted path with
-//! spaces) decides what `remove`, `inspect` and `wired_commands` act on.
-//!
-//! `apply` rewrites a command, so it uses
-//! [`command_is_ours_for`], which has no legacy leniency (HORO-2303). Both
-//! use `claude_settings::command_is_ours_with_suffix`, the one shared rule:
-//! the text before the event's exact suffix must be ONE path token whose
-//! final component is exactly `libra-governor`. A lookalike, a wrapped
+//! A hook command string is "ours" only if it ends with one of the exact
+//! `codex-hook` subcommand invocations this integration documents
+//! (`integrations/codex/README.md`, see [`OWNED_COMMAND_SUFFIXES`]) and the
+//! text before it is ONE path token whose final component is exactly
+//! `libra-governor`; the single shared rule is
+//! `claude_settings::command_is_ours_with_suffix`. A lookalike, a wrapped
 //! command (`env X=1 ...`, `cd x && ...`, a pipeline) or a trailing-`/` path
 //! is never ours.
+//!
+//! [`command_is_ours`] (used by `remove`, `inspect` and `wired_commands`) and
+//! [`command_is_ours_for`] (used by `apply` to repoint and collapse) both use
+//! the legacy-tolerant form of that rule: it also accepts what older
+//! installers pasted unquoted (a path with spaces or benign punctuation, or a
+//! bare `libra-governor`), so a reinstall repoints exactly what uninstall
+//! would remove (HORO-2303).
 //!
 //! # Trust gate is out of scope for this file
 //!
@@ -215,7 +216,7 @@ fn command_is_ours(command: &str) -> bool {
         .any(|suffix| crate::claude_settings::command_is_ours_with_suffix(command, suffix, true))
 }
 
-/// Install-side ownership for one event: the same rule as `remove`, so a
+/// Install-side ownership for one event: the same legacy-tolerant rule as `remove`, so a
 /// reinstall repoints (and collapses) exactly the entries uninstall would
 /// remove -- including a v0.0.4-shape unquoted spaced or bare path -- and
 /// nothing the rule rejects (wrapped user commands, lookalikes).
