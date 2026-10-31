@@ -470,9 +470,11 @@ pub enum SharedBudgetOutcome {
     },
     /// Answer to `SettleTurn` when Codex is enrolled. `disposition` is the
     /// daemon's short, content-free label for what happened (settled, already
-    /// settled, charged after the fact, not applicable); it is for logs and
-    /// carries no amount a client may act on.
-    CodexTurnSettled { disposition: String },
+    /// settled, charged after the fact, not applicable). It is for logs only:
+    /// a client must not parse it.
+    CodexTurnSettled {
+        disposition: String,
+    },
     Status(Box<SharedBudgetStatus>),
 }
 
