@@ -987,7 +987,10 @@ mod tests {
         assert!(!codex_enrolled_in(&reported, Some(unmarked.path())));
         assert!(!codex_enrolled_in(&reported, None));
         // No budget file: a marker alone enrols nothing.
-        assert!(!codex_enrolled_in(&Posture::NotConfigured, Some(marked.path())));
+        assert!(!codex_enrolled_in(
+            &Posture::NotConfigured,
+            Some(marked.path())
+        ));
 
         // A symlink does not count, as for the hook and the daemon.
         let linked = tempfile::tempdir().unwrap();

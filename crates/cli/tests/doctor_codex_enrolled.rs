@@ -30,8 +30,7 @@ struct Env {
     codex_home: PathBuf,
 }
 
-const BUDGET: &str =
-    r#"{"schema_version":1,"monthly_cap_usd_cents":5000,"time_zone":"UTC","turn_hold_usd_cents":1000"#;
+const BUDGET: &str = r#"{"schema_version":1,"monthly_cap_usd_cents":5000,"time_zone":"UTC","turn_hold_usd_cents":1000"#;
 
 impl Env {
     /// `overrides` is the JSON body of `pricing_overrides`, if any.
@@ -86,12 +85,23 @@ impl Env {
     /// (an unwired Claude hook under a budget file is itself an Error).
     fn install_claude_hooks(&self) {
         let out = self.command(&["install"]).output().unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     fn install_codex_hooks(&self) {
-        let out = self.command(&["install", "--agent", "codex"]).output().unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let out = self
+            .command(&["install", "--agent", "codex"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     fn doctor_with(&self, extra_env: &[(&str, &str)]) -> Doctor {

@@ -22,9 +22,13 @@
 //! value itself (only a *pointer* to one, e.g. `security` or `op`).
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use libra_governor_protocol::{DoctorResult, Request, Response};
+use libra_governor_protocol::{
+    DoctorResult, Request, Response, SharedBudgetOutcome, SharedBudgetRefusal, SharedBudgetRequest,
+};
 
+use crate::agent::{budget_gate, run as agent_run};
 use crate::{
     claude_settings, client, codex_hooks_file, gateway_cmd, install_cmd, shared_budget_view,
 };
@@ -123,6 +127,7 @@ fn collect_findings(daemon_present: bool) -> Vec<Finding> {
     findings.push(pacing_authority_finding());
     findings.push(execution_identity_capture_finding());
     findings.extend(shared_budget_findings());
+    findings.extend(codex_enrolment_findings());
     findings.push(host_traffic_setting_finding());
     findings
 }
@@ -146,12 +151,22 @@ fn shared_budget_findings() -> Vec<Finding> {
     let settings = claude_settings::settings_path()
         .ok()
         .map(|p| claude_settings::inspect(&p));
-    budget_findings_for(&posture, settings.as_ref())
+    let state_dir = libra_governor_daemon::paths::state_dir().ok();
+    let codex_enrolled = shared_budget_view::codex_enrolled_in(&posture, state_dir.as_deref());
+    budget_findings_with(&posture, settings.as_ref(), codex_enrolled)
 }
 
 fn budget_findings_for(
     posture: &shared_budget_view::Posture,
     settings: Option<&claude_settings::Inspection>,
+) -> Vec<Finding> {
+    budget_findings_with(posture, settings, false)
+}
+
+fn budget_findings_with(
+    posture: &shared_budget_view::Posture,
+    settings: Option<&claude_settings::Inspection>,
+    codex_enrolled: bool,
 ) -> Vec<Finding> {
     use shared_budget_view::Posture;
     let mut findings = Vec::new();
@@ -335,7 +350,7 @@ fn budget_findings_for(
             "guarantee: {}; amounts are {}. The budget does NOT cover: {}",
             shared_budget_view::GUARANTEE_LABEL,
             shared_budget_view::USD_MEANING,
-            shared_budget_view::NOT_COVERED
+            shared_budget_view::not_covered_for(codex_enrolled)
                 .iter()
                 .map(|item| format!("({item})"))
                 .collect::<Vec<_>>()
@@ -345,15 +360,21 @@ fn budget_findings_for(
     findings
 }
 
+/// The session id of the read-only admission probe. It is synthetic, passes
+/// the daemon's identity validation, and is never admitted, charged or settled.
+const CODEX_PROBE_SESSION: &str = "libra-doctor-codex-probe";
+
 /// What the Codex enrolment findings are derived from (HORO-2285, C5). Every
 /// field is read-only evidence gathered by [`codex_enrolment_findings`].
 struct CodexEnrolment {
     marker_present: bool,
     budget_file_present: bool,
+    /// `LIBRA_GOVERNOR_CODEX_EXECUTION_OWNER`, as seen by this process.
     owner_route: bool,
     hooks: codex_hooks_file::Inspection,
     trust: CodexTrustState,
-    /// `None` when the budget file could not be read as a valid one.
+    /// Whether some `pricing_overrides` model id starts with `gpt`; `None`
+    /// when the budget file is not a valid one.
     gpt_override: Option<bool>,
     probe: CodexProbe,
 }
@@ -367,20 +388,250 @@ enum CodexProbe {
     NotConfigured,
     /// The daemon gave a real admission answer.
     Answered(String),
-    /// The daemon refused the provider or the request.
+    /// The daemon refused the request.
     Refused(String),
     /// Anything else.
     Unexpected(String),
 }
 
-fn classify_codex_probe(
-    _answer: Result<libra_governor_protocol::SharedBudgetOutcome, String>,
-) -> CodexProbe {
-    CodexProbe::Unexpected(String::new())
+/// Sorts the daemon's answer to the probe. A current daemon answers an
+/// enrolled Codex `Check` with a real outcome; a v25 build that predates C3
+/// answers `not_configured` (or does not know the provider), which leaves the
+/// install silently ungated.
+fn classify_codex_probe(answer: Result<SharedBudgetOutcome, String>) -> CodexProbe {
+    match answer {
+        Err(why) => CodexProbe::Unreachable(why),
+        Ok(SharedBudgetOutcome::NotConfigured) => CodexProbe::NotConfigured,
+        Ok(SharedBudgetOutcome::Refused {
+            reason: SharedBudgetRefusal::UnsupportedProvider,
+        }) => CodexProbe::NotConfigured,
+        Ok(SharedBudgetOutcome::Refused { reason }) => CodexProbe::Refused(format!("{reason:?}")),
+        Ok(SharedBudgetOutcome::Checked { state, .. }) => {
+            CodexProbe::Answered(format!("check: {state:?}"))
+        }
+        Ok(SharedBudgetOutcome::Denied { reason, .. }) => {
+            CodexProbe::Answered(format!("denied: {reason:?}"))
+        }
+        Ok(other) => CodexProbe::Unexpected(format!("{other:?}").chars().take(80).collect()),
+    }
 }
 
-fn codex_findings_for(_codex: &CodexEnrolment) -> Vec<Finding> {
-    Vec::new()
+/// Asks the running daemon one Codex `Check` for a synthetic session. `Check`
+/// is a read: it never creates a pool, reserves, sweeps or logs a decision.
+/// Bounded by one overall deadline; never spawns a daemon.
+fn probe_codex_admission(socket: &Path, budget: Duration) -> Result<SharedBudgetOutcome, String> {
+    let socket = socket.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let outcome = client::connect_only_with_budget(&socket, budget).and_then(|stream| {
+            client::roundtrip(
+                &stream,
+                Request::SharedBudget {
+                    shared_budget: SharedBudgetRequest::Check {
+                        session_id: CODEX_PROBE_SESSION.to_string(),
+                        agent_id: None,
+                        provider: Some("codex".to_string()),
+                    },
+                },
+            )
+        });
+        let _ = tx.send(outcome);
+    });
+    match rx.recv_timeout(budget) {
+        Ok(Ok(Response::SharedBudget(outcome))) => Ok(*outcome),
+        Ok(Ok(_)) => Err("unexpected response kind for a shared-budget check".to_string()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("the daemon did not answer in time".to_string()),
+    }
+}
+
+/// The Codex enrolment findings (HORO-2285, C5). Empty — and no file is read
+/// beyond one stat, no daemon contacted — unless the `shared-budget.codex`
+/// marker exists, so a non-enrolled doctor prints exactly what it always did.
+fn codex_enrolment_findings() -> Vec<Finding> {
+    let Ok(state_dir) = libra_governor_daemon::paths::state_dir() else {
+        return Vec::new();
+    };
+    let marker = state_dir.join(budget_gate::CODEX_MARKER_FILE_NAME);
+    if !std::fs::symlink_metadata(marker).is_ok_and(|m| m.is_file()) {
+        return Vec::new();
+    }
+    let budget_file_present = budget_gate::budget_file_present();
+    let hooks = codex_hooks_file::hooks_path()
+        .map(|path| codex_hooks_file::inspect(&path))
+        .unwrap_or_default();
+    let trust = codex_home_config_dir()
+        .map(|dir| codex_trust_state(&dir.join("config.toml")))
+        .unwrap_or(CodexTrustState::Unknown(
+            "could not resolve $CODEX_HOME".to_string(),
+        ));
+    let gpt_override =
+        match libra_governor_daemon::shared_budget_file::LoadedSharedBudget::load(&state_dir).state
+        {
+            libra_governor_daemon::shared_budget_file::SharedBudgetFileState::Valid(cfg) => Some(
+                cfg.pricing_overrides
+                    .models()
+                    .any(|model| model.to_ascii_lowercase().starts_with("gpt")),
+            ),
+            _ => None,
+        };
+    let probe = if budget_file_present {
+        match libra_governor_daemon::paths::socket_path() {
+            Ok(socket) => classify_codex_probe(probe_codex_admission(
+                &socket,
+                shared_budget_view::REPORT_BUDGET,
+            )),
+            Err(e) => CodexProbe::Unreachable(format!("could not resolve the daemon socket: {e}")),
+        }
+    } else {
+        CodexProbe::Unreachable("no shared-budget.json".to_string())
+    };
+    codex_findings_for(&CodexEnrolment {
+        marker_present: true,
+        budget_file_present,
+        owner_route: agent_run::codex_owner_route_enabled(),
+        hooks,
+        trust,
+        gpt_override,
+        probe,
+    })
+}
+
+fn codex_findings_for(codex: &CodexEnrolment) -> Vec<Finding> {
+    if !codex.marker_present {
+        return Vec::new();
+    }
+    if !codex.budget_file_present {
+        return vec![Finding {
+            id: "codex_enrolment",
+            severity: Severity::Warn,
+            message: "shared-budget.codex exists but there is no shared-budget.json, so Codex is \
+                      not enrolled: the marker does nothing without a budget file"
+                .to_string(),
+        }];
+    }
+    let mut findings = Vec::new();
+
+    // 1. The marker, and the one combination that blocks every prompt.
+    findings.push(if codex.owner_route {
+        Finding {
+            id: "codex_enrolment",
+            severity: Severity::Error,
+            message: "Codex is enrolled (shared-budget.codex) while \
+                      LIBRA_GOVERNOR_CODEX_EXECUTION_OWNER is set in the environment doctor ran \
+                      in: the two cannot be combined, so every Codex prompt is blocked. Unset \
+                      LIBRA_GOVERNOR_CODEX_EXECUTION_OWNER or remove shared-budget.codex"
+                .to_string(),
+        }
+    } else {
+        Finding {
+            id: "codex_enrolment",
+            severity: Severity::Ok,
+            message: "Codex is enrolled in the shared budget (experimental, off by default): \
+                      shared-budget.json and the shared-budget.codex marker exist, so Codex \
+                      prompts are admitted against the monthly budget and Stop settles the \
+                      turn. Remove shared-budget.codex to switch it off"
+                .to_string(),
+        }
+    });
+
+    // 2. Hooks and trust: an untrusted hook is skipped by Codex without a
+    // signal, which leaves the install ungated, and doctor cannot prove trust.
+    let wired = codex.hooks.hooks_wired;
+    let all_wired = codex.hooks.file_present && wired.iter().all(|w| *w);
+    findings.push(Finding {
+        id: "codex_enrolled_hooks",
+        severity: Severity::Warn,
+        message: if all_wired {
+            format!(
+                "Codex hooks (UserPromptSubmit, PostToolUse, Stop) are wired; trust: {}. Codex \
+                 runs a hook only after the operator trusts it in /hooks and skips an untrusted \
+                 one silently, which leaves this install ungated; doctor cannot prove trust \
+                 (`libra-governor doctor --verify-trust` asks Codex itself)",
+                codex.trust
+            )
+        } else {
+            "Codex is enrolled but its hooks are not all installed (UserPromptSubmit admits, \
+             Stop settles), so Codex is ungated: run `libra-governor install --agent codex`, \
+             then trust the hooks in Codex's /hooks"
+                .to_string()
+        },
+    });
+
+    // 3. Pricing: the pinned table prices no OpenAI model.
+    match codex.gpt_override {
+        Some(false) => findings.push(Finding {
+            id: "codex_pricing",
+            severity: Severity::Warn,
+            message: "no pricing_overrides entry for a gpt model in shared-budget.json, and the \
+                      pinned table prices no OpenAI model, so every Codex turn is booked at the \
+                      flat per-turn hold (unmeasured) and a long turn can cost more than it is \
+                      charged. Add a pricing_overrides entry for the Codex model id (this check \
+                      recognises ids that start with gpt)"
+                .to_string(),
+        }),
+        Some(true) => findings.push(Finding {
+            id: "codex_pricing",
+            severity: Severity::Ok,
+            message: "a gpt pricing_overrides entry exists; a Codex model without a matching \
+                      entry still settles at the flat per-turn hold"
+                .to_string(),
+        }),
+        None => {}
+    }
+
+    // 4. The running daemon must actually honour Codex admission.
+    findings.push(match &codex.probe {
+        CodexProbe::NotConfigured => Finding {
+            id: "codex_daemon_admission",
+            severity: Severity::Error,
+            message: "enrolled but the running daemon is not honouring Codex admission \
+                      (restart/upgrade the daemon): a read-only Codex check answered \
+                      not_configured, so Codex prompts are silently ungated"
+                .to_string(),
+        },
+        CodexProbe::Answered(answer) => Finding {
+            id: "codex_daemon_admission",
+            severity: Severity::Ok,
+            message: format!(
+                "the running daemon honours Codex admission (a read-only Codex check answered \
+                 {answer})"
+            ),
+        },
+        CodexProbe::Unreachable(why) => Finding {
+            id: "codex_daemon_admission",
+            severity: Severity::Warn,
+            message: format!(
+                "Codex admission was not verified: the daemon did not answer a read-only Codex \
+                 check ({why}); it starts on the next prompt. A daemon started before this \
+                 build must be restarted to gate Codex"
+            ),
+        },
+        CodexProbe::Refused(why) => Finding {
+            id: "codex_daemon_admission",
+            severity: Severity::Warn,
+            message: format!("the daemon refused the read-only Codex check ({why})"),
+        },
+        CodexProbe::Unexpected(what) => Finding {
+            id: "codex_daemon_admission",
+            severity: Severity::Warn,
+            message: format!("unexpected answer to the read-only Codex check: {what}"),
+        },
+    });
+
+    // 5. Known limits, always when enrolled.
+    findings.push(Finding {
+        id: "codex_limits",
+        severity: Severity::Ok,
+        message: "known Codex limits (experimental): there is no heartbeat, so a turn longer \
+                  than the 1 h hold expires and is settled later; subagent prompts and Stops \
+                  are neither admitted nor settled; there is no Codex PreToolUse check; a prompt \
+                  without a turn_id is admitted unmapped and its hold only expires; hooks run \
+                  only after the operator trusts them in /hooks; a Codex model with no pricing \
+                  entry settles at the flat hold"
+            .to_string(),
+    });
+    findings
 }
 
 fn invalid_config_finding(reason: &str) -> Finding {
@@ -1912,7 +2163,10 @@ mod tests {
     #[test]
     fn hooks_and_trust_are_reported_and_never_claimed_trusted() {
         let cases = [
-            (CodexTrustState::LikelyNotYetTrusted, "likely not yet trusted"),
+            (
+                CodexTrustState::LikelyNotYetTrusted,
+                "likely not yet trusted",
+            ),
             (CodexTrustState::Unknown("no proof".into()), "unknown"),
             (CodexTrustState::HooksDisabled, "disabled"),
         ];
@@ -1962,7 +2216,10 @@ mod tests {
         let mut codex = enrolled();
         codex.gpt_override = None;
         let findings = codex_findings_for(&codex);
-        assert!(findings.iter().all(|f| f.id != "codex_pricing"), "{findings:?}");
+        assert!(
+            findings.iter().all(|f| f.id != "codex_pricing"),
+            "{findings:?}"
+        );
     }
 
     #[test]
@@ -2060,5 +2317,4 @@ mod tests {
             assert!(f.message.contains(needle), "{needle}: {f:?}");
         }
     }
-
 }
