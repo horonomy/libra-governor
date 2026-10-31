@@ -15,6 +15,10 @@ const SLOTS: [ConfigSlot; 3] = [
 ];
 const MAX_REVISION: u64 = 9_007_199_254_740_991;
 
+/// Required-but-nullable: the key MUST be present, its value may be an
+/// explicit `null`. Deliberately NOT `#[serde(default)]`, which would also
+/// accept a record that omits the key and so weaken validation of this
+/// persisted state record. Pinned by `required_nullable_fields_refuse_omission_and_accept_null`.
 fn nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
@@ -74,7 +78,7 @@ pub(super) struct OwnedHook {
     pub(super) slot: ConfigSlot,
     pub(super) event: String,
     #[serde(deserialize_with = "nullable")]
-    pub(super) matcher: Option<String>,
+    pub(super) matcher: Option<String>, // NOSONAR rust:S9334 required-nullable by design, see `nullable`
     pub(super) handler: HookHandler,
     pub(super) sha256: String,
 }
@@ -118,7 +122,7 @@ pub(super) struct PendingIntent {
     pub(super) base_revision: u64,
     pub(super) artifact: FileDelta,
     #[serde(deserialize_with = "nullable")]
-    pub(super) target: Option<TargetDelta>,
+    pub(super) target: Option<TargetDelta>, // NOSONAR rust:S9334 required-nullable by design, see `nullable`
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,9 +138,9 @@ pub(super) struct InstallationRecord {
     pub(super) installed: bool,
     pub(super) desired_enabled: bool,
     #[serde(deserialize_with = "nullable")]
-    pub(super) connection: Option<ConnectionEvidence>,
+    pub(super) connection: Option<ConnectionEvidence>, // NOSONAR rust:S9334 required-nullable by design, see `nullable`
     #[serde(deserialize_with = "nullable")]
-    pub(super) pending: Option<PendingIntent>,
+    pub(super) pending: Option<PendingIntent>, // NOSONAR rust:S9334 required-nullable by design, see `nullable`
 }
 
 impl std::fmt::Debug for InstallationRecord {
@@ -623,6 +627,81 @@ mod tests {
         let mut unknown = value;
         unknown["supported"] = serde_json::json!(true);
         assert!(serde_json::from_value::<InstallationRecord>(unknown).is_err());
+    }
+
+    /// For one object holding a required-nullable `key`, proves the contract:
+    /// omission refuses, explicit `null` is accepted and yields `None`, and a
+    /// present value round-trips unchanged.
+    fn assert_required_nullable<T>(present: &T, key: &str)
+    where
+        T: Serialize + serde::de::DeserializeOwned + PartialEq,
+    {
+        let value = serde_json::to_value(present).unwrap();
+        assert!(
+            value[key].is_object() || value[key].is_string(),
+            "{key} must be present"
+        );
+        assert!(&serde_json::from_value::<T>(value.clone()).unwrap() == present);
+
+        let mut omitted = value.clone();
+        omitted.as_object_mut().unwrap().remove(key);
+        assert!(
+            serde_json::from_value::<T>(omitted).is_err(),
+            "omitted {key} must refuse"
+        );
+
+        let mut null = value;
+        null[key] = serde_json::Value::Null;
+        let parsed = serde_json::from_value::<T>(null.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap(),
+            null,
+            "{key} null must round-trip as None"
+        );
+    }
+
+    #[test]
+    fn required_nullable_fields_refuse_omission_and_accept_null() {
+        let mut record = fixture();
+        let hook = OwnedHook {
+            slot: ConfigSlot::PromptSubmit,
+            event: "UserPromptSubmit".into(),
+            matcher: Some("Bash".into()),
+            handler: HookHandler {
+                kind: "command".into(),
+                command: "libra-governor hook".into(),
+            },
+            sha256: "0".repeat(64),
+        };
+        assert_required_nullable(&hook, "matcher");
+
+        let target = FileFingerprint::from_bytes(Some(b"settings"));
+        let delta = TargetDelta {
+            before: target.clone(),
+            after: target.clone(),
+            owned_before: vec![hook.clone()],
+            owned_after: vec![hook.clone()],
+        };
+        let pending = PendingIntent {
+            transaction_id: TRANSACTION.into(),
+            operation: ConfigIntent::Enable,
+            phase: IntentPhase::Prepared,
+            base_revision: 3,
+            artifact: FileDelta {
+                before: file(&record),
+                after: file(&record),
+            },
+            target: Some(delta),
+        };
+        assert_required_nullable(&pending, "target");
+
+        record.connection = Some(ConnectionEvidence {
+            target,
+            owned: vec![hook],
+        });
+        record.pending = Some(pending);
+        assert_required_nullable(&record, "connection");
+        assert_required_nullable(&record, "pending");
     }
 
     #[test]
