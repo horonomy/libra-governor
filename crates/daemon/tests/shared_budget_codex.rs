@@ -27,11 +27,11 @@ use libra_governor_daemon::shared_budget_file::SHARED_BUDGET_FILE_NAME;
 use libra_governor_daemon::usage::codex_priced::price_codex_turn;
 use libra_governor_daemon::usage::TurnUsage;
 use libra_governor_domain::{
-    ChargeSource, ExecutorKind, PoolId, PrincipalId, QuotaUnit, ReservationState,
+    ChargeSource, ExecutorKind, IanaTimeZone, PoolId, PrincipalId, QuotaUnit, ReservationState,
     SharedPoolReservation, SharedPoolReservationId, LOCAL_BUDGET_OWNER,
 };
 use libra_governor_ledger::{
-    CapacitySource, ExecutorAttribution, LedgerStore, MeteredReserveRequest,
+    CapacitySource, ExecutorAttribution, LedgerStore, MeteredReserveRequest, PruneRequest,
     SharedPoolReserveRequest,
 };
 
@@ -854,4 +854,256 @@ fn removing_the_marker_after_enabling_returns_settlement_to_inert() {
         before,
         "whole ledger unchanged once inert"
     );
+}
+
+
+// ---------------------------------------------------------------------
+// HORO-2284 (C4): orphan recovery and true-up
+// ---------------------------------------------------------------------
+
+/// `TURN_BIG - TURN_SMALL`: the record a flush adds after a settle that saw
+/// only `TURN_SMALL`. Priced alone it is 97 cents on top of 179.
+const TURN_LATE: [i64; 5] = [1000, 900, 100, 30, 10];
+const LATE_DELTA: u64 = BIG_CENTS - SMALL_CENTS;
+
+/// A turn whose final record was flushed after the first settle read it.
+fn grown_lines(turn: &str) -> Vec<String> {
+    vec![
+        task_started(turn),
+        usage_record(turn, SESSION, TURN_SMALL, TURN_SMALL),
+        usage_record(turn, SESSION, TURN_LATE, TURN_BIG),
+        task_complete(turn),
+    ]
+}
+
+fn trueup_prefix(hold: SharedPoolReservationId) -> String {
+    format!("codex-trueup:{}|{}|", lp(&lane()), hold.0)
+}
+
+impl Fx {
+    fn trueup_total(&self, hold: SharedPoolReservationId) -> u64 {
+        self.ledger
+            .as_ref()
+            .unwrap()
+            .shared_charges_total_by_key_prefix(&principal(), &trueup_prefix(hold), OWNER_PREFIX)
+            .unwrap()
+    }
+
+    fn trueup_row(
+        &self,
+        hold: SharedPoolReservationId,
+        cumulative: u64,
+    ) -> Option<SharedPoolReservation> {
+        let key = format!("{}c{cumulative}", trueup_prefix(hold));
+        self.ledger
+            .as_ref()
+            .unwrap()
+            .find_shared_reservation_by_key(&principal(), &key, OWNER_PREFIX)
+            .unwrap()
+    }
+
+    fn hold_row(&self, id: SharedPoolReservationId) -> SharedPoolReservation {
+        self.holds().into_iter().find(|h| h.id == id).unwrap()
+    }
+}
+
+#[test]
+fn a_killed_turn_is_settled_at_the_next_settle_by_its_own_turn_id() {
+    let mut fx = fx();
+    let killed = fx.admit("turn-a");
+    // No Stop for turn-a: its hold expires, the user prompts again.
+    fx.clock.set(t("2027-01-15T14:00:00Z"));
+    let live = fx.admit("turn-b");
+    assert_ne!(killed, live);
+    assert_eq!(fx.hold_row(killed).state, ReservationState::Expired);
+    let lines = [turn_lines("turn-a", TURN_BIG), turn_lines("turn-b", TURN_SMALL)].concat();
+    let path = fx.rollout("r.jsonl", &lines);
+    let out = fx.settle("turn-b", Some(MODEL), Some(&path));
+    assert_eq!(settled(&out), (SMALL_CENTS, true, None));
+    let orphan = fx.hold_row(killed);
+    assert_eq!(orphan.state, ReservationState::Settled);
+    assert_eq!(orphan.settled_amount, Some(BIG_CENTS), "its own turn, not turn-b");
+    assert_eq!(orphan.usage_known, Some(true));
+    assert_eq!(orphan.pool_id.0, POOL_JAN);
+    assert_eq!(fx.used_reserved(), (BIG_CENTS + SMALL_CENTS, 0));
+}
+
+#[test]
+fn an_unmeasurable_orphan_settles_at_the_hold_amount_never_zero_and_only_once() {
+    let mut fx = fx();
+    let killed = fx.admit("turn-a");
+    fx.clock.set(t("2027-01-15T14:00:00Z"));
+    fx.admit("turn-b");
+    // The rollout has no trace of turn-a.
+    let path = fx.rollout("r.jsonl", &turn_lines("turn-b", TURN_SMALL));
+    fx.settle("turn-b", Some(MODEL), Some(&path));
+    let orphan = fx.hold_row(killed);
+    assert_eq!(orphan.state, ReservationState::Settled);
+    assert_eq!(orphan.settled_amount, Some(HOLD));
+    assert_eq!(orphan.usage_known, Some(false));
+    let before = fx.fingerprint();
+    fx.settle("turn-b", Some(MODEL), Some(&path));
+    assert_eq!(fx.fingerprint(), before, "a replay books nothing");
+}
+
+#[test]
+fn a_final_record_appended_after_settle_books_exactly_the_delta_and_replay_books_zero() {
+    let mut fx = fx();
+    let h = fx.admit("turn-a");
+    let path = fx.rollout("r.jsonl", &turn_lines("turn-a", TURN_SMALL));
+    let first = fx.settle("turn-a", Some(MODEL), Some(&path));
+    assert_eq!(settled(&first), (SMALL_CENTS, true, None));
+    assert_eq!(fx.trueup_total(h), 0);
+    // The writer flushes the last record; the next settle sees it.
+    fx.rollout("r.jsonl", &grown_lines("turn-a"));
+    fx.clock.set(t("2027-01-15T12:10:00Z"));
+    fx.settle("turn-a", Some(MODEL), Some(&path));
+    assert_eq!(fx.trueup_total(h), LATE_DELTA);
+    let row = fx.trueup_row(h, BIG_CENTS).expect("keyed by cumulative");
+    assert_eq!(row.settled_amount, Some(LATE_DELTA));
+    assert_eq!(row.pool_id.0, POOL_JAN);
+    assert_eq!(fx.hold_row(h).settled_amount, Some(SMALL_CENTS), "hold row untouched");
+    assert_eq!(fx.used_reserved(), (BIG_CENTS, 0));
+    let before = fx.fingerprint();
+    fx.settle("turn-a", Some(MODEL), Some(&path));
+    fx.restart();
+    fx.settle("turn-a", Some(MODEL), Some(&path));
+    assert_eq!(fx.fingerprint(), before, "replay books 0");
+}
+
+#[test]
+fn a_smaller_re_measure_books_nothing() {
+    let mut fx = fx();
+    let h = fx.admit("turn-a");
+    let path = fx.rollout("r.jsonl", &turn_lines("turn-a", TURN_BIG));
+    fx.settle("turn-a", Some(MODEL), Some(&path));
+    fx.rollout("r.jsonl", &turn_lines("turn-a", TURN_SMALL));
+    let before = fx.fingerprint();
+    fx.settle("turn-a", Some(MODEL), Some(&path));
+    assert_eq!(fx.trueup_total(h), 0);
+    assert_eq!(fx.fingerprint(), before, "never a refund");
+    assert_eq!(fx.used_reserved(), (BIG_CENTS, 0));
+}
+
+#[test]
+fn an_unmeasured_hold_never_trues_up() {
+    let mut fx = fx_with_hold(HOLD, false, true);
+    let h = fx.admit("turn-a");
+    let path = fx.rollout("r.jsonl", &turn_lines("turn-a", TURN_SMALL));
+    let first = fx.settle("turn-a", Some(MODEL), Some(&path));
+    assert_eq!(settled(&first), (HOLD, false, Some("unpriced_model")));
+    fx.rollout("r.jsonl", &grown_lines("turn-a"));
+    let before = fx.fingerprint();
+    fx.settle("turn-a", Some(MODEL), Some(&path));
+    assert_eq!(fx.trueup_total(h), 0);
+    assert_eq!(fx.fingerprint(), before);
+}
+
+#[test]
+fn a_turn_without_task_complete_is_not_trued_up_until_it_has_one() {
+    let mut fx = fx();
+    let h = fx.admit("turn-a");
+    let mut lines = vec![
+        task_started("turn-a"),
+        usage_record("turn-a", SESSION, TURN_SMALL, TURN_SMALL),
+    ];
+    let path = fx.rollout("r.jsonl", &lines);
+    fx.settle("turn-a", Some(MODEL), Some(&path));
+    let mut grown = grown_lines("turn-a");
+    grown.pop();
+    fx.rollout("r.jsonl", &grown);
+    fx.settle("turn-a", Some(MODEL), Some(&path));
+    assert_eq!(fx.trueup_total(h), 0, "no task_complete yet");
+    lines = grown_lines("turn-a");
+    fx.rollout("r.jsonl", &lines);
+    fx.settle("turn-a", Some(MODEL), Some(&path));
+    assert_eq!(fx.trueup_total(h), LATE_DELTA);
+}
+
+#[test]
+fn the_trueup_key_does_not_change_when_a_smaller_turn_id_joins_the_hold() {
+    let mut fx = fx();
+    // turn-m creates the hold; turn-a (sorts first) re-prompts into it.
+    let h = fx.admit("turn-m");
+    assert_eq!(fx.admit("turn-a"), h);
+    let first_lines = [turn_lines("turn-a", TURN_SMALL), turn_lines("turn-m", TURN_SMALL)].concat();
+    let path = fx.rollout("r.jsonl", &first_lines);
+    let out = fx.settle("turn-m", Some(MODEL), Some(&path));
+    assert_eq!(settled(&out), (2 * SMALL_CENTS, true, None));
+    let grown = [turn_lines("turn-a", TURN_SMALL), grown_lines("turn-m")].concat();
+    fx.rollout("r.jsonl", &grown);
+    fx.settle("turn-m", Some(MODEL), Some(&path));
+    let cumulative = SMALL_CENTS + BIG_CENTS;
+    assert!(fx.trueup_row(h, cumulative).is_some(), "keyed by the hold id");
+    assert_eq!(fx.trueup_total(h), LATE_DELTA);
+    let before = fx.fingerprint();
+    fx.settle("turn-a", Some(MODEL), Some(&path));
+    fx.settle("turn-m", Some(MODEL), Some(&path));
+    assert_eq!(fx.fingerprint(), before, "replay books 0");
+}
+
+#[test]
+fn a_trueup_across_a_month_boundary_lands_in_the_holds_own_period() {
+    let mut fx = fx();
+    let h = fx.admit("turn-a");
+    let path = fx.rollout("r.jsonl", &turn_lines("turn-a", TURN_SMALL));
+    fx.settle("turn-a", Some(MODEL), Some(&path));
+    fx.rollout("r.jsonl", &grown_lines("turn-a"));
+    fx.clock.set(t("2027-02-02T09:00:00Z"));
+    fx.settle("turn-a", Some(MODEL), Some(&path));
+    let row = fx.trueup_row(h, BIG_CENTS).expect("booked");
+    assert_eq!(row.pool_id.0, POOL_JAN, "the period the spend ran in");
+    let pools: Vec<String> = fx
+        .ledger()
+        .shared_pool_ids_with_prefix(OWNER_PREFIX)
+        .unwrap()
+        .into_iter()
+        .map(|p| p.0)
+        .collect();
+    assert_eq!(pools, vec![POOL_JAN.to_string()], "no February pool");
+}
+
+#[test]
+fn prune_then_replay_books_zero() {
+    let mut fx = fx();
+    let h = fx.admit("turn-a");
+    let path = fx.rollout("r.jsonl", &turn_lines("turn-a", TURN_SMALL));
+    fx.settle("turn-a", Some(MODEL), Some(&path));
+    fx.rollout("r.jsonl", &grown_lines("turn-a"));
+    fx.settle("turn-a", Some(MODEL), Some(&path));
+    assert_eq!(fx.trueup_total(h), LATE_DELTA);
+    fx.clock.set(t("2027-04-10T09:00:00Z"));
+    let now = fx.clock.now();
+    let zone = IanaTimeZone::new("UTC").unwrap();
+    let report = fx
+        .ledger()
+        .prune_closed_periods(PruneRequest {
+            keep_months: 1,
+            now,
+            time_zone: &zone,
+            dry_run: false,
+        })
+        .unwrap();
+    assert_eq!(report.pools_pruned, 1);
+    assert_eq!(fx.trueup_total(h), LATE_DELTA, "the floor keeps the total");
+    let before = fx.fingerprint();
+    let out = fx.settle("turn-a", Some(MODEL), Some(&path));
+    assert!(matches!(out, CodexSettlement::AlreadySettled), "{out:?}");
+    assert_eq!(fx.trueup_total(h), LATE_DELTA);
+    assert_eq!(fx.fingerprint(), before, "replay books 0");
+}
+
+#[test]
+fn recovery_writes_nothing_without_the_marker() {
+    let mut fx = fx_with_hold(HOLD, true, false);
+    let killed = fx.admit("turn-a");
+    fx.clock.set(t("2027-01-15T14:00:00Z"));
+    fx.admit("turn-b");
+    let lines = [turn_lines("turn-a", TURN_BIG), grown_lines("turn-b")].concat();
+    let path = fx.rollout("r.jsonl", &lines);
+    let before = fx.fingerprint();
+    let out = fx.settle("turn-b", Some(MODEL), Some(&path));
+    assert!(matches!(out, CodexSettlement::NotConfigured), "{out:?}");
+    assert_eq!(fx.fingerprint(), before, "whole ledger unchanged");
+    assert_eq!(fx.hold_row(killed).state, ReservationState::Expired);
 }
