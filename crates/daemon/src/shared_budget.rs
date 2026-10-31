@@ -100,6 +100,8 @@ pub const CODEX_MARKER_FILE_NAME: &str = "shared-budget.codex";
 /// turns; past this the hold settles unmeasured rather than rescanning the
 /// rollout without bound.
 const MAX_CODEX_HOLD_TURNS: usize = 64;
+/// Longest recovery failure line kept in telemetry.
+const MAX_RECOVERY_ERROR_LEN: usize = 160;
 
 /// A source of "now". Injectable so rollover and timezone-boundary tests
 /// are deterministic without sleeping.
@@ -193,6 +195,11 @@ struct Telemetry {
     future_timestamps: u64,
     /// Codex turns charged after the fact because no hold was mapped to them.
     unadmitted_turns: u64,
+    /// Codex recovery steps (an orphan settle or a true-up) that failed and
+    /// were left for the lane's next settle.
+    codex_recovery_errors: u64,
+    /// The newest such failure, one bounded line.
+    codex_recovery_last_error: Option<String>,
 }
 
 /// A model id from a transcript, reduced to a safe, bounded display token:
@@ -283,6 +290,27 @@ impl SharedBudgetRuntime {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .unadmitted_turns
+    }
+
+    /// How many Codex recovery steps failed since the daemon started, and the
+    /// newest failure as one bounded line (volatile, like the other counters).
+    /// A failed step never fails the `Stop` that ran it; it is retried at the
+    /// lane's next settle.
+    pub fn codex_recovery_errors(&self) -> (u64, Option<String>) {
+        let t = self.telemetry.lock().unwrap_or_else(|e| e.into_inner());
+        (t.codex_recovery_errors, t.codex_recovery_last_error.clone())
+    }
+
+    fn note_recovery_error(&self, step: &str, err: &SharedBudgetError) {
+        let line: String = format!("codex recovery {step} failed: {err}")
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(MAX_RECOVERY_ERROR_LEN)
+            .collect();
+        self.note(|t| {
+            t.codex_recovery_errors += 1;
+            t.codex_recovery_last_error = Some(line);
+        });
     }
 
     /// The configuration as read at daemon start.
@@ -1920,9 +1948,9 @@ pub fn settle_codex_turn(
         ),
     };
     // Recovery is best effort and never changes the outcome of this `Stop`:
-    // whatever it could not do (a busy ledger, say) is retried, idempotently,
-    // at the lane's next settle.
-    let _ = recover_codex_lane(
+    // whatever it could not do (a busy ledger, say) is counted in telemetry
+    // and retried, idempotently, at the lane's next settle.
+    recover_codex_lane(
         ledger,
         rt,
         &state,
@@ -1967,6 +1995,10 @@ fn trueup_candidate(
 /// Recovers a Codex lane at its next settle (HORO-2284): settles every
 /// expired, unsettled hold by its own turn ids, then trues up
 /// `trueup_target`. See [`settle_codex_turn`].
+///
+/// Each step is isolated: a hold that fails is counted
+/// ([`SharedBudgetRuntime::codex_recovery_errors`]) and skipped, and the
+/// remaining holds and the true-up still run.
 #[allow(clippy::too_many_arguments)]
 fn recover_codex_lane(
     ledger: &mut LedgerStore,
@@ -1977,39 +2009,58 @@ fn recover_codex_lane(
     trueup_target: Option<libra_governor_domain::SharedPoolReservationId>,
     model: Option<&str>,
     transcript_path: Option<&str>,
-) -> Result<(), SharedBudgetError> {
-    let holds = ledger.shared_lane_holds(
+) {
+    let holds = match ledger.shared_lane_holds(
         &principal(),
         lane,
         None,
         ExecutorKind::AgentAbsent,
         OWNER_POOL_PREFIX,
-    )?;
-    let orphans: Vec<_> = holds
+    ) {
+        Ok(holds) => holds,
+        Err(e) => {
+            rt.note_recovery_error("list", &e.into());
+            Vec::new()
+        }
+    };
+    let mut recovered = 0;
+    for hold in holds
         .iter()
         .filter(|h| h.state == ReservationState::Expired && h.settled_amount.is_none())
-        .take(MAX_CODEX_RECOVERIES_PER_SETTLE)
-        .map(|h| h.id)
-        .collect();
-    for id in orphans {
-        let turns = ledger.prompts_for_hold(&principal(), lane, id)?;
-        // Never the foreign-turn fallback: only a hold with a recorded turn
-        // mapping is a Codex turn of this lane.
-        let Some(first) = turns.first() else { continue };
-        settle_codex_hold(
+    {
+        if recovered >= MAX_CODEX_RECOVERIES_PER_SETTLE {
+            break;
+        }
+        // Only a hold with a recorded turn mapping is a Codex turn of this
+        // lane. Unmapped holds are skipped before the cap is applied, so
+        // they cannot starve a mapped one.
+        let first = match ledger.prompts_for_hold(&principal(), lane, hold.id) {
+            Ok(turns) => match turns.into_iter().next() {
+                Some(first) => first,
+                None => continue,
+            },
+            Err(e) => {
+                rt.note_recovery_error("orphan", &e.into());
+                continue;
+            }
+        };
+        recovered += 1;
+        if let Err(e) = settle_codex_hold(
             ledger,
             rt,
             state,
             session_id,
             lane,
-            first,
-            id,
+            &first,
+            hold.id,
             model,
             transcript_path,
-        )?;
+        ) {
+            rt.note_recovery_error("orphan", &e);
+        }
     }
     if let Some(id) = trueup_target {
-        trueup_codex_hold(
+        if let Err(e) = trueup_codex_hold(
             ledger,
             rt,
             state,
@@ -2018,9 +2069,10 @@ fn recover_codex_lane(
             id,
             model,
             transcript_path,
-        )?;
+        ) {
+            rt.note_recovery_error("trueup", &e);
+        }
     }
-    Ok(())
 }
 
 /// Whether the rollout's tail holds a `task_complete` line for `turn_id`.
@@ -2028,12 +2080,27 @@ fn recover_codex_lane(
 /// the `Stop` hook), so a true-up checks for itself that the turn is over.
 fn codex_turn_complete(path: &str, turn_id: &str) -> bool {
     use std::io::{Read, Seek, SeekFrom};
-    let Ok(mut file) = std::fs::File::open(path) else {
+    use std::os::unix::fs::OpenOptionsExt;
+    // `path` is host-claimed: a FIFO with no writer would block `open` and
+    // with it the daemon's serial accept loop. Stat first (never blocks), then
+    // open without blocking and check the handle actually opened.
+    if crate::usage::reject_non_regular_file(std::path::Path::new(path)).is_err() {
+        return false;
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    else {
         return false;
     };
-    let Ok(len) = file.metadata().map(|m| m.len()) else {
+    let Ok(meta) = file.metadata() else {
         return false;
     };
+    if !meta.is_file() {
+        return false;
+    }
+    let len = meta.len();
     let start = len.saturating_sub(BUDGET_SCAN_CAP_BYTES);
     if file.seek(SeekFrom::Start(start)).is_err() {
         return false;
@@ -2077,6 +2144,10 @@ fn codex_turn_complete(path: &str, turn_id: &str) -> bool {
 ///   prune folded into the charge floor). Only `measured - baseline > 0` is
 ///   booked: a smaller measurement books nothing and nothing is ever
 ///   refunded.
+/// - The prune floor for this family is currently redundant: a hold's row and
+///   its true-ups share one pool and are pruned together, after which this
+///   function finds no hold row and books nothing. The floor is kept as
+///   defence in depth, for a true-up whose row outlives its hold's.
 /// - The key names the hold's own row id, which cannot change, not a turn id:
 ///   a turn that joined the hold later could otherwise change the key and let
 ///   a replay book twice.

@@ -1229,6 +1229,9 @@ fn one_persistently_failing_orphan_does_not_stop_a_later_orphan_or_the_trueup() 
     assert_eq!(fx.hold_row(bad).state, ReservationState::Expired);
     assert_eq!(fx.hold_row(good).settled_amount, Some(SMALL_CENTS));
     assert_eq!(fx.trueup_total(target), LATE_DELTA, "the true-up still ran");
+    let (errors, last) = fx.rt.codex_recovery_errors();
+    assert!(errors >= 1, "the failure is counted, not swallowed");
+    assert!(last.is_some_and(|l| l.len() <= 200 && !l.contains('\n')));
 }
 
 #[test]
