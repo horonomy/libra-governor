@@ -49,7 +49,10 @@ hook schemas vs. what remains unverified.
   Create the marker with `touch <state_dir>/shared-budget.codex` (no CLI
   subcommand does this; a symlink does not count; find the state directory
   from the `shared-budget.json` path printed by `libra-governor shared-budget
-  status`). The capability row
+  status`; `status --json` also prints `state_dir`, and with no budget file
+  `status` prints `No shared-budget.json in <dir>`. The directory is
+  `$LIBRA_GOVERNOR_STATE_DIR` (used as is, takes precedence) or
+  `$XDG_STATE_HOME/libra-governor`, else `~/.local/state/libra-governor`). The capability row
   `shared_budget_admission_gate` stays Unavailable. With the marker present:
   - `UserPromptSubmit` admits the main-lane turn (`provider:"codex"`,
     `prompt_id` = the payload's `turn_id`) and prints

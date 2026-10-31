@@ -201,8 +201,10 @@ contracts, reservations, receipts and related rows) gain rows. To enrol, create
 the marker as a plain empty regular file (a symlink does not count) next to
 `shared-budget.json`: find the state directory from the path
 `libra-governor shared-budget status` prints for `shared-budget.json`
-(default `~/.local/state/libra-governor`, or `$LIBRA_GOVERNOR_STATE_DIR` /
-`$XDG_STATE_HOME/libra-governor` when set), then
+(`status --json` also prints `state_dir`; with no budget file `status` prints
+`No shared-budget.json in <dir>`). The directory is
+`$LIBRA_GOVERNOR_STATE_DIR` (used as is, takes precedence) or
+`$XDG_STATE_HOME/libra-governor`, else `~/.local/state/libra-governor`. Then
 `touch <state-dir>/shared-budget.codex`. There is no CLI subcommand for this.
 When enrolled:
 
