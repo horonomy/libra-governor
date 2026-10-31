@@ -92,6 +92,9 @@ jobs:
           if "Preflight complete" not in context:
               raise SystemExit(f"fresh install preflight was unavailable: {context!r}")
           PY
+      - name: test build_site link scanners and invariants (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: python3 tools/test_build_site.py
       - name: build and verify public surface (Ubuntu)
         if: matrix.os == 'ubuntu-latest'
         run: |
