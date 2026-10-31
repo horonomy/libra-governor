@@ -634,17 +634,14 @@ mod tests {
     /// present value round-trips unchanged.
     fn assert_required_nullable<T>(present: &T, key: &str)
     where
-        T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+        T: Serialize + serde::de::DeserializeOwned + PartialEq,
     {
         let value = serde_json::to_value(present).unwrap();
         assert!(
             value[key].is_object() || value[key].is_string(),
             "{key} must be present"
         );
-        assert_eq!(
-            &serde_json::from_value::<T>(value.clone()).unwrap(),
-            present
-        );
+        assert!(&serde_json::from_value::<T>(value.clone()).unwrap() == present);
 
         let mut omitted = value.clone();
         omitted.as_object_mut().unwrap().remove(key);
