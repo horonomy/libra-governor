@@ -60,6 +60,12 @@ hook schemas vs. what remains unverified.
     hold only until it expires.
   - Unless `shared-budget.json` carries `pricing_overrides` for the Codex
     model, every turn settles at the flat per-turn hold (`usage_known=false`).
+  - Known limits: a stale daemon (built before this change, same protocol
+    version 25) silently leaves an enrolled install ungated until it is
+    restarted; a prompt with no `turn_id` is admitted unmapped and its hold
+    just expires after the TTL; subagent prompts and Stops are neither
+    admitted nor settled (known gap); there is no heartbeat, so a turn longer
+    than the 1 h hold expires and is settled later by orphan recovery (C4).
   - **Codex hooks only run after the operator trusts them in Codex's
     `/hooks`.** Untrusted (or changed-since-trusted) hooks are skipped by
     Codex without any signal, so an enrolled but untrusted install is
