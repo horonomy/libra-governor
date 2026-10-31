@@ -466,6 +466,29 @@ pub(crate) fn reject_non_regular_file(path: &Path) -> Result<(), UsageUnavailabl
     }
 }
 
+/// Opens `path` for reading and refuses anything that is not a regular file,
+/// judged on the **opened handle**. [`reject_non_regular_file`] is a stat
+/// before the open, so a regular file replaced by a FIFO in between would
+/// still block a plain `File::open` forever; `O_NONBLOCK` makes the open of a
+/// FIFO return at once and the `fstat` then refuses it. The flag is harmless
+/// on a regular file.
+pub(crate) fn open_regular_file(path: &Path) -> Result<File, UsageUnavailable> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| UsageUnavailable::Unreadable)?;
+    match file.metadata() {
+        Ok(m) if m.is_file() => Ok(file),
+        _ => Err(UsageUnavailable::Unreadable),
+    }
+}
+
 /// Scans `path` backwards from EOF in [`CHUNK_BYTES`] chunks, calling
 /// `visit` once per complete line (newest first), stopping at the first
 /// [`ControlFlow::Break`], the start of the file, or `cap_bytes`,
@@ -481,7 +504,7 @@ pub(crate) fn scan_lines_backward<B>(
     mut visit: impl FnMut(&[u8]) -> ControlFlow<B>,
 ) -> Result<ScanEnd<B>, UsageUnavailable> {
     reject_non_regular_file(path)?;
-    let mut file = File::open(path).map_err(|_| UsageUnavailable::Unreadable)?;
+    let mut file = open_regular_file(path)?;
     let len = file
         .seek(SeekFrom::End(0))
         .map_err(|_| UsageUnavailable::Unreadable)?;
