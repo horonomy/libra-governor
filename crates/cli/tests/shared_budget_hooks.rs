@@ -1391,11 +1391,20 @@ fn an_enrolled_codex_subagent_prompt_is_not_admitted_and_is_logged() {
         Request::SharedBudget { .. } => reply(denied(SharedBudgetDenyReason::CapExhausted)),
         _ => err("scripted"),
     });
-    let ran = codex_prompt(state.path(), "codex-s", Some("turn-1"), Some("agent-7"), &[]);
+    let ran = codex_prompt(
+        state.path(),
+        "codex-s",
+        Some("turn-1"),
+        Some("agent-7"),
+        &[],
+    );
     assert!(!ran.stdout.contains("\"decision\""), "{}", ran.stdout);
     assert_eq!(fake.kinds(), vec!["preflight".to_string()]);
     let log = daemon_log(state.path());
-    assert!(log.contains("subagent") && log.contains("not admitted"), "{log}");
+    assert!(
+        log.contains("subagent") && log.contains("not admitted"),
+        "{log}"
+    );
 }
 
 #[test]
@@ -1450,7 +1459,11 @@ fn an_enrolled_codex_prompt_with_a_blank_or_reserved_session_is_skipped() {
             reply(denied(SharedBudgetDenyReason::CapExhausted))
         });
         let ran = codex_prompt(state.path(), session, Some("turn-1"), None, &[]);
-        assert!(!ran.stdout.contains("\"decision\""), "{session:?}: {}", ran.stdout);
+        assert!(
+            !ran.stdout.contains("\"decision\""),
+            "{session:?}: {}",
+            ran.stdout
+        );
         assert!(
             fake.kinds().iter().all(|k| !k.starts_with("shared_budget")),
             "{session:?}: {:?}",
@@ -1498,10 +1511,18 @@ fn an_enrolled_codex_stop_sends_settle_turn_before_finalize_and_prints_nothing()
         state.path(),
         &codex_stop_payload("codex-s", Some("turn-1"), None),
     );
-    assert_eq!((ran.code, ran.stdout.as_str()), (Some(0), ""), "{}", ran.stderr);
+    assert_eq!(
+        (ran.code, ran.stdout.as_str()),
+        (Some(0), ""),
+        "{}",
+        ran.stderr
+    );
     assert_eq!(
         fake.kinds(),
-        vec!["shared_budget:settle_turn".to_string(), "finalize".to_string()]
+        vec![
+            "shared_budget:settle_turn".to_string(),
+            "finalize".to_string()
+        ]
     );
     let settle = &fake.requests()[0]["shared_budget"];
     assert_eq!(settle["session_id"], "codex-s");
@@ -1558,6 +1579,12 @@ fn an_enrolled_codex_stop_waits_at_most_five_seconds_for_settle_turn() {
         ran.elapsed < Duration::from_secs(9),
         "a stalled SettleTurn must be bounded: {:?}",
         ran.elapsed
+    );
+    assert!(
+        fake.kinds()
+            .contains(&"shared_budget:settle_turn".to_string()),
+        "the stalled request was sent: {:?}",
+        fake.requests()
     );
     assert!(fake.kinds().contains(&"finalize".to_string()));
 }

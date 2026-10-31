@@ -1963,7 +1963,10 @@ fn settle_turn_settles_the_admitted_turn_hold_exactly_once() {
         SharedBudgetOutcome::CodexTurnSettled { .. }
     ));
     let settled = fx.status();
-    assert_eq!((settled.used_usd_cents, settled.reserved_usd_cents), (1_000, 0));
+    assert_eq!(
+        (settled.used_usd_cents, settled.reserved_usd_cents),
+        (1_000, 0)
+    );
 
     let before = fx.fingerprint();
     assert!(matches!(
