@@ -834,7 +834,10 @@ mod tests {
             ("negative input", [-5, 0, 0, 7, 0]),
             ("negative output", [10, 0, 0, -7, 0]),
             ("negative cached", [10, -3, 0, 5, 0]),
-            ("negative cache write in otherwise consistent usage", [10, 2, -4, 5, 1]),
+            (
+                "negative cache write in otherwise consistent usage",
+                [10, 2, -4, 5, 1],
+            ),
         ];
         for (label, [i, c, w, o, r]) in cases {
             let f = write_lines(&[
