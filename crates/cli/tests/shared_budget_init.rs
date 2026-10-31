@@ -310,7 +310,10 @@ fn help_forms_print_usage_to_stdout_and_exit_zero() {
         let stdout = text(&out.stdout);
         assert!(stdout.contains("shared-budget init"), "{form}: {stdout}");
         assert!(stdout.contains("shared-budget status"), "{form}: {stdout}");
-        assert!(stdout.contains("no backup is kept"), "{form}: {stdout}");
+        assert!(
+            stdout.contains("shared-budget.json.bak"),
+            "{form}: {stdout}"
+        );
         assert!(out.stderr.is_empty(), "{form}: help is not an error");
     }
     // Asking for help must not create the state directory.
