@@ -76,10 +76,12 @@ product sees repeated use — see HORO-1154.
 
 ## Install
 
-No release binary has been published yet. `.github/workflows/release.yml`
-can build and attest one, but publishes only from a founder-authorized `v*`
-tag (see `docs/quota-observation/preview-delivery.md`) — there is no
-`curl | sh`-a-prebuilt-binary path to offer honestly. The real install path is building from a clone with
+The v0.0.4 GitHub Release carries an Apple Silicon macOS tarball
+(`libra-governor-aarch64-apple-darwin.tar.gz`) with a sha256 and a GitHub
+build-provenance attestation (`gh attestation verify <file> --repo
+horonomy/libra-governor`); see `docs/release-notes/v0.0.4.md`. No other platform
+is published, and the v0.0.5 candidate on `main` is unreleased. There is no
+`curl | sh`-a-prebuilt-binary path to offer honestly. To build from source, use a clone with
 `cargo install`:
 
 ```bash
@@ -531,13 +533,15 @@ Run `libra-governor doctor` afterward to confirm — it will report
 - **Shadow-decision/early-warning and multi-level custody accounting are
   not production-evidenced.** See "Capability status" above and
   [`docs/adr/0014-v0-0-3-go-scope-and-exclusions.md`](docs/adr/0014-v0-0-3-go-scope-and-exclusions.md).
-- **Developer Preview, not a general release.** No published binaries
-  exist yet (see "Install" above); `cargo install` from a local clone is
-  the real install path.
+- **Developer Preview, not a general release.** v0.0.4 is published as a
+  Cooperative Preview for Apple Silicon macOS only (tarball with sha256 and
+  build-provenance attestation, see "Install" above); building from a local
+  clone with `cargo install` is the other install path. The v0.0.5 candidate is
+  unreleased.
 - **No Team Alpha / hosted control plane.** Shared team policy, a
   management console, and any cloud component are unbuilt — see
   HORO-1154/1159/1163/1165. Everything in the published releases runs
-  entirely on your machine; v0.0.4 is unreleased.
+  entirely on your machine.
 - **Upgrading directly from v0.0.1 needs one manual daemon restart** if
   Claude Code was already running before you upgraded. Try
   `libra-governor daemon stop` first; if it refuses because no pid record
