@@ -855,3 +855,39 @@ fn removing_the_marker_after_enabling_returns_settlement_to_inert() {
         "whole ledger unchanged once inert"
     );
 }
+
+// ---------------------------------------------------------------------
+// Turn cap (HORO-2282 review follow-up)
+// ---------------------------------------------------------------------
+
+fn many_turn_hold(fx: &mut Fx, turns: usize) -> PathBuf {
+    let mut lines = Vec::new();
+    for i in 0..turns {
+        let id = format!("turn-{i:02}");
+        fx.admit(&id);
+        lines.extend(turn_lines(&id, TURN_SMALL));
+    }
+    fx.rollout("r.jsonl", &lines)
+}
+
+#[test]
+fn a_hold_over_the_turn_cap_measures_the_first_turns_and_books_the_larger_of_priced_and_hold() {
+    // 20 turns on one hold; only the first 16 are measured: 16 * 179 = 2864,
+    // above the 1,000 hold, so it is booked as measured with the cap label.
+    let mut fx = fx();
+    let path = many_turn_hold(&mut fx, 20);
+    let out = fx.settle("turn-19", Some(MODEL), Some(&path));
+    assert_eq!(
+        settled(&out),
+        (16 * SMALL_CENTS, true, Some("scan_cap_reached"))
+    );
+}
+
+#[test]
+fn a_hold_over_the_turn_cap_never_books_below_the_flat_hold() {
+    // 16 * 179 = 2864 is under a 50,000 hold: the hold stands, unmeasured.
+    let mut fx = fx_with_hold(50_000, true, true);
+    let path = many_turn_hold(&mut fx, 20);
+    let out = fx.settle("turn-19", Some(MODEL), Some(&path));
+    assert_eq!(settled(&out), (50_000, false, Some("scan_cap_reached")));
+}
