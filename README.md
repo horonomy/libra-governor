@@ -190,8 +190,23 @@ original strict hard-cap guarantee.
 **Codex accounting (v0.0.5 candidate; opt-in, off by default).** Codex is not
 admitted or charged unless **both** a configured `shared-budget.json` **and**
 the marker file `<state-dir>/shared-budget.codex` exist; delete the marker to
-switch it off again (it is checked on every call). Without the marker the Codex
-hooks send nothing and the ledger is unchanged. When enrolled:
+switch it off again (it is checked on every call). Without the marker the
+shared budget is untouched: the Codex hooks send no shared-budget admission or
+settlement, the daemon answers shared-budget Codex requests `not_configured`
+and the shared-budget tables do not change. The task preflight and receipt
+behaviour that existed in v0.0.4 is not changed by v0.0.5 and still runs: the
+prompt hook prints the preflight `additionalContext`, `Stop` prints an
+Estimate-vs-Actual receipt to stderr, and the task ledger tables (tasks, plans,
+contracts, reservations, receipts and related rows) gain rows. To enrol, create
+the marker as a plain empty regular file (a symlink does not count) next to
+`shared-budget.json`: find the state directory from the path
+`libra-governor shared-budget status` prints for `shared-budget.json`
+(`status --json` also prints `state_dir`; with no budget file `status` prints
+`No shared-budget.json in <dir>`). The directory is
+`$LIBRA_GOVERNOR_STATE_DIR` (used as is, takes precedence) or
+`$XDG_STATE_HOME/libra-governor`, else `~/.local/state/libra-governor`. Then
+`touch <state-dir>/shared-budget.codex`. There is no CLI subcommand for this.
+When enrolled:
 
 - Codex hooks run only after you trust them in Codex's `/hooks`. Untrusted
   hooks are skipped silently and leave an enrolled install ungated; `doctor`

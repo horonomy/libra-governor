@@ -43,7 +43,16 @@ hook schemas vs. what remains unverified.
   `<state_dir>/shared-budget.codex` exist (a regular file, contents never
   read, removing it switches the gate off again), the Codex hook route never
   sends a shared-budget `Admit`, never sends `SettleTurn`, never blocks a
-  prompt and never denies a tool call. The capability row
+  prompt and never denies a tool call. This scopes only the shared budget:
+  the pre-existing task preflight (prompt hook prints `additionalContext`)
+  and receipt (`Stop` prints to stderr) behaviour is unchanged and still runs.
+  Create the marker with `touch <state_dir>/shared-budget.codex` (no CLI
+  subcommand does this; a symlink does not count; find the state directory
+  from the `shared-budget.json` path printed by `libra-governor shared-budget
+  status`; `status --json` also prints `state_dir`, and with no budget file
+  `status` prints `No shared-budget.json in <dir>`. The directory is
+  `$LIBRA_GOVERNOR_STATE_DIR` (used as is, takes precedence) or
+  `$XDG_STATE_HOME/libra-governor`, else `~/.local/state/libra-governor`). The capability row
   `shared_budget_admission_gate` stays Unavailable. With the marker present:
   - `UserPromptSubmit` admits the main-lane turn (`provider:"codex"`,
     `prompt_id` = the payload's `turn_id`) and prints
@@ -54,8 +63,8 @@ hook schemas vs. what remains unverified.
   - Combining the marker with `LIBRA_GOVERNOR_CODEX_EXECUTION_OWNER=1` blocks
     the prompt with an explicit reason; unset one of them.
   - `Stop` sends `SettleTurn` (`turn_id` + `transcript_path`) before the
-    normal Finalize / owner Stop, waits at most 5 s, prints nothing and never
-    blocks.
+    normal Finalize / owner Stop, waits at most 5 s, prints nothing to
+    stdout (the Estimate-vs-Actual receipt goes to stderr) and never blocks.
   - There is no `PreToolUse` gate for Codex; a long tool-free turn keeps its
     hold only until it expires.
   - Unless `shared-budget.json` carries `pricing_overrides` for the Codex
@@ -234,9 +243,9 @@ command is an explicit, operator-invoked action that starts Codex's
 one), calls its `hooks/list` RPC, and reports each installed hook's real
 `currentHash`/`trustStatus` straight from Codex — not a guess.
 
-It is never reachable from `--help`, plain `doctor`, or any other
-passive/inspection surface; starting `app-server` only ever happens when
-you type this exact subcommand.
+`--help` lists it, but it never runs implicitly: plain `doctor` and every
+other passive/inspection surface leave it alone, and `app-server` is only
+started when you type this exact subcommand.
 
 Fail-closed: if `app-server` is unreachable, the RPC times out, the
 response is malformed, or a hook wired in `hooks.json` is absent from
