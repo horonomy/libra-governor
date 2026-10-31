@@ -1820,3 +1820,158 @@ fn the_internal_lane_functions_still_refuse_an_empty_lane() {
     );
     assert_eq!(sb::heartbeat(&mut fx.ledger, rt, " ").unwrap(), 0);
 }
+
+// ---- HORO-2283 (C3): the Codex marker turns Codex Admit/Check/SettleTurn on ----
+
+fn enrol_codex(fx: &Fx) {
+    std::fs::write(fx.path().join("shared-budget.codex"), b"").unwrap();
+}
+
+fn codex_admit(fx: &mut Fx, session: &str, turn: Option<&str>) -> SharedBudgetOutcome {
+    fx.sb(SharedBudgetRequest::Admit {
+        session_id: session.to_string(),
+        agent_id: None,
+        prompt_id: turn.map(String::from),
+        provider: Some("codex".to_string()),
+    })
+}
+
+fn settle_turn(fx: &mut Fx, session: &str, turn: &str) -> SharedBudgetOutcome {
+    fx.sb(SharedBudgetRequest::SettleTurn {
+        session_id: session.to_string(),
+        turn_id: turn.to_string(),
+        model: None,
+        transcript_path: None,
+    })
+}
+
+#[test]
+fn an_enrolled_codex_admit_holds_on_the_codex_lane_apart_from_the_claude_lane() {
+    let mut fx = Fx::new(Some(&cfg_json(2_000, "UTC", 1_000)), JAN);
+    enrol_codex(&fx);
+
+    let codex = grant(codex_admit(&mut fx, "s", Some("turn-1")));
+    assert_eq!(codex.hold, 1_000);
+    assert!(!codex.reused);
+    assert_eq!(fx.pools().len(), 1);
+
+    // The same raw session id on the Claude lane is a different hold.
+    let claude = grant(fx.admit("s", None, Some("p-1")));
+    assert!(!claude.reused);
+    assert_ne!(claude.id, codex.id);
+    assert_eq!(fx.status().reserved_usd_cents, 2_000);
+}
+
+#[test]
+fn an_enrolled_codex_admit_is_denied_when_the_cap_is_exhausted() {
+    let mut fx = Fx::new(Some(&cfg_json(1_500, "UTC", 1_000)), JAN);
+    enrol_codex(&fx);
+    grant(codex_admit(&mut fx, "s1", Some("t1")));
+    let before = fx.fingerprint();
+    expect_cap_exhausted(codex_admit(&mut fx, "s2", Some("t2")), 500);
+    assert_eq!(fx.fingerprint(), before, "a denial writes nothing");
+}
+
+#[test]
+fn a_replayed_enrolled_codex_admit_reuses_its_hold() {
+    let mut fx = Fx::new(Some(&cfg_json(5_000, "UTC", 1_000)), JAN);
+    enrol_codex(&fx);
+    let first = grant(codex_admit(&mut fx, "s", Some("turn-1")));
+    let again = grant(codex_admit(&mut fx, "s", Some("turn-1")));
+    assert!(again.reused);
+    assert_eq!(again.id, first.id);
+}
+
+#[test]
+fn an_enrolled_codex_check_reads_the_codex_lane() {
+    let mut fx = Fx::new(Some(&cfg_json(5_000, "UTC", 1_000)), JAN);
+    enrol_codex(&fx);
+    let check = |fx: &mut Fx| {
+        fx.sb(SharedBudgetRequest::Check {
+            session_id: "s".to_string(),
+            agent_id: None,
+            provider: Some("codex".to_string()),
+        })
+    };
+    assert!(matches!(
+        check(&mut fx),
+        SharedBudgetOutcome::Checked {
+            state: SharedBudgetCheckState::Available,
+            ..
+        }
+    ));
+    grant(codex_admit(&mut fx, "s", Some("t1")));
+    assert!(matches!(
+        check(&mut fx),
+        SharedBudgetOutcome::Checked {
+            state: SharedBudgetCheckState::Admitted,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn removing_the_marker_switches_codex_admission_back_off_without_a_restart() {
+    let mut fx = Fx::new(Some(&cfg_json(5_000, "UTC", 1_000)), JAN);
+    enrol_codex(&fx);
+    grant(codex_admit(&mut fx, "s", Some("t1")));
+    std::fs::remove_file(fx.path().join("shared-budget.codex")).unwrap();
+    let before = fx.fingerprint();
+    assert_eq!(
+        codex_admit(&mut fx, "s", Some("t2")),
+        SharedBudgetOutcome::NotConfigured
+    );
+    assert_eq!(fx.fingerprint(), before, "nothing moved");
+}
+
+#[test]
+fn the_marker_does_not_revive_any_other_codex_lane_request() {
+    let mut fx = Fx::new(Some(&cfg_json(2_000, "UTC", 1_000)), JAN);
+    enrol_codex(&fx);
+    let before = fx.fingerprint();
+    for request in lane_requests("s", Some("codex")) {
+        assert_eq!(
+            fx.sb(request.clone()),
+            SharedBudgetOutcome::NotConfigured,
+            "{request:?}"
+        );
+    }
+    assert_eq!(fx.fingerprint(), before, "nothing moved");
+}
+
+#[test]
+fn settle_turn_without_the_marker_is_inert_and_writes_nothing() {
+    let mut fx = Fx::new(Some(&cfg_json(2_000, "UTC", 1_000)), JAN);
+    let before = fx.fingerprint();
+    assert_eq!(
+        settle_turn(&mut fx, "s", "turn-1"),
+        SharedBudgetOutcome::NotConfigured
+    );
+    assert_eq!(fx.fingerprint(), before, "nothing moved");
+}
+
+#[test]
+fn settle_turn_settles_the_admitted_turn_hold_exactly_once() {
+    let mut fx = Fx::new(Some(&cfg_json(5_000, "UTC", 1_000)), JAN);
+    enrol_codex(&fx);
+    grant(codex_admit(&mut fx, "s", Some("turn-1")));
+    assert_eq!(fx.status().reserved_usd_cents, 1_000);
+
+    // No transcript: the flat hold is the settled amount, never 0.
+    assert!(matches!(
+        settle_turn(&mut fx, "s", "turn-1"),
+        SharedBudgetOutcome::CodexTurnSettled { .. }
+    ));
+    let settled = fx.status();
+    assert_eq!(
+        (settled.used_usd_cents, settled.reserved_usd_cents),
+        (1_000, 0)
+    );
+
+    let before = fx.fingerprint();
+    assert!(matches!(
+        settle_turn(&mut fx, "s", "turn-1"),
+        SharedBudgetOutcome::CodexTurnSettled { .. }
+    ));
+    assert_eq!(fx.fingerprint(), before, "a replay writes nothing");
+}

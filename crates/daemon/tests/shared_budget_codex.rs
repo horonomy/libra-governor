@@ -7,11 +7,10 @@
 //! real Codex host runs.
 //!
 //! `settle_codex_turn` is exercised directly against a `LedgerStore` and a
-//! `ManualClock` runtime: the `SettleTurn` wire request and every hook are C3.
-//! Codex `Admit` stays `not_configured` in this slice, so the holds a Codex
-//! turn would have been admitted with are seeded through the same ledger
-//! calls `admit` makes (`reserve_shared_metered_for_prompt`,
-//! `renew_shared_for_prompt`) on the derived Codex lane.
+//! `ManualClock` runtime. The holds come from the real `admit` on the derived
+//! Codex lane (honoured since C3, HORO-2283, because every fixture that admits
+//! writes the marker); the `SettleTurn` wire request and the hooks are tested
+//! in `shared_budget_core.rs` and `crates/cli/tests/shared_budget_hooks.rs`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,7 +19,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use libra_governor_daemon::shared_budget::{
-    budget_lane, settle_codex_turn, status, Clock, CodexSettlement, ManualClock,
+    admit, budget_lane, settle_codex_turn, status, Clock, CodexSettlement, ManualClock,
     SharedBudgetRuntime,
 };
 use libra_governor_daemon::shared_budget_file::SHARED_BUDGET_FILE_NAME;
@@ -34,6 +33,7 @@ use libra_governor_ledger::{
     CapacitySource, ExecutorAttribution, LedgerStore, MeteredReserveRequest, PruneRequest,
     SharedPoolReserveRequest,
 };
+use libra_governor_protocol::SharedBudgetOutcome;
 
 const BASE: &str = "2027-01-15T12:00:00Z";
 const OWNER_PREFIX: &str = "metered:local-budget/";
@@ -75,7 +75,6 @@ fn lane() -> String {
 }
 
 struct Fx {
-    hold: u64,
     dir: tempfile::TempDir,
     clock: Arc<ManualClock>,
     rt: SharedBudgetRuntime,
@@ -83,7 +82,7 @@ struct Fx {
 }
 
 impl Fx {
-    fn new(hold: u64, config: &str, marker: bool) -> Self {
+    fn new(config: &str, marker: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(SHARED_BUDGET_FILE_NAME), config).unwrap();
         if marker {
@@ -93,7 +92,6 @@ impl Fx {
         let rt = SharedBudgetRuntime::load(dir.path()).with_clock(clock.clone());
         let ledger = Some(LedgerStore::open(dir.path().join("ledger.sqlite3")).unwrap());
         Self {
-            hold,
             dir,
             clock,
             rt,
@@ -113,60 +111,13 @@ impl Fx {
         self.ledger = Some(LedgerStore::open(self.dir.path().join("ledger.sqlite3")).unwrap());
     }
 
-    /// What `admit` does for a main-lane prompt, on the derived Codex lane:
-    /// renew the lane's live hold and record the prompt, else reserve a hold
-    /// for it.
+    /// The real `Admit` for a Codex main-lane turn (the marker is present in
+    /// every fixture that admits).
     fn admit(&mut self, turn: &str) -> SharedPoolReservationId {
-        let now = self.clock.now();
-        let pool = PoolId(POOL_JAN.to_string());
-        let lane = lane();
-        let hold = self.hold;
-        let ledger = self.ledger();
-        ledger
-            .ensure_pool(&pool, &QuotaUnit::UsdCents, CAP, now)
-            .unwrap();
-        ledger.expire_stale_shared_pool_reservations(now).unwrap();
-        let live = ledger
-            .active_shared_hold_for_lane(
-                &pool,
-                &principal(),
-                &lane,
-                None,
-                ExecutorKind::AgentAbsent,
-                now,
-            )
-            .unwrap();
-        if let Some(existing) = live {
-            ledger
-                .renew_shared_for_prompt(existing.id, &principal(), &lane, now, 3600, Some(turn))
-                .unwrap();
-            return existing.id;
-        }
-        let key = format!("hold:{}|-|p{}", lp(&lane), lp(turn));
-        let outcome = ledger
-            .reserve_shared_metered_for_prompt(
-                MeteredReserveRequest {
-                    base: SharedPoolReserveRequest {
-                        pool_id: &pool,
-                        principal_id: &principal(),
-                        session_id: &lane,
-                        amount: hold,
-                        unit: &QuotaUnit::UsdCents,
-                        idempotency_key: &key,
-                        now,
-                        ttl_secs: 3600,
-                        attribution: ExecutorAttribution::main_executor(Some(
-                            ChargeSource::TurnHold,
-                        )),
-                    },
-                    session_cap: None,
-                    capacity_source: CapacitySource::LocalConfigured { cap: CAP },
-                },
-                Some(turn),
-            )
-            .unwrap();
-        match outcome {
-            libra_governor_ledger::MeteredReserveOutcome::Granted(h) => h.id,
+        let rt = &self.rt;
+        let ledger = self.ledger.as_mut().unwrap();
+        match admit(ledger, rt, SESSION, None, Some(turn), Some("codex")).unwrap() {
+            SharedBudgetOutcome::Allowed { reservation_id, .. } => reservation_id,
             other => panic!("expected a grant, got {other:?}"),
         }
     }
@@ -246,7 +197,7 @@ impl Fx {
 }
 
 fn fx_with_hold(hold: u64, overrides: bool, marker: bool) -> Fx {
-    Fx::new(hold, &cfg_json(hold, overrides), marker)
+    Fx::new(&cfg_json(hold, overrides), marker)
 }
 
 fn fx() -> Fx {
@@ -711,7 +662,7 @@ fn a_restart_between_admit_and_settle_settles_exactly_once() {
 fn a_codex_settle_never_touches_the_claude_hold_of_the_same_raw_session_id() {
     let mut fx = fx();
     // A Claude hold for the same raw session id, through the real admit.
-    let claude = libra_governor_daemon::shared_budget::admit(
+    let claude = admit(
         fx.ledger.as_mut().unwrap(),
         &fx.rt,
         SESSION,
@@ -720,10 +671,7 @@ fn a_codex_settle_never_touches_the_claude_hold_of_the_same_raw_session_id() {
         None,
     )
     .unwrap();
-    assert!(matches!(
-        claude,
-        libra_governor_protocol::SharedBudgetOutcome::Allowed { .. }
-    ));
+    assert!(matches!(claude, SharedBudgetOutcome::Allowed { .. }));
     fx.admit("turn-a");
     let path = fx.rollout("r.jsonl", &turn_lines("turn-a", TURN_BIG));
     fx.settle("turn-a", Some(MODEL), Some(&path));
@@ -747,9 +695,10 @@ fn a_codex_settle_never_touches_the_claude_hold_of_the_same_raw_session_id() {
 
 #[test]
 fn without_the_marker_every_codex_settle_is_not_configured_and_writes_zero_rows() {
-    let mut fx = fx_with_hold(HOLD, true, false);
-    // A hold that would have been settled, and a measurable rollout.
+    // A hold that would have been settled, then the marker is withdrawn.
+    let mut fx = fx_with_hold(HOLD, true, true);
     fx.admit("turn-a");
+    std::fs::remove_file(fx.dir.path().join("shared-budget.codex")).unwrap();
     let path = fx.rollout("r.jsonl", &turn_lines("turn-a", TURN_BIG));
     let other = fx.rollout("o.jsonl", &turn_lines("turn-x", TURN_BIG));
     let before = fx.fingerprint();
@@ -786,24 +735,27 @@ fn an_unusable_turn_id_is_not_applicable_and_writes_nothing() {
 }
 
 #[test]
-fn a_codex_request_answers_not_configured_and_writes_nothing_with_or_without_the_marker() {
-    use libra_governor_daemon::shared_budget::{admit, charge, check};
-    use libra_governor_protocol::SharedBudgetOutcome;
+fn a_codex_request_is_inert_without_the_marker_and_a_charge_stays_inert_with_it() {
+    use libra_governor_daemon::shared_budget::{charge, check};
     for marker in [false, true] {
         let mut fx = fx_with_hold(HOLD, true, marker);
         let before = fx.fingerprint();
         let rt = &fx.rt;
         let ledger = fx.ledger.as_mut().unwrap();
-        let admitted = admit(ledger, rt, SESSION, None, Some("turn-a"), Some("codex")).unwrap();
-        assert!(
-            matches!(admitted, SharedBudgetOutcome::NotConfigured),
-            "{admitted:?}"
-        );
-        let checked = check(ledger, rt, SESSION, None, Some("codex")).unwrap();
-        assert!(
-            matches!(checked, SharedBudgetOutcome::NotConfigured),
-            "{checked:?}"
-        );
+        if !marker {
+            let admitted = admit(ledger, rt, SESSION, None, Some("turn-a"), Some("codex")).unwrap();
+            assert!(
+                matches!(admitted, SharedBudgetOutcome::NotConfigured),
+                "{admitted:?}"
+            );
+            let checked = check(ledger, rt, SESSION, None, Some("codex")).unwrap();
+            assert!(
+                matches!(checked, SharedBudgetOutcome::NotConfigured),
+                "{checked:?}"
+            );
+        }
+        // Enrolment turns on Admit/Check/SettleTurn only; a Codex charge is
+        // still not a thing the daemon books on a client's word.
         let charged = charge(
             ledger,
             rt,

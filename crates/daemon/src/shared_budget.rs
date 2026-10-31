@@ -458,16 +458,19 @@ fn denied(
 
 /// Validates a client identity and derives the budget lane its holds live
 /// on. `Err` is the outcome to return unchanged: a refusal, or `NotConfigured`
-/// for a Codex lane, which stays inert until the Codex settlement exists
-/// (HORO-2282): nothing is read, reserved or written for it.
+/// for a Codex lane unless `codex_enrolled` (the marker file, HORO-2283): then
+/// nothing is read, reserved or written for it. Only `Admit` and `Check` pass
+/// an enrolled runtime's answer; every other lane-taking entry point passes
+/// `false` and so keeps Codex inert.
 fn admission_lane(
     session_id: &str,
     agent_id: Option<&str>,
     provider: Option<&str>,
+    codex_enrolled: bool,
 ) -> Result<(ExecutorKind, String), SharedBudgetOutcome> {
     let kind = validate_identity(session_id, agent_id).map_err(refused)?;
     let lane = budget_lane(session_id, provider).map_err(refused)?;
-    if provider == Some(CODEX_PROVIDER) {
+    if provider == Some(CODEX_PROVIDER) && !codex_enrolled {
         return Err(SharedBudgetOutcome::NotConfigured);
     }
     Ok((kind, lane))
@@ -500,7 +503,7 @@ fn gate_context(
     if matches!(state, SharedBudgetFileState::Absent) {
         return Ok(Err(SharedBudgetOutcome::NotConfigured));
     }
-    let (kind, lane) = match admission_lane(session_id, agent_id, provider) {
+    let (kind, lane) = match admission_lane(session_id, agent_id, provider, rt.codex_enrolled()) {
         Ok(admitted) => admitted,
         Err(outcome) => return Ok(Err(outcome)),
     };
@@ -1050,7 +1053,7 @@ pub fn charge(
     if matches!(rt.effective().state, SharedBudgetFileState::Absent) {
         return Ok(SharedBudgetOutcome::NotConfigured);
     }
-    let lane = match admission_lane(session_id, agent_id, provider) {
+    let lane = match admission_lane(session_id, agent_id, provider, false) {
         Ok((_, lane)) => lane,
         Err(outcome) => return Ok(outcome),
     };
@@ -2234,6 +2237,33 @@ fn trueup_codex_hold(
     Ok(())
 }
 
+/// Handles `SharedBudgetRequest::SettleTurn` (HORO-2283): [`settle_codex_turn`]
+/// and its wire answer. A runtime with no budget file or no Codex marker
+/// answers `NotConfigured` and writes nothing; every other settlement is
+/// reported by its content-free [`CodexSettlement::label`].
+pub fn settle_codex_request(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    session_id: &str,
+    turn_id: &str,
+    model: Option<&str>,
+    transcript_path: Option<&str>,
+) -> Result<(SharedBudgetOutcome, Option<String>), SharedBudgetError> {
+    let settlement = settle_codex_turn(ledger, rt, session_id, turn_id, model, transcript_path)?;
+    Ok(match settlement {
+        CodexSettlement::NotConfigured => (SharedBudgetOutcome::NotConfigured, None),
+        other => {
+            let label = other.label();
+            (
+                SharedBudgetOutcome::CodexTurnSettled {
+                    disposition: label.clone(),
+                },
+                Some(label),
+            )
+        }
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn settle_codex_hold(
     ledger: &mut LedgerStore,
@@ -2838,7 +2868,7 @@ pub fn settle_tail(
     if matches!(rt.effective().state, SharedBudgetFileState::Absent) {
         return Ok(SharedBudgetOutcome::NotConfigured);
     }
-    let lane = match admission_lane(session_id, None, provider) {
+    let lane = match admission_lane(session_id, None, provider, false) {
         Ok((_, lane)) => lane,
         Err(outcome) => return Ok(outcome),
     };
@@ -3075,7 +3105,7 @@ pub fn transcript_ready(
         }
         SharedBudgetFileState::Valid(_) => {}
     }
-    let lane = match admission_lane(session_id, None, provider) {
+    let lane = match admission_lane(session_id, None, provider, false) {
         Ok((_, lane)) => lane,
         Err(outcome) => return Ok(outcome),
     };
