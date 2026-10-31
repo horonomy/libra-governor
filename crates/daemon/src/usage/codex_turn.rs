@@ -805,6 +805,45 @@ mod tests {
     }
 
     #[test]
+    fn negative_counters_are_inconsistent_not_zero() {
+        // (label, usage = input, cached, write, output, reasoning). The
+        // running total mirrors `usage` so only the negative is wrong.
+        let cases: [(&str, [i64; 5]); 5] = [
+            ("negative input and output", [-5, 0, 0, -7, 0]),
+            ("negative input", [-5, 0, 0, 7, 0]),
+            ("negative output", [10, 0, 0, -7, 0]),
+            ("negative cached", [10, -3, 0, 5, 0]),
+            ("negative cache write in otherwise consistent usage", [10, 2, -4, 5, 1]),
+        ];
+        for (label, [i, c, w, o, r]) in cases {
+            let f = write_lines(&[
+                task_started(T1),
+                usage_record(T1, THREAD, SESSION, i, c, w, o, r, i, c, w, o, r),
+            ]);
+            let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+            assert_eq!(
+                observed,
+                UsageObservation::Unavailable(UsageUnavailable::Inconsistent),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn negative_running_total_is_inconsistent_not_zero() {
+        // `usage` is valid; only the turn's running total is negative.
+        let f = write_lines(&[
+            task_started(T1),
+            usage_record(T1, THREAD, SESSION, 0, 0, 0, 0, 0, -5, 0, 0, -7, 0),
+        ]);
+        let observed = observe_codex_turn(f.path(), SESSION, T1, DEFAULT_SCAN_CAP_BYTES);
+        assert_eq!(
+            observed,
+            UsageObservation::Unavailable(UsageUnavailable::Inconsistent)
+        );
+    }
+
+    #[test]
     fn cached_exceeding_input_is_inconsistent() {
         let f = write_lines(&[
             task_started(T1),
