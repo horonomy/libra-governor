@@ -156,6 +156,7 @@ fn shared_budget_findings() -> Vec<Finding> {
     budget_findings_with(&posture, settings.as_ref(), codex_enrolled)
 }
 
+#[cfg(test)]
 fn budget_findings_for(
     posture: &shared_budget_view::Posture,
     settings: Option<&claude_settings::Inspection>,
@@ -2198,15 +2199,13 @@ mod tests {
 
     #[test]
     fn no_gpt_pricing_override_warns_that_every_turn_books_the_flat_hold() {
-        for gpt_override in [Some(false)] {
-            let mut codex = enrolled();
-            codex.gpt_override = gpt_override;
-            let findings = codex_findings_for(&codex);
-            let f = by_id(&findings, "codex_pricing");
-            assert_eq!(f.severity, Severity::Warn, "{f:?}");
-            assert!(f.message.contains("pricing_overrides"), "{f:?}");
-            assert!(f.message.contains("flat"), "{f:?}");
-        }
+        let mut codex = enrolled();
+        codex.gpt_override = Some(false);
+        let findings = codex_findings_for(&codex);
+        let f = by_id(&findings, "codex_pricing");
+        assert_eq!(f.severity, Severity::Warn, "{f:?}");
+        assert!(f.message.contains("pricing_overrides"), "{f:?}");
+        assert!(f.message.contains("flat"), "{f:?}");
         let findings = codex_findings_for(&enrolled());
         assert_eq!(by_id(&findings, "codex_pricing").severity, Severity::Ok);
     }
