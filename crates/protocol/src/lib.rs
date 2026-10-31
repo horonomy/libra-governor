@@ -294,5 +294,7 @@ pub use messages::{
 /// Code traffic is byte-identical to v24. A v24 daemon's `deny_unknown_fields`
 /// decoder rejects an `Admit` or `Check` that carries it, so a long-lived v24
 /// daemon must be restarted after upgrading; the hook's one-retry stale-daemon
-/// path covers that.
+/// path covers that. HORO-2282 adds the same optional, omitted-when-absent
+/// `provider` to `ChargeAgent`, `SettleTail` and `TranscriptReady` without a
+/// further bump: no shipped client sets it yet.
 pub const PROTOCOL_VERSION: u32 = 25;

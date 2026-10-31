@@ -113,6 +113,7 @@ fn probe_daemon(socket: &Path, session_id: &str, transcript_path: &str) -> Probe
         shared_budget: SharedBudgetRequest::TranscriptReady {
             session_id: session_id.to_string(),
             transcript_path: transcript_path.to_string(),
+            provider: None,
         },
     };
     // One connection per probe, dropped before the caller sleeps.
