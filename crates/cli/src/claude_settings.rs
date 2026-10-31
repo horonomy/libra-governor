@@ -498,8 +498,19 @@ fn apply_locked(
                 continue;
             };
             for h in inner.iter_mut() {
-                if h.get("command").and_then(Value::as_str) != Some(command.as_str()) {
-                    continue;
+                let existing = h.get("command").and_then(Value::as_str);
+                if existing != Some(command.as_str()) {
+                    // Our hook for this subcommand installed from another
+                    // binary path: repoint it so a reinstall does not leave
+                    // two sets firing (HORO-2303). A foreign command never
+                    // passes `command_is_ours`.
+                    let ours_elsewhere =
+                        existing.is_some_and(|c| c.ends_with(subcommand) && command_is_ours(c));
+                    if !ours_elsewhere {
+                        continue;
+                    }
+                    h["command"] = Value::String(command.clone());
+                    upgraded = true;
                 }
                 already_present = true;
                 if wants_timeout && h.get("timeout").is_none() {
@@ -986,6 +997,38 @@ mod tests {
             "re-running apply must be a no-op on an already-wired file"
         );
         assert!(!second.statusline_added);
+    }
+
+    #[test]
+    fn apply_from_a_different_binary_path_repoints_our_hooks_instead_of_adding_a_second_set() {
+        // HORO-2303: a reinstall from another path (new install prefix, moved
+        // checkout) used to leave the old hooks and append a second full set,
+        // so every event fired twice, once through a possibly dead path.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let moved = PathBuf::from("/usr/local/bin/libra-governor");
+        apply(&path, &binary()).unwrap();
+        apply(&path, &moved).unwrap();
+
+        let root: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let mut owned = Vec::new();
+        for groups in root["hooks"].as_object().unwrap().values() {
+            for group in groups.as_array().unwrap() {
+                for hook in group["hooks"].as_array().unwrap() {
+                    let command = hook["command"].as_str().unwrap();
+                    if command_is_ours(command) {
+                        owned.push(command.to_string());
+                    }
+                }
+            }
+        }
+        assert_eq!(owned.len(), HOOK_SUBCOMMANDS.len(), "one hook per event");
+        assert!(
+            owned
+                .iter()
+                .all(|c| c.starts_with("/usr/local/bin/libra-governor ")),
+            "every owned hook points at the newest path: {owned:?}"
+        );
     }
 
     #[test]
