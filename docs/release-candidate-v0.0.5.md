@@ -144,94 +144,32 @@ founder-named SHA must be chosen after that decision.
 
 ## Release notes draft
 
-Deliberately kept here and **not** at `docs/release-notes/v0.0.5.md`: the
-release workflow publishes `docs/release-notes/<tag>.md` as the first Release
-body and fails closed, so a placeholder file at that path must not exist until
-the founder-named SHA is frozen. There is no CHANGELOG file in this repository.
+The draft is the file [`release-candidate-v0.0.5-notes.md`](release-candidate-v0.0.5-notes.md),
+kept next to this packet and **not** at `docs/release-notes/v0.0.5.md`: the
+release workflow publishes `docs/release-notes/<tag>.md` as the first Release body
+and fails closed, so a placeholder file at that path must not exist until the
+founder-named SHA is frozen. There is no CHANGELOG file in this repository.
 
-Fields that cannot exist before freeze (and are the only open ones): the
-frozen SHA, the QA result line, and the artifact checksum. The checksum is
-produced by the release workflow when the tag is built
-(`shasum -a 256 libra-governor-aarch64-apple-darwin.tar.gz`, written next to the
-tarball as `.sha256`) and is recorded in the Release; a pre-tag candidate build
-of the same workflow does not fix it, because the tagged build is the shipped
-artifact and bit-for-bit reproducibility is not claimed.
+What the release workflow requires of that file (`.github/workflows/release.yml`,
+job `create-release`, step "require the approved release-notes body"): it must exist,
+be non-empty and under 100000 bytes, and contain each of nine literal, case-sensitive
+markers (`grep -qF`): `not a hard spending cap`, `Admission-bounded (cooperative)`,
+`In-turn overshoot`, `Codex is not gated`, `never your provider bill`,
+`Accounting boundary`, `Fail-open behaviour`, `over-accounted by approximately 5x`,
+`NOT a security boundary`. The draft is built from the approved v0.0.4 wording; the
+only disclosure rewritten is the Codex one (now "Codex is not gated by default", with the
+opt-in explained), and disclosure 5 now names opted-in Codex turns. All nine markers were
+checked present in the draft with the same `grep -qF` test the workflow uses.
 
-> # Libra Governor v0.0.5 - Cooperative Preview (Apple Silicon macOS) - DRAFT
->
-> Builds on v0.0.4. Still a **Cooperative Preview, not a hard spending cap.**
-> Every v0.0.4 disclosure still applies except where this text changes it:
-> admission-bounded and cooperative only; in-turn overshoot is possible;
-> amounts are Libra's list-price-equivalent estimates (or flat holds), never
-> your provider bill; only executors whose settlement hooks run and whose
-> records can be read are counted; an unreachable daemon refuses prompts when a
-> budget is configured; Libra is not a security boundary against an agent
-> running as the same operating-system user.
->
-> **What is new**
-> - **Opt-in Codex accounting, off by default.** v0.0.4 said Codex is not gated.
->   In v0.0.5 you can enrol Codex by creating the marker file
->   `<state-dir>/shared-budget.codex` next to a configured shared budget. Until you
->   do, Codex behaves exactly as before: nothing is admitted, nothing is charged,
->   and the ledger is unchanged (covered by named tests). When enrolled, Codex
->   prompts are admitted against the monthly budget, and each turn is settled
->   from the turn's recorded usage; a turn that cannot be measured books the flat
->   hold, never zero. A turn Codex kills or whose final usage record arrives late
->   is settled or topped up at the next settle, and Libra never refunds.
->   `libra-governor doctor` and `shared-budget status` report enrolment, whether
->   the Codex hooks are installed, pricing state and the gaps below.
-> - **Provider-namespaced budget lanes** (protocol v25). Claude Code and Codex
->   sessions that reuse a session id no longer interact. Run the daemon and the
->   CLI from the same release: a v24 daemon rejects a request that carries a
->   provider, and a v25 daemon built before the Codex hooks rejects the new
->   settle request, which leaves an enrolled install ungated until the daemon is
->   restarted (`doctor` probes for this).
-> - **Hardening.** `shared-budget` refuses to chmod through a state-directory
->   symlink; reinstalling the hooks from a different binary path repoints Libra's
->   own hooks instead of adding a second set; a hand-quoted hook command is
->   recognised as Libra's; `shared-budget export` labels its capacity as the
->   pool-row value.
->
-> **Codex limits you should know about**
-> - Codex hooks run only after you trust them in Codex's `/hooks`. Untrusted
->   hooks are skipped silently and leave an enrolled install ungated; `doctor`
->   can only say trust is "likely not yet trusted" or "unknown", never "trusted".
-> - Without a `gpt-*` price in `pricing_overrides`, every Codex turn books the
->   flat hold (unmeasured) and is never trued up.
-> - A Codex turn that is interrupted or aborted writes no usage record, so that
->   spend is not visible and is under-counted. A turn longer than the one-hour
->   hold is settled late on partial usage. Codex subagents are neither admitted
->   nor settled.
-> - Codex support was derived from reading Codex source at tags 0.160, 0.163,
->   0.164 and 0.165 and from synthetic fixtures. It has not been run against a
->   real Codex host or provider.
->
-> **Also unchanged and still true:** `shared-budget init --force` replaces the
-> whole budget file with no backup; there is no repair command after a forward
-> clock jump; the end-of-turn sweep has the v0.0.4 file-count and size limits.
->
-> **Not in this release:** the S11 gateway hard cap, an OpenAI gateway, remote
-> upload, a strict cross-host cap. Enabling any Codex budget control beyond the
-> marker is not part of this release.
->
-> **What was tested, and what was not.** Automated: 2957 tests passed on the
-> release candidate (fmt, clippy with warnings denied, the full workspace test
-> run), with the disabled-by-default behavior shown by named tests rather than
-> asserted. Each change was reviewed by an independent AI reviewer on its exact
-> head; that is static review, not human review and not a runtime test.
-> **Independent product QA result:** to be recorded at freeze. **Not verified:**
-> a real Codex host, real-provider billing, quota or latency, a fresh-machine
-> install, rollback of a published artifact, and Intel macOS, Linux and Windows.
->
-> **Platform:** Apple Silicon (aarch64) macOS only. The release workflow builds
-> exactly one target, `aarch64-apple-darwin` (the x86_64 macOS and Linux targets
-> were removed on purpose, ADR-0025 item 7); other platforms are neither
-> supported nor verified.
->
-> **Artifact:** `libra-governor-aarch64-apple-darwin.tar.gz` with its `.sha256`
-> and a GitHub build-provenance attestation
-> (`gh attestation verify <file> --repo horonomy/libra-governor`). Checksum and
-> frozen SHA: recorded in the Release at publication.
+Fields that cannot exist before freeze, and are the only open ones: the frozen SHA and
+the artifact checksum (both recorded in the Release at publication; the checksum is
+produced by the release workflow when the tag is built, and bit-for-bit reproducibility
+is not claimed), and the independent product QA result line (`QA_RESULT_AT_FREEZE`).
+
+Freeze procedure (after the founder names a SHA): `git mv`/copy the draft to
+`docs/release-notes/v0.0.5.md`, replace `QA_RESULT_AT_FREEZE` with the recorded QA
+verdict, re-run the nine-marker check, and confirm `scripts/check-release-tag.sh v0.0.5`
+passes against the workspace version. Do not tag until the founder GO.
 
 ## Rollback
 
