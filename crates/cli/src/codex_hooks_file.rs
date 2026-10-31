@@ -59,16 +59,16 @@
 //! `libra-governor` *and* ends with one of the exact `codex-hook`
 //! subcommand invocations this integration documents
 //! (`integrations/codex/README.md`) — see [`OWNED_COMMAND_SUFFIXES`].
-//! Both conditions must hold, so a user's own differently named wrapper
-//! script is never touched. That loose predicate ([`command_is_ours`])
-//! decides what `remove`, `inspect` and `wired_commands` act on.
+//! [`command_is_ours`] (which also accepts a legacy unquoted path with
+//! spaces) decides what `remove`, `inspect` and `wired_commands` act on.
 //!
 //! `apply` rewrites a command, so it uses the stricter
-//! [`command_is_ours_for`]: the text before the event's exact suffix must
-//! be a path whose final component is exactly `libra-governor`
-//! (optionally wrapped in one matching pair of hand-written shell quotes),
-//! the same rule as `claude_settings` (HORO-2303). A lookalike such as
-//! `/opt/libra-governor-tools/x codex-hook stop` is never repointed.
+//! [`command_is_ours_for`], which has no legacy leniency (HORO-2303). Both
+//! use `claude_settings::command_is_ours_with_suffix`, the one shared rule:
+//! the text before the event's exact suffix must be ONE path token whose
+//! final component is exactly `libra-governor`. A lookalike, a wrapped
+//! command (`env X=1 ...`, `cd x && ...`, a pipeline) or a trailing-`/` path
+//! is never ours.
 //!
 //! # Trust gate is out of scope for this file
 //!
@@ -118,6 +118,12 @@ const HOOK_EVENTS: [&str; 3] = ["UserPromptSubmit", "PostToolUse", "Stop"];
 pub enum CodexHooksError {
     #[error("could not determine home directory (HOME env var unset)")]
     NoHomeDir,
+    #[error(
+        "refusing to install: the binary path {binary} contains whitespace or a shell \
+         metacharacter, and the hook command is run unquoted by a shell. Install the \
+         binary to a plain path such as ~/.cargo/bin and re-run"
+    )]
+    UnsafeBinaryPath { binary: PathBuf },
     #[error("io error at {path}: {source}")]
     Io {
         path: PathBuf,
@@ -197,27 +203,22 @@ fn with_write_lock<T>(
     body()
 }
 
+/// Read/remove-side ownership (`remove`, `inspect`, `wired_commands`): the
+/// shared one-path-token rule, plus the legacy unquoted-space install (this
+/// installer did not refuse such a path before HORO-2303), so uninstall still
+/// removes Libra's own old hooks. A lookalike such as
+/// `/opt/libra-governor-tools/x codex-hook stop` is NOT ours and is no longer
+/// deleted by uninstall.
 fn command_is_ours(command: &str) -> bool {
-    command.contains("libra-governor")
-        && OWNED_COMMAND_SUFFIXES
-            .iter()
-            .any(|suffix| command.ends_with(suffix))
+    OWNED_COMMAND_SUFFIXES
+        .iter()
+        .any(|suffix| crate::claude_settings::command_is_ours_with_suffix(command, suffix, true))
 }
 
-/// Stricter than [`command_is_ours`]: `command` is `<path> <subcommand>`
-/// where the final component of `<path>` (hand quotes stripped) is exactly
-/// `libra-governor`. Used by `apply` to decide what it may repoint or
-/// collapse; same rule as `claude_settings::command_is_ours`.
+/// Install-side ownership: only an unambiguous single-path-token command is
+/// repointed or collapsed; a wrapped or legacy-space command is left alone.
 fn command_is_ours_for(command: &str, subcommand: &str) -> bool {
-    command
-        .strip_suffix(subcommand)
-        .map(str::trim_end)
-        .is_some_and(|binary| {
-            let binary = crate::claude_settings::unquote(binary).unwrap_or(binary);
-            Path::new(binary)
-                .file_name()
-                .is_some_and(|name| name == "libra-governor")
-        })
+    crate::claude_settings::command_is_ours_with_suffix(command, subcommand, false)
 }
 
 /// `true` when `group` applies to every tool (no matcher, or an empty / `*`
@@ -431,6 +432,13 @@ pub struct Applied {
 /// docs. No `matcher` field is written: this integration observes every
 /// tool, not a filtered subset.
 pub fn apply(path: &Path, binary: &Path) -> Result<Applied, CodexHooksError> {
+    // The command is `{binary} {subcommand}` run by a shell, unquoted; a
+    // repoint must never produce a command that splits (HORO-2303).
+    if crate::claude_settings::has_shell_unsafe_char(&binary.to_string_lossy()) {
+        return Err(CodexHooksError::UnsafeBinaryPath {
+            binary: binary.to_path_buf(),
+        });
+    }
     with_write_lock(path, || apply_locked(path, binary))
 }
 
@@ -1470,5 +1478,153 @@ mod tests {
             "one per event, no leftover"
         );
         assert_eq!(read_value(&path), seed);
+    }
+
+    /// Commands that merely end in our suffix or mention our binary; none is
+    /// a single `libra-governor` path token, so none is ours.
+    fn not_ours_commands(sub: &str) -> Vec<String> {
+        vec![
+            format!("env X=1 /p/libra-governor {sub}"),
+            format!("/usr/bin/env LIBRA_GOVERNOR_STATE_DIR=/s /p/libra-governor {sub}"),
+            format!("cd /x && /p/libra-governor {sub}"),
+            format!("a | /p/libra-governor {sub}"),
+            format!("/p/libra-governor/{sub}"),
+            format!("/p/libra-governor/ {sub}"),
+            format!("/opt/libra-governor-tools/x {sub}"),
+            format!("/p/other-tool {sub}"),
+            format!("/p/libra-governor{sub}"),
+        ]
+    }
+
+    #[test]
+    fn wrapped_lookalike_and_other_binary_commands_are_not_ours() {
+        for (_, sub) in EVENT_SUBCOMMANDS {
+            for cmd in not_ours_commands(sub) {
+                assert!(!command_is_ours(&cmd), "{cmd}");
+                assert!(!command_is_ours_for(&cmd, sub), "{cmd}");
+            }
+        }
+    }
+
+    #[test]
+    fn install_and_duplicate_collapse_leave_wrapped_and_lookalike_commands_byte_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let mut hooks = serde_json::Map::new();
+        let mut originals = serde_json::Map::new();
+        for (event, sub) in EVENT_SUBCOMMANDS {
+            let mut groups: Vec<Value> = not_ours_commands(sub)
+                .into_iter()
+                .map(|c| serde_json::json!({ "hooks": [{ "type": "command", "command": c }] }))
+                .collect();
+            originals.insert(event.to_string(), Value::Array(groups.clone()));
+            // Two real duplicates after the user entries, to drive the collapse.
+            groups.push(serde_json::json!({ "hooks": [{ "type": "command", "command": old_command(sub) }] }));
+            groups.push(serde_json::json!({ "hooks": [{ "type": "command", "command": format!("/third/libra-governor {sub}") }] }));
+            hooks.insert(event.to_string(), Value::Array(groups));
+        }
+        let seed = serde_json::json!({ "hooks": Value::Object(hooks) });
+        std::fs::write(&path, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+
+        apply(&path, &binary()).unwrap();
+
+        let root = read_value(&path);
+        for (event, sub) in EVENT_SUBCOMMANDS {
+            let groups = root["hooks"][event].as_array().unwrap();
+            let user = originals[event].as_array().unwrap();
+            assert_eq!(
+                &groups[..user.len()],
+                &user[..],
+                "{event}: user entries byte-preserved"
+            );
+            assert_eq!(groups.len(), user.len() + 1, "{event}: one Libra entry");
+            assert_eq!(
+                groups[user.len()]["hooks"][0]["command"],
+                format!("{} {sub}", binary().display())
+            );
+        }
+    }
+
+    #[test]
+    fn uninstall_keeps_a_lookalike_binary_command_and_wrapped_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let user: Vec<Value> = not_ours_commands("codex-hook stop")
+            .into_iter()
+            .map(|c| serde_json::json!({ "hooks": [{ "type": "command", "command": c }] }))
+            .collect();
+        let seed = serde_json::json!({ "hooks": { "Stop": user } });
+        std::fs::write(&path, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+        apply(&path, &binary()).unwrap();
+
+        let removed = remove(&path).unwrap();
+
+        assert_eq!(removed.hook_commands_removed, 3);
+        assert_eq!(read_value(&path), seed);
+    }
+
+    #[test]
+    fn a_legacy_unquoted_space_path_is_still_removed_by_uninstall_but_not_rewritten_by_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let legacy = "/opt/legacy path/libra-governor codex-hook stop";
+        let seed = serde_json::json!({ "hooks": { "Stop": [
+            { "hooks": [{ "type": "command", "command": legacy }] }
+        ] } });
+        std::fs::write(&path, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+
+        apply(&path, &binary()).unwrap();
+        let root = read_value(&path);
+        assert_eq!(
+            root["hooks"]["Stop"][0], seed["hooks"]["Stop"][0],
+            "not rewritten"
+        );
+        assert_eq!(root["hooks"]["Stop"].as_array().unwrap().len(), 2);
+
+        remove(&path).unwrap();
+        assert!(
+            read_value(&path).get("hooks").is_none(),
+            "legacy entry removed too"
+        );
+    }
+
+    #[test]
+    fn a_hand_quoted_path_round_trips_through_reinstall_and_uninstall() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let seed = serde_json::json!({ "hooks": { "Stop": [{ "hooks": [{ "type": "command",
+            "command": "'/opt/my tools/libra-governor' codex-hook stop" }] }] } });
+        std::fs::write(&path, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+        assert!(command_is_ours_for(
+            "'/opt/my tools/libra-governor' codex-hook stop",
+            "codex-hook stop"
+        ));
+        assert!(!command_is_ours_for(
+            "'/opt/my tools/libra-governor\" codex-hook stop",
+            "codex-hook stop"
+        ));
+
+        apply(&path, &binary()).unwrap();
+        assert_eq!(owned_commands(&read_value(&path), "Stop").len(), 1);
+        remove(&path).unwrap();
+        assert!(read_value(&path).get("hooks").is_none());
+    }
+
+    #[test]
+    fn install_refuses_a_binary_path_the_shell_would_split_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        for bad in [
+            "/opt/my tools/libra-governor",
+            "/opt/a;b/libra-governor",
+            "/opt/$HOME/libra-governor",
+        ] {
+            let err = apply(&path, Path::new(bad)).unwrap_err();
+            assert!(
+                matches!(err, CodexHooksError::UnsafeBinaryPath { .. }),
+                "{bad}"
+            );
+        }
+        assert!(!path.exists());
     }
 }

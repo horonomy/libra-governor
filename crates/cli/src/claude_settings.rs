@@ -194,23 +194,71 @@ fn matcher_is_all_tools(group: &Value) -> bool {
     }
 }
 
-/// Ours only if the command is `<path>/libra-governor <exact suffix>`: the
-/// text before the suffix must be a path whose final component is exactly
-/// `libra-governor`. A merely similar name (`libra-governor-tools/x`,
-/// `my-libra-governor-wrapper`) or a directory called `libra-governor`
-/// holding some other binary is a foreign command and is never touched.
+/// Ours only if the command is `<one path token> <exact suffix>` where the
+/// path token's final component is exactly `libra-governor` (see
+/// [`command_is_ours_with_suffix`]). Used by `remove` and `inspect`, so it
+/// also accepts the legacy unquoted-space install.
 fn command_is_ours(command: &str) -> bool {
-    OWNED_COMMAND_SUFFIXES.iter().any(|suffix| {
-        command
-            .strip_suffix(suffix)
-            .map(str::trim_end)
-            .is_some_and(|binary| {
-                let binary = unquote(binary).unwrap_or(binary);
-                Path::new(binary)
-                    .file_name()
-                    .is_some_and(|name| name == "libra-governor")
-            })
-    })
+    OWNED_COMMAND_SUFFIXES
+        .iter()
+        .any(|suffix| command_is_ours_with_suffix(command, suffix, true))
+}
+
+/// The one ownership rule shared by the Claude and Codex installers.
+///
+/// `command` is ours only if it is `<binary> <suffix>` with whitespace
+/// between them, and `<binary>` is exactly ONE path token whose final
+/// component is exactly `libra-governor`:
+/// - unquoted: no whitespace and no shell metacharacter, no leading `~`, no
+///   trailing `/` (so `env X=1 /p/libra-governor`, `cd /x && /p/libra-governor`,
+///   `a | /p/libra-governor`, `/p/libra-governor/` + a script named like the
+///   suffix are all someone else's command);
+/// - or wrapped whole in ONE matching pair of hand-written quotes
+///   (HORO-2303, PR 274), whose content a shell would pass as one word.
+///
+/// `allow_legacy_unquoted_space` additionally accepts what installers before
+/// PR 242 wrote: an unquoted absolute path containing spaces and nothing
+/// else shell-significant (no `=` or `-` led word, which would mean an
+/// `env VAR=x`/flag prefix). It is `true` only for the read/remove side
+/// (`remove`, `inspect`, `doctor`) so Libra's own old hooks are still found
+/// and removed; install passes `false` and so never rewrites or deletes a
+/// command that is not unambiguously ours.
+pub(crate) fn command_is_ours_with_suffix(
+    command: &str,
+    suffix: &str,
+    allow_legacy_unquoted_space: bool,
+) -> bool {
+    let Some(before) = command.strip_suffix(suffix) else {
+        return false;
+    };
+    if !before.ends_with(char::is_whitespace) {
+        return false;
+    }
+    let binary = before.trim_end();
+    let path = if let Some(inner) = unquote(binary) {
+        if !is_hand_quoted_and_runnable(binary) || inner.contains(['\n', '\t']) {
+            return false;
+        }
+        inner
+    } else if !has_shell_unsafe_char(binary) && !binary.starts_with('~') && !binary.is_empty() {
+        binary
+    } else if allow_legacy_unquoted_space
+        && binary.starts_with('/')
+        && !binary.contains(|c: char| {
+            c != ' ' && (c.is_whitespace() || "\"'\\$`;&|<>()*?[]{}!#^~".contains(c))
+        })
+        && !binary
+            .split(' ')
+            .any(|word| word.contains('=') || word.starts_with('-'))
+    {
+        binary
+    } else {
+        return false;
+    };
+    !path.ends_with('/')
+        && Path::new(path)
+            .file_name()
+            .is_some_and(|name| name == "libra-governor")
 }
 
 /// The path inside one pair of matching shell quotes around the whole binary
@@ -447,7 +495,7 @@ pub fn apply_hooks_only(path: &Path, binary: &Path) -> Result<Applied, SettingsE
 
 /// Whether `text`, written unquoted into a command a shell runs, would be
 /// split or interpreted instead of naming one program.
-fn has_shell_unsafe_char(text: &str) -> bool {
+pub(crate) fn has_shell_unsafe_char(text: &str) -> bool {
     text.chars()
         .any(|c| c.is_whitespace() || "\"'\\$`;&|<>()*?[]{}!#^".contains(c))
 }
@@ -537,7 +585,7 @@ fn apply_locked(
                     // two sets firing (HORO-2303). A foreign command never
                     // passes `command_is_ours`.
                     let ours_elsewhere =
-                        existing.is_some_and(|c| c.ends_with(subcommand) && command_is_ours(c));
+                        existing.is_some_and(|c| command_is_ours_with_suffix(c, subcommand, false));
                     if !ours_elsewhere {
                         continue;
                     }
@@ -1874,5 +1922,50 @@ mod tests {
     fn quoting_does_not_make_a_lookalike_or_a_mismatched_quote_ours() {
         assert!(!command_is_ours("'/opt/libra-governor-tools/x' hook stop"));
         assert!(!command_is_ours("'/opt/libra-governor\" hook stop"));
+    }
+
+    /// HORO-2303: wrapped, pipelined, lookalike or trailing-slash commands are
+    /// not ours, so install never rewrites them and uninstall never removes
+    /// them; the legacy unquoted-space install still is ours for uninstall.
+    #[test]
+    fn wrapped_and_lookalike_commands_are_left_alone_and_legacy_space_path_is_still_ours() {
+        let sub = "hook stop";
+        let others = [
+            format!("env X=1 /p/libra-governor {sub}"),
+            format!("/usr/bin/env LIBRA_GOVERNOR_STATE_DIR=/s /p/libra-governor {sub}"),
+            format!("cd /x && /p/libra-governor {sub}"),
+            format!("a | /p/libra-governor {sub}"),
+            format!("/p/libra-governor/{sub}"),
+            format!("/p/libra-governor/ {sub}"),
+            format!("/opt/libra-governor-tools/x {sub}"),
+            format!("/p/other-tool {sub}"),
+        ];
+        for c in &others {
+            assert!(!command_is_ours(c), "{c}");
+        }
+        assert!(command_is_ours("/opt/legacy path/libra-governor hook stop"));
+        assert!(!command_is_ours_with_suffix(
+            "/opt/legacy path/libra-governor hook stop",
+            "hook stop",
+            false
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let groups: Vec<Value> = others
+            .iter()
+            .map(|c| serde_json::json!({ "hooks": [{ "type": "command", "command": c }] }))
+            .collect();
+        let seed = serde_json::json!({ "hooks": { "Stop": groups.clone() } });
+        std::fs::write(&path, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+        apply(&path, &binary()).unwrap();
+        let root: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            &root["hooks"]["Stop"].as_array().unwrap()[..groups.len()],
+            &groups[..]
+        );
+        remove(&path).unwrap();
+        let root: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(root["hooks"]["Stop"], Value::Array(groups));
     }
 }
