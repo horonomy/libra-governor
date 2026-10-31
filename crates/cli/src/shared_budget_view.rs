@@ -57,17 +57,42 @@ pub const NOT_COVERED: [&str; 4] = [
      budget early",
 ];
 
+/// The "does NOT cover" list of a report whose Codex route is enrolled
+/// (HORO-2285). The Codex route is gated at prompt admission and settled at
+/// `Stop`, so "no budget gate" no longer holds; the remaining Codex gaps
+/// replaces it. The other three entries are [`NOT_COVERED`]'s, verbatim.
+const NOT_COVERED_CODEX_ENROLLED: [&str; 4] = [
+    NOT_COVERED[0],
+    "Codex coverage is partial (experimental shared-budget.codex marker): Codex subagent \
+     prompts and Stops are neither admitted nor settled, there is no Codex PreToolUse check and \
+     no Codex heartbeat, a prompt without a turn_id is admitted unmapped, Codex hooks the \
+     operator has not trusted in /hooks do not run (that install is ungated), and a Codex model \
+     with no pricing_overrides entry settles at the flat per-turn hold, unmeasured",
+    NOT_COVERED[2],
+    NOT_COVERED[3],
+];
+
 /// Is Codex enrolled in the budget, judged from what this report was built
 /// from: a budget exists (`posture`) and a regular `shared-budget.codex` file
-/// sits in `state_dir`? (HORO-2285)
-pub fn codex_enrolled_in(_posture: &Posture, _state_dir: Option<&Path>) -> bool {
-    false
+/// sits in `state_dir`, by stat alone like the hook and the daemon (a symlink
+/// does not count)?
+pub fn codex_enrolled_in(posture: &Posture, state_dir: Option<&Path>) -> bool {
+    if matches!(posture, Posture::NotConfigured) {
+        return false;
+    }
+    state_dir
+        .map(|dir| dir.join(budget_gate::CODEX_MARKER_FILE_NAME))
+        .is_some_and(|path| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()))
 }
 
 /// The "does NOT cover" list for a report. Without Codex enrolment it is
-/// exactly [`NOT_COVERED`].
-pub fn not_covered_for(_codex_enrolled: bool) -> Vec<&'static str> {
-    NOT_COVERED.to_vec()
+/// exactly [`NOT_COVERED`], so every Claude-side byte is unchanged.
+pub fn not_covered_for(codex_enrolled: bool) -> Vec<&'static str> {
+    if codex_enrolled {
+        NOT_COVERED_CODEX_ENROLLED.to_vec()
+    } else {
+        NOT_COVERED.to_vec()
+    }
 }
 
 /// How long the statusline segment may wait for the daemon. The shared
@@ -428,7 +453,10 @@ pub fn render_human(posture: &Posture, state_dir: Option<&Path>) -> String {
                 one_line(reason)
             ));
         }
-        Posture::Reported(status) => render_reported(&mut out, status),
+        Posture::Reported(status) => {
+            let not_covered = not_covered_for(codex_enrolled_in(posture, state_dir));
+            render_reported(&mut out, status, &not_covered)
+        }
     }
     out
 }
@@ -438,7 +466,7 @@ fn push_labels(out: &mut String) {
     out.push_str(&format!("Units: {USD_MEANING} ({})\n", pricing_version()));
 }
 
-fn render_reported(out: &mut String, s: &SharedBudgetStatus) {
+fn render_reported(out: &mut String, s: &SharedBudgetStatus, not_covered: &[&str]) {
     out.push_str("Shared budget (local, this host and OS user)\n");
     push_labels(out);
     match s.config_state {
@@ -587,7 +615,7 @@ fn render_reported(out: &mut String, s: &SharedBudgetStatus) {
         }
     }
     out.push_str("Does NOT cover:\n");
-    for item in NOT_COVERED {
+    for item in not_covered {
         out.push_str(&format!("  - {item}\n"));
     }
 }
@@ -609,7 +637,7 @@ pub fn render_json(posture: &Posture, state_dir: Option<&Path>) -> Value {
             "guarantee": GUARANTEE_LABEL,
             "usd_meaning": USD_MEANING,
             "pricing_version": pricing_version(),
-            "not_covered": NOT_COVERED,
+            "not_covered": not_covered_for(codex_enrolled_in(posture, state_dir)),
             "state_dir": state_dir.map(|d| d.display().to_string()),
         })
     };
