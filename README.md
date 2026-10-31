@@ -176,9 +176,9 @@ original strict hard-cap guarantee.
   written, a subagent file over 32 MiB, and a hook that fails open while the
   daemon is down can be under-counted or missed. A forward clock jump or a
   time-zone change near a month edge opens the next month's budget early.
-  `shared-budget init --force` replaces the whole file and keeps no backup,
-  dropping `pricing_overrides`, the subagent fallback and unrepeated soft
-  limits.
+  `shared-budget init --force` replaces the whole file, dropping `pricing_overrides`, the subagent
+  fallback and unrepeated soft limits; the previous file is kept as
+  `shared-budget.json.bak`.
 
 **Where to look.** `libra-governor shared-budget status` (add `--json`),
 the `shared_budget_*` checks in `libra-governor doctor`, and a `budget $x/$y`

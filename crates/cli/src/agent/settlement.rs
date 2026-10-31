@@ -172,6 +172,7 @@ pub fn tail_request(end: &SessionEnd) -> Result<SharedBudgetRequest, &'static st
     Ok(SharedBudgetRequest::SettleTail {
         session_id: end.session_id.clone(),
         transcript_path: path,
+        provider: None,
     })
 }
 
@@ -531,6 +532,7 @@ mod tests {
             SharedBudgetRequest::SettleTail {
                 session_id: "s-2".into(),
                 transcript_path: "/h/p/s-2.jsonl".into(),
+                provider: None,
             }
         );
         let no_path = parse_session_end(r#"{"session_id":"s-2"}"#).unwrap();

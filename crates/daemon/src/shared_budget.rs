@@ -68,10 +68,11 @@ use libra_governor_protocol::{
 use crate::shared_budget_file::{
     ConfigDrift, LoadedSharedBudget, SharedBudgetConfig, SharedBudgetFileState, SoftLimits,
 };
+use crate::usage::codex_priced::price_codex_turn;
 use crate::usage::priced::{
     observe_priced, PricedObservation, ReadMode, BUDGET_SCAN_CAP_BYTES, FUTURE_SKEW,
 };
-use crate::usage::UsageUnavailable;
+use crate::usage::{observe_codex_turn, UsageObservation, UsageUnavailable};
 
 /// How long a turn hold lives without a heartbeat. Each tool event renews
 /// it, so only an abandoned turn (a crash, a kill) ever waits this out.
@@ -90,6 +91,19 @@ pub const PROVIDER_LANE_PREFIX: &str = "shared-budget-provider-v1:";
 const CLAUDE_PROVIDER: &str = "claude-code";
 /// The one other provider the budget derives a lane for.
 const CODEX_PROVIDER: &str = "codex";
+/// The file whose presence in the state directory enrols Codex in the budget
+/// (HORO-2282). Absent, every Codex settlement is `not_configured` and writes
+/// nothing. Its contents are never read.
+pub const CODEX_MARKER_FILE_NAME: &str = "shared-budget.codex";
+/// Most turns one Codex hold is measured over. A hold normally maps 1-3 turns
+/// (a re-prompt renews it), but a hold lives an hour and each tool event renews
+/// it, so a re-prompt storm could name many more. Each turn is one backward
+/// rollout scan of up to `BUDGET_SCAN_CAP_BYTES`, so this bounds the work of
+/// one settlement to 16 scans. Past it the first turns are measured and the
+/// hold settles at `max(priced_sum, hold)` labelled `scan_cap_reached`.
+const MAX_CODEX_HOLD_TURNS: usize = 16;
+/// Longest recovery failure line kept in telemetry.
+const MAX_RECOVERY_ERROR_LEN: usize = 160;
 
 /// A source of "now". Injectable so rollover and timezone-boundary tests
 /// are deterministic without sleeping.
@@ -181,6 +195,13 @@ struct Telemetry {
     foreign_lines: u64,
     sweep_deferred_files: u64,
     future_timestamps: u64,
+    /// Codex turns charged after the fact because no hold was mapped to them.
+    unadmitted_turns: u64,
+    /// Codex recovery steps (an orphan settle or a true-up) that failed and
+    /// were left for the lane's next settle.
+    codex_recovery_errors: u64,
+    /// The newest such failure, one bounded line.
+    codex_recovery_last_error: Option<String>,
 }
 
 /// A model id from a transcript, reduced to a safe, bounded display token:
@@ -247,6 +268,51 @@ impl SharedBudgetRuntime {
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// Whether the Codex marker file (`<state_dir>/shared-budget.codex`) is
+    /// present right now. Stat on every call, so removing the file switches
+    /// Codex settlement off from the next request. A runtime with no state
+    /// directory is never enrolled; a symlink does not count.
+    pub fn codex_enrolled(&self) -> bool {
+        self.loaded
+            .path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .is_some_and(|dir| {
+                std::fs::symlink_metadata(dir.join(CODEX_MARKER_FILE_NAME))
+                    .is_ok_and(|m| m.is_file())
+            })
+    }
+
+    /// Codex turns booked post-hoc since the daemon started (volatile, like
+    /// every settlement counter; the durable record is the ledger row).
+    pub fn unadmitted_turns(&self) -> u64 {
+        self.telemetry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unadmitted_turns
+    }
+
+    /// How many Codex recovery steps failed since the daemon started, and the
+    /// newest failure as one bounded line (volatile, like the other counters).
+    /// A failed step never fails the `Stop` that ran it; it is retried at the
+    /// lane's next settle.
+    pub fn codex_recovery_errors(&self) -> (u64, Option<String>) {
+        let t = self.telemetry.lock().unwrap_or_else(|e| e.into_inner());
+        (t.codex_recovery_errors, t.codex_recovery_last_error.clone())
+    }
+
+    fn note_recovery_error(&self, step: &str, err: &SharedBudgetError) {
+        let line: String = format!("codex recovery {step} failed: {err}")
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(MAX_RECOVERY_ERROR_LEN)
+            .collect();
+        self.note(|t| {
+            t.codex_recovery_errors += 1;
+            t.codex_recovery_last_error = Some(line);
+        });
     }
 
     /// The configuration as read at daemon start.
@@ -392,16 +458,19 @@ fn denied(
 
 /// Validates a client identity and derives the budget lane its holds live
 /// on. `Err` is the outcome to return unchanged: a refusal, or `NotConfigured`
-/// for a Codex lane, which stays inert until the Codex settlement exists
-/// (HORO-2282): nothing is read, reserved or written for it.
+/// for a Codex lane unless `codex_enrolled` (the marker file, HORO-2283): then
+/// nothing is read, reserved or written for it. Only `Admit` and `Check` pass
+/// an enrolled runtime's answer; every other lane-taking entry point passes
+/// `false` and so keeps Codex inert.
 fn admission_lane(
     session_id: &str,
     agent_id: Option<&str>,
     provider: Option<&str>,
+    codex_enrolled: bool,
 ) -> Result<(ExecutorKind, String), SharedBudgetOutcome> {
     let kind = validate_identity(session_id, agent_id).map_err(refused)?;
     let lane = budget_lane(session_id, provider).map_err(refused)?;
-    if provider == Some(CODEX_PROVIDER) {
+    if provider == Some(CODEX_PROVIDER) && !codex_enrolled {
         return Err(SharedBudgetOutcome::NotConfigured);
     }
     Ok((kind, lane))
@@ -434,7 +503,7 @@ fn gate_context(
     if matches!(state, SharedBudgetFileState::Absent) {
         return Ok(Err(SharedBudgetOutcome::NotConfigured));
     }
-    let (kind, lane) = match admission_lane(session_id, agent_id, provider) {
+    let (kind, lane) = match admission_lane(session_id, agent_id, provider, rt.codex_enrolled()) {
         Ok(admitted) => admitted,
         Err(outcome) => return Ok(Err(outcome)),
     };
@@ -497,6 +566,35 @@ pub fn budget_lane(
         }
         Some(_) => Err(SharedBudgetRefusal::UnsupportedProvider),
     }
+}
+
+fn validate_agent(agent_id: Option<&str>) -> Result<(), SharedBudgetRefusal> {
+    match agent_id {
+        Some(a) if a.trim().is_empty() => Err(SharedBudgetRefusal::InvalidAgentId),
+        _ => Ok(()),
+    }
+}
+
+/// Validates a client-supplied session id and derives the lane key its holds
+/// live on. The one door from a wire `(provider, session_id)` to the
+/// lane-taking functions, which take the returned key as-is (HORO-2282).
+pub fn client_lane(
+    session_id: &str,
+    provider: Option<&str>,
+) -> Result<String, SharedBudgetRefusal> {
+    validate_identity(session_id, None)?;
+    budget_lane(session_id, provider)
+}
+
+/// What the lane-taking functions check on a key their caller already
+/// derived: only that there is one. The reserved prefix is rightly present
+/// on a derived key, so it is refused for *client* ids by
+/// [`validate_identity`] and never here.
+fn validate_lane_key(lane: &str) -> Result<(), SharedBudgetRefusal> {
+    if lane.trim().is_empty() {
+        return Err(SharedBudgetRefusal::EmptySessionId);
+    }
+    Ok(())
 }
 
 fn validate_identity(
@@ -938,9 +1036,43 @@ pub fn check(
 /// arithmetic is only specified for real clocks.
 const EVENT_YEARS: std::ops::RangeInclusive<i32> = 2000..=2200;
 
-/// Handles `SharedBudgetRequest::ChargeAgent`.
+/// Handles `SharedBudgetRequest::ChargeAgent` for a client-supplied
+/// `(provider, session_id)`. A Codex lane stays inert (HORO-2282).
 #[allow(clippy::too_many_arguments)]
 pub fn charge(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    session_id: &str,
+    agent_id: Option<&str>,
+    amount_usd_cents: u64,
+    idempotency_key: &str,
+    charge_source: ChargeSource,
+    event_time: Option<&str>,
+    provider: Option<&str>,
+) -> Result<SharedBudgetOutcome, SharedBudgetError> {
+    if matches!(rt.effective().state, SharedBudgetFileState::Absent) {
+        return Ok(SharedBudgetOutcome::NotConfigured);
+    }
+    let lane = match admission_lane(session_id, agent_id, provider, false) {
+        Ok((_, lane)) => lane,
+        Err(outcome) => return Ok(outcome),
+    };
+    charge_on_lane(
+        ledger,
+        rt,
+        &lane,
+        agent_id,
+        amount_usd_cents,
+        idempotency_key,
+        charge_source,
+        event_time,
+    )
+}
+
+/// [`charge`] on an already-derived lane key, which is not re-validated as a
+/// client identity. `agent_id` is still a client value and is checked.
+#[allow(clippy::too_many_arguments)]
+pub fn charge_on_lane(
     ledger: &mut LedgerStore,
     rt: &SharedBudgetRuntime,
     session_id: &str,
@@ -955,7 +1087,7 @@ pub fn charge(
         return Ok(SharedBudgetOutcome::NotConfigured);
     }
     // Same precedence as before the split: identity, amount, key.
-    if let Err(reason) = validate_identity(session_id, agent_id) {
+    if let Err(reason) = validate_lane_key(session_id).and_then(|()| validate_agent(agent_id)) {
         return Ok(refused(reason));
     }
     if amount_usd_cents == 0 || i64::try_from(amount_usd_cents).is_err() {
@@ -1015,7 +1147,9 @@ fn book_charge(
         usage_known,
         watermark,
     } = charge;
-    if let Err(reason) = validate_identity(session_id, agent_id) {
+    // Every caller has already validated the identity (a client id or a
+    // derived lane key); this is only the empty-key backstop.
+    if let Err(reason) = validate_lane_key(session_id).and_then(|()| validate_agent(agent_id)) {
         return Ok(refused(reason));
     }
     if amount_usd_cents == 0 || i64::try_from(amount_usd_cents).is_err() {
@@ -1390,6 +1524,9 @@ fn pending_hold(holds: &[SharedPoolReservation]) -> Option<&SharedPoolReservatio
 ///   `Stop`): nothing, even when a newer hold is pending. Without a
 ///   `prompt_id` a duplicate cannot be told from a real `Stop` whose
 ///   transcript has not flushed, and settles the pending hold.
+///
+/// `session_id` is the lane key, already derived by [`client_lane`]; it is
+/// not re-validated as a client identity (HORO-2282).
 pub fn settle_turn(
     ledger: &mut LedgerStore,
     rt: &SharedBudgetRuntime,
@@ -1402,7 +1539,7 @@ pub fn settle_turn(
     if matches!(state, SharedBudgetFileState::Absent) {
         return Ok(TurnSettlement::NotConfigured);
     }
-    if validate_identity(session_id, None).is_err() {
+    if validate_lane_key(session_id).is_err() {
         return Ok(TurnSettlement::NotApplicable);
     }
     let holds = ledger.shared_lane_holds(
@@ -1569,6 +1706,720 @@ pub fn settle_turn(
         SharedPoolSettleOutcome::AlreadyFinal(_) | SharedPoolSettleOutcome::NotFound => {
             TurnSettlement::AlreadySettled
         }
+    })
+}
+
+/// What settling a Codex `Stop` did (HORO-2282). Content-free: it is logged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexSettlement {
+    /// No budget file, or Codex is not enrolled (no marker): nothing was read
+    /// or written.
+    NotConfigured,
+    /// The session id is empty or reserved, or the turn id is empty or too
+    /// long to have been recorded: there is nothing to settle or key a
+    /// charge on.
+    NotApplicable,
+    /// The turn's mapped hold settled.
+    Settled {
+        reservation_id: libra_governor_domain::SharedPoolReservationId,
+        pool_id: String,
+        hold_usd_cents: u64,
+        settled_usd_cents: u64,
+        /// False when the hold amount was settled because the turns could
+        /// not be measured and priced.
+        usage_known: bool,
+        /// How far the settled amount exceeds the hold (never clamped).
+        overrun_usd_cents: u64,
+        /// How many turns of the hold were measured.
+        turns: usize,
+        /// Why the hold was not (fully) measured; `None` when it was.
+        unmeasured_reason: Option<&'static str>,
+    },
+    /// The turn's hold is already final (a replayed `Stop`), or its row has
+    /// been pruned: nothing was written.
+    AlreadySettled,
+    /// No hold was mapped to the turn, so it was charged after the fact under
+    /// `codex-turn:<lane>|<turn>`. A pending hold of another turn is never
+    /// touched.
+    Unadmitted {
+        reservation_id: libra_governor_domain::SharedPoolReservationId,
+        charged_usd_cents: u64,
+        usage_known: bool,
+        /// True when this turn was already charged (a retry): no new row.
+        already_charged: bool,
+        unmeasured_reason: Option<&'static str>,
+    },
+    /// An unadmitted turn that was not charged, and why.
+    Unbooked(&'static str),
+}
+
+impl CodexSettlement {
+    /// A short, content-free label for the daemon log.
+    pub fn label(&self) -> String {
+        match self {
+            Self::NotConfigured => "shared budget: codex not enrolled".to_string(),
+            Self::NotApplicable => "shared budget: codex turn not applicable".to_string(),
+            Self::AlreadySettled => "shared budget: codex hold already settled".to_string(),
+            Self::Unbooked(why) => {
+                format!("shared budget: codex unadmitted turn not charged ({why})")
+            }
+            Self::Settled {
+                hold_usd_cents,
+                settled_usd_cents,
+                usage_known,
+                overrun_usd_cents,
+                turns,
+                unmeasured_reason,
+                ..
+            } => format!(
+                "shared budget: codex settled {settled_usd_cents}c of {hold_usd_cents}c hold \
+                 over {turns} turn(s) (usage_known={usage_known}, overrun={overrun_usd_cents}c, \
+                 reason={})",
+                unmeasured_reason.unwrap_or("measured")
+            ),
+            Self::Unadmitted {
+                charged_usd_cents,
+                usage_known,
+                already_charged,
+                unmeasured_reason,
+                ..
+            } => format!(
+                "shared budget: codex unadmitted turn charged {charged_usd_cents}c \
+                 (usage_known={usage_known}, already={already_charged}, reason={})",
+                unmeasured_reason.unwrap_or("measured")
+            ),
+        }
+    }
+}
+
+/// The label an unmeasurable Codex turn is flagged with. The same spellings
+/// the Claude settlement uses.
+fn codex_unavailable_reason(why: UsageUnavailable) -> &'static str {
+    match why {
+        UsageUnavailable::NoTranscriptPath => "no_transcript_path",
+        UsageUnavailable::Unreadable => "transcript_unreadable",
+        UsageUnavailable::ScanCapReached => "scan_cap_reached",
+        UsageUnavailable::NoUsageInWindow => "no_usage_in_window",
+        UsageUnavailable::TurnIncomplete | UsageUnavailable::Inconsistent => {
+            "transcript_inconsistent"
+        }
+    }
+}
+
+/// Measures and prices every turn in `turn_ids` from one Codex rollout.
+///
+/// Returns the cents to book as a measurement (`None` = book the hold amount,
+/// unmeasured) and the reason the turns were not all measured. Each turn is
+/// read by its own `turn_id`, never by `root_turn_id` and never as a session
+/// window, and priced on its own (rounded up once per turn).
+///
+/// If any turn is unmeasurable the result is `max(priced_sum, hold)`: the
+/// priced part counts as a measurement only when it exceeds the hold, so an
+/// interrupted turn's spend cannot be lost by measuring only the turn the
+/// `Stop` names (the same rule as the Claude `future_timestamp` window).
+fn measure_codex_turns(
+    rt: &SharedBudgetRuntime,
+    cfg: &SharedBudgetConfig,
+    session_id: &str,
+    turn_ids: &[String],
+    model: Option<&str>,
+    transcript_path: Option<&str>,
+    hold: u64,
+) -> (Option<u64>, Option<&'static str>) {
+    let table = cfg.pricing_overrides.table();
+    // The rollout carries no model: it is the host's claim in the `Stop`
+    // payload. Without a price the turns cannot be measured in cents.
+    let Some(model) = model.filter(|m| table.lookup(m).is_some()) else {
+        if let Some(m) = model {
+            rt.note_unpriced(&[m.to_string()]);
+        }
+        return (None, Some("unpriced_model"));
+    };
+    let Some(path) = transcript_path else {
+        return (None, Some("no_transcript_path"));
+    };
+    let capped = turn_ids.len() > MAX_CODEX_HOLD_TURNS;
+    let turn_ids = &turn_ids[..turn_ids.len().min(MAX_CODEX_HOLD_TURNS)];
+    let mut priced_sum: u64 = 0;
+    let mut reason: Option<&'static str> = None;
+    for turn in turn_ids {
+        match observe_codex_turn(
+            std::path::Path::new(path),
+            session_id,
+            turn,
+            BUDGET_SCAN_CAP_BYTES,
+        ) {
+            UsageObservation::Measured(usage) => match price_codex_turn(&usage, model, &table) {
+                Some(cents) => priced_sum = priced_sum.saturating_add(cents),
+                None => {
+                    reason.get_or_insert("unpriced_model");
+                }
+            },
+            UsageObservation::Unavailable(why) => {
+                reason.get_or_insert(codex_unavailable_reason(why));
+            }
+        }
+    }
+    if capped {
+        reason = Some("scan_cap_reached");
+    }
+    match reason {
+        None => (Some(priced_sum), None),
+        Some(r) => (Some(priced_sum).filter(|sum| *sum > hold), Some(r)),
+    }
+}
+
+/// Settles a Codex turn at `Stop`, turn-scoped from the rollout (HORO-2282).
+///
+/// Dark: with no budget file or no `shared-budget.codex` marker it returns
+/// [`CodexSettlement::NotConfigured`] before touching the ledger. `session_id`
+/// is the host's raw session id; the lane is derived here.
+///
+/// # Which hold
+///
+/// Only the hold `turn_id` itself was admitted into (the ledger's prompt
+/// mapping). There is deliberately **no** first-prompt-key fallback and **no**
+/// "newest pending hold" fallback, unlike [`settle_turn`]: a `Stop` for a turn
+/// that was never admitted (a subagent turn firing `Stop` with the parent's
+/// session id, say) would otherwise settle the parent's pending hold and make
+/// the parent's real `Stop` a replay.
+///
+/// - the mapped hold is already final, or its row was pruned: nothing is
+///   written ([`CodexSettlement::AlreadySettled`]);
+/// - no mapping: the turn is charged after the fact, keyed by turn id, at its
+///   measured cents or else the hold amount
+///   ([`CodexSettlement::Unadmitted`]); a pending hold is untouched.
+///
+/// # Which turns, which cents
+///
+/// A re-prompt renews the live hold and maps its turn id to the same hold, so
+/// the hold covers every turn mapped to it; the settlement is the sum over all
+/// of them, not just the turn the `Stop` names. See [`measure_codex_turns`] for
+/// the unmeasurable cases, which always settle at the hold amount or more and
+/// never at 0. An invalid budget file settles the hold amount without its
+/// overrides. A late settle of an expired hold lands in the hold's own row and
+/// period.
+///
+/// # Cost and locking
+///
+/// Reading the rollout is blocking file I/O: up to 16 backward scans of at
+/// most `BUDGET_SCAN_CAP_BYTES` each, performed while the caller holds the
+/// `&mut LedgerStore`. C3 must not call this while holding the ledger/server
+/// lock any longer than the request needs, and should do the cheap checks
+/// (marker, ids) before taking it.
+///
+/// The post-hoc charge is booked to the period of the settle time: the reader
+/// returns no record timestamps, so the record's own event time is not used.
+///
+/// # Recovery (HORO-2284)
+///
+/// After the `Stop`'s own outcome, and only past the same marker gate, the
+/// lane is recovered: every `expired`, unsettled hold with a turn mapping is
+/// settled late by its own turn ids in its own row and period (measured, else
+/// the hold amount, never zero), and the lane's newest measured settled hold
+/// is trued up by [`trueup_codex_hold`]. Neither changes this call's result.
+pub fn settle_codex_turn(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    session_id: &str,
+    turn_id: &str,
+    model: Option<&str>,
+    transcript_path: Option<&str>,
+) -> Result<CodexSettlement, SharedBudgetError> {
+    let state = rt.effective().state;
+    if matches!(state, SharedBudgetFileState::Absent) || !rt.codex_enrolled() {
+        return Ok(CodexSettlement::NotConfigured);
+    }
+    let Some(turn_id) = usable_prompt(Some(turn_id)) else {
+        return Ok(CodexSettlement::NotApplicable);
+    };
+    let Ok(lane) = client_lane(session_id, Some(CODEX_PROVIDER)) else {
+        return Ok(CodexSettlement::NotApplicable);
+    };
+    // The hold to true up is the lane's newest settled one as of *before*
+    // this call, so a hold settled by this very call is not re-read at once.
+    let trueup_target = trueup_candidate(ledger, &lane).ok().flatten();
+    let primary = match ledger.hold_for_prompt(&principal(), &lane, turn_id)? {
+        Some(hold_id) => settle_codex_hold(
+            ledger,
+            rt,
+            &state,
+            session_id,
+            &lane,
+            turn_id,
+            hold_id,
+            model,
+            transcript_path,
+        ),
+        None => charge_unadmitted_codex_turn(
+            ledger,
+            rt,
+            &state,
+            session_id,
+            &lane,
+            turn_id,
+            model,
+            transcript_path,
+        ),
+    };
+    // Recovery is best effort and never changes the outcome of this `Stop`:
+    // whatever it could not do (a busy ledger, say) is counted in telemetry
+    // and retried, idempotently, at the lane's next settle.
+    recover_codex_lane(
+        ledger,
+        rt,
+        &state,
+        session_id,
+        &lane,
+        trueup_target,
+        model,
+        transcript_path,
+    );
+    primary
+}
+
+/// Most expired, unsettled holds one settle recovers; the rest wait for the
+/// lane's next settle.
+const MAX_CODEX_RECOVERIES_PER_SETTLE: usize = 16;
+
+/// The lane's newest settled hold whose cents were measured. A hold settled
+/// at the flat hold amount (`usage_known=false`) is never re-measured: a
+/// true-up only ever adds to a measurement.
+fn trueup_candidate(
+    ledger: &LedgerStore,
+    lane: &str,
+) -> Result<Option<libra_governor_domain::SharedPoolReservationId>, SharedBudgetError> {
+    let holds = ledger.shared_lane_holds(
+        &principal(),
+        lane,
+        None,
+        ExecutorKind::AgentAbsent,
+        OWNER_POOL_PREFIX,
+    )?;
+    Ok(holds
+        .iter()
+        .filter(|h| {
+            h.state == ReservationState::Settled
+                && h.usage_known == Some(true)
+                && h.settled_amount.is_some()
+        })
+        .max_by_key(|h| (h.settled_at, h.created_at))
+        .map(|h| h.id))
+}
+
+/// Recovers a Codex lane at its next settle (HORO-2284): settles every
+/// expired, unsettled hold by its own turn ids, then trues up
+/// `trueup_target`. See [`settle_codex_turn`].
+///
+/// Each step is isolated: a hold that fails is counted
+/// ([`SharedBudgetRuntime::codex_recovery_errors`]) and skipped, and the
+/// remaining holds and the true-up still run.
+#[allow(clippy::too_many_arguments)]
+fn recover_codex_lane(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    state: &SharedBudgetFileState,
+    session_id: &str,
+    lane: &str,
+    trueup_target: Option<libra_governor_domain::SharedPoolReservationId>,
+    model: Option<&str>,
+    transcript_path: Option<&str>,
+) {
+    let holds = match ledger.shared_lane_holds(
+        &principal(),
+        lane,
+        None,
+        ExecutorKind::AgentAbsent,
+        OWNER_POOL_PREFIX,
+    ) {
+        Ok(holds) => holds,
+        Err(e) => {
+            rt.note_recovery_error("list", &e.into());
+            Vec::new()
+        }
+    };
+    let mut recovered = 0;
+    for hold in holds
+        .iter()
+        .filter(|h| h.state == ReservationState::Expired && h.settled_amount.is_none())
+    {
+        if recovered >= MAX_CODEX_RECOVERIES_PER_SETTLE {
+            break;
+        }
+        // Only a hold with a recorded turn mapping is a Codex turn of this
+        // lane. Unmapped holds are skipped before the cap is applied, so
+        // they cannot starve a mapped one.
+        let first = match ledger.prompts_for_hold(&principal(), lane, hold.id) {
+            Ok(turns) => match turns.into_iter().next() {
+                Some(first) => first,
+                None => continue,
+            },
+            Err(e) => {
+                rt.note_recovery_error("orphan", &e.into());
+                continue;
+            }
+        };
+        recovered += 1;
+        if let Err(e) = settle_codex_hold(
+            ledger,
+            rt,
+            state,
+            session_id,
+            lane,
+            &first,
+            hold.id,
+            model,
+            transcript_path,
+        ) {
+            rt.note_recovery_error("orphan", &e);
+        }
+    }
+    if let Some(id) = trueup_target {
+        if let Err(e) = trueup_codex_hold(
+            ledger,
+            rt,
+            state,
+            session_id,
+            lane,
+            id,
+            model,
+            transcript_path,
+        ) {
+            rt.note_recovery_error("trueup", &e);
+        }
+    }
+}
+
+/// Whether the rollout's tail holds a `task_complete` line for `turn_id`.
+/// The reader that settles a turn does not require one (it is written after
+/// the `Stop` hook), so a true-up checks for itself that the turn is over.
+fn codex_turn_complete(path: &str, turn_id: &str) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    // `path` is host-claimed: a FIFO with no writer would block `open` and
+    // with it the daemon's serial accept loop. The shared opener opens without
+    // blocking and refuses anything that is not a regular file on the handle.
+    let Ok(mut file) = crate::usage::open_regular_file(std::path::Path::new(path)) else {
+        return false;
+    };
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return false;
+    };
+    let start = len.saturating_sub(BUDGET_SCAN_CAP_BYTES);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return false;
+    }
+    let mut buf = Vec::new();
+    if file
+        .take(BUDGET_SCAN_CAP_BYTES)
+        .read_to_end(&mut buf)
+        .is_err()
+    {
+        return false;
+    }
+    let mut lines = buf.split(|b| *b == b'\n');
+    if start > 0 {
+        // The window opens mid-line.
+        lines.next();
+    }
+    lines.any(|line| {
+        std::str::from_utf8(line)
+            .ok()
+            .filter(|l| l.contains("task_complete"))
+            .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .is_some_and(|v| {
+                v["type"] == "event_msg"
+                    && v["payload"]["type"] == "task_complete"
+                    && v["payload"]["turn_id"] == turn_id
+            })
+    })
+}
+
+/// Books what a settled, measured Codex hold under-counted (HORO-2284).
+///
+/// The final `token_usage_record` can still sit in Codex's writer queue when
+/// `Stop` settles, which the reader cannot detect, so the hold settles short.
+/// Once every turn of the hold has its `task_complete` line, the hold is
+/// measured again and the difference is booked as a charge keyed
+/// `codex-trueup:<lane>|<hold id>|c<cumulative cents>`.
+///
+/// - The baseline is the hold's settled amount plus every true-up already
+///   booked for the hold (summed by key prefix across periods, plus what a
+///   prune folded into the charge floor). Only `measured - baseline > 0` is
+///   booked: a smaller measurement books nothing and nothing is ever
+///   refunded.
+/// - The prune floor for this family is currently redundant: a hold's row and
+///   its true-ups share one pool and are pruned together, after which this
+///   function finds no hold row and books nothing. The floor is kept as
+///   defence in depth, for a true-up whose row outlives its hold's.
+/// - The key names the hold's own row id, which cannot change, not a turn id:
+///   a turn that joined the hold later could otherwise change the key and let
+///   a replay book twice.
+/// - The delta lands in the hold's own period (the pool it was admitted
+///   into), even when that month has closed. If that pool or the hold row has
+///   been pruned, nothing is booked.
+#[allow(clippy::too_many_arguments)]
+fn trueup_codex_hold(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    state: &SharedBudgetFileState,
+    session_id: &str,
+    lane: &str,
+    hold_id: libra_governor_domain::SharedPoolReservationId,
+    model: Option<&str>,
+    transcript_path: Option<&str>,
+) -> Result<(), SharedBudgetError> {
+    let SharedBudgetFileState::Valid(cfg) = state else {
+        return Ok(());
+    };
+    let (Some(model), Some(path)) = (model, transcript_path) else {
+        return Ok(());
+    };
+    let holds = ledger.shared_lane_holds(
+        &principal(),
+        lane,
+        None,
+        ExecutorKind::AgentAbsent,
+        OWNER_POOL_PREFIX,
+    )?;
+    let Some(hold) = holds.iter().find(|h| h.id == hold_id) else {
+        return Ok(());
+    };
+    let (ReservationState::Settled, Some(true), Some(settled)) =
+        (hold.state, hold.usage_known, hold.settled_amount)
+    else {
+        return Ok(());
+    };
+    let turns = ledger.prompts_for_hold(&principal(), lane, hold.id)?;
+    if turns.is_empty() || !turns.iter().all(|t| codex_turn_complete(path, t)) {
+        return Ok(());
+    }
+    let (Some(measured), None) = measure_codex_turns(
+        rt,
+        cfg,
+        session_id,
+        &turns,
+        Some(model),
+        Some(path),
+        hold.amount,
+    ) else {
+        return Ok(());
+    };
+    let prefix = format!("codex-trueup:{}|{}|", lp(lane), hold.id.0);
+    let prior =
+        ledger.shared_charges_total_by_key_prefix(&principal(), &prefix, OWNER_POOL_PREFIX)?;
+    let delta = measured.saturating_sub(settled.saturating_add(prior));
+    if delta == 0 {
+        return Ok(());
+    }
+    // The charge books by event time. The hold's creation time falls in the
+    // pool it was admitted into; if the configured zone has changed since,
+    // the two disagree and nothing is booked rather than booking elsewhere.
+    if period_at(cfg, hold.created_at)?.pool_id != hold.pool_id {
+        return Ok(());
+    }
+    let key = format!("{prefix}c{measured}");
+    let event_time = rfc(hold.created_at);
+    book_charge(
+        ledger,
+        rt,
+        state,
+        BookedCharge {
+            session_id: lane,
+            agent_id: None,
+            amount_usd_cents: delta,
+            key: &key,
+            charge_source: ChargeSource::TurnHold,
+            event_time: Some(&event_time),
+            usage_known: true,
+            watermark: None,
+        },
+    )?;
+    Ok(())
+}
+
+/// Handles `SharedBudgetRequest::SettleTurn` (HORO-2283): [`settle_codex_turn`]
+/// and its wire answer. A runtime with no budget file or no Codex marker
+/// answers `NotConfigured` and writes nothing; every other settlement is
+/// reported by its content-free [`CodexSettlement::label`].
+pub fn settle_codex_request(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    session_id: &str,
+    turn_id: &str,
+    model: Option<&str>,
+    transcript_path: Option<&str>,
+) -> Result<(SharedBudgetOutcome, Option<String>), SharedBudgetError> {
+    let settlement = settle_codex_turn(ledger, rt, session_id, turn_id, model, transcript_path)?;
+    Ok(match settlement {
+        CodexSettlement::NotConfigured => (SharedBudgetOutcome::NotConfigured, None),
+        other => {
+            let label = other.label();
+            (
+                SharedBudgetOutcome::CodexTurnSettled {
+                    disposition: label.clone(),
+                },
+                Some(label),
+            )
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn settle_codex_hold(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    state: &SharedBudgetFileState,
+    session_id: &str,
+    lane: &str,
+    turn_id: &str,
+    hold_id: libra_governor_domain::SharedPoolReservationId,
+    model: Option<&str>,
+    transcript_path: Option<&str>,
+) -> Result<CodexSettlement, SharedBudgetError> {
+    let holds = ledger.shared_lane_holds(
+        &principal(),
+        lane,
+        None,
+        ExecutorKind::AgentAbsent,
+        OWNER_POOL_PREFIX,
+    )?;
+    // A pruned hold keeps its prompt mapping but not its row: the turn
+    // settled long ago.
+    let Some(target) = holds.iter().find(|h| h.id == hold_id) else {
+        return Ok(CodexSettlement::AlreadySettled);
+    };
+    if !matches!(
+        target.state,
+        ReservationState::Active | ReservationState::Expired
+    ) {
+        return Ok(CodexSettlement::AlreadySettled);
+    }
+    let mut turns = ledger.prompts_for_hold(&principal(), lane, target.id)?;
+    if !turns.iter().any(|t| t == turn_id) {
+        turns.push(turn_id.to_string());
+    }
+    let (actual, reason) = match state {
+        SharedBudgetFileState::Valid(cfg) => measure_codex_turns(
+            rt,
+            cfg,
+            session_id,
+            &turns,
+            model,
+            transcript_path,
+            target.amount,
+        ),
+        // An invalid file: the pricing it would supply is not trusted.
+        SharedBudgetFileState::Invalid(_) => (None, Some("config_invalid")),
+        SharedBudgetFileState::Absent => return Ok(CodexSettlement::NotConfigured),
+    };
+    if reason.is_some() {
+        rt.note(|t| t.unmeasured_settlements += 1);
+    }
+    let outcome = ledger.settle_shared_with_watermark(
+        target.id,
+        actual,
+        rt.now(),
+        ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+        None,
+    )?;
+    Ok(match outcome {
+        SharedPoolSettleOutcome::Settled {
+            reservation,
+            overrun,
+            ..
+        } => CodexSettlement::Settled {
+            reservation_id: reservation.id,
+            pool_id: reservation.pool_id.0.clone(),
+            hold_usd_cents: reservation.amount,
+            settled_usd_cents: reservation.settled_amount.unwrap_or(reservation.amount),
+            usage_known: reservation.usage_known.unwrap_or(false),
+            overrun_usd_cents: overrun.unwrap_or(0),
+            turns: turns.len().min(MAX_CODEX_HOLD_TURNS),
+            unmeasured_reason: reason,
+        },
+        SharedPoolSettleOutcome::AlreadyFinal(_) | SharedPoolSettleOutcome::NotFound => {
+            CodexSettlement::AlreadySettled
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn charge_unadmitted_codex_turn(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    state: &SharedBudgetFileState,
+    session_id: &str,
+    lane: &str,
+    turn_id: &str,
+    model: Option<&str>,
+    transcript_path: Option<&str>,
+) -> Result<CodexSettlement, SharedBudgetError> {
+    // The hold amount is the fallback charge and only a valid file has one.
+    let SharedBudgetFileState::Valid(cfg) = state else {
+        return Ok(CodexSettlement::Unbooked("config_invalid"));
+    };
+    let hold = cfg.turn_hold_usd_cents;
+    let (measured, reason) = measure_codex_turns(
+        rt,
+        cfg,
+        session_id,
+        &[turn_id.to_string()],
+        model,
+        transcript_path,
+        hold,
+    );
+    let amount = measured.unwrap_or(hold);
+    if amount == 0 {
+        // A measured turn that used no tokens costs nothing; the ledger
+        // refuses a zero charge and a zero row would carry no information.
+        return Ok(CodexSettlement::Unbooked("measured_zero"));
+    }
+    let key = format!("codex-turn:{}|{}", lp(lane), lp(turn_id));
+    let event_time = rfc(rt.now());
+    let outcome = book_charge(
+        ledger,
+        rt,
+        state,
+        BookedCharge {
+            session_id: lane,
+            agent_id: None,
+            amount_usd_cents: amount,
+            key: &key,
+            charge_source: ChargeSource::TurnHold,
+            event_time: Some(&event_time),
+            usage_known: measured.is_some(),
+            watermark: None,
+        },
+    )?;
+    Ok(match outcome {
+        SharedBudgetOutcome::Charged {
+            reservation_id,
+            already_charged,
+            ..
+        } => {
+            if !already_charged {
+                rt.note(|t| {
+                    t.unadmitted_turns += 1;
+                    if reason.is_some() {
+                        t.unmeasured_charges += 1;
+                    }
+                });
+            }
+            CodexSettlement::Unadmitted {
+                reservation_id,
+                charged_usd_cents: amount,
+                usage_known: measured.is_some(),
+                already_charged,
+                unmeasured_reason: reason,
+            }
+        }
+        // The same turn was charged before, at another amount: it is booked
+        // once and never re-priced.
+        SharedBudgetOutcome::Refused {
+            reason: SharedBudgetRefusal::KeyConflict,
+        } => CodexSettlement::Unbooked("already_charged"),
+        SharedBudgetOutcome::Refused { .. } => CodexSettlement::Unbooked("refused"),
+        _ => CodexSettlement::Unbooked("not_booked"),
     })
 }
 
@@ -2005,8 +2856,28 @@ fn remember_swept(rt: &SharedBudgetRuntime, key: (String, String), stamp: (u64, 
     seen.insert(key, stamp);
 }
 
-/// Handles `SharedBudgetRequest::SettleTail` (HORO-2196). See the request.
+/// Handles `SharedBudgetRequest::SettleTail` (HORO-2196) for a
+/// client-supplied `(provider, session_id)`. A Codex lane stays inert.
 pub fn settle_tail(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    session_id: &str,
+    transcript_path: &str,
+    provider: Option<&str>,
+) -> Result<SharedBudgetOutcome, SharedBudgetError> {
+    if matches!(rt.effective().state, SharedBudgetFileState::Absent) {
+        return Ok(SharedBudgetOutcome::NotConfigured);
+    }
+    let lane = match admission_lane(session_id, None, provider, false) {
+        Ok((_, lane)) => lane,
+        Err(outcome) => return Ok(outcome),
+    };
+    settle_tail_on_lane(ledger, rt, &lane, transcript_path)
+}
+
+/// [`settle_tail`] on an already-derived lane key, which is not re-validated
+/// as a client identity.
+pub fn settle_tail_on_lane(
     ledger: &mut LedgerStore,
     rt: &SharedBudgetRuntime,
     session_id: &str,
@@ -2016,7 +2887,7 @@ pub fn settle_tail(
     if matches!(state, SharedBudgetFileState::Absent) {
         return Ok(SharedBudgetOutcome::NotConfigured);
     }
-    if let Err(reason) = validate_identity(session_id, None) {
+    if let Err(reason) = validate_lane_key(session_id) {
         return Ok(refused(reason));
     }
     let cfg = match configured(&state) {
@@ -2225,6 +3096,29 @@ pub fn transcript_ready(
     rt: &SharedBudgetRuntime,
     session_id: &str,
     transcript_path: &str,
+    provider: Option<&str>,
+) -> Result<SharedBudgetOutcome, SharedBudgetError> {
+    match rt.effective().state {
+        SharedBudgetFileState::Absent => return Ok(SharedBudgetOutcome::NotConfigured),
+        SharedBudgetFileState::Invalid(_) => {
+            return Ok(SharedBudgetOutcome::TranscriptReadiness { ready: true })
+        }
+        SharedBudgetFileState::Valid(_) => {}
+    }
+    let lane = match admission_lane(session_id, None, provider, false) {
+        Ok((_, lane)) => lane,
+        Err(outcome) => return Ok(outcome),
+    };
+    transcript_ready_on_lane(ledger, rt, &lane, transcript_path)
+}
+
+/// [`transcript_ready`] on an already-derived lane key, which is not
+/// re-validated as a client identity.
+pub fn transcript_ready_on_lane(
+    ledger: &LedgerStore,
+    rt: &SharedBudgetRuntime,
+    session_id: &str,
+    transcript_path: &str,
 ) -> Result<SharedBudgetOutcome, SharedBudgetError> {
     let state = rt.effective().state;
     let cfg = match &state {
@@ -2234,7 +3128,7 @@ pub fn transcript_ready(
         }
         SharedBudgetFileState::Valid(cfg) => cfg,
     };
-    if let Err(reason) = validate_identity(session_id, None) {
+    if let Err(reason) = validate_lane_key(session_id) {
         return Ok(refused(reason));
     }
     let holds = ledger.shared_lane_holds(
@@ -2404,6 +3298,7 @@ pub fn status(
 /// of `session_id` in the current period's pool, whichever lane it belongs
 /// to (a tool event carries no agent id, so the lane cannot be preferred). Returns how many were renewed. Does nothing -- not even a
 /// ledger read -- unless a valid shared-budget file is loaded.
+/// `session_id` is the lane key, already derived by [`client_lane`].
 pub fn heartbeat(
     ledger: &mut LedgerStore,
     rt: &SharedBudgetRuntime,
@@ -2413,7 +3308,7 @@ pub fn heartbeat(
     let SharedBudgetFileState::Valid(cfg) = &state else {
         return Ok(0);
     };
-    if validate_identity(session_id, None).is_err() {
+    if validate_lane_key(session_id).is_err() {
         return Ok(0);
     }
     let now = rt.now();

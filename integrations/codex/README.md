@@ -38,11 +38,64 @@ hook schemas vs. what remains unverified.
   running the check (a moved binary needs re-trust — see "Trust gate"
   below), and a best-effort read of `~/.codex/config.toml`'s
   `[hooks.state]` trust gate.
-- **No local shared-budget gate (ADR-0026).** Unlike Claude Code, the Codex
-  hook route never sends a shared-budget `Admit`/`Check`, never blocks a
-  prompt and never denies a tool call, whether or not `shared-budget.json`
-  exists. The capability row `shared_budget_admission_gate` is
-  Unavailable for Codex.
+- **Local shared-budget gate: OFF by default, experimental (ADR-0026,
+  HORO-2283).** Unless both `shared-budget.json` and the marker file
+  `<state_dir>/shared-budget.codex` exist (a regular file, contents never
+  read, removing it switches the gate off again), the Codex hook route never
+  sends a shared-budget `Admit`, never sends `SettleTurn`, never blocks a
+  prompt and never denies a tool call. The capability row
+  `shared_budget_admission_gate` stays Unavailable. With the marker present:
+  - `UserPromptSubmit` admits the main-lane turn (`provider:"codex"`,
+    `prompt_id` = the payload's `turn_id`) and prints
+    `{"decision":"block","reason":...}` when the budget is exhausted, invalid,
+    or the daemon cannot be reached or answers unusably. An allowed prompt
+    carries the same one-line soft-limit warning as Claude Code.
+  - A subagent prompt (payload has `agent_id`) is not admitted and is logged.
+  - Combining the marker with `LIBRA_GOVERNOR_CODEX_EXECUTION_OWNER=1` blocks
+    the prompt with an explicit reason; unset one of them.
+  - `Stop` sends `SettleTurn` (`turn_id` + `transcript_path`) before the
+    normal Finalize / owner Stop, waits at most 5 s, prints nothing and never
+    blocks.
+  - There is no `PreToolUse` gate for Codex; a long tool-free turn keeps its
+    hold only until it expires.
+  - Unless `shared-budget.json` carries `pricing_overrides` for the Codex
+    model, every turn settles at the flat per-turn hold (`usage_known=false`).
+  - Known limits: a stale daemon (built before this change, same protocol
+    version 25) silently leaves an enrolled install ungated until it is
+    restarted; a prompt with no `turn_id` is admitted unmapped and its hold
+    just expires after the TTL; subagent prompts and Stops are neither
+    admitted nor settled (known gap); there is no heartbeat, so a turn longer
+    than the 1 h hold expires and is settled later by orphan recovery (C4).
+  - **Codex hooks only run after the operator trusts them in Codex's
+    `/hooks`.** Untrusted (or changed-since-trusted) hooks are skipped by
+    Codex without any signal, so an enrolled but untrusted install is
+    silently **ungated**. `doctor` cannot prove trust (see "Trust gate").
+  - **`doctor` and `shared-budget status` while enrolled (HORO-2285).**
+    With no marker, `doctor` prints nothing Codex-enrolment-related and its
+    output is byte-identical to before. With the marker it adds, by finding id:
+    - `codex_enrolment`: the marker state (Ok), a marker with no
+      `shared-budget.json` (Warn, nothing is enrolled), or the marker together
+      with `LIBRA_GOVERNOR_CODEX_EXECUTION_OWNER` in doctor's own environment
+      (Error, every Codex prompt is blocked);
+    - `codex_enrolled_hooks`: whether the three hooks are wired and the trust
+      state (likely not yet trusted / unknown / disabled), always a Warn
+      because doctor cannot prove trust;
+    - `codex_pricing`: a Warn when no `pricing_overrides` model id starts with
+      `gpt` (every turn then books the flat hold; a Codex model id that does
+      not start with `gpt` is not recognised by this check);
+    - `codex_daemon_admission`: a read-only Codex `Check` with a synthetic
+      session probes the running daemon. `not_configured` is an **Error**
+      ("enrolled but the running daemon is not honouring Codex admission
+      (restart/upgrade the daemon)"), a real answer is Ok, an unreachable
+      daemon stays a Warn and the daemon is never started;
+    - `codex_limits`: the known limits listed above.
+
+    `shared-budget status` swaps the "Codex route has no budget gate" line of
+    its not-covered list for the remaining Codex gaps (subagents, no
+    PreToolUse, no heartbeat, unmapped no-`turn_id` prompts, untrusted hooks
+    ungated, unpriced models at the flat hold). The guarantee label stays
+    `admission-bounded (cooperative)`, and the `agents` capability row stays
+    Unavailable.
 - `libra-governor agents [--json]` — the capability matrix for both
   agents this integration knows about (see "Capability tiers" below).
 
