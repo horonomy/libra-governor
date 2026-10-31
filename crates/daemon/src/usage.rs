@@ -681,6 +681,34 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// A FIFO swapped in after the stat pre-check must be refused on the
+    /// opened handle without blocking the daemon: a plain `File::open` of a
+    /// FIFO with no writer blocks forever. The open runs on a thread with a
+    /// timeout so a regression fails instead of hanging the suite.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_refused_on_the_opened_handle_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("rollout.fifo");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(open_regular_file(&path).map(|_| ()));
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("opening a FIFO must not block");
+        assert_eq!(got, Err(UsageUnavailable::Unreadable));
+    }
+
+    #[test]
+    fn a_regular_file_opens() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        assert!(open_regular_file(f.path()).is_ok());
+    }
+
     fn epoch_plus(secs: i64) -> OffsetDateTime {
         OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(secs)
     }
