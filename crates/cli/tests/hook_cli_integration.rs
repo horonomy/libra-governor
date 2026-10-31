@@ -228,6 +228,49 @@ fn statusline_never_spawns_and_reports_placeholder_when_daemon_is_down() {
     );
 }
 
+/// Privacy regression guard (HORO-2179 / HORO-2303): with a live task whose
+/// session id and agent id are distinctive, neither the legacy statusline
+/// line nor the statusline provider document echoes either of them.
+#[test]
+fn statusline_never_carries_the_session_or_agent_id() {
+    let state_dir = support::DaemonState::new();
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
+    let session_id = "sess-SECRET-0042";
+    let agent_id = "agent-SECRET-0042";
+
+    let payload = serde_json::json!({
+        "session_id": session_id,
+        "agent_id": agent_id,
+        "cwd": repo.path(),
+        "prompt": "fix the bug",
+    })
+    .to_string();
+    let (output, _) = run_hook(state_dir.path(), &payload);
+    assert!(additional_context(&output.stdout).contains("Preflight complete"));
+
+    for args in [&["statusline"][..], &["statusline", "provider"][..]] {
+        let out = Command::new(bin())
+            .args(args)
+            .env("LIBRA_GOVERNOR_STATE_DIR", state_dir.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(!stdout.trim().is_empty(), "{args:?} printed nothing");
+        assert!(!stdout.contains("SECRET"), "{args:?}: {stdout}");
+    }
+
+    // The legacy line is showing the live task, not the "-" placeholder.
+    let line = Command::new(bin())
+        .arg("statusline")
+        .env("LIBRA_GOVERNOR_STATE_DIR", state_dir.path())
+        .output()
+        .unwrap();
+    let line = String::from_utf8(line.stdout).unwrap();
+    assert!(line.starts_with("libra: task "), "{line}");
+}
+
 /// End-to-end: preflight -> tool calls -> stop -> receipt. The
 /// acceptance-critical "full local loop" test (HORO-1126).
 #[test]

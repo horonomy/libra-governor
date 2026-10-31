@@ -895,6 +895,45 @@ mod tests {
         assert!(over_segment.contains(" WARN"), "{over_segment}");
     }
 
+    /// Privacy regression guard (HORO-2179 / HORO-2303): the status the
+    /// segment is built from carries session and agent ids (executor rows and
+    /// soft-limit warnings), but the statusline segment must never echo them.
+    #[test]
+    fn the_segment_never_carries_a_session_or_agent_id() {
+        let mut with_ids = status();
+        with_ids.executors = vec![
+            fixtures::row(
+                "sess-SECRET-1",
+                Some("agent-SECRET-1"),
+                libra_governor_domain::ExecutorKind::Agent,
+                230,
+                1_000,
+            ),
+            fixtures::row(
+                "sess-SECRET-1",
+                None,
+                libra_governor_domain::ExecutorKind::AgentAbsent,
+                0,
+                0,
+            ),
+        ];
+        for (scope, agent) in [
+            (SoftLimitScope::PerSession, None),
+            (SoftLimitScope::PerAgent, Some("agent-SECRET-1".to_string())),
+        ] {
+            with_ids.warnings.push(SoftLimitWarning {
+                scope,
+                session_id: "sess-SECRET-1".into(),
+                agent_id: agent,
+                used_plus_reserved_usd_cents: 600,
+                threshold_usd_cents: 500,
+            });
+        }
+        let segment = statusline_segment(&with_ids).unwrap();
+        assert!(segment.contains(" WARN"), "{segment}");
+        assert!(!segment.contains("SECRET"), "{segment}");
+    }
+
     #[test]
     fn the_segment_says_when_new_sessions_would_be_denied() {
         // The healthy fixture ($487.70 left, $10 hold) carries no marker.
