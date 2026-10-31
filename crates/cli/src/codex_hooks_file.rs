@@ -60,7 +60,15 @@
 //! subcommand invocations this integration documents
 //! (`integrations/codex/README.md`) — see [`OWNED_COMMAND_SUFFIXES`].
 //! Both conditions must hold, so a user's own differently named wrapper
-//! script is never touched.
+//! script is never touched. That loose predicate ([`command_is_ours`])
+//! decides what `remove`, `inspect` and `wired_commands` act on.
+//!
+//! `apply` rewrites a command, so it uses the stricter
+//! [`command_is_ours_for`]: the text before the event's exact suffix must
+//! be a path whose final component is exactly `libra-governor`
+//! (optionally wrapped in one matching pair of hand-written shell quotes),
+//! the same rule as `claude_settings` (HORO-2303). A lookalike such as
+//! `/opt/libra-governor-tools/x codex-hook stop` is never repointed.
 //!
 //! # Trust gate is out of scope for this file
 //!
@@ -194,6 +202,33 @@ fn command_is_ours(command: &str) -> bool {
         && OWNED_COMMAND_SUFFIXES
             .iter()
             .any(|suffix| command.ends_with(suffix))
+}
+
+/// Stricter than [`command_is_ours`]: `command` is `<path> <subcommand>`
+/// where the final component of `<path>` (hand quotes stripped) is exactly
+/// `libra-governor`. Used by `apply` to decide what it may repoint or
+/// collapse; same rule as `claude_settings::command_is_ours`.
+fn command_is_ours_for(command: &str, subcommand: &str) -> bool {
+    command
+        .strip_suffix(subcommand)
+        .map(str::trim_end)
+        .is_some_and(|binary| {
+            let binary = crate::claude_settings::unquote(binary).unwrap_or(binary);
+            Path::new(binary)
+                .file_name()
+                .is_some_and(|name| name == "libra-governor")
+        })
+}
+
+/// `true` when `group` applies to every tool (no matcher, or an empty / `*`
+/// one). Our own groups never carry a matcher; a user's scoped group that
+/// happens to hold our command is left alone.
+fn matcher_is_all_tools(group: &Value) -> bool {
+    match group.get("matcher") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(m)) => m.is_empty() || m == "*",
+        Some(_) => false,
+    }
 }
 
 /// A sha256 over this file's exact bytes at one instant, used only to
@@ -384,7 +419,11 @@ pub struct Applied {
 /// groups, pointing at `binary`, to `path["hooks"]` (see module docs on
 /// why `"hooks"`, not the top level, is where these belong).
 /// Idempotent: an already-present Governor-owned entry is not
-/// duplicated. Never touches any other key (including the sibling
+/// duplicated. A Governor-owned entry pointing at a different binary path
+/// (or hand-quoted) is repointed in place, keeping its group, position,
+/// timeout and any other keys; extra Governor-owned entries for the same
+/// event (left by the pre-HORO-2303 installer) are collapsed into that one.
+/// Entries that are not ours are never touched. Never touches any other key (including the sibling
 /// top-level `description` field, or any foreign hook group). `binary`
 /// should be an absolute path. Writes [`HOOK_TIMEOUT_SECS`] on every
 /// entry and `"async": true` on the `PostToolUse` entry only (it prints
@@ -421,18 +460,58 @@ fn apply_locked(path: &Path, binary: &Path) -> Result<Applied, CodexHooksError> 
                         event: event.to_string(),
                     })?;
 
-            let already_present = entries_arr.iter().any(|matcher| {
-                matcher
-                    .get("hooks")
-                    .and_then(Value::as_array)
-                    .map(|inner| {
-                        inner.iter().any(|h| {
-                            h.get("command").and_then(Value::as_str) == Some(command.as_str())
-                        })
-                    })
-                    .unwrap_or(false)
-            });
-            if !already_present {
+            // Our hook for this event, installed from any path: keep the
+            // first in place (repointed if it points elsewhere) and drop
+            // later ones, so a reinstall from another binary path -- or a
+            // file already doubled by the earlier bug -- ends with exactly
+            // one (HORO-2303). Only a group that applies to every tool
+            // counts; user hooks and lookalikes never pass
+            // `command_is_ours_for`.
+            let mut kept = false;
+            let mut changed = false;
+            let mut emptied_groups = Vec::new();
+            for (idx, group) in entries_arr.iter_mut().enumerate() {
+                if !matcher_is_all_tools(group) {
+                    continue;
+                }
+                let Some(inner) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+                    continue;
+                };
+                let before = inner.len();
+                inner.retain_mut(|h| {
+                    let Some(existing) = h.get("command").and_then(Value::as_str) else {
+                        return true;
+                    };
+                    if existing != command && !command_is_ours_for(existing, subcommand) {
+                        return true;
+                    }
+                    if kept {
+                        changed = true;
+                        return false;
+                    }
+                    kept = true;
+                    if existing != command {
+                        h["command"] = Value::String(command.clone());
+                        changed = true;
+                    }
+                    true
+                });
+                if before > 0 && inner.is_empty() {
+                    emptied_groups.push(idx);
+                }
+            }
+            // Same index-shift rule as `remove`: Codex keys trust by group
+            // index, so a collapsed duplicate's group is dropped only when
+            // it is the tail; otherwise its empty `{"hooks": []}` stays.
+            for idx in emptied_groups.into_iter().rev() {
+                if idx == entries_arr.len() - 1 {
+                    entries_arr.remove(idx);
+                }
+            }
+            if changed {
+                hooks_added += 1;
+            }
+            if !kept {
                 let mut hook_entry = serde_json::json!({
                     "type": "command",
                     "command": command,
@@ -626,10 +705,10 @@ pub fn inspect(path: &Path) -> Inspection {
 /// binary's own path, which can differ from what's on disk (e.g. the
 /// binary moved since `install` last ran; see `doctor`'s own
 /// `wired_command_matches_current_binary` check for that exact case).
-/// If a Governor-owned event has more than one matching command (not
-/// expected in practice — `apply` is idempotent and never duplicates —
-/// but not structurally impossible for a hand-edited file), the first
-/// one found is returned; this is a read-only best-effort lookup, not a
+/// If a Governor-owned event has more than one matching command (a file
+/// written by a pre-HORO-2303 installer reinstalled from another path, or
+/// a hand-edited one; the next `apply` collapses them), the first one
+/// found is returned; this is a read-only best-effort lookup, not a
 /// validator.
 pub fn wired_commands(path: &Path) -> [Option<String>; 3] {
     let mut out: [Option<String>; 3] = Default::default();

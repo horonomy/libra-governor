@@ -217,7 +217,7 @@ fn command_is_ours(command: &str) -> bool {
 /// part (`'/a b/libra-governor'`), or `None` when it is not wrapped in a
 /// matching pair. A user may quote the path by hand so the shell does not
 /// split it (HORO-2303); the quotes are not part of the file name.
-fn unquote(binary: &str) -> Option<&str> {
+pub(crate) fn unquote(binary: &str) -> Option<&str> {
     let inner = binary
         .strip_prefix('\'')
         .and_then(|rest| rest.strip_suffix('\''))
