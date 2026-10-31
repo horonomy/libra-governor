@@ -345,6 +345,44 @@ fn budget_findings_for(
     findings
 }
 
+/// What the Codex enrolment findings are derived from (HORO-2285, C5). Every
+/// field is read-only evidence gathered by [`codex_enrolment_findings`].
+struct CodexEnrolment {
+    marker_present: bool,
+    budget_file_present: bool,
+    owner_route: bool,
+    hooks: codex_hooks_file::Inspection,
+    trust: CodexTrustState,
+    /// `None` when the budget file could not be read as a valid one.
+    gpt_override: Option<bool>,
+    probe: CodexProbe,
+}
+
+/// What a read-only Codex `Check` told us about the running daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexProbe {
+    /// The daemon could not be asked (not running, timed out, errored).
+    Unreachable(String),
+    /// The daemon answered `not_configured` although Codex is enrolled.
+    NotConfigured,
+    /// The daemon gave a real admission answer.
+    Answered(String),
+    /// The daemon refused the provider or the request.
+    Refused(String),
+    /// Anything else.
+    Unexpected(String),
+}
+
+fn classify_codex_probe(
+    _answer: Result<libra_governor_protocol::SharedBudgetOutcome, String>,
+) -> CodexProbe {
+    CodexProbe::Unexpected(String::new())
+}
+
+fn codex_findings_for(_codex: &CodexEnrolment) -> Vec<Finding> {
+    Vec::new()
+}
+
 fn invalid_config_finding(reason: &str) -> Finding {
     Finding {
         id: "shared_budget_config",
@@ -1800,4 +1838,227 @@ mod tests {
         assert!(!finding.message.contains("turn: captured"));
         assert!(!finding.message.contains("task: captured"));
     }
+
+    // ---- HORO-2285 (C5): Codex enrolment findings ----
+
+    fn enrolled() -> CodexEnrolment {
+        CodexEnrolment {
+            marker_present: true,
+            budget_file_present: true,
+            owner_route: false,
+            hooks: codex_hooks_file::Inspection {
+                file_present: true,
+                hooks_wired: [true; 3],
+            },
+            trust: CodexTrustState::LikelyNotYetTrusted,
+            gpt_override: Some(true),
+            probe: CodexProbe::Answered("available".to_string()),
+        }
+    }
+
+    fn by_id<'a>(findings: &'a [Finding], id: &str) -> &'a Finding {
+        findings
+            .iter()
+            .find(|f| f.id == id)
+            .unwrap_or_else(|| panic!("no {id} finding in {findings:?}"))
+    }
+
+    #[test]
+    fn no_marker_means_no_codex_enrolment_finding_at_all() {
+        let mut codex = enrolled();
+        codex.marker_present = false;
+        assert!(codex_findings_for(&codex).is_empty());
+        // Nothing else in the Codex state matters without the marker.
+        codex.owner_route = true;
+        codex.probe = CodexProbe::NotConfigured;
+        assert!(codex_findings_for(&codex).is_empty());
+    }
+
+    #[test]
+    fn a_marker_without_a_budget_file_warns_that_nothing_is_enrolled() {
+        let mut codex = enrolled();
+        codex.budget_file_present = false;
+        let findings = codex_findings_for(&codex);
+        let f = by_id(&findings, "codex_enrolment");
+        assert_eq!(f.severity, Severity::Warn, "{f:?}");
+        assert!(f.message.contains("shared-budget.json"), "{f:?}");
+        assert!(f.message.contains("not enrolled"), "{f:?}");
+    }
+
+    #[test]
+    fn an_enrolled_install_reports_the_marker_state_and_stays_experimental() {
+        let findings = codex_findings_for(&enrolled());
+        let f = by_id(&findings, "codex_enrolment");
+        assert_eq!(f.severity, Severity::Ok, "{f:?}");
+        assert!(f.message.contains("shared-budget.codex"), "{f:?}");
+        assert!(f.message.contains("enrolled"), "{f:?}");
+        assert!(f.message.contains("experimental"), "{f:?}");
+    }
+
+    #[test]
+    fn owner_route_together_with_the_marker_is_an_error() {
+        let mut codex = enrolled();
+        codex.owner_route = true;
+        let findings = codex_findings_for(&codex);
+        let f = by_id(&findings, "codex_enrolment");
+        assert_eq!(f.severity, Severity::Error, "{f:?}");
+        assert!(
+            f.message.contains("LIBRA_GOVERNOR_CODEX_EXECUTION_OWNER"),
+            "{f:?}"
+        );
+        assert!(f.message.contains("blocked"), "{f:?}");
+    }
+
+    #[test]
+    fn hooks_and_trust_are_reported_and_never_claimed_trusted() {
+        let cases = [
+            (CodexTrustState::LikelyNotYetTrusted, "likely not yet trusted"),
+            (CodexTrustState::Unknown("no proof".into()), "unknown"),
+            (CodexTrustState::HooksDisabled, "disabled"),
+        ];
+        for (trust, needle) in cases {
+            let mut codex = enrolled();
+            codex.trust = trust;
+            let findings = codex_findings_for(&codex);
+            let f = by_id(&findings, "codex_enrolled_hooks");
+            assert_eq!(f.severity, Severity::Warn, "{f:?}");
+            assert!(f.message.contains(needle), "{needle}: {f:?}");
+            assert!(f.message.contains("/hooks"), "{f:?}");
+            assert!(!f.message.contains("hooks are trusted"), "{f:?}");
+        }
+    }
+
+    #[test]
+    fn unwired_codex_hooks_under_enrolment_warn_that_nothing_is_gated() {
+        let mut codex = enrolled();
+        codex.hooks = codex_hooks_file::Inspection {
+            file_present: true,
+            hooks_wired: [true, false, true],
+        };
+        let findings = codex_findings_for(&codex);
+        let f = by_id(&findings, "codex_enrolled_hooks");
+        assert_eq!(f.severity, Severity::Warn, "{f:?}");
+        assert!(f.message.contains("install --agent codex"), "{f:?}");
+        assert!(f.message.contains("ungated"), "{f:?}");
+    }
+
+    #[test]
+    fn no_gpt_pricing_override_warns_that_every_turn_books_the_flat_hold() {
+        for gpt_override in [Some(false)] {
+            let mut codex = enrolled();
+            codex.gpt_override = gpt_override;
+            let findings = codex_findings_for(&codex);
+            let f = by_id(&findings, "codex_pricing");
+            assert_eq!(f.severity, Severity::Warn, "{f:?}");
+            assert!(f.message.contains("pricing_overrides"), "{f:?}");
+            assert!(f.message.contains("flat"), "{f:?}");
+        }
+        let findings = codex_findings_for(&enrolled());
+        assert_eq!(by_id(&findings, "codex_pricing").severity, Severity::Ok);
+    }
+
+    #[test]
+    fn an_unreadable_budget_file_makes_no_pricing_claim() {
+        let mut codex = enrolled();
+        codex.gpt_override = None;
+        let findings = codex_findings_for(&codex);
+        assert!(findings.iter().all(|f| f.id != "codex_pricing"), "{findings:?}");
+    }
+
+    #[test]
+    fn a_daemon_that_answers_codex_check_not_configured_is_an_error() {
+        let mut codex = enrolled();
+        codex.probe = CodexProbe::NotConfigured;
+        let findings = codex_findings_for(&codex);
+        let f = by_id(&findings, "codex_daemon_admission");
+        assert_eq!(f.severity, Severity::Error, "{f:?}");
+        assert!(
+            f.message.contains(
+                "enrolled but the running daemon is not honouring Codex admission \
+                 (restart/upgrade the daemon)"
+            ),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_daemon_stays_a_warning_and_a_real_answer_is_ok() {
+        let mut codex = enrolled();
+        codex.probe = CodexProbe::Unreachable("no socket".into());
+        let findings = codex_findings_for(&codex);
+        assert_eq!(
+            by_id(&findings, "codex_daemon_admission").severity,
+            Severity::Warn
+        );
+
+        codex.probe = CodexProbe::Answered("exhausted".into());
+        let findings = codex_findings_for(&codex);
+        assert_eq!(
+            by_id(&findings, "codex_daemon_admission").severity,
+            Severity::Ok
+        );
+    }
+
+    #[test]
+    fn probe_answers_are_classified() {
+        use libra_governor_protocol::{
+            SharedBudgetCheckState, SharedBudgetDenyReason, SharedBudgetOutcome,
+            SharedBudgetRefusal,
+        };
+        assert_eq!(
+            classify_codex_probe(Ok(SharedBudgetOutcome::NotConfigured)),
+            CodexProbe::NotConfigured
+        );
+        assert!(matches!(
+            classify_codex_probe(Ok(SharedBudgetOutcome::Checked {
+                state: SharedBudgetCheckState::Available,
+                remaining_usd_cents: 5_000,
+                period_end: "2027-02-01T00:00:00Z".into(),
+            })),
+            CodexProbe::Answered(_)
+        ));
+        assert!(matches!(
+            classify_codex_probe(Ok(SharedBudgetOutcome::Denied {
+                reason: SharedBudgetDenyReason::ConfigInvalid,
+                remaining_usd_cents: None,
+                period_end: None,
+                detail: None,
+            })),
+            CodexProbe::Answered(_)
+        ));
+        assert!(matches!(
+            classify_codex_probe(Ok(SharedBudgetOutcome::Refused {
+                reason: SharedBudgetRefusal::UnsupportedProvider
+            })),
+            CodexProbe::NotConfigured
+        ));
+        assert!(matches!(
+            classify_codex_probe(Ok(SharedBudgetOutcome::Refused {
+                reason: SharedBudgetRefusal::EmptySessionId
+            })),
+            CodexProbe::Refused(_)
+        ));
+        assert!(matches!(
+            classify_codex_probe(Err("did not answer".into())),
+            CodexProbe::Unreachable(_)
+        ));
+    }
+
+    #[test]
+    fn enrolled_doctor_names_the_known_limits() {
+        let findings = codex_findings_for(&enrolled());
+        let f = by_id(&findings, "codex_limits");
+        assert_eq!(f.severity, Severity::Ok, "{f:?}");
+        for needle in [
+            "no heartbeat",
+            "subagent",
+            "turn_id",
+            "unmapped",
+            "PreToolUse",
+            "/hooks",
+        ] {
+            assert!(f.message.contains(needle), "{needle}: {f:?}");
+        }
+    }
+
 }
