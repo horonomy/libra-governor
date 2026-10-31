@@ -938,6 +938,24 @@ The executor key in this ADR is `(host_id, provider, session_id, agent_id | null
 - The model is the host's claim in the `Stop` payload (the rollout has none), and the rollout is a file any same-user process can write; the amount a measured turn books is therefore bounded by what the host reports, exactly as for Claude.
 - Telemetry: `unadmitted_turns` counts post-hoc Codex charges in daemon memory. It is not yet a field of `SharedBudgetStatus`; exposing it needs an additive protocol field.
 
+### Codex orphan recovery and true-up (HORO-2284, C4, v0.0.5, dark)
+
+Both run inside `settle_codex_turn`, after the `Stop`'s own outcome and behind the same budget-file and marker gate, so with the marker absent neither reads nor writes anything. Neither changes the result of the `Stop` that triggers it; a recovery step that cannot complete is retried idempotently at the lane's next settle.
+
+- **Orphan recovery.** A hold whose `Stop` never arrived (Codex killed) expires after an hour and keeps its prompt mapping. At the lane's next settle every `expired`, unsettled hold with a mapping is settled late, in its own row and period, by its own turn ids: the measured cents, else the hold amount with `usage_known=false`. Never zero. At most 16 per settle; the rest wait for the next one.
+- **True-up.** The final `token_usage_record` can still sit in Codex's writer queue when `Stop` settles, so a measured hold can settle short (undetectable by the reader). At the next settle the lane's newest settled hold with `usage_known=true` is measured again, provided every turn mapped to it now has a `task_complete` line. The delta `measured - (settled_amount + prior true-ups)` is booked as a charge keyed `codex-trueup:<lane>|<hold id>|c<cumulative cents>`. The baseline sums every true-up already booked for the hold by key prefix across periods, plus what a prune folded into `shared_charge_floor`. A smaller measurement books nothing; nothing is ever refunded; a replay books 0. The Codex reader is keyed by `turn_id` and has no timestamp watermark, so the objection that rejected reconciliation for Claude does not apply.
+- **Key identity.** The key names the hold's row id, not a turn id: a turn that joined the hold later (a smaller id sorting first) would otherwise change the key and let a replay book twice.
+- **Prune.** The `codex-trueup:` family (prefix up to the last `|`) is folded into `shared_charge_floor` in the prune transaction, exactly as `subagent-transcript:` is. The `subagent-transcript:` filter and every other row are unchanged.
+
+Residuals, disclosed:
+
+- **Period.** A true-up books to the pool the hold was admitted into, even when that month has since closed, because that is the period the spend ran in; it can therefore add spend to an already-closed month's totals. It is skipped, writing nothing, when the hold row or its pool has been pruned, or when the configured zone has changed so that the hold's creation time no longer maps to its pool. C2's post-hoc charge for an unadmitted turn still books at settle time (the deviation recorded above, unchanged).
+- A hold that settled at the flat hold amount (`usage_known=false`, including every Codex turn while no `gpt-*` price is configured) is never trued up. It stays at the flat hold; a true-up never refunds a flat hold that was larger than the real spend.
+- A record flushed after the last settle of a lane, or after the hold's row was pruned, is never booked.
+- The last turn of a killed session that is never resumed stays unsettled: the under-count is bounded by its real spend (the same class as Claude's killed-host residual).
+- Only the lane's newest measured settled hold is re-measured per settle; an older hold with a late record that was not the newest at the time of a settle is not trued up.
+- The model and rollout path used are the `Stop` payload's, host-claimed as for the settlement itself.
+
 ## Consequences
 
 - Once slices S4-S8 land (design intent), refusal before spend at prompt
