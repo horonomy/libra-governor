@@ -1627,4 +1627,30 @@ mod tests {
         }
         assert!(!path.exists());
     }
+
+    /// v0.0.4 wrote `{current_exe} {sub}` with no path check and recognised
+    /// any command containing `libra-governor`, so a parenthesised or
+    /// apostrophe directory is a real upgrade case: uninstall must still
+    /// remove it, install must not rewrite it.
+    #[test]
+    fn a_v004_style_command_with_parens_and_apostrophe_is_removed_by_uninstall_but_not_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let old = "/Users/o'neil/Tools (old)/libra-governor codex-hook stop";
+        let seed = serde_json::json!({ "hooks": { "Stop": [
+            { "hooks": [{ "type": "command", "command": old }] }
+        ] } });
+        std::fs::write(&path, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+        assert!(command_is_ours(old));
+        assert!(!command_is_ours_for(old, "codex-hook stop"));
+
+        apply(&path, &binary()).unwrap();
+        assert_eq!(
+            read_value(&path)["hooks"]["Stop"][0],
+            seed["hooks"]["Stop"][0]
+        );
+
+        remove(&path).unwrap();
+        assert!(read_value(&path).get("hooks").is_none());
+    }
 }

@@ -209,18 +209,91 @@ fn is_plain_token(binary: &str) -> bool {
     !binary.is_empty() && !has_shell_unsafe_char(binary) && !binary.starts_with('~')
 }
 
-/// What installers before PR 242 wrote: an absolute path whose only
-/// shell-significant character is a plain space, with no `VAR=x` or `-flag`
-/// word (which would mean an `env`/option prefix around someone else's
-/// command).
-fn is_legacy_unquoted_space_path(binary: &str) -> bool {
-    binary.starts_with('/')
-        && !binary.contains(|c: char| {
-            c != ' ' && (c.is_whitespace() || "\"'\\$`;&|<>()*?[]{}!#^~".contains(c))
-        })
+/// Programs that run another command given as arguments. A legacy-looking
+/// `<launcher> ... /p/libra-governor <suffix>` is someone else's command.
+const LAUNCHER_BASENAMES: &[&str] = &[
+    "env",
+    "sudo",
+    "doas",
+    "su",
+    "runuser",
+    "nice",
+    "ionice",
+    "nohup",
+    "time",
+    "timeout",
+    "stdbuf",
+    "xargs",
+    "exec",
+    "command",
+    "builtin",
+    "eval",
+    "setsid",
+    "caffeinate",
+    "arch",
+    "taskpolicy",
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "ksh",
+    "fish",
+    "watch",
+    "strace",
+    "ltrace",
+    "chroot",
+    "flock",
+    "nsenter",
+    "parallel",
+    "unbuffer",
+    "script",
+    "firejail",
+    "sandbox-exec",
+    "systemd-run",
+    "open",
+    "osascript",
+];
+
+const SYSTEM_BIN_DIRS: &[&str] = &[
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
+];
+
+/// What installers before PR 242 (Claude) and before HORO-2303 (Codex, which
+/// never checked the path) wrote: `current_exe()` pasted unquoted. An absolute
+/// path that may hold spaces and benign punctuation (`'`, `(`, `)`, ...) but
+/// nothing that can chain, redirect, substitute or break a command
+/// (`; & | < > $` backtick, control characters). It is rejected when it looks
+/// like a launcher around someone else's command: a first word that is a
+/// known launcher or lives in a system bin dir, any later word starting with
+/// `/`, or a `VAR=x` / `-flag` word.
+fn is_legacy_unquoted_path(binary: &str) -> bool {
+    if !binary.starts_with('/')
+        || binary.contains(|c: char| c.is_control() || ";&|<>$`".contains(c))
+    {
+        return false;
+    }
+    let mut words = binary.split(' ');
+    let first = words.next().unwrap_or_default();
+    let first_path = Path::new(first);
+    let launcher = first_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| LAUNCHER_BASENAMES.contains(&n));
+    let system_dir = first_path
+        .parent()
+        .and_then(|d| d.to_str())
+        .is_some_and(|d| SYSTEM_BIN_DIRS.contains(&d));
+    !launcher
+        && !system_dir
         && !binary
             .split(' ')
             .any(|word| word.contains('=') || word.starts_with('-'))
+        && !words.any(|word| word.starts_with('/'))
 }
 
 /// The one ownership rule shared by the Claude and Codex installers.
@@ -235,10 +308,8 @@ fn is_legacy_unquoted_space_path(binary: &str) -> bool {
 /// - or wrapped whole in ONE matching pair of hand-written quotes
 ///   (HORO-2303, PR 274), whose content a shell would pass as one word.
 ///
-/// `allow_legacy_unquoted_space` additionally accepts what installers before
-/// PR 242 wrote: an unquoted absolute path containing spaces and nothing
-/// else shell-significant (no `=` or `-` led word, which would mean an
-/// `env VAR=x`/flag prefix). It is `true` only for the read/remove side
+/// `allow_legacy_unquoted_space` additionally accepts what older installers
+/// pasted unquoted (see [`is_legacy_unquoted_path`]). It is `true` only for the read/remove side
 /// (`remove`, `inspect`, `doctor`) so Libra's own old hooks are still found
 /// and removed; install passes `false` and so never rewrites or deletes a
 /// command that is not unambiguously ours.
@@ -250,23 +321,27 @@ pub(crate) fn command_is_ours_with_suffix(
     let Some(before) = command.strip_suffix(suffix) else {
         return false;
     };
-    if !before.ends_with(char::is_whitespace) {
+    if !before.ends_with([' ', '\t']) {
         return false;
     }
-    let binary = before.trim_end();
+    let binary = before.trim_end_matches([' ', '\t']);
     let path = if let Some(inner) = unquote(binary) {
         if !is_hand_quoted_and_runnable(binary) || inner.contains(['\n', '\t']) {
             return false;
         }
         inner
     } else if is_plain_token(binary)
-        || (allow_legacy_unquoted_space && is_legacy_unquoted_space_path(binary))
+        || (allow_legacy_unquoted_space && is_legacy_unquoted_path(binary))
     {
         binary
     } else {
         return false;
     };
-    !path.ends_with('/')
+    // A bare `libra-governor` (PATH lookup) was written by an early legacy
+    // install, so uninstall still removes it; the strict install rule never
+    // treats it as ours (current installers always write an absolute path).
+    (path.contains('/') || allow_legacy_unquoted_space)
+        && !path.ends_with('/')
         && Path::new(path)
             .file_name()
             .is_some_and(|name| name == "libra-governor")
@@ -508,7 +583,7 @@ pub fn apply_hooks_only(path: &Path, binary: &Path) -> Result<Applied, SettingsE
 /// split or interpreted instead of naming one program.
 pub(crate) fn has_shell_unsafe_char(text: &str) -> bool {
     text.chars()
-        .any(|c| c.is_whitespace() || "\"'\\$`;&|<>()*?[]{}!#^".contains(c))
+        .any(|c| c.is_whitespace() || c.is_control() || "\"'\\$`;&|<>()*?[]{}!#^".contains(c))
 }
 
 /// A command `command_is_ours` recognises whose binary part the shell would
@@ -1978,5 +2053,70 @@ mod tests {
         remove(&path).unwrap();
         let root: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(root["hooks"]["Stop"], Value::Array(groups));
+    }
+
+    /// The legacy (read/remove-side) rule is narrow: launcher-wrapped commands
+    /// are never ours, a real spaced install path still is.
+    #[test]
+    fn the_legacy_rule_rejects_launcher_wrapped_commands_and_keeps_real_spaced_paths() {
+        let sub = "hook stop";
+        for rejected in [
+            format!("/usr/bin/env FOO bar /p/libra-governor {sub}"),
+            format!("/usr/bin/env /p/libra-governor {sub}"),
+            format!("/usr/bin/nohup /p/libra-governor {sub}"),
+            format!("/usr/bin/time /p/libra-governor {sub}"),
+            format!("/usr/bin/timeout 5 /p/libra-governor {sub}"),
+            format!("/usr/bin/sudo /p/libra-governor {sub}"),
+            format!("/opt/tools/nice -n5 /p/libra-governor {sub}"),
+            format!("/opt/my tools/xargs /p/libra-governor {sub}"),
+            format!("/opt/homebrew/bin/foo bar/libra-governor {sub}"),
+            format!("/opt/my tools -x/libra-governor {sub}"),
+            format!("/opt/my X=1/libra-governor {sub}"),
+            format!("/opt/my tool; rm x/libra-governor {sub}"),
+            format!("/opt/my tool $(x)/libra-governor {sub}"),
+            format!("/opt/my tool\u{0}x/libra-governor {sub}"),
+        ] {
+            assert!(!command_is_ours(&rejected), "{rejected}");
+        }
+        for accepted in [
+            format!("/Users/me/My Tools/bin/libra-governor {sub}"),
+            format!("/Users/me/Tools (old)/it's/libra-governor {sub}"),
+        ] {
+            assert!(command_is_ours(&accepted), "{accepted}");
+            assert!(
+                !command_is_ours_with_suffix(&accepted, sub, false),
+                "{accepted}"
+            );
+        }
+    }
+
+    #[test]
+    fn separator_must_be_space_or_tab_and_a_bare_name_or_control_char_is_not_ours() {
+        let sub = "hook stop";
+        assert!(command_is_ours_with_suffix(
+            "/p/libra-governor\thook stop",
+            sub,
+            false
+        ));
+        for rejected in [
+            "/p/libra-governor\nhook stop".to_string(),
+            "/p/libra-governor\u{a0}hook stop".to_string(),
+            "/p/libra\u{0}-governor hook stop".to_string(),
+        ] {
+            assert!(!command_is_ours(&rejected), "{rejected:?}");
+        }
+        assert!(!command_is_ours_with_suffix(
+            "'libra-governor' hook stop",
+            sub,
+            false
+        ));
+        assert!(command_is_ours("libra-governor hook stop"));
+        assert!(!command_is_ours_with_suffix(
+            "libra-governor hook stop",
+            sub,
+            false
+        ));
+        assert!(has_shell_unsafe_char("/p/a\u{0}b"));
+        assert!(has_shell_unsafe_char("/p/a\u{7}b"));
     }
 }
