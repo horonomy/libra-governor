@@ -938,6 +938,13 @@ The executor key in this ADR is `(host_id, provider, session_id, agent_id | null
 - The model is the host's claim in the `Stop` payload (the rollout has none), and the rollout is a file any same-user process can write; the amount a measured turn books is therefore bounded by what the host reports, exactly as for Claude.
 - Telemetry: `unadmitted_turns` counts post-hoc Codex charges in daemon memory. It is not yet a field of `SharedBudgetStatus`; exposing it needs an additive protocol field.
 
+### Codex hook wiring (HORO-2283, C3, v0.0.5, dark)
+
+- The Codex hooks gate only when `shared-budget.json` **and** the marker `<state_dir>/shared-budget.codex` exist (hook and daemon each stat the marker; a symlink does not count). Without the marker the hooks send no `Admit` and no `SettleTurn` and the daemon answers every Codex-provider request `not_configured` with no write, so Codex behaviour is unchanged. Claude Code hooks and wire bytes are untouched.
+- Daemon: a Codex `Admit` / `Check` is honoured only while the marker exists (`admission_lane` takes the runtime's answer; `ChargeAgent`, `SettleTail` and `TranscriptReady` stay inert for Codex). New additive request `SettleTurn { session_id, turn_id, model?, transcript_path? }` dispatches to `settle_codex_turn`; its answer is `not_configured` (no write) or `codex_turn_settled { disposition }`, a log label. `PROTOCOL_VERSION` stays 25: a v25 daemon built before this change rejects `SettleTurn` as malformed (the hook logs and moves on) and answers a Codex `Admit` `not_configured`, so after upgrading an enrolled install must restart a long-lived daemon to be gated.
+- Hook: `prompt_id := turn_id`; a block uses the Claude block JSON. Fail-closed rows are the Claude rows (daemon unreachable, unusable answer). A blank or reserved session is skipped; a subagent prompt (`agent_id`) is not admitted and is logged; marker + `LIBRA_GOVERNOR_CODEX_EXECUTION_OWNER=1` blocks with an explicit reason. `Stop` sends `SettleTurn` before Finalize / owner Stop, within 5 s, never printing and never blocking, and skips a subagent, a payload with no `turn_id` and a bad session.
+- Codex hooks run only after the operator trusts them in Codex's `/hooks`; untrusted hooks are skipped silently and leave an enrolled install ungated.
+
 ## Consequences
 
 - Once slices S4-S8 land (design intent), refusal before spend at prompt

@@ -38,11 +38,32 @@ hook schemas vs. what remains unverified.
   running the check (a moved binary needs re-trust — see "Trust gate"
   below), and a best-effort read of `~/.codex/config.toml`'s
   `[hooks.state]` trust gate.
-- **No local shared-budget gate (ADR-0026).** Unlike Claude Code, the Codex
-  hook route never sends a shared-budget `Admit`/`Check`, never blocks a
-  prompt and never denies a tool call, whether or not `shared-budget.json`
-  exists. The capability row `shared_budget_admission_gate` is
-  Unavailable for Codex.
+- **Local shared-budget gate: OFF by default, experimental (ADR-0026,
+  HORO-2283).** Unless both `shared-budget.json` and the marker file
+  `<state_dir>/shared-budget.codex` exist (a regular file, contents never
+  read, removing it switches the gate off again), the Codex hook route never
+  sends a shared-budget `Admit`, never sends `SettleTurn`, never blocks a
+  prompt and never denies a tool call. The capability row
+  `shared_budget_admission_gate` stays Unavailable. With the marker present:
+  - `UserPromptSubmit` admits the main-lane turn (`provider:"codex"`,
+    `prompt_id` = the payload's `turn_id`) and prints
+    `{"decision":"block","reason":...}` when the budget is exhausted, invalid,
+    or the daemon cannot be reached or answers unusably. An allowed prompt
+    carries the same one-line soft-limit warning as Claude Code.
+  - A subagent prompt (payload has `agent_id`) is not admitted and is logged.
+  - Combining the marker with `LIBRA_GOVERNOR_CODEX_EXECUTION_OWNER=1` blocks
+    the prompt with an explicit reason; unset one of them.
+  - `Stop` sends `SettleTurn` (`turn_id` + `transcript_path`) before the
+    normal Finalize / owner Stop, waits at most 5 s, prints nothing and never
+    blocks.
+  - There is no `PreToolUse` gate for Codex; a long tool-free turn keeps its
+    hold only until it expires.
+  - Unless `shared-budget.json` carries `pricing_overrides` for the Codex
+    model, every turn settles at the flat per-turn hold (`usage_known=false`).
+  - **Codex hooks only run after the operator trusts them in Codex's
+    `/hooks`.** Untrusted (or changed-since-trusted) hooks are skipped by
+    Codex without any signal, so an enrolled but untrusted install is
+    silently **ungated**. `doctor` cannot prove trust (see "Trust gate").
 - `libra-governor agents [--json]` — the capability matrix for both
   agents this integration knows about (see "Capability tiers" below).
 
