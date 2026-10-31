@@ -402,7 +402,7 @@ fn ends_with_newline(path: &Path) -> Result<bool, UsageUnavailable> {
     use std::io::{Read, Seek, SeekFrom};
 
     super::reject_non_regular_file(path)?;
-    let mut file = std::fs::File::open(path).map_err(|_| UsageUnavailable::Unreadable)?;
+    let mut file = super::open_regular_file(path)?;
     let len = file
         .seek(SeekFrom::End(0))
         .map_err(|_| UsageUnavailable::Unreadable)?;

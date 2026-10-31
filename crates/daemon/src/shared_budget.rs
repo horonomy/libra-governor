@@ -68,10 +68,11 @@ use libra_governor_protocol::{
 use crate::shared_budget_file::{
     ConfigDrift, LoadedSharedBudget, SharedBudgetConfig, SharedBudgetFileState, SoftLimits,
 };
+use crate::usage::codex_priced::price_codex_turn;
 use crate::usage::priced::{
     observe_priced, PricedObservation, ReadMode, BUDGET_SCAN_CAP_BYTES, FUTURE_SKEW,
 };
-use crate::usage::UsageUnavailable;
+use crate::usage::{observe_codex_turn, UsageObservation, UsageUnavailable};
 
 /// How long a turn hold lives without a heartbeat. Each tool event renews
 /// it, so only an abandoned turn (a crash, a kill) ever waits this out.
@@ -90,6 +91,17 @@ pub const PROVIDER_LANE_PREFIX: &str = "shared-budget-provider-v1:";
 const CLAUDE_PROVIDER: &str = "claude-code";
 /// The one other provider the budget derives a lane for.
 const CODEX_PROVIDER: &str = "codex";
+/// The file whose presence in the state directory enrols Codex in the budget
+/// (HORO-2282). Absent, every Codex settlement is `not_configured` and writes
+/// nothing. Its contents are never read.
+pub const CODEX_MARKER_FILE_NAME: &str = "shared-budget.codex";
+/// Most turns one Codex hold is measured over. A hold normally maps 1-3 turns
+/// (a re-prompt renews it), but a hold lives an hour and each tool event renews
+/// it, so a re-prompt storm could name many more. Each turn is one backward
+/// rollout scan of up to `BUDGET_SCAN_CAP_BYTES`, so this bounds the work of
+/// one settlement to 16 scans. Past it the first turns are measured and the
+/// hold settles at `max(priced_sum, hold)` labelled `scan_cap_reached`.
+const MAX_CODEX_HOLD_TURNS: usize = 16;
 
 /// A source of "now". Injectable so rollover and timezone-boundary tests
 /// are deterministic without sleeping.
@@ -181,6 +193,8 @@ struct Telemetry {
     foreign_lines: u64,
     sweep_deferred_files: u64,
     future_timestamps: u64,
+    /// Codex turns charged after the fact because no hold was mapped to them.
+    unadmitted_turns: u64,
 }
 
 /// A model id from a transcript, reduced to a safe, bounded display token:
@@ -247,6 +261,30 @@ impl SharedBudgetRuntime {
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// Whether the Codex marker file (`<state_dir>/shared-budget.codex`) is
+    /// present right now. Stat on every call, so removing the file switches
+    /// Codex settlement off from the next request. A runtime with no state
+    /// directory is never enrolled; a symlink does not count.
+    pub fn codex_enrolled(&self) -> bool {
+        self.loaded
+            .path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .is_some_and(|dir| {
+                std::fs::symlink_metadata(dir.join(CODEX_MARKER_FILE_NAME))
+                    .is_ok_and(|m| m.is_file())
+            })
+    }
+
+    /// Codex turns booked post-hoc since the daemon started (volatile, like
+    /// every settlement counter; the durable record is the ledger row).
+    pub fn unadmitted_turns(&self) -> u64 {
+        self.telemetry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unadmitted_turns
     }
 
     /// The configuration as read at daemon start.
@@ -1637,6 +1675,409 @@ pub fn settle_turn(
         SharedPoolSettleOutcome::AlreadyFinal(_) | SharedPoolSettleOutcome::NotFound => {
             TurnSettlement::AlreadySettled
         }
+    })
+}
+
+/// What settling a Codex `Stop` did (HORO-2282). Content-free: it is logged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexSettlement {
+    /// No budget file, or Codex is not enrolled (no marker): nothing was read
+    /// or written.
+    NotConfigured,
+    /// The session id is empty or reserved, or the turn id is empty or too
+    /// long to have been recorded: there is nothing to settle or key a
+    /// charge on.
+    NotApplicable,
+    /// The turn's mapped hold settled.
+    Settled {
+        reservation_id: libra_governor_domain::SharedPoolReservationId,
+        pool_id: String,
+        hold_usd_cents: u64,
+        settled_usd_cents: u64,
+        /// False when the hold amount was settled because the turns could
+        /// not be measured and priced.
+        usage_known: bool,
+        /// How far the settled amount exceeds the hold (never clamped).
+        overrun_usd_cents: u64,
+        /// How many turns of the hold were measured.
+        turns: usize,
+        /// Why the hold was not (fully) measured; `None` when it was.
+        unmeasured_reason: Option<&'static str>,
+    },
+    /// The turn's hold is already final (a replayed `Stop`), or its row has
+    /// been pruned: nothing was written.
+    AlreadySettled,
+    /// No hold was mapped to the turn, so it was charged after the fact under
+    /// `codex-turn:<lane>|<turn>`. A pending hold of another turn is never
+    /// touched.
+    Unadmitted {
+        reservation_id: libra_governor_domain::SharedPoolReservationId,
+        charged_usd_cents: u64,
+        usage_known: bool,
+        /// True when this turn was already charged (a retry): no new row.
+        already_charged: bool,
+        unmeasured_reason: Option<&'static str>,
+    },
+    /// An unadmitted turn that was not charged, and why.
+    Unbooked(&'static str),
+}
+
+impl CodexSettlement {
+    /// A short, content-free label for the daemon log.
+    pub fn label(&self) -> String {
+        match self {
+            Self::NotConfigured => "shared budget: codex not enrolled".to_string(),
+            Self::NotApplicable => "shared budget: codex turn not applicable".to_string(),
+            Self::AlreadySettled => "shared budget: codex hold already settled".to_string(),
+            Self::Unbooked(why) => {
+                format!("shared budget: codex unadmitted turn not charged ({why})")
+            }
+            Self::Settled {
+                hold_usd_cents,
+                settled_usd_cents,
+                usage_known,
+                overrun_usd_cents,
+                turns,
+                unmeasured_reason,
+                ..
+            } => format!(
+                "shared budget: codex settled {settled_usd_cents}c of {hold_usd_cents}c hold \
+                 over {turns} turn(s) (usage_known={usage_known}, overrun={overrun_usd_cents}c, \
+                 reason={})",
+                unmeasured_reason.unwrap_or("measured")
+            ),
+            Self::Unadmitted {
+                charged_usd_cents,
+                usage_known,
+                already_charged,
+                unmeasured_reason,
+                ..
+            } => format!(
+                "shared budget: codex unadmitted turn charged {charged_usd_cents}c \
+                 (usage_known={usage_known}, already={already_charged}, reason={})",
+                unmeasured_reason.unwrap_or("measured")
+            ),
+        }
+    }
+}
+
+/// The label an unmeasurable Codex turn is flagged with. The same spellings
+/// the Claude settlement uses.
+fn codex_unavailable_reason(why: UsageUnavailable) -> &'static str {
+    match why {
+        UsageUnavailable::NoTranscriptPath => "no_transcript_path",
+        UsageUnavailable::Unreadable => "transcript_unreadable",
+        UsageUnavailable::ScanCapReached => "scan_cap_reached",
+        UsageUnavailable::NoUsageInWindow => "no_usage_in_window",
+        UsageUnavailable::TurnIncomplete | UsageUnavailable::Inconsistent => {
+            "transcript_inconsistent"
+        }
+    }
+}
+
+/// Measures and prices every turn in `turn_ids` from one Codex rollout.
+///
+/// Returns the cents to book as a measurement (`None` = book the hold amount,
+/// unmeasured) and the reason the turns were not all measured. Each turn is
+/// read by its own `turn_id`, never by `root_turn_id` and never as a session
+/// window, and priced on its own (rounded up once per turn).
+///
+/// If any turn is unmeasurable the result is `max(priced_sum, hold)`: the
+/// priced part counts as a measurement only when it exceeds the hold, so an
+/// interrupted turn's spend cannot be lost by measuring only the turn the
+/// `Stop` names (the same rule as the Claude `future_timestamp` window).
+fn measure_codex_turns(
+    rt: &SharedBudgetRuntime,
+    cfg: &SharedBudgetConfig,
+    session_id: &str,
+    turn_ids: &[String],
+    model: Option<&str>,
+    transcript_path: Option<&str>,
+    hold: u64,
+) -> (Option<u64>, Option<&'static str>) {
+    let table = cfg.pricing_overrides.table();
+    // The rollout carries no model: it is the host's claim in the `Stop`
+    // payload. Without a price the turns cannot be measured in cents.
+    let Some(model) = model.filter(|m| table.lookup(m).is_some()) else {
+        if let Some(m) = model {
+            rt.note_unpriced(&[m.to_string()]);
+        }
+        return (None, Some("unpriced_model"));
+    };
+    let Some(path) = transcript_path else {
+        return (None, Some("no_transcript_path"));
+    };
+    let capped = turn_ids.len() > MAX_CODEX_HOLD_TURNS;
+    let turn_ids = &turn_ids[..turn_ids.len().min(MAX_CODEX_HOLD_TURNS)];
+    let mut priced_sum: u64 = 0;
+    let mut reason: Option<&'static str> = None;
+    for turn in turn_ids {
+        match observe_codex_turn(
+            std::path::Path::new(path),
+            session_id,
+            turn,
+            BUDGET_SCAN_CAP_BYTES,
+        ) {
+            UsageObservation::Measured(usage) => match price_codex_turn(&usage, model, &table) {
+                Some(cents) => priced_sum = priced_sum.saturating_add(cents),
+                None => {
+                    reason.get_or_insert("unpriced_model");
+                }
+            },
+            UsageObservation::Unavailable(why) => {
+                reason.get_or_insert(codex_unavailable_reason(why));
+            }
+        }
+    }
+    if capped {
+        reason = Some("scan_cap_reached");
+    }
+    match reason {
+        None => (Some(priced_sum), None),
+        Some(r) => (Some(priced_sum).filter(|sum| *sum > hold), Some(r)),
+    }
+}
+
+/// Settles a Codex turn at `Stop`, turn-scoped from the rollout (HORO-2282).
+///
+/// Dark: with no budget file or no `shared-budget.codex` marker it returns
+/// [`CodexSettlement::NotConfigured`] before touching the ledger. `session_id`
+/// is the host's raw session id; the lane is derived here.
+///
+/// # Which hold
+///
+/// Only the hold `turn_id` itself was admitted into (the ledger's prompt
+/// mapping). There is deliberately **no** first-prompt-key fallback and **no**
+/// "newest pending hold" fallback, unlike [`settle_turn`]: a `Stop` for a turn
+/// that was never admitted (a subagent turn firing `Stop` with the parent's
+/// session id, say) would otherwise settle the parent's pending hold and make
+/// the parent's real `Stop` a replay.
+///
+/// - the mapped hold is already final, or its row was pruned: nothing is
+///   written ([`CodexSettlement::AlreadySettled`]);
+/// - no mapping: the turn is charged after the fact, keyed by turn id, at its
+///   measured cents or else the hold amount
+///   ([`CodexSettlement::Unadmitted`]); a pending hold is untouched.
+///
+/// # Which turns, which cents
+///
+/// A re-prompt renews the live hold and maps its turn id to the same hold, so
+/// the hold covers every turn mapped to it; the settlement is the sum over all
+/// of them, not just the turn the `Stop` names. See [`measure_codex_turns`] for
+/// the unmeasurable cases, which always settle at the hold amount or more and
+/// never at 0. An invalid budget file settles the hold amount without its
+/// overrides. A late settle of an expired hold lands in the hold's own row and
+/// period.
+///
+/// # Cost and locking
+///
+/// Reading the rollout is blocking file I/O: up to 16 backward scans of at
+/// most `BUDGET_SCAN_CAP_BYTES` each, performed while the caller holds the
+/// `&mut LedgerStore`. C3 must not call this while holding the ledger/server
+/// lock any longer than the request needs, and should do the cheap checks
+/// (marker, ids) before taking it.
+///
+/// The post-hoc charge is booked to the period of the settle time: the reader
+/// returns no record timestamps, so the record's own event time is not used.
+pub fn settle_codex_turn(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    session_id: &str,
+    turn_id: &str,
+    model: Option<&str>,
+    transcript_path: Option<&str>,
+) -> Result<CodexSettlement, SharedBudgetError> {
+    let state = rt.effective().state;
+    if matches!(state, SharedBudgetFileState::Absent) || !rt.codex_enrolled() {
+        return Ok(CodexSettlement::NotConfigured);
+    }
+    let Some(turn_id) = usable_prompt(Some(turn_id)) else {
+        return Ok(CodexSettlement::NotApplicable);
+    };
+    let Ok(lane) = client_lane(session_id, Some(CODEX_PROVIDER)) else {
+        return Ok(CodexSettlement::NotApplicable);
+    };
+    match ledger.hold_for_prompt(&principal(), &lane, turn_id)? {
+        Some(hold_id) => settle_codex_hold(
+            ledger,
+            rt,
+            &state,
+            session_id,
+            &lane,
+            turn_id,
+            hold_id,
+            model,
+            transcript_path,
+        ),
+        None => charge_unadmitted_codex_turn(
+            ledger,
+            rt,
+            &state,
+            session_id,
+            &lane,
+            turn_id,
+            model,
+            transcript_path,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn settle_codex_hold(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    state: &SharedBudgetFileState,
+    session_id: &str,
+    lane: &str,
+    turn_id: &str,
+    hold_id: libra_governor_domain::SharedPoolReservationId,
+    model: Option<&str>,
+    transcript_path: Option<&str>,
+) -> Result<CodexSettlement, SharedBudgetError> {
+    let holds = ledger.shared_lane_holds(
+        &principal(),
+        lane,
+        None,
+        ExecutorKind::AgentAbsent,
+        OWNER_POOL_PREFIX,
+    )?;
+    // A pruned hold keeps its prompt mapping but not its row: the turn
+    // settled long ago.
+    let Some(target) = holds.iter().find(|h| h.id == hold_id) else {
+        return Ok(CodexSettlement::AlreadySettled);
+    };
+    if !matches!(
+        target.state,
+        ReservationState::Active | ReservationState::Expired
+    ) {
+        return Ok(CodexSettlement::AlreadySettled);
+    }
+    let mut turns = ledger.prompts_for_hold(&principal(), lane, target.id)?;
+    if !turns.iter().any(|t| t == turn_id) {
+        turns.push(turn_id.to_string());
+    }
+    let (actual, reason) = match state {
+        SharedBudgetFileState::Valid(cfg) => measure_codex_turns(
+            rt,
+            cfg,
+            session_id,
+            &turns,
+            model,
+            transcript_path,
+            target.amount,
+        ),
+        // An invalid file: the pricing it would supply is not trusted.
+        SharedBudgetFileState::Invalid(_) => (None, Some("config_invalid")),
+        SharedBudgetFileState::Absent => return Ok(CodexSettlement::NotConfigured),
+    };
+    if reason.is_some() {
+        rt.note(|t| t.unmeasured_settlements += 1);
+    }
+    let outcome = ledger.settle_shared_with_watermark(
+        target.id,
+        actual,
+        rt.now(),
+        ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
+        None,
+    )?;
+    Ok(match outcome {
+        SharedPoolSettleOutcome::Settled {
+            reservation,
+            overrun,
+            ..
+        } => CodexSettlement::Settled {
+            reservation_id: reservation.id,
+            pool_id: reservation.pool_id.0.clone(),
+            hold_usd_cents: reservation.amount,
+            settled_usd_cents: reservation.settled_amount.unwrap_or(reservation.amount),
+            usage_known: reservation.usage_known.unwrap_or(false),
+            overrun_usd_cents: overrun.unwrap_or(0),
+            turns: turns.len().min(MAX_CODEX_HOLD_TURNS),
+            unmeasured_reason: reason,
+        },
+        SharedPoolSettleOutcome::AlreadyFinal(_) | SharedPoolSettleOutcome::NotFound => {
+            CodexSettlement::AlreadySettled
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn charge_unadmitted_codex_turn(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    state: &SharedBudgetFileState,
+    session_id: &str,
+    lane: &str,
+    turn_id: &str,
+    model: Option<&str>,
+    transcript_path: Option<&str>,
+) -> Result<CodexSettlement, SharedBudgetError> {
+    // The hold amount is the fallback charge and only a valid file has one.
+    let SharedBudgetFileState::Valid(cfg) = state else {
+        return Ok(CodexSettlement::Unbooked("config_invalid"));
+    };
+    let hold = cfg.turn_hold_usd_cents;
+    let (measured, reason) = measure_codex_turns(
+        rt,
+        cfg,
+        session_id,
+        &[turn_id.to_string()],
+        model,
+        transcript_path,
+        hold,
+    );
+    let amount = measured.unwrap_or(hold);
+    if amount == 0 {
+        // A measured turn that used no tokens costs nothing; the ledger
+        // refuses a zero charge and a zero row would carry no information.
+        return Ok(CodexSettlement::Unbooked("measured_zero"));
+    }
+    let key = format!("codex-turn:{}|{}", lp(lane), lp(turn_id));
+    let event_time = rfc(rt.now());
+    let outcome = book_charge(
+        ledger,
+        rt,
+        state,
+        BookedCharge {
+            session_id: lane,
+            agent_id: None,
+            amount_usd_cents: amount,
+            key: &key,
+            charge_source: ChargeSource::TurnHold,
+            event_time: Some(&event_time),
+            usage_known: measured.is_some(),
+            watermark: None,
+        },
+    )?;
+    Ok(match outcome {
+        SharedBudgetOutcome::Charged {
+            reservation_id,
+            already_charged,
+            ..
+        } => {
+            if !already_charged {
+                rt.note(|t| {
+                    t.unadmitted_turns += 1;
+                    if reason.is_some() {
+                        t.unmeasured_charges += 1;
+                    }
+                });
+            }
+            CodexSettlement::Unadmitted {
+                reservation_id,
+                charged_usd_cents: amount,
+                usage_known: measured.is_some(),
+                already_charged,
+                unmeasured_reason: reason,
+            }
+        }
+        // The same turn was charged before, at another amount: it is booked
+        // once and never re-priced.
+        SharedBudgetOutcome::Refused {
+            reason: SharedBudgetRefusal::KeyConflict,
+        } => CodexSettlement::Unbooked("already_charged"),
+        SharedBudgetOutcome::Refused { .. } => CodexSettlement::Unbooked("refused"),
+        _ => CodexSettlement::Unbooked("not_booked"),
     })
 }
 
