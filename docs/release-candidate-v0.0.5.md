@@ -61,9 +61,18 @@ C2 to C5 acceptance criteria are mapped to named tests in the evidence file
   admission, settlement, recovery and true-up run only when the shared budget
   file **and** the marker `<state_dir>/shared-budget.codex` both exist (a
   symlink does not count; the marker is checked on every call). Without the
-  marker the Codex hooks send nothing, the daemon answers every Codex request
-  `not_configured` and the ledger is unchanged. This is evidenced by named
-  tests (whole-ledger fingerprint before/after, `not_configured` answers, the
+  marker the **shared budget** is untouched: the Codex hooks send no
+  shared-budget admission or settlement, the daemon answers shared-budget
+  Codex requests `not_configured`, and the shared-budget tables do not change.
+  The pre-existing v0.0.4 task-preflight and receipt behaviour is **not**
+  changed by v0.0.5 and still runs without the marker: the prompt hook prints
+  the preflight `additionalContext`, `Stop` writes an Estimate-vs-Actual
+  receipt to stderr, and the non-budget task ledger tables (tasks, plans,
+  contracts, contract_criteria, reservations, resource_accounts,
+  session_preflights, session_tasks, task_budgets, receipts) gain rows. This
+  was observed identical on v0.0.4 and v0.0.5 in independent QA (QA-1 SF-H,
+  QA-3 SF-H-diff). The shared-budget claim is evidenced by named tests
+  (shared-budget table fingerprint before/after, `not_configured` answers, the
   retained pre-existing Codex hook test, Claude golden-byte tests); see
   `ACCEPTANCE-C2-C5.md`. It is **not** a claim that disabled behavior is
   byte-identical to v0.0.4 beyond the cases where a test compares bytes.
@@ -121,6 +130,8 @@ ticket-backed limit below stays open until its fix is merged and verified.
 | Gateway path may under-count truncated streams (dark gateway only) | HORO-2286 |
 | Pool and account identity not bound to captured identity | HORO-2191 |
 | Pricing-table errors (1-hour cache tier, fast mode, geo multiplier under-counted; Haiku 5.5 over-counted) | ADR-0026 |
+| The `amount_too_large` ceiling (one charge above ten times the monthly cap) applies to explicit per-charge requests and extra charges (subagent transcript, session-tail, late Codex true-up), **not** to the end-of-turn settlement of a turn's hold from measured transcript or rollout usage, which books the measured amount without a ceiling. A corrupt or hostile transcript can therefore inflate the ledger (1e15 input tokens booked about $3e9 on Claude `Stop`; Codex saw the same) and make later prompts refuse for the rest of the month. Same on v0.0.4 and v0.0.5; within the documented same-user trust boundary. Disclosed, not fixed | tracked in the QA follow-up ticket HORO-2350 |
+| A Claude `SessionEnd` with no preceding `Stop` for that session does not release or settle the hold. It stays `active` and reduces the remaining budget until it expires (`HOLD_TTL_SECS` = 3600 s after the last renewal); on the next admission it is marked `expired`, its capacity returns and nothing is booked for it, unless a later `Stop` on the same lane settles it. Same on v0.0.4 and v0.0.5 | tracked in the QA follow-up ticket HORO-2350 |
 
 ## Acceptance state
 
