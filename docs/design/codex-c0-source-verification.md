@@ -57,7 +57,7 @@ Some(2) if handler.can_apply_control_effects() => { if let Some(reason) = trimme
 
 ## Recheck at rust-v0.163.0, v0.164.0 and v0.165.0 (HORO-2280, v0.0.5)
 
-> **Status: source-derived, nothing executed, no real Codex host run.** Read from the public tag tarballs by a read-only agent; not independently re-read by a second reviewer yet. The installed CLI on the development machine is `codex-cli 0.163.0` (`/opt/homebrew/Caskroom/codex/0.163.0/bin/codex`, sha256 `8813367285524ac798dd96d1b071aea30d58708c7226fd236cd275cf1cfdee31`). The version string matches the tag; the build provenance of the binary was not verified.
+> **Status: source-derived, nothing executed, no real Codex host run.** Read from the public tag tarballs by a read-only agent; a second reviewer re-read part of it at 0.165 only (see the evidence-status table below). The installed CLI on the development machine is `codex-cli 0.163.0` (`/opt/homebrew/Caskroom/codex/0.163.0/bin/codex`, sha256 `8813367285524ac798dd96d1b071aea30d58708c7226fd236cd275cf1cfdee31`). The version string matches the tag; the build provenance of the binary was not verified.
 
 | Tag | Commit |
 |---|---|
@@ -66,7 +66,7 @@ Some(2) if handler.can_apply_control_effects() => { if let Some(reason) = trimme
 | rust-v0.164.0 | 6aaac694803004a63c6f393d153c96d22521a6b9 |
 | rust-v0.165.0 | 360319d8dee62d87e2d59fc0c21805d79519cfed |
 
-Q1 to Q6 above hold at 0.163.0, 0.164.0 and 0.165.0. Only line numbers moved (for example the usage record call is now `record_response_token_usage`, `core/src/session/mod.rs`). No id source, block semantics, flush ordering or subagent-transcript claim changed between 0.163 and 0.165. Blocked-turn lifecycle events remain UNKNOWN.
+Q1 to Q6 above appear to hold at 0.163.0, 0.164.0 and 0.165.0: a single read found only line numbers moved (for example the usage record call is now `record_response_token_usage`, `core/src/session/mod.rs`) and no id source, block semantics, flush ordering or subagent-transcript claim changed between 0.163 and 0.165. That single read was not re-checked at 0.163 or 0.164; only the rows marked CONFIRMED in the evidence-status table had a second read, and only at 0.165. Blocked-turn lifecycle events remain UNKNOWN.
 
 ### What a `token_usage_record` is (source-derived, 0.163 to 0.165)
 
@@ -77,7 +77,7 @@ Q1 to Q6 above hold at 0.163.0, 0.164.0 and 0.165.0. Only line numbers moved (fo
 - A failed or incomplete response writes a record only when it carries a `response_id`; that record holds partial spend.
 - An aborted or stream-failed request writes **no** record, and Stop does not run on abort. That spend is not visible to any rollout reader.
 - Resume does not re-append old records. A fork drops the parent's records.
-- Safe turn total: the last record's `turn_token_usage`, or the sum of `usage` de-duplicated by `response_id`. Never sum the cumulative fields.
+- Safe turn total, as far as the format allows: the last record's `turn_token_usage`, or the sum of `usage` de-duplicated by `response_id`. Never sum the cumulative fields. The shipped reader (`crates/daemon/src/usage/codex_turn.rs`) does not de-duplicate: it sums `usage` over the matched records, requires that sum to equal the newest record's `turn_token_usage`, and refuses the read as inconsistent on a mismatch or a duplicated record (the caller then falls back to the flat hold).
 
 ### Hooks disabled or untrusted
 
@@ -106,5 +106,5 @@ An independent read-only reviewer re-read `openai/codex` at `rust-v0.165.0` only
 
 Not covered by this document at any tag: `task_complete` ordering relative to Stop. `docs/design/codex-shared-budget-gate.md` says it is written after Stop returns (from `codex_turn.rs`); C3 and C4 depend on it for true-up gating.
 
-Flush ordering: Q5 infers that the final `token_usage_record` is very likely on disk before Stop runs. That is an inference from source reading, not a run. The design doc takes the pessimistic reading (the final record may still be in the writer's channel at Stop, an undetectable under-count) and the C2 to C4 code keeps that reading until a runtime probe exists.
+Flush ordering: Q5 infers that the final `token_usage_record` is very likely on disk before Stop runs. That is an inference from source reading, not a run. The `codex_turn.rs` module header takes the same no-barrier reading as the design doc (there is no barrier between the persist and Stop; the explicit flush comes later). The design doc takes the pessimistic reading (the final record may still be in the writer's channel at Stop, an undetectable under-count) and the C2 to C4 code keeps that reading until a runtime probe exists.
 
