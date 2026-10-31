@@ -326,3 +326,46 @@ fn a_stop_that_names_an_agent_still_closes_the_parents_turn() {
         "the turn was finalized twice"
     );
 }
+
+/// The reverse of the test above, pinned as documented behaviour
+/// (`docs/execution-owner-contract.md`, "The fallback is one-way"): the prompt
+/// carried an `agent_id` but the `Stop` did not. A `Finalize` with no agent
+/// does not search the session's agent lanes, so it closes nothing -- no
+/// receipt -- and the agent lane's task stays open (its reservation is held
+/// until the TTL). Characterization only: this is a disclosed limitation, not
+/// a behaviour to preserve for its own sake (HORO-2250 row 8).
+#[test]
+fn a_stop_without_an_agent_does_not_close_an_agent_lanes_turn() {
+    let state = support::DaemonState::new();
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
+    let s = "reverse-asymmetric-session";
+
+    prompt(state.path(), repo.path(), s, Some("agent-1"));
+    tool(state.path(), s, Some("agent-1"), 3);
+    let seen = wait_for_total(state.path(), 3);
+    assert_eq!(
+        seen,
+        [(
+            Lane::Agent {
+                session: s.into(),
+                agent: "agent-1".into()
+            },
+            3
+        )]
+        .into_iter()
+        .collect()
+    );
+
+    // A Stop with no agent finds no task on the session's own lane.
+    let unnamed = hook(state.path(), "stop", &json!({"session_id": s}));
+    assert!(
+        !String::from_utf8_lossy(&unnamed.stderr).contains("Execution Receipt"),
+        "a Stop with no agent must not close an agent lane's turn"
+    );
+
+    // The agent lane's turn is still open: naming it now closes it, with
+    // every call it made.
+    let receipt = receipt_tool_calls(state.path(), s, Some("agent-1"));
+    assert!(receipt.contains("Tool calls: 3"), "{receipt}");
+}
