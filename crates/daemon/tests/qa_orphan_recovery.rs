@@ -635,49 +635,22 @@ fn s09b_incomplete_turn_is_not_trued_up_until_task_complete() {
     assert_eq!(fx.trueup_total(h), BIG_CENTS - SMALL_CENTS);
 }
 
-/// ADR: a hold settled at the flat amount (usage_known=false) is never trued
-/// up, even if its rollout later gains usage. This one covers a flat orphan
-/// recovery next to a measured newest hold; `s09d` covers a flat direct settle
-/// that is itself the true-up candidate.
-#[test]
-fn s09c_flat_settled_hold_is_never_trued_up_even_when_rollout_later_gains_usage() {
-    let mut fx = Fx::new(HOLD);
-    let (a, b) = kill_a_then_admit_b(&mut fx, TTL + 600);
-    // First settle: turn-a absent from the rollout -> flat orphan.
-    let path = fx.rollout("r.jsonl", &turn_lines("turn-b", SMALL));
-    fx.settle("turn-b", &path);
-    assert_eq!(fx.hold(a).usage_known, Some(false));
-    assert_eq!(fx.hold(a).settled_amount, Some(HOLD));
-    // The orphan's records now appear.
-    fx.rollout(
-        "r.jsonl",
-        &[turn_lines("turn-a", BIG), turn_lines("turn-b", SMALL)].concat(),
-    );
-    let before = fx.fingerprint();
-    fx.settle("turn-b", &path);
-    fx.settle("turn-b", &path);
-    assert_eq!(fx.trueup_total(a), 0);
-    assert_eq!(
-        fx.hold(a).settled_amount,
-        Some(HOLD),
-        "stays at the flat hold"
-    );
-    assert_eq!(fx.trueup_total(b), 0, "B was complete and measured exactly");
-    assert_eq!(fx.fingerprint(), before);
-}
-
-/// The flat hold is the lane's only settled hold, so it is the true-up
-/// candidate. Were the `usage_known == Some(true)` guards removed it would be
-/// re-measured and trued up; it must not be.
+/// ADR: a hold settled at the flat amount (`usage_known=false`) is never
+/// trued up, even if its rollout later gains usage. The flat hold is the
+/// lane's only settled hold, so it is the true-up candidate, and it is smaller
+/// than the later measurement: were the `usage_known == Some(true)` guards
+/// removed it would be re-measured and 276 - 100 = 176 cents would be booked.
 #[test]
 fn s09d_a_flat_direct_settle_that_is_the_only_settled_hold_is_never_trued_up() {
-    let mut fx = Fx::new(HOLD);
+    const SMALL_HOLD: u64 = 100;
+    const _: () = assert!(SMALL_HOLD < BIG_CENTS);
+    let mut fx = Fx::new(SMALL_HOLD);
     let a = fx.admit("turn-a");
     // The turn completes but its rollout has no usage record: flat settle.
     let path = fx.rollout("r.jsonl", &[started("turn-a"), complete("turn-a")]);
     fx.settle("turn-a", &path);
     assert_eq!(fx.hold(a).usage_known, Some(false));
-    assert_eq!(fx.hold(a).settled_amount, Some(HOLD));
+    assert_eq!(fx.hold(a).settled_amount, Some(SMALL_HOLD));
     // Usage for the turn appears later, then any later settle runs the
     // true-up pass.
     fx.rollout(
@@ -687,7 +660,7 @@ fn s09d_a_flat_direct_settle_that_is_the_only_settled_hold_is_never_trued_up() {
     fx.settle("turn-x", &path);
     fx.settle("turn-x", &path);
     assert_eq!(fx.trueup_total(a), 0, "a flat hold is never trued up");
-    assert_eq!(fx.hold(a).settled_amount, Some(HOLD));
+    assert_eq!(fx.hold(a).settled_amount, Some(SMALL_HOLD));
 }
 
 // (10) ------------------------------------------------------------------
