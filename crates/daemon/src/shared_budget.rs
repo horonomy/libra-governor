@@ -1129,6 +1129,69 @@ struct BookedCharge<'a> {
     watermark: Option<&'a SettleWatermark>,
 }
 
+/// A measured settlement above this is not a plausible single turn: it is a
+/// corrupt or forged transcript. The bound is `book_charge`'s ten months of
+/// budget, but never below an absolute floor, so a small monthly cap cannot
+/// make a real, expensive turn look implausible and hide genuine overspend.
+/// Under the bound the measured cost is recorded in full (overruns included);
+/// over it the measurement is neither booked nor clipped: the turn settles at
+/// its hold, flagged unmeasured with [`IMPLAUSIBLE_USAGE_REASON`]. The Claude
+/// watermark advances past the skipped window so later turns are measured
+/// again; the skipped lines are recorded as not believed, never as spend
+/// (HORO-2350).
+const IMPLAUSIBLE_USAGE_REASON: &str = "usage_implausible";
+const PLAUSIBLE_TURN_FLOOR_USD_CENTS: u64 = 100_000;
+
+fn settlement_ceiling_usd_cents(monthly_cap_usd_cents: u64) -> u64 {
+    monthly_cap_usd_cents
+        .saturating_mul(10)
+        .max(PLAUSIBLE_TURN_FLOOR_USD_CENTS)
+}
+
+/// `true` (and one content-free line in `<state dir>/daemon.log`, written
+/// through the daemon's own best-effort logger, so the amount that was not
+/// booked can be audited later) when `cents` is not a plausible single turn.
+fn implausible_measurement(
+    rt: &SharedBudgetRuntime,
+    state: &SharedBudgetFileState,
+    cents: Option<u64>,
+) -> bool {
+    let (SharedBudgetFileState::Valid(cfg), Some(cents)) = (state, cents) else {
+        return false;
+    };
+    let ceiling = settlement_ceiling_usd_cents(cfg.monthly_cap_usd_cents);
+    if cents <= ceiling {
+        return false;
+    }
+    if let Some(dir) = rt.loaded.path.as_deref().and_then(std::path::Path::parent) {
+        crate::log::append_line(
+            &dir.join("daemon.log"),
+            &format!(
+                "shared-budget: measured usage of {cents} USD cents exceeds the plausible \
+single-turn bound of {ceiling}; the turn was settled at its hold, unmeasured \
+({IMPLAUSIBLE_USAGE_REASON})"
+            ),
+        );
+    }
+    true
+}
+
+#[cfg(test)]
+mod settlement_ceiling_tests {
+    use super::*;
+
+    #[test]
+    fn the_ceiling_is_ten_months_of_budget_with_an_absolute_floor() {
+        assert_eq!(settlement_ceiling_usd_cents(100_000), 1_000_000);
+        // A $5 cap would otherwise call any turn over $50 implausible.
+        assert_eq!(
+            settlement_ceiling_usd_cents(500),
+            PLAUSIBLE_TURN_FLOOR_USD_CENTS
+        );
+        assert_eq!(settlement_ceiling_usd_cents(u64::MAX), u64::MAX);
+    }
+}
+
 /// Validates and books `charge` into the right period's pool. The single
 /// write path for `ChargeAgent` and `ChargeAgentTranscript`.
 fn book_charge(
@@ -1678,6 +1741,14 @@ pub fn settle_turn(
             SharedBudgetFileState::Invalid(_) => (None, Some("config_invalid"), None),
             SharedBudgetFileState::Absent => return Ok(TurnSettlement::NotConfigured),
         };
+    // The watermark still advances past the skipped window: leaving it would
+    // re-read the same implausible lines in every later Stop of the session
+    // and settle each of those turns at its hold too, hiding real spend.
+    let (actual, reason, watermark) = if implausible_measurement(rt, &state, actual) {
+        (None, Some(IMPLAUSIBLE_USAGE_REASON), watermark)
+    } else {
+        (actual, reason, watermark)
+    };
     if reason.is_some() {
         rt.note(|t| t.unmeasured_settlements += 1);
     }
@@ -2311,6 +2382,11 @@ fn settle_codex_hold(
         // An invalid file: the pricing it would supply is not trusted.
         SharedBudgetFileState::Invalid(_) => (None, Some("config_invalid")),
         SharedBudgetFileState::Absent => return Ok(CodexSettlement::NotConfigured),
+    };
+    let (actual, reason) = if implausible_measurement(rt, state, actual) {
+        (None, Some(IMPLAUSIBLE_USAGE_REASON))
+    } else {
+        (actual, reason)
     };
     if reason.is_some() {
         rt.note(|t| t.unmeasured_settlements += 1);

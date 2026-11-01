@@ -477,6 +477,104 @@ fn a_stop_settles_the_turn_hold_at_the_priced_usd_and_a_retry_does_not_settle_ag
     assert_eq!(totals(&fx.status()), (450, 0));
 }
 
+/// HORO-2350: a measured settlement follows `book_charge`'s bound of ten
+/// months of budget (cap 100,000 -> 1,000,000 cents). Under it the real spend
+/// is recorded in full; over it the measurement is not believed, not booked and
+/// not clipped; the watermark advances past it so later turns are measured again.
+#[test]
+fn a_large_but_plausible_measured_turn_is_recorded_in_full() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    fx.admit_hold("s1");
+    let tx = fx.path().join("s1.jsonl");
+    // 3,000 Mi tokens = 900,000 cents, far above the 1,000 hold, below the bound.
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(3_000), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(totals(&fx.status()), (900_000, 0));
+    let lane = fx.lane("s1");
+    assert_eq!(lane[0].settled_amount, Some(900_000));
+    assert_eq!(lane[0].usage_known, Some(true));
+}
+
+#[test]
+fn a_measured_turn_above_ten_months_of_budget_settles_at_the_hold_unmeasured() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    fx.admit_hold("s1");
+    let tx = fx.path().join("s1.jsonl");
+    // 4,000 Mi tokens = 1,200,000 cents > 1,000,000.
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(4_000), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(
+        totals(&fx.status()),
+        (1_000, 0),
+        "neither the figure nor a clipped copy of it is booked"
+    );
+    let log = std::fs::read_to_string(fx.path().join("daemon.log")).unwrap_or_default();
+    assert!(
+        log.contains("1200000 USD cents") && log.contains("usage_implausible"),
+        "the skipped figure is written to the daemon log: {log:?}"
+    );
+    let lane = fx.lane("s1");
+    assert_eq!(lane[0].settled_amount, Some(1_000));
+    assert_eq!(lane[0].usage_known, Some(false));
+}
+
+#[test]
+fn a_turn_after_an_implausible_one_is_measured_again() {
+    // The mark only matters once a first measured Stop has set one: without
+    // the watermark advancing, the implausible line of turn 2 would be read
+    // again by turn 3 and flag it implausible too (review of #295).
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+
+    fx.admit_hold("s1");
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(totals(&fx.status()), (300, 0), "turn 1 measured");
+
+    fx.clock.set(at(100));
+    fx.admit_hold("s1");
+    // 4,000 Mi tokens = 1,200,000 cents > 1,000,000, stamped after the mark.
+    append_lines(&tx, &[rec(110, "m2", SONNET, mi(4_000), Some("s1"), false)]);
+    fx.clock.set(at(150));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(
+        totals(&fx.status()),
+        (1_300, 0),
+        "turn 2 settles at its hold, nothing implausible is booked"
+    );
+
+    fx.clock.set(at(200));
+    fx.admit_hold("s1");
+    append_lines(&tx, &[rec(210, "m3", SONNET, mi(2), Some("s1"), false)]);
+    fx.clock.set(at(250));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(
+        totals(&fx.status()),
+        (1_900, 0),
+        "turn 3 is measured at its own 600 cents"
+    );
+    let lane = fx.lane("s1");
+    assert_eq!(lane[2].settled_amount, Some(600));
+    assert_eq!(lane[2].usage_known, Some(true));
+}
+
+#[test]
+fn a_small_cap_does_not_make_a_real_expensive_turn_implausible() {
+    // Cap 500 cents: ten times that is 5,000, but a 30,000-cent turn is below
+    // the absolute floor, so it is recorded in full.
+    let mut fx = Fx::new(Some(&cfg_json(500, "UTC", 100)), BASE);
+    fx.admit_hold("s1");
+    let tx = fx.path().join("s1.jsonl");
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(100), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(totals(&fx.status()), (30_000, 0));
+    assert_eq!(fx.lane("s1")[0].usage_known, Some(true));
+}
+
 #[test]
 fn two_consecutive_stops_never_count_a_record_twice() {
     let mut fx = Fx::new(Some(&cfg()), BASE);

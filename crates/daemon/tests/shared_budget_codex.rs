@@ -329,6 +329,47 @@ fn a_measured_turn_above_the_hold_records_the_overrun_unclamped() {
     }
 }
 
+/// HORO-2350: `book_charge` never accepts one charge above ten months of
+/// budget (`CAP * 10`); a measured settlement now follows the same bound.
+/// Below it the real spend is recorded in full, above it the measurement is
+/// not believed (corrupt or forged rollout) and is not booked, clipped or
+/// otherwise turned into a number.
+const CEILING_CENTS: u64 = CAP * 10;
+const _: () = assert!(997_615 < CEILING_CENTS);
+
+#[test]
+fn a_large_but_plausible_measured_turn_is_recorded_in_full_not_clipped() {
+    let mut fx = fx();
+    fx.admit("turn-a");
+    // 399,000 output tokens at 2.5001 cents each, plus the fixture's input:
+    // 997,615 cents, just under the ten-month bound.
+    let path = fx.rollout(
+        "r.jsonl",
+        &turn_lines("turn-a", [2000, 1500, 400, 399_000, 30]),
+    );
+    let out = fx.settle("turn-a", Some(MODEL), Some(&path));
+    assert_eq!(settled(&out), (997_615, true, None));
+    assert_eq!(fx.holds()[0].settled_amount, Some(997_615));
+}
+
+#[test]
+fn a_measured_turn_above_ten_months_of_budget_is_not_booked_and_is_named() {
+    let mut fx = fx();
+    fx.admit("turn-a");
+    let path = fx.rollout(
+        "r.jsonl",
+        &turn_lines("turn-a", [2000, 1500, 400, 600_000, 30]),
+    );
+    let out = fx.settle("turn-a", Some(MODEL), Some(&path));
+    // The flat hold stands, flagged unmeasured with its own reason: neither
+    // the implausible figure nor a clipped copy of it reaches the ledger.
+    assert_eq!(settled(&out), (HOLD, false, Some("usage_implausible")));
+    let holds = fx.holds();
+    assert_eq!(holds[0].settled_amount, Some(HOLD));
+    assert_eq!(holds[0].usage_known, Some(false));
+    assert_eq!(fx.used_reserved(), (HOLD, 0));
+}
+
 #[test]
 fn default_without_gpt_overrides_books_the_flat_hold_unmeasured_and_names_the_model() {
     let mut fx = fx_with_hold(HOLD, false, true);
