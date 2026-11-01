@@ -335,6 +335,7 @@ fn a_measured_turn_above_the_hold_records_the_overrun_unclamped() {
 /// not believed (corrupt or forged rollout) and is not booked, clipped or
 /// otherwise turned into a number.
 const CEILING_CENTS: u64 = CAP * 10;
+const _: () = assert!(997_615 < CEILING_CENTS);
 
 #[test]
 fn a_large_but_plausible_measured_turn_is_recorded_in_full_not_clipped() {
@@ -348,7 +349,6 @@ fn a_large_but_plausible_measured_turn_is_recorded_in_full_not_clipped() {
     );
     let out = fx.settle("turn-a", Some(MODEL), Some(&path));
     assert_eq!(settled(&out), (997_615, true, None));
-    assert!(997_615 < CEILING_CENTS);
     assert_eq!(fx.holds()[0].settled_amount, Some(997_615));
 }
 
