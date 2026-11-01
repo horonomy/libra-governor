@@ -1148,24 +1148,32 @@ fn settlement_ceiling_usd_cents(monthly_cap_usd_cents: u64) -> u64 {
         .max(PLAUSIBLE_TURN_FLOOR_USD_CENTS)
 }
 
-/// `true` (and one content-free line in the daemon log with the skipped figure,
-/// so the amount that was not booked can be audited later) when `cents` is not
-/// a plausible single turn.
-fn implausible_measurement(state: &SharedBudgetFileState, cents: Option<u64>) -> bool {
-    match (state, cents) {
-        (SharedBudgetFileState::Valid(cfg), Some(cents)) => {
-            let ceiling = settlement_ceiling_usd_cents(cfg.monthly_cap_usd_cents);
-            if cents > ceiling {
-                eprintln!(
-                    "libra-governor daemon: measured usage of {cents} USD cents exceeds the plausible \
-single-turn bound of {ceiling}; the turn was settled at its hold, unmeasured ({IMPLAUSIBLE_USAGE_REASON})"
-                );
-                return true;
-            }
-            false
-        }
-        _ => false,
+/// `true` (and one content-free line in `<state dir>/daemon.log`, written
+/// through the daemon's own best-effort logger, so the amount that was not
+/// booked can be audited later) when `cents` is not a plausible single turn.
+fn implausible_measurement(
+    rt: &SharedBudgetRuntime,
+    state: &SharedBudgetFileState,
+    cents: Option<u64>,
+) -> bool {
+    let (SharedBudgetFileState::Valid(cfg), Some(cents)) = (state, cents) else {
+        return false;
+    };
+    let ceiling = settlement_ceiling_usd_cents(cfg.monthly_cap_usd_cents);
+    if cents <= ceiling {
+        return false;
     }
+    if let Some(dir) = rt.loaded.path.as_deref().and_then(std::path::Path::parent) {
+        crate::log::append_line(
+            &dir.join("daemon.log"),
+            &format!(
+                "shared-budget: measured usage of {cents} USD cents exceeds the plausible \
+single-turn bound of {ceiling}; the turn was settled at its hold, unmeasured \
+({IMPLAUSIBLE_USAGE_REASON})"
+            ),
+        );
+    }
+    true
 }
 
 #[cfg(test)]
@@ -1736,7 +1744,7 @@ pub fn settle_turn(
     // The watermark still advances past the skipped window: leaving it would
     // re-read the same implausible lines in every later Stop of the session
     // and settle each of those turns at its hold too, hiding real spend.
-    let (actual, reason, watermark) = if implausible_measurement(&state, actual) {
+    let (actual, reason, watermark) = if implausible_measurement(rt, &state, actual) {
         (None, Some(IMPLAUSIBLE_USAGE_REASON), watermark)
     } else {
         (actual, reason, watermark)
@@ -2375,7 +2383,7 @@ fn settle_codex_hold(
         SharedBudgetFileState::Invalid(_) => (None, Some("config_invalid")),
         SharedBudgetFileState::Absent => return Ok(CodexSettlement::NotConfigured),
     };
-    let (actual, reason) = if implausible_measurement(state, actual) {
+    let (actual, reason) = if implausible_measurement(rt, state, actual) {
         (None, Some(IMPLAUSIBLE_USAGE_REASON))
     } else {
         (actual, reason)

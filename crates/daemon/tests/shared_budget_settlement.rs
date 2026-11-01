@@ -510,6 +510,11 @@ fn a_measured_turn_above_ten_months_of_budget_settles_at_the_hold_unmeasured() {
         (1_000, 0),
         "neither the figure nor a clipped copy of it is booked"
     );
+    let log = std::fs::read_to_string(fx.path().join("daemon.log")).unwrap_or_default();
+    assert!(
+        log.contains("1200000 USD cents") && log.contains("usage_implausible"),
+        "the skipped figure is written to the daemon log: {log:?}"
+    );
     let lane = fx.lane("s1");
     assert_eq!(lane[0].settled_amount, Some(1_000));
     assert_eq!(lane[0].usage_known, Some(false));
