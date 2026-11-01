@@ -1135,9 +1135,10 @@ struct BookedCharge<'a> {
 /// make a real, expensive turn look implausible and hide genuine overspend.
 /// Under the bound the measured cost is recorded in full (overruns included);
 /// over it the measurement is neither booked nor clipped: the turn settles at
-/// its hold, flagged unmeasured with [`IMPLAUSIBLE_USAGE_REASON`], and the
-/// Claude watermark does not advance, so the lines stay visible to every later
-/// window instead of being silently dropped (HORO-2350).
+/// its hold, flagged unmeasured with [`IMPLAUSIBLE_USAGE_REASON`]. The Claude
+/// watermark advances past the skipped window so later turns are measured
+/// again; the skipped lines are recorded as not believed, never as spend
+/// (HORO-2350).
 const IMPLAUSIBLE_USAGE_REASON: &str = "usage_implausible";
 const PLAUSIBLE_TURN_FLOOR_USD_CENTS: u64 = 100_000;
 
@@ -1721,8 +1722,11 @@ pub fn settle_turn(
             SharedBudgetFileState::Invalid(_) => (None, Some("config_invalid"), None),
             SharedBudgetFileState::Absent => return Ok(TurnSettlement::NotConfigured),
         };
+    // The watermark still advances past the skipped window: leaving it would
+    // re-read the same implausible lines in every later Stop of the session
+    // and settle each of those turns at its hold too, hiding real spend.
     let (actual, reason, watermark) = if implausible_measurement(&state, actual) {
-        (None, Some(IMPLAUSIBLE_USAGE_REASON), None)
+        (None, Some(IMPLAUSIBLE_USAGE_REASON), watermark)
     } else {
         (actual, reason, watermark)
     };

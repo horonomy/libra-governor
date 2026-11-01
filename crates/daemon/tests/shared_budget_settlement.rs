@@ -480,7 +480,7 @@ fn a_stop_settles_the_turn_hold_at_the_priced_usd_and_a_retry_does_not_settle_ag
 /// HORO-2350: a measured settlement follows `book_charge`'s bound of ten
 /// months of budget (cap 100,000 -> 1,000,000 cents). Under it the real spend
 /// is recorded in full; over it the measurement is not believed, not booked and
-/// not clipped, and its lines stay after the watermark.
+/// not clipped; the watermark advances past it so later turns are measured again.
 #[test]
 fn a_large_but_plausible_measured_turn_is_recorded_in_full() {
     let mut fx = Fx::new(Some(&cfg()), BASE);
@@ -513,6 +513,46 @@ fn a_measured_turn_above_ten_months_of_budget_settles_at_the_hold_unmeasured() {
     let lane = fx.lane("s1");
     assert_eq!(lane[0].settled_amount, Some(1_000));
     assert_eq!(lane[0].usage_known, Some(false));
+}
+
+#[test]
+fn a_turn_after_an_implausible_one_is_measured_again() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    fx.admit_hold("s1");
+    let tx = fx.path().join("s1.jsonl");
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(4_000), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(totals(&fx.status()), (1_000, 0));
+
+    fx.clock.set(at(100));
+    fx.admit_hold("s1");
+    // 1 Mi tokens = 300 cents, written after the implausible line.
+    append_lines(&tx, &[rec(110, "m2", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(150));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(
+        totals(&fx.status()),
+        (1_300, 0),
+        "the first turn at its hold plus the second measured in full"
+    );
+    let lane = fx.lane("s1");
+    assert_eq!(lane[1].settled_amount, Some(300));
+    assert_eq!(lane[1].usage_known, Some(true));
+}
+
+#[test]
+fn a_small_cap_does_not_make_a_real_expensive_turn_implausible() {
+    // Cap 500 cents: ten times that is 5,000, but a 30,000-cent turn is below
+    // the absolute floor, so it is recorded in full.
+    let mut fx = Fx::new(Some(&cfg_json(500, "UTC", 100)), BASE);
+    fx.admit_hold("s1");
+    let tx = fx.path().join("s1.jsonl");
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(100), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(totals(&fx.status()), (30_000, 0));
+    assert_eq!(fx.lane("s1")[0].usage_known, Some(true));
 }
 
 #[test]
