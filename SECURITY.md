@@ -23,9 +23,11 @@ and ship a fix before any public disclosure.
 
 ## Supported versions
 
-This project is pre-1.0 and under active bootstrap. Security fixes are
-applied to `main` only until a formal release/support policy is
-published.
+This project is pre-1.0 and under active bootstrap. The latest published
+release is v0.0.4 (Cooperative Preview, Apple Silicon macOS only, a
+prerelease). Security fixes are applied to `main` only until a formal
+release/support policy is published; there is no backport commitment for
+published tarballs, so fixes reach users in a later release.
 
 ## Secret-handling policy
 

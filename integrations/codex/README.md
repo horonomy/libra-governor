@@ -268,7 +268,7 @@ evidence-gathering.
 | Capability | Codex |
 |---|---|
 | Preflight gate, tool observation, completion receipt, inline explanation channel | Available — same hook shapes as Claude Code |
-| Tool gate (hard pre-tool-call refusal) | Unavailable — MVP 1.0 hooks are advisory for every agent; the gateway is the only hard-enforcement point (ADR 0003) |
+| Tool gate (hard pre-tool-call refusal) | Unavailable for Codex — Codex hooks are advisory (in v0.0.4 they never block or send a budget request). Claude Code's `PreToolUse` can deny, but only for local monthly budget decisions when `shared-budget.json` exists; the gateway is the other hard-enforcement point (ADR 0003) |
 | Model event observation (token/cost/provider per request) | Unavailable — no hook payload on either agent exposes this |
 | Model gateway / hard budget enforcement | **Unavailable — incompatible wire format.** Codex's custom model provider only supports `wire_api: "responses"` (`POST /v1/responses`); the gateway only speaks Anthropic's `POST /v1/messages`. Not a scoping choice — a real incompatibility. |
 | Persistent status surface (statusline) | Unavailable — verified absent from Codex's config schema at any level |
@@ -281,8 +281,10 @@ evidence-gathering.
   oversight.
 - **No statusline equivalent** — verified absent from Codex's config
   schema.
-- **No `PreToolUse` hard-gating** — matches Claude Code; hooks stay
-  advisory for both agents in MVP 1.0.
+- **No `PreToolUse` hard-gating for Codex** — Codex hooks stay advisory. Claude
+  Code's hooks are advisory too, except the optional local monthly budget
+  (`UserPromptSubmit` block, `PreToolUse` deny, only when `shared-budget.json`
+  exists).
 - **No MCP explain/query surface** — Codex supports MCP as a client
   (`mcp_servers.<id>` stdio config), but `ARCHITECTURE.md` forbids MCP as
   an enforcement boundary regardless, and no explain surface is wired for
@@ -294,8 +296,10 @@ evidence-gathering.
 
 ## Platforms
 
-Same practical platform set as the existing Unix-socket daemon: macOS
-12+, Ubuntu 20.04+/Debian 10+, Windows 11 via WSL2 only.
+The only supported and verified platform is Apple Silicon (aarch64) macOS
+(the v0.0.4 Cooperative Preview). Nothing in the binary or `install` blocks
+other platforms, but Linux, Intel macOS and Windows are unsupported and
+unverified, including for Codex.
 
 ## Uninstall
 
