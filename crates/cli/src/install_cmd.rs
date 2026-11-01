@@ -63,6 +63,32 @@ fn build_output_path_warning(binary: &std::path::Path) -> Option<String> {
     }
 }
 
+/// `install` writes this binary's own path into the hook commands, and
+/// `doctor`/`uninstall`/repoint recognise a Libra hook only when that path's
+/// file name is exactly `libra-governor` (a deliberate ownership boundary,
+/// HORO-2303: `libra-governor-tools/x` is not ours). A differently named
+/// binary would install hooks nothing could later detect or remove, so refuse
+/// before writing anything (HORO-2349).
+fn binary_name_refusal(binary: &std::path::Path) -> Option<String> {
+    let name = binary.file_name()?.to_string_lossy();
+    if name == "libra-governor" {
+        return None;
+    }
+    Some(format!(
+        "libra-governor install: this binary is named `{name}`, but Libra only recognises its own \
+hooks when the executable is named exactly `libra-governor`; hooks written for `{name}` would \
+not be reported by `doctor` and would not be removed by `uninstall`. Copy or rename it to \
+`libra-governor` and run install from that file. Nothing was changed."
+    ))
+}
+
+fn refuse_misnamed_binary(binary: &std::path::Path) {
+    if let Some(refusal) = binary_name_refusal(binary) {
+        eprintln!("{refusal}");
+        std::process::exit(1);
+    }
+}
+
 fn warn_if_build_output_path(binary: &std::path::Path) {
     if let Some(warning) = build_output_path_warning(binary) {
         eprintln!("{warning}");
@@ -86,6 +112,7 @@ fn run_claude(install_statusline: bool) {
             std::process::exit(1);
         }
     };
+    refuse_misnamed_binary(&binary);
     warn_if_build_output_path(&binary);
 
     let settings_path = match claude_settings::settings_path() {
@@ -188,6 +215,7 @@ pub fn run_codex() {
             std::process::exit(1);
         }
     };
+    refuse_misnamed_binary(&binary);
     warn_if_build_output_path(&binary);
 
     let hooks_path = match codex_hooks_file::hooks_path() {
@@ -298,6 +326,29 @@ mod build_output_path_warning_tests {
             build_output_path_warning(Path::new("/Users/bryant/.local/bin/libra-governor"))
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod binary_name_refusal_tests {
+    use super::binary_name_refusal;
+    use std::path::Path;
+
+    #[test]
+    fn the_canonical_name_is_accepted() {
+        assert_eq!(
+            binary_name_refusal(Path::new("/opt/libra/bin/libra-governor")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_renamed_binary_is_refused_with_the_required_name() {
+        let refusal = binary_name_refusal(Path::new("/opt/libra/bin/libra-governor-c4e2e43"))
+            .expect("renamed binary must be refused");
+        assert!(refusal.contains("libra-governor-c4e2e43"), "{refusal}");
+        assert!(refusal.contains("exactly `libra-governor`"), "{refusal}");
+        assert!(refusal.contains("Nothing was changed"), "{refusal}");
     }
 }
 

@@ -811,3 +811,57 @@ fn dropping_a_sandbox_reaps_the_daemon_its_binary_spawned() {
          leaks every daemon (HORO-1500)",
     );
 }
+
+/// HORO-2349: a binary not named exactly `libra-governor` would install hooks
+/// that `doctor` cannot see and `uninstall` cannot remove, so install refuses
+/// before writing anything.
+#[test]
+fn install_refuses_a_renamed_binary_and_writes_nothing() {
+    warm_up_binary();
+    let bin_dir = tempfile::tempdir().unwrap();
+    let state_parent = tempfile::tempdir().unwrap();
+    let claude_parent = tempfile::tempdir().unwrap();
+    let state_dir = state_parent.path().join("state");
+    let claude_dir = claude_parent.path().join("claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    let renamed = bin_dir.path().join("libra-governor-renamed");
+    copy_binary_for_exec(std::path::Path::new(bin()), &renamed);
+
+    for args in [
+        &["install"][..],
+        &["install", "--hooks-only"][..],
+        &["install", "--agent", "codex"][..],
+    ] {
+        let mut cmd = Command::new(&renamed);
+        cmd.args(args)
+            .env("LIBRA_GOVERNOR_STATE_DIR", &state_dir)
+            .env("LIBRA_GOVERNOR_CLAUDE_DIR", &claude_dir)
+            .env(
+                "LIBRA_GOVERNOR_CODEX_HOME",
+                claude_parent.path().join("codex"),
+            )
+            .env("CODEX_HOME", claude_parent.path().join("codex"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = spawn_binary(&mut cmd).wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "{args:?} must be refused: {stderr}"
+        );
+        assert!(
+            stderr.contains("exactly `libra-governor`"),
+            "{args:?}: {stderr}"
+        );
+    }
+    assert!(
+        std::fs::read_dir(&claude_dir).unwrap().next().is_none(),
+        "a refused install must not write into the Claude dir"
+    );
+    assert!(
+        !state_dir.exists(),
+        "a refused install must not create state"
+    );
+    assert!(!claude_parent.path().join("codex").exists());
+}
