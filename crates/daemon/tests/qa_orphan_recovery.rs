@@ -6,6 +6,8 @@
 //! Prices (independently computed): with `OVERRIDES`, BIG = 2,750,080
 //! micro-dollars -> ceil(275.008) = 276 cents; SMALL = 1,785,050 -> 179.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -191,32 +193,7 @@ impl Fx {
 
     /// Every table's rows as text, read through a separate connection.
     fn fingerprint(&self) -> String {
-        let conn = rusqlite::Connection::open_with_flags(
-            self.dir.path().join("ledger.sqlite3"),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
-        let tables: Vec<String> = {
-            let mut stmt = conn
-                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
-                .unwrap();
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
-            rows.map(Result::unwrap).collect()
-        };
-        let mut out = String::new();
-        for table in tables {
-            let mut stmt = conn.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
-            let columns = stmt.column_count();
-            let mut rows = stmt.query([]).unwrap();
-            out.push_str(&format!("[{table}]\n"));
-            while let Some(row) = rows.next().unwrap() {
-                for i in 0..columns {
-                    out.push_str(&format!("{:?}|", row.get_ref(i).unwrap()));
-                }
-                out.push('\n');
-            }
-        }
-        out
+        common::ledger_fingerprint(&self.dir.path().join("ledger.sqlite3"))
     }
 
     fn rollout(&self, name: &str, lines: &[String]) -> PathBuf {
