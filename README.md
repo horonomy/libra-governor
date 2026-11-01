@@ -62,8 +62,8 @@ product sees repeated use — see HORO-1154.
 
 ## Requirements
 
-- A Rust toolchain (`cargo`, `rustc`) — see <https://rustup.rs> if you
-  do not have one.
+- A Rust toolchain (`cargo`, `rustc`) — see <https://rustup.rs> — only if you
+  build from source. The v0.0.4 Apple Silicon tarball needs no toolchain.
 - Supported platform for the Cooperative Preview (v0.0.4, and the v0.0.5 candidate): Apple Silicon
   macOS (aarch64). Linux builds and runs in CI; Intel macOS is not built or
   tested. Both are unsupported and unverified for the local monthly budget;
@@ -81,7 +81,8 @@ The v0.0.4 GitHub Release carries an Apple Silicon macOS tarball
 build-provenance attestation (`gh attestation verify <file> --repo
 horonomy/libra-governor`); see `docs/release-notes/v0.0.4.md`. No other platform
 is published, and the v0.0.5 candidate on `main` is unreleased. There is no
-`curl | sh`-a-prebuilt-binary path to offer honestly. To build from source, use a clone with
+`curl | sh`-a-prebuilt-binary path to offer honestly. Either install the
+tarball (next section) or build from source, using a clone with
 `cargo install`:
 
 ```bash
@@ -110,6 +111,43 @@ libra-governor install
 libra-governor doctor
 ```
 
+### Install the v0.0.4 tarball (Apple Silicon macOS only)
+
+```bash
+mkdir libra-v0.0.4 && cd libra-v0.0.4
+gh release download v0.0.4 --repo horonomy/libra-governor
+shasum -a 256 -c libra-governor-aarch64-apple-darwin.tar.gz.sha256
+gh attestation verify libra-governor-aarch64-apple-darwin.tar.gz --repo horonomy/libra-governor
+tar -xzf libra-governor-aarch64-apple-darwin.tar.gz
+mkdir -p ~/.local/bin
+cp libra-governor-aarch64-apple-darwin/libra-governor ~/.local/bin/
+~/.local/bin/libra-governor --version      # libra-governor 0.0.4
+~/.local/bin/libra-governor install
+~/.local/bin/libra-governor doctor
+```
+
+- The binary is ad-hoc signed and **not notarized**. Download it with `gh` (as
+  above) or `curl`. A copy saved by a web browser carries macOS's quarantine
+  attribute and Gatekeeper will refuse to run it; remove the attribute only
+  after you have verified the checksum and attestation
+  (`xattr -d com.apple.quarantine <file>`).
+- `install` writes the binary's absolute path into the hook commands in
+  `~/.claude/settings.json`. Keep the binary at one stable path: installing
+  again from a different path can leave a second hook set (see the v0.0.4 release
+  notes), and a path containing whitespace or a shell metacharacter is refused.
+  Put `~/.local/bin` on your `PATH` yourself if you want to type
+  `libra-governor` without the path.
+- **Upgrade** (from an earlier build, including from a source-built v0.0.1 or
+  v0.0.2): run `libra-governor daemon stop` first so the old daemon does not keep
+  serving, then replace the binary at the same path. The ledger is migrated by
+  the new daemon on the next prompt (checked for ledgers created by the v0.0.1
+  and v0.0.2 schemas). There is no downgrade: an older binary reports the ledger
+  schema as ahead of it.
+- **Uninstall / rollback**: see "Uninstall" below; the tarball binary is deleted
+  by hand. To roll back, uninstall, delete the binary, and keep the
+  `settings.json.libra-backup-*` file if you need your original
+  `settings.json` byte for byte.
+
 ## Quickstart (5 minutes)
 
 1. Run the install steps above.
@@ -126,8 +164,10 @@ libra-governor doctor
 5. Run `libra-governor doctor` any time to check on things.
 
 That's it — the `balanced` policy preset and no enforcement gateway are
-the defaults, and nothing here blocks or interrupts your normal Claude
-Code workflow (see "Safe defaults" below).
+the defaults, and with no `shared-budget.json` nothing here blocks or
+interrupts your normal Claude Code workflow (see "Safe defaults" below). If
+you turn on the optional local monthly budget, a prompt can be refused (see
+"Local monthly budget").
 
 ## Local monthly budget (optional, Cooperative Preview)
 
@@ -147,15 +187,17 @@ Run `libra-governor install` first so the hooks are wired.
 
 **What it is.** An admission-bounded (cooperative) limit on Libra-accounted,
 list-price-equivalent USD, shared by every Claude Code session and subagent
-(and, if you opted in, Codex main-lane turns; no Codex subagents)
+(and, in the v0.0.5 candidate only and if you opted in, Codex main-lane turns;
+no Codex subagents; v0.0.4 never counts Codex)
 on this host and OS user. When less than one turn hold remains, a prompt from
 a session that holds no budget is blocked with a message that names the
 period end in your zone and how to raise the cap.
 
 **What it is not.** Not a provider bill, not provider quota and not a hard
 spending cap. With hooks only, spend *inside* a turn is seen after the fact,
-so a turn can cost more than its hold. Codex sessions are not counted unless
-you opt in (see "Codex accounting" below).
+so a turn can cost more than its hold. Codex sessions are never counted in
+v0.0.4, and are counted in the v0.0.5 candidate only if you opt in (see
+"Codex accounting" below).
 There is no gateway hard cap. Evidence is `TestOwnedLive` (real binaries,
 synthetic transcripts), not observed on a real host.
 
@@ -165,7 +207,7 @@ original strict hard-cap guarantee.
 
 - *Not a strict monetary cap.* A prompt is admitted or refused up front;
   nothing stops spend once a turn is running, so in-turn overshoot is possible.
-- *Codex is not counted unless you opt in.* The gateway hard cap is designed
+- *Codex is not counted (v0.0.4) unless you opt in (v0.0.5 candidate only).* The gateway hard cap is designed
   but off by default and not enabled. Codex accounting (v0.0.5 candidate) is
   opt-in and off by default; see "Codex accounting" below.
 - *Not your bill.* Amounts are Libra's list-price-equivalent estimates, or the
@@ -173,7 +215,7 @@ original strict hard-cap guarantee.
   (for example the 1-hour cache tier is under-counted); see ADR-0026.
 - *Accounting boundary.* Counted: Claude Code sessions and subagents whose
   settlement hooks run and whose transcripts can be read and attributed, plus
-  Codex main-lane turns only if you opted in. Not counted or not attributable:
+  (v0.0.5 candidate only) Codex main-lane turns if you opted in. Not counted or not attributable:
   any other executor, Codex subagents, a subagent without a
   readable transcript or agent id, and spend outside Claude Code. Such spend
   can settle at the flat hold, be recorded unattributed, or be missed. See
@@ -184,7 +226,8 @@ original strict hard-cap guarantee.
   daemon is down can be under-counted or missed. A forward clock jump or a
   time-zone change near a month edge opens the next month's budget early.
   `shared-budget init --force` replaces the whole file, dropping `pricing_overrides`, the subagent
-  fallback and unrepeated soft limits; the previous file is kept as
+  fallback and unrepeated soft limits. In the published v0.0.4 no backup is
+  kept; the v0.0.5 candidate keeps the previous file as
   `shared-budget.json.bak`.
 
 **Codex accounting (v0.0.5 candidate; opt-in, off by default).** Codex is not
@@ -491,8 +534,12 @@ Truthful, matching the actual implementation — not aspirational copy:
 ## Safe defaults
 
 Advisory behavior never unexpectedly blocks an existing Claude Code
-workflow: every hook is advisory-only (no `{"decision": "block", ...}`
-is ever emitted — see
+workflow: with no `shared-budget.json`, every hook is advisory-only (no
+`{"decision": "block", ...}` is emitted). The one exception is the optional
+local monthly budget: once you create `shared-budget.json`, `UserPromptSubmit`
+(and only that hook) refuses a prompt when the pool is exhausted, the budget
+file is invalid, a clock anomaly is flagged, or the daemon cannot be reached —
+see
 [`integrations/claude-code/README.md`](integrations/claude-code/README.md#what-this-integration-intentionally-does-not-do-yet)),
 and hard enforcement requires you to deliberately configure and start
 the optional gateway with a compatible credential/provider
@@ -533,18 +580,26 @@ Removes exactly what this integration's own installer added:
    nothing is changed at all, rather than overwriting that change with
    an edit computed from the older content; re-run the command to apply
    it on top of the new content.
-2. The state directory (`ledger.sqlite3`, `daemon.sock`, `daemon.log`,
-   `config.json`, `gateway.token`) — **only** with `--yes` or an
+2. The whole state directory (`ledger.sqlite3` and its `-wal`/`-shm` files,
+   `daemon.sock`, `daemon.pid`, `daemon.log`, `config.json`, `gateway.token`,
+   `host_id`, `install.json` and **`shared-budget.json`**, so the monthly
+   budget and its spend ledger are gone too) — **only** with `--yes` or an
    interactive "yes" confirmation, since it holds your only local record
    of estimate-vs-actual calibration history and deleting it is
-   unrecoverable.
-3. Nothing else. The daemon binary itself is never deleted by
+   unrecoverable. Without confirmation the directory is left in place.
+3. Nothing else, except what `install` and `uninstall` leave behind in
+   `~/.claude`: one `settings.json.libra-backup-<timestamp>-<pid>` file per
+   run and `settings.json.horonom-write.lock` (Libra's own write lock). Keep
+   or delete the backups; the install-time backup is your byte-identical
+   original. The daemon binary itself is never deleted by
    `uninstall` — it was put in place by `cargo install`, so only `cargo
    uninstall libra-governor-cli` keeps cargo's own package bookkeeping
    consistent. When `install`'s own marker file proves this exact binary
    path was installed by `libra-governor install`, `uninstall` prints
-   that command for you to run; a binary you built or installed some
-   other way is never mentioned.
+   that command for you to run. The marker only records that
+   `libra-governor install` ran from that path, so the v0.0.4 tarball binary
+   also gets the `cargo uninstall` hint (a known v0.0.4 issue): delete the
+   copied binary yourself instead.
 
 Run `libra-governor doctor` afterward to confirm — it will report
 "not installed."
