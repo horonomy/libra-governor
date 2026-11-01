@@ -1148,10 +1148,21 @@ fn settlement_ceiling_usd_cents(monthly_cap_usd_cents: u64) -> u64 {
         .max(PLAUSIBLE_TURN_FLOOR_USD_CENTS)
 }
 
+/// `true` (and one content-free line in the daemon log with the skipped figure,
+/// so the amount that was not booked can be audited later) when `cents` is not
+/// a plausible single turn.
 fn implausible_measurement(state: &SharedBudgetFileState, cents: Option<u64>) -> bool {
     match (state, cents) {
         (SharedBudgetFileState::Valid(cfg), Some(cents)) => {
-            cents > settlement_ceiling_usd_cents(cfg.monthly_cap_usd_cents)
+            let ceiling = settlement_ceiling_usd_cents(cfg.monthly_cap_usd_cents);
+            if cents > ceiling {
+                eprintln!(
+                    "libra-governor daemon: measured usage of {cents} USD cents exceeds the plausible \
+single-turn bound of {ceiling}; the turn was settled at its hold, unmeasured ({IMPLAUSIBLE_USAGE_REASON})"
+                );
+                return true;
+            }
+            false
         }
         _ => false,
     }

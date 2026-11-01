@@ -517,28 +517,43 @@ fn a_measured_turn_above_ten_months_of_budget_settles_at_the_hold_unmeasured() {
 
 #[test]
 fn a_turn_after_an_implausible_one_is_measured_again() {
+    // The mark only matters once a first measured Stop has set one: without
+    // the watermark advancing, the implausible line of turn 2 would be read
+    // again by turn 3 and flag it implausible too (review of #295).
     let mut fx = Fx::new(Some(&cfg()), BASE);
-    fx.admit_hold("s1");
     let tx = fx.path().join("s1.jsonl");
-    write_lines(&tx, &[rec(10, "m1", SONNET, mi(4_000), Some("s1"), false)]);
+
+    fx.admit_hold("s1");
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
     fx.clock.set(at(60));
     fx.finalize("s1", Some(&s(&tx)));
-    assert_eq!(totals(&fx.status()), (1_000, 0));
+    assert_eq!(totals(&fx.status()), (300, 0), "turn 1 measured");
 
     fx.clock.set(at(100));
     fx.admit_hold("s1");
-    // 1 Mi tokens = 300 cents, written after the implausible line.
-    append_lines(&tx, &[rec(110, "m2", SONNET, mi(1), Some("s1"), false)]);
+    // 4,000 Mi tokens = 1,200,000 cents > 1,000,000, stamped after the mark.
+    append_lines(&tx, &[rec(110, "m2", SONNET, mi(4_000), Some("s1"), false)]);
     fx.clock.set(at(150));
     fx.finalize("s1", Some(&s(&tx)));
     assert_eq!(
         totals(&fx.status()),
         (1_300, 0),
-        "the first turn at its hold plus the second measured in full"
+        "turn 2 settles at its hold, nothing implausible is booked"
+    );
+
+    fx.clock.set(at(200));
+    fx.admit_hold("s1");
+    append_lines(&tx, &[rec(210, "m3", SONNET, mi(2), Some("s1"), false)]);
+    fx.clock.set(at(250));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(
+        totals(&fx.status()),
+        (1_900, 0),
+        "turn 3 is measured at its own 600 cents"
     );
     let lane = fx.lane("s1");
-    assert_eq!(lane[1].settled_amount, Some(300));
-    assert_eq!(lane[1].usage_known, Some(true));
+    assert_eq!(lane[2].settled_amount, Some(600));
+    assert_eq!(lane[2].usage_known, Some(true));
 }
 
 #[test]
