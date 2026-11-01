@@ -241,7 +241,10 @@ fn settled_of(o: &CodexSettlement) -> (u64, bool) {
 
 /// Scenario driver: A admitted at BASE and killed; B admitted `gap` seconds
 /// after A's admission; returns (A's hold, B's hold).
-fn kill_a_then_admit_b(fx: &mut Fx, gap: i64) -> (SharedPoolReservationId, SharedPoolReservationId) {
+fn kill_a_then_admit_b(
+    fx: &mut Fx,
+    gap: i64,
+) -> (SharedPoolReservationId, SharedPoolReservationId) {
     let a = fx.admit("turn-a");
     fx.clock.set(at(gap));
     let b = fx.admit("turn-b");
@@ -256,8 +259,15 @@ fn s01_killed_turn_recovered_measured_from_rollout_after_ttl() {
     let (a, b) = kill_a_then_admit_b(&mut fx, TTL + 600);
     assert_ne!(a, b);
     assert_eq!(fx.hold(a).state, ReservationState::Expired);
-    assert_eq!(fx.hold(a).settled_amount, None, "orphan not settled before the next settle");
-    let path = fx.rollout("r.jsonl", &[turn_lines("turn-a", BIG), turn_lines("turn-b", SMALL)].concat());
+    assert_eq!(
+        fx.hold(a).settled_amount,
+        None,
+        "orphan not settled before the next settle"
+    );
+    let path = fx.rollout(
+        "r.jsonl",
+        &[turn_lines("turn-a", BIG), turn_lines("turn-b", SMALL)].concat(),
+    );
     let out = fx.settle("turn-b", &path);
     assert_eq!(settled_of(&out), (SMALL_CENTS, true));
     let orphan = fx.hold(a);
@@ -287,12 +297,24 @@ fn s02_killed_turn_without_usage_settles_flat_hold_unmeasured() {
         assert_eq!(settled_of(&out), (SMALL_CENTS, true), "variant {variant}");
         let orphan = fx.hold(a);
         assert_eq!(orphan.state, ReservationState::Settled, "variant {variant}");
-        assert_eq!(orphan.settled_amount, Some(HOLD), "variant {variant}: flat hold, never zero");
+        assert_eq!(
+            orphan.settled_amount,
+            Some(HOLD),
+            "variant {variant}: flat hold, never zero"
+        );
         assert_eq!(orphan.usage_known, Some(false), "variant {variant}");
         // The reason is not surfaced for an orphan; the only observable
         // signal is the unmeasured_settlements counter.
-        assert_eq!(fx.status().unmeasured_settlements, before + 1, "variant {variant}");
-        assert_eq!(fx.used_reserved(), (HOLD + SMALL_CENTS, 0), "variant {variant}");
+        assert_eq!(
+            fx.status().unmeasured_settlements,
+            before + 1,
+            "variant {variant}"
+        );
+        assert_eq!(
+            fx.used_reserved(),
+            (HOLD + SMALL_CENTS, 0),
+            "variant {variant}"
+        );
     }
 }
 
@@ -303,7 +325,10 @@ fn s02_killed_turn_without_usage_settles_flat_hold_unmeasured() {
 fn boundary(delta: i64) -> (Fx, SharedPoolReservationId, SharedPoolReservationId) {
     let mut fx = Fx::new(HOLD);
     let (a, b) = kill_a_then_admit_b(&mut fx, TTL + delta);
-    let path = fx.rollout("r.jsonl", &[turn_lines("turn-a", BIG), turn_lines("turn-b", SMALL)].concat());
+    let path = fx.rollout(
+        "r.jsonl",
+        &[turn_lines("turn-a", BIG), turn_lines("turn-b", SMALL)].concat(),
+    );
     fx.settle("turn-b", &path);
     (fx, a, b)
 }
@@ -315,9 +340,19 @@ fn s03a_one_second_before_ttl_hold_is_live_and_not_recovered_as_orphan() {
     let h = fx.hold(a);
     assert_eq!(h.state, ReservationState::Settled);
     // One hold covers both turns; no separate orphan row exists.
-    assert_eq!(fx.holds().iter().filter(|h| h.state != ReservationState::Settled).count(), 0);
+    assert_eq!(
+        fx.holds()
+            .iter()
+            .filter(|h| h.state != ReservationState::Settled)
+            .count(),
+        0
+    );
     assert_eq!(fx.holds().len(), 1);
-    assert_eq!(h.settled_amount, Some(BIG_CENTS + SMALL_CENTS), "both turns, each priced once");
+    assert_eq!(
+        h.settled_amount,
+        Some(BIG_CENTS + SMALL_CENTS),
+        "both turns, each priced once"
+    );
     assert_eq!(fx.used_reserved(), (BIG_CENTS + SMALL_CENTS, 0));
 }
 
@@ -349,10 +384,17 @@ fn s03d_stop_only_settle_past_ttl_without_an_admit_sweep() {
     let mut fx = Fx::new(HOLD);
     let a = fx.admit("turn-a");
     // Unadmitted turn X (no mapping) settles at TTL - 1 s and at TTL + 1 s.
-    let path = fx.rollout("r.jsonl", &[turn_lines("turn-a", BIG), turn_lines("turn-x", SMALL)].concat());
+    let path = fx.rollout(
+        "r.jsonl",
+        &[turn_lines("turn-a", BIG), turn_lines("turn-x", SMALL)].concat(),
+    );
     fx.clock.set(at(TTL - 1));
     fx.settle("turn-x", &path);
-    assert_eq!(fx.hold(a).state, ReservationState::Active, "not recovered before expiry");
+    assert_eq!(
+        fx.hold(a).state,
+        ReservationState::Active,
+        "not recovered before expiry"
+    );
     fx.clock.set(at(TTL + 1));
     fx.settle("turn-x", &path);
     let state_after = fx.hold(a).state;
@@ -388,7 +430,12 @@ fn s04_more_than_sixteen_orphans_cap_respected_rest_on_later_settles_no_double_b
             .filter(|id| fx.hold(**id).state == ReservationState::Settled)
             .count()
     };
-    assert_eq!(ids.iter().filter(|id| fx.hold(**id).state == ReservationState::Expired).count(), ORPHANS);
+    assert_eq!(
+        ids.iter()
+            .filter(|id| fx.hold(**id).state == ReservationState::Expired)
+            .count(),
+        ORPHANS
+    );
 
     fx.settle("turn-b", &path);
     assert_eq!(settled_orphans(&fx), 16, "cap of 16 per settle");
@@ -402,7 +449,11 @@ fn s04_more_than_sixteen_orphans_cap_respected_rest_on_later_settles_no_double_b
     let expected = ORPHANS as u64 * BIG_CENTS + SMALL_CENTS;
     assert_eq!(fx.used_reserved(), (expected, 0));
     for id in &ids {
-        assert_eq!(fx.hold(*id).settled_amount, Some(BIG_CENTS), "each exactly once");
+        assert_eq!(
+            fx.hold(*id).settled_amount,
+            Some(BIG_CENTS),
+            "each exactly once"
+        );
     }
     let before = fx.fingerprint();
     fx.settle("turn-b", &path);
@@ -417,7 +468,10 @@ fn s04_more_than_sixteen_orphans_cap_respected_rest_on_later_settles_no_double_b
 fn s05_replayed_stop_and_repeated_recovery_never_book_twice() {
     let mut fx = Fx::new(HOLD);
     let (a, b) = kill_a_then_admit_b(&mut fx, TTL + 600);
-    let path = fx.rollout("r.jsonl", &[turn_lines("turn-a", BIG), turn_lines("turn-b", SMALL)].concat());
+    let path = fx.rollout(
+        "r.jsonl",
+        &[turn_lines("turn-a", BIG), turn_lines("turn-b", SMALL)].concat(),
+    );
     fx.settle("turn-b", &path);
     let before = fx.fingerprint();
     let totals = fx.used_reserved();
@@ -448,7 +502,10 @@ fn s06_restart_between_orphan_creation_and_recovery() {
     let _b = fx.admit("turn-b");
     assert_eq!(fx.hold(a).state, ReservationState::Expired);
     fx.restart();
-    let path = fx.rollout("r.jsonl", &[turn_lines("turn-a", BIG), turn_lines("turn-b", SMALL)].concat());
+    let path = fx.rollout(
+        "r.jsonl",
+        &[turn_lines("turn-a", BIG), turn_lines("turn-b", SMALL)].concat(),
+    );
     fx.settle("turn-b", &path);
     assert_eq!(fx.hold(a).settled_amount, Some(BIG_CENTS));
     assert_eq!(fx.hold(a).usage_known, Some(true));
@@ -468,7 +525,10 @@ fn s07_month_rollover_between_admit_and_recovery_books_into_the_admit_pool() {
     let a = fx.admit("turn-a");
     fx.clock.set(t("2027-02-01T02:00:00Z"));
     let b = fx.admit("turn-b");
-    let path = fx.rollout("r.jsonl", &[turn_lines("turn-a", BIG), turn_lines("turn-b", SMALL)].concat());
+    let path = fx.rollout(
+        "r.jsonl",
+        &[turn_lines("turn-a", BIG), turn_lines("turn-b", SMALL)].concat(),
+    );
     fx.settle("turn-b", &path);
     let (ha, hb) = (fx.hold(a), fx.hold(b));
     assert_eq!(ha.pool_id.0, POOL_JAN);
@@ -487,11 +547,18 @@ fn s07_month_rollover_between_admit_and_recovery_books_into_the_admit_pool() {
 fn s08_recovered_measured_turn_above_hold_records_full_overrun() {
     let mut fx = Fx::new(100);
     let (a, _b) = kill_a_then_admit_b(&mut fx, TTL + 600);
-    let path = fx.rollout("r.jsonl", &[turn_lines("turn-a", BIG), turn_lines("turn-b", SMALL)].concat());
+    let path = fx.rollout(
+        "r.jsonl",
+        &[turn_lines("turn-a", BIG), turn_lines("turn-b", SMALL)].concat(),
+    );
     fx.settle("turn-b", &path);
     let h = fx.hold(a);
     assert_eq!(h.amount, 100);
-    assert_eq!(h.settled_amount, Some(BIG_CENTS), "no clipping to the 100-cent hold");
+    assert_eq!(
+        h.settled_amount,
+        Some(BIG_CENTS),
+        "no clipping to the 100-cent hold"
+    );
     assert_eq!(h.usage_known, Some(true));
     assert_eq!(fx.used_reserved(), (BIG_CENTS + SMALL_CENTS, 0));
 }
@@ -516,27 +583,53 @@ fn grown(turn: &str, extra: bool) -> Vec<String> {
 fn s09a_measured_short_hold_is_trued_up_once_upward_and_idempotently() {
     let mut fx = Fx::new(HOLD);
     let h = fx.admit("turn-a");
-    let path = fx.rollout("r.jsonl", &[started("turn-a"), record("turn-a", "r1", SMALL, SMALL), complete("turn-a")]);
+    let path = fx.rollout(
+        "r.jsonl",
+        &[
+            started("turn-a"),
+            record("turn-a", "r1", SMALL, SMALL),
+            complete("turn-a"),
+        ],
+    );
     assert_eq!(settled_of(&fx.settle("turn-a", &path)), (SMALL_CENTS, true));
     fx.rollout("r.jsonl", &grown("turn-a", false));
     fx.clock.set(at(600));
     fx.settle("turn-a", &path);
     assert_eq!(fx.trueup_total(h), BIG_CENTS - SMALL_CENTS);
-    assert_eq!(fx.hold(h).settled_amount, Some(SMALL_CENTS), "hold row untouched");
+    assert_eq!(
+        fx.hold(h).settled_amount,
+        Some(SMALL_CENTS),
+        "hold row untouched"
+    );
     assert_eq!(fx.used_reserved(), (BIG_CENTS, 0));
     let before = fx.fingerprint();
     fx.settle("turn-a", &path);
     fx.restart();
     fx.settle("turn-a", &path);
-    assert_eq!(fx.fingerprint(), before, "idempotent across replay and restart");
+    assert_eq!(
+        fx.fingerprint(),
+        before,
+        "idempotent across replay and restart"
+    );
     // Downward: a smaller measurement never refunds.
-    fx.rollout("r.jsonl", &[started("turn-a"), record("turn-a", "r1", SMALL, SMALL), complete("turn-a")]);
+    fx.rollout(
+        "r.jsonl",
+        &[
+            started("turn-a"),
+            record("turn-a", "r1", SMALL, SMALL),
+            complete("turn-a"),
+        ],
+    );
     fx.settle("turn-a", &path);
     assert_eq!(fx.fingerprint(), before, "never a refund");
     // Further growth books only the further delta.
     fx.rollout("r.jsonl", &grown("turn-a", true));
     fx.settle("turn-a", &path);
-    assert_eq!(fx.trueup_total(h), 326 - SMALL_CENTS, "cumulative delta only");
+    assert_eq!(
+        fx.trueup_total(h),
+        326 - SMALL_CENTS,
+        "cumulative delta only"
+    );
     assert_eq!(fx.used_reserved(), (326, 0));
 }
 
@@ -544,7 +637,14 @@ fn s09a_measured_short_hold_is_trued_up_once_upward_and_idempotently() {
 fn s09b_incomplete_turn_is_not_trued_up_until_task_complete() {
     let mut fx = Fx::new(HOLD);
     let h = fx.admit("turn-a");
-    let path = fx.rollout("r.jsonl", &[started("turn-a"), record("turn-a", "r1", SMALL, SMALL), complete("turn-a")]);
+    let path = fx.rollout(
+        "r.jsonl",
+        &[
+            started("turn-a"),
+            record("turn-a", "r1", SMALL, SMALL),
+            complete("turn-a"),
+        ],
+    );
     fx.settle("turn-a", &path);
     let mut lines = grown("turn-a", false);
     lines.pop(); // no task_complete yet
@@ -569,12 +669,19 @@ fn s09c_flat_settled_hold_is_never_trued_up_even_when_rollout_later_gains_usage(
     assert_eq!(fx.hold(a).usage_known, Some(false));
     assert_eq!(fx.hold(a).settled_amount, Some(HOLD));
     // The orphan's records now appear.
-    fx.rollout("r.jsonl", &[turn_lines("turn-a", BIG), turn_lines("turn-b", SMALL)].concat());
+    fx.rollout(
+        "r.jsonl",
+        &[turn_lines("turn-a", BIG), turn_lines("turn-b", SMALL)].concat(),
+    );
     let before = fx.fingerprint();
     fx.settle("turn-b", &path);
     fx.settle("turn-b", &path);
     assert_eq!(fx.trueup_total(a), 0);
-    assert_eq!(fx.hold(a).settled_amount, Some(HOLD), "stays at the flat hold");
+    assert_eq!(
+        fx.hold(a).settled_amount,
+        Some(HOLD),
+        "stays at the flat hold"
+    );
     assert_eq!(fx.trueup_total(b), 0, "B was complete and measured exactly");
     assert_eq!(fx.fingerprint(), before);
 }
@@ -587,13 +694,23 @@ fn corrupt_variant(kind: usize) -> Vec<String> {
         // all counters negative
         0 => vec![
             started("turn-a"),
-            record("turn-a", "ra", [-2000, -1500, -400, -80, -30], [-2000, -1500, -400, -80, -30]),
+            record(
+                "turn-a",
+                "ra",
+                [-2000, -1500, -400, -80, -30],
+                [-2000, -1500, -400, -80, -30],
+            ),
             complete("turn-a"),
         ],
         // one negative counter among valid ones
         1 => vec![
             started("turn-a"),
-            record("turn-a", "ra", [2000, -1500, 400, 80, 30], [2000, -1500, 400, 80, 30]),
+            record(
+                "turn-a",
+                "ra",
+                [2000, -1500, 400, 80, 30],
+                [2000, -1500, 400, 80, 30],
+            ),
             complete("turn-a"),
         ],
         // truncated JSON record
@@ -613,7 +730,12 @@ fn corrupt_variant(kind: usize) -> Vec<String> {
         // absurdly large (i64::MAX) counters
         _ => vec![
             started("turn-a"),
-            record("turn-a", "ra", [i64::MAX, 0, 0, i64::MAX, 0], [i64::MAX, 0, 0, i64::MAX, 0]),
+            record(
+                "turn-a",
+                "ra",
+                [i64::MAX, 0, 0, i64::MAX, 0],
+                [i64::MAX, 0, 0, i64::MAX, 0],
+            ),
             complete("turn-a"),
         ],
     };
@@ -635,7 +757,10 @@ fn s10_corrupt_or_negative_counter_rollout_does_not_book_a_bogus_number() {
         ));
         assert_eq!(h.state, ReservationState::Settled, "variant {kind}");
         let settled = h.settled_amount.unwrap();
-        assert!(settled > 0, "variant {kind}: an orphan is never settled at zero ({settled})");
+        assert!(
+            settled > 0,
+            "variant {kind}: an orphan is never settled at zero ({settled})"
+        );
         // Contract: unmeasurable -> exactly the flat hold; a number other than
         // the hold must only come from a real measurement of real counters.
         assert!(
