@@ -378,7 +378,7 @@ fn s03c_one_second_after_ttl_hold_is_expired_and_recovered() {
 /// A hold past its TTL is only moved to `expired` by a sweep that runs in
 /// `admit` (and the launch gate). A Stop-only settle with no admit in between
 /// finds the hold still `active`. This pins what the daemon does so the
-/// behaviour is recorded; see the report for the severity discussion.
+/// behaviour is recorded (QA-4 observation O1, Low).
 #[test]
 fn s03d_stop_only_settle_past_ttl_without_an_admit_sweep() {
     let mut fx = Fx::new(HOLD);
@@ -397,13 +397,15 @@ fn s03d_stop_only_settle_past_ttl_without_an_admit_sweep() {
     );
     fx.clock.set(at(TTL + 1));
     fx.settle("turn-x", &path);
-    let state_after = fx.hold(a).state;
-    // Record observed behaviour for the report.
-    eprintln!("S03D observed: orphan state after post-TTL Stop-only settle = {state_after:?}");
-    assert!(matches!(
-        state_after,
-        ReservationState::Active | ReservationState::Settled
-    ));
+    // Current behaviour, not an ADR promise: only `admit` (and the launch
+    // gate) sweep a past-TTL hold to `expired`, and a Stop-only settle
+    // recovers only `expired` holds. If the product ever recovers on Stop,
+    // this test must change deliberately.
+    assert_eq!(
+        fx.hold(a).state,
+        ReservationState::Active,
+        "a past-TTL hold nobody swept is not recovered by a Stop-only settle"
+    );
 }
 
 // (4) -------------------------------------------------------------------
@@ -657,8 +659,9 @@ fn s09b_incomplete_turn_is_not_trued_up_until_task_complete() {
 }
 
 /// ADR: a hold settled at the flat amount (usage_known=false) is never trued
-/// up, even if its rollout later gains usage. Covers a flat direct settle and
-/// a flat orphan recovery.
+/// up, even if its rollout later gains usage. This one covers a flat orphan
+/// recovery next to a measured newest hold; `s09d` covers a flat direct settle
+/// that is itself the true-up candidate.
 #[test]
 fn s09c_flat_settled_hold_is_never_trued_up_even_when_rollout_later_gains_usage() {
     let mut fx = Fx::new(HOLD);
@@ -684,6 +687,30 @@ fn s09c_flat_settled_hold_is_never_trued_up_even_when_rollout_later_gains_usage(
     );
     assert_eq!(fx.trueup_total(b), 0, "B was complete and measured exactly");
     assert_eq!(fx.fingerprint(), before);
+}
+
+/// The flat hold is the lane's only settled hold, so it is the true-up
+/// candidate. Were the `usage_known == Some(true)` guards removed it would be
+/// re-measured and trued up; it must not be.
+#[test]
+fn s09d_a_flat_direct_settle_that_is_the_only_settled_hold_is_never_trued_up() {
+    let mut fx = Fx::new(HOLD);
+    let a = fx.admit("turn-a");
+    // The turn completes but its rollout has no usage record: flat settle.
+    let path = fx.rollout("r.jsonl", &[started("turn-a"), complete("turn-a")]);
+    fx.settle("turn-a", &path);
+    assert_eq!(fx.hold(a).usage_known, Some(false));
+    assert_eq!(fx.hold(a).settled_amount, Some(HOLD));
+    // Usage for the turn appears later, then any later settle runs the
+    // true-up pass.
+    fx.rollout(
+        "r.jsonl",
+        &[turn_lines("turn-a", BIG), turn_lines("turn-x", SMALL)].concat(),
+    );
+    fx.settle("turn-x", &path);
+    fx.settle("turn-x", &path);
+    assert_eq!(fx.trueup_total(a), 0, "a flat hold is never trued up");
+    assert_eq!(fx.hold(a).settled_amount, Some(HOLD));
 }
 
 // (10) ------------------------------------------------------------------
@@ -761,13 +788,19 @@ fn s10_corrupt_or_negative_counter_rollout_does_not_book_a_bogus_number() {
             settled > 0,
             "variant {kind}: an orphan is never settled at zero ({settled})"
         );
-        // Contract: unmeasurable -> exactly the flat hold; a number other than
-        // the hold must only come from a real measurement of real counters.
-        assert!(
-            (h.usage_known == Some(false) && settled == HOLD)
-                || (h.usage_known == Some(true) && settled > HOLD),
-            "variant {kind}: booked an unexplained number {settled} usage_known={:?}",
-            h.usage_known
+        // ADR: a count that is not a non-negative integer settles at the hold
+        // amount, unmeasured. No number other than the flat hold is booked.
+        assert_eq!(
+            (h.usage_known, settled),
+            (Some(false), HOLD),
+            "variant {kind}: a corrupt rollout must settle at the flat hold"
+        );
+        // The corrupt orphan must not damage the lane's own turn.
+        let b = fx.hold(_b);
+        assert_eq!(
+            (b.state, b.usage_known, b.settled_amount),
+            (ReservationState::Settled, Some(true), Some(SMALL_CENTS)),
+            "variant {kind}: turn B is measured normally"
         );
     }
     eprintln!("S10 observed:\n{}", report.join("\n"));
