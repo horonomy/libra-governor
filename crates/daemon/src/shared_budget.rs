@@ -1129,6 +1129,49 @@ struct BookedCharge<'a> {
     watermark: Option<&'a SettleWatermark>,
 }
 
+/// A measured settlement above this is not a plausible single turn: it is a
+/// corrupt or forged transcript. The bound is `book_charge`'s ten months of
+/// budget, but never below an absolute floor, so a small monthly cap cannot
+/// make a real, expensive turn look implausible and hide genuine overspend.
+/// Under the bound the measured cost is recorded in full (overruns included);
+/// over it the measurement is neither booked nor clipped: the turn settles at
+/// its hold, flagged unmeasured with [`IMPLAUSIBLE_USAGE_REASON`], and the
+/// Claude watermark does not advance, so the lines stay visible to every later
+/// window instead of being silently dropped (HORO-2350).
+const IMPLAUSIBLE_USAGE_REASON: &str = "usage_implausible";
+const PLAUSIBLE_TURN_FLOOR_USD_CENTS: u64 = 100_000;
+
+fn settlement_ceiling_usd_cents(monthly_cap_usd_cents: u64) -> u64 {
+    monthly_cap_usd_cents
+        .saturating_mul(10)
+        .max(PLAUSIBLE_TURN_FLOOR_USD_CENTS)
+}
+
+fn implausible_measurement(state: &SharedBudgetFileState, cents: Option<u64>) -> bool {
+    match (state, cents) {
+        (SharedBudgetFileState::Valid(cfg), Some(cents)) => {
+            cents > settlement_ceiling_usd_cents(cfg.monthly_cap_usd_cents)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod settlement_ceiling_tests {
+    use super::*;
+
+    #[test]
+    fn the_ceiling_is_ten_months_of_budget_with_an_absolute_floor() {
+        assert_eq!(settlement_ceiling_usd_cents(100_000), 1_000_000);
+        // A $5 cap would otherwise call any turn over $50 implausible.
+        assert_eq!(
+            settlement_ceiling_usd_cents(500),
+            PLAUSIBLE_TURN_FLOOR_USD_CENTS
+        );
+        assert_eq!(settlement_ceiling_usd_cents(u64::MAX), u64::MAX);
+    }
+}
+
 /// Validates and books `charge` into the right period's pool. The single
 /// write path for `ChargeAgent` and `ChargeAgentTranscript`.
 fn book_charge(
@@ -1678,6 +1721,11 @@ pub fn settle_turn(
             SharedBudgetFileState::Invalid(_) => (None, Some("config_invalid"), None),
             SharedBudgetFileState::Absent => return Ok(TurnSettlement::NotConfigured),
         };
+    let (actual, reason, watermark) = if implausible_measurement(&state, actual) {
+        (None, Some(IMPLAUSIBLE_USAGE_REASON), None)
+    } else {
+        (actual, reason, watermark)
+    };
     if reason.is_some() {
         rt.note(|t| t.unmeasured_settlements += 1);
     }
@@ -2311,6 +2359,11 @@ fn settle_codex_hold(
         // An invalid file: the pricing it would supply is not trusted.
         SharedBudgetFileState::Invalid(_) => (None, Some("config_invalid")),
         SharedBudgetFileState::Absent => return Ok(CodexSettlement::NotConfigured),
+    };
+    let (actual, reason) = if implausible_measurement(state, actual) {
+        (None, Some(IMPLAUSIBLE_USAGE_REASON))
+    } else {
+        (actual, reason)
     };
     if reason.is_some() {
         rt.note(|t| t.unmeasured_settlements += 1);
