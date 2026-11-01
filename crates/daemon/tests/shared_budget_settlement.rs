@@ -477,6 +477,44 @@ fn a_stop_settles_the_turn_hold_at_the_priced_usd_and_a_retry_does_not_settle_ag
     assert_eq!(totals(&fx.status()), (450, 0));
 }
 
+/// HORO-2350: a measured settlement follows `book_charge`'s bound of ten
+/// months of budget (cap 100,000 -> 1,000,000 cents). Under it the real spend
+/// is recorded in full; over it the measurement is not believed, not booked and
+/// not clipped, and its lines stay after the watermark.
+#[test]
+fn a_large_but_plausible_measured_turn_is_recorded_in_full() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    fx.admit_hold("s1");
+    let tx = fx.path().join("s1.jsonl");
+    // 3,000 Mi tokens = 900,000 cents, far above the 1,000 hold, below the bound.
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(3_000), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(totals(&fx.status()), (900_000, 0));
+    let lane = fx.lane("s1");
+    assert_eq!(lane[0].settled_amount, Some(900_000));
+    assert_eq!(lane[0].usage_known, Some(true));
+}
+
+#[test]
+fn a_measured_turn_above_ten_months_of_budget_settles_at_the_hold_unmeasured() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    fx.admit_hold("s1");
+    let tx = fx.path().join("s1.jsonl");
+    // 4,000 Mi tokens = 1,200,000 cents > 1,000,000.
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(4_000), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(
+        totals(&fx.status()),
+        (1_000, 0),
+        "neither the figure nor a clipped copy of it is booked"
+    );
+    let lane = fx.lane("s1");
+    assert_eq!(lane[0].settled_amount, Some(1_000));
+    assert_eq!(lane[0].usage_known, Some(false));
+}
+
 #[test]
 fn two_consecutive_stops_never_count_a_record_twice() {
     let mut fx = Fx::new(Some(&cfg()), BASE);
