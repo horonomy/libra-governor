@@ -128,9 +128,9 @@ cp libra-governor-aarch64-apple-darwin/libra-governor ~/.local/bin/
 
 - The binary is ad-hoc signed and **not notarized**. Download it with `gh` (as
   above) or `curl`. A copy saved by a web browser carries macOS's quarantine
-  attribute and Gatekeeper will refuse to run it; remove the attribute only
-  after you have verified the checksum and attestation
-  (`xattr -d com.apple.quarantine <file>`).
+  attribute, and Gatekeeper may refuse to run the extracted binary (not tested
+  here); if it does, remove the attribute only after you have verified the
+  checksum and attestation (`xattr -d com.apple.quarantine <file>`).
 - `install` writes the binary's absolute path into the hook commands in
   `~/.claude/settings.json`. Keep the binary at one stable path: installing
   again from a different path can leave a second hook set (see the v0.0.4 release
@@ -141,8 +141,9 @@ cp libra-governor-aarch64-apple-darwin/libra-governor ~/.local/bin/
   v0.0.2): run `libra-governor daemon stop` first so the old daemon does not keep
   serving, then replace the binary at the same path. The ledger is migrated by
   the new daemon on the next prompt (checked for ledgers created by the v0.0.1
-  and v0.0.2 schemas). There is no downgrade: an older binary reports the ledger
-  schema as ahead of it.
+  and v0.0.2 schemas). There is no downgrade path: a v0.0.4 ledger is at schema v24 and
+  has not been tested against older binaries (`doctor` flags a ledger that is
+  ahead of the binary).
 - **Uninstall / rollback**: see "Uninstall" below; the tarball binary is deleted
   by hand. To roll back, uninstall, delete the binary, and keep the
   `settings.json.libra-backup-*` file if you need your original
@@ -537,10 +538,10 @@ Advisory behavior never unexpectedly blocks an existing Claude Code
 workflow: with no `shared-budget.json`, every hook is advisory-only (no
 `{"decision": "block", ...}` is emitted). The one exception is the optional
 local monthly budget: once you create `shared-budget.json`, `UserPromptSubmit`
-(and only that hook) refuses a prompt when the pool is exhausted, the budget
-file is invalid, a clock anomaly is flagged, or the daemon cannot be reached —
-see
-[`integrations/claude-code/README.md`](integrations/claude-code/README.md#what-this-integration-intentionally-does-not-do-yet)),
+refuses a prompt (and `PreToolUse` can deny a tool call) when the pool is
+exhausted, the budget file is invalid, a clock anomaly is flagged, or the daemon
+cannot be reached; no other hook blocks — see
+[`integrations/claude-code/README.md`](integrations/claude-code/README.md#what-this-integration-intentionally-does-not-do-yet),
 and hard enforcement requires you to deliberately configure and start
 the optional gateway with a compatible credential/provider
 configuration — configuration validation *refuses to start* a
@@ -590,15 +591,17 @@ Removes exactly what this integration's own installer added:
 3. Nothing else, except what `install` and `uninstall` leave behind in
    `~/.claude`: one `settings.json.libra-backup-<timestamp>-<pid>` file per
    run and `settings.json.horonom-write.lock` (Libra's own write lock). Keep
-   or delete the backups; the install-time backup is your byte-identical
-   original. The daemon binary itself is never deleted by
+   or delete the backups; the backup written by your first `install` is your
+   byte-identical original (later backups contain already-wired content), and
+   `install --agent codex` leaves `~/.codex/hooks.json.libra-backup-*` files in
+   the same way. The daemon binary itself is never deleted by
    `uninstall` — it was put in place by `cargo install`, so only `cargo
    uninstall libra-governor-cli` keeps cargo's own package bookkeeping
    consistent. When `install`'s own marker file proves this exact binary
    path was installed by `libra-governor install`, `uninstall` prints
    that command for you to run. The marker only records that
    `libra-governor install` ran from that path, so the v0.0.4 tarball binary
-   also gets the `cargo uninstall` hint (a known v0.0.4 issue): delete the
+   also gets the `cargo uninstall` hint (a known limitation, also present on the v0.0.5 candidate): delete the
    copied binary yourself instead.
 
 Run `libra-governor doctor` afterward to confirm — it will report

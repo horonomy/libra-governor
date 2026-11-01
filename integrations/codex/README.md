@@ -297,8 +297,8 @@ evidence-gathering.
 ## Platforms
 
 The only supported and verified platform is Apple Silicon (aarch64) macOS
-(the v0.0.4 Cooperative Preview). Nothing in the binary or `install` blocks
-other platforms, but Linux, Intel macOS and Windows are unsupported and
+(the v0.0.4 Cooperative Preview). No platform check was found in the source, so
+other platforms are not blocked, but Linux, Intel macOS and Windows are unsupported and
 unverified, including for Codex.
 
 ## Uninstall
