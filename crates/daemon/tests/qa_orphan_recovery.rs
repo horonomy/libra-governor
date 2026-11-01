@@ -87,7 +87,7 @@ fn counters(u: [i64; 5]) -> String {
         u[2],
         u[3],
         u[4],
-        u[0] + u[3]
+        u[0].saturating_add(u[3])
     )
 }
 
