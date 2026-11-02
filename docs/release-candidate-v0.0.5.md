@@ -129,7 +129,7 @@ ticket-backed limit below stays open until its fix is merged and verified.
 | Gateway path may under-count truncated streams (dark gateway only) | HORO-2286 |
 | Pool and account identity not bound to captured identity | HORO-2191 |
 | Pricing-table errors (1-hour cache tier, fast mode, geo multiplier under-counted; Haiku 5.5 over-counted) | ADR-0026 |
-| The `amount_too_large` ceiling (one charge above ten times the monthly cap) applies to explicit per-charge requests and extra charges (subagent transcript, session-tail, late Codex true-up, a Codex turn booked without a hold), **not** to the end-of-turn settlement of a turn's hold from measured transcript or rollout usage, which books the measured amount without a ceiling. A corrupt or hostile transcript can therefore inflate the ledger (1e15 input tokens booked about $3e9 on Claude `Stop`; Codex saw the same) and make later prompts refuse for the rest of the month. Same on v0.0.4 and v0.0.5; within the documented same-user trust boundary. Disclosed, not fixed | tracked in the QA follow-up ticket HORO-2350 (wording corrections from the same QA: HORO-2349) |
+| The `amount_too_large` ceiling (one charge above ten times the monthly cap) applies to explicit per-charge requests and extra charges. The end-of-turn settlement of a turn's hold from measured transcript or rollout usage has a separate ceiling (HORO-2350, #295): a measured figure at or under ten times the monthly cap (never below $1,000) is booked in full; a strictly larger one is treated as implausible and the turn settles at its hold, unmeasured (`usage_implausible`, logged to `daemon.log`). A corrupt or hostile transcript can therefore still inflate the ledger by up to that ceiling in one turn (bounded, not unlimited); within the documented same-user trust boundary. Fixed in v0.0.5 for the 1e15-token case; the v0.0.4 behaviour is unchanged | HORO-2350 (wording corrections from the same QA: HORO-2349) |
 | A Claude `SessionEnd` with no preceding `Stop` for that session does not release or settle the hold. It stays `active` and reduces the remaining budget until it expires (`HOLD_TTL_SECS` = 3600 s after the last renewal); on the next admission it is marked `expired`, its capacity returns and nothing is booked for the hold itself, unless a later `Stop` on the same lane settles it. (`SessionEnd` still runs its tail settlement, which books nothing for a session that never had a `Stop`.) Same on v0.0.4 and v0.0.5 | tracked in the QA follow-up ticket HORO-2350 |
 
 ## Acceptance state
@@ -160,8 +160,8 @@ founder-named SHA must be chosen after that decision.
 2. **Real-host independent product QA (a baseline requirement, not an R-criterion).** The provider-free groups are done (above). The
    real-host group needs the owner to log in to dedicated QA homes and trust the hooks; one consolidated owner action is prepared in
    `qa/realhost/`. Until it runs, the not-verified list stays in the notes.
-3. **Two pre-existing behaviours (HORO-2350), disclosed, not changed:** settlement of measured usage has no per-charge ceiling, and a Claude
-   `SessionEnd` without a `Stop` leaves its hold until it expires. Whether to change either is an accounting-semantics decision for the founder.
+3. **Pre-existing behaviour (HORO-2350), disclosed, not changed:** a Claude
+   `SessionEnd` without a `Stop` leaves its hold until it expires (Medium, fail-safe, identical on v0.0.4; basis in the release-criteria reconciliation). The per-charge ceiling on measured settlement was fixed in #295.
 4. **Founder SHA-specific GO.** Not given; tagging, publication and deployment stay gated.
 
 ## Release notes draft
