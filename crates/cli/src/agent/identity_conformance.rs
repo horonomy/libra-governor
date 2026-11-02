@@ -19,10 +19,11 @@
 //! `normalizer_vectors_hold_through_libras_payload_path` like every other
 //! normalizer vector.
 //!
-//! One vector remains a named, justified deviation ([`JUSTIFIED_DEVIATIONS`]):
-//! `claude-not-a-mapping`. See the constant for the invariant. Every other
-//! requirement of the contract (no fabricated ids, blank is absent, Claude
-//! `turn_id` unmapped) is asserted by the vectors that do match.
+//! Every normalizer vector now matches the reference. `claude-not-a-mapping`
+//! (payload `["s-1"]`) was a justified deviation until HORO-2197 follow-up:
+//! `normalize` returns the identity-free event for a non-object payload
+//! instead of refusing it, so the envelope carries every identity field absent
+//! while the array is still never decoded positionally into a session.
 
 use libra_governor_domain::{AgentKind, ExecutionIdentity, Scope};
 use serde_json::{json, Value};
@@ -35,22 +36,6 @@ use super::normalize::{normalize, EntryPoint};
 const VECTORS: &str =
     include_str!("../../../domain/tests/fixtures/execution-identity-conformance-vectors.json");
 const PINNED_SHA256: &str = "c6ab9b978540e723a4d338f40b5218f6e355667c35dec456e9b7a650233b5a13";
-
-/// Vectors Libra deliberately does not match, each with the invariant that
-/// forbids it. Pinned by [`justified_deviations_refuse_and_never_attribute_a_session`].
-///
-/// `claude-not-a-mapping` (payload `["s-1"]`): the reference emits an
-/// envelope with every identity field absent. Libra refuses the whole hook
-/// event instead. Invariant: a hook payload that is not a JSON object names
-/// no field at all, and serde's derived struct decoders would otherwise read
-/// the array *positionally*, so `["s-1"]` would become session `s-1` -- an
-/// identity read out of a payload that names nothing. `normalize` therefore
-/// rejects every non-object before any decoder runs, and the event produces
-/// no envelope, no daemon request and no counter. This is strictly stricter
-/// than the reference (the reference's envelope would also carry no session);
-/// what the vector protects -- no session is ever attributed from a
-/// non-mapping -- holds, and is asserted here for every entry point.
-const JUSTIFIED_DEVIATIONS: [&str; 1] = ["claude-not-a-mapping"];
 
 fn vectors() -> Value {
     serde_json::from_str(VECTORS).expect("vendored vectors are valid JSON")
@@ -185,9 +170,6 @@ fn normalizer_vectors_hold_through_libras_payload_path() {
     let mut checked = 0;
     for vector in normalizers(&doc) {
         let name = vector["name"].as_str().unwrap();
-        if JUSTIFIED_DEVIATIONS.contains(&name) {
-            continue;
-        }
         let agent = agent_kind(vector["provider"].as_str().unwrap());
         let host_id = vector["host_id"].as_str().unwrap();
         for entry in entry_points(&vector["payload"]) {
@@ -199,40 +181,8 @@ fn normalizer_vectors_hold_through_libras_payload_path() {
             checked += 1;
         }
     }
-    // 8 vectors x 3 entry points + 'claude-main', routed to its one named entry point.
-    assert_eq!(checked, 8 * 3 + 1);
-}
-
-#[test]
-fn justified_deviations_refuse_and_never_attribute_a_session() {
-    let doc = vectors();
-    let mut refused = 0;
-    for vector in normalizers(&doc) {
-        let name = vector["name"].as_str().unwrap();
-        if !JUSTIFIED_DEVIATIONS.contains(&name) {
-            continue;
-        }
-        assert!(
-            !vector["payload"].is_object(),
-            "{name}: a deviation justified by the non-object guard must be a non-object payload"
-        );
-        let agent = agent_kind(vector["provider"].as_str().unwrap());
-        for entry in entry_points(&vector["payload"]) {
-            let identity = identity_from_payload(agent, "host-1", entry, &vector["payload"]);
-            assert!(
-                identity.is_none(),
-                "{name}/{entry:?}: Libra now accepts this payload; move it out of \
-                 JUSTIFIED_DEVIATIONS and let the exact-match test cover it"
-            );
-            refused += 1;
-        }
-        assert_eq!(
-            vector["expect"]["provider_session_id"],
-            Value::Null,
-            "{name}: the reference attributes no session either"
-        );
-    }
-    assert_eq!(refused, JUSTIFIED_DEVIATIONS.len() * 3);
+    // 9 vectors x 3 entry points + 'claude-main', routed to its one named entry point.
+    assert_eq!(checked, 9 * 3 + 1);
 }
 
 /// What the three newly matching vectors must never be turned into: the
