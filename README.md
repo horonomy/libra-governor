@@ -162,7 +162,7 @@ cp libra-governor-aarch64-apple-darwin/libra-governor ~/.local/bin/
    couple of seconds to something like:
 
    ```
-   libra: task a1b2c3d4 | plan e5f6a7b8 | preflight: Preflight complete | recon: 0.03s | remaining P90: 42s | stable
+   libra: task a1b2c3d4 | plan e5f6a7b8 | preflight: Preflight complete | recon: 0.0s | remaining P90: 42s | stable
    ```
 
 5. Run `libra-governor doctor` any time to check on things.
@@ -212,8 +212,9 @@ original strict hard-cap guarantee.
 
 - *Not a strict monetary cap.* A prompt is admitted or refused up front;
   nothing stops spend once a turn is running, so in-turn overshoot is possible.
-- *Codex is not counted (v0.0.4) unless you opt in (v0.0.5 candidate only).* The gateway hard cap is designed
-  but off by default and not enabled. Codex accounting (v0.0.5 candidate) is
+- *Codex is not counted (v0.0.4) unless you opt in (v0.0.5 candidate only).* There is no gateway hard cap for the monthly
+  budget: the S11 design is not built (the optional local gateway is a separate,
+  per-task mechanism that is not connected to the monthly budget). Codex accounting (v0.0.5 candidate) is
   opt-in and off by default; see "Codex accounting" below.
 - *Not your bill.* Amounts are Libra's list-price-equivalent estimates, or the
   flat turn hold when a turn cannot be measured. Pricing gaps drift both ways
@@ -615,6 +616,8 @@ Run `libra-governor doctor` afterward to confirm — it will report
 
 ## Known limitations
 
+- **Corrections to the published v0.0.4 release notes** are listed in
+  [`docs/release-notes/v0.0.4-corrections.md`](docs/release-notes/v0.0.4-corrections.md).
 - **Shadow-decision/early-warning and multi-level custody accounting are
   not production-evidenced.** See "Capability status" above and
   [`docs/adr/0014-v0-0-3-go-scope-and-exclusions.md`](docs/adr/0014-v0-0-3-go-scope-and-exclusions.md).
