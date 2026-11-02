@@ -1,0 +1,768 @@
+# Claude Code integration
+
+HORO-1125 shipped the first real Claude Code integration: a submitted
+prompt triggers the local Governor daemon to run bounded, read-only
+reconnaissance and produce a preflight result (a draft Completion
+Contract) surfaced inside Claude Code's own context, plus a one-line
+statusline showing the daemon's current state. HORO-1126 closes the loop:
+the preflight now carries a real probabilistic P50/P80/P90 cost/time
+[`Estimate`](https://github.com/horonomy/libra-governor/blob/main/crates/domain/src/estimate.rs), tool calls are counted
+during the session, and a `Stop` hook finalizes the session's task into
+an [`ExecutionReceipt`](https://github.com/horonomy/libra-governor/blob/main/crates/domain/src/execution_receipt.rs) —
+the estimate-vs-actual record used for calibration. HORO-1139 closes a
+further loop — "govern the run": every `PostToolUse` notification is now
+also checked for a MATERIAL deviation from what the current plan's
+estimate implied (a possible tool-call loop, or a tool-call count that
+has exceeded what history says is typical — see
+[`crates/domain/src/replan.rs`](https://github.com/horonomy/libra-governor/blob/main/crates/domain/src/replan.rs) for
+exactly which signals are genuinely available from Claude Code's hook
+payloads and which are honestly left undetected). A material event,
+subject to cooldown/max-replan hysteresis, triggers a deterministic
+replan: the remaining-work estimate is recomputed and widened, linked
+back to the plan it replaces with a structured reason, and persisted.
+The statusline now surfaces this directly (current plan id, remaining
+P90, and replan state) — see "What Claude Code's hook payloads actually
+expose" below for why this is the statusline's job rather than
+`PostToolUse`'s. See [`../../ARCHITECTURE.md`](architecture.md)
+for how this fits the overall hooks/daemon responsibility boundary.
+
+> **Evidence export (HORO-1154):** if you're participating in an
+> evaluation and have agreed to share your local usage signals with the
+> founder, see "Evidence export (opt-in, manual): `libra-governor
+> evidence-report`" in the top-level [`README.md`](developer-preview.md).
+> It's a manual, opt-in-gated, local-only export you run yourself — not
+> telemetry, no network call, nothing automatic.
+
+## Explicit installed callback lifecycle
+
+The user-scoped `libra.claude-hooks.v1` profile manages the three advisory
+callbacks separately from the legacy `install` command:
+
+```sh
+libra-governor adapter install claude_code --profile libra.claude-hooks.v1 --scope user
+libra-governor adapter enable claude_code --profile libra.claude-hooks.v1 --scope user
+libra-governor adapter status claude_code --json
+libra-governor adapter doctor claude_code --json
+libra-governor adapter disable claude_code --profile libra.claude-hooks.v1 --scope user
+libra-governor adapter uninstall claude_code --profile libra.claude-hooks.v1 --scope user
+```
+
+`install` creates and verifies a private immutable callback artifact with its gate
+disabled; it writes no host callbacks. `enable` connects the three exact callbacks
+after checking the artifact, current binary and target configuration. `disable`
+closes admission before removing positively owned references. `uninstall`
+requires disabled state and removes only that installation's references and
+artifact, preserving registration, ledger, unrelated configuration and other
+products. All four mutators accept `--json` and `--dry-run`; previews report
+current state and planned artifact/callback changes without writing or executing
+an adapter. Project scope and other profiles are currently unsupported.
+
+The target follows the existing `LIBRA_GOVERNOR_CLAUDE_DIR`/home-directory
+convention; the state root follows `LIBRA_GOVERNOR_STATE_DIR`. Their captured
+locators, installation identity, validator and binary digest must still match.
+After a binary upgrade, activation refuses stale identity; disable/uninstall can
+still clean up the stored exact references without executing the old binary.
+The [request](https://github.com/horonomy/libra-governor/blob/main/crates/daemon/resources/config-profiles/libra.claude-hooks.v1/request.schema.json) and
+[plan](https://github.com/horonomy/libra-governor/blob/main/crates/daemon/resources/config-profiles/libra.claude-hooks.v1/plan.schema.json) schemas belong to
+the compiled product profile; no adapter supplies commands or filesystem paths.
+
+Unknown settings values, foreign hook members, statusLine, model/provider,
+MCP and plugin settings survive lifecycle changes. Modified, moved, duplicate or
+partial owned callbacks are conflicts. A failure before completion leaves a pending operation
+with a closed gate. Drift observed after a completion commit is reported as
+unconfirmed; recorded intent remains intact, current integrity is unknown, and
+the callback refuses the changed artifact or references. Retry the same command to reconcile a proven before/after
+state; ambiguous user edits remain pending. An enable retry proven to have made
+no target change reports `operation_not_applied` and does not replay activation.
+No stale whole-file backup is restored.
+
+The installed gate exits before stdin or legacy effects when missing, disabled
+or pending. Enabled admission holds the existing reservation only for integrity
+checks, then releases it before input/consumer work. A callback admitted before
+disable may finish afterward. Installed input is limited to 1 MiB before entering
+the shared legacy handler; this local byte limit is not a native-host timeout or
+capability claim. These handlers retain their existing session-level advisory
+semantics; they do not establish canonical execution/task attribution.
+
+Legacy callbacks are independent: a disabled installed profile does not disable
+legacy commands. Activation refuses conflicting legacy/orphan callbacks rather
+than adopting or deleting them. Legacy install refuses a canonical installation;
+legacy removal preserves canonical references, and its existing state-purge guard
+refuses the adapter namespace. Native verification remains `unverified`, including
+when local integrity checks pass. This profile does not add a Codex statusline or
+certify native Codex readiness.
+
+## Passive operator inspection
+
+`adapter status`, ordinary `adapter doctor`, and `adapter explain <id>` provide
+passive inspection of registration, recorded code trust and local installation
+state. Their installation facts and metadata share one catalog observation.
+Catalog drift refuses the query; damaged local configuration, package or artifact
+preserves recorded intent with unknown integrity. Pending operations remain
+pending during inspection.
+
+Connected local callbacks do not establish host trust or observed native
+execution. Those dimensions remain `unknown`, and native verification remains
+`unverified`. Selecting an external planner reports its own registration;
+the builtin consumer's installation is not attributed to the planner. These
+commands start no adapter child or daemon and do not reconcile configuration.
+
+## External planner preview
+
+An explicitly registered and trusted ConfigDriver can propose a preview for an
+existing installed `libra.claude-hooks.v1` consumer:
+
+```sh
+libra-governor adapter plan <registered-planner-id> --profile libra.claude-hooks.v1 --intent enable --dry-run --json
+libra-governor adapter plan <registered-planner-id> --profile libra.claude-hooks.v1 --intent enable --json
+```
+
+The runtime ID selects the external planner; the installation still belongs to
+the builtin consumer. Dry-run performs local preflight with no child or writes
+and reports `external_plan_required`. Ordinary planning executes trusted code
+with ambient authority through handshake and `plan_config`. The product validates
+the returned plan against its shipped profile and renders a preview without
+applying it. Output identifies the profile, consumer, three slot actions and
+whether a configuration change would be required; it exposes no commands or
+configuration paths. Observed code, catalog, package, artifact or target drift
+refuses the preview and is preserved.
+
+`enable`, `disable` and `uninstall` are accepted preview intents; install, project
+scope and other profiles are unavailable here. There is no apply token or saved
+plan input. Native verification remains `unverified`; a validated preview grants
+no activation or task attribution. Builtin disable/uninstall never requires the
+external planner to remain registered or trusted.
+
+## What ships
+
+- `libra-governor hook user-prompt-submit` — a `UserPromptSubmit` hook
+  command. Reads the hook JSON payload from stdin, asks the daemon
+  (starting it if not already running) for a preflight — now including a
+  real `Estimate` (P50/P80/P90 duration and resource quantiles, computed
+  by `libra-governor-estimator` from local `ExecutionReceipt` history;
+  see cold-start handling below) — and prints a
+  `hookSpecificOutput.additionalContext` JSON object so Claude Code
+  injects the preflight summary into its own context window.
+- `libra-governor hook post-tool-use` — a `PostToolUse` hook command.
+  Fires a cheap, fire-and-forget notification at the daemon to increment
+  a per-session tool-call counter. Never spawns the daemon and never
+  waits for its response (see `crates/cli/src/client.rs::fire_and_forget`
+  docs) — this must not add perceptible latency to every tool call.
+- `libra-governor hook stop` — a `Stop` hook command. Asks the daemon to
+  finalize the session's task: compute elapsed wall-clock duration
+  (from the session's first `Preflight`), gather the tool-call count,
+  and persist an `ExecutionReceipt` with `outcome: Unknown` (MVP 1.0 has
+  no automated Completion Contract verification — see "What this
+  integration intentionally does not do" below). Prints a concise
+  Estimate-vs-Actual summary to **stderr** (never stdout, which stays
+  reserved for the hook protocol); a safe no-op when the session never
+  had a preceding preflight.
+- `libra-governor statusline` — a `statusLine` command. Reads the
+  daemon's current task/preflight state and prints one short line, e.g.:
+
+  ```
+  libra: task a1b2c3d4 | plan f00dcafe | preflight: high | recon: 0.4s | remaining P90: 90s | replanned 1x
+  ```
+
+  `replanned 1x` (or `stable` / `escalated — awaiting approval`,
+  HORO-1139) reflects the most recent material replan, if any — this is
+  the primary visibility surface for runtime replanning; see "What ships"
+  above. Never spawns the daemon and never makes an LLM call of its own —
+  see `crates/cli/src/statusline.rs`.
+
+  This one-line form cannot be composed with anything else, and Claude
+  Code gives a scope only one `statusLine.command`. The supported surface
+  is now `libra-governor statusline provider`, below; this one is kept
+  working unchanged rather than removed.
+- `libra-governor statusline provider` — Libra's side of the shared
+  Horonom statusline provider contract (HORO-1569): one versioned JSON
+  document on stdout, always exit 0, composed by a shared host alongside
+  your own statusline and other products' providers.
+  `libra-governor statusline explain` prints the read-only long form for
+  the host's explain surface. Both are read-only, host-scoped, answer from
+  state the daemon already holds, and never spawn it. What they report and
+  what they never report is in [`docs/statusline.md`](statusline.md);
+  the render logic is `crates/cli/src/statusline_provider.rs`.
+- `libra-governor calibration report` — a manual command (not a hook):
+  asks the daemon for real duration-coverage and admission-replay
+  calibration evidence, computed over every locally recorded receipt
+  paired back to its originating estimate, and prints a human-readable
+  report to stdout. Honestly reports "insufficient data" rather than a
+  fabricated number when local history is thin — see
+  `libra-governor-estimator::calibration` docs.
+- `libra-governor doctor [--json]` — a read-only diagnostic snapshot
+  (HORO-1150): daemon availability/version, SQLite schema health,
+  `config.json` validity, gateway configuration/capability tier, and
+  this Claude Code integration's own hook/statusline wiring. Never
+  spawns the daemon, never prints a secret value. See the root
+  [`README.md`](developer-preview.md#diagnostics-libra-governor-doctor) for
+  the full field-by-field explanation.
+- `libra-governor install` / `libra-governor uninstall [--yes]` —
+  `install` wires the six hooks and, only when the slot is free, the legacy
+  statusline; `uninstall` removes those and also removes an
+  `env.ANTHROPIC_BASE_URL` / `apiKeyHelper` entry that points at this gateway
+  if you added one by hand (see "Enforcement gateway" below). Each run writes
+  a `settings.json.libra-backup-<ts>-<pid>` file and leaves a
+  `settings.json.horonom-write.lock` in place. Neither touches any other key
+  in `~/.claude/settings.json` (HORO-1150). See the root
+  [`README.md`](developer-preview.md#uninstall) for the exact safety
+  guarantees.
+
+All talk to the daemon over the versioned JSON-over-Unix-socket
+protocol defined in `crates/protocol` (bumped to version 2 in HORO-1126,
+to version 3 in HORO-1132 for the `CalibrationReport` request/response,
+to version 4 in HORO-1139 for the replan-visibility fields on
+`PreflightResult`/`TaskSummary`, to version 5 in HORO-1141 for
+`PreflightResult`'s `admission`/`completion_reserve` and the receipt's
+reservation evidence, to version 6 in HORO-1144 for the `GatewayStatus`
+request/response, and to version 7 in HORO-1150 for the `Doctor`
+request/response — see that crate's `lib.rs` docs for the upgrade
+caveat: a long-lived daemon on an older protocol version must be
+restarted, it will not understand a newer client's request variants;
+`libra-governor doctor` itself surfaces this as a plain error finding
+rather than a crash).
+Everything about admission, reconnaissance, estimation, and the ledger
+stays local — see the Privacy Boundary section of `ARCHITECTURE.md`.
+
+## What Claude Code's hook payloads actually expose (verified against
+## the official hooks docs, HORO-1126)
+
+- `Stop` and `PostToolUse` payloads both include a `model` field (the
+  canonical model name) — `hook stop` parses and records it on the
+  receipt when present.
+- Neither payload exposes a provider identifier, token counts, or
+  cost/spend data. `ExecutionReceipt.provider` is therefore always `None`
+  today, and `actual_usage` is always an empty list — an honest "unknown"
+  rather than a fabricated zero-cost figure. See
+  `crates/domain/src/execution_receipt.rs` field docs.
+
+## Setup
+
+The fastest path is `./scripts/install.sh` (or `cargo install --path
+crates/cli --locked && libra-governor install`) from the repository root
+— see the root [`README.md`](developer-preview.md#install), which does
+exactly the settings.json edit below for you, safely (see
+[`README.md#uninstall`](developer-preview.md#uninstall) for the guarantees).
+To install only Libra's six hooks without changing `statusLine`, use
+`./scripts/install.sh --hooks-only` or `libra-governor install --hooks-only`.
+That mode preserves `statusLine` exactly as it is, whether it is absent,
+foreign, or an unrecognized JSON value. The manual steps below describe
+the default install, which also adds Libra's legacy statusline only when
+the slot is free.
+
+Build the binary and put it on your `PATH` (or reference it by absolute
+path in the settings below):
+
+```bash
+cargo build --release -p libra-governor-cli
+# binary at target/release/libra-governor
+```
+
+Add the following to `.claude/settings.json` (project-level) or
+`~/.claude/settings.json` (user-level):
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/libra-governor hook user-prompt-submit"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/libra-governor hook post-tool-use"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/libra-governor hook stop"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/libra-governor hook pre-tool-use"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/libra-governor hook subagent-stop",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/libra-governor hook session-end",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "/absolute/path/to/libra-governor statusline"
+  }
+}
+```
+
+The `statusLine` entry above is the legacy single-product form, and it is
+only written when the slot is free. If you already have a statusline, or
+want another Horonom product's state on the same line, leave `statusLine`
+alone and register `libra-governor statusline provider` with the shared
+statusline host instead — [`docs/statusline.md`](statusline.md).
+
+No further configuration is required to get today's defaults (the
+`balanced` admission policy, no gateway). The daemon is started on demand
+— see "Daemon lifecycle" below — and stores its state under
+`$LIBRA_GOVERNOR_STATE_DIR`, or `$XDG_STATE_HOME/libra-governor`, or
+`~/.local/state/libra-governor` (see `crates/daemon/src/paths.rs`). To
+select a different admission policy preset, or to turn the enforcement
+gateway on, see "Configuring the daemon (`config.json`)" below.
+
+## Configuring the daemon (`config.json`)
+
+By default `libra-governor daemon run` uses the `balanced` admission
+policy preset and runs with no enforcement gateway (`gateway: None`) —
+exactly the behavior described above, unchanged. An optional
+`config.json` file, read once at daemon startup from the state directory
+(`$LIBRA_GOVERNOR_STATE_DIR/config.json`, or wherever `paths::state_dir()`
+resolves — see above), lets you override either or both without touching
+any code. **Absence of the file is the normal case** — every existing
+deployment with no `config.json` keeps today's defaults exactly.
+
+A present-but-invalid file does not stop the daemon from starting: the
+error is logged to `daemon.log` and the daemon falls back to the
+defaults, the same "a mistyped config must not take away the daemon's
+core function" rule applied elsewhere in this integration.
+
+```json
+{
+  "policy": {
+    "preset": "deadline_first",
+    "resource_target_tokens": 150000,
+    "time_target_secs": 1800
+  },
+  "gateway": {
+    "bind_addr": "127.0.0.1:8787",
+    "token_path": "/absolute/path/to/state-dir/gateway.token",
+    "credential_mode": "pass_through_subscription"
+  }
+}
+```
+
+The top-level tables (`policy`, `gateway`, and the extension and launcher
+tables not described here) are optional and independent — a file with only
+`policy`, only `gateway`, or neither (`{}`) is valid.
+
+### `policy`
+
+| Field | Required | Meaning |
+|---|---|---|
+| `preset` | yes | One of the four named presets `crates/domain/src/policy.rs` ships: `"balanced"`, `"deadline_first"`, `"cost_first"`, `"strict_budget"`. Any other value is rejected at startup (falls back to defaults, logged). |
+| `resource_target_tokens` | no (default `100000`) | The preset's resource target, in tokens — this integration only ever reports token counts (see "Enforcement gateway" below for why). |
+| `time_target_secs` | no (default `3600`) | The preset's time target, in seconds. |
+
+This is a preset **selector**, not a general policy DSL — it cannot
+define a new preset, only pick one of the four existing ones and scale
+its resource/time target. That is a deliberate scope limit (HORO-1146):
+if a fifth preset shape is ever needed, it belongs in
+`crates/domain/src/policy.rs` as real, tested code, not as arbitrary
+config-file input.
+
+### `gateway`
+
+Same fields as [`GatewayConfig`](https://github.com/horonomy/libra-governor/blob/main/crates/gateway/src/config.rs), in
+`snake_case`:
+
+| Field | Required | Meaning |
+|---|---|---|
+| `bind_addr` | yes | Loopback address:port the gateway listens on, e.g. `"127.0.0.1:8787"`. Matches the `ANTHROPIC_BASE_URL` you point Claude Code at in step 2 of "Setup" below. |
+| `token_path` | yes | Must equal `<state_dir>/gateway.token`: `libra-governor gateway token` always reads and creates that file whatever this setting says, so any other value makes `apiKeyHelper` print a token the gateway rejects. |
+| `credential_mode` | yes | `"governor_held"` or `"pass_through_subscription"` — see "Capability tiers" below for what each one can honestly claim. |
+| `credential_command` | only for `governor_held` | The program to run to fetch the real provider key (step 3 of "Setup" below) — e.g. `"security"`, `"op"`, `"pass"`. Its stdout is read directly into the credential; never written back to this file or any other config. |
+| `credential_args` | no (default `[]`) | Arguments to `credential_command`, e.g. `["read", "op://Private/Anthropic/api-key"]`. |
+| `upstream_host_allowlist` | no (defaults to the built-in allowlist) | Overrides which upstream hosts the gateway will forward to — see the gateway module's SSRF-prevention doctrine. Only change this if you know why. |
+
+`credential_mode: "governor_held"` without a `credential_command` is
+rejected at startup (there is nothing to run to get the key) — the daemon
+falls back to no gateway, logged.
+
+### Verifying what actually loaded
+
+`libra-governor gateway status` (or, over the daemon protocol,
+`Request::GatewayStatus`) reports the gateway tier that is actually
+running, which reflects `config.json` if one was loaded — this is the
+authoritative way to confirm a `config.json` change took effect, not just
+that the file parses.
+
+## Daemon lifecycle
+
+The daemon is *not* started separately — the hook subcommand starts it
+on demand the first time it is needed:
+
+1. `hook user-prompt-submit` tries to connect to the daemon's Unix
+   socket.
+2. If that fails, it spawns `libra-governor daemon run` as a detached
+   background process (stdin/stdout/stderr redirected to `/dev/null`;
+   diagnostics go to `daemon.log` in the state dir, never to stdout,
+   which is reserved for the hook protocol response) and polls for the
+   socket to become connectable for up to ~3 seconds before giving up
+   and degrading gracefully.
+3. The daemon then keeps running in the background across prompts and
+   sessions, so subsequent hook invocations connect immediately with no
+   spawn latency.
+
+`statusline` **never** spawns the daemon — a statusline refreshes on a
+short interval, and spawning from it would be a race factory. If the
+daemon is not running, `statusline` prints `libra: -` and exits
+immediately.
+
+### Already-running / stale-socket detection
+
+`libra-governor daemon run` binds its Unix socket before doing anything
+else. If the bind fails with `AddrInUse`:
+
+- It tries to *connect* to the same path. A successful connect proves a
+  live daemon already owns it — this process logs the fact and exits
+  cleanly (the spawn-if-absent race is expected to sometimes produce two
+  near-simultaneous daemon starts; only one keeps running).
+- A failed connect proves the socket file is stale (left behind by a
+  crashed daemon) — the file is removed and the bind retried exactly
+  once.
+
+The bind is never preceded by an unconditional `unlink`, so a
+slow-starting live daemon's socket is never deleted out from under it.
+See `crates/daemon/src/server.rs::bind_or_detect_running` for the exact
+logic and its known narrow-window limitation (documented there).
+
+## Manual smoke test against a real Claude Code install
+
+1. Build the binary: `cargo build --release -p libra-governor-cli`.
+2. Add the `.claude/settings.json` snippet above to a real project,
+   pointing `command` at your built binary's absolute path.
+3. Open that project in Claude Code and submit any prompt.
+4. Confirm:
+   - The statusline (bottom of the Claude Code UI) updates to show
+     `libra: task ... | plan ... | preflight: ... | recon: ...s |
+     remaining P90: ... | stable` shortly after you submit the prompt.
+   - `tail -f ~/.local/state/libra-governor/daemon.log` shows a `daemon
+     started` line the first time, and no errors on later prompts.
+   - `ls ~/.local/state/libra-governor/` shows `daemon.sock`,
+     `ledger.sqlite3`, and `daemon.log`.
+5. Submit a second prompt in the same Claude Code session. Confirm the
+   statusline's task id is unchanged (same task, per
+   `docs/adr/0002-task-not-session-as-economic-unit.md`) while the
+   Completion Contract revision surfaced in Claude's context advances
+   (revision 1 -> 2).
+6. Kill the daemon (`libra-governor daemon stop`) and submit
+   another prompt. Confirm the hook still returns quickly (it respawns
+   the daemon) and the statusline briefly shows `libra: -` before the
+   new daemon comes up.
+
+This manual path is not automated in CI; the equivalent scenarios are
+covered by `crates/cli/tests/hook_cli_integration.rs` (spawns the real
+binary as a subprocess) and `crates/daemon/tests/preflight_integration.rs`
+(drives the real daemon dispatch logic over a real socket).
+
+## Enforcement gateway (HORO-1144) — optional, off by default
+
+Everything above is **advisory**. A hook can print a preflight summary
+into Claude Code's context and the ledger can record that a budget was
+exceeded, but nothing physically stops the agent from spending the money.
+The enforcement gateway is the missing checkpoint: a loopback reverse
+proxy that reserves each request's worst-case cost *before* forwarding
+it, refuses one the budget cannot absorb, and settles the reservation
+against the provider's own reported usage afterwards.
+
+It is **off unless configured** (`DaemonConfig.gateway` defaults to
+`None`) and runs on a thread inside the existing daemon process — not a
+second binary, not a Cargo feature. See
+[`docs/adr/0003-gateway-enforcement-boundary.md`](https://github.com/horonomy/libra-governor/blob/main/docs/adr/0003-gateway-enforcement-boundary.md)
+for the full decision record.
+
+### Capability tiers — what each mode can honestly claim
+
+| Mode | Tier | Credential | Usage accounting | Monetary hard cap |
+|---|---|---|---|---|
+| API / BYOK key, held by the Governor | `GatewayMetered` | Governor-held; the agent never sees it | Provider-reported, exact | **Enforced**, at a pinned `pricing_version` |
+| Subscription (Max/Pro) OAuth, forwarded unchanged | `GatewayObservedQuota` | Agent-held; the Governor takes no custody | Provider-reported, exact | **Not available** — the subscription's own quota accounting is not exposed to us |
+| No gateway — hooks only | `HooksOnly` | Not applicable | None | **Not available** — hooks fire after the request is already in flight |
+
+This is not a documentation promise. Configuration validation **refuses
+to start** a `PassThroughSubscription` gateway against a USD-denominated
+admission policy, because that pairing would advertise a monetary cap the
+system cannot honor. Run `libra-governor gateway status` to see what your
+deployment actually claims:
+
+```
+Tier:       GatewayObservedQuota
+Credential: AgentHeld
+Usage:      ProviderReported
+Monetary cap: NOT ENFORCED (OpaqueProviderQuota)
+```
+
+### Setup
+
+The gateway needs two things Claude Code does not have today: an endpoint
+to talk to, and something to authenticate with. The real provider key
+stays out of both.
+
+1. **Get the local capability token.** This is 32 bytes of OS randomness
+   that authorize use of a loopback proxy on this machine. It is **not**
+   a provider credential and is worth nothing anywhere else.
+
+   ```bash
+   libra-governor gateway token
+   ```
+
+2. **Point Claude Code at the gateway**, in `~/.claude/settings.json`:
+
+   ```json
+   {
+     "env": {
+       "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"
+     },
+     "apiKeyHelper": "/absolute/path/to/libra-governor gateway token"
+   }
+   ```
+
+   Plain HTTP, loopback only, deliberately: Claude Code does not route
+   loopback traffic through its own trust store, so a self-signed local
+   certificate would fail. The boundary is the loopback bind plus the
+   capability token, not TLS on this hop.
+
+3. **Tell the daemon where the real key lives** — as a *command*, never as
+   a value in a config file:
+
+   ```
+   security find-generic-password -s anthropic-api-key -w     # macOS Keychain
+   pass show anthropic/api-key                                # pass
+   op read "op://Private/Anthropic/api-key"                   # 1Password
+   ```
+
+   The daemon runs that command at startup, reads stdout into a newtype
+   with no `Display`, no `Serialize`, and a `Debug` that prints
+   `<redacted>`, and substitutes it on the outbound request. It never
+   reaches Claude Code's environment, arguments, or configuration; never
+   the ledger; and never a log line at any level.
+
+4. **Restart the daemon** (`libra-governor daemon stop`; the
+   next hook invocation respawns it). The gateway is started from the
+   daemon's own configuration — there is deliberately no
+   `gateway start` command, because a security boundary a client can
+   switch off with one keystroke is not one.
+
+### What a refusal looks like
+
+A refused request gets HTTP **403** (never 429 — Claude Code treats 429
+as a rate limit and retries with backoff, which would storm a boundary
+that will refuse every time), an Anthropic-shaped error body so Claude
+Code renders it, and two headers:
+
+```
+x-libra-decision: budget_exceeded | task_unbound | unpriced_model | no_budget |
+                  unenforceable_request | ambiguous_credential | host_mismatch |
+                  route_not_found | payload_too_large | overloaded |
+                  unauthorized | upstream_unavailable
+x-libra-request-id: <uuid>
+```
+
+```json
+{"type":"error","error":{"type":"permission_error",
+ "message":"libra-governor: this request would exceed the budget admitted for this task"}}
+```
+
+### Failure semantics
+
+- **The gateway's own admission fails closed.** Anything it cannot meter
+  exactly, it refuses before any provider call: no `max_tokens`, no task
+  binding, an unpriced model against a USD budget, a quota-percent
+  budget, a policy denial, exhausted headroom, or an unreachable ledger.
+- **The daemon's core function fails open.** If gateway configuration
+  validation or credential resolution fails, the daemon logs it, leaves
+  the gateway disabled, and keeps serving hooks and the statusline
+  normally. Check `gateway status` — it reports `not running` with the
+  reason.
+- **A crash leaves the reservation to the TTL.** An in-flight request
+  whose process dies leaves an `Active` reservation that
+  `expire_stale_reservations` reclaims after the gateway reservation TTL
+  (`GatewayConfig.reservation_ttl_secs`, 600s, not settable from
+  `config.json`; the plan-level reservation TTL is 900s).
+
+### What the gateway intentionally does not do
+
+- **No `GET /v1/models`, no Bedrock/Vertex/Foundry, no non-Anthropic
+  provider.** The closed route table proxies exactly three endpoints:
+  `POST /v1/messages`, `POST /v1/messages/count_tokens` (free, unmetered),
+  and `GET|HEAD /api/hello` (answered locally).
+- **No interactive approval.** A policy `ApprovalRequired` forwards the
+  request and surfaces the fact through `gateway status`; the proxy has
+  no channel through which to interrupt a human mid-request.
+- **No resolved-IP SSRF guard beyond TLS hostname pinning.** Certificate
+  validation against the configured hostname already binds the real
+  destination — a DNS rebind to loopback fails validation and carries no
+  bytes. An IP check would add a TOCTOU race for a property TLS already
+  guarantees.
+- **No live pricing.** `PRICING_VERSION` names a pinned static snapshot
+  recorded on every reservation and provenance row. When prices change it
+  is stale until updated; the gateway's `config.json` has no price override
+  (unknown keys, including `pricing_overrides`, are ignored without an error).
+- **No body or header logging, at any level, ever.** There is no debug
+  dump switch, and the `gateway_requests` table has no column that could
+  hold one.
+- **No crash-time spend recovery.** A crash mid-request returns the
+  capacity via the TTL but loses that one request's *spend* record, so
+  total spend is under-counted by it.
+- **No aggregate tuning for parallel subagents.** N concurrent requests
+  each reserve their own worst case against one `TaskBudget`; their sum
+  can refuse a request that real usage would have fit. Not fixed in this
+  MVP.
+
+### Known limitation: the session-binding header is unverified
+
+The gateway attributes a request to a task via a session-id header —
+`x-claude-code-session-id`; the header name is fixed in this release (there
+is no `config.json` key, flag or environment variable for it). A request carrying no such header
+is refused `403 task_unbound`, because charging it to whichever task
+happens to be around would be worse than refusing it.
+
+**Whether a real Claude Code build emits that header on its Messages
+requests has not been verified against live provider traffic** — the
+integration tests drive a local fake upstream, by design (no real
+credential and no live API call exists anywhere in this repository). If
+your Claude Code build sends a different header or none, the gateway will
+refuse every metered request with `403 task_unbound` rather than
+mis-attribute one. This is the
+one part of the setup above that a real end-to-end smoke test is needed
+to confirm.
+
+## Local monthly shared budget (HORO-2215, HORO-2216; ADR-0026) — cooperative gate
+
+If `<state_dir>/shared-budget.json` exists, the hooks consult the daemon's
+local monthly shared budget. If it does not exist, **nothing changes**: the
+hooks make no extra connection and print byte-for-byte what they printed
+before this feature (pinned by `crates/cli/tests/shared_budget_hooks.rs`).
+The hooks hold no policy; every decision is the daemon's. Codex has no
+budget gate (its hook route is unchanged).
+
+| Hook | Budget file | Outcome |
+|---|---|---|
+| `UserPromptSubmit` | absent | unchanged |
+| `UserPromptSubmit` | present, daemon allows / `not_configured` | unchanged Preflight output; over a soft limit, one short warning line is appended to `additionalContext` (never blocks) |
+| `UserPromptSubmit` | present, `cap_exhausted` / `config_invalid` / `clock_anomaly` / refused identity | `{"decision":"block","reason":"..."}`, exit 0, Preflight is **not** called |
+| `UserPromptSubmit` | present, daemon unreachable (after the existing autospawn attempt, or immediately with `LIBRA_GOVERNOR_NO_AUTOSPAWN=1`) or no answer within the client timeout | block: `budget enforcement unavailable: daemon unreachable` |
+| `PreToolUse` (`hook pre-tool-use`, no matcher = every tool) | absent | empty output, the daemon is not contacted |
+| `PreToolUse` | present, budget exhausted / `config_invalid` / `clock_anomaly` | `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"..."}}`, exit 0 |
+| `PreToolUse` | present, anything else (available, admitted, `not_configured`, daemon down, error, no answer in 500 ms) | empty output = allow (fail open); never spawns a daemon |
+| `SubagentStop` (`hook subagent-stop`) | absent | nothing is parsed or sent, the daemon is not contacted |
+| `SubagentStop` | present | one `ChargeAgentTranscript` with `session_id`, `agent_id` and `agent_transcript_path` as the host sent them; the daemon reads, binds, prices and de-duplicates. Always silent, exit 0 |
+| `SessionEnd` (`hook session-end`) | absent | nothing is parsed or sent, the daemon is not contacted |
+| `SessionEnd` | present | one `SettleTail` with `session_id` and `transcript_path`; the daemon charges the records no `Stop` counted. Always silent, exit 0 |
+
+`Stop` also waits, bounded, before it settles (HORO-2246): when a budget file
+exists it polls the daemon's read-only `TranscriptReady` probe, for at most 1.5 s
+(plus one in-flight probe of up to 400 ms, so about 1.9 s worst case)
+(`LIBRA_GOVERNOR_STOP_FLUSH_WAIT_MS` overrides it; `0` disables it, 5000 is the
+ceiling), because the host writes its transcript about 70 ms after the hook is
+dispatched. It never denies and never opens the transcript; a daemon that is
+down, older or slow ends the wait and `Finalize` is sent as before. With no
+budget file nothing is probed. See ADR-0026 *Flush lag at Stop*.
+
+The settlement hooks (`SubagentStop`, `SessionEnd`) never block and never
+spawn a daemon: no daemon, no answer within 5 s, a malformed payload, an
+unusable session id or a missing path is a log line and exit 0. A blank id
+is treated as absent and no agent id is ever invented; an `agent_id`
+outside `[A-Za-z0-9_-]` is not forwarded. When the transcript's file name
+is exactly `agent-<id>.jsonl` the hook sends that id (the same one the daemon's
+`Stop` sweep derives), so the hook and the sweep book one family and a file is
+never charged twice or lost; any other file is charged under the payload id,
+else unattributed. stdin is read only once a budget file exists and is capped
+at 1 MiB (oversize or non-UTF-8 input is ignored). Transcript paths are passed through verbatim; only the
+daemon validates and reads them. `libra-governor install` writes both with
+`"timeout": 10` because the host's default window for a `SessionEnd` hook
+is short; whether the host honours that value has not been verified on a
+real host.
+
+What the label means: amounts are **Libra-accounted USD** at the pinned
+price table, never the provider's bill or a plan quota. The guarantee is
+**admission-bounded (cooperative)**: a prompt is refused before spend, but
+in-turn spend is only visible afterwards, so spend can overshoot the hold,
+and anything that edits `shared-budget.json` as the same OS user can change
+the cap. A per-request hard cap exists only with the gateway (ADR-0003).
+Every reason text says "Libra-accounted USD, admission-bounded".
+
+The installer (`libra-governor install`, HORO-2216) adds the `PreToolUse`,
+`SubagentStop` and `SessionEnd` entries beside the original three,
+idempotently, and `uninstall` removes exactly those. They are installed
+whether or not a budget file exists; without one each is a cheap no-op.
+`libra-governor shared-budget status [--json]` shows the budget (config
+state, zone-local period, cap, settled, held, remaining, a per-executor
+table reconciled against the pool total, warn-only soft-limit warnings,
+flagged settlements, clock anomaly), the legacy statusline appends a short
+`budget $12.30/$500 (3%)` segment only while a budget file exists, and
+`doctor` checks the file, all six hooks, daemon reachability, clock anomaly
+and flagged settlements (HORO-2217, ADR-0026 S8). Not built: the gateway
+hard cap (S11), remote upload, and any real-provider evidence. The real
+Claude Code 2.1.306 binary was driven interactively against these hooks and a
+fake loopback upstream, but no real provider traffic, billing or latency has been
+observed; the evidence is `TestOwnedLive`.
+
+## What this integration intentionally does not do (yet)
+
+- No automated Completion Contract verification — `hook stop` always
+  records `ExecutionOutcome::Unknown`. MVP 1.0 has no test-running
+  integration; a task is never inferred "done" merely because the model
+  stopped talking. Future scope.
+- No hard budget enforcement *through the hooks*. The hooks are
+  advisory, with one precisely-scoped exception: the local monthly shared
+  budget (see the section below). Only when `<state_dir>/shared-budget.json`
+  exists may `UserPromptSubmit` emit `{"decision": "block", ...}` and
+  `PreToolUse` emit a `deny`, and only for budget decisions. `PostToolUse`
+  and `Stop` never block, and no hook ever blocks for any other reason.
+  A hard per-request cap, where wanted, is the optional gateway documented
+  above (HORO-1144).
+- No task classification — the estimator's class-bucketed-history tier
+  is implemented and unit-tested in `libra-governor-estimator`, but no
+  caller supplies a class yet (nothing in the schema classifies tasks).
+  Every MVP 1.0 estimate comes from the global-local-history or
+  cold-start tier. See that crate's docs.
+- No cross-session task finalization — `resolve_or_create_task_for_session`
+  already maps each distinct `session_id` to its own `TaskId`, so `hook
+  stop` finalizes per-session/per-task; there is no multi-session merge
+  to get wrong.
+- No MCP server or skill command — out of scope; the hook + statusline
+  path above is the required integration surface. Per `ARCHITECTURE.md`,
+  any future MCP surface stays explain/query/manual-control only and is
+  never an enforcement boundary: enforcement lives in the daemon and, when
+  enabled, the gateway.
+- No Completion Contract correction UX — the draft is produced and
+  surfaced, but editing it is a follow-up.

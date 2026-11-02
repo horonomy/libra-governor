@@ -1,0 +1,431 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Composable statusline - Libra Governor · Developer Preview</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-2459343d.css">
+        <link rel="stylesheet" href="css/chrome-ae938929.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="docs-a4da9feb.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "navy";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-b51fc6cb.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-a32c0190.js"></script>
+        <link rel="canonical" href="https://libra.horonom.com/docs/statusline.html">
+</head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('navy')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Libra Governor · Developer Preview</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/horonomy/libra-governor" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="libra-governor-in-a-composable-statusline"><a class="header" href="#libra-governor-in-a-composable-statusline">Libra Governor in a composable statusline</a></h1>
+<p>Claude Code gives a scope exactly one <code>statusLine.command</code>. That is the whole
+reason this document exists: Libra is not the only thing worth showing there,
+and a product that takes the slot for itself makes every other product — and
+whatever the user wrote themselves — disappear.</p>
+<p>So Libra does not own the slot. It publishes a <strong>provider document</strong> and lets a
+shared host compose it with the user’s own statusline and with any other
+Horonom product’s. The contract is
+<a href="https://github.com/horonomy/.github/blob/main/governance/product/statusline-provider-contract.md"><code>governance/product/statusline-provider-contract.md</code></a>
+in <code>horonomy/.github</code>.</p>
+<p>There are three ways a Libra segment can be on screen today. Two of them are
+older than this mechanism and neither is deleted by adopting it.</p>
+<h2 id="the-supported-surface"><a class="header" href="#the-supported-surface">The supported surface</a></h2>
+<pre><code class="language-bash">libra-governor statusline provider   # one JSON document on stdout, exit 0 always
+libra-governor statusline explain    # the read-only long form, for the host's explain surface
+</code></pre>
+<p><code>statusline provider</code> is read-only and host-scoped. It answers from state the
+daemon already holds — <code>Request::Status</code> and <code>Request::Doctor</code> are both
+documented as answered without new reconnaissance and without any LLM call — and
+it never spawns the daemon. A statusline refreshes on a timer, and a refreshing
+statusline that spawns a daemon is a race factory.</p>
+<p>It has a 200 ms budget for the whole probe. Both round trips share that one
+deadline rather than getting one each, and the <code>Doctor</code> half is failure-isolated
+from the <code>Status</code> half: if the diagnostic is slow or unreachable, the profile
+segment is simply absent and the rest still renders.</p>
+<p><code>statusline explain</code> has three seconds instead, because there a user has asked a
+question and is waiting for the answer.</p>
+<h3 id="what-it-reports"><a class="header" href="#what-it-reports">What it reports</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Segment</th><th>When</th><th>What it says</th></tr>
+</thead>
+<tbody>
+<tr><td><code>task</code></td><td>always</td><td>the task being governed and its replan state, or explicitly that none is</td></tr>
+<tr><td><code>estimate</code></td><td>while a task is governed</td><td>the remaining-work P90 and the confidence <em>in that estimate</em></td></tr>
+<tr><td><code>budget</code></td><td>while a task is governed</td><td>how much of <em>that task’s</em> envelope is left, and how much of it has been measured at all</td></tr>
+<tr><td><code>budget_configured</code></td><td>idle, and only if amounts were asked for</td><td>the ceiling a <em>new</em> task would be admitted to — never a remainder</td></tr>
+<tr><td><code>profile</code></td><td>running config no longer matches disk</td><td>which policy preset is actually running</td></tr>
+</tbody>
+</table>
+</div>
+<p>Four segments is the host’s per-provider maximum and a document that exceeds it
+is refused whole, so Libra would render as <em>nothing</em> at precisely the moment it
+had the most to say. The allowance is fully spent by <code>task</code>, <code>estimate</code>,
+<code>budget</code> and <code>profile</code>, which is why <code>budget_configured</code> can only appear while
+idle — where there is no estimate to show — and why an escalation is worded onto
+the <code>task</code> segment rather than claiming a fifth.</p>
+<p>Spans leave as seconds plus a noun (<code>P90</code>), never as <code>5d4h</code>: the host owns span
+formatting, so two products cannot disagree about what a day is. Glyphs are the
+same — the provider emits no emoji at all and the host chooses one, with a
+deterministic text fallback.</p>
+<p>Amounts work the same way. <code>remaining</code> and <code>total</code> leave as the contract’s own
+<code>count</code>/<code>total</code> fields with a <code>count_label</code> naming what is being counted, so the
+host decides how <code>57,000 of 150,000 tokens</code> reads in its own line. Each figure
+is denominated in the envelope’s own resource kind, which on every build today
+is <strong>tokens</strong> — a currency is never assumed because a number exists, and an
+envelope denominated in quota percentage shows its share rather than a second
+unmarked percentage beside it.</p>
+<h3 id="choosing-how-much-the-budget-phrase-spells-out"><a class="header" href="#choosing-how-much-the-budget-phrase-spells-out">Choosing how much the budget phrase spells out</a></h3>
+<pre><code class="language-bash">libra-governor statusline presentation                                   # what is recorded, and where
+libra-governor statusline presentation --budget-display remaining+total  # record a choice
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Choice</th><th>The most the label will say</th></tr>
+</thead>
+<tbody>
+<tr><td><code>percent</code> <em>(default)</em></td><td><code>53% budget left</code></td></tr>
+<tr><td><code>remaining</code></td><td>the same phrase, plus a <code>count</code> for the host to render</td></tr>
+<tr><td><code>remaining+total</code></td><td>plus the envelope that remainder is drawn from, as <code>total</code></td></tr>
+<tr><td><code>used+remaining+total</code></td><td><code>53% left, 18,000 used</code></td></tr>
+<tr><td><code>full</code></td><td><code>53% left, 18,000 used, 70,000 held</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Each row names the <em>most</em> that choice will ever show: the host caps a label at
+48 characters and refuses the whole document over an over-long one, so the
+renderer drops to the next shorter phrase rather than risk it. Whatever does not
+fit is still in the structured fields and in <code>statusline explain</code>.</p>
+<p>The preference lives in <code>presentation.json</code> in Libra’s own state directory.
+Nothing else reads or writes it, deleting it restores the default, and an
+upgrade does not create it — which is what makes “an existing statusline does
+not change by itself” true rather than merely intended. It is deliberately
+<em>not</em> in <code>~/.claude/settings.json</code>, which belongs to the user and to Claude
+Code, and deliberately not in the daemon’s <code>config.json</code>, which is read at
+startup and would make a wording change wait for a restart.</p>
+<p>Held capacity is never folded into settled spend. A reservation that has not
+been drawn against and a charge that has are different facts, and only <code>full</code>
+shows both.</p>
+<h3 id="what-it-never-reports"><a class="header" href="#what-it-never-reports">What it never reports</a></h3>
+<p>Prompts, task or tool content, the estimator’s free-text reason, the
+estimator’s resource or cost quantiles, a credential, a filesystem path, or an
+ANSI escape. Every string in the document is a fixed literal in
+<a href="https://github.com/horonomy/libra-governor/blob/main/crates/cli/src/statusline_provider.rs"><code>crates/cli/src/statusline_provider.rs</code></a>
+or a value drawn from a closed set. That is enforced by tests over every
+document the provider can emit, not by review.</p>
+<p>It is also not a control. Nothing in it lets a reader approve, deny or escalate
+anything; <code>EscalatedAwaitingApproval</code> is reported as a spent budget, because
+nothing is blocked and nothing is waiting on an answer from the reader.</p>
+<h3 id="enabling-it"><a class="header" href="#enabling-it">Enabling it</a></h3>
+<p>Enable and disable go through the shared host lifecycle, not by hand-editing
+JSON. The host reads the existing <code>statusLine</code> object, preserves it whole —
+including keys it does not understand — registers your original command as an
+upstream provider, and only then routes the slot through the compositor.
+Disabling Libra leaves every other provider and your original statusline exactly
+where they were.</p>
+<p><code>libra-governor</code> itself never writes a shared-host registration. Its <code>install</code>
+still wires only its own hooks and, if the slot is free, its own legacy
+statusline; registering a provider is the host’s job and the host’s alone.
+Use <code>libra-governor install --hooks-only</code> when you want its hooks without any
+change to <code>statusLine</code>; that mode preserves the value exactly as found, or
+leaves it absent.</p>
+<h2 id="migrating-from-an-external-wrapper"><a class="header" href="#migrating-from-an-external-wrapper">Migrating from an external wrapper</a></h2>
+<h3 id="1-the-founder-dogfood-wrapper"><a class="header" href="#1-the-founder-dogfood-wrapper">1. The founder DogFood wrapper</a></h3>
+<p>A shell wrapper that calls <code>libra-governor statusline</code>, extracts fields from the
+plain-text line and composes them with other products’ output. This is the
+“integration glue, not a product capability” the provider replaces, and it is
+where both of the reported readability defects actually lived:</p>
+<ul>
+<li>the broken glyph was a bare U+2696 SCALES emitted by the wrapper. Its East
+Asian Width is <code>N</code> and it carries <code>Emoji_Presentation=No</code>, so a terminal is
+entitled to draw it as one monochrome column — which is what happened. The
+provider’s fix is structural: it emits no glyph, and the host picks one that
+is presentation-safe.</li>
+<li><code>pf:high</code> was assembled by the wrapper from the product’s <code>preflight: high</code>.
+An unqualified <code>high</code> beside a task reads as a risk or priority rating. The
+provider sends <code>confidence</code> together with <code>confidence_of</code>, and the host
+renders <code>preflight confidence high</code>; the contract refuses a bare confidence
+outright, so the ambiguity cannot come back.</li>
+</ul>
+<p>To migrate: enable Libra through the host lifecycle, then stop calling the
+wrapper from <code>statusLine</code>. Nothing deletes the wrapper for you, and nothing
+requires you to remove it — the bare <code>statusline</code> command it depends on keeps
+working (see below).</p>
+<h3 id="2-libra-governor-installs-own-statusline-entry"><a class="header" href="#2-libra-governor-installs-own-statusline-entry">2. <code>libra-governor install</code>’s own <code>statusLine</code> entry</a></h3>
+<p>If <code>install</code> wired <code>~/.claude/settings.json</code>’s <code>statusLine</code> to <code>libra-governor statusline</code>, that entry is a <em>manual historical configuration</em> in the shared
+host’s terms. Enabling Libra through the host registers it as your upstream
+command, so it keeps rendering as it does today, composed rather than replaced.</p>
+<p>Run <code>libra-governor doctor</code> to see which of the two is wired. Nothing here is
+removed automatically: a supported mechanism existing is not a reason to delete
+configuration a user chose.</p>
+<h3 id="3-a-project-local-statusline"><a class="header" href="#3-a-project-local-statusline">3. A project-local statusline</a></h3>
+<p>Claude Code’s project scope <strong>replaces</strong> the global <code>statusLine</code> rather than
+merging with it, so a project-local entry — including one in
+<code>.claude/settings.local.json</code> — silently wins wherever it applies. If you have
+one, the host’s <code>doctor</code> will report which scope owns the slot. Libra does not
+touch project-scoped files, and no Libra command deletes
+<code>.claude/settings.local.json</code>.</p>
+<h2 id="the-legacy-statusline-command"><a class="header" href="#the-legacy-statusline-command">The legacy <code>statusline</code> command</a></h2>
+<p><code>libra-governor statusline</code> still prints today’s line, unchanged:</p>
+<pre><code>libra: task 1a2b3c4d | plan 9f8e7d6c | preflight: high | recon: 2.4s | remaining P90: 447120s | escalated — awaiting approval
+</code></pre>
+<p>It is byte-for-byte what it was, deliberately: the founder’s wrapper parses its
+exact phrases, and breaking it to make a migration tidier would break a working
+setup to serve an internal preference.</p>
+<p>One addition, made only when it applies (HORO-2217): while a
+<code>shared-budget.json</code> exists, the line is followed by <code> | budget $12.30/$500 (3%)</code>
+(settled plus held against the cap, percent rounded up, with a trailing
+<code> WARN</code> for a soft-limit warning or when nothing remains). The part before <code> | budget</code> is untouched, and with no
+budget file, or if the daemon does not answer in 200 ms, the line is exactly
+what it was. <code>statusline provider</code> is not changed.</p>
+<p>It is, however, on a migration path to retirement. New setups should use
+<code>statusline provider</code>. The legacy line cannot be composed with anything, cannot
+be degraded to fit a narrow terminal, cannot express “unknown” distinctly from
+“nothing”, and formats its own spans and its own labels — all four of which the
+provider contract exists to fix.</p>
+<p>No removal date is set here. Retiring it is a product decision for a later
+ticket, and it will not happen silently.</p>
+<h2 id="troubleshooting"><a class="header" href="#troubleshooting">Troubleshooting</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr>
+</thead>
+<tbody>
+<tr><td>The Libra segment is absent entirely</td><td>The provider is not registered with the host, or the host is not in the slot</td><td>The host’s <code>doctor</code> reports which; it is read-only and safe to run</td></tr>
+<tr><td>The Libra segment reads <code>Not running</code> (reason <code>daemon_unreachable</code>)</td><td>The daemon is not running — the provider never spawns one by design</td><td>Submit a prompt; <code>hook user-prompt-submit</code> spawns it on demand</td></tr>
+<tr><td>A <code>Running policy ...</code> segment appeared</td><td>You edited <code>config.json</code> after the daemon started, so the edit has not taken effect</td><td><code>pkill -f "libra-governor daemon run"</code>; the next hook invocation respawns it</td></tr>
+<tr><td>The estimate says no local history yet</td><td>A genuine cold start — the estimator has no comparable local receipts</td><td>Nothing to fix; it resolves as receipts accumulate. <code>statusline explain</code> names the basis it did use</td></tr>
+<tr><td>No confidence is shown beside the estimate</td><td>There is no P90 to be confident <em>in</em></td><td>Expected: a confidence attached to an absent number would read as a verdict on the task</td></tr>
+<tr><td>The budget phrase is a percentage with no amount</td><td>The default is percentage-only, so an existing statusline does not change on upgrade</td><td><code>statusline presentation --budget-display remaining+total</code> (or <code>full</code>)</td></tr>
+<tr><td>An amount was asked for and the phrase is still a bare percentage</td><td>Either the envelope is unmeasured, or the longer phrase would not fit the host’s 48-character label</td><td><code>statusline explain</code> shows the whole envelope regardless of either</td></tr>
+<tr><td>The budget says usage unknown</td><td>Nothing has been attributed to this task yet — which is not the same as nothing having been spent</td><td>Expected: reporting it as <code>100% budget left</code> would be a measurement nobody made</td></tr>
+<tr><td>The amount is in tokens where a cost was expected</td><td>The envelope is denominated in tokens, and a currency is never assumed because a number exists</td><td>Nothing to fix; <code>statusline explain</code> names the unit it used</td></tr>
+<tr><td>The budget says <code>No lifetime cap, 400,000 per turn</code></td><td>The task was created by a daemon with no <code>config.json</code>, which is turn-scoped (ADR-0024): there is no lifetime total, remainder or percentage, only a per-turn ceiling. The segment carries <code>budget_lifetime_scope: "turn_scoped"</code>, <code>budget_turn_ceiling</code> and reason code <code>budget_turn_scoped</code>; <code>budget_total</code>, <code>budget_remaining</code>, <code>budget_pressure_percent</code>, <code>semantic_state</code> and <code>count</code>/<code>total</code> are absent. When concurrent holds reach the ceiling it reads <code>Turn ceiling reached</code> (<code>budget_turn_ceiling_reached</code>)</td><td>Expected. A <code>config.json</code> makes tasks created afterwards lifetime-bounded; <code>libra-governor doctor</code> flags a config file added under a running turn-scoped daemon. The idle <code>budget_configured</code> segment reads <code>No lifetime cap for a new task</code> with a <code>budget_turn_ceiling</code> instead of a total</td></tr>
+<tr><td>The budget label ends <code>(stale)</code></td><td>The envelope’s own ledger row has not been touched recently enough to trust (HORO-1904) — independent of whether the task is still being worked</td><td><code>statusline explain</code> shows the exact age; the figures beside it are the last ones recorded, not a current reading</td></tr>
+<tr><td>The budget label ends <code>(freshness unknown)</code></td><td>The daemon could not read or trust the envelope’s last-touch timestamp (e.g. none was recorded, or it is ahead of the daemon’s own clock)</td><td>Expected on a row with no readable timestamp; never resolves to “fresh” by itself</td></tr>
+<tr><td>The segment carries no colour</td><td>Colour is the shared renderer’s, from the <code>semantic_state</code> the provider sends; text is authoritative on its own</td><td>The host’s documentation covers palette and <code>NO_COLOR</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>For anything about the slot itself — who owns it, what a drift report means, how
+uninstall restores your original — see the host’s own documentation. This
+document covers only Libra’s side of the contract.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="codex.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="security.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="codex.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="security.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-c2a407aa.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

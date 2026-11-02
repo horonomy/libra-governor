@@ -139,9 +139,12 @@ cp libra-governor-aarch64-apple-darwin/libra-governor ~/.local/bin/
   `libra-governor` without the path.
 - **Upgrade** (from an earlier build, including from a source-built v0.0.1 or
   v0.0.2): run `libra-governor daemon stop` first so the old daemon does not keep
-  serving, then replace the binary at the same path. The ledger is migrated by
-  the new daemon on the next prompt (checked for ledgers created by the v0.0.1
-  and v0.0.2 schemas). There is no downgrade path: a v0.0.4 ledger is at schema v24 and
+  serving, then replace the binary at the path it already runs from (a source
+  build lives in `~/.cargo/bin`; the `cp` target above is for a fresh install, and
+  a different path leaves a second hook set). The ledger is migrated by the new
+  daemon on the next prompt; this was checked by the release QA with synthetic
+  ledgers built from the v0.0.1 and v0.0.2 migration files, not with a real
+  user ledger. There is no downgrade path: a v0.0.4 ledger is at schema v24 and
   has not been tested against older binaries (`doctor` flags a ledger that is
   ahead of the binary).
 - **Uninstall / rollback**: see "Uninstall" below; the tarball binary is deleted
@@ -199,8 +202,9 @@ spending cap. With hooks only, spend *inside* a turn is seen after the fact,
 so a turn can cost more than its hold. Codex sessions are never counted in
 v0.0.4, and are counted in the v0.0.5 candidate only if you opt in (see
 "Codex accounting" below).
-There is no gateway hard cap. Evidence is `TestOwnedLive` (real binaries,
-synthetic transcripts), not observed on a real host.
+There is no gateway hard cap. Evidence is `TestOwnedLive` (real binaries and
+a real Claude Code build driven against a fake loopback upstream with synthetic
+usage), not observed against real provider traffic, billing or latency.
 
 **Cooperative Preview: what to expect.** v0.0.4 shipped this, and the v0.0.5 candidate keeps it, as a preview of
 cooperative admission, by founder scope decision (ADR-0026). It is not the
@@ -587,7 +591,9 @@ Removes exactly what this integration's own installer added:
    budget and its spend ledger are gone too) — **only** with `--yes` or an
    interactive "yes" confirmation, since it holds your only local record
    of estimate-vs-actual calibration history and deleting it is
-   unrecoverable. Without confirmation the directory is left in place.
+   unrecoverable. Without confirmation the directory is left in place, and
+   `uninstall` refuses (exit 1) if the directory still holds a `host-adapters`
+   registration until you unregister it.
 3. Nothing else, except what `install` and `uninstall` leave behind in
    `~/.claude`: one `settings.json.libra-backup-<timestamp>-<pid>` file per
    run and `settings.json.horonom-write.lock` (Libra's own write lock). Keep

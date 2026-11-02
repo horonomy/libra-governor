@@ -2,13 +2,14 @@
 
 Libra is a local Governor for coding-agent work. Its North Star is **never
 start work you are unlikely to afford to finish**. This Developer Preview is
-installed from source and runs on your machine; it provides no hosted runtime,
+installed from the v0.0.4 Apple Silicon macOS release tarball or from source,
+and runs on your machine; it provides no hosted runtime,
 account system, control plane, or SaaS dependency.
 
 ## Start with the real product guide
 
 The chapters in this site are rendered from the repository's canonical Markdown.
-They cover the source installer, first preflight, four policy presets, statusline,
+They cover the tarball and source installs, first preflight, four policy presets, statusline,
 diagnostics, platform support, privacy and security, release compatibility, and
 the actual capability differences between Claude Code and Codex.
 

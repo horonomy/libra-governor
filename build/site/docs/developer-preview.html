@@ -1,0 +1,841 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Developer Preview guide - Libra Governor · Developer Preview</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-2459343d.css">
+        <link rel="stylesheet" href="css/chrome-ae938929.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="docs-a4da9feb.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "navy";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-b51fc6cb.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-a32c0190.js"></script>
+        <link rel="canonical" href="https://libra.horonom.com/docs/developer-preview.html">
+</head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('navy')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Libra Governor · Developer Preview</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/horonomy/libra-governor" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="libra-governor"><a class="header" href="#libra-governor">Libra Governor</a></h1>
+<blockquote>
+<p>Never start work you are unlikely to afford to finish.</p>
+</blockquote>
+<p>Libra is a local <strong>Governor</strong>: a data-plane daemon that sits between
+agentic work and the LLM provider it talks to (an agentic coding tool —
+Claude Code today — is the current integration). It estimates the cost
+and time-to-complete of a task <em>before</em>
+admitting it, tracks spend against that estimate as the task runs, and
+makes replanning a deliberate, auditable decision rather than an implicit
+one. See <a href="north-star.html"><code>PRODUCT.md</code></a> for the full product North Star and
+<a href="architecture.html"><code>ARCHITECTURE.md</code></a> for how the pieces fit together.</p>
+<p><strong>Product page and hosted docs:</strong> <a href="https://libra.horonom.com">libra.horonom.com</a> (<a href="https://libra.horonom.com/docs/">docs</a>) — Developer Preview.</p>
+<p><strong>Release status.</strong> The latest <em>published</em> release is v0.0.4, the Option 2 <strong>local monthly shared budget</strong> Cooperative Preview (<a href="https://github.com/horonomy/libra-governor/blob/main/docs/adr/0026-local-monthly-shared-budget.md">ADR-0026</a>, <a href="https://github.com/horonomy/libra-governor/blob/main/docs/adr/0025-v0-0-4-scope-evidence-and-exclusions.md">ADR-0025</a>); Apple Silicon macOS only. <code>main</code> is the <strong>v0.0.5 candidate</strong> line: unreleased and untagged, nothing is published from it, and releasing it is a separate founder GO. v0.0.5 adds <strong>opt-in, off-by-default Codex accounting</strong> against the same shared budget (see “Local monthly budget” below); it is still a Cooperative Preview, not a hard cap. v0.0.3 is a separate line (<code>release/v0.0.3</code>, <a href="https://github.com/horonomy/libra-governor/blob/main/docs/adr/0014-v0-0-3-go-scope-and-exclusions.md">ADR-0014</a>). The feature set below is the v0.0.3 baseline that <code>main</code> builds on: everything from v0.0.2 (the v0.0.1 MVP 3
+local flow, Codex support, local extension points — see below) plus the
+Agent Execution Economics work (HORO-1666–1673, HORO-1689): hierarchical
+resource accounting, a progressive remaining-cost estimator with shadow
+runtime decisions, counterfactual policy replay, and economic-truth
+reconstruction (<code>libra-governor economics explain</code>).</p>
+<h3 id="capability-status-v003-baseline-v004-evidence-lives-in-adr-0025--what-is-production-evidenced-and-what-is-not"><a class="header" href="#capability-status-v003-baseline-v004-evidence-lives-in-adr-0025--what-is-production-evidenced-and-what-is-not">Capability status (v0.0.3 baseline; v0.0.4 evidence lives in ADR-0025) — what is production-evidenced and what is not</a></h3>
+<p>The founder’s v0.0.3 GO verdict is <strong>narrowed to the evidence that actually
+exists.</strong> Full record: <a href="https://github.com/horonomy/libra-governor/blob/main/docs/adr/0014-v0-0-3-go-scope-and-exclusions.md"><code>docs/adr/0014-v0-0-3-go-scope-and-exclusions.md</code></a>.</p>
+<p><strong>Production-evidenced</strong> (real DogFood evidence, not just synthetic tests —
+see <code>experiments/v003_1689_dogfood/README.md</code>):</p>
+<ul>
+<li>Duration estimation (the progressive/bucketed estimator, <code>libra-governor calibration report</code>).</li>
+<li>Admission (preflight cost/time estimation and admission-replay policies).</li>
+<li>Flat / single-tenant resource accounts — the only account shape any real
+installation has ever produced.</li>
+</ul>
+<p><strong>Implemented and tested, but explicitly not yet production-evidenced — do
+not rely on these for production decisions:</strong></p>
+<ul>
+<li>The shadow-decision / early-warning mechanism (proactive Stop/Degrade
+proposals). Real-usage measurement has twice (synthetic and real
+DogFood) produced zero classifiable samples against the pre-registered
+floors. Tracked: HORO-1693.</li>
+<li>Multi-level / multi-tenant hierarchical custody accounting
+(organization → principal → session → agent). No real installation has
+ever created a non-flat account; the code path has no production caller.
+Intentionally kept research/latent — see HORO-1694. Not wired further
+without a real multi-level product requirement.</li>
+</ul>
+<h3 id="also-in-this-release-carried-from-v002"><a class="header" href="#also-in-this-release-carried-from-v002">Also in this release (carried from v0.0.2)</a></h3>
+<ul>
+<li><strong>Codex support</strong> (HORO-1157/1167) — Claude Code and Codex share the
+same Governor core through a stable Agent Adapter contract; capability
+differences between the two are reported honestly, not papered over.</li>
+<li><strong>Local extension points</strong> (HORO-1174) — an optional, outbound-only
+Business Context Provider fetch and signed event/policy webhooks, plus
+one inbound path over the existing 0600 Unix socket for external
+Outcome Providers. Off by default; narrowing-only where it touches
+policy (see <code>docs/adr/0005-local-extension-points.md</code>).</li>
+</ul>
+<p><strong>Team Alpha (a hosted control plane for shared team policy) is not part
+of this release.</strong> It remains gated on real evidence that the local
+product sees repeated use — see HORO-1154.</p>
+<h2 id="requirements"><a class="header" href="#requirements">Requirements</a></h2>
+<ul>
+<li>A Rust toolchain (<code>cargo</code>, <code>rustc</code>) — see <a href="https://rustup.rs">https://rustup.rs</a> — only if you
+build from source. The v0.0.4 Apple Silicon tarball needs no toolchain.</li>
+<li>Supported platform for the Cooperative Preview (v0.0.4, and the v0.0.5 candidate): Apple Silicon
+macOS (aarch64). Linux builds and runs in CI; Intel macOS is not built or
+tested. Both are unsupported and unverified for the local monthly budget;
+Windows is unsupported. Claude Code with hook and statusline support, and/or
+Codex with its hooks support (run <code>libra-governor install --agent codex</code>) — see <code>integrations/codex/README.md</code> for Codex-specific setup
+and capability-tier differences.</li>
+<li>No Docker. No account or login. No SaaS dependency — everything below
+runs entirely on your machine.</li>
+</ul>
+<h2 id="install"><a class="header" href="#install">Install</a></h2>
+<p>The v0.0.4 GitHub Release carries an Apple Silicon macOS tarball
+(<code>libra-governor-aarch64-apple-darwin.tar.gz</code>) with a sha256 and a GitHub
+build-provenance attestation (<code>gh attestation verify &lt;file&gt; --repo horonomy/libra-governor</code>); see <code>docs/release-notes/v0.0.4.md</code>. No other platform
+is published, and the v0.0.5 candidate on <code>main</code> is unreleased. There is no
+<code>curl | sh</code>-a-prebuilt-binary path to offer honestly. Either install the
+tarball (next section) or build from source, using a clone with
+<code>cargo install</code>:</p>
+<pre><code class="language-bash">git clone https://github.com/horonomy/libra-governor.git
+cd libra-governor
+./scripts/install.sh
+</code></pre>
+<p><code>scripts/install.sh</code> runs <code>cargo install --path crates/cli --locked</code>,
+wires this binary’s hooks and statusline into
+<code>~/.claude/settings.json</code> (via <code>libra-governor install</code> — see
+“Uninstall” below for exactly what that touches), and finishes by
+running <code>libra-governor doctor</code> so you see real, current state rather
+than an installer’s own claim of success. If you want the six hooks
+without changing Claude Code’s statusline setting, use
+<code>./scripts/install.sh --hooks-only</code> or, after installing the binary,
+<code>libra-governor install --hooks-only</code>. This mode preserves <code>statusLine</code>
+exactly as found, including leaving it absent; default install behavior is
+unchanged.</p>
+<p>Equivalent manual steps, if you would rather not run the script:</p>
+<pre><code class="language-bash">cargo install --path crates/cli --locked
+libra-governor install
+libra-governor doctor
+</code></pre>
+<h3 id="install-the-v004-tarball-apple-silicon-macos-only"><a class="header" href="#install-the-v004-tarball-apple-silicon-macos-only">Install the v0.0.4 tarball (Apple Silicon macOS only)</a></h3>
+<pre><code class="language-bash">mkdir libra-v0.0.4 &amp;&amp; cd libra-v0.0.4
+gh release download v0.0.4 --repo horonomy/libra-governor
+shasum -a 256 -c libra-governor-aarch64-apple-darwin.tar.gz.sha256
+gh attestation verify libra-governor-aarch64-apple-darwin.tar.gz --repo horonomy/libra-governor
+tar -xzf libra-governor-aarch64-apple-darwin.tar.gz
+mkdir -p ~/.local/bin
+cp libra-governor-aarch64-apple-darwin/libra-governor ~/.local/bin/
+~/.local/bin/libra-governor --version      # libra-governor 0.0.4
+~/.local/bin/libra-governor install
+~/.local/bin/libra-governor doctor
+</code></pre>
+<ul>
+<li>The binary is ad-hoc signed and <strong>not notarized</strong>. Download it with <code>gh</code> (as
+above) or <code>curl</code>. A copy saved by a web browser carries macOS’s quarantine
+attribute, and Gatekeeper may refuse to run the extracted binary (not tested
+here); if it does, remove the attribute only after you have verified the
+checksum and attestation (<code>xattr -d com.apple.quarantine &lt;file&gt;</code>).</li>
+<li><code>install</code> writes the binary’s absolute path into the hook commands in
+<code>~/.claude/settings.json</code>. Keep the binary at one stable path: installing
+again from a different path can leave a second hook set (see the v0.0.4 release
+notes), and a path containing whitespace or a shell metacharacter is refused.
+Put <code>~/.local/bin</code> on your <code>PATH</code> yourself if you want to type
+<code>libra-governor</code> without the path.</li>
+<li><strong>Upgrade</strong> (from an earlier build, including from a source-built v0.0.1 or
+v0.0.2): run <code>libra-governor daemon stop</code> first so the old daemon does not keep
+serving, then replace the binary at the same path. The ledger is migrated by
+the new daemon on the next prompt (checked for ledgers created by the v0.0.1
+and v0.0.2 schemas). There is no downgrade path: a v0.0.4 ledger is at schema v24 and
+has not been tested against older binaries (<code>doctor</code> flags a ledger that is
+ahead of the binary).</li>
+<li><strong>Uninstall / rollback</strong>: see “Uninstall” below; the tarball binary is deleted
+by hand. To roll back, uninstall, delete the binary, and keep the
+<code>settings.json.libra-backup-*</code> file if you need your original
+<code>settings.json</code> byte for byte.</li>
+</ul>
+<h2 id="quickstart-5-minutes"><a class="header" href="#quickstart-5-minutes">Quickstart (5 minutes)</a></h2>
+<ol>
+<li>
+<p>Run the install steps above.</p>
+</li>
+<li>
+<p>Restart Claude Code (or start a new session) so it picks up the
+<code>settings.json</code> change.</p>
+</li>
+<li>
+<p>Open any project in Claude Code and submit a prompt.</p>
+</li>
+<li>
+<p>Watch the statusline (bottom of the Claude Code UI) update within a
+couple of seconds to something like:</p>
+<pre><code>libra: task a1b2c3d4 | plan e5f6a7b8 | preflight: Preflight complete | recon: 0.03s | remaining P90: 42s | stable
+</code></pre>
+</li>
+<li>
+<p>Run <code>libra-governor doctor</code> any time to check on things.</p>
+</li>
+</ol>
+<p>That’s it — the <code>balanced</code> policy preset and no enforcement gateway are
+the defaults, and with no <code>shared-budget.json</code> nothing here blocks or
+interrupts your normal Claude Code workflow (see “Safe defaults” below). If
+you turn on the optional local monthly budget, a prompt can be refused (see
+“Local monthly budget”).</p>
+<h2 id="local-monthly-budget-optional-cooperative-preview"><a class="header" href="#local-monthly-budget-optional-cooperative-preview">Local monthly budget (optional, Cooperative Preview)</a></h2>
+<p>You can cap what Claude Code may spend in a calendar month on this machine
+(and, from the v0.0.5 candidate, optionally Codex too; see below). It is off
+until you create the file:</p>
+<pre><code class="language-bash">libra-governor shared-budget init --monthly-usd 200 --time-zone America/New_York
+libra-governor shared-budget status
+</code></pre>
+<p><code>--time-zone</code> is required, an IANA name: the month starts and ends in that
+zone and there is deliberately no UTC default. <code>--turn-hold-usd</code> (default
+<code>10</code>) is what each prompt reserves up front; it must fit inside the cap.
+Run <code>libra-governor install</code> first so the hooks are wired.</p>
+<p><strong>What it is.</strong> An admission-bounded (cooperative) limit on Libra-accounted,
+list-price-equivalent USD, shared by every Claude Code session and subagent
+(and, in the v0.0.5 candidate only and if you opted in, Codex main-lane turns;
+no Codex subagents; v0.0.4 never counts Codex)
+on this host and OS user. When less than one turn hold remains, a prompt from
+a session that holds no budget is blocked with a message that names the
+period end in your zone and how to raise the cap.</p>
+<p><strong>What it is not.</strong> Not a provider bill, not provider quota and not a hard
+spending cap. With hooks only, spend <em>inside</em> a turn is seen after the fact,
+so a turn can cost more than its hold. Codex sessions are never counted in
+v0.0.4, and are counted in the v0.0.5 candidate only if you opt in (see
+“Codex accounting” below).
+There is no gateway hard cap. Evidence is <code>TestOwnedLive</code> (real binaries,
+synthetic transcripts), not observed on a real host.</p>
+<p><strong>Cooperative Preview: what to expect.</strong> v0.0.4 shipped this, and the v0.0.5 candidate keeps it, as a preview of
+cooperative admission, by founder scope decision (ADR-0026). It is not the
+original strict hard-cap guarantee.</p>
+<ul>
+<li><em>Not a strict monetary cap.</em> A prompt is admitted or refused up front;
+nothing stops spend once a turn is running, so in-turn overshoot is possible.</li>
+<li><em>Codex is not counted (v0.0.4) unless you opt in (v0.0.5 candidate only).</em> The gateway hard cap is designed
+but off by default and not enabled. Codex accounting (v0.0.5 candidate) is
+opt-in and off by default; see “Codex accounting” below.</li>
+<li><em>Not your bill.</em> Amounts are Libra’s list-price-equivalent estimates, or the
+flat turn hold when a turn cannot be measured. Pricing gaps drift both ways
+(for example the 1-hour cache tier is under-counted); see ADR-0026.</li>
+<li><em>Accounting boundary.</em> Counted: Claude Code sessions and subagents whose
+settlement hooks run and whose transcripts can be read and attributed, plus
+(v0.0.5 candidate only) Codex main-lane turns if you opted in. Not counted or not attributable:
+any other executor, Codex subagents, a subagent without a
+readable transcript or agent id, and spend outside Claude Code. Such spend
+can settle at the flat hold, be recorded unattributed, or be missed. See
+<code>docs/execution-owner-contract.md</code>.</li>
+<li><em>Known unmeasured or early-opening cases.</em> Turns around <code>/compact</code>, a
+partly flushed interactive turn that settles before its last record is
+written, a subagent file over 32 MiB, and a hook that fails open while the
+daemon is down can be under-counted or missed. A forward clock jump or a
+time-zone change near a month edge opens the next month’s budget early.
+<code>shared-budget init --force</code> replaces the whole file, dropping <code>pricing_overrides</code>, the subagent
+fallback and unrepeated soft limits. In the published v0.0.4 no backup is
+kept; the v0.0.5 candidate keeps the previous file as
+<code>shared-budget.json.bak</code>.</li>
+</ul>
+<p><strong>Codex accounting (v0.0.5 candidate; opt-in, off by default).</strong> Codex is not
+admitted or charged unless <strong>both</strong> a configured <code>shared-budget.json</code> <strong>and</strong>
+the marker file <code>&lt;state-dir&gt;/shared-budget.codex</code> exist; delete the marker to
+switch it off again (it is checked on every call). Without the marker the
+shared budget is untouched: the Codex hooks send no shared-budget admission or
+settlement, the daemon answers shared-budget Codex requests <code>not_configured</code>
+and the shared-budget tables do not change. The task preflight and receipt
+behaviour that existed in v0.0.4 is not changed by v0.0.5 and still runs: the
+prompt hook prints the preflight <code>additionalContext</code>, <code>Stop</code> prints an
+Estimate-vs-Actual receipt to stderr, and the task ledger tables (tasks, plans,
+contracts, reservations, receipts and related rows) gain rows. To enrol, create
+the marker as a plain empty regular file (a symlink does not count) next to
+<code>shared-budget.json</code>: find the state directory from the path
+<code>libra-governor shared-budget status</code> prints for <code>shared-budget.json</code>
+(<code>status --json</code> also prints <code>state_dir</code>; with no budget file <code>status</code> prints
+<code>No shared-budget.json in &lt;dir&gt;</code>). The directory is
+<code>$LIBRA_GOVERNOR_STATE_DIR</code> (used as is, takes precedence) or
+<code>$XDG_STATE_HOME/libra-governor</code>, else <code>~/.local/state/libra-governor</code>. Then
+<code>touch &lt;state-dir&gt;/shared-budget.codex</code>. There is no CLI subcommand for this.
+When enrolled:</p>
+<ul>
+<li>Codex hooks run only after you trust them in Codex’s <code>/hooks</code>. Untrusted
+hooks are skipped silently and leave an enrolled install ungated; <code>doctor</code>
+can report trust as “likely not yet trusted” or “unknown”, never “trusted”.</li>
+<li>With no <code>gpt-*</code> price in <code>pricing_overrides</code>, every Codex turn books the flat
+hold, unmeasured, and is never trued up.</li>
+<li>A turn Codex interrupts or aborts writes no usage record, so that spend is
+under-counted. A turn longer than the one-hour hold is settled late on
+partial usage.</li>
+<li>Codex subagents are neither admitted nor settled.</li>
+<li>The marker must be a regular file; a symlinked marker does not count.</li>
+<li>There is no Codex <code>PreToolUse</code> gate and no mid-turn hold renewal.</li>
+<li>A flat hold is never refunded by a later true-up.</li>
+<li>The marker together with <code>LIBRA_GOVERNOR_CODEX_EXECUTION_OWNER=1</code> blocks the
+prompt with an explicit reason; unset one of them.</li>
+<li>Run the daemon and the CLI from the same release; a daemon built before the
+Codex hooks leaves an enrolled install ungated until it is restarted.</li>
+<li>Support was derived from reading Codex source at 0.160, 0.163, 0.164 and
+0.165 and from synthetic fixtures. It has not been run against a real Codex
+host or provider. Setup: <code>integrations/codex/README.md</code>.</li>
+</ul>
+<p><strong>Where to look.</strong> <code>libra-governor shared-budget status</code> (add <code>--json</code>),
+the <code>shared_budget_*</code> checks in <code>libra-governor doctor</code>, and a <code>budget $x/$y</code>
+segment on the statusline that adds <code>budget low: new sessions blocked</code> when less
+than one turn hold remains.</p>
+<p><strong>Change or remove it.</strong> Edit <code>shared-budget.json</code> in the state directory
+(<code>status</code> prints its path) or delete it; the daemon re-reads it on every
+decision, so the change applies from the next prompt. To start over use
+<code>shared-budget init --force</code>.</p>
+<p>Details: <a href="https://github.com/horonomy/libra-governor/blob/main/docs/adr/0026-local-monthly-shared-budget.md">ADR-0026</a> and
+<a href="claude-code.html"><code>integrations/claude-code/README.md</code></a>.</p>
+<h2 id="your-first-preflight-walked-through"><a class="header" href="#your-first-preflight-walked-through">Your first preflight, walked through</a></h2>
+<p>When you submit a prompt, the <code>UserPromptSubmit</code> hook
+(<code>libra-governor hook user-prompt-submit</code>) sends it to the local daemon,
+which:</p>
+<ol>
+<li>Starts itself on demand if it is not already running (no separate
+“start the daemon” step — see
+<a href="claude-code.html#daemon-lifecycle"><code>integrations/claude-code/README.md</code></a>).</li>
+<li>Runs bounded, read-only reconnaissance against your repository (file
+counts, detected build/test tooling — never raw file contents).</li>
+<li>Drafts a Completion Contract and a probabilistic P50/P80/P90
+cost/time estimate from your own local history (or an honestly
+labeled cold-start estimate on a fresh install — see
+<a href="https://github.com/horonomy/libra-governor/blob/main/crates/domain/src/estimate.rs"><code>crates/domain/src/estimate.rs</code></a>).</li>
+<li>Evaluates admission against your active policy preset and reserves
+the Completion Reserve required to <em>finish</em> the task, not just start
+it.</li>
+<li>Surfaces the result into Claude’s own context (the preflight summary)
+and the statusline.</li>
+</ol>
+<p>As you work, <code>PostToolUse</code> cheaply counts tool calls, and if the run
+materially deviates from what the plan implied (a possible tool-call
+loop, or a call count history says is atypical), the daemon
+automatically replans — recomputing and widening the remaining estimate,
+subject to a cooldown/max-replan budget — and the statusline shows this
+(<code>replanned x2</code>, or <code>awaiting approval</code> once that budget is exhausted).
+See
+<a href="https://github.com/horonomy/libra-governor/blob/main/crates/domain/src/replan.rs"><code>crates/domain/src/replan.rs</code></a> for exactly
+what signals this is (and honestly is not) able to detect from Claude
+Code’s hook payloads. On <code>Stop</code>, the session’s task is finalized into an
+<code>ExecutionReceipt</code> — the estimate-vs-actual record used for calibration
+(<code>libra-governor calibration report</code>).</p>
+<h2 id="policy-presets"><a class="header" href="#policy-presets">Policy presets</a></h2>
+<p>Four named presets, defined in
+<a href="https://github.com/horonomy/libra-governor/blob/main/crates/domain/src/policy.rs"><code>crates/domain/src/policy.rs</code></a>:
+<code>balanced</code> (the default), <code>deadline_first</code>, <code>cost_first</code>, and
+<code>strict_budget</code>. Select one (and optionally scale its resource/time
+target) via an optional <code>config.json</code> in the daemon’s state directory —
+full field reference in
+<a href="claude-code.html#configuring-the-daemon-configjson"><code>integrations/claude-code/README.md</code></a>.
+Absence of <code>config.json</code> is the normal case; every existing install
+without one keeps the <code>balanced</code> default unchanged. <code>libra-governor doctor</code> reports which preset is actually active.</p>
+<h2 id="statusline-and-replanning"><a class="header" href="#statusline-and-replanning">Statusline and replanning</a></h2>
+<p>The statusline is the visible explanation channel for what the daemon
+has decided — not something buried in a log file you never open. It
+shows the current task id, plan id, preflight/recon status, the current
+remaining P90 estimate, and replan state (<code>stable</code>, <code>replanned xN</code>, or
+<code>awaiting approval</code>).</p>
+<p>Claude Code gives a scope exactly one <code>statusLine.command</code>, so Libra does
+not take it. The supported surface is a provider document composed by a
+shared host alongside your own statusline and any other Horonom product’s:</p>
+<pre><code class="language-bash">libra-governor statusline provider   # one versioned JSON document, read-only, always exit 0
+libra-governor statusline explain    # the long form the statusline has no room for
+</code></pre>
+<p><a href="statusline.html"><code>docs/statusline.md</code></a> covers opting in, what the
+provider never emits, and migrating off an external wrapper. Bare
+<code>libra-governor statusline</code> still prints today’s one-line render
+unchanged — see
+<a href="https://github.com/horonomy/libra-governor/blob/main/crates/cli/src/statusline.rs"><code>crates/cli/src/statusline.rs</code></a> for that
+logic and <a href="https://github.com/horonomy/libra-governor/blob/main/crates/cli/src/statusline_provider.rs"><code>crates/cli/src/statusline_provider.rs</code></a>
+for the provider’s; both are unit-tested independently of a live socket.</p>
+<h2 id="diagnostics-libra-governor-doctor"><a class="header" href="#diagnostics-libra-governor-doctor">Diagnostics: <code>libra-governor doctor</code></a></h2>
+<p>A read-only diagnostic snapshot — never spawns the daemon, never mutates
+anything, never prints a secret value (only presence/absence — see
+“Security &amp; privacy” below):</p>
+<pre><code class="language-bash">libra-governor doctor          # human-readable
+libra-governor doctor --json   # machine-readable: {"findings": [...], "daemon": {...} | null}
+</code></pre>
+<p>It reports, combining local file checks with a <code>Request::Doctor</code> round
+trip to the daemon when one is reachable:</p>
+<ul>
+<li>Daemon availability and version, and whether its protocol version
+matches this CLI’s own (a version-skewed daemon is reported as an
+error naming the fix — restart it).</li>
+<li>SQLite ledger schema version vs. this build’s latest known migration.</li>
+<li>Claude Code hook/statusline wiring (<code>~/.claude/settings.json</code>).</li>
+<li>The active admission policy preset.</li>
+<li>Gateway configuration presence, whether it is actually running, and
+its honest capability tier (see “Enforcement gateway” in
+<a href="claude-code.html#enforcement-gateway-horo-1144--optional-off-by-default"><code>integrations/claude-code/README.md</code></a>).</li>
+<li><code>config.json</code> presence and validity, checked both locally (so a fresh
+install with no daemon running yet still catches a corrupt file) and,
+when a daemon is reachable, against what it actually loaded at
+startup — a present-but-invalid file is flagged as an error either way
+(the daemon is silently running on its hardcoded defaults until this
+is fixed).</li>
+<li>Stale config: whether a currently-running daemon’s in-memory policy
+preset/gateway presence still matches what’s on disk right now — an
+edited <code>config.json</code> with no daemon restart since is flagged as an
+error naming the fix (restart it).</li>
+<li>Telemetry posture (see “Security &amp; privacy” below).</li>
+</ul>
+<p>Exit code <code>0</code> unless at least one finding is error-severity — a daemon
+that simply has not started yet (the normal state before your first
+prompt) is a warning, not a failure.</p>
+<h2 id="evidence-export-opt-in-manual-libra-governor-evidence-report"><a class="header" href="#evidence-export-opt-in-manual-libra-governor-evidence-report">Evidence export (opt-in, manual): <code>libra-governor evidence-report</code></a></h2>
+<p>This is <strong>not telemetry</strong>. Nothing here runs automatically, nothing runs
+in the background, and nothing is ever transmitted anywhere by this tool
+— it is a manual self-report export you run deliberately, and it makes
+zero network calls.</p>
+<p>It exists for HORO-1154: when a real Claude Code/Codex power user is
+participating in an evaluation and has agreed to share their local usage
+signals with the founder, this gives them a way to do that without
+handing over prompt text, source code, or tool output.</p>
+<pre><code class="language-bash">libra-governor evidence-report consent   # records explicit opt-in, once
+libra-governor evidence-report           # refuses without the above
+</code></pre>
+<p><code>consent</code> writes a timestamped marker to
+<code>~/.local/state/libra-governor/evidence_consent.json</code>. Without it,
+<code>evidence-report</code> refuses outright and explains why — it never collects
+or writes anything on your behalf without this explicit step.</p>
+<p>With consent on record, <code>evidence-report</code>:</p>
+<ol>
+<li>Reads coarse, privacy-safe <strong>counts</strong> out of your local ledger: how
+many preflights you’ve run, how many were admitted vs. denied, how
+many replans happened, how many tasks you finished (Execution
+Receipts). Every one of these is a <code>COUNT()</code>-style aggregate — see
+<code>libra_governor_ledger::EvidenceAggregates</code>, which is structurally
+incapable of holding a prompt fragment, a file path, or tool output.</li>
+<li>Reads whether Claude Code’s hooks/statusline are currently wired into
+<code>~/.claude/settings.json</code> — a real, observable fact. It explicitly
+<strong>cannot</strong> detect whether you ran a session with the hooks removed or
+otherwise worked around them; that is invisible from inside this
+product, and the exported report says so in plain language rather
+than inventing a signal for it.</li>
+<li>Prompts you, interactively, for the open-ended questions HORO-1154
+asks about: perceived friction, whether you’d route more work through
+it, team/Codex demand, and a willingness-to-pay signal. Whatever you
+type is included verbatim — this is genuinely your own words, never
+inferred or fabricated on your behalf.</li>
+<li>Writes one JSON file and one Markdown file locally, under
+<code>~/.local/state/libra-governor/evidence-reports/</code>, and prints their
+paths. That’s it. <strong>You</strong> decide whether and how to send either file
+to anyone (e.g. attach the Markdown to an email) — this command never
+does that for you.</li>
+</ol>
+<p>See <code>crates/cli/src/evidence_report_cmd.rs</code> for the full contract and
+<code>crates/cli/tests/evidence_report_privacy.rs</code> for the automated evidence
+that a real prompt nonce, driven through a real Preflight, never appears
+anywhere in the exported files.</p>
+<h2 id="troubleshooting"><a class="header" href="#troubleshooting">Troubleshooting</a></h2>
+<p>Real, observed failure modes and the exact fix — not invented generic
+advice:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr>
+</thead>
+<tbody>
+<tr><td><code>doctor</code> reports a protocol version mismatch</td><td>You upgraded the binary while an old daemon was still running (every <code>PROTOCOL_VERSION</code> bump has required this — see <a href="https://github.com/horonomy/libra-governor/blob/main/crates/protocol/src/lib.rs"><code>crates/protocol/src/lib.rs</code></a>’s bump history)</td><td><code>libra-governor daemon stop</code>; the next hook invocation respawns it</td></tr>
+<tr><td>Statusline shows <code>libra: -</code></td><td>The daemon is not running; <code>statusline</code> never spawns one by design (a refreshing statusline spawning a daemon would be a race factory)</td><td>Submit a prompt — <code>hook user-prompt-submit</code> spawns it on demand</td></tr>
+<tr><td><code>doctor</code> reports <code>config.json ... rejected</code></td><td>A typo or invalid value in <code>config.json</code> — full detail is in <code>daemon.log</code>, not swallowed</td><td>Fix the file (see the field reference in <code>integrations/claude-code/README.md</code>); the daemon keeps running on defaults meanwhile, never crashes on this</td></tr>
+<tr><td><code>doctor</code> reports <code>stale_config</code></td><td>You edited <code>config.json</code> after the daemon last started, so it’s still running on the old values</td><td><code>libra-governor daemon stop</code>; the next hook invocation respawns it with the new file</td></tr>
+<tr><td><code>doctor</code> reports <code>stale_runtime</code></td><td>You replaced the installed binary while an old daemon was still running — the daemon’s own executable (hashed at startup) no longer matches what is on disk at the installed path</td><td><code>libra-governor daemon stop</code>; the next hook invocation respawns it running the new binary</td></tr>
+<tr><td><code>doctor</code> reports <code>orphan_socket</code></td><td><code>daemon.sock</code> exists but <code>daemon.pid</code> is missing or unreadable — either a stale leftover from an unclean exit, or a live daemon old enough to predate the pid-record feature</td><td>Confirm via <code>ps</code>/<code>lsof</code> whether a Governor daemon still holds the state dir; if not, remove <code>daemon.sock</code> and <code>daemon.log</code> by hand (<code>doctor</code> never deletes these itself)</td></tr>
+<tr><td><code>install</code> says an existing <code>statusLine</code> was left untouched</td><td>You already had a non-Governor <code>statusLine</code> configured in <code>~/.claude/settings.json</code></td><td>You do not have to choose. Register <code>statusline provider</code> with the shared statusline host and both render — see <a href="statusline.html"><code>docs/statusline.md</code></a>. <code>install</code> never overwrites a foreign <code>statusLine</code></td></tr>
+<tr><td><code>doctor</code> reports the ledger schema is ahead of this binary</td><td>A newer daemon build already migrated the database, and you are now running an older CLI/daemon binary</td><td>Rebuild/reinstall this binary at the newer version</td></tr>
+<tr><td>Gateway configured but <code>doctor</code> says <code>not running</code></td><td>Configuration validation or credential resolution failed at daemon startup (fails open, never takes the daemon down)</td><td>Run <code>libra-governor gateway status</code> for the exact <code>disabled_reason</code>; the daemon keeps serving hooks/statusline normally either way</td></tr>
+<tr><td>A gateway request is refused with HTTP 403</td><td>The gateway’s own admission failed closed (see <code>x-libra-decision</code> header)</td><td>See “What a refusal looks like” in <code>integrations/claude-code/README.md</code></td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="security--privacy"><a class="header" href="#security--privacy">Security &amp; privacy</a></h2>
+<p>Truthful, matching the actual implementation — not aspirational copy:</p>
+<ul>
+<li><strong>What stays local:</strong> full prompt text, source code, and raw tool
+output never leave your machine as part of Libra’s own operation —
+this is a structural guarantee, not a policy switch (see
+<a href="architecture.html#privacy-boundary"><code>ARCHITECTURE.md</code></a>). The ledger’s
+schema has no column for a raw prompt, file content, or tool output —
+see <code>crates/ledger/migrations/0001_init.sql</code> and
+<code>libra_governor_domain</code>’s crate-level docs.</li>
+<li><strong>What is persisted in SQLite</strong> (<code>~/.local/state/libra-governor/ledger.sqlite3</code>,
+owner-only <code>0700</code>/<code>0600</code> permissions): task/plan/contract structure,
+estimates, execution receipts (tool-call counts, duration, outcome),
+reservation/settlement ledger entries, and — only when the optional
+gateway is enabled — a <code>gateway_requests</code> provenance row per proxied
+request that has <strong>no column for a body, a header, a prompt, or tool
+output</strong> (see <code>crates/ledger/migrations/0007_gateway_requests.sql</code>).</li>
+<li><strong>What may pass through the optional gateway:</strong> only traffic you
+explicitly route through it (<code>ANTHROPIC_BASE_URL</code> pointed at the
+gateway’s loopback address). It is off by default
+(<code>DaemonConfig.gateway: None</code>). Even when enabled, it enforces
+provider-spend limits — it does not inspect, log, or exfiltrate
+request/response bodies at any level; there is deliberately no debug
+body-dump switch anywhere in the code.</li>
+<li><strong>What is never uploaded automatically:</strong> everything. There is no
+telemetry code path anywhere in this repository — nothing runs on a
+schedule, in the background, or without your explicit invocation — and
+no Team Alpha / cross-machine sync exists yet — <code>libra-governor doctor</code>’s telemetry finding reflects this as a real, observed absence,
+not an aspiration. The one exception is <code>libra-governor evidence-report</code>
+(see “Evidence export” above): a manual, opt-in-gated command you run
+yourself, that writes a local file and makes no network call of its
+own — it is a self-report export tool, not telemetry, and it never
+decides on your behalf to send anything anywhere.</li>
+<li><strong>Egress inventory:</strong> <a href="https://github.com/horonomy/libra-governor/blob/main/docs/egress-inventory.md"><code>docs/egress-inventory.md</code></a>
+lists every outbound pathway in this repository. In short: only
+<code>crates/gateway</code> (opt-in, allowlisted upstream, default
+<code>api.anthropic.com</code>) and <code>crates/extension</code> (loopback-literal webhooks)
+hold network clients, and a test in <code>cargo test</code> fails if any other crate
+gains a network dependency or socket/client code. Evidence export refuses
+every transport except local-only for every profile; the corporate/personal
+profile is a data stamp, not a network switch. There is no telemetry, update
+check, or upload. Not enforced by Libra: Claude Code’s own telemetry and
+WebFetch (including <code>CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC</code>) are host
+traffic that Libra does not control; <code>doctor</code> only reports whether
+<code>CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC</code> is set (a non-empty process value or a <code>settings.json</code> key; the value is
+never printed or interpreted).</li>
+<li><strong>Logs and receipts:</strong> <code>daemon.log</code>
+(<code>crates/daemon/src/log.rs</code>) never receives raw prompt text or hook
+payload content. Execution receipts record structural facts (counts,
+durations, outcome) never the content that produced them.</li>
+<li><strong>API/BYOK vs. subscription enforcement — exact limits:</strong> reusing
+HORO-1144’s model rather than re-describing it inconsistently — see
+<code>EnforcementCapabilities</code>/<code>EnforcementTier</code> in
+<a href="https://github.com/horonomy/libra-governor/blob/main/crates/domain/src/capability.rs"><code>crates/domain/src/capability.rs</code></a>
+and the capability-tier table in
+<a href="claude-code.html#capability-tiers--what-each-mode-can-honestly-claim"><code>integrations/claude-code/README.md</code></a>.
+In short: a Governor-held API/BYOK credential gets a genuine pre-spend
+monetary hard cap; a forwarded subscription credential gets exact
+token observation but <strong>no</strong> monetary cap (the provider does not
+expose that quota’s accounting to us); no gateway gets neither — hooks
+are advisory only. <code>libra-governor gateway status</code> and
+<code>libra-governor doctor</code> report which one your deployment actually is.</li>
+<li><strong>How to disable/remove the integration:</strong> see “Uninstall” below.</li>
+</ul>
+<h2 id="safe-defaults"><a class="header" href="#safe-defaults">Safe defaults</a></h2>
+<p>Advisory behavior never unexpectedly blocks an existing Claude Code
+workflow: with no <code>shared-budget.json</code>, every hook is advisory-only (no
+<code>{"decision": "block", ...}</code> is emitted). The one exception is the optional
+local monthly budget: once you create <code>shared-budget.json</code>, <code>UserPromptSubmit</code>
+refuses a prompt (and <code>PreToolUse</code> can deny a tool call) when the pool is
+exhausted, the budget file is invalid, a clock anomaly is flagged, or the daemon
+cannot be reached; no other hook blocks — see
+<a href="claude-code.html#what-this-integration-intentionally-does-not-do-yet"><code>integrations/claude-code/README.md</code></a>,
+and hard enforcement requires you to deliberately configure and start
+the optional gateway with a compatible credential/provider
+configuration — configuration validation <em>refuses to start</em> a
+combination that would overclaim a monetary cap it cannot honor (see
+<code>libra_governor_gateway::config::validate</code>). Conflicting or invalid
+configuration is diagnosed (<code>libra-governor doctor</code>, <code>daemon.log</code>)
+rather than silently overwritten. <code>libra-governor install</code> merges into
+<code>~/.claude/settings.json</code> — it never replaces the file wholesale; see
+<code>crates/cli/src/claude_settings.rs</code> for the exact safe read-modify-write
+algorithm.</p>
+<h2 id="uninstall"><a class="header" href="#uninstall">Uninstall</a></h2>
+<pre><code class="language-bash">libra-governor uninstall          # removes settings.json keys only; asks before deleting state
+libra-governor uninstall --yes    # also deletes the state directory without prompting
+</code></pre>
+<p>Removes exactly what this integration’s own installer added:</p>
+<ol>
+<li>The <code>UserPromptSubmit</code>/<code>PostToolUse</code>/<code>Stop</code> and <code>PreToolUse</code>/<code>SubagentStop</code>/<code>SessionEnd</code>
+hook entries,
+<code>statusLine</code>, and — if present — the gateway’s <code>env.ANTHROPIC_BASE_URL</code>
+(loopback-only) and <code>apiKeyHelper</code> keys from <code>~/.claude/settings.json</code>.
+Every other key in that file — anything from another tool, or your
+own hand edits — is preserved with its original value untouched (see
+the ownership predicate in <code>crates/cli/src/claude_settings.rs</code>, and
+its test suite that seeds foreign content and asserts every foreign
+value survives). The file itself is rewritten as pretty-printed JSON
+with keys in alphabetical order, so the surrounding bytes — key
+order, exact whitespace — are not preserved verbatim, only the
+values. A timestamped backup of the pre-edit file is written before
+any change if you need the original byte-for-byte. If the file
+changes on disk between the moment the command reads it and the
+moment it would write it back — Claude Code itself, another tool, or
+your editor saving over it — the write is refused with an error and
+nothing is changed at all, rather than overwriting that change with
+an edit computed from the older content; re-run the command to apply
+it on top of the new content.</li>
+<li>The whole state directory (<code>ledger.sqlite3</code> and its <code>-wal</code>/<code>-shm</code> files,
+<code>daemon.sock</code>, <code>daemon.pid</code>, <code>daemon.log</code>, <code>config.json</code>, <code>gateway.token</code>,
+<code>host_id</code>, <code>install.json</code> and <strong><code>shared-budget.json</code></strong>, so the monthly
+budget and its spend ledger are gone too) — <strong>only</strong> with <code>--yes</code> or an
+interactive “yes” confirmation, since it holds your only local record
+of estimate-vs-actual calibration history and deleting it is
+unrecoverable. Without confirmation the directory is left in place.</li>
+<li>Nothing else, except what <code>install</code> and <code>uninstall</code> leave behind in
+<code>~/.claude</code>: one <code>settings.json.libra-backup-&lt;timestamp&gt;-&lt;pid&gt;</code> file per
+run and <code>settings.json.horonom-write.lock</code> (Libra’s own write lock). Keep
+or delete the backups; the backup written by your first <code>install</code> is your
+byte-identical original (later backups contain already-wired content), and
+<code>install --agent codex</code> leaves <code>~/.codex/hooks.json.libra-backup-*</code> files in
+the same way. The daemon binary itself is never deleted by
+<code>uninstall</code> — it was put in place by <code>cargo install</code>, so only <code>cargo uninstall libra-governor-cli</code> keeps cargo’s own package bookkeeping
+consistent. When <code>install</code>’s own marker file proves this exact binary
+path was installed by <code>libra-governor install</code>, <code>uninstall</code> prints
+that command for you to run. The marker only records that
+<code>libra-governor install</code> ran from that path, so the v0.0.4 tarball binary
+also gets the <code>cargo uninstall</code> hint (a known limitation, also present on the v0.0.5 candidate): delete the
+copied binary yourself instead.</li>
+</ol>
+<p>Run <code>libra-governor doctor</code> afterward to confirm — it will report
+“not installed.”</p>
+<h2 id="known-limitations"><a class="header" href="#known-limitations">Known limitations</a></h2>
+<ul>
+<li><strong>Shadow-decision/early-warning and multi-level custody accounting are
+not production-evidenced.</strong> See “Capability status” above and
+<a href="https://github.com/horonomy/libra-governor/blob/main/docs/adr/0014-v0-0-3-go-scope-and-exclusions.md"><code>docs/adr/0014-v0-0-3-go-scope-and-exclusions.md</code></a>.</li>
+<li><strong>Developer Preview, not a general release.</strong> v0.0.4 is published as a
+Cooperative Preview for Apple Silicon macOS only (tarball with sha256 and
+build-provenance attestation, see “Install” above); building from a local
+clone with <code>cargo install</code> is the other install path. The v0.0.5 candidate is
+unreleased.</li>
+<li><strong>No Team Alpha / hosted control plane.</strong> Shared team policy, a
+management console, and any cloud component are unbuilt — see
+HORO-1154/1159/1163/1165. Everything in the published releases runs
+entirely on your machine.</li>
+<li><strong>Upgrading directly from v0.0.1 needs one manual daemon restart</strong> if
+Claude Code was already running before you upgraded. Try
+<code>libra-governor daemon stop</code> first; if it refuses because no pid record
+exists (the v0.0.1 daemon predates HORO-1380’s pid-record write and
+cannot be identity-checked), fall back to <code>pkill -f "libra-governor daemon run"</code> for this one specific transition only (or just restart
+Claude Code). <code>doctor</code> will tell you if this applies. This is a
+one-time limitation of that specific transition — the v0.0.1 daemon
+predates the self-healing fix that makes every later upgrade automatic
+(see <code>experiments/v002_gate/README.md</code>).</li>
+<li><strong>The gateway’s session-binding header is unverified against live
+Claude Code traffic</strong> — see
+<a href="claude-code.html#known-limitation-the-session-binding-header-is-unverified"><code>integrations/claude-code/README.md</code></a>.</li>
+<li><strong>No automated Completion Contract verification</strong> — a task is never
+inferred “done” merely because the model stopped talking (MVP scope).</li>
+<li><strong>No cross-machine sync or telemetry</strong> — every install’s history is
+local to that machine.</li>
+<li>Further limitations (task classification, cross-session merge, MCP
+surface, Contract correction UX) are listed in
+<a href="claude-code.html#what-this-integration-intentionally-does-not-do-yet"><code>integrations/claude-code/README.md</code></a>.</li>
+</ul>
+<h2 id="contributing"><a class="header" href="#contributing">Contributing</a></h2>
+<p>See <a href="https://github.com/horonomy/libra-governor/blob/main/CONTRIBUTING.md"><code>CONTRIBUTING.md</code></a> for branch/commit/PR
+conventions, and <a href="https://github.com/horonomy/libra-governor/blob/main/CLAUDE.md"><code>CLAUDE.md</code></a> for repository-specific agent
+instructions. Build and test commands:</p>
+<pre><code class="language-bash">cargo build --workspace
+cargo test --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+</code></pre>
+<p>A real, runnable install/uninstall lifecycle smoke test lives at
+<a href="https://github.com/horonomy/libra-governor/blob/main/scripts/smoke-test.sh"><code>scripts/smoke-test.sh</code></a> (not wired into CI —
+see that script’s own docs for why).</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="index.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="north-star.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="index.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="north-star.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-c2a407aa.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

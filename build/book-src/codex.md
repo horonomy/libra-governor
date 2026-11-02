@@ -1,0 +1,314 @@
+# Codex CLI integration
+
+HORO-1157 added Codex CLI as a second governed coding agent, sharing
+every byte of hook-translation logic with the existing
+[Claude Code integration](claude-code.md) via
+`crates/cli/src/agent/` — see
+[`docs/adr/0004-agent-adapter-contract.md`](https://github.com/horonomy/libra-governor/blob/main/docs/adr/0004-agent-adapter-contract.md)
+for why that is a shared translation layer rather than a trait or a
+separate crate, and for exactly what was verified against Codex's real
+hook schemas vs. what remains unverified.
+
+## What ships
+
+- `libra-governor codex-hook user-prompt-submit` — the Codex
+  `UserPromptSubmit` hook entry point. Reads the hook JSON payload from
+  stdin, asks the daemon (starting it if not already running) for a
+  preflight, and prints a `hookSpecificOutput.additionalContext` JSON
+  object — byte-for-byte the same translation `hook user-prompt-submit`
+  (Claude Code) performs, via `crate::agent::run::run_prompt_submit`.
+- `libra-governor codex-hook post-tool-use` — the Codex `PostToolUse`
+  hook entry point. Fire-and-forget tool-call counting, never spawns the
+  daemon, never blocks on a response.
+- `libra-governor codex-hook stop` — the Codex `Stop` hook entry point.
+  Finalizes the session's task into an `ExecutionReceipt`, printing the
+  Estimate-vs-Actual summary to stderr. Maps to `Stop`, not `SessionEnd`
+  — see the ADR's "Stop-not-SessionEnd decision".
+- `libra-governor install --agent codex` / `uninstall --agent codex
+  [--yes]` — wires/unwires exactly these three hooks into
+  `~/.codex/hooks.json` (or `$CODEX_HOME/hooks.json`), via
+  `crates/cli/src/codex_hooks_file.rs`, which mirrors
+  `claude_settings.rs`'s exact safety discipline (parse-or-abort on
+  malformed JSON, a verbatim-bytes backup before every write, atomic
+  temp-file-then-rename, a refusal to write anything at all if the file
+  changed on disk since it was read, never touching a foreign hook
+  group).
+- `libra-governor doctor` — reports whether `hooks.json`'s three groups
+  are wired, whether the wired command path matches the binary currently
+  running the check (a moved binary needs re-trust — see "Trust gate"
+  below), and a best-effort read of `~/.codex/config.toml`'s
+  `[hooks.state]` trust gate.
+- **Local shared-budget gate: OFF by default, experimental (ADR-0026,
+  HORO-2283).** Unless both `shared-budget.json` and the marker file
+  `<state_dir>/shared-budget.codex` exist (a regular file, contents never
+  read, removing it switches the gate off again), the Codex hook route never
+  sends a shared-budget `Admit`, never sends `SettleTurn`, never blocks a
+  prompt and never denies a tool call. This scopes only the shared budget:
+  the pre-existing task preflight (prompt hook prints `additionalContext`)
+  and receipt (`Stop` prints to stderr) behaviour is unchanged and still runs.
+  Create the marker with `touch <state_dir>/shared-budget.codex` (no CLI
+  subcommand does this; a symlink does not count; find the state directory
+  from the `shared-budget.json` path printed by `libra-governor shared-budget
+  status`; `status --json` also prints `state_dir`, and with no budget file
+  `status` prints `No shared-budget.json in <dir>`. The directory is
+  `$LIBRA_GOVERNOR_STATE_DIR` (used as is, takes precedence) or
+  `$XDG_STATE_HOME/libra-governor`, else `~/.local/state/libra-governor`). The capability row
+  `shared_budget_admission_gate` stays Unavailable. With the marker present:
+  - `UserPromptSubmit` admits the main-lane turn (`provider:"codex"`,
+    `prompt_id` = the payload's `turn_id`) and prints
+    `{"decision":"block","reason":...}` when the budget is exhausted, invalid,
+    or the daemon cannot be reached or answers unusably. An allowed prompt
+    carries the same one-line soft-limit warning as Claude Code.
+  - A subagent prompt (payload has `agent_id`) is not admitted and is logged.
+  - Combining the marker with `LIBRA_GOVERNOR_CODEX_EXECUTION_OWNER=1` blocks
+    the prompt with an explicit reason; unset one of them.
+  - `Stop` sends `SettleTurn` (`turn_id` + `transcript_path`) before the
+    normal Finalize / owner Stop, waits at most 5 s, prints nothing to
+    stdout (the Estimate-vs-Actual receipt goes to stderr) and never blocks.
+  - There is no `PreToolUse` gate for Codex; a long tool-free turn keeps its
+    hold only until it expires.
+  - Unless `shared-budget.json` carries `pricing_overrides` for the Codex
+    model, every turn settles at the flat per-turn hold (`usage_known=false`).
+  - Known limits: a stale daemon (built before this change, same protocol
+    version 25) silently leaves an enrolled install ungated until it is
+    restarted; a prompt with no `turn_id` is admitted unmapped and its hold
+    just expires after the TTL; subagent prompts and Stops are neither
+    admitted nor settled (known gap); there is no heartbeat, so a turn longer
+    than the 1 h hold expires and is settled later by orphan recovery (C4).
+  - **Codex hooks only run after the operator trusts them in Codex's
+    `/hooks`.** Untrusted (or changed-since-trusted) hooks are skipped by
+    Codex without any signal, so an enrolled but untrusted install is
+    silently **ungated**. `doctor` cannot prove trust (see "Trust gate").
+  - **`doctor` and `shared-budget status` while enrolled (HORO-2285).**
+    With no marker, `doctor` prints nothing Codex-enrolment-related and its
+    output is byte-identical to before. With the marker it adds, by finding id:
+    - `codex_enrolment`: the marker state (Ok), a marker with no
+      `shared-budget.json` (Warn, nothing is enrolled), or the marker together
+      with `LIBRA_GOVERNOR_CODEX_EXECUTION_OWNER` in doctor's own environment
+      (Error, every Codex prompt is blocked);
+    - `codex_enrolled_hooks`: whether the three hooks are wired and the trust
+      state (likely not yet trusted / unknown / disabled), always a Warn
+      because doctor cannot prove trust;
+    - `codex_pricing`: a Warn when no `pricing_overrides` model id starts with
+      `gpt` (every turn then books the flat hold; a Codex model id that does
+      not start with `gpt` is not recognised by this check);
+    - `codex_daemon_admission`: a read-only Codex `Check` with a synthetic
+      session probes the running daemon. `not_configured` is an **Error**
+      ("enrolled but the running daemon is not honouring Codex admission
+      (restart/upgrade the daemon)"), a real answer is Ok, an unreachable
+      daemon stays a Warn and the daemon is never started;
+    - `codex_limits`: the known limits listed above.
+
+    `shared-budget status` swaps the "Codex route has no budget gate" line of
+    its not-covered list for the remaining Codex gaps (subagents, no
+    PreToolUse, no heartbeat, unmapped no-`turn_id` prompts, untrusted hooks
+    ungated, unpriced models at the flat hold). The guarantee label stays
+    `admission-bounded (cooperative)`, and the `agents` capability row stays
+    Unavailable.
+- `libra-governor agents [--json]` — the capability matrix for both
+  agents this integration knows about (see "Capability tiers" below).
+
+## What Codex's real hook payloads expose (verified against
+## `openai/codex`'s generated JSON schemas, HORO-1157)
+
+- `UserPromptSubmit`: `session_id`, `cwd`, `prompt`, `model`, `turn_id`,
+  `permission_mode`, `hook_event_name`, `transcript_path` (+ optional
+  `agent_id`/`agent_type` for subagent sessions).
+- `PostToolUse`: `session_id`, `cwd`, `tool_name`, `tool_input`,
+  `tool_response`, `tool_use_id`, `model`, `turn_id`, `permission_mode`,
+  `transcript_path`.
+- `Stop`: `session_id`, `cwd`, `model`, `turn_id`, `stop_hook_active`,
+  `last_assistant_message`, `permission_mode`, `transcript_path`.
+- stdout contract: `hookSpecificOutput: { hookEventName,
+  additionalContext }` plus `continue`/`decision`/`reason`/`stopReason`/
+  `systemMessage`/`suppressOutput` — the same shape Claude Code's hooks
+  already use, which is exactly why `crate::agent::render` needed no
+  Codex-specific branch.
+- Every field name Codex's payloads use for `session_id`/`cwd`/`prompt`/
+  `tool_name`/`model` matches Claude Code's own payloads exactly — see
+  `crates/cli/src/agent/payload.rs`.
+- Default hook timeout is 600s; `SessionEnd`/`Interrupt` default to
+  1s/3s max — too tight for a client-daemon round trip, which is why
+  `hook stop` maps to `Stop`, not `SessionEnd` (see the ADR).
+
+**Verified by actually running a real local Codex CLI install** (v0.154.0,
+against a sandboxed `$CODEX_HOME`, never the real user's own `~/.codex`
+or real API credentials): `hooks.json`'s real top-level shape (see
+"Setup" below — an earlier draft of this integration had it wrong, caught
+by running the real binary and reading its parse warning); that the
+`hooks` feature is on (`stable`/`true`) by default in this version; that
+`--dangerously-bypass-hook-trust` is a real, distinct trust-gate
+override; and, end to end, that `codex-hook user-prompt-submit` receives
+a real Codex `UserPromptSubmit` payload and the daemon records a real
+task against Codex's own real session id.
+
+**Unverified, treated as unknown rather than asserted** — see the ADR's
+"What was verified vs. what remains open" for the complete list:
+`[hooks.state]`'s exact key shape; whether `session_id` stays stable
+across `compact`/`fork`/`resume`.
+
+## Setup
+
+Build the binary the same way as for Claude Code:
+
+```bash
+cargo build --release -p libra-governor-cli
+# binary at target/release/libra-governor
+```
+
+Then wire the three Codex hooks:
+
+```bash
+/path/to/libra-governor install --agent codex
+```
+
+This writes `~/.codex/hooks.json` (or `$CODEX_HOME/hooks.json`) with:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "/absolute/path/to/libra-governor codex-hook user-prompt-submit", "timeout": 15 }] }
+    ],
+    "PostToolUse": [
+      { "hooks": [{ "type": "command", "command": "/absolute/path/to/libra-governor codex-hook post-tool-use", "timeout": 15, "async": true }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "/absolute/path/to/libra-governor codex-hook stop", "timeout": 15 }] }
+    ]
+  }
+}
+```
+
+The hook groups live under a top-level `"hooks"` key — Codex's own
+top-level schema only accepts `"description"`/`"hooks"` as top-level
+fields and rejects (fails open — every hook silently disabled, no error
+surfaced to the user) any other top-level key. Verified by running a
+real local Codex CLI install; see the ADR.
+
+Every hook gets a 15-second timeout (not Codex's own 600s default) so a
+wedged daemon cannot hang a prompt for ten minutes; `PostToolUse` also
+gets `"async": true` since it prints nothing and must never add
+perceptible latency to a tool call.
+
+### The `/hooks` trust step — required, not optional
+
+**Writing `hooks.json` is not enough for Codex to actually run these
+hooks.** `[hooks.state]` in `~/.codex/config.toml` gates whether a
+configured hook fires at all, and trust is recorded by content hash.
+After `install --agent codex`:
+
+1. Open Codex.
+2. Run `/hooks` inside Codex and trust the three `libra-governor` hooks.
+3. If you later move or rebuild the binary, its content hash changes —
+   you must re-trust it the same way.
+
+`libra-governor doctor` flags a binary-path mismatch (a strong signal
+you moved the binary and forgot to re-trust) but cannot itself detect
+whether `/hooks` trust was granted — see "Trust gate" below for why.
+
+No further daemon configuration is required to get today's defaults —
+see the [Claude Code README's "Configuring the daemon
+(`config.json`)"](claude-code.md#configuring-the-daemon-configjson)
+section, which is agent-agnostic (the daemon has no idea which agent
+sent a request).
+
+## Trust gate — `doctor`'s honesty limits
+
+`libra-governor doctor` reads `~/.codex/config.toml` as plain text — no
+TOML parser dependency was added (none existed anywhere in this
+workspace before HORO-1157, and this ticket's scope explicitly avoids
+adding one). It reports exactly three states, deliberately conservative:
+
+| State | Meaning |
+|---|---|
+| `hooks disabled in Codex config` | A literal `[features]` section with `hooks = false` was found — unambiguous regardless of TOML nesting/quoting subtleties. |
+| `likely not yet trusted` | No `[hooks.state]` section header exists anywhere in the file — Codex has nowhere else to record trust, so this is reasonably strong evidence `/hooks` has not been run. |
+| `unknown` | Either `config.toml` could not be read, or a `[hooks.state]` section does exist but this doctor does not know its real key shape (unverified — see the ADR) and makes no claim about what is trusted inside it. |
+
+`doctor` **never** reports "trusted" — that would require parsing
+`[hooks.state]`'s real shape, which was not verified during HORO-1157.
+Verify trust yourself with `/hooks` inside Codex, or use the
+authoritative command below.
+
+## `doctor --verify-trust` — Codex's own authoritative answer (HORO-1906)
+
+`libra-governor doctor --verify-trust [--json]` replaces the local,
+conservative hedge above with Codex's **own** live answer, per ADR-0015
+(`horonomy/internal-docs`,
+`docs/engineering/adr-0015-cross-product-host-trust-resolution.md`,
+Option A). Unlike plain `doctor`, this
+command is an explicit, operator-invoked action that starts Codex's
+`app-server` process (against your real `$CODEX_HOME`, never a synthetic
+one), calls its `hooks/list` RPC, and reports each installed hook's real
+`currentHash`/`trustStatus` straight from Codex — not a guess.
+
+`--help` lists it, but it never runs implicitly: plain `doctor` and every
+other passive/inspection surface leave it alone, and `app-server` is only
+started when you type this exact subcommand.
+
+Fail-closed: if `app-server` is unreachable, the RPC times out, the
+response is malformed, or a hook wired in `hooks.json` is absent from
+Codex's response (orphaned entry), that hook is reported `unknown` —
+never silently reported as trusted.
+
+Known side effect, not introduced by this command: starting Codex's
+`app-server` performs Codex's own first-run initialization (SQLite state
+files, an `installation_id`) the very first time it runs against a given
+`$CODEX_HOME`. On an already-initialized `~/.codex` (the normal case for
+anyone who has used Codex before), repeated runs were observed to touch
+only an internal operational log file — not `auth.json` — across ten
+consecutive real local round trips measured during this ticket's own
+evidence-gathering.
+
+## Capability tiers
+
+`libra-governor agents --json` is the source of truth; a summary:
+
+| Capability | Codex |
+|---|---|
+| Preflight gate, tool observation, completion receipt, inline explanation channel | Available — same hook shapes as Claude Code |
+| Tool gate (hard pre-tool-call refusal) | Unavailable for Codex — Codex hooks are advisory (in v0.0.4 they never block or send a budget request). Claude Code's `PreToolUse` can deny, but only for local monthly budget decisions when `shared-budget.json` exists; the gateway is the other hard-enforcement point (ADR 0003) |
+| Model event observation (token/cost/provider per request) | Unavailable — no hook payload on either agent exposes this |
+| Model gateway / hard budget enforcement | **Unavailable — incompatible wire format.** Codex's custom model provider only supports `wire_api: "responses"` (`POST /v1/responses`); the gateway only speaks Anthropic's `POST /v1/messages`. Not a scoping choice — a real incompatibility. |
+| Persistent status surface (statusline) | Unavailable — verified absent from Codex's config schema at any level |
+| Session/subagent lifecycle, interruption signal, MCP explain surface | Unavailable — Codex exposes the underlying hook/MCP primitives, but this integration does not wire any of them to a daemon action yet (see non-goals below) |
+
+## Explicit non-goals for this integration
+
+- **No gateway/enforcement path for Codex** — the `responses` vs.
+  `messages` wire-format incompatibility above is a real blocker, not an
+  oversight.
+- **No statusline equivalent** — verified absent from Codex's config
+  schema.
+- **No `PreToolUse` hard-gating for Codex** — Codex hooks stay advisory. Claude
+  Code's hooks are advisory too, except the optional local monthly budget
+  (`UserPromptSubmit` block, `PreToolUse` deny, only when `shared-budget.json`
+  exists).
+- **No MCP explain/query surface** — Codex supports MCP as a client
+  (`mcp_servers.<id>` stdio config), but `ARCHITECTURE.md` forbids MCP as
+  an enforcement boundary regardless, and no explain surface is wired for
+  either agent yet.
+- **No `SessionStart`/`SessionEnd`/`SubagentStart`/`SubagentStop`/
+  `Interrupt`/`PreCompact`/`PostCompact` daemon wiring** — each needs new
+  protocol variants and ledger semantics nobody has specified yet; these
+  map to `NormalizedEvent::RecognizedUnwired` only when they occur.
+
+## Platforms
+
+The only supported and verified platform is Apple Silicon (aarch64) macOS
+(the v0.0.4 Cooperative Preview). No platform check was found in the source, so
+other platforms are not blocked, but Linux, Intel macOS and Windows are unsupported and
+unverified, including for Codex.
+
+## Uninstall
+
+```bash
+libra-governor uninstall --agent codex --yes
+```
+
+Removes exactly the three Governor-owned hook groups from `hooks.json`
+(any foreign hook group survives byte-for-byte), then — with the same
+confirmation discipline as the Claude Code path — the shared state
+directory. See the root [`README.md`](developer-preview.md#uninstall) for the
+full safety guarantees, which are agent-agnostic.

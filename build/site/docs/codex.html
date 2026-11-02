@@ -1,0 +1,546 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Codex CLI integration - Libra Governor · Developer Preview</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-2459343d.css">
+        <link rel="stylesheet" href="css/chrome-ae938929.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="docs-a4da9feb.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "navy";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-b51fc6cb.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-a32c0190.js"></script>
+        <link rel="canonical" href="https://libra.horonom.com/docs/codex.html">
+</head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('navy')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Libra Governor · Developer Preview</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/horonomy/libra-governor" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="codex-cli-integration"><a class="header" href="#codex-cli-integration">Codex CLI integration</a></h1>
+<p>HORO-1157 added Codex CLI as a second governed coding agent, sharing
+every byte of hook-translation logic with the existing
+<a href="claude-code.html">Claude Code integration</a> via
+<code>crates/cli/src/agent/</code> — see
+<a href="https://github.com/horonomy/libra-governor/blob/main/docs/adr/0004-agent-adapter-contract.md"><code>docs/adr/0004-agent-adapter-contract.md</code></a>
+for why that is a shared translation layer rather than a trait or a
+separate crate, and for exactly what was verified against Codex’s real
+hook schemas vs. what remains unverified.</p>
+<h2 id="what-ships"><a class="header" href="#what-ships">What ships</a></h2>
+<ul>
+<li><code>libra-governor codex-hook user-prompt-submit</code> — the Codex
+<code>UserPromptSubmit</code> hook entry point. Reads the hook JSON payload from
+stdin, asks the daemon (starting it if not already running) for a
+preflight, and prints a <code>hookSpecificOutput.additionalContext</code> JSON
+object — byte-for-byte the same translation <code>hook user-prompt-submit</code>
+(Claude Code) performs, via <code>crate::agent::run::run_prompt_submit</code>.</li>
+<li><code>libra-governor codex-hook post-tool-use</code> — the Codex <code>PostToolUse</code>
+hook entry point. Fire-and-forget tool-call counting, never spawns the
+daemon, never blocks on a response.</li>
+<li><code>libra-governor codex-hook stop</code> — the Codex <code>Stop</code> hook entry point.
+Finalizes the session’s task into an <code>ExecutionReceipt</code>, printing the
+Estimate-vs-Actual summary to stderr. Maps to <code>Stop</code>, not <code>SessionEnd</code>
+— see the ADR’s “Stop-not-SessionEnd decision”.</li>
+<li><code>libra-governor install --agent codex</code> / <code>uninstall --agent codex [--yes]</code> — wires/unwires exactly these three hooks into
+<code>~/.codex/hooks.json</code> (or <code>$CODEX_HOME/hooks.json</code>), via
+<code>crates/cli/src/codex_hooks_file.rs</code>, which mirrors
+<code>claude_settings.rs</code>’s exact safety discipline (parse-or-abort on
+malformed JSON, a verbatim-bytes backup before every write, atomic
+temp-file-then-rename, a refusal to write anything at all if the file
+changed on disk since it was read, never touching a foreign hook
+group).</li>
+<li><code>libra-governor doctor</code> — reports whether <code>hooks.json</code>’s three groups
+are wired, whether the wired command path matches the binary currently
+running the check (a moved binary needs re-trust — see “Trust gate”
+below), and a best-effort read of <code>~/.codex/config.toml</code>’s
+<code>[hooks.state]</code> trust gate.</li>
+<li><strong>Local shared-budget gate: OFF by default, experimental (ADR-0026,
+HORO-2283).</strong> Unless both <code>shared-budget.json</code> and the marker file
+<code>&lt;state_dir&gt;/shared-budget.codex</code> exist (a regular file, contents never
+read, removing it switches the gate off again), the Codex hook route never
+sends a shared-budget <code>Admit</code>, never sends <code>SettleTurn</code>, never blocks a
+prompt and never denies a tool call. This scopes only the shared budget:
+the pre-existing task preflight (prompt hook prints <code>additionalContext</code>)
+and receipt (<code>Stop</code> prints to stderr) behaviour is unchanged and still runs.
+Create the marker with <code>touch &lt;state_dir&gt;/shared-budget.codex</code> (no CLI
+subcommand does this; a symlink does not count; find the state directory
+from the <code>shared-budget.json</code> path printed by <code>libra-governor shared-budget status</code>; <code>status --json</code> also prints <code>state_dir</code>, and with no budget file
+<code>status</code> prints <code>No shared-budget.json in &lt;dir&gt;</code>. The directory is
+<code>$LIBRA_GOVERNOR_STATE_DIR</code> (used as is, takes precedence) or
+<code>$XDG_STATE_HOME/libra-governor</code>, else <code>~/.local/state/libra-governor</code>). The capability row
+<code>shared_budget_admission_gate</code> stays Unavailable. With the marker present:
+<ul>
+<li>
+<p><code>UserPromptSubmit</code> admits the main-lane turn (<code>provider:"codex"</code>,
+<code>prompt_id</code> = the payload’s <code>turn_id</code>) and prints
+<code>{"decision":"block","reason":...}</code> when the budget is exhausted, invalid,
+or the daemon cannot be reached or answers unusably. An allowed prompt
+carries the same one-line soft-limit warning as Claude Code.</p>
+</li>
+<li>
+<p>A subagent prompt (payload has <code>agent_id</code>) is not admitted and is logged.</p>
+</li>
+<li>
+<p>Combining the marker with <code>LIBRA_GOVERNOR_CODEX_EXECUTION_OWNER=1</code> blocks
+the prompt with an explicit reason; unset one of them.</p>
+</li>
+<li>
+<p><code>Stop</code> sends <code>SettleTurn</code> (<code>turn_id</code> + <code>transcript_path</code>) before the
+normal Finalize / owner Stop, waits at most 5 s, prints nothing to
+stdout (the Estimate-vs-Actual receipt goes to stderr) and never blocks.</p>
+</li>
+<li>
+<p>There is no <code>PreToolUse</code> gate for Codex; a long tool-free turn keeps its
+hold only until it expires.</p>
+</li>
+<li>
+<p>Unless <code>shared-budget.json</code> carries <code>pricing_overrides</code> for the Codex
+model, every turn settles at the flat per-turn hold (<code>usage_known=false</code>).</p>
+</li>
+<li>
+<p>Known limits: a stale daemon (built before this change, same protocol
+version 25) silently leaves an enrolled install ungated until it is
+restarted; a prompt with no <code>turn_id</code> is admitted unmapped and its hold
+just expires after the TTL; subagent prompts and Stops are neither
+admitted nor settled (known gap); there is no heartbeat, so a turn longer
+than the 1 h hold expires and is settled later by orphan recovery (C4).</p>
+</li>
+<li>
+<p><strong>Codex hooks only run after the operator trusts them in Codex’s
+<code>/hooks</code>.</strong> Untrusted (or changed-since-trusted) hooks are skipped by
+Codex without any signal, so an enrolled but untrusted install is
+silently <strong>ungated</strong>. <code>doctor</code> cannot prove trust (see “Trust gate”).</p>
+</li>
+<li>
+<p><strong><code>doctor</code> and <code>shared-budget status</code> while enrolled (HORO-2285).</strong>
+With no marker, <code>doctor</code> prints nothing Codex-enrolment-related and its
+output is byte-identical to before. With the marker it adds, by finding id:</p>
+<ul>
+<li><code>codex_enrolment</code>: the marker state (Ok), a marker with no
+<code>shared-budget.json</code> (Warn, nothing is enrolled), or the marker together
+with <code>LIBRA_GOVERNOR_CODEX_EXECUTION_OWNER</code> in doctor’s own environment
+(Error, every Codex prompt is blocked);</li>
+<li><code>codex_enrolled_hooks</code>: whether the three hooks are wired and the trust
+state (likely not yet trusted / unknown / disabled), always a Warn
+because doctor cannot prove trust;</li>
+<li><code>codex_pricing</code>: a Warn when no <code>pricing_overrides</code> model id starts with
+<code>gpt</code> (every turn then books the flat hold; a Codex model id that does
+not start with <code>gpt</code> is not recognised by this check);</li>
+<li><code>codex_daemon_admission</code>: a read-only Codex <code>Check</code> with a synthetic
+session probes the running daemon. <code>not_configured</code> is an <strong>Error</strong>
+(“enrolled but the running daemon is not honouring Codex admission
+(restart/upgrade the daemon)”), a real answer is Ok, an unreachable
+daemon stays a Warn and the daemon is never started;</li>
+<li><code>codex_limits</code>: the known limits listed above.</li>
+</ul>
+<p><code>shared-budget status</code> swaps the “Codex route has no budget gate” line of
+its not-covered list for the remaining Codex gaps (subagents, no
+PreToolUse, no heartbeat, unmapped no-<code>turn_id</code> prompts, untrusted hooks
+ungated, unpriced models at the flat hold). The guarantee label stays
+<code>admission-bounded (cooperative)</code>, and the <code>agents</code> capability row stays
+Unavailable.</p>
+</li>
+</ul>
+</li>
+<li><code>libra-governor agents [--json]</code> — the capability matrix for both
+agents this integration knows about (see “Capability tiers” below).</li>
+</ul>
+<h2 id="what-codexs-real-hook-payloads-expose-verified-against"><a class="header" href="#what-codexs-real-hook-payloads-expose-verified-against">What Codex’s real hook payloads expose (verified against</a></h2>
+<h2 id="openaicodexs-generated-json-schemas-horo-1157"><a class="header" href="#openaicodexs-generated-json-schemas-horo-1157"><code>openai/codex</code>’s generated JSON schemas, HORO-1157)</a></h2>
+<ul>
+<li><code>UserPromptSubmit</code>: <code>session_id</code>, <code>cwd</code>, <code>prompt</code>, <code>model</code>, <code>turn_id</code>,
+<code>permission_mode</code>, <code>hook_event_name</code>, <code>transcript_path</code> (+ optional
+<code>agent_id</code>/<code>agent_type</code> for subagent sessions).</li>
+<li><code>PostToolUse</code>: <code>session_id</code>, <code>cwd</code>, <code>tool_name</code>, <code>tool_input</code>,
+<code>tool_response</code>, <code>tool_use_id</code>, <code>model</code>, <code>turn_id</code>, <code>permission_mode</code>,
+<code>transcript_path</code>.</li>
+<li><code>Stop</code>: <code>session_id</code>, <code>cwd</code>, <code>model</code>, <code>turn_id</code>, <code>stop_hook_active</code>,
+<code>last_assistant_message</code>, <code>permission_mode</code>, <code>transcript_path</code>.</li>
+<li>stdout contract: <code>hookSpecificOutput: { hookEventName, additionalContext }</code> plus <code>continue</code>/<code>decision</code>/<code>reason</code>/<code>stopReason</code>/
+<code>systemMessage</code>/<code>suppressOutput</code> — the same shape Claude Code’s hooks
+already use, which is exactly why <code>crate::agent::render</code> needed no
+Codex-specific branch.</li>
+<li>Every field name Codex’s payloads use for <code>session_id</code>/<code>cwd</code>/<code>prompt</code>/
+<code>tool_name</code>/<code>model</code> matches Claude Code’s own payloads exactly — see
+<code>crates/cli/src/agent/payload.rs</code>.</li>
+<li>Default hook timeout is 600s; <code>SessionEnd</code>/<code>Interrupt</code> default to
+1s/3s max — too tight for a client-daemon round trip, which is why
+<code>hook stop</code> maps to <code>Stop</code>, not <code>SessionEnd</code> (see the ADR).</li>
+</ul>
+<p><strong>Verified by actually running a real local Codex CLI install</strong> (v0.154.0,
+against a sandboxed <code>$CODEX_HOME</code>, never the real user’s own <code>~/.codex</code>
+or real API credentials): <code>hooks.json</code>’s real top-level shape (see
+“Setup” below — an earlier draft of this integration had it wrong, caught
+by running the real binary and reading its parse warning); that the
+<code>hooks</code> feature is on (<code>stable</code>/<code>true</code>) by default in this version; that
+<code>--dangerously-bypass-hook-trust</code> is a real, distinct trust-gate
+override; and, end to end, that <code>codex-hook user-prompt-submit</code> receives
+a real Codex <code>UserPromptSubmit</code> payload and the daemon records a real
+task against Codex’s own real session id.</p>
+<p><strong>Unverified, treated as unknown rather than asserted</strong> — see the ADR’s
+“What was verified vs. what remains open” for the complete list:
+<code>[hooks.state]</code>’s exact key shape; whether <code>session_id</code> stays stable
+across <code>compact</code>/<code>fork</code>/<code>resume</code>.</p>
+<h2 id="setup"><a class="header" href="#setup">Setup</a></h2>
+<p>Build the binary the same way as for Claude Code:</p>
+<pre><code class="language-bash">cargo build --release -p libra-governor-cli
+# binary at target/release/libra-governor
+</code></pre>
+<p>Then wire the three Codex hooks:</p>
+<pre><code class="language-bash">/path/to/libra-governor install --agent codex
+</code></pre>
+<p>This writes <code>~/.codex/hooks.json</code> (or <code>$CODEX_HOME/hooks.json</code>) with:</p>
+<pre><code class="language-json">{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "/absolute/path/to/libra-governor codex-hook user-prompt-submit", "timeout": 15 }] }
+    ],
+    "PostToolUse": [
+      { "hooks": [{ "type": "command", "command": "/absolute/path/to/libra-governor codex-hook post-tool-use", "timeout": 15, "async": true }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "/absolute/path/to/libra-governor codex-hook stop", "timeout": 15 }] }
+    ]
+  }
+}
+</code></pre>
+<p>The hook groups live under a top-level <code>"hooks"</code> key — Codex’s own
+top-level schema only accepts <code>"description"</code>/<code>"hooks"</code> as top-level
+fields and rejects (fails open — every hook silently disabled, no error
+surfaced to the user) any other top-level key. Verified by running a
+real local Codex CLI install; see the ADR.</p>
+<p>Every hook gets a 15-second timeout (not Codex’s own 600s default) so a
+wedged daemon cannot hang a prompt for ten minutes; <code>PostToolUse</code> also
+gets <code>"async": true</code> since it prints nothing and must never add
+perceptible latency to a tool call.</p>
+<h3 id="the-hooks-trust-step--required-not-optional"><a class="header" href="#the-hooks-trust-step--required-not-optional">The <code>/hooks</code> trust step — required, not optional</a></h3>
+<p><strong>Writing <code>hooks.json</code> is not enough for Codex to actually run these
+hooks.</strong> <code>[hooks.state]</code> in <code>~/.codex/config.toml</code> gates whether a
+configured hook fires at all, and trust is recorded by content hash.
+After <code>install --agent codex</code>:</p>
+<ol>
+<li>Open Codex.</li>
+<li>Run <code>/hooks</code> inside Codex and trust the three <code>libra-governor</code> hooks.</li>
+<li>If you later move or rebuild the binary, its content hash changes —
+you must re-trust it the same way.</li>
+</ol>
+<p><code>libra-governor doctor</code> flags a binary-path mismatch (a strong signal
+you moved the binary and forgot to re-trust) but cannot itself detect
+whether <code>/hooks</code> trust was granted — see “Trust gate” below for why.</p>
+<p>No further daemon configuration is required to get today’s defaults —
+see the <a href="claude-code.html#configuring-the-daemon-configjson">Claude Code README’s “Configuring the daemon
+(<code>config.json</code>)”</a>
+section, which is agent-agnostic (the daemon has no idea which agent
+sent a request).</p>
+<h2 id="trust-gate--doctors-honesty-limits"><a class="header" href="#trust-gate--doctors-honesty-limits">Trust gate — <code>doctor</code>’s honesty limits</a></h2>
+<p><code>libra-governor doctor</code> reads <code>~/.codex/config.toml</code> as plain text — no
+TOML parser dependency was added (none existed anywhere in this
+workspace before HORO-1157, and this ticket’s scope explicitly avoids
+adding one). It reports exactly three states, deliberately conservative:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>State</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>hooks disabled in Codex config</code></td><td>A literal <code>[features]</code> section with <code>hooks = false</code> was found — unambiguous regardless of TOML nesting/quoting subtleties.</td></tr>
+<tr><td><code>likely not yet trusted</code></td><td>No <code>[hooks.state]</code> section header exists anywhere in the file — Codex has nowhere else to record trust, so this is reasonably strong evidence <code>/hooks</code> has not been run.</td></tr>
+<tr><td><code>unknown</code></td><td>Either <code>config.toml</code> could not be read, or a <code>[hooks.state]</code> section does exist but this doctor does not know its real key shape (unverified — see the ADR) and makes no claim about what is trusted inside it.</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>doctor</code> <strong>never</strong> reports “trusted” — that would require parsing
+<code>[hooks.state]</code>’s real shape, which was not verified during HORO-1157.
+Verify trust yourself with <code>/hooks</code> inside Codex, or use the
+authoritative command below.</p>
+<h2 id="doctor---verify-trust--codexs-own-authoritative-answer-horo-1906"><a class="header" href="#doctor---verify-trust--codexs-own-authoritative-answer-horo-1906"><code>doctor --verify-trust</code> — Codex’s own authoritative answer (HORO-1906)</a></h2>
+<p><code>libra-governor doctor --verify-trust [--json]</code> replaces the local,
+conservative hedge above with Codex’s <strong>own</strong> live answer, per ADR-0015
+(<code>horonomy/internal-docs</code>,
+<code>docs/engineering/adr-0015-cross-product-host-trust-resolution.md</code>,
+Option A). Unlike plain <code>doctor</code>, this
+command is an explicit, operator-invoked action that starts Codex’s
+<code>app-server</code> process (against your real <code>$CODEX_HOME</code>, never a synthetic
+one), calls its <code>hooks/list</code> RPC, and reports each installed hook’s real
+<code>currentHash</code>/<code>trustStatus</code> straight from Codex — not a guess.</p>
+<p><code>--help</code> lists it, but it never runs implicitly: plain <code>doctor</code> and every
+other passive/inspection surface leave it alone, and <code>app-server</code> is only
+started when you type this exact subcommand.</p>
+<p>Fail-closed: if <code>app-server</code> is unreachable, the RPC times out, the
+response is malformed, or a hook wired in <code>hooks.json</code> is absent from
+Codex’s response (orphaned entry), that hook is reported <code>unknown</code> —
+never silently reported as trusted.</p>
+<p>Known side effect, not introduced by this command: starting Codex’s
+<code>app-server</code> performs Codex’s own first-run initialization (SQLite state
+files, an <code>installation_id</code>) the very first time it runs against a given
+<code>$CODEX_HOME</code>. On an already-initialized <code>~/.codex</code> (the normal case for
+anyone who has used Codex before), repeated runs were observed to touch
+only an internal operational log file — not <code>auth.json</code> — across ten
+consecutive real local round trips measured during this ticket’s own
+evidence-gathering.</p>
+<h2 id="capability-tiers"><a class="header" href="#capability-tiers">Capability tiers</a></h2>
+<p><code>libra-governor agents --json</code> is the source of truth; a summary:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Capability</th><th>Codex</th></tr>
+</thead>
+<tbody>
+<tr><td>Preflight gate, tool observation, completion receipt, inline explanation channel</td><td>Available — same hook shapes as Claude Code</td></tr>
+<tr><td>Tool gate (hard pre-tool-call refusal)</td><td>Unavailable for Codex — Codex hooks are advisory (in v0.0.4 they never block or send a budget request). Claude Code’s <code>PreToolUse</code> can deny, but only for local monthly budget decisions when <code>shared-budget.json</code> exists; the gateway is the other hard-enforcement point (ADR 0003)</td></tr>
+<tr><td>Model event observation (token/cost/provider per request)</td><td>Unavailable — no hook payload on either agent exposes this</td></tr>
+<tr><td>Model gateway / hard budget enforcement</td><td><strong>Unavailable — incompatible wire format.</strong> Codex’s custom model provider only supports <code>wire_api: "responses"</code> (<code>POST /v1/responses</code>); the gateway only speaks Anthropic’s <code>POST /v1/messages</code>. Not a scoping choice — a real incompatibility.</td></tr>
+<tr><td>Persistent status surface (statusline)</td><td>Unavailable — verified absent from Codex’s config schema at any level</td></tr>
+<tr><td>Session/subagent lifecycle, interruption signal, MCP explain surface</td><td>Unavailable — Codex exposes the underlying hook/MCP primitives, but this integration does not wire any of them to a daemon action yet (see non-goals below)</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="explicit-non-goals-for-this-integration"><a class="header" href="#explicit-non-goals-for-this-integration">Explicit non-goals for this integration</a></h2>
+<ul>
+<li><strong>No gateway/enforcement path for Codex</strong> — the <code>responses</code> vs.
+<code>messages</code> wire-format incompatibility above is a real blocker, not an
+oversight.</li>
+<li><strong>No statusline equivalent</strong> — verified absent from Codex’s config
+schema.</li>
+<li><strong>No <code>PreToolUse</code> hard-gating for Codex</strong> — Codex hooks stay advisory. Claude
+Code’s hooks are advisory too, except the optional local monthly budget
+(<code>UserPromptSubmit</code> block, <code>PreToolUse</code> deny, only when <code>shared-budget.json</code>
+exists).</li>
+<li><strong>No MCP explain/query surface</strong> — Codex supports MCP as a client
+(<code>mcp_servers.&lt;id&gt;</code> stdio config), but <code>ARCHITECTURE.md</code> forbids MCP as
+an enforcement boundary regardless, and no explain surface is wired for
+either agent yet.</li>
+<li><strong>No <code>SessionStart</code>/<code>SessionEnd</code>/<code>SubagentStart</code>/<code>SubagentStop</code>/
+<code>Interrupt</code>/<code>PreCompact</code>/<code>PostCompact</code> daemon wiring</strong> — each needs new
+protocol variants and ledger semantics nobody has specified yet; these
+map to <code>NormalizedEvent::RecognizedUnwired</code> only when they occur.</li>
+</ul>
+<h2 id="platforms"><a class="header" href="#platforms">Platforms</a></h2>
+<p>The only supported and verified platform is Apple Silicon (aarch64) macOS
+(the v0.0.4 Cooperative Preview). No platform check was found in the source, so
+other platforms are not blocked, but Linux, Intel macOS and Windows are unsupported and
+unverified, including for Codex.</p>
+<h2 id="uninstall"><a class="header" href="#uninstall">Uninstall</a></h2>
+<pre><code class="language-bash">libra-governor uninstall --agent codex --yes
+</code></pre>
+<p>Removes exactly the three Governor-owned hook groups from <code>hooks.json</code>
+(any foreign hook group survives byte-for-byte), then — with the same
+confirmation discipline as the Claude Code path — the shared state
+directory. See the root <a href="developer-preview.html#uninstall"><code>README.md</code></a> for the
+full safety guarantees, which are agent-agnostic.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="claude-code.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="statusline.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="claude-code.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="statusline.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-c2a407aa.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

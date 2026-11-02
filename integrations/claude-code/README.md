@@ -744,7 +744,7 @@ observed; the evidence is `TestOwnedLive`.
   stopped talking. Future scope.
 - No hard budget enforcement *through the hooks*. The hooks are
   advisory, with one precisely-scoped exception: the local monthly shared
-  budget (see the section below). Only when `<state_dir>/shared-budget.json`
+  budget (see the "Local monthly shared budget" section above). Only when `<state_dir>/shared-budget.json`
   exists may `UserPromptSubmit` emit `{"decision": "block", ...}` and
   `PreToolUse` emit a `deny`, and only for budget decisions. `PostToolUse`
   and `Stop` never block, and no hook ever blocks for any other reason.
