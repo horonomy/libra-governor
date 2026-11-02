@@ -542,9 +542,10 @@ Advisory behavior never unexpectedly blocks an existing Claude Code
 workflow: with no `shared-budget.json`, every hook is advisory-only (no
 `{"decision": "block", ...}` is emitted). The one exception is the optional
 local monthly budget: once you create `shared-budget.json`, `UserPromptSubmit`
-refuses a prompt (and `PreToolUse` can deny a tool call) when the pool is
-exhausted, the budget file is invalid, a clock anomaly is flagged, or the daemon
-cannot be reached; no other hook blocks — see
+refuses a prompt when the pool is exhausted, the budget file is invalid, a clock
+anomaly is flagged, or the daemon cannot be reached. `PreToolUse` denies a tool
+call only on those explicit budget decisions (exhausted, invalid, clock
+anomaly); with the daemon down it allows the call. No other hook blocks — see
 [`integrations/claude-code/README.md`](integrations/claude-code/README.md#what-this-integration-intentionally-does-not-do-yet),
 and hard enforcement requires you to deliberately configure and start
 the optional gateway with a compatible credential/provider
