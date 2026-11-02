@@ -28,8 +28,9 @@
 //! documents `turn_id`; both hosts document `agent_id` in subagent
 //! contexts. Missing values remain absent. A payload that is not a JSON
 //! object (e.g. an array, which serde's derived visitors would otherwise
-//! decode positionally) is refused by `normalize` as malformed -- the hook
-//! fails open, no identity is produced. Neither host documents a
+//! decode positionally) never reaches a decoder: `normalize` returns the
+//! identity-free event (no session, agent or turn), and the hook skips it
+//! exactly like any payload with no usable session. Neither host documents a
 //! `parent_agent_id` field, so captured lineage remains
 //! `LineageStatus::Unknown`; see `crates/cli/src/agent/identity.rs`.
 

@@ -1148,6 +1148,12 @@ fn settlement_ceiling_usd_cents(monthly_cap_usd_cents: u64) -> u64 {
         .max(PLAUSIBLE_TURN_FLOOR_USD_CENTS)
 }
 
+/// A figure equal to the ceiling is booked in full; only a strictly larger one
+/// is treated as implausible.
+fn exceeds_settlement_ceiling(cents: u64, ceiling: u64) -> bool {
+    cents > ceiling
+}
+
 /// `true` (and one content-free line in `<state dir>/daemon.log`, written
 /// through the daemon's own best-effort logger, so the amount that was not
 /// booked can be audited later) when `cents` is not a plausible single turn.
@@ -1160,7 +1166,7 @@ fn implausible_measurement(
         return false;
     };
     let ceiling = settlement_ceiling_usd_cents(cfg.monthly_cap_usd_cents);
-    if cents <= ceiling {
+    if !exceeds_settlement_ceiling(cents, ceiling) {
         return false;
     }
     if let Some(dir) = rt.loaded.path.as_deref().and_then(std::path::Path::parent) {
@@ -1189,6 +1195,24 @@ mod settlement_ceiling_tests {
             PLAUSIBLE_TURN_FLOOR_USD_CENTS
         );
         assert_eq!(settlement_ceiling_usd_cents(u64::MAX), u64::MAX);
+    }
+
+    /// HORO-2350 review: a figure exactly at the ceiling is recorded in full
+    /// and the first cent above it is not, for a cap whose ceiling is ten
+    /// months of budget and for one where the absolute floor applies.
+    #[test]
+    fn the_ceiling_itself_is_booked_and_one_cent_above_it_is_not() {
+        for cap in [100_000, 500] {
+            let ceiling = settlement_ceiling_usd_cents(cap);
+            assert!(!exceeds_settlement_ceiling(ceiling, ceiling), "cap {cap}");
+            assert!(
+                exceeds_settlement_ceiling(ceiling + 1, ceiling),
+                "cap {cap}"
+            );
+            assert!(!exceeds_settlement_ceiling(0, ceiling), "cap {cap}");
+        }
+        assert_eq!(settlement_ceiling_usd_cents(100_000), 1_000_000);
+        assert_eq!(settlement_ceiling_usd_cents(500), 100_000);
     }
 }
 
