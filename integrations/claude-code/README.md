@@ -200,9 +200,9 @@ external planner to remain registered or trusted.
 - `libra-governor install` / `libra-governor uninstall [--yes]` —
   `install` wires the six hooks and, only when the slot is free, the legacy
   statusline; `uninstall` removes those and also removes an
-  `env.ANTHROPIC_BASE_URL` / `apiKeyHelper` entry that points at this gateway
-  if you added one by hand (see "Enforcement gateway" below). Each run writes
-  a `settings.json.libra-backup-<ts>-<pid>` file and leaves a
+  `env.ANTHROPIC_BASE_URL` / `apiKeyHelper` entry whose base URL is a loopback address
+  if you added one by hand (see "Enforcement gateway" below). Each run that finds an
+  existing `settings.json` writes a `settings.json.libra-backup-<ts>-<pid>` file and leaves a
   `settings.json.horonom-write.lock` in place. Neither touches any other key
   in `~/.claude/settings.json` (HORO-1150). See the root
   [`README.md`](../../README.md#uninstall) for the exact safety

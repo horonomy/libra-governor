@@ -142,9 +142,9 @@ cp libra-governor-aarch64-apple-darwin/libra-governor ~/.local/bin/
   serving, then replace the binary at the path it already runs from (a source
   build lives in `~/.cargo/bin`; the `cp` target above is for a fresh install, and
   a different path leaves a second hook set). The ledger is migrated by the new
-  daemon on the next prompt; this was checked by the release QA with synthetic
-  ledgers built from the v0.0.1 and v0.0.2 migration files, not with a real
-  user ledger. There is no downgrade path: a v0.0.4 ledger is at schema v24 and
+  daemon on the next prompt; the producer's post-publication QA checked this with
+  synthetic ledgers built from the v0.0.1 and v0.0.2 migration files (not a real
+  user ledger, and not yet independently re-run). There is no downgrade path: a v0.0.4 ledger is at schema v24 and
   has not been tested against older binaries (`doctor` flags a ledger that is
   ahead of the binary).
 - **Uninstall / rollback**: see "Uninstall" below; the tarball binary is deleted
@@ -596,7 +596,7 @@ Removes exactly what this integration's own installer added:
    registration until you unregister it.
 3. Nothing else, except what `install` and `uninstall` leave behind in
    `~/.claude`: one `settings.json.libra-backup-<timestamp>-<pid>` file per
-   run and `settings.json.horonom-write.lock` (Libra's own write lock). Keep
+   run that finds an existing `settings.json`, and `settings.json.horonom-write.lock` (Libra's own write lock). Keep
    or delete the backups; the backup written by your first `install` is your
    byte-identical original (later backups contain already-wired content), and
    `install --agent codex` leaves `~/.codex/hooks.json.libra-backup-*` files in

@@ -8,7 +8,7 @@ copies under `site/`.
 The source installer remains `scripts/install.sh`. The site describes the
 published v0.0.4 Apple Silicon tarball (as the GitHub Release carries it) and
 source installation; it does not invent a hosted installer,
-hosted installer, account, API, or SaaS surface. Product maturity remains
+account, API, or SaaS surface. Product maturity remains
 Developer Preview.
 
 The shared public-surface checker is pinned by content checksum to the independently
