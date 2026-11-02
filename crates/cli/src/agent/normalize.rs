@@ -207,8 +207,8 @@ mod tests {
                 "null",
                 "true",
             ] {
-                let event = normalize(entry, raw)
-                    .unwrap_or_else(|e| panic!("{entry:?} {raw}: {e}"));
+                let event =
+                    normalize(entry, raw).unwrap_or_else(|e| panic!("{entry:?} {raw}: {e}"));
                 let (session, agent, turn) = match event {
                     NormalizedEvent::PromptSubmitted {
                         session_id,
