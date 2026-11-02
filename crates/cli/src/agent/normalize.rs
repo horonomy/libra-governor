@@ -199,7 +199,14 @@ mod tests {
             EntryPoint::ToolCompleted,
             EntryPoint::TurnCompleted,
         ] {
-            for raw in [r#"["s-1"]"#, r#""s-1""#, "42", "null", "true"] {
+            for raw in [
+                r#"["s-1"]"#,
+                r#"["s-1","/repo","fix it"]"#,
+                r#""s-1""#,
+                "42",
+                "null",
+                "true",
+            ] {
                 let event = normalize(entry, raw)
                     .unwrap_or_else(|e| panic!("{entry:?} {raw}: {e}"));
                 let (session, agent, turn) = match event {
@@ -426,23 +433,6 @@ mod tests {
             normalize(EntryPoint::ToolRequested, other).unwrap(),
             NormalizedEvent::Unrecognized { .. }
         ));
-    }
-
-    #[test]
-    fn a_non_object_payload_is_malformed_not_positionally_decoded() {
-        for entry in [
-            EntryPoint::PromptSubmit,
-            EntryPoint::ToolCompleted,
-            EntryPoint::TurnCompleted,
-        ] {
-            for raw in [r#"["s-1"]"#, r#"["s-1","/repo","fix it"]"#, r#""s-1""#, "7"] {
-                let err = normalize(entry, raw).unwrap_err();
-                assert!(
-                    matches!(err, NormalizeError::Malformed(_)),
-                    "{entry:?} {raw}"
-                );
-            }
-        }
     }
 
     #[test]

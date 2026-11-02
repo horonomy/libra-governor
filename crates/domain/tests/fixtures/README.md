@@ -30,4 +30,3 @@ All ten normalizer vectors match the reference. `claude-not-a-mapping` (payload 
 was a documented deviation until the HORO-2197 follow-up: a non-object payload
 now normalizes to the identity-free event (every identity field absent), and is
 still never decoded positionally into a session.
-

@@ -20,7 +20,7 @@
 //! normalizer vector.
 //!
 //! Every normalizer vector now matches the reference. `claude-not-a-mapping`
-//! (payload `["s-1"]`) was a justified deviation until HORO-2197 follow-up:
+//! (payload `["s-1"]`) was a justified deviation until the HORO-2197 conformance follow-up:
 //! `normalize` returns the identity-free event for a non-object payload
 //! instead of refusing it, so the envelope carries every identity field absent
 //! while the array is still never decoded positionally into a session.
