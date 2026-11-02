@@ -13,6 +13,8 @@
 //! function behaves exactly like the pre-HORO-1157 per-hook `serde_json`
 //! parse it replaces (see `crates/cli/tests/agent_contract.rs`).
 
+use std::path::PathBuf;
+
 use super::event::NormalizedEvent;
 use super::payload::{
     PromptSubmitPayload, ToolCompletedPayload, ToolRequestedPayload, TurnCompletedPayload,
@@ -65,17 +67,54 @@ fn native_session(session_id: Option<String>) -> Option<String> {
     session_id.filter(|s| !s.trim().is_empty())
 }
 
+/// The event for a payload that names no field at all: no session, no agent,
+/// no turn, and empty placeholders for the non-identity fields an event
+/// variant must carry.
+fn identity_free_event(entry: EntryPoint) -> NormalizedEvent {
+    match entry {
+        EntryPoint::PromptSubmit => NormalizedEvent::PromptSubmitted {
+            session_id: None,
+            cwd: PathBuf::new(),
+            prompt: String::new(),
+            turn_id: None,
+            agent_id: None,
+            prompt_id: None,
+        },
+        EntryPoint::ToolRequested => NormalizedEvent::ToolRequested {
+            session_id: None,
+            agent_id: None,
+        },
+        EntryPoint::ToolCompleted => NormalizedEvent::ToolCompleted {
+            session_id: None,
+            tool_name: String::new(),
+            native_call_id: None,
+            turn_id: None,
+            agent_id: None,
+        },
+        EntryPoint::TurnCompleted => NormalizedEvent::TurnCompleted {
+            session_id: None,
+            model: None,
+            turn_id: None,
+            agent_id: None,
+            prompt_id: None,
+            transcript_path: None,
+        },
+    }
+}
+
 /// Parses `raw` into a [`NormalizedEvent`] for `entry`. See module docs.
 pub fn normalize(entry: EntryPoint, raw: &str) -> Result<NormalizedEvent, NormalizeError> {
     let value: serde_json::Value = serde_json::from_str(raw)?;
     // serde's derived struct deserializers also accept a JSON array
     // positionally, so `["s-1"]` would otherwise decode as session `s-1`:
-    // an identity read out of a payload that names no field at all.
+    // an identity read out of a payload that names no field at all. A
+    // non-object therefore never reaches a decoder; it becomes the same
+    // identity-free event an object with no usable `session_id` produces,
+    // which is what the Host conformance vector `claude-not-a-mapping`
+    // expects (every identity field absent). Callers already treat a
+    // missing session as "skip".
     if !value.is_object() {
-        return Err(<serde_json::Error as serde::de::Error>::custom(
-            "hook payload must be a JSON object",
-        )
-        .into());
+        return Ok(identity_free_event(entry));
     }
     let hook_event_name = value.get("hook_event_name").and_then(|v| v.as_str());
 
@@ -150,6 +189,57 @@ mod tests {
     fn missing_required_field_is_a_returned_error_not_a_panic() {
         let err = normalize(EntryPoint::PromptSubmit, r#"{"session_id": "s"}"#).unwrap_err();
         assert!(matches!(err, NormalizeError::Malformed(_)));
+    }
+
+    #[test]
+    fn a_non_object_payload_names_no_session_at_any_entry_point() {
+        for entry in [
+            EntryPoint::PromptSubmit,
+            EntryPoint::ToolRequested,
+            EntryPoint::ToolCompleted,
+            EntryPoint::TurnCompleted,
+        ] {
+            for raw in [
+                r#"["s-1"]"#,
+                r#"["s-1","/repo","fix it"]"#,
+                r#""s-1""#,
+                "42",
+                "null",
+                "true",
+            ] {
+                let event =
+                    normalize(entry, raw).unwrap_or_else(|e| panic!("{entry:?} {raw}: {e}"));
+                let (session, agent, turn) = match event {
+                    NormalizedEvent::PromptSubmitted {
+                        session_id,
+                        agent_id,
+                        turn_id,
+                        ..
+                    }
+                    | NormalizedEvent::ToolCompleted {
+                        session_id,
+                        agent_id,
+                        turn_id,
+                        ..
+                    }
+                    | NormalizedEvent::TurnCompleted {
+                        session_id,
+                        agent_id,
+                        turn_id,
+                        ..
+                    } => (session_id, agent_id, turn_id),
+                    NormalizedEvent::ToolRequested {
+                        session_id,
+                        agent_id,
+                    } => (session_id, agent_id, None),
+                    other => panic!("{entry:?} {raw}: unexpected {other:?}"),
+                };
+                assert!(
+                    session.is_none() && agent.is_none() && turn.is_none(),
+                    "{entry:?} {raw}: an identity was read out of a non-object"
+                );
+            }
+        }
     }
 
     #[test]
@@ -343,23 +433,6 @@ mod tests {
             normalize(EntryPoint::ToolRequested, other).unwrap(),
             NormalizedEvent::Unrecognized { .. }
         ));
-    }
-
-    #[test]
-    fn a_non_object_payload_is_malformed_not_positionally_decoded() {
-        for entry in [
-            EntryPoint::PromptSubmit,
-            EntryPoint::ToolCompleted,
-            EntryPoint::TurnCompleted,
-        ] {
-            for raw in [r#"["s-1"]"#, r#"["s-1","/repo","fix it"]"#, r#""s-1""#, "7"] {
-                let err = normalize(entry, raw).unwrap_err();
-                assert!(
-                    matches!(err, NormalizeError::Malformed(_)),
-                    "{entry:?} {raw}"
-                );
-            }
-        }
     }
 
     #[test]
