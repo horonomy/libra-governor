@@ -198,9 +198,12 @@ external planner to remain registered or trusted.
   [`README.md`](../../README.md#diagnostics-libra-governor-doctor) for
   the full field-by-field explanation.
 - `libra-governor install` / `libra-governor uninstall [--yes]` —
-  wires/unwires exactly this integration's own hooks, statusline, and
-  (if present) the gateway's `env.ANTHROPIC_BASE_URL`/`apiKeyHelper`
-  entries described under "Setup" below, without touching any other key
+  `install` wires the six hooks and, only when the slot is free, the legacy
+  statusline; `uninstall` removes those and also removes an
+  `apiKeyHelper` entry that is Libra's own `gateway token` command and an
+  `env.ANTHROPIC_BASE_URL` whose host is a loopback address, if you added them by hand (see "Enforcement gateway" below). Each run that finds an
+  existing `settings.json` writes a `settings.json.libra-backup-<ts>-<pid>` file and leaves a
+  `settings.json.horonom-write.lock` in place. Neither touches any other key
   in `~/.claude/settings.json` (HORO-1150). See the root
   [`README.md`](../../README.md#uninstall) for the exact safety
   guarantees.
@@ -370,13 +373,14 @@ core function" rule applied elsewhere in this integration.
   },
   "gateway": {
     "bind_addr": "127.0.0.1:8787",
-    "token_path": "/absolute/path/to/state-dir/gateway_token",
+    "token_path": "/absolute/path/to/state-dir/gateway.token",
     "credential_mode": "pass_through_subscription"
   }
 }
 ```
 
-Both top-level tables are optional and independent — a file with only
+The top-level tables (`policy`, `gateway`, and the extension and launcher
+tables not described here) are optional and independent — a file with only
 `policy`, only `gateway`, or neither (`{}`) is valid.
 
 ### `policy`
@@ -402,7 +406,7 @@ Same fields as [`GatewayConfig`](../../crates/gateway/src/config.rs), in
 | Field | Required | Meaning |
 |---|---|---|
 | `bind_addr` | yes | Loopback address:port the gateway listens on, e.g. `"127.0.0.1:8787"`. Matches the `ANTHROPIC_BASE_URL` you point Claude Code at in step 2 of "Setup" below. |
-| `token_path` | yes | Where the daemon writes the local capability token `libra-governor gateway token` reads from. |
+| `token_path` | yes | Must equal `<state_dir>/gateway.token`: `libra-governor gateway token` always reads and creates that file whatever this setting says, so any other value makes `apiKeyHelper` print a token the gateway rejects. |
 | `credential_mode` | yes | `"governor_held"` or `"pass_through_subscription"` — see "Capability tiers" below for what each one can honestly claim. |
 | `credential_command` | only for `governor_held` | The program to run to fetch the real provider key (step 3 of "Setup" below) — e.g. `"security"`, `"op"`, `"pass"`. Its stdout is read directly into the credential; never written back to this file or any other config. |
 | `credential_args` | no (default `[]`) | Arguments to `credential_command`, e.g. `["read", "op://Private/Anthropic/api-key"]`. |
@@ -587,7 +591,8 @@ Code renders it, and two headers:
 ```
 x-libra-decision: budget_exceeded | task_unbound | unpriced_model | no_budget |
                   unenforceable_request | ambiguous_credential | host_mismatch |
-                  route_not_found | payload_too_large | overloaded
+                  route_not_found | payload_too_large | overloaded |
+                  unauthorized | upstream_unavailable
 x-libra-request-id: <uuid>
 ```
 
@@ -609,8 +614,9 @@ x-libra-request-id: <uuid>
   reason.
 - **A crash leaves the reservation to the TTL.** An in-flight request
   whose process dies leaves an `Active` reservation that
-  `expire_stale_reservations` reclaims after `gateway_reservation_ttl_secs`
-  (default 600s, shorter than the plan-level 900s).
+  `expire_stale_reservations` reclaims after the gateway reservation TTL
+  (`GatewayConfig.reservation_ttl_secs`, 600s, not settable from
+  `config.json`; the plan-level reservation TTL is 900s).
 
 ### What the gateway intentionally does not do
 
@@ -628,8 +634,8 @@ x-libra-request-id: <uuid>
   guarantees.
 - **No live pricing.** `PRICING_VERSION` names a pinned static snapshot
   recorded on every reservation and provenance row. When prices change it
-  is stale until updated; a `pricing_overrides` config field is the
-  escape hatch.
+  is stale until updated; the gateway's `config.json` has no price override
+  (unknown keys, including `pricing_overrides`, are ignored without an error).
 - **No body or header logging, at any level, ever.** There is no debug
   dump switch, and the `gateway_requests` table has no column that could
   hold one.
@@ -644,8 +650,8 @@ x-libra-request-id: <uuid>
 ### Known limitation: the session-binding header is unverified
 
 The gateway attributes a request to a task via a session-id header —
-`x-claude-code-session-id` by default, configurable via
-`DaemonConfig.gateway_session_header`. A request carrying no such header
+`x-claude-code-session-id`; the header name is fixed in this release (there
+is no `config.json` key, flag or environment variable for it). A request carrying no such header
 is refused `403 task_unbound`, because charging it to whichever task
 happens to be around would be worse than refusing it.
 
@@ -653,9 +659,9 @@ happens to be around would be worse than refusing it.
 requests has not been verified against live provider traffic** — the
 integration tests drive a local fake upstream, by design (no real
 credential and no live API call exists anywhere in this repository). If
-your Claude Code build sends a different header, set
-`gateway_session_header` to match; if it sends none, the gateway will
-refuse every metered request rather than mis-attribute one. This is the
+your Claude Code build sends a different header or none, the gateway will
+refuse every metered request with `403 task_unbound` rather than
+mis-attribute one. This is the
 one part of the setup above that a real end-to-end smoke test is needed
 to confirm.
 
@@ -725,8 +731,10 @@ flagged settlements, clock anomaly), the legacy statusline appends a short
 `budget $12.30/$500 (3%)` segment only while a budget file exists, and
 `doctor` checks the file, all six hooks, daemon reachability, clock anomaly
 and flagged settlements (HORO-2217, ADR-0026 S8). Not built: the gateway
-hard cap (S11), remote upload, and any real-host evidence. No real Claude
-Code host has run these installed hooks yet; the evidence is `TestOwnedLive`.
+hard cap (S11), remote upload, and any real-provider evidence. The real
+Claude Code 2.1.306 binary was driven interactively against these hooks and a
+fake loopback upstream, but no real provider traffic, billing or latency has been
+observed; the evidence is `TestOwnedLive`.
 
 ## What this integration intentionally does not do (yet)
 
@@ -736,7 +744,7 @@ Code host has run these installed hooks yet; the evidence is `TestOwnedLive`.
   stopped talking. Future scope.
 - No hard budget enforcement *through the hooks*. The hooks are
   advisory, with one precisely-scoped exception: the local monthly shared
-  budget (see the next section). Only when `<state_dir>/shared-budget.json`
+  budget (see the "Local monthly shared budget" section above). Only when `<state_dir>/shared-budget.json`
   exists may `UserPromptSubmit` emit `{"decision": "block", ...}` and
   `PreToolUse` emit a `deny`, and only for budget decisions. `PostToolUse`
   and `Stop` never block, and no hook ever blocks for any other reason.

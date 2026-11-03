@@ -204,7 +204,7 @@ ticket, and it will not happen silently.
 | Symptom | Cause | Fix |
 |---|---|---|
 | The Libra segment is absent entirely | The provider is not registered with the host, or the host is not in the slot | The host's `doctor` reports which; it is read-only and safe to run |
-| The segment says the state could not be read | The daemon is not running — the provider never spawns one by design | Submit a prompt; `hook user-prompt-submit` spawns it on demand |
+| The Libra segment reads `Not running` (reason `daemon_unreachable`) | The daemon is not running — the provider never spawns one by design | Submit a prompt; `hook user-prompt-submit` spawns it on demand |
 | A `Running policy ...` segment appeared | You edited `config.json` after the daemon started, so the edit has not taken effect | `pkill -f "libra-governor daemon run"`; the next hook invocation respawns it |
 | The estimate says no local history yet | A genuine cold start — the estimator has no comparable local receipts | Nothing to fix; it resolves as receipts accumulate. `statusline explain` names the basis it did use |
 | No confidence is shown beside the estimate | There is no P90 to be confident *in* | Expected: a confidence attached to an absent number would read as a verdict on the task |

@@ -5,9 +5,10 @@ artifact is `build/site`. Documentation chapters are rendered from the existing
 product-owned Markdown listed in `tools/build_site.py`; do not maintain parallel
 copies under `site/`.
 
-The source installer remains `scripts/install.sh`. The site describes source
-installation and links to that script; it does not invent a release binary,
-hosted installer, account, API, or SaaS surface. Product maturity remains
+The source installer remains `scripts/install.sh`. The site describes the
+published v0.0.4 Apple Silicon tarball (as the GitHub Release carries it) and
+source installation; it does not invent a hosted installer,
+account, API, or SaaS surface. Product maturity remains
 Developer Preview.
 
 The shared public-surface checker is pinned by content checksum to the independently
@@ -20,7 +21,7 @@ independently reviewed upstream revision.
 Source preparation and merge do not authorize publication. Before creating a
 Pages deployment or attaching DNS, resolve HORO-1701's experimental/public-preview
 release-contract decision with the product owner. Keep Developer Preview maturity;
-the existing public release is v0.0.2, and Team Alpha remains outside this surface.
+the latest published release is v0.0.4 (Cooperative Preview, a prerelease), and Team Alpha remains outside this surface.
 
 Build and validate the artifact before deployment. Reuse the established static
 Cloudflare Pages pattern and attach only `libra.horonom.com`; Libra is local-first,
