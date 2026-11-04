@@ -84,12 +84,13 @@ pub struct PricingTable {
 /// Prices are US dollars per million tokens, transcribed from Anthropic's
 /// published list price as of the date in [`PRICING_VERSION`]. They are a
 /// static record, not a live quote — see this module's docs. Model ids
-/// are matched by *prefix* (see [`PricingTable::lookup`]) so a dated
-/// release suffix does not silently fall off the table.
+/// are matched exactly or with a dated `-YYYYMMDD` snapshot suffix (see
+/// [`PricingTable::lookup`]), so a dated release does not silently fall off the
+/// table and a newer sibling id is never priced at an older entry.
 const PINNED: &[(&str, ModelPricing)] = &[
     // Current generation (HORO-2192). `cache_creation_input_usd_per_mtok` is
     // the 5-minute cache-write price; the 1-hour tier (2x base input) is not
-    // modelled by `ModelPricing`. Longest-prefix matching keeps e.g.
+    // modelled by `ModelPricing`. Exact/dated matching keeps e.g.
     // `claude-opus-5-5` from falling to `claude-opus-5`.
     // Fable 5.1 and Opus/Sonnet 5.5 have a discounted cache-read multiplier
     // (0.025x and 0.05x of base input respectively) per the pricing page.
@@ -298,15 +299,20 @@ impl PricingTable {
             .count()
     }
 
-    /// Looks up `model`, preferring an exact match and otherwise falling
-    /// back to the longest entry that is a prefix of it.
+    /// Looks up `model`: an exact match, otherwise the longest entry `model`
+    /// extends by a dated-snapshot suffix only.
     ///
     /// Provider model ids carry a dated release suffix
     /// (`claude-sonnet-4-5-20260929`) that changes without the price
-    /// changing. Exact-match-only would drop every such id off the table
-    /// and refuse real traffic as "unpriced"; longest-prefix keeps the
-    /// entry matched while still letting a more specific entry
-    /// (`claude-opus-4-1` over `claude-opus-4`) win.
+    /// changing, so exact-match-only would refuse real traffic as
+    /// "unpriced". But a *plain* string prefix is not safe (HORO-2366): a
+    /// newer sibling such as `claude-opus-5-6` or `gpt-6.1-sol-pro` shares
+    /// the prefix of a listed id and is not guaranteed to share its price,
+    /// so it used to be silently priced at the older entry. The remainder
+    /// after a listed id must therefore be empty or exactly `-` followed by
+    /// eight ASCII digits (a `YYYYMMDD` date); anything else is unpriced.
+    /// The longest such entry still wins (`claude-opus-4-1` over
+    /// `claude-opus-4`), and overrides follow the same rule.
     ///
     /// Returns `None` when nothing matches — the caller must then refuse,
     /// never guess. See [`crate::cost::worst_case_reservation`].
@@ -316,10 +322,20 @@ impl PricingTable {
         }
         self.entries
             .iter()
-            .filter(|(key, _)| model.starts_with(key.as_str()))
+            .filter(|(key, _)| {
+                model
+                    .strip_prefix(key.as_str())
+                    .is_some_and(is_dated_snapshot_suffix)
+            })
             .max_by_key(|(key, _)| key.len())
             .map(|(_, pricing)| *pricing)
     }
+}
+
+/// `-YYYYMMDD`: a dash then exactly eight ASCII digits, nothing else.
+fn is_dated_snapshot_suffix(rest: &str) -> bool {
+    rest.strip_prefix('-')
+        .is_some_and(|d| d.len() == 8 && d.bytes().all(|b| b.is_ascii_digit()))
 }
 
 #[cfg(test)]
@@ -491,6 +507,51 @@ mod tests {
     #[test]
     fn pricing_version_names_this_snapshot() {
         assert_eq!(PRICING_VERSION, "pricing-2026-10-static-v2");
+    }
+
+    // ---- HORO-2366: a variant is never priced at the older entry ----
+
+    #[test]
+    fn a_newer_variant_sharing_a_listed_prefix_is_unpriced_not_priced_at_the_older_entry() {
+        let table = PricingTable::pinned();
+        // `claude-opus-5` is a listed id and a string prefix of both.
+        assert_eq!(table.lookup("claude-opus-5-6"), None);
+        assert_eq!(table.lookup("claude-opus-5-5-pro"), None);
+        assert_eq!(table.lookup("claude-sonnet-4-5-latest"), None);
+        // Nor does a date-shaped but wrong-length suffix count.
+        assert_eq!(table.lookup("claude-opus-5-5-2026"), None);
+        assert_eq!(table.lookup("claude-opus-5-5-202610245"), None);
+        assert_eq!(table.lookup("claude-opus-5-5-2026102x"), None);
+    }
+
+    #[test]
+    fn a_dated_snapshot_still_resolves_to_the_longest_exact_entry() {
+        let table = PricingTable::pinned();
+        let dated = table.lookup("claude-opus-5-5-20261024").unwrap();
+        assert_eq!(dated.input_usd_per_mtok, 4.0);
+        assert_eq!(dated, table.lookup("claude-opus-5-5").unwrap());
+        assert_eq!(
+            table
+                .lookup("claude-opus-4-1-20260805")
+                .unwrap()
+                .output_usd_per_mtok,
+            75.0
+        );
+    }
+
+    #[test]
+    fn an_override_matches_exactly_or_by_dated_snapshot_only() {
+        let price = ModelPricing {
+            input_usd_per_mtok: 9.0,
+            cache_creation_input_usd_per_mtok: 9.0,
+            cache_read_input_usd_per_mtok: 0.9,
+            output_usd_per_mtok: 90.0,
+        };
+        let table =
+            PricingTable::with_overrides(BTreeMap::from([("custom-model".to_string(), price)]));
+        assert_eq!(table.lookup("custom-model"), Some(price));
+        assert_eq!(table.lookup("custom-model-20261101"), Some(price));
+        assert_eq!(table.lookup("custom-model-mini"), None);
     }
 
     #[test]
