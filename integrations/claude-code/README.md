@@ -679,7 +679,8 @@ budget gate (its hook route is unchanged).
 |---|---|---|
 | `UserPromptSubmit` | absent | unchanged |
 | `UserPromptSubmit` | present, daemon allows / `not_configured` | unchanged Preflight output; over a soft limit, one short warning line is appended to `additionalContext` (never blocks) |
-| `UserPromptSubmit` | present, `cap_exhausted` / `config_invalid` / `clock_anomaly` / refused identity | `{"decision":"block","reason":"..."}`, exit 0, Preflight is **not** called |
+| `UserPromptSubmit` | present, `cap_exhausted` / `config_invalid` / `clock_anomaly` | `{"decision":"block","reason":"..."}`, exit 0, Preflight is **not** called |
+| `UserPromptSubmit` | present, the daemon refuses the host-supplied identity | no budget decision: the prompt proceeds and is never blocked for an identity refusal (also in v0.0.4) |
 | `UserPromptSubmit` | present, daemon unreachable (after the existing autospawn attempt, or immediately with `LIBRA_GOVERNOR_NO_AUTOSPAWN=1`) or no answer within the client timeout | block: `budget enforcement unavailable: daemon unreachable` |
 | `PreToolUse` (`hook pre-tool-use`, no matcher = every tool) | absent | empty output, the daemon is not contacted |
 | `PreToolUse` | present, budget exhausted / `config_invalid` / `clock_anomaly` | `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"..."}}`, exit 0 |
