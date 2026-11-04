@@ -149,7 +149,9 @@ across `compact`/`fork`/`resume`.
 
 ## Setup
 
-Build the binary the same way as for Claude Code:
+Use the same binary as for Claude Code. For the published v0.0.4 Apple Silicon
+tarball see the root README's "Install the v0.0.4 tarball" section (Codex
+accounting is not part of v0.0.4); or build from source:
 
 ```bash
 cargo build --release -p libra-governor-cli

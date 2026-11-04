@@ -216,7 +216,8 @@ to version 4 in HORO-1139 for the replan-visibility fields on
 `PreflightResult`'s `admission`/`completion_reserve` and the receipt's
 reservation evidence, to version 6 in HORO-1144 for the `GatewayStatus`
 request/response, and to version 7 in HORO-1150 for the `Doctor`
-request/response — see that crate's `lib.rs` docs for the upgrade
+request/response, and has been bumped many times since (v0.0.4 reports protocol
+v24 in `doctor`) — see that crate's `lib.rs` docs for the upgrade
 caveat: a long-lived daemon on an older protocol version must be
 restarted, it will not understand a newer client's request variants;
 `libra-governor doctor` itself surfaces this as a plain error finding
