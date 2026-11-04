@@ -274,8 +274,13 @@ When enrolled:
 - Run the daemon and the CLI from the same release; a daemon built before the
   Codex hooks leaves an enrolled install ungated until it is restarted.
 - Support was derived from reading Codex source at 0.160, 0.163, 0.164 and
-  0.165 and from synthetic fixtures. It has not been run against a real Codex
-  host or provider. Setup: `integrations/codex/README.md`.
+  0.165 and from synthetic fixtures. It was then run against one real Codex
+  host (codex-cli 0.163.0, a few trivial turns in an isolated QA home):
+  trusted hooks fire, a turn is admitted and settled from measured rollout
+  usage, the block decision is honoured, untrusted hooks are skipped silently,
+  and a resumed session is booked once per turn. Interrupt, compact and fork
+  behavior, other Codex versions and provider billing were not run. Setup:
+  `integrations/codex/README.md`.
 
 **Where to look.** `libra-governor shared-budget status` (add `--json`),
 the `shared_budget_*` checks in `libra-governor doctor`, and a `budget $x/$y`
