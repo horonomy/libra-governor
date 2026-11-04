@@ -132,6 +132,70 @@ pub const CANNED_SSE_OVER_BOUND: &str = concat!(
     "data: {\"type\":\"message_stop\"}\n\n",
 );
 
+/// Only the `message_start` frame: the provider has committed to the
+/// request and reported the input side, and nothing has been generated yet.
+pub const SSE_MESSAGE_START: &str = concat!(
+    "event: message_start\n",
+    r#"data: {"type":"message_start","message":{"id":"msg_fake","usage":{"input_tokens":120,"output_tokens":1}}}"#,
+    "\n\n",
+);
+
+/// A `message_delta` carrying a cumulative `output_tokens` figure.
+pub fn sse_delta(output_tokens: u64) -> String {
+    format!(
+        "event: message_delta\ndata: {{\"type\":\"message_delta\",\"usage\":{{\"output_tokens\":{output_tokens}}}}}\n\n"
+    )
+}
+
+/// One step of a scripted streaming response body.
+pub enum Step {
+    Chunk(String),
+    Sleep(u64),
+    /// Fail the body, as a connection reset mid-stream would.
+    Abort,
+    /// Never send another byte and never close, until the test ends.
+    Hold,
+}
+
+/// A streaming body that plays `steps` in order, then ends with a clean EOF
+/// unless a step aborted or held it.
+fn scripted_body(steps: Vec<Step>) -> BoxBody<Bytes, std::io::Error> {
+    let (mut sender, channel) = http_body_util::channel::Channel::<Bytes, std::io::Error>::new(8);
+    tokio::spawn(async move {
+        for step in steps {
+            match step {
+                Step::Chunk(text) => {
+                    if sender
+                        .send(hyper::body::Frame::data(Bytes::from(text)))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Step::Sleep(ms) => tokio::time::sleep(std::time::Duration::from_millis(ms)).await,
+                Step::Abort => {
+                    sender.abort(std::io::Error::other("upstream reset"));
+                    return;
+                }
+                Step::Hold => {
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                    return;
+                }
+            }
+        }
+    });
+    channel.boxed()
+}
+
+fn sse_response(body: BoxBody<Bytes, std::io::Error>) -> Response<BoxBody<Bytes, std::io::Error>> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .body(body)
+        .unwrap()
+}
+
 fn body(bytes: impl Into<Bytes>) -> BoxBody<Bytes, std::io::Error> {
     Full::new(bytes.into())
         .map_err(|never| match never {})
@@ -231,6 +295,33 @@ async fn serve_one(
             .header("content-type", "text/event-stream")
             .body(body(CANNED_SSE_TRUNCATED))
             .unwrap(),
+        // Provider reported the input side, then the connection reset.
+        "cut_after_start" => sse_response(scripted_body(vec![
+            Step::Chunk(SSE_MESSAGE_START.to_string()),
+            Step::Abort,
+        ])),
+        // Provider reported 250 output tokens so far, then the connection reset.
+        "cut_mid_output" => sse_response(scripted_body(vec![
+            Step::Chunk(SSE_MESSAGE_START.to_string()),
+            Step::Chunk(sse_delta(40)),
+            Step::Chunk(sse_delta(250)),
+            Step::Abort,
+        ])),
+        // Slow enough that a client hang-up is noticed before the next frame.
+        "slow_stream" => sse_response(scripted_body(vec![
+            Step::Chunk(SSE_MESSAGE_START.to_string()),
+            Step::Sleep(600),
+            Step::Chunk(sse_delta(17)),
+            Step::Sleep(600),
+            Step::Chunk(sse_delta(40)),
+            Step::Sleep(600),
+            Step::Chunk("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string()),
+        ])),
+        // Reports the input side and then goes silent without closing.
+        "stall_after_start" => sse_response(scripted_body(vec![
+            Step::Chunk(SSE_MESSAGE_START.to_string()),
+            Step::Hold,
+        ])),
         "over_bound" => Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/event-stream")
