@@ -175,6 +175,9 @@ fn scripted_body(steps: Vec<Step>) -> BoxBody<Bytes, std::io::Error> {
                 }
                 Step::Sleep(ms) => tokio::time::sleep(std::time::Duration::from_millis(ms)).await,
                 Step::Abort => {
+                    // `Channel` yields a pending abort before any frame
+                    // still queued, so let the queued frames drain first.
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                     sender.abort(std::io::Error::other("upstream reset"));
                     return;
                 }
