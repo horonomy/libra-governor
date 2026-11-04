@@ -99,6 +99,66 @@ type AccountRow = (
     Option<String>, // closed_at
 );
 
+/// Wire form of [`libra_governor_domain::LineageStatus`] in
+/// `resource_accounts.provider_lineage_status`.
+fn lineage_to_str(status: libra_governor_domain::LineageStatus) -> &'static str {
+    use libra_governor_domain::LineageStatus;
+    match status {
+        LineageStatus::Root => "root",
+        LineageStatus::Child => "child",
+        LineageStatus::Unknown => "unknown",
+    }
+}
+
+/// Inverse of [`lineage_to_str`]. A NULL column (a legacy row) or an
+/// unrecognized value is `None`: not recorded, never guessed.
+fn lineage_from_str(raw: &str) -> Option<libra_governor_domain::LineageStatus> {
+    use libra_governor_domain::LineageStatus;
+    match raw {
+        "root" => Some(LineageStatus::Root),
+        "child" => Some(LineageStatus::Child),
+        "unknown" => Some(LineageStatus::Unknown),
+        _ => None,
+    }
+}
+
+/// The identity-dimension columns written on a new account row
+/// (HORO-2191 AC2).
+pub(crate) struct IdentityColumns {
+    pub(crate) lineage: &'static str,
+    pub(crate) dimension_key_json: Option<String>,
+}
+
+/// With no captured identity the lineage is the literal `unknown` (so a
+/// new row is distinguishable from a legacy row's NULL) and no dimension
+/// key is stored. With one, lineage is the provider-reported status and
+/// the key is [`libra_governor_domain::ExecutionIdentity::cache_key`] at
+/// the narrowest scope the identity proves, serialized as a
+/// [`libra_governor_domain::DimensionKey`].
+pub(crate) fn identity_columns(
+    identity: Option<&libra_governor_domain::ExecutionIdentity>,
+) -> Result<IdentityColumns, LedgerError> {
+    use libra_governor_domain::{DimensionKey, Scope};
+    let Some(identity) = identity else {
+        return Ok(IdentityColumns {
+            lineage: lineage_to_str(libra_governor_domain::LineageStatus::Unknown),
+            dimension_key_json: None,
+        });
+    };
+    let key = [Scope::TurnTask, Scope::Agent, Scope::Session, Scope::Host]
+        .into_iter()
+        .find_map(|scope| identity.cache_key(scope).ok())
+        .map(DimensionKey);
+    let dimension_key_json = key
+        .map(|k| serde_json::to_string(&k))
+        .transpose()
+        .map_err(|e| LedgerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
+    Ok(IdentityColumns {
+        lineage: lineage_to_str(identity.lineage_status()),
+        dimension_key_json,
+    })
+}
+
 fn row_to_account(row: AccountRow) -> Result<ResourceAccount, LedgerError> {
     let (
         account_id,
@@ -138,7 +198,9 @@ fn row_to_account(row: AccountRow) -> Result<ResourceAccount, LedgerError> {
             .map(|s| AllocationAuthority::parse(&s).ok_or_else(invalid))
             .transpose()?,
         enforcement_scope: EnforcementScope::parse(&enforcement_scope).ok_or_else(invalid)?,
-        provider_lineage_status: None, // never reconstructed from storage alone — see module docs; populated only at write time by a real ExecutionIdentity in a later ticket.
+        provider_lineage_status: provider_lineage_status
+            .as_deref()
+            .and_then(lineage_from_str),
         execution_dimension_key_json,
         provenance: AccountProvenance::parse(&provenance).ok_or_else(invalid)?,
         account_schema_version,
@@ -146,15 +208,6 @@ fn row_to_account(row: AccountRow) -> Result<ResourceAccount, LedgerError> {
         created_at: parse_time(&created_at)?,
         updated_at: parse_time(&updated_at)?,
         closed_at: closed_at.map(|s| parse_time(&s)).transpose()?,
-    })
-    .map(|mut a: ResourceAccount| {
-        a.provider_lineage_status = provider_lineage_status.as_deref().and_then(|s| match s {
-            "root" => Some(libra_governor_domain::LineageStatus::Root),
-            "child" => Some(libra_governor_domain::LineageStatus::Child),
-            "unknown" => Some(libra_governor_domain::LineageStatus::Unknown),
-            _ => None,
-        });
-        a
     })
 }
 
@@ -222,6 +275,20 @@ impl LedgerStore {
         resource_kind: ResourceKind,
         now: OffsetDateTime,
     ) -> Result<EnsureAccountOutcome, LedgerError> {
+        self.ensure_task_account_with_identity(task_id, resource_kind, None, now)
+    }
+
+    /// [`Self::ensure_task_account`] that records `identity`'s lineage and
+    /// dimension key when it creates the row (HORO-2191 AC2). An existing
+    /// row is returned untouched.
+    pub fn ensure_task_account_with_identity(
+        &mut self,
+        task_id: libra_governor_domain::TaskId,
+        resource_kind: ResourceKind,
+        identity: Option<&libra_governor_domain::ExecutionIdentity>,
+        now: OffsetDateTime,
+    ) -> Result<EnsureAccountOutcome, LedgerError> {
+        let identity_columns = identity_columns(identity)?;
         let account_id = AccountId::for_task(task_id);
         let tx = self
             .conn
@@ -234,7 +301,7 @@ impl LedgerStore {
                 enforcement_scope, provider_lineage_status, execution_dimension_key_json,
                 provenance, account_schema_version, state, created_at, updated_at, closed_at
              ) VALUES (?1, 'task', NULL, ?2, ?3, ?4, NULL, NULL, NULL, 'local_user_config',
-                       'local_device', NULL, NULL, 'native', ?5, 'open', ?6, ?6, NULL)
+                       'local_device', ?7, ?8, 'native', ?5, 'open', ?6, ?6, NULL)
              ON CONFLICT(account_id) DO NOTHING",
             rusqlite::params![
                 account_id.to_string(),
@@ -243,6 +310,8 @@ impl LedgerStore {
                 task_id.to_string(),
                 RESOURCE_ACCOUNT_SCHEMA_VERSION,
                 now_str,
+                identity_columns.lineage,
+                identity_columns.dimension_key_json,
             ],
         )?;
         let row = Self::get_account_tx(&tx, account_id)?
@@ -270,6 +339,21 @@ impl LedgerStore {
         natural_key: &str,
         now: OffsetDateTime,
     ) -> Result<Result<EnsureAccountOutcome, AccountError>, LedgerError> {
+        self.ensure_child_account_with_identity(parent_account_id, level, natural_key, None, now)
+    }
+
+    /// [`Self::ensure_child_account`] that records `identity`'s lineage and
+    /// dimension key when it creates the row (HORO-2191 AC2). An existing
+    /// row is returned untouched.
+    pub fn ensure_child_account_with_identity(
+        &mut self,
+        parent_account_id: AccountId,
+        level: AccountLevel,
+        natural_key: &str,
+        identity: Option<&libra_governor_domain::ExecutionIdentity>,
+        now: OffsetDateTime,
+    ) -> Result<Result<EnsureAccountOutcome, AccountError>, LedgerError> {
+        let identity_columns = identity_columns(identity)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -287,7 +371,7 @@ impl LedgerStore {
                 enforcement_scope, provider_lineage_status, execution_dimension_key_json,
                 provenance, account_schema_version, state, created_at, updated_at, closed_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, NULL,
-                       'local_device', NULL, NULL, 'native', ?7, 'open', ?8, ?8, NULL)
+                       'local_device', ?9, ?10, 'native', ?7, 'open', ?8, ?8, NULL)
              ON CONFLICT(parent_account_id, level, natural_key) DO NOTHING",
             rusqlite::params![
                 new_id.to_string(),
@@ -298,6 +382,8 @@ impl LedgerStore {
                 parent.task_id.map(|t| t.to_string()),
                 RESOURCE_ACCOUNT_SCHEMA_VERSION,
                 now_str,
+                identity_columns.lineage,
+                identity_columns.dimension_key_json,
             ],
         )?;
         let row: AccountRow = tx.query_row(
@@ -1166,6 +1252,241 @@ mod tests {
             .unwrap();
         assert!(!second.created);
         assert_eq!(second.account, first.account);
+    }
+
+    /// HORO-2191 AC2: a new account row with no identity records the
+    /// literal lineage 'unknown' (distinguishable from a legacy NULL) and
+    /// no dimension key, on every insert path.
+    #[test]
+    fn new_accounts_without_identity_record_unknown_lineage_and_no_dimension_key() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = setup(&mut store, 200);
+        let task_account = AccountId::for_task(task_id);
+        let session = store
+            .ensure_child_account(task_account, AccountLevel::Session, "sess-1", now())
+            .unwrap()
+            .unwrap()
+            .account;
+
+        for id in [task_account, session.account_id] {
+            let raw: (Option<String>, Option<String>) = store
+                .conn
+                .query_row(
+                    "SELECT provider_lineage_status, execution_dimension_key_json
+                     FROM resource_accounts WHERE account_id = ?1",
+                    [id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(raw, (Some("unknown".to_string()), None));
+            let read = store.account(id).unwrap().unwrap();
+            assert_eq!(
+                read.provider_lineage_status,
+                Some(libra_governor_domain::LineageStatus::Unknown)
+            );
+            assert_eq!(read.execution_dimension_key_json, None);
+        }
+    }
+
+    fn captured_identity() -> libra_governor_domain::ExecutionIdentity {
+        libra_governor_domain::ExecutionIdentityBuilder::new("host-a", "claude-code")
+            .provider_session_id("sess-1")
+            .agent_id("agent-1")
+            .child_lineage("parent-1")
+            .build_at(now())
+            .unwrap()
+    }
+
+    /// Every table's rows with the two identity-dimension columns removed,
+    /// so two ledgers can be compared for "only those columns differ".
+    fn dump_without_identity_columns(store: &LedgerStore) -> Vec<(String, Vec<Vec<String>>)> {
+        let tables: Vec<String> = store
+            .conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        tables
+            .into_iter()
+            .map(|table| {
+                let columns: Vec<String> = store
+                    .conn
+                    .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                    .unwrap()
+                    .query_map([], |r| r.get(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                let selected: Vec<String> = columns
+                    .iter()
+                    .filter(|c| {
+                        !(table == "resource_accounts"
+                            && matches!(
+                                c.as_str(),
+                                "provider_lineage_status" | "execution_dimension_key_json"
+                            ))
+                    })
+                    .map(|c| format!("quote({c})"))
+                    .collect();
+                let rows = if selected.is_empty() {
+                    Vec::new()
+                } else {
+                    let sql = format!("SELECT {} FROM {table} ORDER BY 1", selected.join(", "));
+                    let mut stmt = store.conn.prepare(&sql).unwrap();
+                    let n = selected.len();
+                    stmt.query_map([], |row| (0..n).map(|i| row.get::<_, String>(i)).collect())
+                        .unwrap()
+                        .collect::<rusqlite::Result<_>>()
+                        .unwrap()
+                };
+                (table, rows)
+            })
+            .collect()
+    }
+
+    fn open_with_task(
+        identity: Option<&libra_governor_domain::ExecutionIdentity>,
+    ) -> (LedgerStore, TaskId) {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        let task_id = TaskId(uuid::Uuid::from_u128(0x2191));
+        store
+            .insert_task(
+                &TaskIdentity {
+                    id: task_id,
+                    external_ref: None,
+                },
+                now(),
+            )
+            .unwrap();
+        let reserve = CompletionReserveEstimate {
+            amount: ResourceAmount::Tokens(200),
+            basis: libra_governor_domain::CompletionReserveBasis::PolicyTarget,
+            fraction: 0.2,
+            required_criteria_count: 1,
+        };
+        store
+            .initialize_task_budget_scoped_with_identity(
+                task_id,
+                &thousand_token_policy(),
+                &reserve,
+                libra_governor_domain::LifetimeScope::LifetimeBounded,
+                identity,
+                now(),
+            )
+            .unwrap();
+        (store, task_id)
+    }
+
+    /// HORO-2191 AC2: a captured identity's lineage and narrowest dimension
+    /// key round-trip through the task and child account rows.
+    #[test]
+    fn captured_identity_lineage_and_dimension_key_round_trip() {
+        let identity = captured_identity();
+        let (mut store, task_id) = open_with_task(Some(&identity));
+        let task_account = AccountId::for_task(task_id);
+        let task_row = store.account(task_account).unwrap().unwrap();
+        let expected_key = serde_json::to_string(
+            &identity
+                .cache_key(libra_governor_domain::Scope::Agent)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            task_row.provider_lineage_status,
+            Some(libra_governor_domain::LineageStatus::Child)
+        );
+        assert_eq!(
+            task_row.execution_dimension_key_json,
+            Some(expected_key.clone())
+        );
+        assert_eq!(
+            expected_key,
+            r#"["host-a","claude-code","sess-1","agent-1"]"#
+        );
+
+        let session = store
+            .ensure_child_account_with_identity(
+                task_account,
+                AccountLevel::Session,
+                "sess-1",
+                Some(&identity),
+                now(),
+            )
+            .unwrap()
+            .unwrap()
+            .account;
+        let read = store.account(session.account_id).unwrap().unwrap();
+        assert_eq!(
+            read.provider_lineage_status,
+            Some(libra_governor_domain::LineageStatus::Child)
+        );
+        assert_eq!(read.execution_dimension_key_json, Some(expected_key));
+
+        // An existing row is never rewritten by a later, different identity.
+        let other = libra_governor_domain::ExecutionIdentityBuilder::new("host-b", "codex")
+            .build_at(now())
+            .unwrap();
+        let again = store
+            .ensure_task_account_with_identity(task_id, ResourceKind::Tokens, Some(&other), now())
+            .unwrap();
+        assert!(!again.created);
+        assert_eq!(again.account, task_row);
+    }
+
+    /// A host-only identity proves nothing narrower than the host scope.
+    #[test]
+    fn host_only_identity_records_the_host_scope_key() {
+        let host_only =
+            libra_governor_domain::ExecutionIdentityBuilder::new("host-a", "claude-code")
+                .build_at(now())
+                .unwrap();
+        let (store, task_id) = open_with_task(Some(&host_only));
+        let row = store
+            .account(AccountId::for_task(task_id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.provider_lineage_status,
+            Some(libra_governor_domain::LineageStatus::Unknown)
+        );
+        assert_eq!(
+            row.execution_dimension_key_json.as_deref(),
+            Some(r#"["host-a"]"#)
+        );
+    }
+
+    /// HORO-2191 AC2: recording identity changes nothing else in the ledger.
+    /// Two ledgers built identically, one with an identity and one without,
+    /// differ only in the two identity columns of `resource_accounts`.
+    #[test]
+    fn recording_identity_changes_only_the_two_identity_columns() {
+        let identity = captured_identity();
+        let (with_identity, task_id) = open_with_task(Some(&identity));
+        let (without_identity, _) = open_with_task(None);
+
+        assert_eq!(
+            dump_without_identity_columns(&with_identity),
+            dump_without_identity_columns(&without_identity)
+        );
+        let columns = |store: &LedgerStore| -> (Option<String>, Option<String>) {
+            store
+                .conn
+                .query_row(
+                    "SELECT provider_lineage_status, execution_dimension_key_json
+                     FROM resource_accounts WHERE account_id = ?1",
+                    [AccountId::for_task(task_id).to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            columns(&without_identity),
+            (Some("unknown".to_string()), None)
+        );
+        assert_eq!(columns(&with_identity).0.as_deref(), Some("child"));
+        assert!(columns(&with_identity).1.is_some());
     }
 
     #[test]
