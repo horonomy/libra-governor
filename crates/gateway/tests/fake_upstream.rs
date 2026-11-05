@@ -29,11 +29,17 @@ use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
-use libra_governor_domain::{Headroom, ReservationId, ResourceAmount, ResourceKind, TaskId};
-use libra_governor_gateway::authority::{
-    AuthorityError, BudgetContext, SpendAuthority, SpendDecision, SpendDenial, SpendRequest,
+use libra_governor_domain::{
+    Headroom, ReservationId, ResourceAmount, ResourceKind, SharedPoolReservationId, TaskId,
 };
+use libra_governor_gateway::authority::{
+    AuthorityError, BudgetContext, SharedBudgetAuthority, SharedDecision, SharedHold, SharedMode,
+    SharedReserveRequest, SharedSettled, SharedSettlement, SpendAuthority, SpendDecision,
+    SpendDenial, SpendRequest,
+};
+use libra_governor_gateway::cost::SettleFlags;
 use libra_governor_gateway::proxy::{GatewayRequestRecord, RequestRecorder};
+use libra_governor_gateway::usage::ObservedUsage;
 
 /// The header a test sets to choose which canned response it wants. It
 /// rides through the gateway untouched, which incidentally also proves
@@ -290,6 +296,13 @@ async fn serve_one(
             .header("content-type", "application/json")
             .body(body(
                 r#"{"type":"error","error":{"type":"api_error","message":"upstream exploded"}}"#,
+            ))
+            .unwrap(),
+        "overloaded_529" => Response::builder()
+            .status(StatusCode::from_u16(529).unwrap())
+            .header("content-type", "application/json")
+            .body(body(
+                r#"{"type":"error","error":{"type":"overloaded_error"}}"#,
             ))
             .unwrap(),
         "overloaded" => Response::builder()
@@ -551,6 +564,137 @@ impl SpendAuthority for StubAuthority {
     }
 }
 
+/// One recorded call against the stub shared-budget authority.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SharedCall {
+    Reserve {
+        session_id: String,
+        model: String,
+        body_bytes: usize,
+        max_tokens: Option<u64>,
+        image_count: usize,
+        request_id: String,
+    },
+    Settle {
+        hold: SharedHold,
+        observed: Option<ObservedUsage>,
+        completed_cleanly: bool,
+        saw_message_start: bool,
+    },
+    Release(SharedPoolReservationId),
+    Renew(SharedPoolReservationId),
+}
+
+/// What the stub shared authority answers a reserve with.
+#[derive(Debug, Clone)]
+pub enum SharedScript {
+    Grant,
+    Decide(SharedDecision),
+    Error,
+}
+
+/// An in-memory `SharedBudgetAuthority`, driven like [`StubAuthority`].
+pub struct StubSharedAuthority {
+    pub mode: Mutex<SharedMode>,
+    pub script: Mutex<SharedScript>,
+    pub settle_flags: Mutex<SettleFlags>,
+    pub calls: Mutex<Vec<SharedCall>>,
+    pub mode_calls: Mutex<u32>,
+}
+
+impl StubSharedAuthority {
+    pub fn new(mode: SharedMode, script: SharedScript) -> Self {
+        Self {
+            mode: Mutex::new(mode),
+            script: Mutex::new(script),
+            settle_flags: Mutex::new(SettleFlags::default()),
+            calls: Mutex::new(Vec::new()),
+            mode_calls: Mutex::new(0),
+        }
+    }
+
+    pub fn calls(&self) -> Vec<SharedCall> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    pub fn reserves(&self) -> Vec<SharedCall> {
+        self.calls()
+            .into_iter()
+            .filter(|c| matches!(c, SharedCall::Reserve { .. }))
+            .collect()
+    }
+
+    pub fn settles(&self) -> Vec<SharedCall> {
+        self.calls()
+            .into_iter()
+            .filter(|c| matches!(c, SharedCall::Settle { .. }))
+            .collect()
+    }
+
+    pub fn releases(&self) -> Vec<SharedPoolReservationId> {
+        self.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                SharedCall::Release(id) => Some(id),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+impl SharedBudgetAuthority for StubSharedAuthority {
+    fn mode(&self) -> SharedMode {
+        *self.mode_calls.lock().unwrap() += 1;
+        *self.mode.lock().unwrap()
+    }
+
+    fn reserve(&self, req: SharedReserveRequest<'_>) -> Result<SharedDecision, AuthorityError> {
+        self.calls.lock().unwrap().push(SharedCall::Reserve {
+            session_id: req.session_id.to_string(),
+            model: req.model.to_string(),
+            body_bytes: req.body_bytes,
+            max_tokens: req.max_tokens,
+            image_count: req.image_count,
+            request_id: req.request_id.to_string(),
+        });
+        match self.script.lock().unwrap().clone() {
+            SharedScript::Grant => Ok(SharedDecision::Granted(SharedHold {
+                id: SharedPoolReservationId::new(),
+                reserved_usd_cents: 4_242,
+                input_bound_tokens: 1_234,
+                model: req.model.to_string(),
+                max_tokens: req.max_tokens.unwrap_or_default(),
+            })),
+            SharedScript::Decide(decision) => Ok(decision),
+            SharedScript::Error => Err(AuthorityError("stub shared failure".to_string())),
+        }
+    }
+
+    fn settle(&self, settlement: SharedSettlement<'_>) -> Result<SharedSettled, AuthorityError> {
+        self.calls.lock().unwrap().push(SharedCall::Settle {
+            hold: settlement.hold.clone(),
+            observed: settlement.observed,
+            completed_cleanly: settlement.completed_cleanly,
+            saw_message_start: settlement.saw_message_start,
+        });
+        Ok(SharedSettled {
+            booked_usd_cents: settlement.hold.reserved_usd_cents,
+            usage_known: settlement.completed_cleanly,
+            flags: *self.settle_flags.lock().unwrap(),
+        })
+    }
+
+    fn release(&self, id: SharedPoolReservationId) -> Result<(), AuthorityError> {
+        self.calls.lock().unwrap().push(SharedCall::Release(id));
+        Ok(())
+    }
+
+    fn renew(&self, id: SharedPoolReservationId, _ttl_secs: u64) -> Result<(), AuthorityError> {
+        self.calls.lock().unwrap().push(SharedCall::Renew(id));
+        Ok(())
+    }
+}
+
 /// Collects the provenance rows the gateway produces.
 #[derive(Default)]
 pub struct StubRecorder {
@@ -583,6 +727,7 @@ pub struct TestGateway {
     pub addr: SocketAddr,
     pub token: String,
     pub authority: Arc<StubAuthority>,
+    pub shared: Option<Arc<StubSharedAuthority>>,
     pub recorder: Arc<StubRecorder>,
     pub stats: Arc<libra_governor_gateway::stats::GatewayStats>,
     pub upstream: FakeUpstream,
@@ -597,6 +742,8 @@ pub struct TestGatewayOptions {
     pub resource_kind: ResourceKind,
     pub credential_mode: libra_governor_gateway::config::GatewayCredentialMode,
     pub max_request_bytes: usize,
+    /// A stub shared-budget authority to attach, if the test wants one.
+    pub shared: Option<Arc<StubSharedAuthority>>,
 }
 
 impl Default for TestGatewayOptions {
@@ -608,6 +755,7 @@ impl Default for TestGatewayOptions {
             resource_kind: ResourceKind::Tokens,
             credential_mode: governor_held_fake_credential(),
             max_request_bytes: libra_governor_gateway::config::DEFAULT_MAX_REQUEST_BYTES,
+            shared: None,
         }
     }
 }
@@ -667,12 +815,17 @@ pub fn start_test_gateway(options: TestGatewayOptions) -> TestGateway {
     let authority = Arc::new(StubAuthority::new(options.behaviour, options.resource_kind));
     let recorder = Arc::new(StubRecorder::default());
     let stats = Arc::new(libra_governor_gateway::stats::GatewayStats::new());
-    let runtime_config = libra_governor_gateway::server::GatewayRuntimeConfig::new(
+    let mut runtime_config = libra_governor_gateway::server::GatewayRuntimeConfig::new(
         validated,
         Arc::clone(&authority) as Arc<dyn SpendAuthority>,
         Arc::clone(&recorder) as Arc<dyn RequestRecorder>,
         Arc::clone(&stats),
     );
+    if let Some(shared) = &options.shared {
+        runtime_config =
+            runtime_config.with_shared_budget(Arc::clone(shared) as Arc<dyn SharedBudgetAuthority>);
+    }
+    let shared = options.shared.clone();
 
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -695,6 +848,7 @@ pub fn start_test_gateway(options: TestGatewayOptions) -> TestGateway {
         addr,
         token,
         authority,
+        shared,
         recorder,
         stats,
         upstream,
