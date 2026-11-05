@@ -248,6 +248,15 @@ pub struct SharedSettlement<'a> {
 
 /// The gateway's surface against the shared monthly budget. Like
 /// [`SpendAuthority`], blocking, and answered by the daemon.
+///
+/// # Known limitation: a hold the gateway never settles
+///
+/// Renewal starts only once the response headers arrive and the pump exists.
+/// A client that cancels before that, a pump task that panics, or a hold whose
+/// lease lapses without renewal is never settled or released by the gateway.
+/// It stays active until the daemon books it on expiry, at the full
+/// reservation (an over-count, the safe direction), or at the next daemon
+/// start. Cancellation is not redesigned here.
 pub trait SharedBudgetAuthority: Send + Sync + 'static {
     fn mode(&self) -> SharedMode;
 
