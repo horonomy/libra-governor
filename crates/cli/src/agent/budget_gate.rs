@@ -250,6 +250,12 @@ fn denied_reason(
                  to continue ({LABEL})."
             )
         }
+        SharedBudgetDenyReason::GatewayUnavailable => format!(
+            "Libra shared budget is set to enforcement=gateway but no governor_held gateway is \
+             running, so nothing would meter this prompt's spend. Start the daemon with a \
+             governor_held gateway, or set \"enforcement\" back to \"hooks\" in \
+             shared-budget.json ({LABEL})."
+        ),
         SharedBudgetDenyReason::ClockAnomaly => format!(
             "Libra shared budget paused: the system clock is earlier than a recorded \
              budget period (clock anomaly); correct the clock to continue. If the clock is already \

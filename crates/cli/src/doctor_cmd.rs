@@ -207,28 +207,44 @@ fn gateway_enforcement_findings(
             ),
         },
     });
+    const SCOPE: &str = "only the user ~/.claude/settings.json is inspected; the shell \
+                         environment and project or local settings may set it differently";
     findings.push(match settings {
         None => Finding {
             id: "shared_budget_gateway_route",
             severity: Severity::Warn,
-            message: "enforcement=gateway: could not resolve ~/.claude/settings.json (HOME \
-                      unset), so the ANTHROPIC_BASE_URL route cannot be checked"
-                .to_string(),
+            message: format!(
+                "enforcement=gateway: could not resolve ~/.claude/settings.json (HOME unset), \
+                 so the ANTHROPIC_BASE_URL route cannot be checked ({SCOPE})"
+            ),
         },
+        Some(inspection) if inspection.base_url_present && inspection.base_url_is_loopback => {
+            Finding {
+                id: "shared_budget_gateway_route",
+                severity: Severity::Ok,
+                message: format!(
+                    "enforcement=gateway: settings.json env sets ANTHROPIC_BASE_URL to a \
+                     loopback address (the value is not printed; {SCOPE})"
+                ),
+            }
+        }
         Some(inspection) if inspection.base_url_present => Finding {
             id: "shared_budget_gateway_route",
-            severity: Severity::Ok,
-            message: "enforcement=gateway: settings.json env sets ANTHROPIC_BASE_URL (presence \
-                      only; its value is not read)"
-                .to_string(),
+            severity: Severity::Error,
+            message: format!(
+                "enforcement=gateway but settings.json env sets ANTHROPIC_BASE_URL to a \
+                 non-loopback address (the value is not printed): Claude Code does not reach the \
+                 local gateway, so its spend is not counted ({SCOPE})"
+            ),
         },
         Some(_) => Finding {
             id: "shared_budget_gateway_route",
             severity: Severity::Error,
-            message: "enforcement=gateway but settings.json env has no ANTHROPIC_BASE_URL key: \
-                      Claude Code does not route through the gateway, so its spend is not \
-                      counted at all"
-                .to_string(),
+            message: format!(
+                "enforcement=gateway but settings.json env has no ANTHROPIC_BASE_URL key: \
+                 Claude Code does not route through the gateway, so its spend is not counted \
+                 ({SCOPE})"
+            ),
         },
     });
     findings
@@ -1664,6 +1680,7 @@ mod tests {
         let routed = claude_settings::Inspection {
             file_present: true,
             base_url_present: true,
+            base_url_is_loopback: true,
             ..Default::default()
         };
         let ok = gateway_enforcement_findings(&GatewayProbe::GovernorHeldRunning, Some(&routed));
@@ -1686,30 +1703,34 @@ mod tests {
     }
 
     #[test]
-    fn gateway_enforcement_needs_the_base_url_key_and_reports_presence_only() {
+    fn gateway_enforcement_needs_a_loopback_base_url_key_and_never_prints_the_value() {
         use shared_budget_view::GatewayProbe;
-        let unrouted = claude_settings::Inspection {
-            file_present: true,
-            base_url_present: false,
-            ..Default::default()
+        let route = |present: bool, loopback: bool| {
+            let inspection = claude_settings::Inspection {
+                file_present: true,
+                base_url_present: present,
+                base_url_is_loopback: loopback,
+                ..Default::default()
+            };
+            let findings =
+                gateway_enforcement_findings(&GatewayProbe::GovernorHeldRunning, Some(&inspection));
+            find(&findings, "shared_budget_gateway_route").clone()
         };
-        let findings =
-            gateway_enforcement_findings(&GatewayProbe::GovernorHeldRunning, Some(&unrouted));
-        let f = find(&findings, "shared_budget_gateway_route");
-        assert_eq!(f.severity, Severity::Error, "{f:?}");
-        let routed = claude_settings::Inspection {
-            base_url_present: true,
-            base_url_is_loopback: true,
-            ..unrouted
-        };
-        let findings =
-            gateway_enforcement_findings(&GatewayProbe::GovernorHeldRunning, Some(&routed));
-        let f = find(&findings, "shared_budget_gateway_route");
-        assert_eq!(f.severity, Severity::Ok);
-        assert!(
-            !f.message.contains("127.0.0.1") && !f.message.contains("http"),
-            "the URL value is never printed: {f:?}"
-        );
+        assert_eq!(route(false, false).severity, Severity::Error);
+        let remote = route(true, false);
+        assert_eq!(remote.severity, Severity::Error, "{remote:?}");
+        let ok = route(true, true);
+        assert_eq!(ok.severity, Severity::Ok, "{ok:?}");
+        for f in [route(false, false), remote, ok] {
+            assert!(
+                !f.message.contains("127.0.0.1") && !f.message.contains("http"),
+                "the URL value is never printed: {f:?}"
+            );
+            assert!(
+                f.message.contains("only the user ~/.claude/settings.json"),
+                "states what was inspected: {f:?}"
+            );
+        }
     }
 
     #[test]

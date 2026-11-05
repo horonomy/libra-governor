@@ -723,6 +723,21 @@ fn a_daemon_one_protocol_version_behind_blocks_admission_even_in_gateway_mode() 
 }
 
 #[test]
+fn an_older_daemon_rejecting_this_v25_request_blocks_admission_in_gateway_mode() {
+    let state = tempfile::tempdir().unwrap();
+    write_budget(state.path(), &config(5_000, r#","enforcement":"gateway""#));
+    let fake = Fake::start(state.path(), |_| {
+        err("protocol version mismatch: daemon speaks 24, client sent 25")
+    });
+    assert_block(&prompt(state.path(), "s-old-daemon", repo().path(), &[]));
+    assert!(
+        !fake.kinds().contains(&"preflight".to_string()),
+        "{:?}",
+        fake.kinds()
+    );
+}
+
+#[test]
 fn allowed_with_soft_limit_warns_in_one_short_line_and_never_blocks() {
     let state = tempfile::tempdir().unwrap();
     write_budget(state.path(), &config(5_000, ""));
