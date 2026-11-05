@@ -51,8 +51,12 @@ fn write_budget(state: &Path) {
 }
 
 fn stop_command(state: &Path, home: &Path, cap_ms: Option<&str>) -> Command {
+    hook_command("stop", state, home, cap_ms)
+}
+
+fn hook_command(hook: &str, state: &Path, home: &Path, cap_ms: Option<&str>) -> Command {
     let mut c = Command::new(bin());
-    c.args(["hook", "stop"])
+    c.args(["hook", hook])
         .env("LIBRA_GOVERNOR_STATE_DIR", state)
         .env("HOME", home)
         .env("LIBRA_GOVERNOR_NO_AUTOSPAWN", "1")
@@ -230,6 +234,36 @@ fn the_hook_polls_until_ready_then_finalizes_exactly_once() {
     );
     assert_eq!(ran.code, Some(0));
     assert_eq!(ran.stdout, "", "a Stop hook never prints to stdout");
+}
+
+/// HORO-2440: `hook session-end` now settles the pending hold, so it waits
+/// for the same transcript flush before it asks the daemon to settle.
+#[test]
+fn session_end_waits_for_the_transcript_flush_before_it_settles() {
+    let state = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write_budget(state.path());
+    let daemon = Scripted::start(
+        state.path(),
+        vec![Probe::Ready(false), Probe::Ready(false), Probe::Ready(true)],
+    );
+    let transcript = state.path().join("never.jsonl");
+    let command = hook_command("session-end", state.path(), home.path(), Some("5000"));
+    let body = serde_json::json!({
+        "session_id": "s1",
+        "hook_event_name": "SessionEnd",
+        "transcript_path": transcript,
+        "reason": "other",
+    })
+    .to_string();
+    let started = Instant::now();
+    let ran = finish(spawn_stop(command, &body), started);
+    assert_eq!(
+        daemon.ops(),
+        ["probe", "probe", "probe", "other"],
+        "three probes, then one SettleTail request (the scripted daemon logs it as `other`)"
+    );
+    assert_eq!(ran.code, Some(0));
 }
 
 #[test]

@@ -97,7 +97,11 @@ pub enum SharedBudgetRequest {
     /// Meant for `SessionEnd`. Charged as a settled `agent_absent` row
     /// (`charge_source = turn_hold`, `usage_known = true`) with the same
     /// session binding, de-duplication and watermark as a `Stop`
-    /// settlement; idempotent. Nothing is charged when nothing is
+    /// settlement; idempotent. When the lane still has an unsettled turn
+    /// hold (a session that ended without a `Stop`, HORO-2440), that hold is
+    /// settled first, as a `Stop` would: measured when readable, the flat
+    /// hold with `usage_known = false` otherwise, measured spend only for an
+    /// expired hold. Otherwise nothing is charged when nothing is
     /// measurable: a tail has no hold to fall back to.
     SettleTail {
         session_id: String,

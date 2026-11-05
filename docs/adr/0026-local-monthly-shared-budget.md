@@ -89,7 +89,9 @@ a local, operator-configured budget as the first real enforceable capacity.
    reconciles actual usage against the hold.
 5. **Crash and expiry recovery.** An active hold that expires is reclaimed
    by the existing stale-hold expiry. A late settle after expiry is still
-   recorded (see Rollover).
+   recorded (see Rollover). A session that ends without a `Stop` does not
+   wait for that expiry: its `SessionEnd` settles the main lane's pending
+   hold from the transcript (see `SettleTail`, HORO-2440).
 6. **No over-allocation.** Accepted holds plus settled spend never exceed the
    cap.
 
@@ -433,7 +435,31 @@ the foreign spend is not imported. The fallback counts toward
 already-charged, so a later measurement books only the excess.
 
 **`SettleTail { session_id, transcript_path }`** (for `SessionEnd`, wired by
-S7, delivered). Charges the main-transcript records past the lane's watermark that no
+S7, delivered).
+
+*Pending hold first (HORO-2440, v0.0.4 erratum E7).* When the Claude main
+lane's newest non-charge hold (any state; gateway and subagent-charge rows
+never qualify) is unsettled, `SettleTail` settles **that hold** from the
+transcript exactly as a `Stop` would: the window is every record after the
+lane's watermark, measured usage is booked on the hold row and only the unused
+remainder is released, and the response maps it onto the existing fields
+(`reservation_id` = the hold, `amount_charged_usd_cents` = the settled cents,
+the usual `unmeasured`/`unpriced`/`transcript_unverified`/`binding_mismatch`
+flags). This also removes the `no_settled_lane` refusal for a first turn that
+never stopped, and a late `Stop` after the `SessionEnd` finds the hold settled
+(`AlreadySettled` for a prompt id, no pending hold otherwise) so it cannot
+flat-book a turn already measured. `Stop`, `SessionEnd` and the flush probe
+share one definition of the pending hold, so after a crash and resume a late
+`Stop` also cannot find an older expired hold that the newer hold's
+settlement already counted. Rules: an *active* hold that cannot be measured settles
+at the flat hold with `usage_known=false` (never zero, as for `Stop`); an
+*expired* hold (its capacity was already released) books measured spend only
+and otherwise writes nothing; an older expired hold is never targeted when a
+newer hold exists, because a later `Stop` already counted its records. Only the
+`SessionEnd` session's raw-id main lane is touched; other sessions, subagent
+lanes, Codex holds and gateway holds are not, and `SubagentStop` stays
+charge-only. With an invalid budget file `SessionEnd` settles nothing (unlike a `Stop`, which settles flat with `config_invalid`), and a host that kills the hook during its bounded flush wait leaves the hold to expire as before. When the lane has no such hold, the tail path below runs unchanged.
+It charges the main-transcript records past the lane's watermark that no
 `Stop` **counted** as a settled `agent_absent`
 row (`charge_source = turn_hold`, `usage_known = true`) with the same
 binding, de-duplication, future-bound and watermark; idempotent; nothing is
@@ -742,15 +768,16 @@ installed hooks**, so nothing here is `ProductionObserved`.
   name is charged under the payload id when valid, else `unattributed`. A
   payload without `agent_transcript_path` is not charged by the hook; the next
   `Stop` sweep (first 64 files) still finds it.
-- *`hook session-end`.* Sends `SettleTail { session_id, transcript_path }`;
-  a session never admitted or settled is refused by the daemon
-  (`no_settled_lane`) and billed nothing.
+- *`hook session-end`.* Sends `SettleTail { session_id, transcript_path }`
+  (after the same bounded transcript-flush wait as `Stop`); the daemon settles
+  the lane's pending hold if there is one (HORO-2440), and a session never
+  admitted is refused (`no_settled_lane`) and billed nothing.
 - *Fail open.* Neither handler prints, blocks, spawns a daemon or exits
   nonzero; no daemon, a malformed payload, a reserved or blank session id, or
   no answer within 5 s is a log line. Only prompt admission denies.
 - *Residuals.* S8 closed the `doctor` gap: it now reports all six hooks. A session whose
-  `SessionEnd` never fires (a killed host) has its tail left unsettled; no
-  other path settles it.
+  `SessionEnd` never fires (a killed host) has its tail and any pending hold
+  left unsettled until the hold's TTL; no other path settles it.
 
 ### Status, statusline and doctor delivered in S8
 
