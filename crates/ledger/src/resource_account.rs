@@ -1322,11 +1322,13 @@ mod tests {
                 let selected: Vec<String> = columns
                     .iter()
                     .filter(|c| {
-                        !(table == "resource_accounts"
-                            && matches!(
-                                c.as_str(),
-                                "provider_lineage_status" | "execution_dimension_key_json"
-                            ))
+                        // applied_at is wall-clock, so two openings can straddle a second boundary.
+                        !(table == "schema_migrations" && c.as_str() == "applied_at")
+                            && !(table == "resource_accounts"
+                                && matches!(
+                                    c.as_str(),
+                                    "provider_lineage_status" | "execution_dimension_key_json"
+                                ))
                     })
                     .map(|c| format!("quote({c})"))
                     .collect();
