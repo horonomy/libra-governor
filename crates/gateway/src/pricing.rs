@@ -32,13 +32,16 @@ use std::collections::BTreeMap;
 /// settlement, and provenance row. Bump whenever any number in
 /// [`PricingTable::pinned`] changes.
 ///
-/// Source: Anthropic official pricing page
+/// Sources: Anthropic official pricing page
 /// <https://platform.claude.com/docs/en/about-claude/pricing> (model ids from
 /// <https://platform.claude.com/docs/en/models/overview>), retrieved
-/// 2026-10-24. Figures are list prices; USD in this crate means
+/// 2026-10-24; OpenAI official pricing page
+/// <https://developers.openai.com/api/docs/pricing>, retrieved 2026-11-05 (the
+/// page carries no update date; standard tier, short context). Figures are
+/// list prices; USD in this crate means
 /// Libra-accounted list-price-equivalent USD at this version, never a
 /// provider bill or quota.
-pub const PRICING_VERSION: &str = "pricing-2026-10-static-v2";
+pub const PRICING_VERSION: &str = "pricing-2026-11-static-v3";
 
 /// Per-million-token USD prices for one model.
 ///
@@ -261,9 +264,78 @@ const PINNED: &[(&str, ModelPricing)] = &[
             output_usd_per_mtok: 4.0,
         },
     ),
+    // OpenAI (C9). Source: <https://developers.openai.com/api/docs/pricing>,
+    // retrieved 2026-11-05 (no update date on the page). Standard tier, SHORT
+    // context only (<= 272K input tokens), USD per 1M tokens. OpenAI bills
+    // prompts above 272K input tokens at a higher rate and `ModelPricing` has
+    // no tier for that, so a long-context turn is UNDER-counted here.
+    // OpenAI has no cache-write surcharge, so cache creation is priced as
+    // ordinary input. `gpt-5.6-*` is deliberately NOT pinned: its Sol row has
+    // promotional pricing until 2026-11-30, so its list price is not stable;
+    // it stays unpriced (flat hold) unless the operator adds an override.
+    (
+        "gpt-6.1-sol",
+        ModelPricing {
+            input_usd_per_mtok: 2.0,
+            cache_creation_input_usd_per_mtok: 2.0,
+            cache_read_input_usd_per_mtok: 0.10,
+            output_usd_per_mtok: 10.0,
+        },
+    ),
+    (
+        "gpt-6.1-terra",
+        ModelPricing {
+            input_usd_per_mtok: 1.0,
+            cache_creation_input_usd_per_mtok: 1.0,
+            cache_read_input_usd_per_mtok: 0.05,
+            output_usd_per_mtok: 5.0,
+        },
+    ),
+    (
+        "gpt-6-sol",
+        ModelPricing {
+            input_usd_per_mtok: 2.0,
+            cache_creation_input_usd_per_mtok: 2.0,
+            cache_read_input_usd_per_mtok: 0.20,
+            output_usd_per_mtok: 10.0,
+        },
+    ),
+    (
+        "gpt-6-astra",
+        ModelPricing {
+            input_usd_per_mtok: 10.0,
+            cache_creation_input_usd_per_mtok: 10.0,
+            cache_read_input_usd_per_mtok: 1.0,
+            output_usd_per_mtok: 50.0,
+        },
+    ),
+    (
+        "gpt-6-luna",
+        ModelPricing {
+            input_usd_per_mtok: 0.10,
+            cache_creation_input_usd_per_mtok: 0.10,
+            cache_read_input_usd_per_mtok: 0.01,
+            output_usd_per_mtok: 0.50,
+        },
+    ),
+    (
+        "gpt-5.3-codex",
+        ModelPricing {
+            input_usd_per_mtok: 1.75,
+            cache_creation_input_usd_per_mtok: 1.75,
+            cache_read_input_usd_per_mtok: 0.175,
+            output_usd_per_mtok: 14.0,
+        },
+    ),
 ];
 
 impl PricingTable {
+    /// The model ids the pinned snapshot lists (read-only; `doctor` uses it to
+    /// report which Codex models are covered without an override).
+    pub fn pinned_model_ids() -> impl Iterator<Item = &'static str> {
+        PINNED.iter().map(|(model, _)| *model)
+    }
+
     /// The pinned snapshot, with no operator overrides applied.
     pub fn pinned() -> Self {
         Self {
@@ -506,7 +578,7 @@ mod tests {
 
     #[test]
     fn pricing_version_names_this_snapshot() {
-        assert_eq!(PRICING_VERSION, "pricing-2026-10-static-v2");
+        assert_eq!(PRICING_VERSION, "pricing-2026-11-static-v3");
     }
 
     // ---- HORO-2366: a variant is never priced at the older entry ----
@@ -552,6 +624,75 @@ mod tests {
         assert_eq!(table.lookup("custom-model"), Some(price));
         assert_eq!(table.lookup("custom-model-20261101"), Some(price));
         assert_eq!(table.lookup("custom-model-mini"), None);
+    }
+
+    // ---- C9: OpenAI list prices ----
+
+    #[test]
+    fn openai_models_are_priced_at_the_cited_short_context_list_prices() {
+        // (model id, input, output, cached input) USD per 1M tokens, standard
+        // tier, <=272K input tokens.
+        let expected = [
+            ("gpt-6.1-sol", 2.00, 10.00, 0.10),
+            ("gpt-6.1-terra", 1.00, 5.00, 0.05),
+            ("gpt-6-sol", 2.00, 10.00, 0.20),
+            ("gpt-6-astra", 10.00, 50.00, 1.00),
+            ("gpt-6-luna", 0.10, 0.50, 0.01),
+            ("gpt-5.3-codex", 1.75, 14.00, 0.175),
+        ];
+        let table = PricingTable::pinned();
+        for (model, input, output, cached) in expected {
+            for id in [model.to_string(), format!("{model}-20261024")] {
+                let p = table.lookup(&id).unwrap_or_else(|| panic!("{id} unpriced"));
+                assert_eq!(
+                    (
+                        p.input_usd_per_mtok,
+                        p.cache_creation_input_usd_per_mtok,
+                        p.cache_read_input_usd_per_mtok,
+                        p.output_usd_per_mtok
+                    ),
+                    // OpenAI has no cache-write surcharge: cache creation is input.
+                    (input, input, cached, output),
+                    "{id}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn openai_variants_and_promotional_models_stay_unpriced() {
+        let table = PricingTable::pinned();
+        assert_eq!(table.lookup("gpt-6.1-sol-pro"), None);
+        assert_eq!(table.lookup("gpt-6-sol-mini"), None);
+        // gpt-5.6-* has promotional list pricing until 2026-11-30: not pinned.
+        assert_eq!(table.lookup("gpt-5.6-sol"), None);
+        assert_eq!(table.lookup("gpt-5.6-codex"), None);
+        assert_ne!(
+            table.lookup("gpt-6-sol").unwrap(),
+            table.lookup("gpt-6.1-sol").unwrap()
+        );
+    }
+
+    #[test]
+    fn an_override_beats_a_pinned_openai_price() {
+        let price = ModelPricing {
+            input_usd_per_mtok: 3.0,
+            cache_creation_input_usd_per_mtok: 3.0,
+            cache_read_input_usd_per_mtok: 0.3,
+            output_usd_per_mtok: 12.0,
+        };
+        let table =
+            PricingTable::with_overrides(BTreeMap::from([("gpt-6.1-sol".to_string(), price)]));
+        assert_eq!(table.lookup("gpt-6.1-sol"), Some(price));
+        assert_eq!(table.lookup("gpt-6.1-sol-20261024"), Some(price));
+        assert_eq!(table.override_count(), 1);
+    }
+
+    #[test]
+    fn pinned_model_ids_lists_every_pin() {
+        let ids: Vec<&str> = PricingTable::pinned_model_ids().collect();
+        assert!(ids.contains(&"gpt-6.1-sol") && ids.contains(&"claude-opus-5-5"));
+        assert_eq!(ids.len(), PINNED.len());
     }
 
     #[test]
