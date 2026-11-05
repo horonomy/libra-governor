@@ -1661,13 +1661,61 @@ pub fn settle_turn(
     let Some(target) = pending_hold(&holds) else {
         return Ok(TurnSettlement::NoHold);
     };
+    Ok(
+        match settle_hold_from_window(
+            ledger,
+            rt,
+            &state,
+            session_id,
+            &holds,
+            target,
+            transcript_path,
+            true,
+        )? {
+            WindowOutcome::Settled(settlement) => settlement,
+            // Unreachable with `book_flat`: an unmeasured window books the hold.
+            WindowOutcome::NotBooked { .. } => TurnSettlement::NoHold,
+        },
+    )
+}
+
+/// What [`settle_hold_from_window`] did.
+enum WindowOutcome {
+    Settled(TurnSettlement),
+    /// The window could not be measured and the caller does not book the flat
+    /// hold: nothing was written. `reason` is why it was not measured.
+    NotBooked {
+        reason: Option<&'static str>,
+    },
+}
+
+/// Settles `target` from the transcript records after the lane's watermark:
+/// the measuring half of [`settle_turn`], shared with `SessionEnd`
+/// (HORO-2440). See [`settle_turn`] for the outcome table.
+///
+/// `book_flat` says what an unmeasurable window does. `true` (a `Stop`, or a
+/// `SessionEnd` of a live hold) settles the hold amount with
+/// `usage_known=false`. `false` (a `SessionEnd` of an expired hold, whose
+/// capacity was already released) books measured spend only and otherwise
+/// writes nothing.
+#[allow(clippy::too_many_arguments)] // one settlement's inputs; a struct would only rename them
+fn settle_hold_from_window(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    state: &SharedBudgetFileState,
+    session_id: &str,
+    holds: &[SharedPoolReservation],
+    target: &SharedPoolReservation,
+    transcript_path: Option<&str>,
+    book_flat: bool,
+) -> Result<WindowOutcome, SharedBudgetError> {
     let (after, previous_ids) =
-        lane_window(ledger, session_id, &holds)?.unwrap_or((target.created_at, Vec::new()));
+        lane_window(ledger, session_id, holds)?.unwrap_or((target.created_at, Vec::new()));
     let counted_ids: HashSet<String> = previous_ids.iter().cloned().collect();
 
     let now = rt.now();
     let (actual, reason, watermark): (Option<u64>, Option<&'static str>, Option<SettleWatermark>) =
-        match &state {
+        match state {
             SharedBudgetFileState::Valid(cfg) => {
                 let observation = match transcript_path {
                     None => PricedObservation::Unavailable(UsageUnavailable::NoTranscriptPath),
@@ -1724,7 +1772,7 @@ pub fn settle_turn(
                     } => {
                         rt.note(|t| t.future_timestamps += 1);
                         (
-                            priced_cents.filter(|c| *c > target.amount),
+                            priced_cents.filter(|c| !book_flat || *c > target.amount),
                             Some("future_timestamp"),
                             // The mark advances only when the in-bound records
                             // were priced, and only to the newest of them. The
@@ -1763,16 +1811,21 @@ pub fn settle_turn(
             }
             // An invalid file: the pricing it would supply is not trusted.
             SharedBudgetFileState::Invalid(_) => (None, Some("config_invalid"), None),
-            SharedBudgetFileState::Absent => return Ok(TurnSettlement::NotConfigured),
+            SharedBudgetFileState::Absent => {
+                return Ok(WindowOutcome::Settled(TurnSettlement::NotConfigured))
+            }
         };
     // The watermark still advances past the skipped window: leaving it would
     // re-read the same implausible lines in every later Stop of the session
     // and settle each of those turns at its hold too, hiding real spend.
-    let (actual, reason, watermark) = if implausible_measurement(rt, &state, actual) {
+    let (actual, reason, watermark) = if implausible_measurement(rt, state, actual) {
         (None, Some(IMPLAUSIBLE_USAGE_REASON), watermark)
     } else {
         (actual, reason, watermark)
     };
+    if actual.is_none() && !book_flat {
+        return Ok(WindowOutcome::NotBooked { reason });
+    }
     if reason.is_some() {
         rt.note(|t| t.unmeasured_settlements += 1);
     }
@@ -1784,7 +1837,7 @@ pub fn settle_turn(
         ExecutorAttribution::main_executor(Some(ChargeSource::TurnHold)),
         watermark.as_ref(),
     )?;
-    Ok(match outcome {
+    Ok(WindowOutcome::Settled(match outcome {
         SharedPoolSettleOutcome::Settled {
             reservation,
             overrun,
@@ -1801,7 +1854,7 @@ pub fn settle_turn(
         SharedPoolSettleOutcome::AlreadyFinal(_) | SharedPoolSettleOutcome::NotFound => {
             TurnSettlement::AlreadySettled
         }
-    })
+    }))
 }
 
 /// What settling a Codex `Stop` did (HORO-2282). Content-free: it is logged.
@@ -2956,6 +3009,56 @@ fn remember_swept(rt: &SharedBudgetRuntime, key: (String, String), stamp: (u64, 
     seen.insert(key, stamp);
 }
 
+/// The hold a `SessionEnd` settles: the lane's newest non-charge hold by
+/// creation time, in ANY state, and only when it is still unsettled (`active`,
+/// or `expired` and unspent). Gateway and subagent-charge rows are not turn
+/// holds and never qualify. Taking the newest hold of any state, rather than
+/// the newest `active`/`expired` one, keeps an older expired hold whose
+/// records a later hold's `Stop` already counted from being booked again
+/// after a crash-then-resume (HORO-2440).
+fn session_end_target(holds: &[SharedPoolReservation]) -> Option<&SharedPoolReservation> {
+    holds
+        .iter()
+        .filter(|h| {
+            !matches!(
+                h.charge_source,
+                Some(ChargeSource::Gateway | ChargeSource::SubagentTranscript)
+            )
+        })
+        .max_by_key(|h| h.created_at)
+        .filter(|h| match h.state {
+            ReservationState::Active => true,
+            ReservationState::Expired => h.settled_amount.is_none(),
+            _ => false,
+        })
+}
+
+/// The `SettleTail` flags for the reason a window was not (fully) measured.
+fn tail_flags_for(reason: Option<&str>) -> TailFlags {
+    match reason {
+        None => TailFlags::default(),
+        Some("binding_mismatch") => TailFlags {
+            mismatch: true,
+            unmeasured: true,
+            ..TailFlags::default()
+        },
+        Some("transcript_unverified") => TailFlags {
+            unverified: true,
+            unmeasured: true,
+            ..TailFlags::default()
+        },
+        Some("unpriced_model") => TailFlags {
+            unpriced: true,
+            unmeasured: true,
+            ..TailFlags::default()
+        },
+        Some(_) => TailFlags {
+            unmeasured: true,
+            ..TailFlags::default()
+        },
+    }
+}
+
 /// Handles `SharedBudgetRequest::SettleTail` (HORO-2196) for a
 /// client-supplied `(provider, session_id)`. A Codex lane stays inert.
 pub fn settle_tail(
@@ -3027,6 +3130,51 @@ pub fn settle_tail_on_lane(
         ExecutorKind::AgentAbsent,
         OWNER_POOL_PREFIX,
     )?;
+    // HORO-2440: a session that ends without a `Stop` still has its turn hold
+    // open. Settle it from the transcript exactly as the `Stop` would have,
+    // so the unused remainder is released now rather than at the TTL, and a
+    // late `Stop` finds nothing to flat-book. Only this raw-id main lane is
+    // read or written. An expired hold's capacity was already released, so it
+    // books measured spend only.
+    if let Some(target) = session_end_target(&holds) {
+        let book_flat = target.state == ReservationState::Active && target.expires_at > now;
+        let path = Some(transcript_path).filter(|p| !p.trim().is_empty());
+        match settle_hold_from_window(
+            ledger, rt, &state, session_id, &holds, target, path, book_flat,
+        )? {
+            WindowOutcome::Settled(TurnSettlement::Settled {
+                reservation_id,
+                pool_id,
+                settled_usd_cents,
+                unmeasured_reason,
+                ..
+            }) => {
+                let flags = tail_flags_for(unmeasured_reason);
+                let admission = ledger.pool_admission_for(&period.pool_id, now, source(cfg))?;
+                return Ok(SharedBudgetOutcome::TailSettled {
+                    reservation_id: Some(reservation_id),
+                    pool_id: Some(pool_id),
+                    amount_charged_usd_cents: settled_usd_cents,
+                    already_charged: false,
+                    remaining_usd_cents: admission.map_or_else(
+                        || i64::try_from(cfg.monthly_cap_usd_cents).unwrap_or(i64::MAX),
+                        |a| a.remaining(),
+                    ),
+                    overrun_usd_cents: admission.map_or(0, |a| a.overrun()),
+                    unmeasured: flags.unmeasured,
+                    unpriced: flags.unpriced,
+                    transcript_unverified: flags.unverified,
+                    binding_mismatch: flags.mismatch,
+                });
+            }
+            WindowOutcome::NotBooked { reason } => {
+                return Ok(posture(tail_flags_for(reason), None, 0, false));
+            }
+            // Settled elsewhere between the read and the write: the tail
+            // path below finds the lane settled.
+            WindowOutcome::Settled(_) => {}
+        }
+    }
     // A tail continues a lane that has settled under this budget. A session
     // that was never admitted, or whose holds never settled, has no
     // watermark to continue from, and charging "everything past nothing"
