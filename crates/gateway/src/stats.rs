@@ -35,6 +35,8 @@ pub struct GatewayStats {
     settled_without_usage: AtomicU64,
     upstream_errors: AtomicU64,
     bound_violations: AtomicU64,
+    truncated_settles: AtomicU64,
+    input_bound_violations: AtomicU64,
 }
 
 /// An immutable snapshot, so a renderer reads one coherent set of numbers
@@ -50,6 +52,8 @@ pub struct GatewayStatsSnapshot {
     pub settled_without_usage: u64,
     pub upstream_errors: u64,
     pub bound_violations: u64,
+    pub truncated_settles: u64,
+    pub input_bound_violations: u64,
 }
 
 impl GatewayStats {
@@ -113,6 +117,20 @@ impl GatewayStats {
         self.bound_violations.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A stream that ended without `message_stop` was settled at the
+    /// conservative truncated amount instead of its partial usage. Only
+    /// the shared-budget mode records this (S11b).
+    pub fn record_truncated_settle(&self) {
+        self.truncated_settles.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The provider reported more input tokens than the pre-flight input
+    /// bound allowed — the input-side counterpart of
+    /// [`Self::record_bound_violation`]. Surfaced rather than clamped.
+    pub fn record_input_bound_violation(&self) {
+        self.input_bound_violations.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> GatewayStatsSnapshot {
         GatewayStatsSnapshot {
             forwarded: self.forwarded.load(Ordering::Relaxed),
@@ -124,6 +142,8 @@ impl GatewayStats {
             settled_without_usage: self.settled_without_usage.load(Ordering::Relaxed),
             upstream_errors: self.upstream_errors.load(Ordering::Relaxed),
             bound_violations: self.bound_violations.load(Ordering::Relaxed),
+            truncated_settles: self.truncated_settles.load(Ordering::Relaxed),
+            input_bound_violations: self.input_bound_violations.load(Ordering::Relaxed),
         }
     }
 }
@@ -156,6 +176,20 @@ mod tests {
         assert_eq!(snapshot.approval_gated, 1);
         assert_eq!(snapshot.bound_violations, 1);
         assert_eq!(snapshot.denied_unenforceable, 0);
+    }
+
+    #[test]
+    fn the_shared_path_counters_are_independent_of_the_task_path_counters() {
+        let stats = GatewayStats::new();
+        stats.record_truncated_settle();
+        stats.record_truncated_settle();
+        stats.record_input_bound_violation();
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.truncated_settles, 2);
+        assert_eq!(snapshot.input_bound_violations, 1);
+        assert_eq!(snapshot.bound_violations, 0);
+        assert_eq!(snapshot.settled_without_usage, 0);
     }
 
     #[test]
