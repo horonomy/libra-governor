@@ -696,7 +696,7 @@ budget gate (its hook route is unchanged).
 | `SubagentStop` (`hook subagent-stop`) | absent | nothing is parsed or sent, the daemon is not contacted |
 | `SubagentStop` | present | one `ChargeAgentTranscript` with `session_id`, `agent_id` and `agent_transcript_path` as the host sent them; the daemon reads, binds, prices and de-duplicates. Always silent, exit 0 |
 | `SessionEnd` (`hook session-end`) | absent | nothing is parsed or sent, the daemon is not contacted |
-| `SessionEnd` | present | one `SettleTail` with `session_id` and `transcript_path`; the daemon charges the records no `Stop` counted. Always silent, exit 0 |
+| `SessionEnd` | present | one `SettleTail` with `session_id` and `transcript_path`; the hook first waits (bounded) for the host's transcript flush, as `Stop` does. The daemon settles the lane's pending turn hold if a `Stop` never did (measured, else the hold amount flagged unmeasured; HORO-2440), then charges the records no `Stop` counted. Always silent, exit 0 |
 
 `Stop` also waits, bounded, before it settles (HORO-2246): when a budget file
 exists it polls the daemon's read-only `TranscriptReady` probe, for at most 1.5 s
