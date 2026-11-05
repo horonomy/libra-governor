@@ -50,13 +50,19 @@ use uuid::Uuid;
 
 use libra_governor_domain::{
     calendar_month_bounds, monthly_pool_alias, ChargeSource, ExecutorKind, MeteredPoolKey, PoolId,
-    PrincipalId, QuotaUnit, ReservationState, SharedPoolReservation, LOCAL_BUDGET_OWNER,
+    PrincipalId, QuotaUnit, ReservationState, ResourceAmount, ResourceKind, SharedPoolReservation,
+    SharedPoolReservationId, LOCAL_BUDGET_OWNER,
 };
+use libra_governor_gateway::cost::{
+    hard_input_upper_bound, settle_amount_for, worst_case_usd_reservation, EnforcementGap,
+    SettleFlags,
+};
+use libra_governor_gateway::usage::ObservedUsage;
 use libra_governor_ledger::{
     CapacitySource, ExecutorAttribution, LedgerError, LedgerStore, MeteredReserveOutcome,
     MeteredReserveRequest, SettleWatermark, SharedPoolChargeOutcome, SharedPoolChargeRequest,
-    SharedPoolExecutorReport, SharedPoolRenewOutcome, SharedPoolReserveRequest,
-    SharedPoolSettleOutcome,
+    SharedPoolExecutorReport, SharedPoolReleaseOutcome, SharedPoolRenewOutcome,
+    SharedPoolReserveRequest, SharedPoolSettleOutcome,
 };
 use libra_governor_protocol::{
     SharedBudgetCheckState, SharedBudgetConfigDrift, SharedBudgetConfigState,
@@ -66,7 +72,8 @@ use libra_governor_protocol::{
 };
 
 use crate::shared_budget_file::{
-    ConfigDrift, LoadedSharedBudget, SharedBudgetConfig, SharedBudgetFileState, SoftLimits,
+    ConfigDrift, Enforcement, LoadedSharedBudget, SharedBudgetConfig, SharedBudgetFileState,
+    SoftLimits,
 };
 use crate::usage::codex_priced::price_codex_turn;
 use crate::usage::priced::{
@@ -3570,4 +3577,410 @@ pub fn heartbeat(
         }
     }
     Ok(renewed)
+}
+
+// ---- Governor-held gateway primitives (S11d) ----
+//
+// The gateway reserves worst-case spend before forwarding a request and
+// settles it afterwards, one pool row per request. These are the daemon-side
+// primitives only; nothing calls them until the gateway is wired to the
+// shared budget (S11e). Rows are attributed `unattributed` with charge source
+// `gateway`, and priced with the shared-budget table (the pinned prices plus
+// the file's `pricing_overrides`) on both sides, so the gateway config's
+// overrides never apply to a shared row.
+
+/// Longest session id or idempotency key a gateway call accepts (bytes).
+/// Both come from a request on a local socket and are stored verbatim.
+const MAX_GATEWAY_FIELD_BYTES: usize = 256;
+
+const GATEWAY_KEY_PREFIX: &str = "gw:";
+
+/// The idempotency key of one gateway request's pool row. `boot_id` names
+/// the gateway process, so the startup orphan sweep can tell a previous
+/// process's rows from the current one's; the gateway generates it once at
+/// start (S11e). Neither part may be empty and `boot_id` may not contain
+/// `:`, or [`gateway_reserve`] refuses the key.
+pub fn gateway_key(boot_id: &str, request_id: &str) -> String {
+    format!("{GATEWAY_KEY_PREFIX}{boot_id}:{request_id}")
+}
+
+/// The `gw:<boot_id>:` prefix every row of one gateway process shares.
+fn gateway_boot_prefix(boot_id: &str) -> Option<String> {
+    (!boot_id.is_empty() && !boot_id.contains(':'))
+        .then(|| format!("{GATEWAY_KEY_PREFIX}{boot_id}:"))
+}
+
+fn gateway_key_is_valid(key: &str) -> bool {
+    key.len() <= MAX_GATEWAY_FIELD_BYTES
+        && key
+            .strip_prefix(GATEWAY_KEY_PREFIX)
+            .and_then(|rest| rest.split_once(':'))
+            .is_some_and(|(boot_id, request_id)| !boot_id.is_empty() && !request_id.is_empty())
+}
+
+/// One request to reserve against the monthly cap. The daemon prices the
+/// worst case itself, from the body size and image count, so the gateway
+/// never supplies an amount.
+pub struct GatewayReserveRequest<'a> {
+    pub session_id: &'a str,
+    pub model: &'a str,
+    /// The request body's size excluding inline base64 `source.data`
+    /// payloads, which `image_count` covers (see `hard_input_upper_bound`).
+    pub body_bytes: usize,
+    pub max_tokens: Option<u64>,
+    pub image_count: usize,
+    /// `gw:<boot_id>:<request_id>`, built by [`gateway_key`].
+    pub key: &'a str,
+    pub ttl_secs: u64,
+}
+
+/// A granted gateway hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayHold {
+    pub reservation_id: SharedPoolReservationId,
+    pub pool_id: String,
+    pub reserved_usd_cents: u64,
+    /// The input-token ceiling the reservation assumed. Pass it back to
+    /// [`gateway_settle`] so an overrun of it is detected.
+    pub input_bound_tokens: u64,
+    pub remaining_usd_cents: i64,
+    /// The key was already granted (a gateway-internal retry); nothing new
+    /// was reserved.
+    pub replayed: bool,
+}
+
+/// Why a gateway reserve wrote nothing and granted nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GatewayRefusal {
+    /// No shared-budget file.
+    NotConfigured,
+    ConfigInvalid(String),
+    /// The file is valid but does not ask for `enforcement = gateway`.
+    NotGatewayEnforced,
+    /// A pool of a later period than the clock's exists.
+    ClockAnomaly {
+        later_pool: String,
+    },
+    Identity(SharedBudgetRefusal),
+    SessionIdTooLong,
+    /// Not shaped `gw:<boot_id>:<request_id>`, or over the length cap.
+    InvalidKey,
+    /// No finite, priceable worst case exists for the request.
+    Unenforceable(EnforcementGap),
+    CapExhausted {
+        remaining_usd_cents: i64,
+    },
+    /// The key already names a different row, such as a charge.
+    KeyConflict,
+    PoolUnitMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GatewayReserveOutcome {
+    Granted(GatewayHold),
+    Refused(GatewayRefusal),
+}
+
+fn gateway_refused(refusal: GatewayRefusal) -> Result<GatewayReserveOutcome, SharedBudgetError> {
+    Ok(GatewayReserveOutcome::Refused(refusal))
+}
+
+/// Reserves the worst case of one request against the current period's pool.
+///
+/// Refuses, writing nothing, unless the shared-budget file is valid and asks
+/// for `enforcement = gateway`, the identity and key are usable, no pool of a
+/// later period exists, and the request has a priceable worst case. Only then
+/// does it create the period's pool, sweep expired holds (a gateway hold that
+/// expired unsettled is booked, not freed) and reserve atomically.
+pub fn gateway_reserve(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    req: &GatewayReserveRequest<'_>,
+) -> Result<GatewayReserveOutcome, SharedBudgetError> {
+    let cfg = match rt.effective().state {
+        SharedBudgetFileState::Absent => return gateway_refused(GatewayRefusal::NotConfigured),
+        SharedBudgetFileState::Invalid(reason) => {
+            return gateway_refused(GatewayRefusal::ConfigInvalid(reason))
+        }
+        SharedBudgetFileState::Valid(cfg) => cfg,
+    };
+    if cfg.enforcement != Enforcement::Gateway {
+        return gateway_refused(GatewayRefusal::NotGatewayEnforced);
+    }
+    if let Err(refusal) = validate_identity(req.session_id, None) {
+        return gateway_refused(GatewayRefusal::Identity(refusal));
+    }
+    if req.session_id.len() > MAX_GATEWAY_FIELD_BYTES {
+        return gateway_refused(GatewayRefusal::SessionIdTooLong);
+    }
+    if !gateway_key_is_valid(req.key) {
+        return gateway_refused(GatewayRefusal::InvalidKey);
+    }
+    let now = rt.now();
+    let period = period_at(&cfg, now)?;
+    if let Some(later) = later_pool(ledger, &period)? {
+        return gateway_refused(GatewayRefusal::ClockAnomaly {
+            later_pool: later.0,
+        });
+    }
+    let input_bound_tokens = hard_input_upper_bound(req.body_bytes, req.image_count);
+    let worst = match worst_case_usd_reservation(
+        input_bound_tokens,
+        req.max_tokens,
+        req.model,
+        &cfg.pricing_overrides.table(),
+    ) {
+        Ok(ResourceAmount::UsdCents(cents)) => u64::try_from(cents)
+            .map_err(|_| SharedBudgetError::Internal("a worst-case reservation is negative"))?,
+        Ok(_) => {
+            return Err(SharedBudgetError::Internal(
+                "a USD reservation priced in another kind",
+            ))
+        }
+        Err(gap) => return gateway_refused(GatewayRefusal::Unenforceable(gap)),
+    };
+
+    ensure_period_pool(ledger, &period.pool_id, &cfg, now)?;
+    ledger.expire_stale_shared_pool_reservations(now)?;
+    let outcome = ledger.reserve_shared_metered(MeteredReserveRequest {
+        base: SharedPoolReserveRequest {
+            pool_id: &period.pool_id,
+            principal_id: &principal(),
+            session_id: req.session_id,
+            amount: worst,
+            unit: &QuotaUnit::UsdCents,
+            idempotency_key: req.key,
+            now,
+            ttl_secs: req.ttl_secs,
+            attribution: ExecutorAttribution::unattributed(Some(ChargeSource::Gateway)),
+        },
+        session_cap: None,
+        capacity_source: source(&cfg),
+    });
+    let (hold, replayed) = match outcome {
+        Ok(MeteredReserveOutcome::Granted(hold)) => (hold, false),
+        Ok(MeteredReserveOutcome::AlreadyGranted(hold)) => (hold, true),
+        Ok(MeteredReserveOutcome::Insufficient { admission, .. }) => {
+            return gateway_refused(GatewayRefusal::CapExhausted {
+                remaining_usd_cents: admission.remaining(),
+            })
+        }
+        Ok(MeteredReserveOutcome::NoPool) => {
+            return Err(SharedBudgetError::Internal(
+                "pool missing right after creation",
+            ))
+        }
+        Ok(MeteredReserveOutcome::SnapshotUnusable(_))
+        | Ok(MeteredReserveOutcome::SessionCapExceeded { .. }) => {
+            return Err(SharedBudgetError::Internal(
+                "a locally configured cap consulted a provider snapshot or session cap",
+            ))
+        }
+        Err(LedgerError::QuotaUnitMismatch { .. }) => {
+            return gateway_refused(GatewayRefusal::PoolUnitMismatch)
+        }
+        Err(LedgerError::SharedPoolKeyConflict) => {
+            return gateway_refused(GatewayRefusal::KeyConflict)
+        }
+        Err(e) => return Err(e.into()),
+    };
+    Ok(GatewayReserveOutcome::Granted(GatewayHold {
+        reservation_id: hold.id,
+        remaining_usd_cents: remaining_of(ledger, &hold.pool_id, &cfg, now)?,
+        pool_id: hold.pool_id.0,
+        reserved_usd_cents: hold.amount,
+        input_bound_tokens,
+        replayed,
+    }))
+}
+
+/// What a gateway call found at a reservation id.
+enum GatewayRow {
+    Missing,
+    /// A row, but not a gateway hold of the local budget: never touched.
+    Foreign,
+    Hold(Box<SharedPoolReservation>),
+}
+
+/// Looks up `id`, accepting only a local-budget row the gateway wrote, so
+/// that no gateway call can settle, release or renew a turn hold.
+fn gateway_row(
+    ledger: &LedgerStore,
+    id: SharedPoolReservationId,
+) -> Result<GatewayRow, SharedBudgetError> {
+    Ok(match ledger.get_shared_reservation(id)? {
+        None => GatewayRow::Missing,
+        Some(row)
+            if row.charge_source == Some(ChargeSource::Gateway)
+                && row.principal_id == principal()
+                && row.pool_id.0.starts_with(POOL_PREFIX) =>
+        {
+            GatewayRow::Hold(Box::new(row))
+        }
+        Some(_) => GatewayRow::Foreign,
+    })
+}
+
+/// What the gateway observed of one finished request (S11b inputs).
+pub struct GatewaySettleRequest<'a> {
+    pub reservation_id: SharedPoolReservationId,
+    pub observed: Option<ObservedUsage>,
+    pub completed_cleanly: bool,
+    pub saw_message_start: bool,
+    pub model: &'a str,
+    pub max_tokens: u64,
+    /// [`GatewayHold::input_bound_tokens`] of the reservation.
+    pub input_bound_tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewaySettleOutcome {
+    Settled {
+        /// What the row now counts against the cap.
+        booked_usd_cents: u64,
+        reserved_usd_cents: u64,
+        /// Whether the booked amount is the provider's own figure.
+        usage_known: bool,
+        flags: SettleFlags,
+        /// Booked above the reservation; recorded unclamped.
+        overrun_usd_cents: Option<u64>,
+    },
+    /// The row was already settled, released or expired and booked.
+    AlreadyFinal,
+    NotFound,
+    /// The id names a row that is not a gateway hold.
+    NotGatewayHold,
+}
+
+/// Settles one gateway hold. The amount is the S11b rule priced with the
+/// shared-budget table and the reserved amount read from the row itself.
+///
+/// If the file is no longer valid when the request ends, nothing can be
+/// priced, so the row is booked at its reservation. The ledger records
+/// `usage_known = false` only when the whole reservation is booked, so a
+/// request that is not fully measured books the larger of its S11b amount and
+/// the reservation, never less.
+pub fn gateway_settle(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    req: &GatewaySettleRequest<'_>,
+) -> Result<GatewaySettleOutcome, SharedBudgetError> {
+    let reserved = match gateway_row(ledger, req.reservation_id)? {
+        GatewayRow::Missing => return Ok(GatewaySettleOutcome::NotFound),
+        GatewayRow::Foreign => return Ok(GatewaySettleOutcome::NotGatewayHold),
+        GatewayRow::Hold(row) => row.amount,
+    };
+    let (priced, usage_known, flags) = match rt.effective().state {
+        SharedBudgetFileState::Valid(cfg) => settle_amount_for(
+            req.observed,
+            req.completed_cleanly,
+            req.saw_message_start,
+            ResourceAmount::UsdCents(i64::try_from(reserved).unwrap_or(i64::MAX)),
+            req.max_tokens,
+            req.input_bound_tokens,
+            ResourceKind::Usd,
+            req.model,
+            &cfg.pricing_overrides.table(),
+        ),
+        _ => (
+            ResourceAmount::UsdCents(i64::try_from(reserved).unwrap_or(i64::MAX)),
+            false,
+            SettleFlags::default(),
+        ),
+    };
+    let priced = match priced {
+        ResourceAmount::UsdCents(cents) => u64::try_from(cents).unwrap_or(reserved),
+        _ => reserved,
+    };
+    let actual = (usage_known || priced > reserved).then_some(priced);
+    match ledger.settle_shared(req.reservation_id, actual, rt.now())? {
+        SharedPoolSettleOutcome::Settled {
+            reservation,
+            overrun,
+            ..
+        } => Ok(GatewaySettleOutcome::Settled {
+            booked_usd_cents: reservation.settled_amount.unwrap_or(reserved),
+            reserved_usd_cents: reserved,
+            usage_known: reservation.usage_known == Some(true),
+            flags,
+            overrun_usd_cents: overrun,
+        }),
+        SharedPoolSettleOutcome::AlreadyFinal(_) => Ok(GatewaySettleOutcome::AlreadyFinal),
+        SharedPoolSettleOutcome::NotFound => Ok(GatewaySettleOutcome::NotFound),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayReleaseOutcome {
+    Released,
+    AlreadyFinal,
+    NotFound,
+    NotGatewayHold,
+}
+
+/// Releases a gateway hold unspent, for a request that never reached the
+/// provider or that the provider did not bill.
+pub fn gateway_release(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    id: SharedPoolReservationId,
+) -> Result<GatewayReleaseOutcome, SharedBudgetError> {
+    match gateway_row(ledger, id)? {
+        GatewayRow::Missing => return Ok(GatewayReleaseOutcome::NotFound),
+        GatewayRow::Foreign => return Ok(GatewayReleaseOutcome::NotGatewayHold),
+        GatewayRow::Hold(_) => {}
+    }
+    Ok(match ledger.release_shared(id, rt.now())? {
+        SharedPoolReleaseOutcome::Released(_) => GatewayReleaseOutcome::Released,
+        SharedPoolReleaseOutcome::AlreadyFinal(_) => GatewayReleaseOutcome::AlreadyFinal,
+        SharedPoolReleaseOutcome::NotFound => GatewayReleaseOutcome::NotFound,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayRenewOutcome {
+    Renewed,
+    /// The hold is no longer active, or already past its expiry.
+    Refused,
+    NotFound,
+    NotGatewayHold,
+}
+
+/// Extends a live gateway hold to `now + ttl_secs`, for a stream that
+/// outlasts its first lease. A failed renewal is not an error: the hold is
+/// then booked on expiry rather than freed, which is the safe direction.
+pub fn gateway_renew(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    id: SharedPoolReservationId,
+    ttl_secs: u64,
+) -> Result<GatewayRenewOutcome, SharedBudgetError> {
+    let session_id = match gateway_row(ledger, id)? {
+        GatewayRow::Missing => return Ok(GatewayRenewOutcome::NotFound),
+        GatewayRow::Foreign => return Ok(GatewayRenewOutcome::NotGatewayHold),
+        GatewayRow::Hold(row) => row.session_id,
+    };
+    Ok(
+        match ledger.renew_shared(id, &principal(), &session_id, rt.now(), ttl_secs)? {
+            SharedPoolRenewOutcome::Renewed(_) => GatewayRenewOutcome::Renewed,
+            SharedPoolRenewOutcome::Refused(_) => GatewayRenewOutcome::Refused,
+            SharedPoolRenewOutcome::NotFound => GatewayRenewOutcome::NotFound,
+        },
+    )
+}
+
+/// Books every gateway hold a previous gateway process left active at its
+/// reservation (a crash cannot be told from a request still in flight, and
+/// the safe direction is to count it). Run at daemon start, whether or not
+/// the gateway is enabled. `boot_id` is the current process's, whose rows are
+/// kept. Returns the rows booked.
+pub fn gateway_orphans_at_start(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    boot_id: &str,
+) -> Result<Vec<SharedPoolReservation>, SharedBudgetError> {
+    let prefix = gateway_boot_prefix(boot_id).ok_or(SharedBudgetError::Internal(
+        "a gateway boot id is empty or contains ':'",
+    ))?;
+    Ok(ledger.settle_orphaned_gateway_holds(&prefix, rt.now())?)
 }
