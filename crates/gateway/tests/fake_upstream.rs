@@ -479,6 +479,7 @@ pub struct TestGateway {
     pub token: String,
     pub authority: Arc<StubAuthority>,
     pub recorder: Arc<StubRecorder>,
+    pub stats: Arc<libra_governor_gateway::stats::GatewayStats>,
     pub upstream: FakeUpstream,
     _dir: tempfile::TempDir,
     _shutdown: std::sync::mpsc::Sender<()>,
@@ -560,11 +561,12 @@ pub fn start_test_gateway(options: TestGatewayOptions) -> TestGateway {
 
     let authority = Arc::new(StubAuthority::new(options.behaviour, options.resource_kind));
     let recorder = Arc::new(StubRecorder::default());
+    let stats = Arc::new(libra_governor_gateway::stats::GatewayStats::new());
     let runtime_config = libra_governor_gateway::server::GatewayRuntimeConfig::new(
         validated,
         Arc::clone(&authority) as Arc<dyn SpendAuthority>,
         Arc::clone(&recorder) as Arc<dyn RequestRecorder>,
-        Arc::new(libra_governor_gateway::stats::GatewayStats::new()),
+        Arc::clone(&stats),
     );
 
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
@@ -589,6 +591,7 @@ pub fn start_test_gateway(options: TestGatewayOptions) -> TestGateway {
         token,
         authority,
         recorder,
+        stats,
         upstream,
         _dir: dir,
         _shutdown: shutdown_tx,
