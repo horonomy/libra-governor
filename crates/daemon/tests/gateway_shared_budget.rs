@@ -601,18 +601,45 @@ fn a_file_corrupted_before_any_request_still_refuses_when_it_started_gateway_enf
 }
 
 #[test]
-fn an_unreadable_file_that_was_never_gateway_enforced_leaves_the_gateway_as_it_was() {
+fn an_unreadable_file_refuses_a_governor_held_gateway_even_if_never_gateway_enforced() {
     let fx = Fx::new(Some(CORRUPT.to_string()), &["s1"]);
     let gw = fx.held_gateway("boot1");
-    assert_eq!(fx.post(&gw, Some("s1"), "sse").status, StatusCode::OK);
+    assert_refused_unavailable(&fx, &gw, 0);
     assert!(fx.shared_rows().is_empty());
 
-    // Nor does a hooks-mode file that later breaks.
+    // A hooks-mode file stands the gateway down; breaking it refuses again.
     fx.write_file(&file("hooks", 5_000));
     assert_eq!(fx.post(&gw, Some("s1"), "sse").status, StatusCode::OK);
     fx.write_file(CORRUPT);
-    assert_eq!(fx.post(&gw, Some("s1"), "sse").status, StatusCode::OK);
+    assert_refused_unavailable(&fx, &gw, 1);
     assert!(fx.shared_rows().is_empty());
+}
+
+#[test]
+fn a_restart_over_a_corrupt_file_refuses_rather_than_forwarding_uncapped() {
+    let fx = Fx::new(Some(file("gateway", 5_000)), &["s1"]);
+    fx.write_file(CORRUPT);
+    // A new daemon process: a fresh runtime and authority that never saw the
+    // file valid.
+    let restarted = Arc::new(SharedBudgetRuntime::load(fx.dir.path()).with_clock(fx.clock.clone()));
+    let authority = Arc::new(LedgerSharedAuthority::new(
+        Arc::clone(&fx.ledger),
+        restarted,
+        "boot2".to_string(),
+        true,
+    ));
+    let gw = fx.gateway(authority, governor_held_fake_credential());
+    assert_refused_unavailable(&fx, &gw, 0);
+}
+
+#[test]
+fn a_pass_through_gateway_is_not_stopped_by_a_file_that_was_never_gateway_enforced() {
+    let fx = Fx::new(Some(CORRUPT.to_string()), &["s1"]);
+    let gw = fx.gateway(
+        fx.authority("boot1", false),
+        GatewayCredentialMode::PassThroughSubscription,
+    );
+    assert_eq!(fx.post(&gw, Some("s1"), "sse").status, StatusCode::OK);
 }
 
 #[test]
