@@ -208,7 +208,11 @@ pub const TOOL_PROMPT_TOKENS: u64 = 1_000;
 /// Refuses a body whose input cannot be bounded from its own bytes
 /// (S11b): server tools (`web_search_*`, `web_fetch_*`,
 /// `code_execution_*`), a `url` or `file` content source, `mcp_servers`
-/// or a `container`. Returns the first gap found.
+/// a `container`, or a `container_upload` block (a Files-API reference
+/// with no `source`). Returns the first gap found.
+///
+/// The list is closed: a server-tool or block type added upstream passes
+/// until it is named here, so S11a must re-check it against the API docs.
 ///
 /// Structural only — nothing from the body is retained. A body that does
 /// not parse as JSON returns `None`: envelope parsing already refuses it
@@ -247,18 +251,22 @@ pub fn screen_unbounded_inputs(body: &[u8]) -> Option<EnforcementGap> {
 }
 
 /// `true` if any `source` object in `value`, at any depth, is of type
-/// `url` or `file`. Keyed on the `source` field so prose that merely
-/// mentions those words never matches.
+/// `url` or `file`, or any block is a `container_upload`. Keyed on the
+/// `source` and `type` fields so prose that merely mentions those words
+/// never matches.
 fn has_unbounded_source(value: &serde_json::Value) -> bool {
     match value {
-        serde_json::Value::Object(map) => map.iter().any(|(key, child)| {
-            let is_unbounded = key == "source"
-                && child
-                    .get("type")
-                    .and_then(|t| t.as_str())
-                    .is_some_and(|t| t == "url" || t == "file");
-            is_unbounded || has_unbounded_source(child)
-        }),
+        serde_json::Value::Object(map) => {
+            map.get("type").and_then(|t| t.as_str()) == Some("container_upload")
+                || map.iter().any(|(key, child)| {
+                    let is_unbounded = key == "source"
+                        && child
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .is_some_and(|t| t == "url" || t == "file");
+                    is_unbounded || has_unbounded_source(child)
+                })
+        }
         serde_json::Value::Array(items) => items.iter().any(has_unbounded_source),
         _ => false,
     }
@@ -812,6 +820,17 @@ mod tests {
                 "{source_type}"
             );
         }
+    }
+
+    #[test]
+    fn a_container_upload_block_is_refused_even_when_nested() {
+        let body = serde_json::json!({"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "content": [{"type": "container_upload", "file_id": "f"}]}
+        ]}]});
+        assert!(matches!(
+            gap(body),
+            Some(EnforcementGap::UnboundedInput { .. })
+        ));
     }
 
     #[test]
