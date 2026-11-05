@@ -374,9 +374,10 @@ struct CodexEnrolment {
     owner_route: bool,
     hooks: codex_hooks_file::Inspection,
     trust: CodexTrustState,
-    /// Whether some `pricing_overrides` model id starts with `gpt`; `None`
-    /// when the budget file is not a valid one.
-    gpt_override: Option<bool>,
+    /// The `pricing_overrides` model ids that start with `gpt` (they take
+    /// precedence over the pinned OpenAI prices); `None` when the budget file
+    /// is not a valid one.
+    gpt_overrides: Option<Vec<String>>,
     probe: CodexProbe,
 }
 
@@ -466,13 +467,15 @@ fn codex_enrolment_findings() -> Vec<Finding> {
         .unwrap_or(CodexTrustState::Unknown(
             "could not resolve $CODEX_HOME".to_string(),
         ));
-    let gpt_override =
+    let gpt_overrides =
         match libra_governor_daemon::shared_budget_file::LoadedSharedBudget::load(&state_dir).state
         {
             libra_governor_daemon::shared_budget_file::SharedBudgetFileState::Valid(cfg) => Some(
                 cfg.pricing_overrides
                     .models()
-                    .any(|model| model.to_ascii_lowercase().starts_with("gpt")),
+                    .filter(|model| model.to_ascii_lowercase().starts_with("gpt"))
+                    .map(str::to_string)
+                    .collect(),
             ),
             _ => None,
         };
@@ -493,7 +496,7 @@ fn codex_enrolment_findings() -> Vec<Finding> {
         owner_route: agent_run::codex_owner_route_enabled(),
         hooks,
         trust,
-        gpt_override,
+        gpt_overrides,
         probe,
     })
 }
@@ -559,26 +562,14 @@ fn codex_findings_for(codex: &CodexEnrolment) -> Vec<Finding> {
         },
     });
 
-    // 3. Pricing: the pinned table prices no OpenAI model.
-    match codex.gpt_override {
-        Some(false) => findings.push(Finding {
-            id: "codex_pricing",
-            severity: Severity::Warn,
-            message: "no pricing_overrides entry for a gpt model in shared-budget.json, and the \
-                      pinned table prices no OpenAI model, so every Codex turn is booked at the \
-                      flat per-turn hold (unmeasured) and a long turn can cost more than it is \
-                      charged. Add a pricing_overrides entry for the Codex model id (this check \
-                      recognises ids that start with gpt)"
-                .to_string(),
-        }),
-        Some(true) => findings.push(Finding {
+    // 3. Pricing: which OpenAI models are priced (pinned list prices, then
+    // operator overrides on top) and which are not.
+    if let Some(overrides) = &codex.gpt_overrides {
+        findings.push(Finding {
             id: "codex_pricing",
             severity: Severity::Ok,
-            message: "a gpt pricing_overrides entry exists; a Codex model without a matching \
-                      entry still settles at the flat per-turn hold"
-                .to_string(),
-        }),
-        None => {}
+            message: codex_pricing_message(overrides),
+        });
     }
 
     // 4. The running daemon must actually honour Codex admission.
@@ -628,11 +619,41 @@ fn codex_findings_for(codex: &CodexEnrolment) -> Vec<Finding> {
                   than the 1 h hold expires and is settled later; subagent prompts and Stops \
                   are neither admitted nor settled; there is no Codex PreToolUse check; a prompt \
                   without a turn_id is admitted unmapped and its hold only expires; hooks run \
-                  only after the operator trusts them in /hooks; a Codex model with no pricing \
-                  entry settles at the flat hold"
+                  only after the operator trusts them in /hooks; a Codex model with no pinned or \
+                  overridden price settles at the flat hold"
             .to_string(),
     });
     findings
+}
+
+/// Pinned-price coverage for Codex models (C9): the pinned `gpt-*` ids and
+/// their source version, the operator's `gpt-*` overrides, and the honest
+/// statement that every other model id is unpriced.
+fn codex_pricing_message(gpt_overrides: &[String]) -> String {
+    let pinned: Vec<&str> = libra_governor_gateway::pricing::PricingTable::pinned_model_ids()
+        .filter(|id| id.starts_with("gpt"))
+        .collect();
+    let mut message = format!(
+        "Codex turns on these models are priced from the pinned OpenAI list prices ({}; standard \
+         tier, short context): {}. A prompt over 272K input tokens is billed higher by OpenAI and \
+         is under-counted",
+        shared_budget_view::pricing_version(),
+        pinned.join(", ")
+    );
+    if gpt_overrides.is_empty() {
+        message.push_str("; no gpt pricing_overrides entry is set");
+    } else {
+        message.push_str(&format!(
+            "; pricing_overrides take precedence for: {}",
+            gpt_overrides.join(", ")
+        ));
+    }
+    message.push_str(
+        ". Any other Codex model (for example gpt-5.6-* or a variant id such as \
+         gpt-6.1-sol-pro) is unpriced and settles at the flat per-turn hold, unmeasured, until \
+         a pricing_overrides entry names it",
+    );
+    message
 }
 
 fn invalid_config_finding(reason: &str) -> Finding {
@@ -2103,7 +2124,7 @@ mod tests {
                 hooks_wired: [true; 3],
             },
             trust: CodexTrustState::LikelyNotYetTrusted,
-            gpt_override: Some(true),
+            gpt_overrides: Some(vec!["gpt-5-codex".to_string()]),
             probe: CodexProbe::Answered("available".to_string()),
         }
     }
@@ -2198,22 +2219,41 @@ mod tests {
     }
 
     #[test]
-    fn no_gpt_pricing_override_warns_that_every_turn_books_the_flat_hold() {
+    fn without_a_gpt_override_the_pinned_openai_prices_are_reported_as_coverage() {
         let mut codex = enrolled();
-        codex.gpt_override = Some(false);
+        codex.gpt_overrides = Some(Vec::new());
         let findings = codex_findings_for(&codex);
         let f = by_id(&findings, "codex_pricing");
-        assert_eq!(f.severity, Severity::Warn, "{f:?}");
-        assert!(f.message.contains("pricing_overrides"), "{f:?}");
-        assert!(f.message.contains("flat"), "{f:?}");
+        assert_eq!(f.severity, Severity::Ok, "{f:?}");
+        assert!(f.message.contains("gpt-6.1-sol"), "{f:?}");
+        assert!(f.message.contains("gpt-5.3-codex"), "{f:?}");
+        assert!(
+            f.message
+                .contains(libra_governor_gateway::pricing::PRICING_VERSION),
+            "{f:?}"
+        );
+        assert!(f.message.contains("272K"), "{f:?}");
+        assert!(f.message.contains("no gpt pricing_overrides"), "{f:?}");
+        // The old claim that every turn books the flat hold must be gone.
+        assert!(!f.message.contains("every Codex turn"), "{f:?}");
+        assert!(f.message.contains("unpriced"), "{f:?}");
+    }
+
+    #[test]
+    fn a_gpt_override_is_named_as_taking_precedence_over_the_pins() {
         let findings = codex_findings_for(&enrolled());
-        assert_eq!(by_id(&findings, "codex_pricing").severity, Severity::Ok);
+        let f = by_id(&findings, "codex_pricing");
+        assert_eq!(f.severity, Severity::Ok, "{f:?}");
+        assert!(
+            f.message.contains("take precedence for: gpt-5-codex"),
+            "{f:?}"
+        );
     }
 
     #[test]
     fn an_unreadable_budget_file_makes_no_pricing_claim() {
         let mut codex = enrolled();
-        codex.gpt_override = None;
+        codex.gpt_overrides = None;
         let findings = codex_findings_for(&codex);
         assert!(
             findings.iter().all(|f| f.id != "codex_pricing"),

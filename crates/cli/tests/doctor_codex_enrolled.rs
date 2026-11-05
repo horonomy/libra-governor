@@ -332,18 +332,22 @@ fn a_hooks_state_section_is_unknown_not_trusted() {
 // ---------------------------------------------------------------------
 
 #[test]
-fn no_gpt_pricing_override_warns_even_with_the_daemon_down() {
+fn no_gpt_pricing_override_reports_pinned_coverage_even_with_the_daemon_down() {
     let env = Env::new(Some(""), true);
     let (severity, message) = env.doctor().expect("codex_pricing");
-    assert_eq!(severity, "warn", "{message}");
-    assert!(message.contains("flat"), "{message}");
+    assert_eq!(severity, "ok", "{message}");
+    assert!(message.contains("gpt-6.1-sol"), "{message}");
+    assert!(message.contains("pricing-"), "{message}");
+    assert!(!message.contains("every Codex turn"), "{message}");
 }
 
 #[test]
-fn a_non_gpt_override_does_not_count() {
+fn a_non_gpt_override_does_not_count_as_gpt_coverage() {
     let other = r#","pricing_overrides":{"claude-x":{"input_usd_per_mtok":1.0,"cache_creation_input_usd_per_mtok":1.0,"cache_read_input_usd_per_mtok":0.1,"output_usd_per_mtok":5.0}}"#;
     let env = Env::new(Some(other), true);
-    assert_eq!(env.doctor().expect("codex_pricing").0, "warn");
+    let (severity, message) = env.doctor().expect("codex_pricing");
+    assert_eq!(severity, "ok", "{message}");
+    assert!(message.contains("no gpt pricing_overrides"), "{message}");
 }
 
 #[test]
@@ -351,6 +355,10 @@ fn a_gpt_pricing_override_is_ok() {
     let env = Env::new(Some(GPT_OVERRIDE), true);
     let (severity, message) = env.doctor().expect("codex_pricing");
     assert_eq!(severity, "ok", "{message}");
+    assert!(
+        message.contains("take precedence for: gpt-5-codex"),
+        "{message}"
+    );
 }
 
 // ---------------------------------------------------------------------

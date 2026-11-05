@@ -113,8 +113,13 @@ C2 to C5 acceptance criteria are mapped to named tests in the evidence file
 - Codex subagents are neither admitted nor settled (known gap).
 - Codex has no mid-turn hold renewal here: a turn longer than the 1 h hold
   expires and is settled late by orphan recovery on partial measurement.
-- With no `gpt-*` pricing override configured, every Codex turn books the flat
-  hold, unmeasured, and is never trued up.
+- Codex turns are priced from the pinned OpenAI list prices (standard tier,
+  short context; `pricing-2026-11-static-v3`, source
+  <https://developers.openai.com/api/docs/pricing>, retrieved 2026-11-05) for
+  gpt-6.1-sol, gpt-6.1-terra, gpt-6-sol, gpt-6-astra, gpt-6-luna and gpt-5.3-codex; a `pricing_overrides` entry takes precedence. Any other Codex model
+  (including `gpt-5.6-*`) is unpriced: its turns book the flat hold,
+  unmeasured, and are never trued up. Prompts above 272K input tokens are
+  under-counted.
 - A long-lived daemon built before C3 rejects `SettleTurn`; an enrolled install
   is then ungated until the daemon restarts. `doctor` probes for this.
 
@@ -132,7 +137,7 @@ ticket-backed limit below stays open until its fix is merged and verified.
 | Repeat real-host flush-lag measurement not done | HORO-2246 |
 | Gateway path may under-count truncated streams (dark gateway only) | HORO-2286 |
 | Pool and account identity not bound to captured identity | HORO-2191 |
-| Pricing-table errors (1-hour cache tier, fast mode, geo multiplier under-counted; Haiku 5.5 over-counted); pricing lookup is longest-prefix, so a newer model id that shares a listed prefix is priced at the older entry instead of the flat hold (error bounded by the price gap, either direction) | ADR-0026; HORO-2366 |
+| Pricing-table errors (1-hour cache tier, fast mode, geo multiplier under-counted; Haiku 5.5 over-counted); Codex prompts above 272K input tokens under-counted (no long-context tier) | ADR-0026; C9 |
 | Optional gateway (off by default, dark): `gateway token` ignores a configured `gateway.token_path` (fails closed, the gateway rejects the token); the `doctor` config check only says `config.json` parses; it does not validate `bind_addr` or flag unknown keys (the gateway itself still refuses a non-loopback bind at start); the in-product NOT_COVERED text says gateway `governor_held` "is not built" where it means not connected to the monthly budget; pass-through mode has no local token by design (the provider adjudicates the caller's own credential) | follow-ups HORO-2363, HORO-2364, HORO-2365; not v0.0.5 acceptance items |
 | The `amount_too_large` ceiling (one charge above ten times the monthly cap) applies to explicit per-charge requests and extra charges. The end-of-turn settlement of a turn's hold from measured transcript or rollout usage has a separate ceiling (HORO-2350, #295): a measured figure at or under ten times the monthly cap (never below $1,000) is booked in full; a strictly larger one is treated as implausible and the turn settles at its hold, unmeasured (`usage_implausible`, logged to `daemon.log`). A corrupt or hostile transcript can therefore still inflate the ledger by up to that ceiling in one turn (bounded, not unlimited); within the documented same-user trust boundary. Fixed in v0.0.5 for the 1e15-token case; the v0.0.4 behaviour is unchanged | HORO-2350 (wording corrections from the same QA: HORO-2349) |
 | A Claude `SessionEnd` with no preceding `Stop` settles that lane's pending hold (HORO-2440): measured usage when the transcript is readable, otherwise the hold amount booked as not measured; an expired hold books measured usage only. A late `Stop` or duplicate `SessionEnd` books nothing more, and other sessions' holds are untouched. A killed host (no `SessionEnd`) still holds until `HOLD_TTL_SECS` = 3600 s | fixed by HORO-2440; was QA3-D1 / v0.0.4 erratum E7 |
