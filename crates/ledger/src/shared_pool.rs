@@ -2375,7 +2375,10 @@ impl LedgerStore {
     /// booked: it becomes `settled` at its reserved amount with
     /// `usage_known = 0`, so its capacity is never freed unaccounted
     /// (HORO-2275). The returned rows are every row the sweep resolved, in
-    /// their new state (`expired` or `settled`).
+    /// their new state (`expired` or `settled`). The reserved amount is the
+    /// gateway's worst-case bound for the request, so a settle that arrives
+    /// after this booking is `AlreadyFinal` and its smaller real figure is
+    /// not recorded (the booking over-counts, never under-counts).
     pub fn expire_stale_shared_pool_reservations(
         &mut self,
         now: OffsetDateTime,
@@ -2450,11 +2453,22 @@ impl LedgerStore {
     /// irrelevant (the owning process is gone), and a second run finds
     /// nothing. Never frees capacity; a late settle from a draining old
     /// process reports `AlreadyFinal`.
+    ///
+    /// One gateway process per ledger is assumed: the sweep is global, so a
+    /// second live gateway on the same ledger would have its holds booked as
+    /// orphans. A `boot_prefix_keep` that is not shaped `gw:<id>:` sweeps
+    /// nothing, so a malformed prefix can never book a live hold.
     pub fn settle_orphaned_gateway_holds(
         &mut self,
         boot_prefix_keep: &str,
         now: OffsetDateTime,
     ) -> Result<Vec<SharedPoolReservation>, LedgerError> {
+        let well_formed = boot_prefix_keep.len() > "gw::".len()
+            && boot_prefix_keep.starts_with("gw:")
+            && boot_prefix_keep.ends_with(':');
+        if !well_formed {
+            return Ok(Vec::new());
+        }
         let now_str = rfc3339(now)?;
         let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
         let ids: Vec<String> = {
