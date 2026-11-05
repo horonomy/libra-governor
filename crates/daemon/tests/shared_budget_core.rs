@@ -38,6 +38,12 @@ fn cfg_json(cap: u64, tz: &str, hold: u64) -> String {
     )
 }
 
+fn with_enforcement(value: &str) -> String {
+    format!(
+        r#"{{"schema_version":1,"monthly_cap_usd_cents":10000,"time_zone":"UTC","enforcement":{value}}}"#
+    )
+}
+
 fn cfg_json_soft(cap: u64, tz: &str, hold: u64, per_session: u64, per_agent: u64) -> String {
     format!(
         r#"{{"schema_version":1,"monthly_cap_usd_cents":{cap},"time_zone":"{tz}","turn_hold_usd_cents":{hold},
@@ -291,6 +297,18 @@ const JAN: &str = "2027-01-15T12:00:00Z";
 // ---------------------------------------------------------------------
 
 #[test]
+fn the_enforcement_mode_changes_nothing_for_the_hook_path() {
+    let mut grants = Vec::new();
+    for value in [r#""hooks""#, r#""gateway""#] {
+        let mut fx = Fx::new(Some(&with_enforcement(value)), JAN);
+        let g = grant(fx.admit("s1", None, Some("p1")));
+        grants.push((g.hold, g.remaining, g.kind, g.warnings.len()));
+    }
+    assert_eq!(grants[0], grants[1]);
+    assert_eq!(grants[0].0, 1_000);
+}
+
+#[test]
 fn no_file_means_the_budget_path_is_not_consulted_and_nothing_is_written() {
     let mut fx = Fx::new(None, JAN);
     let before = fx.fingerprint();
@@ -373,6 +391,10 @@ fn every_invalid_file_denies_config_invalid_and_creates_nothing() {
         r#"{"schema_version":1,"monthly_cap_usd_cents":100,"time_zone":"UTC","soft_limits":{"per_agent_usd_cents":0}}"#.into(),
         r#"{"schema_version":1,"monthly_cap_usd_cents":100,"time_zone":"UTC","soft_limits":{"per_session_usd_cents":-4}}"#.into(),
         r#"{"schema_version":9,"monthly_cap_usd_cents":100,"time_zone":"UTC"}"#.into(),
+        with_enforcement(r#""proxy""#),
+        with_enforcement(r#""Gateway""#),
+        with_enforcement(r#""""#),
+        with_enforcement("7"),
     ];
     for json in bad {
         let mut fx = Fx::new(Some(&json), JAN);
