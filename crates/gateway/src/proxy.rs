@@ -925,6 +925,10 @@ async fn metered_request(
                     Decision::UnenforceableRequest,
                     "the request declares no positive max_tokens, so its cost has no upper bound",
                 ),
+                EnforcementGap::UnboundedInput { .. } => (
+                    Decision::UnenforceableRequest,
+                    "the request references input the gateway cannot bound from its body",
+                ),
                 EnforcementGap::UnsupportedResourceKind { .. } => (
                     Decision::UnenforceableRequest,
                     "this task's budget is denominated in a unit that cannot be derived from \

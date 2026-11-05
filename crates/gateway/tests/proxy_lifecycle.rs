@@ -15,6 +15,9 @@ mod fake_upstream;
 use fake_upstream::*;
 use hyper::StatusCode;
 use libra_governor_domain::{ResourceAmount, ResourceKind};
+use libra_governor_gateway::cost::{settle_amount_for, SettleFlags};
+use libra_governor_gateway::pricing::PricingTable;
+use libra_governor_gateway::usage::UsageAccumulator;
 
 const SESSION: &str = "x-claude-code-session-id";
 
@@ -725,4 +728,140 @@ fn a_provenance_row_never_carries_a_body_or_a_credential() {
             "the upstream credential reached a provenance row"
         );
     }
+}
+
+// --- S11b: shared-budget settlement rules, exercised on real stream bytes.
+// The functions are dark: nothing on the task path calls them, which the
+// last two tests pin.
+
+/// Feeds `stream` through the same tap the pump uses and settles it by the
+/// shared-path rules against a 5 000-token reservation.
+fn shared_settle(
+    stream: &str,
+    completed_cleanly_expected: bool,
+) -> (ResourceAmount, bool, SettleFlags) {
+    let mut accumulator = UsageAccumulator::new();
+    accumulator.feed(stream.as_bytes());
+    assert_eq!(accumulator.completed_cleanly(), completed_cleanly_expected);
+    settle_amount_for(
+        accumulator.observed(),
+        accumulator.completed_cleanly(),
+        accumulator.saw_message_start(),
+        ResourceAmount::Tokens(5_000),
+        1_000,
+        10_000,
+        ResourceKind::Tokens,
+        "claude-sonnet-4-5",
+        &PricingTable::pinned(),
+    )
+}
+
+#[test]
+fn a_truncated_sse_stream_settles_at_input_plus_max_tokens_not_the_partial_17() {
+    let (amount, usage_known, flags) = shared_settle(CANNED_SSE_TRUNCATED, false);
+    assert_eq!(amount, ResourceAmount::Tokens(120 + 1_000));
+    assert!(!usage_known);
+    assert!(flags.truncated_settle);
+}
+
+#[test]
+fn a_client_drop_right_after_message_start_settles_the_same_way() {
+    // The pump stops reading the moment the client hangs up; the
+    // accumulator has then seen only the frames that were relayed.
+    let message_start_only = CANNED_SSE_TRUNCATED
+        .split("\n\n")
+        .next()
+        .map(|frame| format!("{frame}\n\n"))
+        .unwrap();
+    let (amount, usage_known, flags) = shared_settle(&message_start_only, false);
+    assert_eq!(amount, ResourceAmount::Tokens(120 + 1_000));
+    assert!(!usage_known);
+    assert!(flags.truncated_settle);
+}
+
+#[test]
+fn a_stream_cut_before_message_start_settles_at_the_full_reservation() {
+    let (amount, usage_known, flags) =
+        shared_settle("event: ping\ndata: {\"type\":\"ping\"}\n\n", false);
+    assert_eq!(amount, ResourceAmount::Tokens(5_000));
+    assert!(!usage_known);
+    assert!(!flags.truncated_settle);
+}
+
+#[test]
+fn a_completed_stream_still_settles_at_the_exact_usage_on_the_shared_path() {
+    let (amount, usage_known, flags) = shared_settle(CANNED_SSE, true);
+    assert_eq!(amount, ResourceAmount::Tokens(150));
+    assert!(usage_known);
+    assert_eq!(flags, SettleFlags::default());
+}
+
+#[test]
+fn with_the_shared_mode_absent_the_truncated_task_path_ledger_diff_is_unchanged() {
+    let rt = runtime();
+    let gw = start_test_gateway(TestGatewayOptions::default());
+    let body = messages_body("claude-sonnet-4-5", Some(1_000), true);
+    let expected_reserved = (body.len() as f64 / 3.0).ceil() as u64 + 1_000;
+
+    send(
+        &rt,
+        gw.addr,
+        "POST",
+        "/v1/messages",
+        &authorized_headers(&gw.token, "truncated"),
+        &body,
+    );
+    wait_until(
+        || gw.recorder.records().len() == 1,
+        "the pump's provenance row, which is written after settling",
+    );
+
+    // The whole ledger diff: one reservation, one settlement at the
+    // partial figure, nothing else — and no shared-path counter moved.
+    let calls = gw.authority.calls();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert!(matches!(
+        &calls[0],
+        AuthorityCall::Authorize { amount, .. } if *amount == ResourceAmount::Tokens(expected_reserved)
+    ));
+    assert!(matches!(
+        &calls[1],
+        AuthorityCall::Settle {
+            actual: Some(ResourceAmount::Tokens(137)),
+            ..
+        }
+    ));
+    let snapshot = gw.stats.snapshot();
+    assert_eq!(snapshot.truncated_settles, 0);
+    assert_eq!(snapshot.input_bound_violations, 0);
+    assert!(gw.recorder.records()[0].usage_known);
+}
+
+#[test]
+fn with_the_shared_mode_absent_a_server_tool_body_is_still_authorized_and_forwarded() {
+    let rt = runtime();
+    let gw = start_test_gateway(TestGatewayOptions::default());
+    let body = serde_json::to_vec(&serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 100,
+        "stream": true,
+        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+        "messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}}
+        ]}],
+    }))
+    .unwrap();
+
+    let response = send(
+        &rt,
+        gw.addr,
+        "POST",
+        "/v1/messages",
+        &authorized_headers(&gw.token, "sse"),
+        &body,
+    );
+
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(gw.authority.authorize_count(), 1);
+    assert_eq!(gw.upstream.received().len(), 1);
 }

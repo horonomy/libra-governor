@@ -66,6 +66,12 @@ pub enum EnforcementGap {
     /// entry for this model, and the budget is denominated in currency.
     #[error("model {model} has no pinned price, so a USD budget cannot be enforced against it")]
     UnpricedModel { model: String },
+    /// The request references input the gateway cannot bound from the
+    /// body: a server tool, a url- or file-sourced block, an MCP server
+    /// or a container. Only the shared-budget (governor-held) mode
+    /// refuses on this (S11b).
+    #[error("request references {what}, so its input has no finite upper bound")]
+    UnboundedInput { what: &'static str },
 }
 
 /// Upper bound on the input tokens a request body of `body_bytes` can
@@ -171,6 +177,162 @@ fn exact_usd(usage: &ObservedUsage, pricing: &ModelPricing) -> f64 {
 /// `gateway_requests.bound_violated`.
 pub fn bound_violated(max_tokens: u64, observed_output_tokens: u64) -> bool {
     observed_output_tokens > max_tokens
+}
+
+/// Pre-flight input-token ceiling for the shared-budget (governor-held)
+/// mode, where an overrun is a breach of the cap rather than a statusline
+/// note.
+///
+/// # Contract
+/// - `bytes` excludes inline base64 `source.data` payloads; those are
+///   billed by rendering, not bytes, and are covered by `image_count`.
+/// - Byte-level BPE yields at least one byte per token [I], so `bytes`
+///   itself is the ceiling, against the heuristic `bytes / 3` of
+///   [`input_token_upper_bound`].
+/// - `image_count` blocks each add [`IMAGE_MAX_TOKENS`].
+/// - [`TOOL_PROMPT_TOKENS`] is always added for the API's tool-use system
+///   prompt, which is not in the body.
+pub fn hard_input_upper_bound(bytes: usize, image_count: usize) -> u64 {
+    (bytes as u64)
+        .saturating_add((image_count as u64).saturating_mul(IMAGE_MAX_TOKENS))
+        .saturating_add(TOOL_PROMPT_TOKENS)
+}
+
+/// Per-image input ceiling. [I] until S11a pins it from the API docs.
+pub const IMAGE_MAX_TOKENS: u64 = 8_000;
+
+/// Allowance for the tool-use system prompt the API prepends. [I] until
+/// S11a pins it.
+pub const TOOL_PROMPT_TOKENS: u64 = 1_000;
+
+/// Refuses a body whose input cannot be bounded from its own bytes
+/// (S11b): server tools (`web_search_*`, `web_fetch_*`,
+/// `code_execution_*`), a `url` or `file` content source, `mcp_servers`
+/// a `container`, or a `container_upload` block (a Files-API reference
+/// with no `source`). Returns the first gap found.
+///
+/// The list is closed: a server-tool or block type added upstream passes
+/// until it is named here, so S11a must re-check it against the API docs.
+///
+/// Structural only — nothing from the body is retained. A body that does
+/// not parse as JSON returns `None`: envelope parsing already refuses it
+/// and this is not the place to repeat that decision.
+pub fn screen_unbounded_inputs(body: &[u8]) -> Option<EnforcementGap> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let unbounded = |what| Some(EnforcementGap::UnboundedInput { what });
+
+    let server_tool = |tool: &serde_json::Value| {
+        tool.get("type").and_then(|t| t.as_str()).is_some_and(|t| {
+            ["web_search_", "web_fetch_", "code_execution_"]
+                .iter()
+                .any(|prefix| t.starts_with(prefix))
+        })
+    };
+    if value
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .is_some_and(|tools| tools.iter().any(server_tool))
+    {
+        return unbounded("a server tool");
+    }
+    if value
+        .get("mcp_servers")
+        .and_then(|m| m.as_array())
+        .is_some_and(|servers| !servers.is_empty())
+    {
+        return unbounded("an MCP server");
+    }
+    if value.get("container").is_some_and(|c| !c.is_null()) {
+        return unbounded("a container");
+    }
+    has_unbounded_source(&value).then_some(EnforcementGap::UnboundedInput {
+        what: "a url or file content source",
+    })
+}
+
+/// `true` if any `source` object in `value`, at any depth, is of type
+/// `url` or `file`, or any block is a `container_upload`. Keyed on the
+/// `source` and `type` fields so prose that merely mentions those words
+/// never matches.
+fn has_unbounded_source(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.get("type").and_then(|t| t.as_str()) == Some("container_upload")
+                || map.iter().any(|(key, child)| {
+                    let is_unbounded = key == "source"
+                        && child
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .is_some_and(|t| t == "url" || t == "file");
+                    is_unbounded || has_unbounded_source(child)
+                })
+        }
+        serde_json::Value::Array(items) => items.iter().any(has_unbounded_source),
+        _ => false,
+    }
+}
+
+/// Flags raised while settling a shared-budget request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SettleFlags {
+    /// The stream ended without `message_stop` and was settled at the
+    /// conservative amount.
+    pub truncated_settle: bool,
+    /// Reported prompt tokens exceeded the pre-flight input bound.
+    pub input_bound_violated: bool,
+}
+
+/// What a shared-budget request settles at (S11b). Pure: the caller owns
+/// the stats counters and the ledger call.
+///
+/// - Completed cleanly with usage: the exact tiers, `usage_known = true`.
+/// - Cut off after `message_start` usage: the exact input tiers plus
+///   `max_tokens` of output (the provider may have produced all of it
+///   unseen), `usage_known = false`, `truncated_settle`.
+/// - Cut off before any usage, or a model/kind that cannot be priced:
+///   `reserved`, `usage_known = false`.
+///
+/// `input_bound` is the token ceiling the reservation assumed; reported
+/// prompt tokens above it set `input_bound_violated`. The amount is never
+/// clamped to `reserved`, so an overrun stays visible.
+#[allow(clippy::too_many_arguments)]
+pub fn settle_amount_for(
+    observed: Option<ObservedUsage>,
+    completed_cleanly: bool,
+    saw_message_start: bool,
+    reserved: ResourceAmount,
+    max_tokens: u64,
+    input_bound: u64,
+    kind: ResourceKind,
+    model: &str,
+    pricing: &PricingTable,
+) -> (ResourceAmount, bool, SettleFlags) {
+    let mut flags = SettleFlags::default();
+    let Some(usage) = observed else {
+        return (reserved, false, flags);
+    };
+    let prompt_tokens = usage
+        .input_tokens
+        .saturating_add(usage.cache_creation_input_tokens)
+        .saturating_add(usage.cache_read_input_tokens);
+    flags.input_bound_violated = prompt_tokens > input_bound;
+
+    let (priced, usage_known) = if completed_cleanly {
+        (usage, true)
+    } else if saw_message_start {
+        flags.truncated_settle = true;
+        let worst_case_output = ObservedUsage {
+            output_tokens: usage.output_tokens.max(max_tokens),
+            ..usage
+        };
+        (worst_case_output, false)
+    } else {
+        return (reserved, false, flags);
+    };
+    match settled_cost(kind, &priced, model, pricing) {
+        Ok(amount) => (amount, usage_known, flags),
+        Err(_) => (reserved, false, flags),
+    }
 }
 
 #[cfg(test)]
@@ -427,5 +589,268 @@ mod tests {
         assert!(!bound_violated(1_000, 1_000));
         assert!(!bound_violated(1_000, 999));
         assert!(bound_violated(1_000, 1_001));
+    }
+
+    // --- S11b: shared-budget settlement rules and input screening ---
+
+    fn sonnet() -> &'static str {
+        "claude-sonnet-4-5"
+    }
+
+    fn settle(
+        observed: Option<ObservedUsage>,
+        completed_cleanly: bool,
+        saw_message_start: bool,
+        kind: ResourceKind,
+    ) -> (ResourceAmount, bool, SettleFlags) {
+        let reserved = match kind {
+            ResourceKind::Tokens => ResourceAmount::Tokens(5_000),
+            _ => ResourceAmount::UsdCents(500),
+        };
+        settle_amount_for(
+            observed,
+            completed_cleanly,
+            saw_message_start,
+            reserved,
+            1_000,
+            2_000,
+            kind,
+            sonnet(),
+            &PricingTable::pinned(),
+        )
+    }
+
+    #[test]
+    fn a_truncated_stream_settles_at_input_plus_max_tokens_output() {
+        let (amount, usage_known, flags) = settle(
+            Some(usage(120, 0, 0, 17)),
+            false,
+            true,
+            ResourceKind::Tokens,
+        );
+        assert_eq!(amount, ResourceAmount::Tokens(120 + 1_000));
+        assert!(!usage_known);
+        assert!(flags.truncated_settle);
+    }
+
+    #[test]
+    fn a_truncated_usd_settlement_prices_max_tokens_of_output() {
+        let (amount, _, _) = settle(Some(usage(120, 0, 0, 17)), false, true, ResourceKind::Usd);
+        let expected = settled_cost(
+            ResourceKind::Usd,
+            &usage(120, 0, 0, 1_000),
+            sonnet(),
+            &PricingTable::pinned(),
+        )
+        .unwrap();
+        assert_eq!(amount, expected);
+    }
+
+    #[test]
+    fn a_stream_with_no_message_start_settles_at_the_reservation() {
+        let (amount, usage_known, flags) = settle(None, false, false, ResourceKind::Tokens);
+        assert_eq!(amount, ResourceAmount::Tokens(5_000));
+        assert!(!usage_known);
+        assert!(!flags.truncated_settle, "nothing was observed to truncate");
+    }
+
+    #[test]
+    fn message_start_without_usable_usage_settles_at_the_reservation() {
+        let (amount, usage_known, _) = settle(None, false, true, ResourceKind::Tokens);
+        assert_eq!(amount, ResourceAmount::Tokens(5_000));
+        assert!(!usage_known);
+    }
+
+    #[test]
+    fn a_clean_completion_settles_at_the_exact_observed_usage() {
+        let (amount, usage_known, flags) =
+            settle(Some(usage(120, 0, 0, 30)), true, true, ResourceKind::Tokens);
+        assert_eq!(amount, ResourceAmount::Tokens(150));
+        assert!(usage_known);
+        assert_eq!(flags, SettleFlags::default());
+    }
+
+    #[test]
+    fn a_completion_that_reported_more_output_than_max_tokens_is_not_clamped() {
+        let (amount, usage_known, _) = settle(
+            Some(usage(120, 0, 0, 5_000)),
+            true,
+            true,
+            ResourceKind::Tokens,
+        );
+        assert_eq!(amount, ResourceAmount::Tokens(5_120));
+        assert!(usage_known);
+    }
+
+    #[test]
+    fn a_truncated_stream_that_already_exceeded_max_tokens_keeps_the_larger_output() {
+        let (amount, _, _) = settle(
+            Some(usage(120, 0, 0, 5_000)),
+            false,
+            true,
+            ResourceKind::Tokens,
+        );
+        assert_eq!(amount, ResourceAmount::Tokens(5_120));
+    }
+
+    #[test]
+    fn an_unpriced_model_for_a_usd_budget_settles_at_the_reservation() {
+        let (amount, usage_known, _) = settle_amount_for(
+            Some(usage(120, 0, 0, 30)),
+            true,
+            true,
+            ResourceAmount::UsdCents(500),
+            1_000,
+            2_000,
+            ResourceKind::Usd,
+            "an-utterly-unknown-model",
+            &PricingTable::pinned(),
+        );
+        assert_eq!(amount, ResourceAmount::UsdCents(500));
+        assert!(!usage_known);
+    }
+
+    #[test]
+    fn emoji_dense_input_above_the_heuristic_bound_flags_an_input_bound_violation() {
+        // 300 emoji are 1200 bytes: the 3-bytes-per-token heuristic
+        // allows 400 tokens, and a tokenizer can charge more than that.
+        let body_bytes = "\u{1F600}".repeat(300).len();
+        let heuristic = input_token_upper_bound(body_bytes);
+        let (_, _, flags) = settle_amount_for(
+            Some(usage(heuristic + 1, 0, 0, 30)),
+            true,
+            true,
+            ResourceAmount::Tokens(5_000),
+            1_000,
+            heuristic,
+            ResourceKind::Tokens,
+            sonnet(),
+            &PricingTable::pinned(),
+        );
+        assert!(flags.input_bound_violated);
+
+        // Negative control: the same usage is inside the hard bound.
+        let (_, _, flags) = settle_amount_for(
+            Some(usage(heuristic + 1, 0, 0, 30)),
+            true,
+            true,
+            ResourceAmount::Tokens(5_000),
+            1_000,
+            hard_input_upper_bound(body_bytes, 0),
+            ResourceKind::Tokens,
+            sonnet(),
+            &PricingTable::pinned(),
+        );
+        assert!(!flags.input_bound_violated);
+    }
+
+    #[test]
+    fn cache_tiers_count_toward_the_input_bound() {
+        let (_, _, flags) = settle_amount_for(
+            Some(usage(10, 1_000, 1_000, 30)),
+            true,
+            true,
+            ResourceAmount::Tokens(5_000),
+            1_000,
+            1_500,
+            ResourceKind::Tokens,
+            sonnet(),
+            &PricingTable::pinned(),
+        );
+        assert!(flags.input_bound_violated);
+    }
+
+    #[test]
+    fn the_hard_input_bound_is_one_token_per_byte_plus_image_and_tool_allowances() {
+        assert_eq!(hard_input_upper_bound(0, 0), TOOL_PROMPT_TOKENS);
+        assert_eq!(hard_input_upper_bound(900, 0), 900 + TOOL_PROMPT_TOKENS);
+        assert_eq!(
+            hard_input_upper_bound(900, 2),
+            900 + 2 * IMAGE_MAX_TOKENS + TOOL_PROMPT_TOKENS
+        );
+        assert!(hard_input_upper_bound(900, 0) > input_token_upper_bound(900));
+    }
+
+    fn gap(body: serde_json::Value) -> Option<EnforcementGap> {
+        screen_unbounded_inputs(&serde_json::to_vec(&body).unwrap())
+    }
+
+    #[test]
+    fn a_plain_body_and_a_base64_image_pass_the_screen() {
+        assert_eq!(
+            gap(serde_json::json!({
+                "model": "m", "max_tokens": 5,
+                "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "hi"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+                ]}]
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn a_web_search_server_tool_is_refused() {
+        for tool_type in [
+            "web_search_20250305",
+            "web_fetch_20250910",
+            "code_execution_20250522",
+        ] {
+            assert!(
+                matches!(
+                    gap(serde_json::json!({"tools": [{"type": tool_type, "name": "t"}]})),
+                    Some(EnforcementGap::UnboundedInput { .. })
+                ),
+                "{tool_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_url_or_file_sourced_block_is_refused_even_when_nested() {
+        for source_type in ["url", "file"] {
+            let body = serde_json::json!({"messages": [{"role": "user", "content": [
+                {"type": "tool_result", "content": [
+                    {"type": "image", "source": {"type": source_type, "url": "https://x"}}
+                ]}
+            ]}]});
+            assert!(
+                matches!(gap(body), Some(EnforcementGap::UnboundedInput { .. })),
+                "{source_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_container_upload_block_is_refused_even_when_nested() {
+        let body = serde_json::json!({"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "content": [{"type": "container_upload", "file_id": "f"}]}
+        ]}]});
+        assert!(matches!(
+            gap(body),
+            Some(EnforcementGap::UnboundedInput { .. })
+        ));
+    }
+
+    #[test]
+    fn mcp_servers_and_a_container_are_refused() {
+        assert!(gap(serde_json::json!({"mcp_servers": [{"name": "m"}]})).is_some());
+        assert!(gap(serde_json::json!({"container": "c"})).is_some());
+        assert_eq!(gap(serde_json::json!({"mcp_servers": []})), None);
+    }
+
+    #[test]
+    fn text_that_merely_mentions_a_server_tool_is_not_refused() {
+        assert_eq!(
+            gap(serde_json::json!({"messages": [{"role": "user",
+                "content": "use web_search_20250305 with a url source"}]})),
+            None
+        );
+    }
+
+    #[test]
+    fn a_body_that_is_not_json_is_left_to_envelope_parsing() {
+        assert_eq!(screen_unbounded_inputs(b"not json"), None);
     }
 }
