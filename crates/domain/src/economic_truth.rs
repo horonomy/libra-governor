@@ -347,9 +347,9 @@ pub struct CustodyNode {
     pub exclusive: SpendSoFar,
     /// Cross-references the provider-proven agent-lineage forest for
     /// this node — see module docs on why this is never unified with
-    /// the custody edge itself. `NotRecorded` in v0.0.3 for every real
-    /// account: nothing persists an `ExecutionIdentity` envelope on the
-    /// daemon path yet (see
+    /// the custody edge itself. `NotRecorded` for legacy accounts. A new
+    /// account records `Unknown` until a caller passes an `ExecutionIdentity`
+    /// at its first creation, which nothing on the daemon path does yet (see
     /// `crate::resource_account::ResourceAccount::provider_lineage_status`'s
     /// own doc comment). Reconstructing the full forest (not just this
     /// node's own recorded status) is out of scope for HORO-1672 — see

@@ -67,7 +67,8 @@ const NOT_COVERED_CODEX_ENROLLED: [&str; 4] = [
      prompts and Stops are neither admitted nor settled, there is no Codex PreToolUse check and \
      no Codex heartbeat, a prompt without a turn_id is admitted unmapped, Codex hooks the \
      operator has not trusted in /hooks do not run (that install is ungated), and a Codex model \
-     with no pricing_overrides entry settles at the flat per-turn hold, unmeasured",
+     with neither a pinned OpenAI price nor a pricing_overrides entry settles at the flat \
+     per-turn hold, unmeasured",
     NOT_COVERED[2],
     NOT_COVERED[3],
 ];

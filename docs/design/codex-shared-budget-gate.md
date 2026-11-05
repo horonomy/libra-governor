@@ -51,7 +51,7 @@ binary (sandboxed, no auth). **V-fix**: a real serializer output fixture. **I**:
 | The final `token_usage_record` may still sit in the rollout writer's mpsc channel at Stop (undetectable under-count) | V-src | codex_turn.rs:63-118; `docs/execution-owner-contract.md:133-144` |
 | `output_tokens` includes `reasoning_output_tokens`; `cached_input <= input` | V-fix + reader invariant | codex_turn.rs:225-258 |
 | Rollout usage records carry **no `model`** | V-fix (no model field in fixture) | fixture lines 2, 6 |
-| Pinned pricing table has **no OpenAI models** | V (code) | `crates/gateway/src/pricing.rs:41,97-255` |
+| Pinned pricing table had **no OpenAI models** (C9 adds six, see section 4) | V (code) | `crates/gateway/src/pricing.rs:41,97-255` |
 | Hook `turn_id` (UserPromptSubmit and Stop) == rollout `token_usage_record.turn_id` | **U** (I: same id space) | fixtures use synthetic `turn-1` (`crates/cli/tests/fixtures/agent/codex/*.json`) |
 | UserPromptSubmit `turn_id` == Stop `turn_id` for the same turn | **U** (I) | docs call both "active Codex turn id" |
 | Hook `session_id` == rollout `session_id`/`thread_id` | **U** (I; the fixture has session_id == thread_id) | fixture line 2 |
@@ -201,10 +201,16 @@ Daemon `settle_codex_turn` (it deliberately differs from Claude's `settle_turn` 
 | Invalid config file at Stop | hold amount; overrides not used | false | `config_invalid` |
 | No hold mapped to this `turn_id`, enrolled, budget valid (admission skipped, a subagent Stop, or the hold already reclaimed) | **post-hoc charge** of the measured cents (else the hold amount) via `book_charge`, key `codex-turn:<lane>|<turn_id>`, executor `agent_absent`, `charge_source=turn_hold`, `is_charge=1` | as measured | `unadmitted_turn` |
 
-**Default honesty.** With no `pricing_overrides` for `gpt-*` models, **every Codex turn settles at the flat
-hold with `usage_known=false`**. `status`/`doctor` must say so. Adding OpenAI list prices to the pinned table
-needs a cited price source and a `PRICING_VERSION` bump. It is a separate ticket and must not use invented
-numbers.
+**Pricing (C9, delivered).** The pinned table now lists six OpenAI models from the OpenAI pricing page
+<https://developers.openai.com/api/docs/pricing> (retrieved 2026-11-05, no update date on the page; standard tier,
+short context <=272K input tokens): gpt-6.1-sol, gpt-6.1-terra, gpt-6-sol, gpt-6-astra, gpt-6-luna,
+gpt-5.3-codex (`PRICING_VERSION` `pricing-2026-11-static-v3`). Cache creation is priced as input (OpenAI has no
+cache-write surcharge). `gpt-5.6-*` is not pinned (promotional Sol price until 2026-11-30). Lookup matches a
+pinned or override id exactly or with a `-YYYYMMDD` suffix only (HORO-2366), so `gpt-6.1-sol-pro` is unpriced.
+A model that is neither pinned nor overridden settles at the flat hold with `usage_known=false`, and
+`status`/`doctor` must say so. Prompts above 272K input tokens are billed higher by OpenAI and `ModelPricing` has
+no tier for that: those turns are under-counted. A turn-level flag was not added because `TurnUsage` sums many
+model calls, so a turn's total input says nothing about any single prompt's size.
 
 **Idempotency.**
 - Hold settle is once per reservation (`AlreadyFinal`).
@@ -260,7 +266,7 @@ numbers.
   horizon applied.
 - Status/doctor: the per-executor table shows Codex lanes, and the pool total reconciles across providers.
   `NOT_COVERED` is reworded from "Codex has no budget gate" to the remaining Codex gaps: subagents; untrusted
-  hooks are ungated; no PreToolUse check; unpriced by default.
+  hooks are ungated; no PreToolUse check; models outside the pinned list unpriced.
 
 ## 6. Decision levels: what needs the founder, what is engineering, what ships dark
 
@@ -470,7 +476,7 @@ Each slice is one PR of about 500 lines or less, merged with a merge commit.
 3. **Silent ungating.** Untrusted or re-hashed hooks do not run at all, and plain `doctor` cannot prove trust.
 4. **Overshoot is larger than Claude's.** Long agentic turns overshoot the per-turn hold. The cooperative
    label covers this, but the operator must size the hold.
-5. **Unpriced by default.** Until overrides or C9, accounting is flat-hold-per-turn.
+5. **Unpriced outside the pinned list.** Pinned OpenAI models (C9) are priced; any other model, and every prompt above 272K input tokens (under-counted), is not accounted at list price.
 6. **Subagents** are not covered, and C6 carries a double-count risk.
 7. Heartbeat depends on `PostToolUse` (async). A tool-free turn longer than 1 h expires its hold; C4
    recovers it late.

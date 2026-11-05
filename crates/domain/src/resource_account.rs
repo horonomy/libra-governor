@@ -245,16 +245,18 @@ pub struct ResourceAccount {
     pub task_id: Option<TaskId>,
     pub authority_source: Option<AllocationAuthority>,
     pub enforcement_scope: EnforcementScope,
-    /// Recorded from an [`crate::ExecutionIdentity`] when one is
-    /// genuinely available. Today this is always `None` from the daemon
-    /// path — nothing persists or transmits the envelope yet (see
-    /// ADR-0008) — and it is NEVER used to construct a tree edge; the
-    /// edge comes only from the act of leasing.
+    /// Recorded when the account row is created: the captured
+    /// [`crate::ExecutionIdentity`]'s lineage status, or
+    /// [`crate::LineageStatus::Unknown`] when no identity was provided. `None`
+    /// only for a legacy row created before this was recorded (migration
+    /// 0011's backfill, never rewritten). It is NEVER used to construct a
+    /// tree edge; the edge comes only from the act of leasing.
     pub provider_lineage_status: Option<crate::LineageStatus>,
-    /// The narrowest [`crate::DimensionKey`] an [`crate::ExecutionIdentity`]
-    /// proved for this account, serialized, when available. `None` is the
-    /// honest representation of [`crate::UnknownReason::NotExposedByProvider`]
-    /// — never faked.
+    /// The narrowest [`crate::DimensionKey`] a captured
+    /// [`crate::ExecutionIdentity`] proved for this account, serialized.
+    /// `None` when no identity was provided or the row is a legacy row; the
+    /// honest representation of [`crate::UnknownReason::NotExposedByProvider`],
+    /// never faked.
     pub execution_dimension_key_json: Option<String>,
     pub provenance: AccountProvenance,
     pub account_schema_version: String,

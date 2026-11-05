@@ -486,6 +486,24 @@ impl LedgerStore {
         scope: libra_governor_domain::LifetimeScope,
         now: OffsetDateTime,
     ) -> Result<TaskBudget, LedgerError> {
+        self.initialize_task_budget_scoped_with_identity(task_id, policy, reserve, scope, None, now)
+    }
+
+    /// [`Self::initialize_task_budget_scoped`] that also records the
+    /// captured [`libra_governor_domain::ExecutionIdentity`]'s lineage
+    /// status and narrowest dimension key on the task-level account row
+    /// (HORO-2191 AC2). `None` records lineage `unknown` and no dimension
+    /// key. Like the budget, the account is never rewritten once created.
+    pub fn initialize_task_budget_scoped_with_identity(
+        &mut self,
+        task_id: TaskId,
+        policy: &Policy,
+        reserve: &CompletionReserveEstimate,
+        scope: libra_governor_domain::LifetimeScope,
+        identity: Option<&libra_governor_domain::ExecutionIdentity>,
+        now: OffsetDateTime,
+    ) -> Result<TaskBudget, LedgerError> {
+        let identity_columns = crate::resource_account::identity_columns(identity)?;
         let lifetime_bounded: i64 =
             if scope == libra_governor_domain::LifetimeScope::TurnScoped && policy.turn.is_some() {
                 0
@@ -535,7 +553,7 @@ impl LedgerStore {
                 enforcement_scope, provider_lineage_status, execution_dimension_key_json,
                 provenance, account_schema_version, state, created_at, updated_at, closed_at
              ) VALUES (?1, 'task', NULL, ?2, ?3, ?3, NULL, NULL, NULL, 'local_user_config',
-                       'local_device', NULL, NULL, 'native', ?4, 'open', ?5, ?5, NULL)
+                       'local_device', ?6, ?7, 'native', ?4, 'open', ?5, ?5, NULL)
              ON CONFLICT(account_id) DO NOTHING",
             rusqlite::params![
                 AccountId::for_task(task_id).to_string(),
@@ -543,6 +561,8 @@ impl LedgerStore {
                 task_id.to_string(),
                 RESOURCE_ACCOUNT_SCHEMA_VERSION,
                 now_str,
+                identity_columns.lineage,
+                identity_columns.dimension_key_json,
             ],
         )?;
         let row: BudgetRow = tx.query_row(
