@@ -590,12 +590,19 @@ fn startup_books_a_previous_boots_holds_and_keeps_the_current_boots() {
 
 #[test]
 fn gateway_calls_never_touch_a_row_that_is_not_a_gateway_hold() {
-    let mut fx = Fx::gateway();
+    // A turn hold from before a flip to gateway mode: in gateway mode an
+    // `Admit` no longer reserves (S11f), so the hold is made in hooks mode.
+    let mut fx = Fx::new(Some(&file("hooks", CAP, 50_000)), JAN);
     let SharedBudgetOutcome::Allowed { reservation_id, .. } =
         admit(&mut fx.ledger, &fx.rt, "sess-2", None, None, None).unwrap()
     else {
         panic!("expected a turn hold");
     };
+    std::fs::write(
+        fx.dir.path().join(SHARED_BUDGET_FILE_NAME),
+        file("gateway", CAP, 50_000),
+    )
+    .unwrap();
     let before = fx.fingerprint();
     let req = GatewaySettleRequest {
         reservation_id,

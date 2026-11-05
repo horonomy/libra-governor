@@ -1010,8 +1010,18 @@ pub(crate) fn dispatch(
                     }
                     outcome
                 }),
-                SharedBudgetRequest::Status {} => crate::shared_budget::status(ledger, rt)
-                    .map(|status| SharedBudgetOutcome::Status(Box::new(status))),
+                SharedBudgetRequest::Status {} => {
+                    let gateway = config.gateway_stats.snapshot();
+                    crate::shared_budget::status_with_gateway(
+                        ledger,
+                        rt,
+                        crate::shared_budget::GatewayCounters {
+                            truncated_settles: gateway.truncated_settles,
+                            input_bound_violations: gateway.input_bound_violations,
+                        },
+                    )
+                    .map(|status| SharedBudgetOutcome::Status(Box::new(status)))
+                }
             };
             match outcome {
                 Ok(outcome) => Response::SharedBudget(Box::new(outcome)),
