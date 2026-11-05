@@ -308,6 +308,15 @@ pub fn run_subagent_stop(agent: AgentKind) {
 /// `libra-governor hook session-end`: reads stdin, never fails the host.
 pub fn run_session_end(agent: AgentKind) {
     if let Some(raw) = read_stdin_bounded(agent) {
+        // SessionEnd now settles the pending hold (HORO-2440), so it waits
+        // for the host's transcript flush exactly as `hook stop` does.
+        if let Ok(end) = parse_session_end(&raw) {
+            super::flush_wait::await_stop_flush(
+                agent,
+                &end.session_id,
+                end.transcript_path.as_deref().map(std::path::Path::new),
+            );
+        }
         run_session_end_with_input(agent, &raw);
     }
 }
