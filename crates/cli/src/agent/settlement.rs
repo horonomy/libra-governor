@@ -301,6 +301,21 @@ fn read_stdin_bounded(agent: AgentKind) -> Option<String> {
 /// `libra-governor hook subagent-stop`: reads stdin, never fails the host.
 pub fn run_subagent_stop(agent: AgentKind) {
     if let Some(raw) = read_stdin_bounded(agent) {
+        // The charge reads the subagent's own transcript, which the host
+        // writes as late as the main one (HORO-2446): wait for it the same
+        // way. Only a path the charge reads as a subagent file (absolute,
+        // `agent-<id>.jsonl`, the name the daemon's probe recognises) has
+        // anything to wait for.
+        if let Ok(stop) = parse_subagent_stop(&raw) {
+            let waitable = stop.agent_transcript_path.as_deref().filter(|p| {
+                std::path::Path::new(p).is_absolute() && filename_agent_id(p).is_some()
+            });
+            super::flush_wait::await_stop_flush(
+                agent,
+                &stop.session_id,
+                waitable.map(std::path::Path::new),
+            );
+        }
         run_subagent_stop_with_input(agent, &raw);
     }
 }

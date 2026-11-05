@@ -677,8 +677,18 @@ polls a new read-only request, `SharedBudgetRequest::TranscriptReady`
   the 5000 ms clamp, not 1.5 s. `LIBRA_GOVERNOR_STOP_FLUSH_WAIT_MS`
   overrides it: `0` disables the wait, larger values are clamped to 5000.
 - *Unchanged elsewhere.* No budget file: no probe, no connect. Codex: not
-  involved. `SubagentStop` is not waited on: its delta charge and the `Stop`
-  sweep already absorb the lag.
+  involved.
+- *`SessionEnd` and `SubagentStop` wait the same way* (HORO-2440, HORO-2446).
+  A real Claude Code 2.1.306 subagent settled at the flat hold in 10 of 10
+  runs because its charge read the subagent file before the host wrote it, so
+  `hook subagent-stop` probes with the payload's `agent_transcript_path`. The
+  wire is unchanged; the daemon recognises a path whose final component is
+  `agent-<id>.jsonl` and judges readiness as the charge reads it (whole file,
+  sidechain records counted, no pending hold required) instead of by the
+  parent window, which drops sidechain records and would never answer ready.
+  A subagent file that holds no usage line (or a hook paired with an older
+  daemon, which applies the parent window) waits the full cap and then
+  charges as before.
 
 **Why not reconcile the booked hold later (B).** The measurement shows a
 tight lag, not a persistent gap, so a short wait removes the cause. A

@@ -3377,6 +3377,26 @@ pub fn transcript_ready_on_lane(
     if let Err(reason) = validate_lane_key(session_id) {
         return Ok(refused(reason));
     }
+    // A subagent's own transcript is what `SubagentStop` charges, and it is
+    // read whole, sidechain records included (HORO-2446). The parent window
+    // below drops sidechain records, so it would never call this file ready;
+    // and the charge needs no pending hold, so neither does the probe.
+    if let Some(agent_id) = subagent_file_agent_id(transcript_path) {
+        if !std::path::Path::new(transcript_path).is_absolute() {
+            // The charge never opens a relative path: nothing to wait for.
+            return Ok(SharedBudgetOutcome::TranscriptReadiness { ready: true });
+        }
+        let observation = observe_priced(
+            std::path::Path::new(transcript_path),
+            ReadMode::WholeFile {
+                agent_id: Some(agent_id),
+            },
+            session_id,
+            &cfg.pricing_overrides.table(),
+            BUDGET_SCAN_CAP_BYTES,
+        );
+        return Ok(readiness(&observation));
+    }
     let holds = ledger.shared_lane_holds(
         &principal(),
         session_id,
@@ -3401,13 +3421,32 @@ pub fn transcript_ready_on_lane(
         &cfg.pricing_overrides.table(),
         BUDGET_SCAN_CAP_BYTES,
     );
+    Ok(readiness(&observation))
+}
+
+/// Not ready only while the file is absent or holds no usage yet; every
+/// other observation settles the same way however long the hook waits.
+fn readiness(observation: &PricedObservation) -> SharedBudgetOutcome {
     let ready = !matches!(
         observation,
         PricedObservation::Unavailable(
             UsageUnavailable::Unreadable | UsageUnavailable::NoUsageInWindow
         )
     );
-    Ok(SharedBudgetOutcome::TranscriptReadiness { ready })
+    SharedBudgetOutcome::TranscriptReadiness { ready }
+}
+
+/// The agent id when the path's final component is exactly
+/// `agent-<[A-Za-z0-9_-]+>.jsonl`, the name Claude Code gives a subagent's
+/// transcript. A string check; nothing is opened.
+fn subagent_file_agent_id(path: &str) -> Option<&str> {
+    let name = std::path::Path::new(path).file_name()?.to_str()?;
+    let id = name.strip_prefix("agent-")?.strip_suffix(".jsonl")?;
+    (!id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+    .then_some(id)
 }
 
 #[derive(Default)]

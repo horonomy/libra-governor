@@ -266,6 +266,74 @@ fn session_end_waits_for_the_transcript_flush_before_it_settles() {
     assert_eq!(ran.code, Some(0));
 }
 
+/// HORO-2446: `hook subagent-stop` charges the subagent's own transcript, so
+/// it waits for that file (not the parent's) before it asks the daemon to
+/// charge. Runs `subagent-stop` against the scripted daemon with a payload
+/// whose `agent_transcript_path` is the file the probe must name.
+fn run_subagent_stop(
+    script: Vec<Probe>,
+    cap_ms: Option<&str>,
+    agent_transcript: Option<&Path>,
+) -> (Vec<&'static str>, Ran) {
+    let state = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write_budget(state.path());
+    let daemon = Scripted::start(state.path(), script);
+    let mut body = serde_json::json!({
+        "session_id": "s1",
+        "hook_event_name": "SubagentStop",
+        "agent_id": "a1",
+    });
+    if let Some(path) = agent_transcript {
+        body["agent_transcript_path"] = serde_json::json!(path);
+    }
+    let started = Instant::now();
+    let child = spawn_stop(
+        hook_command("subagent-stop", state.path(), home.path(), cap_ms),
+        &body.to_string(),
+    );
+    let ran = finish(child, started);
+    (daemon.ops(), ran)
+}
+
+#[test]
+fn subagent_stop_waits_for_the_transcript_flush_before_it_charges() {
+    let path = Path::new("/nonexistent/s1/subagents/agent-a1.jsonl");
+    let (ops, ran) = run_subagent_stop(
+        vec![Probe::Ready(false), Probe::Ready(false), Probe::Ready(true)],
+        Some("5000"),
+        Some(path),
+    );
+    assert_eq!(
+        ops,
+        ["probe", "probe", "probe", "other"],
+        "three probes, then one ChargeAgentTranscript (logged as `other`)"
+    );
+    assert_eq!(ran.code, Some(0));
+    assert_eq!(ran.stdout, "");
+}
+
+#[test]
+fn subagent_stop_gives_up_at_the_cap_then_charges_once_and_never_fails_the_host() {
+    let path = Path::new("/nonexistent/s1/subagents/agent-a1.jsonl");
+    let (ops, ran) = run_subagent_stop(vec![Probe::Ready(false)], Some("250"), Some(path));
+    assert_eq!(ran.code, Some(0));
+    assert_eq!(ran.stdout, "");
+    assert_eq!(ops.last(), Some(&"other"), "the charge is the last request");
+    assert_eq!(ops.iter().filter(|o| **o == "other").count(), 1);
+    assert!(ops.iter().filter(|o| **o == "probe").count() >= 3);
+    assert!(ran.elapsed >= Duration::from_millis(250), "waited the cap");
+    assert!(ran.elapsed < Duration::from_secs(4), "and not much more");
+}
+
+#[test]
+fn subagent_stop_without_a_transcript_path_does_not_wait() {
+    let (ops, ran) = run_subagent_stop(vec![Probe::Ready(false)], Some("5000"), None);
+    assert!(!ops.contains(&"probe"), "nothing to wait for: {ops:?}");
+    assert_eq!(ran.code, Some(0));
+    assert!(ran.elapsed < Duration::from_secs(3));
+}
+
 #[test]
 fn an_already_flushed_transcript_costs_one_probe_and_no_wait() {
     let (ops, ran) = run_against(vec![Probe::Ready(true)], Some("5000"), true);
@@ -544,6 +612,46 @@ fn a_real_daemon_settles_a_late_flushed_turn_at_the_measured_amount_while_other_
         (st.used_usd_cents, st.reserved_usd_cents),
         (300, HOLD),
         "s1 settled at its measured 300, not the 1000 hold; s2's hold is untouched"
+    );
+    assert_eq!(st.unmeasured_settlements, 0);
+}
+
+/// HORO-2446 end to end: the subagent's file lands while the hook waits, and
+/// the charge is its measured 300, not the flat hold the unflushed read gave.
+#[test]
+fn a_real_daemon_charges_a_late_flushed_subagent_at_the_measured_amount() {
+    let live = Live::start();
+    live.admit("s1");
+    let dir = live.state.path().join("s1").join("subagents");
+    std::fs::create_dir_all(&dir).unwrap();
+    let sub = dir.join("agent-a1.jsonl");
+    let body = serde_json::json!({
+        "session_id": "s1",
+        "hook_event_name": "SubagentStop",
+        "agent_id": "a1",
+        "agent_transcript_path": sub,
+    })
+    .to_string();
+    let started = Instant::now();
+    let child = spawn_stop(
+        hook_command(
+            "subagent-stop",
+            live.state.path(),
+            live.home.path(),
+            Some("5000"),
+        ),
+        &body,
+    );
+    // The hook is demonstrably still waiting: nothing is charged yet.
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(live.status().used_usd_cents, 0);
+    std::fs::write(&sub, assistant_line("s1", "m1") + "\n").unwrap();
+    let ran = finish(child, started);
+    assert_eq!(ran.code, Some(0));
+    let st = live.status();
+    assert_eq!(
+        st.used_usd_cents, 300,
+        "measured, not the {HOLD} flat charge"
     );
     assert_eq!(st.unmeasured_settlements, 0);
 }

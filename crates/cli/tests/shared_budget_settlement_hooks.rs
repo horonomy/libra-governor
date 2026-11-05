@@ -192,9 +192,14 @@ impl Fake {
         self.requests.lock().unwrap().clone()
     }
 
-    /// The `shared_budget` object of the single recorded request.
+    /// The `shared_budget` object of the single recorded settlement request,
+    /// not counting the flush-wait `transcript_ready` probes (HORO-2446).
     fn only_shared_budget(&self) -> serde_json::Value {
-        let requests = self.requests();
+        let requests: Vec<_> = self
+            .requests()
+            .into_iter()
+            .filter(|r| r["shared_budget"]["op"] != "transcript_ready")
+            .collect();
         assert_eq!(requests.len(), 1, "{requests:?}");
         requests[0]["shared_budget"].clone()
     }

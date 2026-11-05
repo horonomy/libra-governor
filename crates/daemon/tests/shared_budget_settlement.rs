@@ -2469,6 +2469,39 @@ fn ready_is_false_only_while_waiting_could_change_what_a_stop_books() {
     assert!(fx.ready("resumed", &tx));
 }
 
+/// HORO-2446: a subagent's transcript (`agent-<id>.jsonl`) is read whole by
+/// the charge, with its sidechain records counted, so readiness for it is
+/// judged the same way and not by the parent window (which excludes
+/// sidechain records and would never become ready).
+#[test]
+fn a_subagent_transcript_is_ready_once_it_holds_a_usage_line_pending_hold_or_not() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    fx.admit_hold("s1");
+    let dir = fx.path().join("s1").join("subagents");
+    std::fs::create_dir_all(&dir).unwrap();
+    let sub = dir.join("agent-a1.jsonl");
+    assert!(!fx.ready("s1", &sub), "the file is not there yet");
+    write_lines(&sub, &[user_line(5, "s1")]);
+    assert!(!fx.ready("s1", &sub), "a prompt alone is not usage");
+    append_lines(&sub, &[rec(10, "a1", SONNET, mi(1), Some("s1"), true)]);
+    assert!(fx.ready("s1", &sub), "a sidechain usage line is ready");
+
+    // The charge does not need a pending hold, so neither does the probe.
+    let mut idle = Fx::new(Some(&cfg()), BASE);
+    let late = idle.path().join("agent-a2.jsonl");
+    assert!(!idle.ready("s2", &late));
+    write_lines(&late, &[rec(10, "b1", SONNET, mi(1), Some("s2"), true)]);
+    assert!(idle.ready("s2", &late));
+
+    // Another session's lines settle as a mismatch however long we wait.
+    let foreign = idle.path().join("agent-a3.jsonl");
+    write_lines(
+        &foreign,
+        &[rec(10, "c1", SONNET, mi(1), Some("other"), true)],
+    );
+    assert!(idle.ready("s2", &foreign));
+}
+
 #[test]
 fn ready_is_true_for_every_outcome_that_waiting_cannot_improve() {
     let mut fx = Fx::new(Some(&cfg()), BASE);
