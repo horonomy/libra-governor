@@ -125,7 +125,8 @@ hook schemas vs. what remains unverified.
   already use, which is exactly why `crate::agent::render` needed no
   Codex-specific branch.
 - Every field name Codex's payloads use for `session_id`/`cwd`/`prompt`/
-  `tool_name`/`model` matches Claude Code's own payloads exactly — see
+  `tool_name` matches Claude Code's own payloads exactly. `model` is the
+  exception: Codex's `Stop` payload carries it, Claude Code's does not — see
   `crates/cli/src/agent/payload.rs`.
 - Default hook timeout is 600s; `SessionEnd`/`Interrupt` default to
   1s/3s max — too tight for a client-daemon round trip, which is why

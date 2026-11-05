@@ -228,9 +228,17 @@ stays local — see the Privacy Boundary section of `ARCHITECTURE.md`.
 ## What Claude Code's hook payloads actually expose (verified against
 ## the official hooks docs, HORO-1126)
 
-- `Stop` and `PostToolUse` payloads both include a `model` field (the
-  canonical model name) — `hook stop` parses and records it on the
-  receipt when present.
+- Claude Code's `Stop` and `PostToolUse` payloads do **not** include a
+  `model` field. Observed on Claude Code 2.1.306 (`Stop`: `background_tasks`,
+  `cwd`, `hook_event_name`, `last_assistant_message`, `permission_mode`,
+  `prompt_id`, `session_crons`, `session_id`, `stop_hook_active`,
+  `transcript_path`; `PostToolUse`: `cwd`, `duration_ms`, `hook_event_name`,
+  `permission_mode`, `prompt_id`, `session_id`, `tool_input`, `tool_name`,
+  `tool_response`, `tool_use_id`, `transcript_path`). `hook stop` parses a
+  `model` when a payload carries one (Codex's `Stop` does), so on Claude Code
+  `ExecutionReceipt.model` is `None`. This does not affect the settled cost:
+  usage is priced from the per-message `model` in the transcript, not from
+  the hook payload.
 - Neither payload exposes a provider identifier, token counts, or
   cost/spend data. `ExecutionReceipt.provider` is therefore always `None`
   today, and `actual_usage` is always an empty list — an honest "unknown"
