@@ -516,13 +516,9 @@ mod tests {
         let model = "claude-sonnet-4-5";
         let from_body =
             worst_case_reservation(ResourceKind::Usd, 3_000, Some(1_000), model, &table).unwrap();
-        let from_bound = worst_case_usd_reservation(
-            input_token_upper_bound(3_000),
-            Some(1_000),
-            model,
-            &table,
-        )
-        .unwrap();
+        let from_bound =
+            worst_case_usd_reservation(input_token_upper_bound(3_000), Some(1_000), model, &table)
+                .unwrap();
         assert_eq!(from_body, from_bound);
 
         assert_eq!(
