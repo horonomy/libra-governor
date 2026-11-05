@@ -14,7 +14,6 @@ mod common;
 #[path = "../../gateway/tests/fake_upstream.rs"]
 mod fake_upstream;
 
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -243,21 +242,25 @@ impl Fx {
     }
 }
 
-/// Opens a request and leaves it unfinished: a stream the test controls.
-fn fire_and_hold(gw: &RunningGateway, session: &str, scenario: &str) -> std::net::TcpStream {
-    let body = body();
-    let mut stream = std::net::TcpStream::connect(gw.addr).unwrap();
-    write!(
-        stream,
-        "POST /v1/messages HTTP/1.1\r\nhost: 127.0.0.1:{}\r\nx-api-key: {}\r\n{SESSION}: {session}\r\n\
-         {SCENARIO_HEADER}: {scenario}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
-        gw.addr.port(),
-        gw.token,
-        body.len()
-    )
-    .unwrap();
-    stream.write_all(&body).unwrap();
-    stream
+/// Starts a request on a background thread and does not wait for it: a
+/// stream the test controls. The thread's `send` panics when the gateway is
+/// later stopped under it; that is the point, and is swallowed here.
+fn start_in_background(gw: &RunningGateway, session: &'static str, scenario: &'static str) {
+    let (addr, token) = (gw.addr, gw.token.clone());
+    std::thread::spawn(move || {
+        let _ = std::panic::catch_unwind(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let headers = [
+                ("x-api-key", token.as_str()),
+                (SESSION, session),
+                (SCENARIO_HEADER, scenario),
+            ];
+            send(&runtime, addr, "POST", "/v1/messages", &headers, &body());
+        });
+    });
 }
 
 /// Fails every settlement, as a ledger write error would.
@@ -459,7 +462,7 @@ fn a_new_boot_books_the_previous_boots_active_hold_exactly_once() {
     let cap = 5_000;
     let fx = Fx::new(Some(file("gateway", cap)), &["s1"]);
     let gw = fx.held_gateway("boot1");
-    let _client = fire_and_hold(&gw, "s1", "stall_after_start");
+    start_in_background(&gw, "s1", "stall_after_start");
     wait_until(
         || fx.shared_rows().iter().any(|r| r.state == "active"),
         "the hold of the in-flight stream",

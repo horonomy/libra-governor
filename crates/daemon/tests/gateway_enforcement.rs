@@ -22,7 +22,7 @@ mod common;
 use common::{fixture_repo, generous_policy};
 use std::io::BufReader;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use libra_governor_daemon::gateway_authority::{
