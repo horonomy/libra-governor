@@ -478,13 +478,7 @@ pub fn serve(listener: UnixListener, config: &DaemonConfig) -> Result<(), Daemon
     // binding holds the value for the scope, while a bare `_` pattern
     // drops it immediately — which would close the shutdown channel and
     // stop the gateway the instant it started.
-    // A fresh id per daemon start names this process's gateway holds
-    // (`gw:<boot_id>:<request_id>`). The sweep books the previous process's
-    // still-active holds whether or not the gateway runs this time, and runs
-    // first so none can be mistaken for this boot's.
-    let boot_id = uuid::Uuid::new_v4().simple().to_string();
-    sweep_gateway_orphans(&mut ledger, config, &boot_id);
-    let _gateway = start_gateway(config, &boot_id);
+    let _gateway = begin_gateway(&mut ledger, config);
     // Same `let _x = ...` (not `let _ = ...`) discipline as `_gateway`
     // above, for the same reason: an underscore-prefixed binding holds
     // the dispatcher's shutdown channel open for the scope, while a bare
@@ -2914,6 +2908,25 @@ fn handle_record_outcome(
             receipt_updated,
         },
     )))
+}
+
+/// A gateway start: the id naming this process's holds, and the running
+/// gateway (if one is configured and started).
+pub struct GatewayStartup {
+    pub boot_id: String,
+    pub handle: Option<GatewayHandle>,
+}
+
+/// The daemon's gateway start sequence, in the order that matters: a fresh
+/// boot id, the sweep that books the previous process's still-active gateway
+/// holds (whether or not the gateway runs this time), and only then the
+/// gateway, which keys its holds `gw:<boot_id>:<request_id>`. The sweep runs
+/// first so no hold of the previous process can be mistaken for this one's.
+pub fn begin_gateway(ledger: &mut LedgerStore, config: &DaemonConfig) -> GatewayStartup {
+    let boot_id = uuid::Uuid::new_v4().simple().to_string();
+    sweep_gateway_orphans(ledger, config, &boot_id);
+    let handle = start_gateway(config, &boot_id);
+    GatewayStartup { boot_id, handle }
 }
 
 /// Books the gateway holds a previous daemon process left active, at their
