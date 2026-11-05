@@ -298,6 +298,17 @@ fn orphan_sweep_books_an_old_boot_row_even_when_its_ttl_has_not_passed() {
 }
 
 #[test]
+fn orphan_sweep_with_a_malformed_prefix_books_nothing() {
+    let (_dir, mut store) = new_store(100);
+    let live = gateway_hold(&mut store, "s", 20, "gw:boot-new:req-1");
+    for prefix in ["", "gw:", "gw::", "boot-new:", "gw:boot-new"] {
+        let booked = store.settle_orphaned_gateway_holds(prefix, now()).unwrap();
+        assert!(booked.is_empty(), "prefix {prefix:?}");
+        assert_eq!(get(&store, &live).state, ReservationState::Active);
+    }
+}
+
+#[test]
 fn sweeps_run_twice_book_once() {
     let (_dir, mut store) = new_store(100);
     gateway_hold(&mut store, "s1", 20, "gw:boot-old:req-1");
