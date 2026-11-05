@@ -355,7 +355,10 @@ fn a_gpt_pricing_override_is_ok() {
     let env = Env::new(Some(GPT_OVERRIDE), true);
     let (severity, message) = env.doctor().expect("codex_pricing");
     assert_eq!(severity, "ok", "{message}");
-    assert!(message.contains("take precedence for: gpt-5-codex"), "{message}");
+    assert!(
+        message.contains("take precedence for: gpt-5-codex"),
+        "{message}"
+    );
 }
 
 // ---------------------------------------------------------------------

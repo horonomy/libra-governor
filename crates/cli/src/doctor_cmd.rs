@@ -2244,7 +2244,10 @@ mod tests {
         let findings = codex_findings_for(&enrolled());
         let f = by_id(&findings, "codex_pricing");
         assert_eq!(f.severity, Severity::Ok, "{f:?}");
-        assert!(f.message.contains("take precedence for: gpt-5-codex"), "{f:?}");
+        assert!(
+            f.message.contains("take precedence for: gpt-5-codex"),
+            "{f:?}"
+        );
     }
 
     #[test]
