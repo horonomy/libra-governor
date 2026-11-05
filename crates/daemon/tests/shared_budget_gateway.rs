@@ -716,3 +716,28 @@ fn keys_are_ascii_graphic_and_a_boot_id_cannot_contain_a_colon() {
     assert_eq!(gateway_key("boot1", "a\nb"), None);
     assert_eq!(gateway_key("boot1", "r:1").as_deref(), Some("gw:boot1:r:1"));
 }
+
+#[test]
+fn a_hold_that_is_settled_released_or_booked_cannot_be_renewed_back_to_life() {
+    let mut fx = Fx::gateway();
+    let settled = fx.hold(&gwkey("boot1", "settled"));
+    fx.settle(&settled, Some(usage(200, 100, 10)), true);
+    let released = fx.hold(&gwkey("boot1", "released"));
+    gateway_release(&mut fx.ledger, &fx.rt, released.reservation_id).unwrap();
+    let lapsed = fx.hold(&gwkey("boot1", "lapsed"));
+    fx.clock.set(t("2027-01-15T12:20:00Z"));
+    fx.hold(&gwkey("boot1", "sweeper")); // books `lapsed` at its reservation
+
+    let before = fx.fingerprint();
+    for hold in [&settled, &released, &lapsed] {
+        assert_eq!(
+            gateway_renew(&mut fx.ledger, &fx.rt, hold.reservation_id, 600).unwrap(),
+            GatewayRenewOutcome::Refused
+        );
+    }
+    assert_eq!(
+        fx.fingerprint(),
+        before,
+        "a refused renewal changed the ledger"
+    );
+}

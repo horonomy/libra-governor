@@ -89,8 +89,9 @@ pub fn run() {
     );
     // Read once, here, from its own file (never from config.json): the
     // budget file's presence must not flip config.json-driven behaviour.
-    config.shared_budget =
-        libra_governor_daemon::shared_budget::SharedBudgetRuntime::load(&state_dir);
+    config.shared_budget = std::sync::Arc::new(
+        libra_governor_daemon::shared_budget::SharedBudgetRuntime::load(&state_dir),
+    );
     log_shared_budget_state(&config);
 
     let listener = match libra_governor_daemon::bind_or_detect_running(&config.socket_path) {
@@ -205,7 +206,7 @@ fn daemon_config(
         launch_gate,
         // Absent here; default-mode `run` loads its own file afterwards and
         // trusted mode never reads state-dir configuration.
-        shared_budget: libra_governor_daemon::shared_budget::SharedBudgetRuntime::absent(),
+        shared_budget: Default::default(),
     }
 }
 

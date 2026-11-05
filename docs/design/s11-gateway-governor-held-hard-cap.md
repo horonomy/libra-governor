@@ -167,6 +167,8 @@ Do not say "hard cap" without the qualifiers "modelled worst case" and "gateway-
      | `Valid`, `enforcement=gateway` | Enforce: steps (b) to (d) |
      | `Invalid` | The mode cannot be read. **Recommend fail closed** with `403 config_invalid`. Note this changes behaviour for existing governor_held deployments that have a broken hooks-mode file |
 
+     **As built (S11e):** an `Invalid` budget file stops a `governor_held` gateway's metered requests with `403 shared_budget_unavailable`, whether or not the file ever asked for gateway enforcement, which is consistent with the hook path denying `config_invalid`. A pass-through gateway is stopped only after it has seen the file ask for gateway enforcement. `Absent` and `enforcement=hooks` leave the gateway as it was.
+
      `later_pool` refuses `clock_anomaly`, the same as ADR-0026:166-174;
    - (b) prices the worst case **daemon-side** with **the shared-budget table** (pinned plus the file's
      `pricing_overrides`, ADR-0026:229-231). Overrides in the gateway config are **not** used on
@@ -253,6 +255,7 @@ server.rs:2911-2919; ADR-0003 §1]. The cases are:
 | One request task panics | The pump never settles | Renewal stops, so expire-as-charge applies | Same |
 | Laptop sleep longer than TTL mid-stream | Expiry frees capacity and the late settle records the actual | Expire-as-charge books the reservation, the late settle is `AlreadyFinal`, and the result is an over-count | Hard |
 | Daemon death between task reserve and shared reserve | The task row expires | Nothing to do for the shared side | — |
+| Client cancels before the pump exists, the pump task panics, or a lease lapses unrenewed (renewal only starts after response headers) | The row stays active | The hold is never settled by the gateway; expire-as-charge books it at the full reservation, or the next start's orphan sweep does. Known limitation (S11e); cancellation is not redesigned | Over-count only, so safe |
 | Death after shared reserve but before forward | — | The orphan sweep books the worst case even though nothing was sent | Over-count, accepted. The alternative is a `forwarded_at` column, which costs a migration and is not worth it |
 | Ledger write fails at settle (`settle_or_release` swallows the error, proxy.rs:1283-1298) | The row stays active, then expiry | Expire-as-charge | Hard |
 | Daemon restart during a hooks-mode turn | Unchanged (S5 rules) | — | — |

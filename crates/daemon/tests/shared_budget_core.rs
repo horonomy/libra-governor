@@ -69,7 +69,7 @@ fn daemon_config(dir: &Path, shared_budget: SharedBudgetRuntime) -> DaemonConfig
         outcome_authority: None,
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
         launch_gate: None,
-        shared_budget,
+        shared_budget: Arc::new(shared_budget),
     }
 }
 

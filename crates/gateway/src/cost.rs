@@ -227,8 +227,9 @@ pub const TOOL_PROMPT_TOKENS: u64 = 1_000;
 /// Refuses a body whose input cannot be bounded from its own bytes
 /// (S11b): server tools (`web_search_*`, `web_fetch_*`,
 /// `code_execution_*`), a `url` or `file` content source, `mcp_servers`
-/// a `container`, or a `container_upload` block (a Files-API reference
-/// with no `source`). Returns the first gap found.
+/// a `container`, a `container_upload` block (a Files-API reference
+/// with no `source`), or a base64 PDF (billed per page, not per byte).
+/// Returns the first gap found.
 ///
 /// The list is closed: a server-tool or block type added upstream passes
 /// until it is named here, so S11a must re-check it against the API docs.
@@ -265,8 +266,37 @@ pub fn screen_unbounded_inputs(body: &[u8]) -> Option<EnforcementGap> {
         return unbounded("a container");
     }
     has_unbounded_source(&value).then_some(EnforcementGap::UnboundedInput {
-        what: "a url or file content source",
+        what: "a url, file or base64 PDF content source",
     })
+}
+
+/// A base64 PDF is billed per rendered page, which its byte length does not
+/// bound (a small PDF can have many pages), so it is as unbounded as a url.
+fn is_base64_pdf(source: &serde_json::Value) -> bool {
+    source.get("type").and_then(|t| t.as_str()) == Some("base64")
+        && source.get("media_type").and_then(|t| t.as_str()) == Some("application/pdf")
+}
+
+/// How many image blocks a request body carries, at any depth.
+///
+/// The shared-budget reservation takes the whole body length as its input
+/// bound (looser than excluding inline base64, hence safe) and adds
+/// [`IMAGE_MAX_TOKENS`] per image, because a small, highly compressible
+/// image can render to more tokens than its bytes. Structural only.
+pub fn image_block_count(body: &[u8]) -> usize {
+    fn count(value: &serde_json::Value) -> usize {
+        match value {
+            serde_json::Value::Object(map) => {
+                usize::from(map.get("type").and_then(|t| t.as_str()) == Some("image"))
+                    + map.values().map(count).sum::<usize>()
+            }
+            serde_json::Value::Array(items) => items.iter().map(count).sum(),
+            _ => 0,
+        }
+    }
+    serde_json::from_slice::<serde_json::Value>(body)
+        .map(|v| count(&v))
+        .unwrap_or(0)
 }
 
 /// `true` if any `source` object in `value`, at any depth, is of type
@@ -282,7 +312,7 @@ fn has_unbounded_source(value: &serde_json::Value) -> bool {
                         && child
                             .get("type")
                             .and_then(|t| t.as_str())
-                            .is_some_and(|t| t == "url" || t == "file");
+                            .is_some_and(|t| t == "url" || t == "file" || is_base64_pdf(child));
                     is_unbounded || has_unbounded_source(child)
                 })
         }
@@ -871,6 +901,28 @@ mod tests {
             gap(body),
             Some(EnforcementGap::UnboundedInput { .. })
         ));
+    }
+
+    #[test]
+    fn a_base64_pdf_is_refused_but_a_base64_image_or_text_document_is_not() {
+        let doc = |media_type: &str| {
+            serde_json::json!({"messages": [{"role": "user", "content": [
+                {"type": "document", "source": {"type": "base64", "media_type": media_type, "data": "AAAA"}}
+            ]}]})
+        };
+        assert!(gap(doc("application/pdf")).is_some());
+        assert_eq!(gap(doc("text/plain")), None);
+        assert_eq!(gap(doc("image/png")), None);
+    }
+
+    #[test]
+    fn image_blocks_are_counted_at_any_depth() {
+        let body = serde_json::json!({"messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA"}},
+            {"type": "tool_result", "content": [{"type": "image", "source": {}}, {"type": "text", "text": "image"}]}
+        ]}]});
+        assert_eq!(image_block_count(body.to_string().as_bytes()), 2);
+        assert_eq!(image_block_count(b"not json"), 0);
     }
 
     #[test]
