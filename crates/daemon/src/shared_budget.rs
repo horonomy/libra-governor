@@ -68,7 +68,8 @@ use libra_governor_protocol::{
     SharedBudgetCheckState, SharedBudgetConfigDrift, SharedBudgetConfigState,
     SharedBudgetConfigView, SharedBudgetDenyReason, SharedBudgetExecutorRow, SharedBudgetOutcome,
     SharedBudgetPeriod, SharedBudgetRefusal, SharedBudgetStatus, SoftLimitScope, SoftLimitWarning,
-    SHARED_BUDGET_BASIS, SHARED_BUDGET_GUARANTEE, SHARED_BUDGET_SCOPE,
+    SHARED_BUDGET_BASIS, SHARED_BUDGET_ENFORCEMENT_HOOKS, SHARED_BUDGET_GUARANTEE,
+    SHARED_BUDGET_SCOPE,
 };
 
 use crate::shared_budget_file::{
@@ -3508,6 +3509,12 @@ pub fn status(
         foreign_lines: 0,
         sweep_deferred_files: 0,
         future_timestamp_settlements: 0,
+        enforcement: SHARED_BUDGET_ENFORCEMENT_HOOKS.to_string(),
+        gateway_in_flight: 0,
+        truncated_settles: 0,
+        input_bound_violations: 0,
+        unrouted_sessions: 0,
+        orphans_booked: 0,
     };
     {
         let t = rt.telemetry.lock().unwrap_or_else(|e| e.into_inner());

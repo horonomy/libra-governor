@@ -19,6 +19,16 @@ use libra_governor_domain::{ChargeSource, ExecutorKind, SharedPoolReservationId}
 pub const SHARED_BUDGET_BASIS: &str = "libra-accounted-usd-list-price-equivalent";
 /// What kind of limit this is: refused before spend, but not a hard cap.
 pub const SHARED_BUDGET_GUARANTEE: &str = "admission-bounded-cooperative";
+/// What kind of limit `enforcement = "gateway"` is (S11). It holds only for
+/// requests routed through the Libra gateway; unrouted spend is not counted,
+/// and it is not a provider-bill guarantee. Never say "hard cap" without both
+/// qualifiers "modelled worst case" and "gateway-routed".
+pub const SHARED_BUDGET_GUARANTEE_GATEWAY: &str = "gateway-reserved-modelled-worst-case";
+/// The `enforcement` a [`SharedBudgetStatus`] reports when the hooks book spend.
+pub const SHARED_BUDGET_ENFORCEMENT_HOOKS: &str = "hooks";
+/// The `enforcement` a [`SharedBudgetStatus`] reports when the gateway books
+/// spend and the hooks book nothing.
+pub const SHARED_BUDGET_ENFORCEMENT_GATEWAY: &str = "gateway";
 /// Whose spend the budget can see.
 pub const SHARED_BUDGET_SCOPE: &str = "this-host-this-os-user";
 
@@ -186,6 +196,11 @@ pub enum SharedBudgetRefusal {
     KeyConflict,
     /// The period's pool exists in a unit other than USD cents.
     PoolUnitMismatch,
+    /// `enforcement = "gateway"`: the gateway meters this spend per request
+    /// and the hooks book nothing, so a charge path (`SubagentStop`,
+    /// `SessionEnd`, the `Stop` sweep, `ChargeAgent`) was not written.
+    /// Informational for a hook; never a reason to block anything.
+    GatewayMetered,
     /// `SettleTail` for a session with no settled hold and no watermark
     /// under this budget: there is nothing to continue from, and charging
     /// the whole transcript history would be wrong.
@@ -362,6 +377,35 @@ pub struct SharedBudgetStatus {
     /// never trusted as a watermark.
     #[serde(default)]
     pub future_timestamp_settlements: u64,
+    /// Who books spend: `"hooks"` (the default) or `"gateway"` (S11). The
+    /// `guarantee` above is the matching label for this mode.
+    #[serde(default = "default_enforcement")]
+    pub enforcement: String,
+    /// Gateway holds active right now in the current period's pool: requests
+    /// reserved and not yet settled. Zero in `hooks` mode.
+    #[serde(default)]
+    pub gateway_in_flight: u64,
+    /// Gateway settlements booked at the full reservation because the stream
+    /// was cut short (the running gateway's counter; zero when none runs).
+    #[serde(default)]
+    pub truncated_settles: u64,
+    /// Gateway requests whose actual input exceeded the modelled bound (the
+    /// running gateway's counter; zero when none runs).
+    #[serde(default)]
+    pub input_bound_violations: u64,
+    /// Distinct sessions that stopped in `gateway` mode without a single
+    /// gateway row in the current pool: their spend bypassed the gateway and
+    /// is NOT counted. Detection only. Daemon memory, since start.
+    #[serde(default)]
+    pub unrouted_sessions: u64,
+    /// Gateway holds a previous process left active that the startup sweep
+    /// booked at their reservation. Daemon memory, since start.
+    #[serde(default)]
+    pub orphans_booked: u64,
+}
+
+fn default_enforcement() -> String {
+    SHARED_BUDGET_ENFORCEMENT_HOOKS.to_string()
 }
 
 /// The response to a [`SharedBudgetRequest`] (embedded in
@@ -386,6 +430,13 @@ pub enum SharedBudgetOutcome {
         /// The hold was granted but the soft-limit warnings could not be
         /// computed; `warnings` is empty and says nothing about limits.
         warnings_unavailable: bool,
+    },
+    /// `enforcement = "gateway"`: the prompt may proceed and NO hold was
+    /// reserved (there is no `reservation_id`); the gateway reserves each
+    /// request. `remaining_usd_cents` is the pool's remaining budget.
+    GatewayMetered {
+        remaining_usd_cents: i64,
+        period_end: String,
     },
     Denied {
         reason: SharedBudgetDenyReason,
@@ -642,6 +693,12 @@ mod tests {
             foreign_lines: 7,
             sweep_deferred_files: 8,
             future_timestamp_settlements: 9,
+            enforcement: SHARED_BUDGET_ENFORCEMENT_HOOKS.into(),
+            gateway_in_flight: 0,
+            truncated_settles: 0,
+            input_bound_violations: 0,
+            unrouted_sessions: 0,
+            orphans_booked: 0,
         })
         .unwrap();
         let obj = status.as_object_mut().unwrap();
@@ -655,10 +712,27 @@ mod tests {
             "foreign_lines",
             "sweep_deferred_files",
             "future_timestamp_settlements",
+            "enforcement",
+            "gateway_in_flight",
+            "truncated_settles",
+            "input_bound_violations",
+            "unrouted_sessions",
+            "orphans_booked",
         ] {
             obj.remove(k);
         }
         let back: SharedBudgetStatus = serde_json::from_value(status).unwrap();
+        assert_eq!(back.enforcement, SHARED_BUDGET_ENFORCEMENT_HOOKS);
+        assert_eq!(
+            (
+                back.gateway_in_flight,
+                back.truncated_settles,
+                back.input_bound_violations,
+                back.unrouted_sessions,
+                back.orphans_booked
+            ),
+            (0, 0, 0, 0, 0)
+        );
         assert!(back.unpriced_models.is_empty());
         assert_eq!(
             (
@@ -901,5 +975,35 @@ mod tests {
         let back: SharedBudgetOutcome =
             serde_json::from_value(serde_json::to_value(&o).unwrap()).unwrap();
         assert_eq!(back, o);
+    }
+
+    #[test]
+    fn the_gateway_outcome_has_no_reservation_and_a_distinct_wire_tag() {
+        let outcome = SharedBudgetOutcome::GatewayMetered {
+            remaining_usd_cents: 4_200,
+            period_end: "2027-02-01T00:00:00Z".into(),
+        };
+        let json = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(json["outcome"], "gateway_metered");
+        assert!(json.get("reservation_id").is_none());
+        assert_eq!(
+            serde_json::from_value::<SharedBudgetOutcome>(json).unwrap(),
+            outcome
+        );
+        let refused = serde_json::to_value(SharedBudgetOutcome::Refused {
+            reason: SharedBudgetRefusal::GatewayMetered,
+        })
+        .unwrap();
+        assert_eq!(refused["reason"], "gateway_metered");
+    }
+
+    #[test]
+    fn the_gateway_guarantee_label_is_separate_and_the_hooks_label_is_unchanged() {
+        assert_eq!(
+            SHARED_BUDGET_GUARANTEE_GATEWAY,
+            "gateway-reserved-modelled-worst-case"
+        );
+        assert_eq!(SHARED_BUDGET_GUARANTEE, "admission-bounded-cooperative");
+        assert_eq!(crate::PROTOCOL_VERSION, 25);
     }
 }

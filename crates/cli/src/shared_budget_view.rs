@@ -833,6 +833,12 @@ pub(crate) mod fixtures {
             foreign_lines: 0,
             sweep_deferred_files: 0,
             future_timestamp_settlements: 0,
+            enforcement: libra_governor_protocol::SHARED_BUDGET_ENFORCEMENT_HOOKS.into(),
+            gateway_in_flight: 0,
+            truncated_settles: 0,
+            input_bound_violations: 0,
+            unrouted_sessions: 0,
+            orphans_booked: 0,
         }
     }
 }
