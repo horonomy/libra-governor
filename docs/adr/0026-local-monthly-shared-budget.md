@@ -447,15 +447,18 @@ remainder is released, and the response maps it onto the existing fields
 the usual `unmeasured`/`unpriced`/`transcript_unverified`/`binding_mismatch`
 flags). This also removes the `no_settled_lane` refusal for a first turn that
 never stopped, and a late `Stop` after the `SessionEnd` finds the hold settled
-(`AlreadySettled` for a prompt id, no hold otherwise) so it cannot flat-book a
-turn already measured. Rules: an *active* hold that cannot be measured settles
+(`AlreadySettled` for a prompt id, no pending hold otherwise) so it cannot
+flat-book a turn already measured. `Stop`, `SessionEnd` and the flush probe
+share one definition of the pending hold, so after a crash and resume a late
+`Stop` also cannot find an older expired hold that the newer hold's
+settlement already counted. Rules: an *active* hold that cannot be measured settles
 at the flat hold with `usage_known=false` (never zero, as for `Stop`); an
 *expired* hold (its capacity was already released) books measured spend only
 and otherwise writes nothing; an older expired hold is never targeted when a
 newer hold exists, because a later `Stop` already counted its records. Only the
 `SessionEnd` session's raw-id main lane is touched; other sessions, subagent
 lanes, Codex holds and gateway holds are not, and `SubagentStop` stays
-charge-only. When the lane has no such hold, the tail path below runs unchanged.
+charge-only. With an invalid budget file `SessionEnd` settles nothing (unlike a `Stop`, which settles flat with `config_invalid`), and a host that kills the hook during its bounded flush wait leaves the hold to expire as before. When the lane has no such hold, the tail path below runs unchanged.
 It charges the main-transcript records past the lane's watermark that no
 `Stop` **counted** as a settled `agent_absent`
 row (`charge_source = turn_hold`, `usage_known = true`) with the same
