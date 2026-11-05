@@ -235,6 +235,31 @@ original strict hard-cap guarantee.
   fallback and unrepeated soft limits. In the published v0.0.4 no backup is
   kept; the v0.0.5 candidate keeps the previous file as
   `shared-budget.json.bak`.
+- *Published v0.0.4: every subagent can be booked at the flat turn hold
+  (known High defect, HORO-2446).* On real Claude Code 2.1.306 the
+  `SubagentStop` hook ran before the host had written the subagent's final
+  transcript record, so Libra booked the flat hold (default $10) for each
+  subagent instead of its measured cost (about a cent in the test). That booking
+  is never refunded. This was measured against a local fake API with
+  instantaneous responses; how often it happens with real provider timing is
+  untested. It affects Libra's own monthly ledger and its refusals, not your
+  provider bill: with a $25 cap, after two subagent runs ($20 settled, $4.97
+  remaining) further prompts were refused ("shared monthly budget exhausted").
+  From the $10 hold, about four subagent runs leave a $50 cap unable to admit
+  another prompt (an estimate; up to three were measured). Repeated and
+  parallel subagents each added one flat hold; no hold was left stranded.
+  A tested interim workaround: remove the `SubagentStop` entry that
+  `libra-governor install` added to the `hooks` section of Claude Code's
+  `settings.json`, leaving the other hooks in place. The subagents were then
+  settled from their transcripts at the parent turn's `Stop` (cents, per-agent
+  rows kept). Limits: it was tested with `claude -p` and subagents that finished
+  before the parent turn ended, the `Stop` sweep is capped per turn so heavy
+  subagent use can settle later, running `libra-governor install` again
+  restores the hook, and it is not a fix. A hand-written
+  `subagent_unmeasured_charge_usd_cents` in `shared-budget.json` lowers the flat
+  charge but under-counts a subagent that is genuinely unmeasurable. Do not
+  raise the cap or turn the budget off to work around this. The fix is tracked
+  for v0.0.5 and is not part of the published binary.
 
 **Codex accounting (v0.0.5 candidate; opt-in, off by default).** Codex is not
 admitted or charged unless **both** a configured `shared-budget.json` **and**
