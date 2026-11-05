@@ -527,8 +527,13 @@ fn no_prompt_token_or_credential_reaches_the_ledger() {
         "the settlement",
     );
     let everything = common::ledger_fingerprint(&fx.ledger_path());
-    for secret in [CANARY, gw.token.as_str(), FAKE_UPSTREAM_KEY] {
-        assert!(!everything.contains(secret), "{secret} reached the ledger");
+    // Failure messages name the leaked value's kind, never the value itself.
+    for (kind, secret) in [
+        ("prompt canary", CANARY),
+        ("gateway token", gw.token.as_str()),
+        ("upstream key", FAKE_UPSTREAM_KEY),
+    ] {
+        assert!(!everything.contains(secret), "{kind} reached the ledger");
     }
 }
 
