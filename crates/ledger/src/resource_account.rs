@@ -1335,7 +1335,14 @@ mod tests {
                 let rows = if selected.is_empty() {
                     Vec::new()
                 } else {
-                    let sql = format!("SELECT {} FROM {table} ORDER BY 1", selected.join(", "));
+                    let order = (1..=selected.len())
+                        .map(|i| i.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!(
+                        "SELECT {} FROM {table} ORDER BY {order}",
+                        selected.join(", ")
+                    );
                     let mut stmt = store.conn.prepare(&sql).unwrap();
                     let n = selected.len();
                     stmt.query_map([], |row| (0..n).map(|i| row.get::<_, String>(i)).collect())
