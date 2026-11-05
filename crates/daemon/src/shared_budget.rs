@@ -3856,10 +3856,8 @@ pub enum GatewaySettleOutcome {
 /// shared-budget table and the reserved amount read from the row itself.
 ///
 /// If the file is no longer valid when the request ends, nothing can be
-/// priced, so the row is booked at its reservation. The ledger records
-/// `usage_known = false` only when the whole reservation is booked, so a
-/// request that is not fully measured books the larger of its S11b amount and
-/// the reservation, never less.
+/// priced, so the row is booked at its reservation, marked unknown. A request
+/// that is not fully measured books exactly its S11b amount, marked unknown.
 pub fn gateway_settle(
     ledger: &mut LedgerStore,
     rt: &SharedBudgetRuntime,
@@ -3892,8 +3890,7 @@ pub fn gateway_settle(
         ResourceAmount::UsdCents(cents) => u64::try_from(cents).unwrap_or(reserved),
         _ => reserved,
     };
-    let actual = (usage_known || priced > reserved).then_some(priced);
-    match ledger.settle_shared(req.reservation_id, actual, rt.now())? {
+    match ledger.settle_shared_marked(req.reservation_id, priced, usage_known, rt.now())? {
         SharedPoolSettleOutcome::Settled {
             reservation,
             overrun,

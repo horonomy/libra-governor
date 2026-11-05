@@ -400,28 +400,37 @@ fn a_retry_of_the_same_key_is_replayed_without_reserving_again() {
 }
 
 #[test]
-fn unmeasured_and_truncated_requests_are_never_booked_below_their_reservation() {
+fn unmeasured_and_truncated_requests_book_the_s11b_amount_marked_unknown() {
     let mut fx = Fx::gateway();
 
     let none = fx.hold(&gateway_key("boot1", "none"));
-    let (booked_usd_cents, usage_known, _, _) = settled(fx.settle(&none, None, false));
-    assert_eq!((booked_usd_cents, usage_known), (WORST, false));
+    let (booked, known, _, _) = settled(fx.settle(&none, None, false));
+    assert_eq!((booked, known), (WORST, false));
+    assert_eq!(fx.row(none.reservation_id).usage_known, Some(false));
 
-    // Cut off after message_start: S11b prices the exact input plus
-    // max_tokens of output (2150 here); the ledger can only mark an
-    // unmeasured row by booking its whole reservation.
+    // Cut off after message_start: the exact input plus max_tokens of output
+    // (2150 here), marked unknown, even though it is below the reservation.
     let cut = fx.hold(&gateway_key("boot1", "cut"));
-    let (booked_usd_cents, usage_known, flags, _) =
-        settled(fx.settle(&cut, Some(usage(200, 100, 3)), false));
-    assert_eq!((booked_usd_cents, usage_known), (WORST, false));
+    let (booked, known, flags, _) = settled(fx.settle(&cut, Some(usage(200, 100, 3)), false));
+    assert_eq!((booked, known), (MEASURED, false));
     assert!(flags.truncated_settle);
+    let row = fx.row(cut.reservation_id);
+    assert_eq!(
+        (row.settled_amount, row.usage_known),
+        (Some(MEASURED), Some(false))
+    );
 
-    // Cut off with an input overrun: the S11b amount exceeds the reservation
-    // and is booked in full, never clamped to it.
+    // Cut off with an input overrun: above the reservation, booked in full
+    // and still marked unknown.
     let over = fx.hold(&gateway_key("boot1", "over"));
-    let (booked, _, flags, overrun) = settled(fx.settle(&over, Some(usage(5_000, 0, 3)), false));
-    assert_eq!((booked, overrun), (50_050, Some(50_050 - WORST)));
+    let (booked, known, flags, overrun) =
+        settled(fx.settle(&over, Some(usage(5_000, 0, 3)), false));
+    assert_eq!(
+        (booked, known, overrun),
+        (50_050, false, Some(50_050 - WORST))
+    );
     assert!(flags.truncated_settle && flags.input_bound_violated);
+    assert_eq!(fx.row(over.reservation_id).usage_known, Some(false));
 }
 
 #[test]
