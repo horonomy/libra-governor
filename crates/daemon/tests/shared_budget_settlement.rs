@@ -3955,3 +3955,360 @@ fn a_claude_tool_event_still_renews_its_own_hold() {
     }
     assert_ne!(format!("{:?}", fx.lane("s1")), before);
 }
+
+// ---------------------------------------------------------------------
+// HORO-2440 (E7 / QA3-D1): a session that ends without a Stop
+// ---------------------------------------------------------------------
+//
+// SessionEnd (`SettleTail`) settles the Claude main lane's unsettled
+// newest hold from the transcript exactly as a Stop would, instead of
+// leaving it to the 3600 s TTL.
+
+/// `(reservation_id, charged cents, unmeasured)` of a `TailSettled`.
+fn tail_row(o: &SharedBudgetOutcome) -> (Option<SharedPoolReservationId>, u64, bool) {
+    match o {
+        SharedBudgetOutcome::TailSettled {
+            reservation_id,
+            amount_charged_usd_cents,
+            unmeasured,
+            ..
+        } => (*reservation_id, *amount_charged_usd_cents, *unmeasured),
+        other => panic!("expected TailSettled, got {other:?}"),
+    }
+}
+
+/// Turn 1 measured by a Stop (300c at t=60), then turn 2 admitted at t=100
+/// with its 300c of usage stamped t=110 and NO Stop. Clock at t=200.
+fn second_turn_without_stop(prompt: Option<&str>) -> (Fx, std::path::PathBuf, Grant) {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    fx.admit_hold("s1");
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(totals(&fx.status()), (300, 0));
+    fx.clock.set(at(100));
+    let hold = grant(fx.admit("s1", None, prompt));
+    append_lines(&tx, &[rec(110, "m2", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(200));
+    (fx, tx, hold)
+}
+
+#[test]
+fn session_end_without_stop_settles_the_pending_hold_at_measured_usage() {
+    let (mut fx, tx, hold) = second_turn_without_stop(None);
+    assert_eq!(totals(&fx.status()), (300, 1_000));
+
+    let out = tail(&mut fx, "s1", &s(&tx));
+    assert_eq!(tail_row(&out), (Some(hold.id), 300, false));
+    assert_eq!(
+        totals(&fx.status()),
+        (600, 0),
+        "measured 300 booked, the unused remainder of the hold released"
+    );
+    let lane = fx.lane("s1");
+    assert_eq!(lane.len(), 2, "no extra charge row in the lane");
+    assert_eq!(lane[1].id, hold.id);
+    assert_eq!(
+        lane[1].state,
+        libra_governor_domain::ReservationState::Settled
+    );
+    assert_eq!(lane[1].settled_amount, Some(300));
+    assert_eq!(lane[1].usage_known, Some(true));
+    assert_eq!(lane[1].settled_at, Some(at(200)));
+}
+
+/// QA3 case 2: no Stop ever settled the lane, so there is no mark and no
+/// settled hold; the tail path refuses it as `NoSettledLane` today.
+#[test]
+fn first_turn_session_end_without_stop_is_not_refused_no_settled_lane() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    let hold = fx.admit_hold("s1");
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    let out = tail(&mut fx, "s1", &s(&tx));
+    assert_eq!(tail_row(&out), (Some(hold.id), 300, false));
+    assert_eq!(totals(&fx.status()), (300, 0));
+    assert_eq!(fx.lane("s1")[0].usage_known, Some(true));
+}
+
+#[test]
+fn session_end_with_unmeasurable_transcript_books_the_flat_hold() {
+    // ADR-0026 "never zero": same as a Stop whose transcript is unreadable.
+    for path in ["gone.jsonl", ""] {
+        let mut fx = Fx::new(Some(&cfg()), BASE);
+        let hold = fx.admit_hold("s1");
+        fx.clock.set(at(60));
+        let p = if path.is_empty() {
+            String::new()
+        } else {
+            s(&fx.path().join(path))
+        };
+        let out = tail(&mut fx, "s1", &p);
+        assert_eq!(
+            tail_row(&out),
+            (Some(hold.id), 1_000, true),
+            "path={path:?}"
+        );
+        assert_eq!(totals(&fx.status()), (1_000, 0), "path={path:?}");
+        let lane = fx.lane("s1");
+        assert_eq!(lane[0].settled_amount, Some(1_000));
+        assert_eq!(lane[0].usage_known, Some(false));
+        assert_eq!(fx.status().unmeasured_settlements, 1);
+    }
+}
+
+#[test]
+fn session_end_after_expiry_books_measured_only_never_flat() {
+    for swept in [false, true] {
+        // Measured: booked at the measured amount, in the hold's own row.
+        let mut fx = Fx::new(Some(&cfg()), BASE);
+        let tx = fx.path().join("s1.jsonl");
+        let hold = fx.admit_hold("s1");
+        write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+        fx.clock.set(at(7_200));
+        if swept {
+            fx.admit_hold("s2");
+            assert_eq!(
+                fx.lane("s1")[0].state,
+                libra_governor_domain::ReservationState::Expired
+            );
+        }
+        let out = tail(&mut fx, "s1", &s(&tx));
+        assert_eq!(tail_row(&out), (Some(hold.id), 300, false), "swept={swept}");
+        let lane = fx.lane("s1");
+        assert_eq!(lane[0].settled_amount, Some(300));
+        assert_eq!(lane[0].usage_known, Some(true));
+
+        // Unmeasurable: that capacity was already released, so nothing is
+        // booked and the hold stays expired and unspent.
+        let mut fx = Fx::new(Some(&cfg()), BASE);
+        fx.admit_hold("s1");
+        fx.clock.set(at(7_200));
+        if swept {
+            fx.admit_hold("s2");
+        }
+        let used_before = fx.status().used_usd_cents;
+        tail(&mut fx, "s1", &s(&fx.path().join("gone.jsonl")));
+        assert_eq!(fx.status().used_usd_cents, used_before, "swept={swept}");
+        assert_eq!(fx.lane("s1")[0].settled_amount, None, "swept={swept}");
+    }
+}
+
+/// Today: the tail charges 300 as a separate row and leaves the hold, so a
+/// late Stop settles the still-active hold flat at 1,000 on top.
+#[test]
+fn late_stop_after_session_end_tail_does_not_flat_book_an_already_measured_turn() {
+    let (mut fx, tx, _hold) = second_turn_without_stop(None);
+    tail(&mut fx, "s1", &s(&tx));
+    fx.clock.set(at(210));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(
+        totals(&fx.status()),
+        (600, 0),
+        "turn 1 (300) + turn 2 (300), not 300 + 300 + 1000"
+    );
+}
+
+#[test]
+fn late_stop_with_prompt_id_after_session_end_is_already_settled() {
+    let (mut fx, tx, _hold) = second_turn_without_stop(Some("p2"));
+    tail(&mut fx, "s1", &s(&tx));
+    let before = fx.fingerprint();
+    fx.clock.set(at(210));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p2"));
+    assert_eq!(fx.fingerprint(), before, "the late Stop writes nothing");
+    assert_eq!(totals(&fx.status()), (600, 0));
+}
+
+#[test]
+fn duplicate_session_end_books_nothing_more() {
+    let (mut fx, tx, hold) = second_turn_without_stop(None);
+    let first = tail(&mut fx, "s1", &s(&tx));
+    assert_eq!(tail_row(&first), (Some(hold.id), 300, false));
+    let before = fx.fingerprint();
+    fx.clock.set(at(205));
+    let second = tail(&mut fx, "s1", &s(&tx));
+    assert_eq!(tail_charged(&second), (0, false));
+    assert_eq!(fx.fingerprint(), before);
+    assert_eq!(totals(&fx.status()), (600, 0));
+}
+
+#[test]
+fn session_end_after_crash_then_stop_books_nothing_extra() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    fx.admit_hold("s1");
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(7_200));
+    fx.admit_hold("s1");
+    append_lines(&tx, &[rec(7_210, "m2", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(7_300));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(totals(&fx.status()), (600, 0));
+
+    // The older expired hold's records were counted by the newer hold's
+    // Stop; it must not be flat-booked or re-measured at SessionEnd.
+    let before = fx.fingerprint();
+    fx.clock.set(at(7_400));
+    let out = tail(&mut fx, "s1", &s(&tx));
+    assert_eq!(tail_charged(&out), (0, false));
+    assert_eq!(fx.fingerprint(), before);
+    assert_eq!(fx.lane("s1")[0].settled_amount, None);
+}
+
+#[test]
+fn session_end_after_a_crash_settles_the_newest_hold_over_both_turns() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    fx.admit_hold("s1");
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(7_200));
+    let h2 = fx.admit_hold("s1");
+    append_lines(&tx, &[rec(7_210, "m2", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(7_300));
+    let out = tail(&mut fx, "s1", &s(&tx));
+    assert_eq!(tail_row(&out), (Some(h2.id), 600, false));
+    assert_eq!(totals(&fx.status()), (600, 0));
+    assert_eq!(fx.lane("s1")[0].settled_amount, None, "h1 stays unspent");
+}
+
+#[test]
+fn session_end_for_a_leaves_b_hold_and_expiry_untouched() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let a = fx.path().join("a.jsonl");
+    fx.admit_hold("a");
+    fx.clock.set(at(30));
+    fx.admit_hold("b");
+    write_lines(&a, &[rec(40, "ma", SONNET, mi(1), Some("a"), false)]);
+    let b_before = format!("{:?}", fx.lane("b"));
+    fx.clock.set(at(100));
+    let out = tail(&mut fx, "a", &s(&a));
+    assert_eq!(tail_row(&out).1, 300);
+    assert_eq!(format!("{:?}", fx.lane("b")), b_before);
+    assert_eq!(totals(&fx.status()), (300, 1_000));
+}
+
+#[test]
+fn session_end_never_touches_subagent_codex_or_gateway_holds() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    std::fs::write(fx.path().join("shared-budget.codex"), b"").unwrap();
+    let tx = fx.path().join("s1.jsonl");
+    let main = fx.admit_hold("s1");
+    grant(fx.admit("s1", Some("aaa1"), None));
+    let _codex = grant(fx.sb(SharedBudgetRequest::Admit {
+        session_id: "s1".to_string(),
+        agent_id: None,
+        prompt_id: Some("c1".to_string()),
+        provider: Some("codex".to_string()),
+    }));
+    // A newer gateway hold on the same raw session id, main-executor lane.
+    fx.clock.set(at(20));
+    let pool = libra_governor_domain::PoolId(fx.pools().remove(0));
+    let gw = match fx
+        .ledger
+        .reserve_shared(libra_governor_ledger::SharedPoolReserveRequest {
+            pool_id: &pool,
+            principal_id: &principal(),
+            session_id: "s1",
+            amount: 50,
+            unit: &libra_governor_domain::QuotaUnit::UsdCents,
+            idempotency_key: "gw:boot:req-1",
+            now: at(20),
+            ttl_secs: 3_600,
+            attribution: libra_governor_ledger::ExecutorAttribution::main_executor(Some(
+                ChargeSource::Gateway,
+            )),
+        })
+        .unwrap()
+    {
+        libra_governor_ledger::SharedPoolReserveOutcome::Granted(r) => *r,
+        other => panic!("expected Granted, got {other:?}"),
+    };
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+
+    let get = |fx: &Fx, id| format!("{:?}", fx.ledger.get_shared_reservation(id).unwrap());
+    let codex_lane =
+        libra_governor_daemon::shared_budget::budget_lane("s1", Some("codex")).unwrap();
+    let others = |fx: &Fx| {
+        let mut v = vec![get(fx, gw.id)];
+        v.push(format!(
+            "{:?}",
+            fx.ledger
+                .shared_lane_holds(
+                    &principal(),
+                    &codex_lane,
+                    None,
+                    ExecutorKind::AgentAbsent,
+                    OWNER_PREFIX
+                )
+                .unwrap()
+        ));
+        v.push(format!(
+            "{:?}",
+            fx.ledger
+                .shared_lane_holds(
+                    &principal(),
+                    "s1",
+                    Some("aaa1"),
+                    ExecutorKind::Agent,
+                    OWNER_PREFIX
+                )
+                .unwrap()
+        ));
+        v
+    };
+    let before = others(&fx);
+
+    let out = tail(&mut fx, "s1", &s(&tx));
+    assert_eq!(tail_row(&out), (Some(main.id), 300, false));
+    assert_eq!(others(&fx), before, "only the raw-id main hold settled");
+}
+
+#[test]
+fn restart_between_admit_and_session_end_settles_exactly_once() {
+    let (mut fx, tx, hold) = second_turn_without_stop(Some("p2"));
+    fx.restart();
+    let out = tail(&mut fx, "s1", &s(&tx));
+    assert_eq!(tail_row(&out), (Some(hold.id), 300, false));
+    fx.restart();
+    let before = fx.fingerprint();
+    let again = tail(&mut fx, "s1", &s(&tx));
+    assert_eq!(tail_charged(&again), (0, false));
+    assert_eq!(fx.fingerprint(), before);
+    assert_eq!(totals(&fx.status()), (600, 0));
+}
+
+#[test]
+fn esc_reprompt_stop_books_both_turns_in_one_hold() {
+    // Regression: the renewed hold of an interrupted turn is settled once,
+    // over every record since the watermark.
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    grant(fx.admit("s1", None, Some("p1")));
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(30));
+    grant(fx.admit("s1", None, Some("p2")));
+    append_lines(&tx, &[rec(40, "m2", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    fx.finalize_for_prompt("s1", Some(&s(&tx)), Some("p2"));
+    assert_eq!(totals(&fx.status()), (600, 0));
+    assert_eq!(fx.lane("s1").len(), 1);
+}
+
+#[test]
+fn session_end_frees_capacity_for_a_second_session() {
+    // Cap 1,500, hold 1,000: s2 is refused while s1 holds, and allowed once
+    // s1's SessionEnd settles a measured 300 and releases the remainder.
+    let mut fx = Fx::new(Some(&cfg_json(1_500, "UTC", 1_000)), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    fx.admit_hold("s1");
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(60));
+    expect_cap_exhausted(fx.admit("s2", None, None), 500);
+    tail(&mut fx, "s1", &s(&tx));
+    grant(fx.admit("s2", None, None));
+    assert_eq!(totals(&fx.status()), (300, 1_000));
+}
