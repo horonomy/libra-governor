@@ -52,9 +52,13 @@ fn at(secs: i64) -> OffsetDateTime {
 /// reservation has an exact worst case (1000 tool-prompt tokens at 10 cents
 /// plus 10 output tokens at 5 cents = 10_050).
 fn file(enforcement: &str) -> String {
+    file_with_hold(enforcement, HOLD)
+}
+
+fn file_with_hold(enforcement: &str, hold: u64) -> String {
     format!(
         r#"{{"schema_version":1,"monthly_cap_usd_cents":{CAP},"time_zone":"UTC",
-        "turn_hold_usd_cents":{HOLD},"enforcement":"{enforcement}",
+        "turn_hold_usd_cents":{hold},"enforcement":"{enforcement}",
         "pricing_overrides":{{"flat-model":{{
         "input_usd_per_mtok":100000,"cache_creation_input_usd_per_mtok":100000,
         "cache_read_input_usd_per_mtok":10000,"output_usd_per_mtok":50000}}}}}}"#
@@ -83,6 +87,20 @@ fn daemon_config(dir: &Path, shared_budget: SharedBudgetRuntime) -> DaemonConfig
     }
 }
 
+/// A valid `governor_held` gateway configuration. It is only validated by the
+/// daemon (as `GatewayStatus` does), never started.
+fn governor_held_gateway(dir: &Path) -> libra_governor_gateway::config::GatewayConfig {
+    use libra_governor_gateway::config::{GatewayConfig, GatewayCredentialMode};
+    use libra_governor_gateway::credential::CredentialCommand;
+    GatewayConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        dir.join("gateway.token"),
+        GatewayCredentialMode::GovernorHeld {
+            credential: CredentialCommand::new("/bin/sh", vec!["-c".into(), "printf x".into()]),
+        },
+    )
+}
+
 struct Fx {
     dir: tempfile::TempDir,
     clock: Arc<ManualClock>,
@@ -106,8 +124,64 @@ impl Fx {
         }
     }
 
+    /// Gateway mode with a `governor_held` gateway configured.
     fn gateway() -> Self {
-        Self::new("gateway")
+        let mut fx = Self::new("gateway");
+        fx.config.gateway = Some(governor_held_gateway(fx.dir.path()));
+        fx
+    }
+
+    /// Every table's rows, except the zero-amount settled charge rows (the
+    /// watermark and offset rows) that a gateway-mode hook may leave behind.
+    fn spend_fingerprint(&self) -> String {
+        let conn = rusqlite::Connection::open_with_flags(
+            &self.config.ledger_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let tables: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.map(Result::unwrap).collect()
+        };
+        let mut out = String::new();
+        for table in tables {
+            let filter = if table == "shared_pool_reservations" {
+                " WHERE NOT (is_charge = 1 AND settled_amount = 0)"
+            } else {
+                ""
+            };
+            let mut stmt = conn
+                .prepare(&format!("SELECT * FROM \"{table}\"{filter}"))
+                .unwrap();
+            let columns = stmt.column_count();
+            let mut rows = stmt.query([]).unwrap();
+            out.push_str(&format!("[{table}]\n"));
+            while let Some(row) = rows.next().unwrap() {
+                for i in 0..columns {
+                    out.push_str(&format!("{:?}|", row.get_ref(i).unwrap()));
+                }
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// Zero-amount settled charge rows: the watermark and offset rows.
+    fn mark_rows(&self) -> i64 {
+        let conn = rusqlite::Connection::open_with_flags(
+            &self.config.ledger_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM shared_pool_reservations WHERE is_charge = 1 AND settled_amount = 0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
     }
 
     fn call_versioned(&mut self, version: u32, request: Request) -> Response {
@@ -198,11 +272,11 @@ impl Fx {
     }
 
     fn set_mode(&self, enforcement: &str) {
-        std::fs::write(
-            self.dir.path().join(SHARED_BUDGET_FILE_NAME),
-            file(enforcement),
-        )
-        .unwrap();
+        self.set_file(&file(enforcement));
+    }
+
+    fn set_file(&self, json: &str) {
+        std::fs::write(self.dir.path().join(SHARED_BUDGET_FILE_NAME), json).unwrap();
     }
 }
 
@@ -264,18 +338,11 @@ fn admit_in_gateway_mode_reserves_nothing_and_writes_nothing() {
 #[test]
 fn admit_in_gateway_mode_denies_when_remaining_is_below_the_hold() {
     let mut fx = Fx::gateway();
-    fx.gateway_hold("routed", "r1");
-    // Book spend so that less than one hold remains: 100000 - 10050 - 89000.
-    let booked = fx.sb(SharedBudgetRequest::ChargeAgent {
-        session_id: "routed".into(),
-        agent_id: None,
-        amount_usd_cents: 89_000,
-        idempotency_key: "spend".into(),
-        charge_source: libra_governor_domain::ChargeSource::SubagentTranscript,
-        event_time: None,
-        provider: None,
-    });
-    assert!(matches!(booked, SharedBudgetOutcome::Charged { .. }));
+    // Nine worst-case reservations of 10_050 leave 9_550.
+    for n in 0..9 {
+        fx.gateway_hold("routed", &format!("r{n}"));
+    }
+    fx.set_file(&file_with_hold("gateway", 9_600));
     let before = fx.fingerprint();
     match fx.admit("sess-2") {
         SharedBudgetOutcome::Denied {
@@ -284,7 +351,7 @@ fn admit_in_gateway_mode_denies_when_remaining_is_below_the_hold() {
             period_end,
             ..
         } => {
-            assert_eq!(remaining_usd_cents, Some(950));
+            assert_eq!(remaining_usd_cents, Some(9_550));
             assert!(period_end.is_some());
         }
         other => panic!("expected Denied cap_exhausted, got {other:?}"),
@@ -293,18 +360,117 @@ fn admit_in_gateway_mode_denies_when_remaining_is_below_the_hold() {
 }
 
 #[test]
-fn check_in_gateway_mode_never_reports_a_lane_hold() {
+fn admit_in_gateway_mode_fails_closed_without_a_governor_held_gateway() {
+    // No gateway configured at all.
+    let mut none = Fx::new("gateway");
+    let before = none.fingerprint();
+    assert!(matches!(
+        none.admit("s"),
+        SharedBudgetOutcome::Denied {
+            reason: SharedBudgetDenyReason::GatewayUnavailable,
+            ..
+        }
+    ));
+    assert_eq!(none.fingerprint(), before, "the denial wrote a row");
+
+    // A pass-through (subscription) gateway is not governor_held.
+    let mut passthrough = Fx::new("gateway");
+    passthrough.config.gateway = Some(libra_governor_gateway::config::GatewayConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        passthrough.dir.path().join("t"),
+        libra_governor_gateway::config::GatewayCredentialMode::PassThroughSubscription,
+    ));
+    assert!(matches!(
+        passthrough.admit("s"),
+        SharedBudgetOutcome::Denied {
+            reason: SharedBudgetDenyReason::GatewayUnavailable,
+            ..
+        }
+    ));
+
+    // With a governor_held gateway the same prompt is metered.
+    let mut held = Fx::gateway();
+    assert!(matches!(
+        held.admit("s"),
+        SharedBudgetOutcome::GatewayMetered { .. }
+    ));
+
+    // Hooks mode never needs a gateway.
+    let mut hooks = Fx::new("hooks");
+    assert!(matches!(
+        hooks.admit("s"),
+        SharedBudgetOutcome::Allowed { .. }
+    ));
+
+    // An invalid file is reported as such, before the gateway question.
+    let mut invalid = Fx::new("gateway");
+    invalid.set_file("{not json");
+    assert!(matches!(
+        invalid.admit("s"),
+        SharedBudgetOutcome::Denied {
+            reason: SharedBudgetDenyReason::ConfigInvalid,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_tool_check_in_gateway_mode_never_denies_on_the_turn_hold_test() {
     let mut fx = Fx::gateway();
+    for n in 0..9 {
+        fx.gateway_hold("routed", &format!("r{n}"));
+    }
+    // Remaining (9_550) is below the hold (9_600): hooks mode would say
+    // exhausted, gateway mode must not wedge an admitted turn.
+    fx.set_file(&file_with_hold("gateway", 9_600));
+    let before = fx.fingerprint();
     match fx.sb(SharedBudgetRequest::Check {
         session_id: "sess-1".into(),
         agent_id: None,
         provider: None,
     }) {
-        SharedBudgetOutcome::Checked { state, .. } => {
-            assert_eq!(state, SharedBudgetCheckState::Available)
+        SharedBudgetOutcome::Checked {
+            state,
+            remaining_usd_cents,
+            ..
+        } => {
+            assert_eq!(state, SharedBudgetCheckState::Available);
+            assert_eq!(remaining_usd_cents, 9_550);
         }
         other => panic!("expected Checked, got {other:?}"),
     }
+    assert_eq!(fx.fingerprint(), before);
+    // An invalid file still denies.
+    fx.set_file("{not json");
+    assert!(matches!(
+        fx.sb(SharedBudgetRequest::Check {
+            session_id: "sess-1".into(),
+            agent_id: None,
+            provider: None,
+        }),
+        SharedBudgetOutcome::Denied {
+            reason: SharedBudgetDenyReason::ConfigInvalid,
+            ..
+        }
+    ));
+    // Hooks mode keeps the exhausted answer.
+    let mut hooks = Fx::new("hooks");
+    hooks.set_file(&file_with_hold("hooks", 60_000));
+    assert!(matches!(
+        hooks.admit("holder"),
+        SharedBudgetOutcome::Allowed { .. }
+    ));
+    assert!(matches!(
+        hooks.sb(SharedBudgetRequest::Check {
+            session_id: "s".into(),
+            agent_id: None,
+            provider: None,
+        }),
+        SharedBudgetOutcome::Checked {
+            state: SharedBudgetCheckState::Exhausted,
+            ..
+        }
+    ));
 }
 
 // ---- the charge paths book zero ----
@@ -315,11 +481,12 @@ fn stop_subagent_stop_session_end_and_the_sweep_book_zero() {
     // A routed session gives the ledger real content to diff.
     fx.gateway_hold("sess-1", "r1");
     let (main, sub) = transcripts(fx.dir.path(), "sess-1");
-    let before = fx.fingerprint();
+    let before = fx.spend_fingerprint();
 
     // Stop: settle_turn plus the subagent sweep over sess-1/subagents.
     fx.finalize("sess-1", Some(&main));
-    assert_eq!(fx.fingerprint(), before, "Stop booked something");
+    assert_eq!(fx.spend_fingerprint(), before, "Stop booked something");
+    assert!(fx.mark_rows() >= 1, "Stop moved the lane watermark");
 
     // SubagentStop.
     let out = fx.sb(SharedBudgetRequest::ChargeAgentTranscript {
@@ -327,13 +494,12 @@ fn stop_subagent_stop_session_end_and_the_sweep_book_zero() {
         agent_id: Some("a1".into()),
         agent_transcript_path: sub,
     });
+    assert_eq!(out, gateway_metered_refusal());
     assert_eq!(
-        out,
-        SharedBudgetOutcome::Refused {
-            reason: SharedBudgetRefusal::GatewayMetered
-        }
+        fx.spend_fingerprint(),
+        before,
+        "SubagentStop booked something"
     );
-    assert_eq!(fx.fingerprint(), before, "SubagentStop booked something");
 
     // SessionEnd.
     let out = fx.sb(SharedBudgetRequest::SettleTail {
@@ -341,19 +507,127 @@ fn stop_subagent_stop_session_end_and_the_sweep_book_zero() {
         transcript_path: main.clone(),
         provider: None,
     });
+    assert_eq!(out, gateway_metered_refusal());
     assert_eq!(
-        out,
-        SharedBudgetOutcome::Refused {
-            reason: SharedBudgetRefusal::GatewayMetered
-        }
+        fx.spend_fingerprint(),
+        before,
+        "SessionEnd booked something"
     );
-    assert_eq!(fx.fingerprint(), before, "SessionEnd booked something");
 
     // Again: idempotent, still nothing.
     fx.finalize("sess-1", Some(&main));
-    assert_eq!(fx.fingerprint(), before);
+    assert_eq!(fx.spend_fingerprint(), before);
     let st = fx.status();
     assert_eq!(st.used_usd_cents, 0);
+}
+
+fn gateway_metered_refusal() -> SharedBudgetOutcome {
+    SharedBudgetOutcome::Refused {
+        reason: SharedBudgetRefusal::GatewayMetered,
+    }
+}
+
+#[test]
+fn an_absent_or_invalid_file_leaves_the_gateway_mode_paths_on_their_old_answers() {
+    // Absent: nothing is consulted or written.
+    let mut absent = Fx::gateway();
+    std::fs::remove_file(absent.dir.path().join(SHARED_BUDGET_FILE_NAME)).unwrap();
+    absent.clock.set(at(1));
+    let (main, sub) = transcripts(absent.dir.path(), "sess-1");
+    let before = absent.fingerprint();
+    absent.finalize("sess-1", Some(&main));
+    assert_eq!(
+        absent.sb(SharedBudgetRequest::ChargeAgentTranscript {
+            session_id: "sess-1".into(),
+            agent_id: Some("a1".into()),
+            agent_transcript_path: sub.clone(),
+        }),
+        SharedBudgetOutcome::NotConfigured
+    );
+    assert_eq!(
+        absent.sb(SharedBudgetRequest::SettleTail {
+            session_id: "sess-1".into(),
+            transcript_path: main.clone(),
+            provider: None,
+        }),
+        SharedBudgetOutcome::NotConfigured
+    );
+    assert_eq!(absent.fingerprint(), before);
+
+    // Invalid: denied config_invalid, nothing written.
+    let mut invalid = Fx::gateway();
+    invalid.set_file("{not json");
+    invalid.clock.set(at(1));
+    let (main, sub) = transcripts(invalid.dir.path(), "sess-1");
+    let before = invalid.fingerprint();
+    invalid.finalize("sess-1", Some(&main));
+    for out in [
+        invalid.sb(SharedBudgetRequest::ChargeAgentTranscript {
+            session_id: "sess-1".into(),
+            agent_id: Some("a1".into()),
+            agent_transcript_path: sub,
+        }),
+        invalid.sb(SharedBudgetRequest::SettleTail {
+            session_id: "sess-1".into(),
+            transcript_path: main,
+            provider: None,
+        }),
+    ] {
+        assert!(
+            matches!(
+                out,
+                SharedBudgetOutcome::Denied {
+                    reason: SharedBudgetDenyReason::ConfigInvalid,
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+    }
+    assert_eq!(invalid.fingerprint(), before);
+}
+
+#[test]
+fn a_codex_lane_in_gateway_mode_keeps_hooks_semantics_and_is_never_counted_unrouted() {
+    let mut fx = Fx::gateway();
+    let before = fx.fingerprint();
+    // Codex without the enrolment marker is inert: nothing is written.
+    let out = fx.sb(SharedBudgetRequest::Admit {
+        session_id: "cx-1".into(),
+        agent_id: None,
+        prompt_id: Some("t1".into()),
+        provider: Some("codex".into()),
+    });
+    assert!(
+        !matches!(out, SharedBudgetOutcome::GatewayMetered { .. }),
+        "the gateway never sees Codex traffic: {out:?}"
+    );
+    assert_eq!(fx.fingerprint(), before);
+    assert_eq!(fx.status().unrouted_sessions, 0);
+}
+
+#[test]
+fn charge_agent_is_refused_in_gateway_mode_and_still_books_in_hooks_mode() {
+    let charge = |fx: &mut Fx| {
+        fx.sb(SharedBudgetRequest::ChargeAgent {
+            session_id: "s".into(),
+            agent_id: None,
+            amount_usd_cents: 5,
+            idempotency_key: "k".into(),
+            charge_source: libra_governor_domain::ChargeSource::SubagentTranscript,
+            event_time: None,
+            provider: None,
+        })
+    };
+    let mut fx = Fx::gateway();
+    let before = fx.fingerprint();
+    assert_eq!(charge(&mut fx), gateway_metered_refusal());
+    assert_eq!(fx.fingerprint(), before);
+    let mut hooks = Fx::new("hooks");
+    assert!(matches!(
+        charge(&mut hooks),
+        SharedBudgetOutcome::Charged { .. }
+    ));
 }
 
 #[test]
@@ -533,4 +807,133 @@ fn a_v24_hook_is_refused_before_it_can_be_admitted_in_gateway_mode() {
         other => panic!("expected an error, got {other:?}"),
     }
     assert_eq!(fx.fingerprint(), before);
+}
+
+// ---- mode flips (both directions) ----
+
+#[test]
+fn a_flip_back_to_hooks_books_only_the_usage_after_the_gateway_turns() {
+    let mut fx = Fx::new("hooks");
+    let dir = fx.dir.path().to_path_buf();
+    let main = dir.join("sess-1.jsonl");
+    let path = main.to_str().unwrap().to_string();
+    let lines = |ids: &[(i64, &str)]| {
+        ids.iter()
+            .map(|(secs, id)| rec(*secs, id, "sess-1", None, 1))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    };
+
+    // 1. A hooks turn: 300 cents.
+    fx.admit("sess-1");
+    std::fs::write(&main, lines(&[(5, "h1")])).unwrap();
+    fx.clock.set(at(10));
+    fx.finalize("sess-1", Some(&path));
+    assert_eq!(fx.status().used_usd_cents, 300);
+
+    // 2. Gateway turns: the gateway meters them; the hooks book nothing.
+    fx.set_mode("gateway");
+    fx.config.gateway = Some(governor_held_gateway(&dir));
+    fx.clock.set(at(20));
+    fx.gateway_hold("sess-1", "r1");
+    std::fs::write(&main, lines(&[(5, "h1"), (25, "g1"), (30, "g2")])).unwrap();
+    fx.clock.set(at(40));
+    let before = fx.spend_fingerprint();
+    fx.finalize("sess-1", Some(&path));
+    assert_eq!(fx.spend_fingerprint(), before, "a gateway Stop booked");
+    assert_eq!(fx.status().used_usd_cents, 300);
+
+    // 3. Flip back to hooks: only the new turn is measured.
+    fx.set_mode("hooks");
+    fx.clock.set(at(50));
+    fx.admit("sess-1");
+    std::fs::write(
+        &main,
+        lines(&[(5, "h1"), (25, "g1"), (30, "g2"), (60, "h2")]),
+    )
+    .unwrap();
+    fx.clock.set(at(70));
+    fx.finalize("sess-1", Some(&path));
+    assert_eq!(
+        fx.status().used_usd_cents,
+        600,
+        "the two gateway-metered records must not be booked again"
+    );
+}
+
+#[test]
+fn a_flip_back_to_hooks_does_not_recharge_a_subagent_file_the_gateway_metered() {
+    let mut fx = Fx::gateway();
+    let dir = fx.dir.path().to_path_buf();
+    fx.gateway_hold("sess-1", "r1");
+    let sub_dir = dir.join("sess-1").join("subagents");
+    std::fs::create_dir_all(&sub_dir).unwrap();
+    let sub = sub_dir.join("agent-a1.jsonl");
+    let path = sub.to_str().unwrap().to_string();
+    std::fs::write(&sub, rec(5, "s1", "sess-1", Some("a1"), 1) + "\n").unwrap();
+    let before = fx.spend_fingerprint();
+    let charge = |fx: &mut Fx| {
+        fx.sb(SharedBudgetRequest::ChargeAgentTranscript {
+            session_id: "sess-1".into(),
+            agent_id: Some("a1".into()),
+            agent_transcript_path: path.clone(),
+        })
+    };
+    assert_eq!(charge(&mut fx), gateway_metered_refusal());
+    assert_eq!(fx.spend_fingerprint(), before);
+    assert_eq!(fx.status().used_usd_cents, 0);
+
+    // Flip back; the file grows by one record; only that one is charged.
+    fx.set_mode("hooks");
+    std::fs::write(
+        &sub,
+        rec(5, "s1", "sess-1", Some("a1"), 1)
+            + "\n"
+            + &rec(9, "s2", "sess-1", Some("a1"), 1)
+            + "\n",
+    )
+    .unwrap();
+    fx.clock.set(at(20));
+    match charge(&mut fx) {
+        SharedBudgetOutcome::TranscriptCharged {
+            amount_charged_usd_cents,
+            ..
+        } => assert_eq!(amount_charged_usd_cents, 300),
+        other => panic!("expected TranscriptCharged, got {other:?}"),
+    }
+    assert_eq!(fx.status().used_usd_cents, 300);
+}
+
+#[test]
+fn session_end_settles_a_pre_flip_hold_and_books_nothing_else() {
+    let mut fx = Fx::new("hooks");
+    fx.admit("sess-1");
+    let (main, _) = transcripts(fx.dir.path(), "sess-1");
+    fx.set_mode("gateway");
+    fx.config.gateway = Some(governor_held_gateway(fx.dir.path()));
+    fx.clock.set(at(10));
+    match fx.sb(SharedBudgetRequest::SettleTail {
+        session_id: "sess-1".into(),
+        transcript_path: main.clone(),
+        provider: None,
+    }) {
+        SharedBudgetOutcome::TailSettled {
+            amount_charged_usd_cents,
+            ..
+        } => assert_eq!(amount_charged_usd_cents, 300),
+        other => panic!("expected TailSettled, got {other:?}"),
+    }
+    let st = fx.status();
+    assert_eq!((st.used_usd_cents, st.reserved_usd_cents), (300, 0));
+    // A second SessionEnd books nothing more.
+    assert_eq!(
+        fx.sb(SharedBudgetRequest::SettleTail {
+            session_id: "sess-1".into(),
+            transcript_path: main,
+            provider: None,
+        }),
+        gateway_metered_refusal()
+    );
+    assert_eq!(fx.status().used_usd_cents, 300);
 }
