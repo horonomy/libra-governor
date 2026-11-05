@@ -694,7 +694,7 @@ budget gate (its hook route is unchanged).
 | `PreToolUse` | present, budget exhausted / `config_invalid` / `clock_anomaly` | `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"..."}}`, exit 0 |
 | `PreToolUse` | present, anything else (available, admitted, `not_configured`, daemon down, error, no answer in 500 ms) | empty output = allow (fail open); never spawns a daemon |
 | `SubagentStop` (`hook subagent-stop`) | absent | nothing is parsed or sent, the daemon is not contacted |
-| `SubagentStop` | present | one `ChargeAgentTranscript` with `session_id`, `agent_id` and `agent_transcript_path` as the host sent them; the daemon reads, binds, prices and de-duplicates. Always silent, exit 0 |
+| `SubagentStop` | present | one `ChargeAgentTranscript` with `session_id`, `agent_id` and `agent_transcript_path` as the host sent them, after the same bounded wait for the subagent's own transcript (HORO-2446); the daemon reads, binds, prices and de-duplicates. Always silent, exit 0 |
 | `SessionEnd` (`hook session-end`) | absent | nothing is parsed or sent, the daemon is not contacted |
 | `SessionEnd` | present | one `SettleTail` with `session_id` and `transcript_path`; the hook first waits (bounded) for the host's transcript flush, as `Stop` does. The daemon settles the lane's pending turn hold if a `Stop` never did (measured, else the hold amount flagged unmeasured; HORO-2440), and otherwise charges the records no `Stop` counted. With an invalid budget file nothing is settled. A host that kills the hook during the flush wait leaves the hold to expire, as before. Always silent, exit 0 |
 
@@ -705,7 +705,8 @@ exists it polls the daemon's read-only `TranscriptReady` probe, for at most 1.5 
 ceiling), because the host writes its transcript about 70 ms after the hook is
 dispatched. It never denies and never opens the transcript; a daemon that is
 down, older or slow ends the wait and `Finalize` is sent as before. With no
-budget file nothing is probed. See ADR-0026 *Flush lag at Stop*.
+budget file nothing is probed. `SessionEnd` and `SubagentStop` wait the same
+way. See ADR-0026 *Flush lag at Stop*.
 
 The settlement hooks (`SubagentStop`, `SessionEnd`) never block and never
 spawn a daemon: no daemon, no answer within 5 s, a malformed payload, an
