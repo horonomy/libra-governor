@@ -196,6 +196,8 @@ fn outer_context(ran: &Ran) -> String {
 /// What the scripted daemon does with one request.
 enum Answer {
     Reply(Response),
+    /// Reply stamped with another protocol version (a skewed daemon).
+    ReplyVersioned(u32, Response),
     /// Accept, read the request, never answer (until the daemon is dropped).
     Stall,
     /// Send one byte every 150 ms for 3 s, never a full line.
@@ -243,6 +245,15 @@ impl Fake {
                             &stream,
                             &ResponseEnvelope {
                                 protocol_version: PROTOCOL_VERSION,
+                                response,
+                            },
+                        );
+                    }
+                    Answer::ReplyVersioned(protocol_version, response) => {
+                        let _ = wire::write_message(
+                            &stream,
+                            &ResponseEnvelope {
+                                protocol_version,
                                 response,
                             },
                         );
@@ -671,6 +682,44 @@ fn not_configured_and_allowed_continue_to_preflight() {
         assert!(!ran.stdout.contains("decision"));
         assert!(!ctx.contains("soft limit"), "{ctx}");
     }
+}
+
+#[test]
+fn a_gateway_metered_answer_lets_the_prompt_continue_to_preflight() {
+    let state = tempfile::tempdir().unwrap();
+    write_budget(state.path(), &config(5_000, r#","enforcement":"gateway""#));
+    let fake = Fake::start(state.path(), |req| match req {
+        Request::SharedBudget { .. } => reply(SharedBudgetOutcome::GatewayMetered {
+            remaining_usd_cents: 4_000,
+            period_end: "2027-02-01T00:00:00Z".into(),
+        }),
+        _ => err("scripted"),
+    });
+    let ran = prompt(state.path(), "s-gw", repo().path(), &[]);
+    assert_eq!(
+        fake.kinds(),
+        vec!["shared_budget:admit".to_string(), "preflight".to_string()]
+    );
+    assert!(!ran.stdout.contains("decision"), "{}", ran.stdout);
+}
+
+#[test]
+fn a_daemon_one_protocol_version_behind_blocks_admission_even_in_gateway_mode() {
+    let state = tempfile::tempdir().unwrap();
+    write_budget(state.path(), &config(5_000, r#","enforcement":"gateway""#));
+    let fake = Fake::start(state.path(), |req| match req {
+        Request::SharedBudget { .. } => Answer::ReplyVersioned(
+            PROTOCOL_VERSION - 1,
+            Response::SharedBudget(Box::new(SharedBudgetOutcome::NotConfigured)),
+        ),
+        _ => err("scripted"),
+    });
+    assert_block(&prompt(state.path(), "s-skew", repo().path(), &[]));
+    assert!(
+        !fake.kinds().contains(&"preflight".to_string()),
+        "a skewed daemon must not let the prompt through: {:?}",
+        fake.kinds()
+    );
 }
 
 #[test]
