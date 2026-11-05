@@ -1235,7 +1235,8 @@ impl LedgerStore {
             "SELECT {RESERVATION_COLUMNS} FROM shared_pool_reservations
              WHERE pool_id = ?1 AND principal_id = ?2 AND session_id = ?3
                AND agent_id IS ?4 AND COALESCE(executor_kind, 'unattributed') = ?5
-               AND state = 'active' AND is_charge = 0"
+               AND state = 'active' AND is_charge = 0
+               AND COALESCE(charge_source, '') <> 'gateway'"
         ))?;
         let rows = stmt.query_map(
             rusqlite::params![
@@ -1314,7 +1315,8 @@ impl LedgerStore {
             "SELECT {RESERVATION_COLUMNS} FROM shared_pool_reservations
              WHERE principal_id = ?1 AND session_id = ?2 AND agent_id IS ?3
                AND COALESCE(executor_kind, 'unattributed') = ?4
-               AND substr(pool_id, 1, length(?5)) = ?5 AND is_charge = 0"
+               AND substr(pool_id, 1, length(?5)) = ?5 AND is_charge = 0
+               AND COALESCE(charge_source, '') <> 'gateway'"
         ))?;
         let rows = stmt.query_map(
             rusqlite::params![
@@ -1485,7 +1487,10 @@ impl LedgerStore {
 
     /// Every active, unexpired, non-charge hold `principal_id` has for
     /// `session_id` in any pool whose id starts with `pool_prefix`
-    /// (HORO-2195) -- the set a tool-event heartbeat renews.
+    /// (HORO-2195) -- the set a tool-event heartbeat renews. Gateway holds
+    /// (`charge_source = 'gateway'`) are excluded: the gateway renews its
+    /// own rows by id, and a tool-event heartbeat must not keep one alive
+    /// past a dead request (HORO-2275).
     pub fn active_shared_holds_for_session(
         &self,
         principal_id: &PrincipalId,
@@ -1497,7 +1502,8 @@ impl LedgerStore {
             "SELECT {RESERVATION_COLUMNS} FROM shared_pool_reservations
              WHERE principal_id = ?1 AND session_id = ?2
                AND substr(pool_id, 1, length(?3)) = ?3
-               AND state = 'active' AND is_charge = 0"
+               AND state = 'active' AND is_charge = 0
+               AND COALESCE(charge_source, '') <> 'gateway'"
         ))?;
         let rows = stmt.query_map(
             rusqlite::params![principal_id.0, session_id, pool_prefix],
@@ -2364,6 +2370,15 @@ impl LedgerStore {
     /// a hold issued by a process that then crashed without settling
     /// stays `active` (correctly still counted against the pool) until
     /// this sweep reclaims it.
+    ///
+    /// A `charge_source = 'gateway'` non-charge hold is not reclaimed but
+    /// booked: it becomes `settled` at its reserved amount with
+    /// `usage_known = 0`, so its capacity is never freed unaccounted
+    /// (HORO-2275). The returned rows are every row the sweep resolved, in
+    /// their new state (`expired` or `settled`). The reserved amount is the
+    /// gateway's worst-case bound for the request, so a settle that arrives
+    /// after this booking is `AlreadyFinal` and its smaller real figure is
+    /// not recorded (the booking over-counts, never under-counts).
     pub fn expire_stale_shared_pool_reservations(
         &mut self,
         now: OffsetDateTime,
@@ -2376,31 +2391,51 @@ impl LedgerStore {
         // fractional seconds (e.g. a real `OffsetDateTime::now_utc()`
         // call) that a lexical string comparison against `expires_at`
         // would not order chronologically in every case.
-        let ids: Vec<String> = {
+        let ids: Vec<(String, bool)> = {
             let mut stmt = tx.prepare(
-                "SELECT id, expires_at FROM shared_pool_reservations WHERE state = 'active'",
+                "SELECT id, expires_at, COALESCE(charge_source, '') = 'gateway' AND is_charge = 0
+                 FROM shared_pool_reservations WHERE state = 'active'",
             )?;
             let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
             })?;
             let mut ids = Vec::new();
             for row in rows {
-                let (id, expires_at) = row?;
+                let (id, expires_at, gateway_hold) = row?;
                 if parse_time(&expires_at)? <= now {
-                    ids.push(id);
+                    ids.push((id, gateway_hold));
                 }
             }
             ids
         };
 
         let mut expired = Vec::with_capacity(ids.len());
-        for id_str in ids {
+        for (id_str, gateway_hold) in ids {
             let id =
                 SharedPoolReservationId(uuid::Uuid::parse_str(&id_str).map_err(|_| invalid())?);
-            tx.execute(
-                "UPDATE shared_pool_reservations SET state = 'expired', released_at = ?1 WHERE id = ?2",
-                rusqlite::params![now_str, id_str],
-            )?;
+            if gateway_hold {
+                // Expire-as-charge (HORO-2275): a gateway request may still
+                // be streaming upstream, so its spend is unknown, not zero.
+                // Freeing the capacity would let the hard cap be exceeded;
+                // booking the reservation is a bounded over-count, and a
+                // late settle then reports `AlreadyFinal`.
+                tx.execute(
+                    "UPDATE shared_pool_reservations
+                     SET state = 'settled', settled_amount = amount, usage_known = 0,
+                         settled_at = ?1
+                     WHERE id = ?2 AND state = 'active'",
+                    rusqlite::params![now_str, id_str],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE shared_pool_reservations SET state = 'expired', released_at = ?1 WHERE id = ?2",
+                    rusqlite::params![now_str, id_str],
+                )?;
+            }
             expired.push(
                 Self::get_shared_reservation_tx(&tx, id)?
                     .expect("id came from a query against this same transaction, just updated"),
@@ -2408,6 +2443,60 @@ impl LedgerStore {
         }
         tx.commit()?;
         Ok(expired)
+    }
+
+    /// Startup orphan sweep for gateway holds (HORO-2275): books every
+    /// `active` `charge_source = 'gateway'` non-charge hold whose
+    /// idempotency key does not start with `boot_prefix_keep` (the current
+    /// process's `gw:{boot_id}:` prefix) at its reserved amount with
+    /// `usage_known = 0`. Rows of the current boot are untouched, expiry is
+    /// irrelevant (the owning process is gone), and a second run finds
+    /// nothing. Never frees capacity; a late settle from a draining old
+    /// process reports `AlreadyFinal`.
+    ///
+    /// One gateway process per ledger is assumed: the sweep is global, so a
+    /// second live gateway on the same ledger would have its holds booked as
+    /// orphans. A `boot_prefix_keep` that is not shaped `gw:<id>:` sweeps
+    /// nothing, so a malformed prefix can never book a live hold.
+    pub fn settle_orphaned_gateway_holds(
+        &mut self,
+        boot_prefix_keep: &str,
+        now: OffsetDateTime,
+    ) -> Result<Vec<SharedPoolReservation>, LedgerError> {
+        let well_formed = boot_prefix_keep.len() > "gw::".len()
+            && boot_prefix_keep.starts_with("gw:")
+            && boot_prefix_keep.ends_with(':');
+        if !well_formed {
+            return Ok(Vec::new());
+        }
+        let now_str = rfc3339(now)?;
+        let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
+        let ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM shared_pool_reservations
+                 WHERE state = 'active' AND is_charge = 0 AND charge_source = 'gateway'
+                   AND substr(idempotency_key, 1, length(?1)) <> ?1",
+            )?;
+            let rows = stmt.query_map([boot_prefix_keep], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let mut booked = Vec::with_capacity(ids.len());
+        for id_str in ids {
+            let id =
+                SharedPoolReservationId(uuid::Uuid::parse_str(&id_str).map_err(|_| invalid())?);
+            tx.execute(
+                "UPDATE shared_pool_reservations
+                 SET state = 'settled', settled_amount = amount, usage_known = 0, settled_at = ?1
+                 WHERE id = ?2 AND state = 'active'",
+                rusqlite::params![now_str, id_str],
+            )?;
+            booked.push(
+                Self::get_shared_reservation_tx(&tx, id)?
+                    .expect("id came from a query against this same transaction, just updated"),
+            );
+        }
+        tx.commit()?;
+        Ok(booked)
     }
 
     /// Ingests a provider-declared gauge reading for `pool_id`, replacing
