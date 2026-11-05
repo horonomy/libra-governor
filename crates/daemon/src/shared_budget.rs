@@ -827,7 +827,9 @@ fn allowed(
     })
 }
 
-/// Handles `SharedBudgetRequest::Admit`.
+/// Handles `SharedBudgetRequest::Admit`, assuming a `governor_held` gateway
+/// is running (see [`admit_with_gateway`], which the daemon dispatch uses
+/// with the real answer). Hooks mode never consults that assumption.
 pub fn admit(
     ledger: &mut LedgerStore,
     rt: &SharedBudgetRuntime,
@@ -835,6 +837,22 @@ pub fn admit(
     agent_id: Option<&str>,
     prompt_id: Option<&str>,
     provider: Option<&str>,
+) -> Result<SharedBudgetOutcome, SharedBudgetError> {
+    admit_with_gateway(ledger, rt, session_id, agent_id, prompt_id, provider, true)
+}
+
+/// [`admit`] told whether the daemon runs a `governor_held` gateway. Under
+/// `enforcement = "gateway"` a prompt with no such gateway is denied
+/// `gateway_unavailable` (after the file, identity and clock checks), because
+/// the hooks book nothing and nothing else would meter the spend.
+pub fn admit_with_gateway(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    session_id: &str,
+    agent_id: Option<&str>,
+    prompt_id: Option<&str>,
+    provider: Option<&str>,
+    governor_held_gateway: bool,
 ) -> Result<SharedBudgetOutcome, SharedBudgetError> {
     let prompt_id = usable_prompt(prompt_id);
     let GateContext {
@@ -856,6 +874,14 @@ pub fn admit(
     // sees Codex traffic.
     if cfg.enforcement == Enforcement::Gateway && is_claude_provider(provider) {
         let remaining = remaining_of(ledger, &period.pool_id, cfg, now)?;
+        if !governor_held_gateway {
+            return Ok(denied(
+                SharedBudgetDenyReason::GatewayUnavailable,
+                Some(remaining),
+                Some(period.end),
+                Some("enforcement=gateway needs a running governor_held gateway".to_string()),
+            ));
+        }
         // A hold admitted before a flip to gateway mode is still live and
         // still settles by transcript; its lane is not denied.
         let has_preflip_hold = ledger
@@ -1065,6 +1091,18 @@ pub fn check(
     let session_id = lane.as_str();
     let cfg = &cfg;
     let remaining = remaining_of(ledger, &period.pool_id, cfg, now)?;
+    // `enforcement = gateway` (S11f): a tool call mid-turn must not be denied
+    // on the turn-hold test. No hold backs the turn, so the test would wedge
+    // an admitted turn once other requests shrink `remaining`; the gateway
+    // meters and refuses each request itself. An invalid file, a clock
+    // anomaly and an absent file were handled above.
+    if cfg.enforcement == Enforcement::Gateway && is_claude_provider(provider) {
+        return Ok(SharedBudgetOutcome::Checked {
+            state: SharedBudgetCheckState::Available,
+            remaining_usd_cents: remaining,
+            period_end: rfc(period.end),
+        });
+    }
     let lane_hold = ledger.active_shared_hold_for_lane(
         &period.pool_id,
         &principal(),
@@ -1112,6 +1150,11 @@ pub fn charge(
         Ok((_, lane)) => lane,
         Err(outcome) => return Ok(outcome),
     };
+    // `enforcement = gateway` (S11f): the gateway is the only writer of
+    // spend for Claude lanes, and no hook sends this request.
+    if is_claude_provider(provider) && gateway_enforced(&rt.effective().state) {
+        return Ok(refused(SharedBudgetRefusal::GatewayMetered));
+    }
     charge_on_lane(
         ledger,
         rt,
@@ -1730,16 +1773,11 @@ pub fn settle_turn(
     }
     // `enforcement = gateway` (S11f): nothing here books spend unless a hold
     // from before the flip is still pending, which settles by transcript below.
-    // A session that stopped without a single gateway row bypassed the gateway;
-    // that is detected and counted, never charged.
-    if gateway_enforced(&state) {
-        note_if_unrouted(ledger, rt, &state, session_id)?;
-    }
-    let Some(target) = pending_hold(&holds) else {
-        return Ok(TurnSettlement::NoHold);
-    };
-    Ok(
-        match settle_hold_from_window(
+    // Afterwards the lane's watermark moves past the gateway-metered turns
+    // (see `advance_gateway_mark`), without booking anything.
+    let settlement = match pending_hold(&holds) {
+        None => TurnSettlement::NoHold,
+        Some(target) => match settle_hold_from_window(
             ledger,
             rt,
             &state,
@@ -1753,30 +1791,95 @@ pub fn settle_turn(
             // Unreachable with `book_flat`: an unmeasured window books the hold.
             WindowOutcome::NotBooked { .. } => TurnSettlement::NoHold,
         },
-    )
+    };
+    if let SharedBudgetFileState::Valid(cfg) = &state {
+        if cfg.enforcement == Enforcement::Gateway {
+            advance_gateway_mark(ledger, rt, cfg, session_id)?;
+        }
+    }
+    Ok(settlement)
 }
 
-/// Counts `session_id` as unrouted when the current period's pool holds no
-/// gateway row for it. Read-only apart from daemon memory.
-fn note_if_unrouted(
+/// Whether the current period's pool holds a gateway row for `session_id`.
+fn session_is_routed(
     ledger: &LedgerStore,
     rt: &SharedBudgetRuntime,
-    state: &SharedBudgetFileState,
+    cfg: &SharedBudgetConfig,
+    session_id: &str,
+) -> Result<bool, SharedBudgetError> {
+    let period = period_at(cfg, rt.now())?;
+    Ok(ledger.has_gateway_row_for_session(&period.pool_id, &principal(), session_id)?)
+}
+
+/// Gateway-mode bookkeeping for a hook that books nothing (S11f).
+///
+/// A session with no gateway row in the current pool bypassed the gateway:
+/// it is counted as unrouted (detection only; Codex lanes are not Claude
+/// traffic and are skipped) and nothing is written. A routed session's
+/// spend is the gateway's, so the lane's persisted watermark is moved to
+/// now by a zero-amount settled row. Without it, a later flip back to hooks
+/// would measure a window that starts before the gateway turns and book
+/// their spend a second time (an over-count the hooks window logic cannot
+/// otherwise see).
+fn advance_gateway_mark(
+    ledger: &mut LedgerStore,
+    rt: &SharedBudgetRuntime,
+    cfg: &SharedBudgetConfig,
     session_id: &str,
 ) -> Result<(), SharedBudgetError> {
-    let SharedBudgetFileState::Valid(cfg) = state else {
-        return Ok(());
-    };
-    let period = period_at(cfg, rt.now())?;
-    if ledger.has_gateway_row_for_session(&period.pool_id, &principal(), session_id)? {
+    if session_id.starts_with(PROVIDER_LANE_PREFIX) {
         return Ok(());
     }
-    rt.note(|t| {
-        if t.unrouted_sessions.len() < MAX_UNROUTED_SESSIONS {
-            t.unrouted_sessions.insert(opaque_id(session_id));
-        }
-    });
-    Ok(())
+    if !session_is_routed(ledger, rt, cfg, session_id)? {
+        rt.note(|t| {
+            if t.unrouted_sessions.len() < MAX_UNROUTED_SESSIONS {
+                t.unrouted_sessions.insert(opaque_id(session_id));
+            }
+        });
+        return Ok(());
+    }
+    let now = rt.now();
+    let period = period_at(cfg, now)?;
+    let key = format!(
+        "gateway-mark:{}|{}",
+        lp(session_id),
+        now.unix_timestamp_nanos()
+    );
+    let mark = SettleWatermark {
+        at: Some(now),
+        message_ids: Vec::new(),
+    };
+    match ledger.charge_shared_with_watermark(
+        SharedPoolChargeRequest {
+            pool_id: &period.pool_id,
+            principal_id: &principal(),
+            session_id,
+            amount: 0,
+            unit: &QuotaUnit::UsdCents,
+            idempotency_key: &key,
+            now,
+            attribution: attribution_for(None, ChargeSource::TurnHold),
+            capacity_source: source(cfg),
+            usage_known: true,
+        },
+        Some(&mark),
+    ) {
+        Ok(_) => Ok(()),
+        Err(LedgerError::QuotaUnitMismatch { .. }) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The part of a subagent's file cost that the gateway metered and no hook
+/// booked, recorded as the largest `g<N>` key under its family prefix.
+fn gateway_metered_offset(ledger: &LedgerStore, prefix: &str) -> Result<u64, SharedBudgetError> {
+    let tag = format!("{prefix}g");
+    Ok(ledger
+        .shared_charge_keys_by_prefix(&principal(), &tag, OWNER_POOL_PREFIX)?
+        .iter()
+        .filter_map(|k| k.strip_prefix(&tag)?.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0))
 }
 
 /// What [`settle_hold_from_window`] did.
@@ -2711,9 +2814,11 @@ pub fn charge_agent_transcript(
     agent_id: Option<&str>,
     agent_transcript_path: &str,
 ) -> Result<SharedBudgetOutcome, SharedBudgetError> {
+    let state = rt.effective().state;
     Ok(charge_transcript_inner(
         ledger,
         rt,
+        &state,
         session_id,
         agent_id,
         agent_transcript_path,
@@ -2731,6 +2836,7 @@ pub fn charge_agent_transcript(
 fn charge_transcript_inner(
     ledger: &mut LedgerStore,
     rt: &SharedBudgetRuntime,
+    state: &SharedBudgetFileState,
     session_id: &str,
     agent_id: Option<&str>,
     agent_transcript_path: &str,
@@ -2738,7 +2844,6 @@ fn charge_transcript_inner(
 ) -> Result<Option<SharedBudgetOutcome>, SharedBudgetError> {
     use sha2::{Digest, Sha256};
 
-    let state = rt.effective().state;
     if matches!(state, SharedBudgetFileState::Absent) {
         return Ok(Some(SharedBudgetOutcome::NotConfigured));
     }
@@ -2749,17 +2854,11 @@ fn charge_transcript_inner(
         Ok(kind) => kind,
         Err(reason) => return Ok(Some(refused(reason))),
     };
-    let cfg = match configured(&state) {
+    let cfg = match configured(state) {
         Ok(cfg) => cfg,
         Err(outcome) => return Ok(Some(outcome)),
     };
     let cfg = &cfg;
-    // `enforcement = gateway` (S11f): the gateway already meters these calls,
-    // so a subagent's transcript is never charged again.
-    if cfg.enforcement == Enforcement::Gateway {
-        return Ok(Some(refused(SharedBudgetRefusal::GatewayMetered)));
-    }
-
     let family = match agent_id {
         Some(agent) => format!("agent:{agent}"),
         None => {
@@ -2873,8 +2972,50 @@ fn charge_transcript_inner(
         ),
     };
 
-    let already =
+    let summed =
         ledger.shared_charges_total_by_key_prefix(&principal(), &prefix, OWNER_POOL_PREFIX)?;
+    // `enforcement = gateway` (S11f): the gateway already meters these calls,
+    // so a subagent's transcript is never charged. For a routed session the
+    // part of the file the gateway metered is recorded as a zero-amount
+    // offset row, so a later flip back to hooks charges only what follows.
+    if cfg.enforcement == Enforcement::Gateway {
+        if let Some((cumulative, _)) = measured {
+            let offset = cumulative.saturating_sub(summed);
+            if offset > gateway_metered_offset(ledger, &prefix)?
+                && session_is_routed(ledger, rt, cfg, session_id)?
+            {
+                let now = rt.now();
+                let period = period_at(cfg, now)?;
+                let key = format!("{prefix}g{offset}");
+                let attribution = match agent_id {
+                    None => {
+                        ExecutorAttribution::unattributed(Some(ChargeSource::SubagentTranscript))
+                    }
+                    Some(_) => attribution_for(agent_id, ChargeSource::SubagentTranscript),
+                };
+                match ledger.charge_shared_with_watermark(
+                    SharedPoolChargeRequest {
+                        pool_id: &period.pool_id,
+                        principal_id: &principal(),
+                        session_id,
+                        amount: 0,
+                        unit: &QuotaUnit::UsdCents,
+                        idempotency_key: &key,
+                        now,
+                        attribution,
+                        capacity_source: source(cfg),
+                        usage_known: true,
+                    },
+                    None,
+                ) {
+                    Ok(_) | Err(LedgerError::QuotaUnitMismatch { .. }) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        return Ok(Some(refused(SharedBudgetRefusal::GatewayMetered)));
+    }
+    let already = summed.saturating_add(gateway_metered_offset(ledger, &prefix)?);
     let (amount, key, event_time, usage_known) = match measured {
         Some((cumulative, last_event)) => {
             let delta = cumulative.saturating_sub(already);
@@ -2923,7 +3064,7 @@ fn charge_transcript_inner(
     let outcome = book_charge(
         ledger,
         rt,
-        &state,
+        state,
         BookedCharge {
             session_id,
             agent_id,
@@ -3023,11 +3164,9 @@ pub fn sweep_with_budget(
 ) -> SweepReport {
     use std::os::unix::fs::MetadataExt;
 
-    // `enforcement = gateway` (S11f): the sweep books nothing, so it does not
-    // even list the directory.
-    if gateway_enforced(&rt.effective().state) {
-        return SweepReport::default();
-    }
+    // One snapshot of the file for the whole sweep, so a mode flip cannot
+    // split it (S11f).
+    let state = rt.effective().state;
     let Some(stem) = transcript_path.strip_suffix(".jsonl") else {
         return SweepReport::default();
     };
@@ -3087,7 +3226,7 @@ pub fn sweep_with_budget(
         }
         processed_any = true;
         spent = spent.saturating_add(cost);
-        match charge_transcript_inner(ledger, rt, session_id, Some(&agent), path, true) {
+        match charge_transcript_inner(ledger, rt, &state, session_id, Some(&agent), path, true) {
             Ok(Some(SharedBudgetOutcome::TranscriptCharged {
                 amount_charged_usd_cents,
                 ..
@@ -3097,7 +3236,10 @@ pub fn sweep_with_budget(
                 }
                 remember_swept(rt, key, stamp);
             }
-            Ok(None) => remember_swept(rt, key, stamp),
+            Ok(None)
+            | Ok(Some(SharedBudgetOutcome::Refused {
+                reason: SharedBudgetRefusal::GatewayMetered,
+            })) => remember_swept(rt, key, stamp),
             // A denial (invalid config) or an error is retried next Stop.
             _ => {}
         }
@@ -3264,6 +3406,7 @@ pub fn settle_tail_on_lane(
     // `enforcement = gateway` (S11f): a pre-flip hold was settled above; the
     // tail past the watermark is already metered by the gateway.
     if cfg.enforcement == Enforcement::Gateway {
+        advance_gateway_mark(ledger, rt, cfg, session_id)?;
         return Ok(refused(SharedBudgetRefusal::GatewayMetered));
     }
     // A tail continues a lane that has settled under this budget. A session

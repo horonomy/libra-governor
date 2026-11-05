@@ -901,13 +901,14 @@ pub(crate) fn dispatch(
                     agent_id,
                     prompt_id,
                     provider,
-                } => crate::shared_budget::admit(
+                } => crate::shared_budget::admit_with_gateway(
                     ledger,
                     rt,
                     &session_id,
                     agent_id.as_deref(),
                     prompt_id.as_deref(),
                     provider.as_deref(),
+                    gateway_is_governor_held(config),
                 ),
                 SharedBudgetRequest::Check {
                     session_id,
@@ -3117,6 +3118,17 @@ fn start_extensions(config: &DaemonConfig) -> Option<ExtensionDispatcherHandle> 
     Some(ExtensionDispatcherHandle {
         _shutdown: shutdown_tx,
     })
+}
+
+/// Whether the daemon's gateway configuration is `governor_held`
+/// ([`libra_governor_domain::EnforcementTier::GatewayMetered`]) and valid,
+/// judged the way `GatewayStatus` judges `running`, which `doctor` reads.
+fn gateway_is_governor_held(config: &DaemonConfig) -> bool {
+    let Some(raw) = config.gateway.clone() else {
+        return false;
+    };
+    libra_governor_gateway::config::validate(raw, config.policy.resource.target.kind())
+        .is_ok_and(|v| v.tier == libra_governor_domain::EnforcementTier::GatewayMetered)
 }
 
 /// Answers a `GatewayStatus` request from state the daemon already holds.
