@@ -64,6 +64,7 @@ struct RawFile {
     soft_limits: Option<RawSoftLimits>,
     subagent_unmeasured_charge_usd_cents: Option<i64>,
     pricing_overrides: Option<BTreeMap<String, RawModelPricing>>,
+    enforcement: Option<String>,
 }
 
 /// One model's USD-per-million-token prices, the same four tiers as the
@@ -176,6 +177,28 @@ pub struct SoftLimits {
     pub per_agent_usd_cents: Option<u64>,
 }
 
+/// How the monthly cap is enforced (S11, `enforcement`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Enforcement {
+    /// Cooperative: the hook-driven turn holds and transcript settlement.
+    /// The default, and the only behaviour before the gateway primitives.
+    #[default]
+    Hooks,
+    /// Governor-held: the gateway reserves and settles each request against
+    /// the pool.
+    Gateway,
+}
+
+fn parse_enforcement(raw: Option<String>) -> Result<Enforcement, String> {
+    match raw.as_deref() {
+        None | Some("hooks") => Ok(Enforcement::Hooks),
+        Some("gateway") => Ok(Enforcement::Gateway),
+        Some(other) => Err(format!(
+            "enforcement must be \"hooks\" or \"gateway\" (got {other:?})"
+        )),
+    }
+}
+
 /// A validated shared-budget configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedBudgetConfig {
@@ -187,6 +210,7 @@ pub struct SharedBudgetConfig {
     /// Operator corrections to the pinned pricing table; empty means the
     /// pinned table is used as is.
     pub pricing_overrides: PricingOverrides,
+    pub enforcement: Enforcement,
 }
 
 /// What the shared-budget file said when it was read.
@@ -267,6 +291,7 @@ fn parse_inner(bytes: &[u8]) -> Result<SharedBudgetConfig, String> {
         raw.subagent_unmeasured_charge_usd_cents,
     )?;
     let pricing_overrides = parse_overrides(raw.pricing_overrides)?;
+    let enforcement = parse_enforcement(raw.enforcement)?;
     Ok(SharedBudgetConfig {
         monthly_cap_usd_cents: cap,
         time_zone,
@@ -274,6 +299,7 @@ fn parse_inner(bytes: &[u8]) -> Result<SharedBudgetConfig, String> {
         soft_limits,
         subagent_unmeasured_charge_usd_cents,
         pricing_overrides,
+        enforcement,
     })
 }
 
@@ -741,5 +767,39 @@ mod tests {
             };
             assert!(reason.contains(needle), "{needle}: {reason}");
         }
+    }
+
+    fn with_enforcement(value: &str) -> String {
+        format!(
+            r#"{{"schema_version":1,"monthly_cap_usd_cents":10000,"time_zone":"UTC","enforcement":{value}}}"#
+        )
+    }
+
+    fn enforcement_of(value: &str) -> Enforcement {
+        let json = with_enforcement(value);
+        match parse(json.as_bytes()) {
+            SharedBudgetFileState::Valid(c) => c.enforcement,
+            other => panic!("expected valid for {json}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enforcement_defaults_to_hooks_and_accepts_the_two_named_modes() {
+        let SharedBudgetFileState::Valid(omitted) = parse(GOOD.as_bytes()) else {
+            panic!("GOOD is valid");
+        };
+        assert_eq!(omitted.enforcement, Enforcement::Hooks);
+        assert_eq!(enforcement_of(r#""hooks""#), Enforcement::Hooks);
+        assert_eq!(enforcement_of(r#""gateway""#), Enforcement::Gateway);
+        assert_eq!(enforcement_of("null"), Enforcement::Hooks);
+    }
+
+    #[test]
+    fn an_unknown_enforcement_value_makes_the_whole_file_invalid() {
+        for value in [r#""proxy""#, r#""Gateway""#, r#""""#] {
+            let reason = invalid(&with_enforcement(value));
+            assert!(reason.contains("enforcement"), "{value}: {reason}");
+        }
+        invalid(&with_enforcement("7"));
     }
 }
