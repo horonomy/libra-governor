@@ -341,6 +341,10 @@ fn decide_admit_in(outcome: &SharedBudgetOutcome, ctx: &BudgetContext) -> Admiss
                 ctx,
             ),
         },
+        // `enforcement = "gateway"`: no hold was reserved; the gateway meters
+        // each request. The prompt proceeds (soft-limit warnings are not
+        // computed in this mode).
+        SharedBudgetOutcome::GatewayMetered { .. } => Admission::Proceed { warning: None },
         // A refusal is driven purely by host-supplied identity, not by the
         // budget: never block the user's prompt for it.
         SharedBudgetOutcome::Refused { .. } => Admission::Proceed { warning: None },
@@ -797,6 +801,17 @@ mod tests {
             panic!()
         };
         assert!(reason.contains("over the cap by $0.03"), "{reason}");
+    }
+
+    #[test]
+    fn the_gateway_metered_answer_proceeds_without_a_warning() {
+        assert!(matches!(
+            decide_admit(&SharedBudgetOutcome::GatewayMetered {
+                remaining_usd_cents: 4_000,
+                period_end: "2027-02-01T00:00:00Z".into(),
+            }),
+            Admission::Proceed { warning: None }
+        ));
     }
 
     #[test]

@@ -15,11 +15,14 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use libra_governor_daemon::shared_budget_file::{LoadedSharedBudget, SharedBudgetFileState};
+use libra_governor_daemon::shared_budget_file::{
+    Enforcement, LoadedSharedBudget, SharedBudgetFileState,
+};
 use libra_governor_domain::{format_local_rfc3339, IanaTimeZone};
 use libra_governor_protocol::{
     Request, Response, SharedBudgetConfigDrift, SharedBudgetConfigState, SharedBudgetOutcome,
-    SharedBudgetRequest, SharedBudgetStatus, SoftLimitScope,
+    SharedBudgetRequest, SharedBudgetStatus, SoftLimitScope, SHARED_BUDGET_ENFORCEMENT_GATEWAY,
+    SHARED_BUDGET_GUARANTEE_GATEWAY,
 };
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
@@ -32,6 +35,12 @@ pub const STATUS_SCHEMA: &str = "libra.shared-budget-status.v1";
 
 /// The limit's kind, as ADR-0026 words it.
 pub const GUARANTEE_LABEL: &str = "admission-bounded (cooperative)";
+
+/// The limit's kind under `enforcement = "gateway"` (S11). Never shortened to
+/// "hard cap": both qualifiers belong with it.
+pub const GUARANTEE_LABEL_GATEWAY: &str = "gateway-reserved-modelled-worst-case (Libra-accounted; \
+    gateway-routed spend only; not a provider-bill guarantee; not tamper-proof against the \
+    same OS user)";
 
 /// How to turn the budget on; shown wherever "not configured" is reported.
 pub const ENABLE_HINT: &str = "To enable it: libra-governor shared-budget init --monthly-usd <n> \
@@ -73,6 +82,24 @@ const NOT_COVERED_CODEX_ENROLLED: [&str; 4] = [
     NOT_COVERED[3],
 ];
 
+/// The "does NOT cover" list under `enforcement = "gateway"`: the hooks book
+/// nothing, so the hooks-only overshoot and "no gateway cap" entries no longer
+/// apply and the gateway's own residuals take their place.
+const NOT_COVERED_GATEWAY: [&str; 4] = [
+    "spend that does not pass through the Libra gateway is NOT counted in gateway mode: a \
+     session that stopped without any gateway request is reported as unrouted (detection \
+     only), and the Claude Code hooks book nothing",
+    NOT_COVERED[1],
+    "modelled worst case, not a provider bill: a request whose actual cost exceeds its modelled \
+     worst case (output past max_tokens, input past the pre-flight bound) is detected and \
+     reported but can overrun the cap; server tools and content the gateway cannot bound are \
+     refused; the 1-hour cache tier, fast mode and similar premiums are bill drift; any \
+     process running as the same OS user can edit shared-budget.json or the ledger",
+    "a request in flight when the daemon stops is booked at its full reservation by the next \
+     start (an over-count); a forward clock or time-zone change opens the next month's budget \
+     early",
+];
+
 /// Is Codex enrolled in the budget, judged from what this report was built
 /// from: a budget exists (`posture`) and a regular `shared-budget.codex` file
 /// sits in `state_dir`, by stat alone like the hook and the daemon (a symlink
@@ -88,11 +115,34 @@ pub fn codex_enrolled_in(posture: &Posture, state_dir: Option<&Path>) -> bool {
 
 /// The "does NOT cover" list for a report. Without Codex enrolment it is
 /// exactly [`NOT_COVERED`], so every Claude-side byte is unchanged.
+#[cfg(test)]
 pub fn not_covered_for(codex_enrolled: bool) -> Vec<&'static str> {
-    if codex_enrolled {
+    not_covered_in_mode(codex_enrolled, false)
+}
+
+/// [`not_covered_for`] for a mode: `gateway` is `enforcement = "gateway"`.
+pub fn not_covered_in_mode(codex_enrolled: bool, gateway: bool) -> Vec<&'static str> {
+    if gateway {
+        let mut items = NOT_COVERED_GATEWAY.to_vec();
+        if codex_enrolled {
+            items[1] = NOT_COVERED_CODEX_ENROLLED[1];
+        }
+        items
+    } else if codex_enrolled {
         NOT_COVERED_CODEX_ENROLLED.to_vec()
     } else {
         NOT_COVERED.to_vec()
+    }
+}
+
+/// Whether the budget in `posture` is enforced by the gateway.
+pub fn gateway_enforced(posture: &Posture) -> bool {
+    match posture {
+        Posture::NotConfigured => false,
+        Posture::DaemonUnreachable { file, .. } => file
+            .config()
+            .is_some_and(|c| c.enforcement == Enforcement::Gateway),
+        Posture::Reported(s) => s.enforcement == SHARED_BUDGET_ENFORCEMENT_GATEWAY,
     }
 }
 
@@ -147,6 +197,58 @@ pub fn fetch_status(socket: &Path, budget: Duration) -> Result<SharedBudgetStatu
         Ok(Ok(_)) => Err("unexpected response kind for a shared-budget status".to_string()),
         Ok(Err(e)) => Err(e.to_string()),
         Err(_) => Err("the daemon did not answer in time".to_string()),
+    }
+}
+
+/// What `doctor` learned about the gateway `enforcement = "gateway"` depends on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayProbe {
+    /// A gateway is running and it is `governor_held`.
+    GovernorHeldRunning,
+    /// No gateway runs; `reason` is the daemon's own account.
+    NotRunning { reason: String },
+    /// A gateway runs but is not `governor_held`.
+    WrongTier,
+    /// The daemon could not be asked.
+    Unreachable(String),
+}
+
+/// Asks the running daemon for its gateway status. Never spawns a daemon.
+pub fn probe_gateway(budget: Duration) -> GatewayProbe {
+    let socket = match libra_governor_daemon::paths::socket_path() {
+        Ok(socket) => socket,
+        Err(e) => return GatewayProbe::Unreachable(format!("no daemon socket: {e}")),
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let answer = client::connect_only_with_budget(&socket, budget)
+            .and_then(|stream| client::roundtrip(&stream, Request::GatewayStatus));
+        let _ = tx.send(answer);
+    });
+    match rx.recv_timeout(budget) {
+        Ok(Ok(Response::GatewayStatus(result))) => classify_gateway(&result),
+        Ok(Ok(_)) => GatewayProbe::Unreachable("unexpected daemon response".to_string()),
+        Ok(Err(e)) => GatewayProbe::Unreachable(one_line(&e.to_string())),
+        Err(_) => GatewayProbe::Unreachable("the daemon did not answer in time".to_string()),
+    }
+}
+
+/// Pure half of [`probe_gateway`].
+pub fn classify_gateway(result: &libra_governor_protocol::GatewayStatusResult) -> GatewayProbe {
+    use libra_governor_domain::EnforcementTier;
+    if !result.running {
+        return GatewayProbe::NotRunning {
+            reason: one_line(
+                result
+                    .disabled_reason
+                    .as_deref()
+                    .unwrap_or("the gateway is disabled"),
+            ),
+        };
+    }
+    match &result.capabilities {
+        Some(c) if c.tier == EnforcementTier::GatewayMetered => GatewayProbe::GovernorHeldRunning,
+        _ => GatewayProbe::WrongTier,
     }
 }
 
@@ -435,7 +537,7 @@ pub fn render_human(posture: &Posture, state_dir: Option<&Path>) -> String {
         }
         Posture::DaemonUnreachable { file, reason } => {
             out.push_str("Shared budget (local, this host and OS user)\n");
-            push_labels(&mut out);
+            push_labels(&mut out, gateway_enforced(posture));
             match &file.state {
                 SharedBudgetFileState::Absent => out.push_str("Config: absent\n"),
                 SharedBudgetFileState::Invalid(why) => out.push_str(&format!(
@@ -455,21 +557,36 @@ pub fn render_human(posture: &Posture, state_dir: Option<&Path>) -> String {
             ));
         }
         Posture::Reported(status) => {
-            let not_covered = not_covered_for(codex_enrolled_in(posture, state_dir));
+            let not_covered = not_covered_in_mode(
+                codex_enrolled_in(posture, state_dir),
+                gateway_enforced(posture),
+            );
             render_reported(&mut out, status, &not_covered)
         }
     }
     out
 }
 
-fn push_labels(out: &mut String) {
-    out.push_str(&format!("Guarantee: {GUARANTEE_LABEL}\n"));
+fn push_labels(out: &mut String, gateway: bool) {
+    let label = if gateway {
+        GUARANTEE_LABEL_GATEWAY
+    } else {
+        GUARANTEE_LABEL
+    };
+    out.push_str(&format!("Guarantee: {label}\n"));
     out.push_str(&format!("Units: {USD_MEANING} ({})\n", pricing_version()));
 }
 
 fn render_reported(out: &mut String, s: &SharedBudgetStatus, not_covered: &[&str]) {
     out.push_str("Shared budget (local, this host and OS user)\n");
-    push_labels(out);
+    let gateway = s.enforcement == SHARED_BUDGET_ENFORCEMENT_GATEWAY;
+    push_labels(out, gateway);
+    if gateway {
+        out.push_str(&format!(
+            "Enforcement: gateway (the gateway reserves every request and is the only writer \
+             of spend; the hooks book nothing; label {SHARED_BUDGET_GUARANTEE_GATEWAY})\n"
+        ));
+    }
     match s.config_state {
         SharedBudgetConfigState::Absent => out.push_str("Config: absent\n"),
         SharedBudgetConfigState::Invalid => out.push_str(&format!(
@@ -545,6 +662,18 @@ fn render_reported(out: &mut String, s: &SharedBudgetStatus, not_covered: &[&str
         None => out.push_str("Remaining: unknown\n"),
     }
 
+    if gateway {
+        out.push_str(&format!(
+            "Gateway: {} request(s) in flight; {} truncated settle(s), {} input-bound \
+             violation(s) since the gateway started; {} unrouted session(s) and {} orphan \
+             hold(s) booked since the daemon started\n",
+            s.gateway_in_flight,
+            s.truncated_settles,
+            s.input_bound_violations,
+            s.unrouted_sessions,
+            s.orphans_booked
+        ));
+    }
     out.push_str(&format!("Executors ({}):\n", s.executors.len()));
     if s.executors.is_empty() {
         out.push_str("  (none)\n");
@@ -631,14 +760,15 @@ fn clip(text: &str, width: usize) -> String {
 }
 
 pub fn render_json(posture: &Posture, state_dir: Option<&Path>) -> Value {
+    let gateway = gateway_enforced(posture);
     let base = |state: &str| {
         json!({
             "schema": STATUS_SCHEMA,
             "state": state,
-            "guarantee": GUARANTEE_LABEL,
+            "guarantee": if gateway { SHARED_BUDGET_GUARANTEE_GATEWAY } else { GUARANTEE_LABEL },
             "usd_meaning": USD_MEANING,
             "pricing_version": pricing_version(),
-            "not_covered": not_covered_for(codex_enrolled_in(posture, state_dir)),
+            "not_covered": not_covered_in_mode(codex_enrolled_in(posture, state_dir), gateway),
             "state_dir": state_dir.map(|d| d.display().to_string()),
         })
     };
@@ -741,6 +871,17 @@ pub fn render_json(posture: &Posture, state_dir: Option<&Path>) -> Value {
             v["flagged_settlements"] = Value::Object(flagged);
             v["clock_anomaly"] = json!(s.clock_anomaly);
             v["future_pool_detected"] = json!(s.future_pool_detected);
+            // Only in gateway mode, so a hooks-mode report is unchanged.
+            if gateway {
+                v["enforcement"] = json!(s.enforcement);
+                v["gateway"] = json!({
+                    "in_flight": s.gateway_in_flight,
+                    "truncated_settles": s.truncated_settles,
+                    "input_bound_violations": s.input_bound_violations,
+                    "unrouted_sessions": s.unrouted_sessions,
+                    "orphans_booked": s.orphans_booked,
+                });
+            }
             v
         }
     }
@@ -847,7 +988,9 @@ pub(crate) mod fixtures {
 mod tests {
     use super::fixtures::sample_status as status;
     use super::*;
-    use libra_governor_protocol::SoftLimitWarning;
+    use libra_governor_protocol::{
+        SoftLimitWarning, SHARED_BUDGET_ENFORCEMENT_GATEWAY, SHARED_BUDGET_GUARANTEE_GATEWAY,
+    };
 
     #[test]
     fn usd_renders_negative_remaining_honestly() {
@@ -1106,6 +1249,100 @@ mod tests {
         for item in NOT_COVERED {
             assert!(text.contains(item), "{item}");
         }
+    }
+
+    fn gateway_status() -> SharedBudgetStatus {
+        let mut s = status();
+        s.enforcement = SHARED_BUDGET_ENFORCEMENT_GATEWAY.into();
+        s.guarantee = SHARED_BUDGET_GUARANTEE_GATEWAY.into();
+        s.gateway_in_flight = 2;
+        s.truncated_settles = 3;
+        s.input_bound_violations = 1;
+        s.unrouted_sessions = 4;
+        s.orphans_booked = 5;
+        s
+    }
+
+    #[test]
+    fn a_gateway_report_carries_its_own_label_residuals_and_counters() {
+        let posture = Posture::Reported(Box::new(gateway_status()));
+        let text = render_human(&posture, None);
+        assert!(
+            text.contains("gateway-reserved-modelled-worst-case"),
+            "{text}"
+        );
+        assert!(text.contains("gateway-routed"), "{text}");
+        assert!(!text.contains("admission-bounded (cooperative)"), "{text}");
+        assert!(
+            text.contains("2 request(s) in flight")
+                && text.contains("4 unrouted session(s)")
+                && text.contains("5 orphan"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("the per-request hard cap (gateway governor_held mode) is not built"),
+            "the replace-mode report must not say the gateway cap is unbuilt: {text}"
+        );
+        for item in not_covered_in_mode(false, true) {
+            assert!(text.contains(item), "{item}");
+        }
+        let v = render_json(&posture, None);
+        assert_eq!(v["guarantee"], SHARED_BUDGET_GUARANTEE_GATEWAY);
+        assert_eq!(v["enforcement"], "gateway");
+        assert_eq!(v["gateway"]["in_flight"], 2);
+        assert_eq!(v["gateway"]["unrouted_sessions"], 4);
+    }
+
+    #[test]
+    fn a_hooks_report_is_unchanged_by_the_new_status_fields() {
+        let v = render_json(&Posture::Reported(Box::new(status())), None);
+        assert_eq!(v["guarantee"], GUARANTEE_LABEL);
+        assert!(v.get("enforcement").is_none());
+        assert!(v.get("gateway").is_none());
+        let text = render_human(&Posture::Reported(Box::new(status())), None);
+        assert!(!text.contains("Enforcement:"), "{text}");
+        assert!(!text.contains("in flight"), "{text}");
+    }
+
+    fn gateway_result(
+        running: bool,
+        tier: libra_governor_domain::EnforcementTier,
+    ) -> libra_governor_protocol::GatewayStatusResult {
+        libra_governor_protocol::GatewayStatusResult {
+            running,
+            disabled_reason: (!running).then(|| "no gateway is configured".to_string()),
+            capabilities: Some(libra_governor_domain::EnforcementCapabilities::for_tier(
+                tier,
+                "pricing-test",
+            )),
+            bind_addr: None,
+            forwarded: 0,
+            denied_budget: 0,
+            denied_unenforceable: 0,
+            denied_unauthorized: 0,
+            approval_gated: 0,
+            settled_with_known_usage: 0,
+            settled_without_usage: 0,
+            upstream_errors: 0,
+            bound_violations: 0,
+        }
+    }
+
+    #[test]
+    fn only_a_running_governor_held_gateway_satisfies_the_probe() {
+        use libra_governor_domain::EnforcementTier;
+        assert_eq!(
+            classify_gateway(&gateway_result(true, EnforcementTier::GatewayMetered)),
+            GatewayProbe::GovernorHeldRunning
+        );
+        assert_eq!(
+            classify_gateway(&gateway_result(true, EnforcementTier::GatewayObservedQuota)),
+            GatewayProbe::WrongTier
+        );
+        assert!(matches!(
+            classify_gateway(&gateway_result(false, EnforcementTier::HooksOnly)),
+            GatewayProbe::NotRunning { .. }
+        ));
     }
 
     #[test]

@@ -204,6 +204,9 @@ fn outcome_line(what: &str, outcome: &SharedBudgetOutcome) -> String {
         SharedBudgetOutcome::Refused {
             reason: SharedBudgetRefusal::NoSettledLane,
         } => format!("{what}: no settled lane, nothing to settle"),
+        SharedBudgetOutcome::Refused {
+            reason: SharedBudgetRefusal::GatewayMetered,
+        } => format!("{what}: metered by the gateway, nothing booked by the hook"),
         SharedBudgetOutcome::Refused { reason } => format!("{what}: refused ({reason:?})"),
         _ => format!("{what}: unexpected daemon answer"),
     }

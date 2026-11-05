@@ -153,7 +153,85 @@ fn shared_budget_findings() -> Vec<Finding> {
         .map(|p| claude_settings::inspect(&p));
     let state_dir = libra_governor_daemon::paths::state_dir().ok();
     let codex_enrolled = shared_budget_view::codex_enrolled_in(&posture, state_dir.as_deref());
-    budget_findings_with(&posture, settings.as_ref(), codex_enrolled)
+    let mut findings = budget_findings_with(&posture, settings.as_ref(), codex_enrolled);
+    if shared_budget_view::gateway_enforced(&posture) {
+        let probe = shared_budget_view::probe_gateway(shared_budget_view::REPORT_BUDGET);
+        findings.extend(gateway_enforcement_findings(&probe, settings.as_ref()));
+    }
+    findings
+}
+
+/// The checks `enforcement = "gateway"` adds (S11f). The mode only counts
+/// spend that passes through a running `governor_held` gateway, and only
+/// traffic Claude Code sends to it, so each missing piece is an Error: the
+/// budget would read as healthy while counting nothing.
+///
+/// `ANTHROPIC_BASE_URL` is checked for PRESENCE only (the key in
+/// `settings.json`'s `env`); its value is never read or printed here.
+fn gateway_enforcement_findings(
+    probe: &shared_budget_view::GatewayProbe,
+    settings: Option<&claude_settings::Inspection>,
+) -> Vec<Finding> {
+    use shared_budget_view::GatewayProbe;
+    let mut findings = Vec::new();
+    findings.push(match probe {
+        GatewayProbe::GovernorHeldRunning => Finding {
+            id: "shared_budget_gateway",
+            severity: Severity::Ok,
+            message: "enforcement=gateway: a governor_held gateway is running".to_string(),
+        },
+        GatewayProbe::NotRunning { reason } => Finding {
+            id: "shared_budget_gateway",
+            severity: Severity::Error,
+            message: format!(
+                "enforcement=gateway but no governor_held gateway is running ({reason}): the \
+                 hooks book nothing in this mode, so no spend is counted and the budget \
+                 enforces nothing. Configure a governor_held gateway and restart the daemon, \
+                 or set \"enforcement\" back to \"hooks\""
+            ),
+        },
+        GatewayProbe::WrongTier => Finding {
+            id: "shared_budget_gateway",
+            severity: Severity::Error,
+            message: "enforcement=gateway but the running gateway is not governor_held: only \
+                      a governor_held gateway reserves against the shared budget, so no spend \
+                      is counted"
+                .to_string(),
+        },
+        GatewayProbe::Unreachable(why) => Finding {
+            id: "shared_budget_gateway",
+            severity: Severity::Error,
+            message: format!(
+                "enforcement=gateway but the daemon did not answer a gateway status request \
+                 ({why}), so a running governor_held gateway cannot be confirmed"
+            ),
+        },
+    });
+    findings.push(match settings {
+        None => Finding {
+            id: "shared_budget_gateway_route",
+            severity: Severity::Warn,
+            message: "enforcement=gateway: could not resolve ~/.claude/settings.json (HOME \
+                      unset), so the ANTHROPIC_BASE_URL route cannot be checked"
+                .to_string(),
+        },
+        Some(inspection) if inspection.base_url_present => Finding {
+            id: "shared_budget_gateway_route",
+            severity: Severity::Ok,
+            message: "enforcement=gateway: settings.json env sets ANTHROPIC_BASE_URL (presence \
+                      only; its value is not read)"
+                .to_string(),
+        },
+        Some(_) => Finding {
+            id: "shared_budget_gateway_route",
+            severity: Severity::Error,
+            message: "enforcement=gateway but settings.json env has no ANTHROPIC_BASE_URL key: \
+                      Claude Code does not route through the gateway, so its spend is not \
+                      counted at all"
+                .to_string(),
+        },
+    });
+    findings
 }
 
 #[cfg(test)]
@@ -344,14 +422,19 @@ fn budget_findings_with(
     }
 
     // 7. What the budget does not cover, always.
+    let gateway = shared_budget_view::gateway_enforced(posture);
     findings.push(Finding {
         id: "shared_budget_limits",
         severity: Severity::Ok,
         message: format!(
             "guarantee: {}; amounts are {}. The budget does NOT cover: {}",
-            shared_budget_view::GUARANTEE_LABEL,
+            if gateway {
+                shared_budget_view::GUARANTEE_LABEL_GATEWAY
+            } else {
+                shared_budget_view::GUARANTEE_LABEL
+            },
             shared_budget_view::USD_MEANING,
-            shared_budget_view::not_covered_for(codex_enrolled)
+            shared_budget_view::not_covered_in_mode(codex_enrolled, gateway)
                 .iter()
                 .map(|item| format!("({item})"))
                 .collect::<Vec<_>>()
@@ -1574,6 +1657,60 @@ fn render_json(findings: &[Finding], daemon: Option<&Result<DoctorResult, String
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn gateway_enforcement_is_an_error_without_a_running_governor_held_gateway() {
+        use shared_budget_view::GatewayProbe;
+        let routed = claude_settings::Inspection {
+            file_present: true,
+            base_url_present: true,
+            ..Default::default()
+        };
+        let ok = gateway_enforcement_findings(&GatewayProbe::GovernorHeldRunning, Some(&routed));
+        assert_eq!(find(&ok, "shared_budget_gateway").severity, Severity::Ok);
+        assert_eq!(
+            find(&ok, "shared_budget_gateway_route").severity,
+            Severity::Ok
+        );
+        for probe in [
+            GatewayProbe::NotRunning {
+                reason: "no gateway is configured".into(),
+            },
+            GatewayProbe::WrongTier,
+            GatewayProbe::Unreachable("daemon down".into()),
+        ] {
+            let findings = gateway_enforcement_findings(&probe, Some(&routed));
+            let f = find(&findings, "shared_budget_gateway");
+            assert_eq!(f.severity, Severity::Error, "{probe:?}: {f:?}");
+        }
+    }
+
+    #[test]
+    fn gateway_enforcement_needs_the_base_url_key_and_reports_presence_only() {
+        use shared_budget_view::GatewayProbe;
+        let unrouted = claude_settings::Inspection {
+            file_present: true,
+            base_url_present: false,
+            ..Default::default()
+        };
+        let findings =
+            gateway_enforcement_findings(&GatewayProbe::GovernorHeldRunning, Some(&unrouted));
+        let f = find(&findings, "shared_budget_gateway_route");
+        assert_eq!(f.severity, Severity::Error, "{f:?}");
+        let routed = claude_settings::Inspection {
+            base_url_present: true,
+            base_url_is_loopback: true,
+            ..unrouted
+        };
+        let findings =
+            gateway_enforcement_findings(&GatewayProbe::GovernorHeldRunning, Some(&routed));
+        let f = find(&findings, "shared_budget_gateway_route");
+        assert_eq!(f.severity, Severity::Ok);
+        assert!(
+            !f.message.contains("127.0.0.1") && !f.message.contains("http"),
+            "the URL value is never printed: {f:?}"
+        );
+    }
 
     #[test]
     fn budget_hooks_finding_is_not_ok_when_a_wired_command_cannot_run() {
