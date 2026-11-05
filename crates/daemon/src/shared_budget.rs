@@ -3598,16 +3598,24 @@ const GATEWAY_KEY_PREFIX: &str = "gw:";
 /// The idempotency key of one gateway request's pool row. `boot_id` names
 /// the gateway process, so the startup orphan sweep can tell a previous
 /// process's rows from the current one's; the gateway generates it once at
-/// start (S11e). Neither part may be empty and `boot_id` may not contain
-/// `:`, or [`gateway_reserve`] refuses the key.
-pub fn gateway_key(boot_id: &str, request_id: &str) -> String {
-    format!("{GATEWAY_KEY_PREFIX}{boot_id}:{request_id}")
+/// start (S11e). Both parts must be non-empty ASCII graphic characters (no
+/// whitespace or control characters) and `boot_id` may not contain `:`;
+/// otherwise there is no key (`None`) and [`gateway_reserve`] refuses it.
+pub fn gateway_key(boot_id: &str, request_id: &str) -> Option<String> {
+    let prefix = gateway_boot_prefix(boot_id)?;
+    key_part_is_valid(request_id).then(|| format!("{prefix}{request_id}"))
 }
 
 /// The `gw:<boot_id>:` prefix every row of one gateway process shares.
 fn gateway_boot_prefix(boot_id: &str) -> Option<String> {
-    (!boot_id.is_empty() && !boot_id.contains(':'))
+    (key_part_is_valid(boot_id) && !boot_id.contains(':'))
         .then(|| format!("{GATEWAY_KEY_PREFIX}{boot_id}:"))
+}
+
+/// Keys are stored verbatim and appear in logs, so a part may not carry
+/// whitespace, control or non-ASCII characters.
+fn key_part_is_valid(part: &str) -> bool {
+    !part.is_empty() && part.chars().all(|c| c.is_ascii_graphic())
 }
 
 fn gateway_key_is_valid(key: &str) -> bool {
@@ -3615,7 +3623,9 @@ fn gateway_key_is_valid(key: &str) -> bool {
         && key
             .strip_prefix(GATEWAY_KEY_PREFIX)
             .and_then(|rest| rest.split_once(':'))
-            .is_some_and(|(boot_id, request_id)| !boot_id.is_empty() && !request_id.is_empty())
+            .is_some_and(|(boot_id, request_id)| {
+                key_part_is_valid(boot_id) && key_part_is_valid(request_id)
+            })
 }
 
 /// One request to reserve against the monthly cap. The daemon prices the
@@ -3643,6 +3653,10 @@ pub struct GatewayHold {
     /// The input-token ceiling the reservation assumed. Pass it back to
     /// [`gateway_settle`] so an overrun of it is detected.
     pub input_bound_tokens: u64,
+    /// The model and `max_tokens` the reservation was priced with. Pass both
+    /// back to [`gateway_settle`] unchanged.
+    pub model: String,
+    pub max_tokens: u64,
     pub remaining_usd_cents: i64,
     /// The key was already granted (a gateway-internal retry); nothing new
     /// was reserved.
@@ -3670,8 +3684,13 @@ pub enum GatewayRefusal {
     CapExhausted {
         remaining_usd_cents: i64,
     },
-    /// The key already names a different row, such as a charge.
+    /// The key already names a different row, such as a charge, or a hold of
+    /// a different session or size.
     KeyConflict,
+    /// The key names a hold that is no longer active (released, settled or
+    /// booked on expiry). A request needs a fresh key; replaying the old one
+    /// would grant a hold that holds nothing.
+    KeyNotActive,
     PoolUnitMismatch,
 }
 
@@ -3691,7 +3710,9 @@ fn gateway_refused(refusal: GatewayRefusal) -> Result<GatewayReserveOutcome, Sha
 /// for `enforcement = gateway`, the identity and key are usable, no pool of a
 /// later period exists, and the request has a priceable worst case. Only then
 /// does it create the period's pool, sweep expired holds (a gateway hold that
-/// expired unsettled is booked, not freed) and reserve atomically.
+/// expired unsettled is booked, not freed) and reserve atomically. The pool
+/// and the sweep may therefore write before a `CapExhausted` refusal; that
+/// booking is intended and independent of the refused request.
 pub fn gateway_reserve(
     ledger: &mut LedgerStore,
     rt: &SharedBudgetRuntime,
@@ -3759,7 +3780,18 @@ pub fn gateway_reserve(
     });
     let (hold, replayed) = match outcome {
         Ok(MeteredReserveOutcome::Granted(hold)) => (hold, false),
-        Ok(MeteredReserveOutcome::AlreadyGranted(hold)) => (hold, true),
+        Ok(MeteredReserveOutcome::AlreadyGranted(hold)) => {
+            // The ledger replays a same-key row in any state. Only a live
+            // hold of this session and size is a retry; anything else would
+            // "grant" capacity that is not held.
+            if hold.state != ReservationState::Active {
+                return gateway_refused(GatewayRefusal::KeyNotActive);
+            }
+            if hold.amount != worst || hold.session_id != req.session_id {
+                return gateway_refused(GatewayRefusal::KeyConflict);
+            }
+            (hold, true)
+        }
         Ok(MeteredReserveOutcome::Insufficient { admission, .. }) => {
             return gateway_refused(GatewayRefusal::CapExhausted {
                 remaining_usd_cents: admission.remaining(),
@@ -3790,6 +3822,8 @@ pub fn gateway_reserve(
         pool_id: hold.pool_id.0,
         reserved_usd_cents: hold.amount,
         input_bound_tokens,
+        model: req.model.to_string(),
+        max_tokens: req.max_tokens.unwrap_or_default(),
         replayed,
     }))
 }
@@ -3822,6 +3856,10 @@ fn gateway_row(
 }
 
 /// What the gateway observed of one finished request (S11b inputs).
+///
+/// `model`, `max_tokens` and `input_bound_tokens` must be the ones the
+/// reservation was priced with ([`GatewayHold`] returns them); the daemon
+/// prices the S11b amount from whatever it is given.
 pub struct GatewaySettleRequest<'a> {
     pub reservation_id: SharedPoolReservationId,
     pub observed: Option<ObservedUsage>,

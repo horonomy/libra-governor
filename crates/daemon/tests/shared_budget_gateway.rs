@@ -35,6 +35,11 @@ const CAP: u64 = 100_000;
 /// 1000 tool-prompt tokens at 10 cents plus 10 output tokens at 5 cents.
 const WORST: u64 = 10_050;
 
+/// A well-formed gateway key.
+fn gwkey(boot_id: &str, request_id: &str) -> String {
+    gateway_key(boot_id, request_id).unwrap()
+}
+
 fn t(s: &str) -> OffsetDateTime {
     OffsetDateTime::parse(s, &Rfc3339).unwrap()
 }
@@ -107,8 +112,8 @@ impl Fx {
             observed,
             completed_cleanly: clean,
             saw_message_start: observed.is_some(),
-            model: "flat-model",
-            max_tokens: 10,
+            model: &hold.model,
+            max_tokens: hold.max_tokens,
             input_bound_tokens: hold.input_bound_tokens,
         };
         gateway_settle(&mut self.ledger, &self.rt, &req).unwrap()
@@ -195,7 +200,7 @@ const MEASURED: u64 = 2_150;
 #[test]
 fn a_missing_file_refuses_and_writes_nothing() {
     let mut fx = Fx::new(None, JAN);
-    let key = gateway_key("boot1", "r1");
+    let key = gwkey("boot1", "r1");
     fx.assert_refused_writing_nothing(&request(&key), GatewayRefusal::NotConfigured);
     assert!(fx.pools().is_empty());
 }
@@ -203,7 +208,7 @@ fn a_missing_file_refuses_and_writes_nothing() {
 #[test]
 fn an_invalid_file_refuses_and_writes_nothing() {
     let mut fx = Fx::new(Some("{ not json"), JAN);
-    let key = gateway_key("boot1", "r1");
+    let key = gwkey("boot1", "r1");
     let before = fx.fingerprint();
     let GatewayReserveOutcome::Refused(GatewayRefusal::ConfigInvalid(reason)) =
         fx.reserve(&request(&key))
@@ -217,7 +222,7 @@ fn an_invalid_file_refuses_and_writes_nothing() {
 #[test]
 fn a_file_that_does_not_ask_for_gateway_enforcement_refuses_and_writes_nothing() {
     let mut fx = Fx::new(Some(&file("hooks", CAP, 50_000)), JAN);
-    let key = gateway_key("boot1", "r1");
+    let key = gwkey("boot1", "r1");
     fx.assert_refused_writing_nothing(&request(&key), GatewayRefusal::NotGatewayEnforced);
 }
 
@@ -225,9 +230,9 @@ fn a_file_that_does_not_ask_for_gateway_enforcement_refuses_and_writes_nothing()
 fn a_later_pool_is_a_clock_anomaly_that_writes_nothing() {
     let mut fx = Fx::gateway();
     fx.clock.set(t("2027-02-10T00:00:00Z"));
-    let february = fx.hold(&gateway_key("boot1", "feb")).pool_id;
+    let february = fx.hold(&gwkey("boot1", "feb")).pool_id;
     fx.clock.set(t(JAN));
-    let key = gateway_key("boot1", "jan");
+    let key = gwkey("boot1", "jan");
     fx.assert_refused_writing_nothing(
         &request(&key),
         GatewayRefusal::ClockAnomaly {
@@ -239,7 +244,7 @@ fn a_later_pool_is_a_clock_anomaly_that_writes_nothing() {
 #[test]
 fn unusable_identity_key_or_request_refuses_and_writes_nothing() {
     let mut fx = Fx::gateway();
-    let key = gateway_key("boot1", "r1");
+    let key = gwkey("boot1", "r1");
     let long = "x".repeat(257);
     let long_key = format!("gw:boot1:{long}");
     let cases: Vec<(GatewayReserveRequest<'_>, GatewayRefusal)> = vec![
@@ -318,9 +323,9 @@ fn unusable_identity_key_or_request_refuses_and_writes_nothing() {
 #[test]
 fn over_the_cap_is_refused_and_remaining_is_unchanged() {
     let mut fx = Fx::new(Some(&file("gateway", 15_000, 50_000)), JAN);
-    let first = fx.hold(&gateway_key("boot1", "r1"));
+    let first = fx.hold(&gwkey("boot1", "r1"));
     assert_eq!(first.remaining_usd_cents, 15_000 - WORST as i64);
-    let key = gateway_key("boot1", "r2");
+    let key = gwkey("boot1", "r2");
     fx.assert_refused_writing_nothing(
         &request(&key),
         GatewayRefusal::CapExhausted {
@@ -334,7 +339,7 @@ fn over_the_cap_is_refused_and_remaining_is_unchanged() {
 #[test]
 fn reserve_settle_and_release_round_trip_in_exact_cents() {
     let mut fx = Fx::gateway();
-    let a = fx.hold(&gateway_key("boot1", "a"));
+    let a = fx.hold(&gwkey("boot1", "a"));
     assert_eq!(a.reserved_usd_cents, WORST);
     assert_eq!(a.input_bound_tokens, 1_000);
     assert_eq!(a.remaining_usd_cents, CAP as i64 - WORST as i64);
@@ -371,7 +376,7 @@ fn reserve_settle_and_release_round_trip_in_exact_cents() {
         GatewaySettleOutcome::AlreadyFinal
     );
 
-    let b = fx.hold(&gateway_key("boot1", "b"));
+    let b = fx.hold(&gwkey("boot1", "b"));
     assert_eq!(
         gateway_release(&mut fx.ledger, &fx.rt, b.reservation_id).unwrap(),
         GatewayReleaseOutcome::Released
@@ -391,7 +396,7 @@ fn reserve_settle_and_release_round_trip_in_exact_cents() {
 #[test]
 fn a_retry_of_the_same_key_is_replayed_without_reserving_again() {
     let mut fx = Fx::gateway();
-    let key = gateway_key("boot1", "r1");
+    let key = gwkey("boot1", "r1");
     let first = fx.hold(&key);
     let again = fx.hold(&key);
     assert!(again.replayed);
@@ -403,14 +408,14 @@ fn a_retry_of_the_same_key_is_replayed_without_reserving_again() {
 fn unmeasured_and_truncated_requests_book_the_s11b_amount_marked_unknown() {
     let mut fx = Fx::gateway();
 
-    let none = fx.hold(&gateway_key("boot1", "none"));
+    let none = fx.hold(&gwkey("boot1", "none"));
     let (booked, known, _, _) = settled(fx.settle(&none, None, false));
     assert_eq!((booked, known), (WORST, false));
     assert_eq!(fx.row(none.reservation_id).usage_known, Some(false));
 
     // Cut off after message_start: the exact input plus max_tokens of output
     // (2150 here), marked unknown, even though it is below the reservation.
-    let cut = fx.hold(&gateway_key("boot1", "cut"));
+    let cut = fx.hold(&gwkey("boot1", "cut"));
     let (booked, known, flags, _) = settled(fx.settle(&cut, Some(usage(200, 100, 3)), false));
     assert_eq!((booked, known), (MEASURED, false));
     assert!(flags.truncated_settle);
@@ -422,7 +427,7 @@ fn unmeasured_and_truncated_requests_book_the_s11b_amount_marked_unknown() {
 
     // Cut off with an input overrun: above the reservation, booked in full
     // and still marked unknown.
-    let over = fx.hold(&gateway_key("boot1", "over"));
+    let over = fx.hold(&gwkey("boot1", "over"));
     let (booked, known, flags, overrun) =
         settled(fx.settle(&over, Some(usage(5_000, 0, 3)), false));
     assert_eq!(
@@ -436,7 +441,7 @@ fn unmeasured_and_truncated_requests_book_the_s11b_amount_marked_unknown() {
 #[test]
 fn an_input_bound_overrun_is_booked_unclamped_and_flagged() {
     let mut fx = Fx::gateway();
-    let hold = fx.hold(&gateway_key("boot1", "r1"));
+    let hold = fx.hold(&gwkey("boot1", "r1"));
     // 5000 prompt tokens against a 1000-token bound: 50000 cents.
     let (booked_usd_cents, usage_known, flags, overrun_usd_cents) =
         settled(fx.settle(&hold, Some(usage(5_000, 0, 0)), true));
@@ -449,7 +454,7 @@ fn an_input_bound_overrun_is_booked_unclamped_and_flagged() {
 #[test]
 fn a_file_removed_before_settlement_books_the_reservation() {
     let mut fx = Fx::gateway();
-    let hold = fx.hold(&gateway_key("boot1", "r1"));
+    let hold = fx.hold(&gwkey("boot1", "r1"));
     std::fs::remove_file(fx.dir.path().join(SHARED_BUDGET_FILE_NAME)).unwrap();
     let (booked_usd_cents, usage_known, _, _) =
         settled(fx.settle(&hold, Some(usage(200, 100, 10)), true));
@@ -462,11 +467,11 @@ fn a_file_removed_before_settlement_books_the_reservation() {
 fn the_file_pricing_overrides_price_both_reserve_and_settle() {
     let mut fx = Fx::gateway();
     // `flat-model` is in no pinned table: it is priced only by the file.
-    let hold = fx.hold(&gateway_key("boot1", "r1"));
+    let hold = fx.hold(&gwkey("boot1", "r1"));
     assert_eq!(hold.reserved_usd_cents, WORST);
 
     // A pinned model is priced from the pinned table, a different figure.
-    let key = gateway_key("boot1", "pinned");
+    let key = gwkey("boot1", "pinned");
     let GatewayReserveOutcome::Granted(pinned) = fx.reserve(&GatewayReserveRequest {
         model: "claude-sonnet-4-5",
         ..request(&key)
@@ -481,7 +486,7 @@ fn the_file_pricing_overrides_price_both_reserve_and_settle() {
         file("gateway", CAP, 100_000),
     )
     .unwrap();
-    let repriced = fx.hold(&gateway_key("boot1", "r2"));
+    let repriced = fx.hold(&gwkey("boot1", "r2"));
     assert_eq!(repriced.reserved_usd_cents, 10_000 + 100);
     // Settlement reads the same table: 10 output tokens now cost 10 cents each.
     let (booked_usd_cents, _, _, _) =
@@ -521,7 +526,7 @@ fn a_hold_settles_in_its_admission_pool_after_the_month_rolls_over() {
 #[test]
 fn renewal_extends_a_live_hold_and_refuses_a_lapsed_one() {
     let mut fx = Fx::gateway();
-    let hold = fx.hold(&gateway_key("boot1", "r1"));
+    let hold = fx.hold(&gwkey("boot1", "r1"));
     fx.clock.set(t("2027-01-15T12:05:00Z"));
     assert_eq!(
         gateway_renew(&mut fx.ledger, &fx.rt, hold.reservation_id, 600).unwrap(),
@@ -541,10 +546,10 @@ fn renewal_extends_a_live_hold_and_refuses_a_lapsed_one() {
 #[test]
 fn a_gateway_hold_that_expires_unsettled_is_booked_not_freed() {
     let mut fx = Fx::gateway();
-    let hold = fx.hold(&gateway_key("boot1", "r1"));
+    let hold = fx.hold(&gwkey("boot1", "r1"));
     fx.clock.set(t("2027-01-15T12:20:00Z"));
     // The next reserve sweeps the lapsed hold first.
-    let next = fx.hold(&gateway_key("boot1", "r2"));
+    let next = fx.hold(&gwkey("boot1", "r2"));
     let row = fx.row(hold.reservation_id);
     assert_eq!(row.state, ReservationState::Settled);
     assert_eq!(
@@ -561,8 +566,8 @@ fn a_gateway_hold_that_expires_unsettled_is_booked_not_freed() {
 #[test]
 fn startup_books_a_previous_boots_holds_and_keeps_the_current_boots() {
     let mut fx = Fx::gateway();
-    let old = fx.hold(&gateway_key("old", "r1"));
-    let current = fx.hold(&gateway_key("new", "r1"));
+    let old = fx.hold(&gwkey("old", "r1"));
+    let current = fx.hold(&gwkey("new", "r1"));
 
     let booked = gateway_orphans_at_start(&mut fx.ledger, &fx.rt, "new").unwrap();
     assert_eq!(booked.len(), 1);
@@ -624,4 +629,90 @@ fn gateway_calls_never_touch_a_row_that_is_not_a_gateway_hold() {
         gateway_renew(&mut fx.ledger, &fx.rt, unknown, 600).unwrap(),
         GatewayRenewOutcome::NotFound
     );
+}
+
+// ---- key reuse, replay mismatch, key shape (PR #318 review) ----
+
+#[test]
+fn a_key_whose_hold_was_released_settled_or_booked_is_not_granted_again() {
+    let mut fx = Fx::gateway();
+    let released = fx.hold(&gwkey("boot1", "released"));
+    gateway_release(&mut fx.ledger, &fx.rt, released.reservation_id).unwrap();
+    let key = gwkey("boot1", "released");
+    fx.assert_refused_writing_nothing(&request(&key), GatewayRefusal::KeyNotActive);
+
+    let done = fx.hold(&gwkey("boot1", "settled"));
+    fx.settle(&done, Some(usage(200, 100, 10)), true);
+    let key = gwkey("boot1", "settled");
+    fx.assert_refused_writing_nothing(&request(&key), GatewayRefusal::KeyNotActive);
+
+    // Booked on expiry: the sweep inside the reserve writes (the booking), and
+    // the retry is then refused rather than granted a hold of nothing.
+    let lapsed = fx.hold(&gwkey("boot1", "lapsed"));
+    fx.clock.set(t("2027-01-15T12:20:00Z"));
+    let key = gwkey("boot1", "lapsed");
+    assert_eq!(
+        fx.reserve(&request(&key)),
+        GatewayReserveOutcome::Refused(GatewayRefusal::KeyNotActive)
+    );
+    assert_eq!(
+        fx.row(lapsed.reservation_id).state,
+        ReservationState::Settled
+    );
+}
+
+#[test]
+fn a_replay_must_match_the_held_session_and_size() {
+    let mut fx = Fx::gateway();
+    let key = gwkey("boot1", "r1");
+    fx.hold(&key);
+    let other_session = GatewayReserveRequest {
+        session_id: "sess-2",
+        ..request(&key)
+    };
+    fx.assert_refused_writing_nothing(&other_session, GatewayRefusal::KeyConflict);
+    let other_size = GatewayReserveRequest {
+        max_tokens: Some(20),
+        ..request(&key)
+    };
+    fx.assert_refused_writing_nothing(&other_size, GatewayRefusal::KeyConflict);
+}
+
+#[test]
+fn settlement_prices_from_the_model_and_max_tokens_it_is_given() {
+    let mut fx = Fx::gateway();
+    let hold = fx.hold(&gwkey("boot1", "r1"));
+    assert_eq!((hold.model.as_str(), hold.max_tokens), ("flat-model", 10));
+    // Cut off: 200 input (2000) + 100 cache read (100) + max_tokens of
+    // output at 5 cents each.
+    let req = GatewaySettleRequest {
+        reservation_id: hold.reservation_id,
+        observed: Some(usage(200, 100, 3)),
+        completed_cleanly: false,
+        saw_message_start: true,
+        model: &hold.model,
+        max_tokens: 20,
+        input_bound_tokens: hold.input_bound_tokens,
+    };
+    let (booked, ..) = settled(gateway_settle(&mut fx.ledger, &fx.rt, &req).unwrap());
+    assert_eq!(booked, 2_000 + 100 + 100);
+}
+
+#[test]
+fn keys_are_ascii_graphic_and_a_boot_id_cannot_contain_a_colon() {
+    let mut fx = Fx::gateway();
+    for bad in [
+        "gw:boot1:a\nb",
+        "gw:boot1:a b",
+        "gw:bo ot:r1",
+        "gw:boot1:r\u{e9}",
+        "gw:boot1:\tr",
+    ] {
+        fx.assert_refused_writing_nothing(&request(bad), GatewayRefusal::InvalidKey);
+    }
+    assert_eq!(gateway_key("a:b", "r1"), None);
+    assert_eq!(gateway_key("", "r1"), None);
+    assert_eq!(gateway_key("boot1", ""), None);
+    assert_eq!(gateway_key("boot1", "a\nb"), None);
+    assert_eq!(gateway_key("boot1", "r:1").as_deref(), Some("gw:boot1:r:1"));
 }
