@@ -478,7 +478,13 @@ pub fn serve(listener: UnixListener, config: &DaemonConfig) -> Result<(), Daemon
     // binding holds the value for the scope, while a bare `_` pattern
     // drops it immediately — which would close the shutdown channel and
     // stop the gateway the instant it started.
-    let _gateway = start_gateway(config);
+    // A fresh id per daemon start names this process's gateway holds
+    // (`gw:<boot_id>:<request_id>`). The sweep books the previous process's
+    // still-active holds whether or not the gateway runs this time, and runs
+    // first so none can be mistaken for this boot's.
+    let boot_id = uuid::Uuid::new_v4().simple().to_string();
+    sweep_gateway_orphans(&mut ledger, config, &boot_id);
+    let _gateway = start_gateway(config, &boot_id);
     // Same `let _x = ...` (not `let _ = ...`) discipline as `_gateway`
     // above, for the same reason: an underscore-prefixed binding holds
     // the dispatcher's shutdown channel open for the scope, while a bare
@@ -2910,6 +2916,26 @@ fn handle_record_outcome(
     )))
 }
 
+/// Books the gateway holds a previous daemon process left active, at their
+/// reservation. A failure is logged and never stops the daemon: the holds
+/// are then booked when they expire.
+fn sweep_gateway_orphans(ledger: &mut LedgerStore, config: &DaemonConfig, boot_id: &str) {
+    match crate::shared_budget::gateway_orphans_at_start(ledger, &config.shared_budget, boot_id) {
+        Ok(booked) if !booked.is_empty() => log::append_line(
+            &config.log_path,
+            &format!(
+                "shared budget: booked {} gateway hold(s) left by a previous process",
+                booked.len()
+            ),
+        ),
+        Ok(_) => {}
+        Err(e) => log::append_line(
+            &config.log_path,
+            &format!("shared budget: orphan sweep failed — {e}"),
+        ),
+    }
+}
+
 /// A running gateway's thread and its shutdown channel.
 ///
 /// Dropping this closes the channel, which the gateway's own shutdown
@@ -2930,7 +2956,7 @@ pub struct GatewayHandle {
 /// (anything it cannot enforce exactly, it refuses), but the daemon's
 /// core function fails OPEN (a mistyped upstream host must not take away
 /// preflight, estimation, and the ledger).
-fn start_gateway(config: &DaemonConfig) -> Option<GatewayHandle> {
+fn start_gateway(config: &DaemonConfig, boot_id: &str) -> Option<GatewayHandle> {
     let raw = config.gateway.clone()?;
     let policy_kind = config.policy.resource.target.kind();
 
@@ -2958,6 +2984,26 @@ fn start_gateway(config: &DaemonConfig) -> Option<GatewayHandle> {
 
     let bind_addr = validated.bind_addr;
     let tier = validated.tier;
+    let shared_authority = gateway_authority::LedgerSharedAuthority::new(
+        std::sync::Arc::clone(&ledger),
+        std::sync::Arc::clone(&config.shared_budget),
+        boot_id.to_string(),
+        tier == libra_governor_domain::EnforcementTier::GatewayMetered,
+    );
+    if tier != libra_governor_domain::EnforcementTier::GatewayMetered
+        && matches!(
+            config.shared_budget.effective().state,
+            crate::shared_budget_file::SharedBudgetFileState::Valid(ref cfg)
+                if cfg.enforcement == crate::shared_budget_file::Enforcement::Gateway
+        )
+    {
+        log::append_line(
+            &config.log_path,
+            "shared-budget enforcement=gateway needs a governor_held gateway; this gateway \
+             passes the caller's credential through, so every metered request is refused \
+             (shared_budget_unavailable) until the file or the gateway changes",
+        );
+    }
     let mut runtime_config = libra_governor_gateway::server::GatewayRuntimeConfig::new(
         validated,
         std::sync::Arc::new(gateway_authority::LedgerSpendAuthority::new(
@@ -2970,6 +3016,7 @@ fn start_gateway(config: &DaemonConfig) -> Option<GatewayHandle> {
         std::sync::Arc::clone(&config.gateway_stats),
     );
     runtime_config.session_header = config.gateway_session_header.clone();
+    runtime_config = runtime_config.with_shared_budget(std::sync::Arc::new(shared_authority));
 
     // Resolving the credential and the capability token happens inside
     // `build_state`, eagerly — a gateway that started and only then

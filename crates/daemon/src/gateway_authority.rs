@@ -27,10 +27,20 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::shared_budget::{
+    gateway_key, gateway_release, gateway_renew, gateway_reserve, gateway_settle, GatewayRefusal,
+    GatewayReleaseOutcome, GatewayRenewOutcome, GatewayReserveOutcome, GatewayReserveRequest,
+    GatewaySettleOutcome, GatewaySettleRequest, SharedBudgetRuntime,
+};
+use crate::shared_budget_file::{Enforcement, SharedBudgetFileState};
+use libra_governor_domain::SharedPoolReservationId;
 use libra_governor_domain::{Admission, Policy, ReservationClass, ReservationId, ResourceAmount};
 use libra_governor_gateway::authority::{
-    AuthorityError, BudgetContext, SpendAuthority, SpendDecision, SpendDenial, SpendRequest,
+    AuthorityError, BudgetContext, SharedBudgetAuthority, SharedDecision, SharedDenial, SharedHold,
+    SharedMode, SharedReserveRequest, SharedSettled, SharedSettlement, SpendAuthority,
+    SpendDecision, SpendDenial, SpendRequest,
 };
+use libra_governor_gateway::cost::SettleFlags;
 use libra_governor_gateway::proxy::{GatewayRequestRecord, RequestRecorder};
 use libra_governor_ledger::{
     GatewayRequestClose, GatewayRequestOpen, LedgerStore, ReserveOutcome, ReserveRequest,
@@ -353,4 +363,188 @@ pub fn open_gateway_ledger(
     ledger_path: &std::path::Path,
 ) -> Result<Arc<Mutex<LedgerStore>>, libra_governor_ledger::LedgerError> {
     Ok(Arc::new(Mutex::new(LedgerStore::open(ledger_path)?)))
+}
+
+/// The daemon's implementation of the gateway's shared-budget interface
+/// (S11e): the per-request reserve, settle, release and renew of the local
+/// monthly cap, over the shared-budget primitives.
+///
+/// It owns the gateway process's `boot_id`, which prefixes every
+/// idempotency key (`gw:<boot_id>:<request_id>`) so the next daemon start
+/// can tell this process's holds from its own.
+pub struct LedgerSharedAuthority {
+    ledger: Arc<Mutex<LedgerStore>>,
+    runtime: Arc<SharedBudgetRuntime>,
+    boot_id: String,
+    /// Whether the gateway holds the upstream credential. The shared cap is
+    /// only hard when it does; a pass-through gateway cannot honour
+    /// `enforcement = gateway`.
+    governor_held: bool,
+}
+
+impl LedgerSharedAuthority {
+    pub fn new(
+        ledger: Arc<Mutex<LedgerStore>>,
+        runtime: Arc<SharedBudgetRuntime>,
+        boot_id: String,
+        governor_held: bool,
+    ) -> Self {
+        Self {
+            ledger,
+            runtime,
+            boot_id,
+            governor_held,
+        }
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, LedgerStore>, AuthorityError> {
+        self.ledger
+            .lock()
+            .map_err(|_| AuthorityError("gateway ledger mutex was poisoned".to_string()))
+    }
+}
+
+fn shared_error(e: impl std::fmt::Display) -> AuthorityError {
+    AuthorityError(e.to_string())
+}
+
+impl SharedBudgetAuthority for LedgerSharedAuthority {
+    fn mode(&self) -> SharedMode {
+        match self.runtime.effective().state {
+            SharedBudgetFileState::Valid(cfg) if cfg.enforcement == Enforcement::Gateway => {
+                if self.governor_held {
+                    SharedMode::Enforce
+                } else {
+                    SharedMode::Unavailable
+                }
+            }
+            // No file, `enforcement = hooks`, or a file that cannot be read:
+            // the gateway behaves as it did before the shared budget. An
+            // invalid file is deliberately NOT a refusal here (design 3.2
+            // would fail closed); the hook path still denies it, and
+            // changing the gateway's behaviour for existing governor_held
+            // deployments is a separate decision.
+            SharedBudgetFileState::Absent
+            | SharedBudgetFileState::Invalid(_)
+            | SharedBudgetFileState::Valid(_) => SharedMode::NotConsulted,
+        }
+    }
+
+    fn reserve(&self, req: SharedReserveRequest<'_>) -> Result<SharedDecision, AuthorityError> {
+        let Some(key) = gateway_key(&self.boot_id, req.request_id) else {
+            return Ok(SharedDecision::Denied(SharedDenial::Unavailable));
+        };
+        let mut ledger = self.lock()?;
+        let outcome = gateway_reserve(
+            &mut ledger,
+            &self.runtime,
+            &GatewayReserveRequest {
+                session_id: req.session_id,
+                model: req.model,
+                body_bytes: req.body_bytes,
+                max_tokens: req.max_tokens,
+                image_count: req.image_count,
+                key: &key,
+                ttl_secs: req.ttl_secs,
+            },
+        )
+        .map_err(shared_error)?;
+        Ok(match outcome {
+            GatewayReserveOutcome::Granted(hold) => SharedDecision::Granted(SharedHold {
+                id: hold.reservation_id,
+                reserved_usd_cents: hold.reserved_usd_cents,
+                input_bound_tokens: hold.input_bound_tokens,
+                model: hold.model,
+                max_tokens: hold.max_tokens,
+            }),
+            GatewayReserveOutcome::Refused(refusal) => match refusal {
+                GatewayRefusal::NotConfigured | GatewayRefusal::NotGatewayEnforced => {
+                    SharedDecision::NotConsulted
+                }
+                GatewayRefusal::CapExhausted {
+                    remaining_usd_cents,
+                } => SharedDecision::Denied(SharedDenial::CapExhausted {
+                    remaining_usd_cents,
+                }),
+                GatewayRefusal::Identity(_) | GatewayRefusal::SessionIdTooLong => {
+                    SharedDecision::Denied(SharedDenial::Unattributable)
+                }
+                GatewayRefusal::Unenforceable(gap) => {
+                    SharedDecision::Denied(SharedDenial::Unenforceable(gap))
+                }
+                GatewayRefusal::ConfigInvalid(_)
+                | GatewayRefusal::ClockAnomaly { .. }
+                | GatewayRefusal::InvalidKey
+                | GatewayRefusal::KeyConflict
+                | GatewayRefusal::KeyNotActive
+                | GatewayRefusal::PoolUnitMismatch => {
+                    SharedDecision::Denied(SharedDenial::Unavailable)
+                }
+            },
+        })
+    }
+
+    fn settle(&self, settlement: SharedSettlement<'_>) -> Result<SharedSettled, AuthorityError> {
+        let hold = settlement.hold;
+        let mut ledger = self.lock()?;
+        let outcome = gateway_settle(
+            &mut ledger,
+            &self.runtime,
+            &GatewaySettleRequest {
+                reservation_id: hold.id,
+                observed: settlement.observed,
+                completed_cleanly: settlement.completed_cleanly,
+                saw_message_start: settlement.saw_message_start,
+                // Exactly what the reservation was priced with.
+                model: &hold.model,
+                max_tokens: hold.max_tokens,
+                input_bound_tokens: hold.input_bound_tokens,
+            },
+        )
+        .map_err(shared_error)?;
+        match outcome {
+            GatewaySettleOutcome::Settled {
+                booked_usd_cents,
+                usage_known,
+                flags,
+                ..
+            } => Ok(SharedSettled {
+                booked_usd_cents,
+                usage_known,
+                flags,
+            }),
+            // Booked already (orphan sweep or expiry): the conservative
+            // amount stands and there is nothing to add.
+            GatewaySettleOutcome::AlreadyFinal => Ok(SharedSettled {
+                booked_usd_cents: hold.reserved_usd_cents,
+                usage_known: false,
+                flags: SettleFlags::default(),
+            }),
+            GatewaySettleOutcome::NotFound | GatewaySettleOutcome::NotGatewayHold => Err(
+                AuthorityError("the shared hold is not a gateway hold".to_string()),
+            ),
+        }
+    }
+
+    fn release(&self, id: SharedPoolReservationId) -> Result<(), AuthorityError> {
+        let mut ledger = self.lock()?;
+        match gateway_release(&mut ledger, &self.runtime, id).map_err(shared_error)? {
+            GatewayReleaseOutcome::Released | GatewayReleaseOutcome::AlreadyFinal => Ok(()),
+            GatewayReleaseOutcome::NotFound | GatewayReleaseOutcome::NotGatewayHold => Err(
+                AuthorityError("the shared hold is not a gateway hold".to_string()),
+            ),
+        }
+    }
+
+    fn renew(&self, id: SharedPoolReservationId, ttl_secs: u64) -> Result<(), AuthorityError> {
+        let mut ledger = self.lock()?;
+        match gateway_renew(&mut ledger, &self.runtime, id, ttl_secs).map_err(shared_error)? {
+            GatewayRenewOutcome::Renewed => Ok(()),
+            GatewayRenewOutcome::Refused
+            | GatewayRenewOutcome::NotFound
+            | GatewayRenewOutcome::NotGatewayHold => Err(AuthorityError(
+                "the shared hold was not renewed".to_string(),
+            )),
+        }
+    }
 }
