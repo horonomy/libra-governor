@@ -167,6 +167,8 @@ Do not say "hard cap" without the qualifiers "modelled worst case" and "gateway-
      | `Valid`, `enforcement=gateway` | Enforce: steps (b) to (d) |
      | `Invalid` | The mode cannot be read. **Recommend fail closed** with `403 config_invalid`. Note this changes behaviour for existing governor_held deployments that have a broken hooks-mode file |
 
+     **As built (S11e):** an `Invalid` budget file stops a `governor_held` gateway's metered requests with `403 shared_budget_unavailable`, whether or not the file ever asked for gateway enforcement, which is consistent with the hook path denying `config_invalid`. A pass-through gateway is stopped only after it has seen the file ask for gateway enforcement. `Absent` and `enforcement=hooks` leave the gateway as it was.
+
      `later_pool` refuses `clock_anomaly`, the same as ADR-0026:166-174;
    - (b) prices the worst case **daemon-side** with **the shared-budget table** (pinned plus the file's
      `pricing_overrides`, ADR-0026:229-231). Overrides in the gateway config are **not** used on
