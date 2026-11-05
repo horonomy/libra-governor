@@ -347,8 +347,13 @@ fn session_end_sends_one_settle_tail_with_the_path_verbatim() {
         }),
     );
     assert_silent_success(&ran);
+    // HORO-2440: SessionEnd probes for the host's flush (one probe, as the
+    // daemon here answers "not configured"), then sends exactly one tail.
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert_eq!(requests[0]["shared_budget"]["op"], "transcript_ready");
     assert_eq!(
-        fake.only_shared_budget(),
+        requests[1]["shared_budget"],
         serde_json::json!({
             "op": "settle_tail",
             "session_id": "sess-2",
@@ -521,7 +526,8 @@ fn oversize_or_non_utf8_stdin_is_ignored_silently_and_quickly() {
         body.as_bytes(),
         true,
     ));
-    assert_eq!(fake.requests().len(), 1);
+    // The flush probe, then the tail request.
+    assert_eq!(fake.requests().len(), 2);
 }
 
 // =====================================================================
