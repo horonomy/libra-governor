@@ -1551,18 +1551,33 @@ fn merged_ids(previous: &[String], counted: &[String]) -> Vec<String> {
     out
 }
 
-/// The hold a `Stop` settles: the lane's most recently created hold that is
-/// still `active` (expired-but-unswept included) or `expired`.
+/// The hold a `Stop`, a `SessionEnd` or the flush probe acts on: the lane's
+/// newest non-charge hold by creation time, in ANY state, and only when it is
+/// still unsettled (`active`, expired-but-unswept included, or `expired` and
+/// unspent). Gateway and subagent-charge rows are not turn holds and never
+/// qualify.
+///
+/// Taking the newest hold of any state, rather than the newest
+/// `active`/`expired` one, keeps an older expired hold whose records a later
+/// hold's settlement already counted (a crash, then a resume in the same
+/// session) from being booked again, flat, by a late or duplicate `Stop`
+/// (HORO-2440). A late settle after expiry is recorded in the hold's own row,
+/// in the hold's own period.
 fn pending_hold(holds: &[SharedPoolReservation]) -> Option<&SharedPoolReservation> {
     holds
         .iter()
         .filter(|h| {
-            matches!(
-                h.state,
-                ReservationState::Active | ReservationState::Expired
+            !matches!(
+                h.charge_source,
+                Some(ChargeSource::Gateway | ChargeSource::SubagentTranscript)
             )
         })
         .max_by_key(|h| h.created_at)
+        .filter(|h| match h.state {
+            ReservationState::Active => true,
+            ReservationState::Expired => h.settled_amount.is_none(),
+            _ => false,
+        })
 }
 
 /// Settles the session's main-executor turn hold at `Stop` (HORO-2196).
@@ -3009,30 +3024,6 @@ fn remember_swept(rt: &SharedBudgetRuntime, key: (String, String), stamp: (u64, 
     seen.insert(key, stamp);
 }
 
-/// The hold a `SessionEnd` settles: the lane's newest non-charge hold by
-/// creation time, in ANY state, and only when it is still unsettled (`active`,
-/// or `expired` and unspent). Gateway and subagent-charge rows are not turn
-/// holds and never qualify. Taking the newest hold of any state, rather than
-/// the newest `active`/`expired` one, keeps an older expired hold whose
-/// records a later hold's `Stop` already counted from being booked again
-/// after a crash-then-resume (HORO-2440).
-fn session_end_target(holds: &[SharedPoolReservation]) -> Option<&SharedPoolReservation> {
-    holds
-        .iter()
-        .filter(|h| {
-            !matches!(
-                h.charge_source,
-                Some(ChargeSource::Gateway | ChargeSource::SubagentTranscript)
-            )
-        })
-        .max_by_key(|h| h.created_at)
-        .filter(|h| match h.state {
-            ReservationState::Active => true,
-            ReservationState::Expired => h.settled_amount.is_none(),
-            _ => false,
-        })
-}
-
 /// The `SettleTail` flags for the reason a window was not (fully) measured.
 fn tail_flags_for(reason: Option<&str>) -> TailFlags {
     match reason {
@@ -3136,7 +3127,7 @@ pub fn settle_tail_on_lane(
     // late `Stop` finds nothing to flat-book. Only this raw-id main lane is
     // read or written. An expired hold's capacity was already released, so it
     // books measured spend only.
-    if let Some(target) = session_end_target(&holds) {
+    if let Some(target) = pending_hold(&holds) {
         let book_flat = target.state == ReservationState::Active && target.expires_at > now;
         let path = Some(transcript_path).filter(|p| !p.trim().is_empty());
         match settle_hold_from_window(
