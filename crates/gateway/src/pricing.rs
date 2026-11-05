@@ -82,6 +82,17 @@ pub struct PricingTable {
     entries: BTreeMap<String, ModelPricing>,
 }
 
+/// An OpenAI row: cache creation is priced as ordinary input (OpenAI has no
+/// cache-write surcharge), so only input, cached input and output differ.
+const fn openai(input: f64, cached_input: f64, output: f64) -> ModelPricing {
+    ModelPricing {
+        input_usd_per_mtok: input,
+        cache_creation_input_usd_per_mtok: input,
+        cache_read_input_usd_per_mtok: cached_input,
+        output_usd_per_mtok: output,
+    }
+}
+
 /// The pinned snapshot's per-model entries.
 ///
 /// Prices are US dollars per million tokens, transcribed from Anthropic's
@@ -273,60 +284,12 @@ const PINNED: &[(&str, ModelPricing)] = &[
     // ordinary input. `gpt-5.6-*` is deliberately NOT pinned: its Sol row has
     // promotional pricing until 2026-11-30, so its list price is not stable;
     // it stays unpriced (flat hold) unless the operator adds an override.
-    (
-        "gpt-6.1-sol",
-        ModelPricing {
-            input_usd_per_mtok: 2.0,
-            cache_creation_input_usd_per_mtok: 2.0,
-            cache_read_input_usd_per_mtok: 0.10,
-            output_usd_per_mtok: 10.0,
-        },
-    ),
-    (
-        "gpt-6.1-terra",
-        ModelPricing {
-            input_usd_per_mtok: 1.0,
-            cache_creation_input_usd_per_mtok: 1.0,
-            cache_read_input_usd_per_mtok: 0.05,
-            output_usd_per_mtok: 5.0,
-        },
-    ),
-    (
-        "gpt-6-sol",
-        ModelPricing {
-            input_usd_per_mtok: 2.0,
-            cache_creation_input_usd_per_mtok: 2.0,
-            cache_read_input_usd_per_mtok: 0.20,
-            output_usd_per_mtok: 10.0,
-        },
-    ),
-    (
-        "gpt-6-astra",
-        ModelPricing {
-            input_usd_per_mtok: 10.0,
-            cache_creation_input_usd_per_mtok: 10.0,
-            cache_read_input_usd_per_mtok: 1.0,
-            output_usd_per_mtok: 50.0,
-        },
-    ),
-    (
-        "gpt-6-luna",
-        ModelPricing {
-            input_usd_per_mtok: 0.10,
-            cache_creation_input_usd_per_mtok: 0.10,
-            cache_read_input_usd_per_mtok: 0.01,
-            output_usd_per_mtok: 0.50,
-        },
-    ),
-    (
-        "gpt-5.3-codex",
-        ModelPricing {
-            input_usd_per_mtok: 1.75,
-            cache_creation_input_usd_per_mtok: 1.75,
-            cache_read_input_usd_per_mtok: 0.175,
-            output_usd_per_mtok: 14.0,
-        },
-    ),
+    ("gpt-6.1-sol", openai(2.0, 0.10, 10.0)),
+    ("gpt-6.1-terra", openai(1.0, 0.05, 5.0)),
+    ("gpt-6-sol", openai(2.0, 0.20, 10.0)),
+    ("gpt-6-astra", openai(10.0, 1.0, 50.0)),
+    ("gpt-6-luna", openai(0.10, 0.01, 0.50)),
+    ("gpt-5.3-codex", openai(1.75, 0.175, 14.0)),
 ];
 
 impl PricingTable {
