@@ -43,7 +43,11 @@ description below is corrected.
 **S8 (HORO-2217) delivers the operator surfaces**: `libra-governor
 shared-budget status [--json]`, a budget segment on the legacy statusline,
 and the shared-budget checks in `doctor` (see *Status, statusline and doctor
-delivered in S8*). **Not built**: the S11 gateway hard cap (`governor_held`),
+delivered in S8*). **S11f (HORO-2274) delivers the hook side of the dark
+`enforcement = "gateway"` mode** (Admit reserves nothing, the charge paths book
+zero, Status and doctor report the mode); the mode is off by default and its
+label claim is not made until the S11g founder packet. **Not built or not
+enabled**: the S11 gateway hard cap (`governor_held`) as a shipped claim,
 a Codex budget gate, remote upload, and any real-host evidence (everything is
 `TestOwnedLive`; nothing is `ProductionObserved`). Everything else below that
 is not delivered by a slice named above is **design intent**; it must not be

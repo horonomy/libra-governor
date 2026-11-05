@@ -518,3 +518,27 @@ independent. S11a gates **enablement**, not building.
   requires (crates/ledger/src/session.rs:49-64)? If not, gateway mode refuses `task_unbound`.
   Verify in S11a and S11e integration tests.
 - **Q4:** Founder choice between replace and `message.id` dedupe (§3.4).
+
+---
+
+## As built: S11f (HORO-2274)
+
+- Protocol stays at the unreleased v25 (no second bump). New: `SharedBudgetOutcome::GatewayMetered`
+  (the Admit answer in gateway mode; no `reservation_id`), `SharedBudgetRefusal::GatewayMetered`
+  (charge paths that booked nothing), `SHARED_BUDGET_GUARANTEE_GATEWAY`, and the additive Status
+  fields `enforcement`, `gateway_in_flight`, `truncated_settles`, `input_bound_violations`,
+  `unrouted_sessions`, `orphans_booked` (all `serde(default)`).
+- Admit in gateway mode is a pure read (no pool creation, no sweep). It denies `cap_exhausted`
+  when remaining is below the turn hold unless the lane still has a live pre-flip hold. Scoped to
+  Claude lanes; Codex keeps hooks semantics.
+- `ChargeAgentTranscript` (SubagentStop), `SettleTail` (SessionEnd, after settling any pre-flip
+  hold), the Stop sweep and the subagent readiness probe book/wait for nothing. `Stop` settles a
+  pre-flip `turn_hold` only. `ChargeAgent` (explicit client amount, sent by no hook) is unchanged.
+- `unrouted_sessions` counts distinct sessions (opaque ids, bounded) whose Stop found no gateway
+  row in the current pool. The ledger gained two read-only queries for it and `gateway_in_flight`.
+- `doctor` Errors when the mode has no running `governor_held` gateway (queried by
+  `GatewayStatus`, never spawning) or no `ANTHROPIC_BASE_URL` key in settings `env` (presence only).
+  The warning for a mode flip with live holds (§3.4) is not implemented.
+- In gateway mode PreToolUse `Check` still reports `exhausted` when remaining < turn hold, so tool
+  calls can be denied mid-turn once gateway reservations shrink remaining; this is stricter than
+  hooks mode.
