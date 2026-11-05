@@ -1530,6 +1530,29 @@ impl LedgerStore {
         Ok(total.saturating_add(floor).max(0) as u64)
     }
 
+    /// Idempotency keys of `principal_id`'s settled charge rows that start
+    /// with `key_prefix`, in pools starting with `pool_prefix` (S11f: reads
+    /// the gateway-metered offsets recorded beside a subagent's charges).
+    /// Read-only.
+    pub fn shared_charge_keys_by_prefix(
+        &self,
+        principal_id: &PrincipalId,
+        key_prefix: &str,
+        pool_prefix: &str,
+    ) -> Result<Vec<String>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT idempotency_key FROM shared_pool_reservations
+             WHERE principal_id = ?1 AND is_charge = 1 AND state = 'settled'
+               AND substr(idempotency_key, 1, length(?2)) = ?2
+               AND substr(pool_id, 1, length(?3)) = ?3",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![principal_id.0, key_prefix, pool_prefix],
+            |row| row.get::<_, String>(0),
+        )?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// Every active, unexpired, non-charge hold `principal_id` has for
     /// `session_id` in any pool whose id starts with `pool_prefix`
     /// (HORO-2195) -- the set a tool-event heartbeat renews. Gateway holds

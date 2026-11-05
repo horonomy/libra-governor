@@ -548,3 +548,31 @@ fn a_session_has_a_gateway_row_in_any_state_but_not_a_turn_hold_row() {
     assert!(!has("never-seen"));
     assert_eq!(dump_reservations(&dir), before, "the probe is read-only");
 }
+
+#[test]
+fn charge_keys_are_listed_by_prefix_without_writing() {
+    let (dir, mut store) = new_store(1_000);
+    for (i, key) in ["fam|c10", "fam|g4", "other|c1"].iter().enumerate() {
+        store
+            .charge_shared(SharedPoolChargeRequest {
+                pool_id: &pool_id(),
+                principal_id: &owner(),
+                session_id: "s1",
+                amount: i as u64,
+                unit: &QuotaUnit::UsdCents,
+                idempotency_key: key,
+                now: now(),
+                attribution: ExecutorAttribution::unattributed(Some(ChargeSource::TurnHold)),
+                capacity_source: CapacitySource::LocalConfigured { cap: 1_000 },
+                usage_known: true,
+            })
+            .unwrap();
+    }
+    let before = dump_reservations(&dir);
+    let mut keys = store
+        .shared_charge_keys_by_prefix(&owner(), "fam|", "metered:")
+        .unwrap();
+    keys.sort();
+    assert_eq!(keys, vec!["fam|c10".to_string(), "fam|g4".to_string()]);
+    assert_eq!(dump_reservations(&dir), before);
+}

@@ -167,6 +167,9 @@ pub enum SharedBudgetDenyReason {
     ClockAnomaly,
     /// Remaining budget is below the turn hold.
     CapExhausted,
+    /// `enforcement = "gateway"` but the daemon runs no `governor_held`
+    /// gateway, so nothing would meter the prompt's spend. Fails closed.
+    GatewayUnavailable,
 }
 
 /// Why a request was refused as malformed or inconsistent (nothing is
