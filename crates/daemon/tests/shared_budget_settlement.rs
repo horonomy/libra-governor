@@ -4093,7 +4093,8 @@ fn session_end_after_expiry_books_measured_only_never_flat() {
         }
         let used_before = fx.status().used_usd_cents;
         let gone = fx.path().join("gone.jsonl");
-        tail(&mut fx, "s1", &s(&gone));
+        let out = tail(&mut fx, "s1", &s(&gone));
+        assert_eq!(tail_row(&out), (None, 0, true), "swept={swept}");
         assert_eq!(fx.status().used_usd_cents, used_before, "swept={swept}");
         assert_eq!(fx.lane("s1")[0].settled_amount, None, "swept={swept}");
     }
@@ -4175,6 +4176,50 @@ fn session_end_after_a_crash_settles_the_newest_hold_over_both_turns() {
     assert_eq!(tail_row(&out), (Some(h2.id), 600, false));
     assert_eq!(totals(&fx.status()), (600, 0));
     assert_eq!(fx.lane("s1")[0].settled_amount, None, "h1 stays unspent");
+}
+
+/// After a crash and resume, the newest hold's settlement counted the older
+/// expired hold's turn. A late or duplicate `Stop` without a prompt id must
+/// not find that older hold and flat-book it a second time.
+#[test]
+fn a_late_stop_after_a_crash_resume_session_end_does_not_flat_book_the_older_expired_hold() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    fx.admit_hold("s1");
+    write_lines(&tx, &[rec(10, "m1", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(7_200));
+    let h2 = fx.admit_hold("s1");
+    append_lines(&tx, &[rec(7_210, "m2", SONNET, mi(1), Some("s1"), false)]);
+    fx.clock.set(at(7_300));
+    assert_eq!(
+        tail_row(&tail(&mut fx, "s1", &s(&tx))),
+        (Some(h2.id), 600, false)
+    );
+    fx.clock.set(at(7_400));
+    fx.finalize("s1", Some(&s(&tx)));
+    fx.finalize("s1", None);
+    assert_eq!(totals(&fx.status()), (600, 0));
+    assert_eq!(fx.lane("s1")[0].settled_amount, None, "h1 stays unspent");
+}
+
+/// A first-turn `SessionEnd` counts only records after the lane's first hold:
+/// the session's earlier transcript history is never billed.
+#[test]
+fn first_turn_session_end_does_not_bill_records_from_before_the_hold() {
+    let mut fx = Fx::new(Some(&cfg()), BASE);
+    let tx = fx.path().join("s1.jsonl");
+    write_lines(
+        &tx,
+        &[
+            rec(-500, "old", SONNET, mi(9), Some("s1"), false),
+            rec(10, "m1", SONNET, mi(1), Some("s1"), false),
+        ],
+    );
+    let hold = fx.admit_hold("s1");
+    fx.clock.set(at(60));
+    let out = tail(&mut fx, "s1", &s(&tx));
+    assert_eq!(tail_row(&out), (Some(hold.id), 300, false));
+    assert_eq!(totals(&fx.status()), (300, 0));
 }
 
 #[test]
