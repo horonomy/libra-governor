@@ -179,8 +179,9 @@ pub struct DaemonConfig {
     /// The local monthly shared budget (HORO-2195, ADR-0026), loaded from
     /// `<state_dir>/shared-budget.json` at start. `Default` is absent: the
     /// shared-budget path is then never consulted and every other request
-    /// behaves exactly as before.
-    pub shared_budget: crate::shared_budget::SharedBudgetRuntime,
+    /// behaves exactly as before. Shared (`Arc`) so the gateway thread
+    /// consults the same hot-reloaded file and clock as the request handler.
+    pub shared_budget: std::sync::Arc<crate::shared_budget::SharedBudgetRuntime>,
 }
 
 /// Default [`DaemonConfig::progressive_interval_secs`] — see that
