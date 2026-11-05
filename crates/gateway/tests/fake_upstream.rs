@@ -176,8 +176,19 @@ fn scripted_body(steps: Vec<Step>) -> BoxBody<Bytes, std::io::Error> {
                 Step::Sleep(ms) => tokio::time::sleep(std::time::Duration::from_millis(ms)).await,
                 Step::Abort => {
                     // `Channel` yields a pending abort before any frame
-                    // still queued, so let the queued frames drain first.
-                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    // still queued, so the real frames must be consumed first.
+                    // The channel holds 8 frames: nine more sends cannot all
+                    // complete until the earlier ones have been read, and the
+                    // empty padding is ignored by the SSE parser.
+                    for _ in 0..9 {
+                        if sender
+                            .send(hyper::body::Frame::data(Bytes::new()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
                     sender.abort(std::io::Error::other("upstream reset"));
                     return;
                 }
