@@ -731,8 +731,7 @@ pub struct TestGateway {
     pub recorder: Arc<StubRecorder>,
     pub stats: Arc<libra_governor_gateway::stats::GatewayStats>,
     pub upstream: FakeUpstream,
-    _dir: tempfile::TempDir,
-    _shutdown: std::sync::mpsc::Sender<()>,
+    _gateway: RunningGateway,
     _runtime: Arc<tokio::runtime::Runtime>,
 }
 
@@ -771,16 +770,32 @@ pub fn governor_held_fake_credential() -> libra_governor_gateway::config::Gatewa
     }
 }
 
-/// Starts a fake upstream and a real gateway pointed at it.
-pub fn start_test_gateway(options: TestGatewayOptions) -> TestGateway {
-    let runtime = Arc::new(
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap(),
-    );
-    let upstream = start_fake_upstream(&runtime);
+/// A real gateway running in front of a fake upstream, with whatever
+/// authorities the caller supplied. Dropping it stops the gateway.
+pub struct RunningGateway {
+    pub addr: SocketAddr,
+    pub token: String,
+    pub stats: Arc<libra_governor_gateway::stats::GatewayStats>,
+    _dir: tempfile::TempDir,
+    _shutdown: std::sync::mpsc::Sender<()>,
+}
 
+/// What a gateway needs besides its authorities.
+pub struct GatewayShape {
+    pub resource_kind: ResourceKind,
+    pub credential_mode: libra_governor_gateway::config::GatewayCredentialMode,
+    pub max_request_bytes: usize,
+}
+
+/// Starts a real gateway pointed at `upstream`, answered by the given
+/// authorities.
+pub fn start_gateway_for(
+    upstream: &FakeUpstream,
+    shape: GatewayShape,
+    spend: Arc<dyn SpendAuthority>,
+    recorder: Arc<dyn RequestRecorder>,
+    shared: Option<Arc<dyn SharedBudgetAuthority>>,
+) -> RunningGateway {
     let dir = tempfile::tempdir().unwrap();
     let token_path = dir.path().join("gateway.token");
     // Created here rather than read back after startup: the gateway
@@ -801,31 +816,27 @@ pub fn start_test_gateway(options: TestGatewayOptions) -> TestGateway {
     let mut raw = libra_governor_gateway::config::GatewayConfig::new(
         addr,
         token_path.clone(),
-        options.credential_mode,
+        shape.credential_mode,
     );
     raw.upstream = format!("http://127.0.0.1:{}", upstream.addr.port());
     raw.upstream_host_allowlist = vec!["127.0.0.1".to_string()];
     raw.allow_plaintext_loopback_upstream = true;
     raw.allow_nonstandard_port = true;
-    raw.max_request_bytes = options.max_request_bytes;
+    raw.max_request_bytes = shape.max_request_bytes;
 
-    let validated = libra_governor_gateway::config::validate(raw, options.resource_kind)
+    let validated = libra_governor_gateway::config::validate(raw, shape.resource_kind)
         .expect("the harness configuration must validate");
 
-    let authority = Arc::new(StubAuthority::new(options.behaviour, options.resource_kind));
-    let recorder = Arc::new(StubRecorder::default());
     let stats = Arc::new(libra_governor_gateway::stats::GatewayStats::new());
     let mut runtime_config = libra_governor_gateway::server::GatewayRuntimeConfig::new(
         validated,
-        Arc::clone(&authority) as Arc<dyn SpendAuthority>,
-        Arc::clone(&recorder) as Arc<dyn RequestRecorder>,
+        spend,
+        recorder,
         Arc::clone(&stats),
     );
-    if let Some(shared) = &options.shared {
-        runtime_config =
-            runtime_config.with_shared_budget(Arc::clone(shared) as Arc<dyn SharedBudgetAuthority>);
+    if let Some(shared) = shared {
+        runtime_config = runtime_config.with_shared_budget(shared);
     }
-    let shared = options.shared.clone();
 
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -844,16 +855,50 @@ pub fn start_test_gateway(options: TestGatewayOptions) -> TestGateway {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
 
-    TestGateway {
+    RunningGateway {
         addr,
         token,
-        authority,
-        shared,
-        recorder,
         stats,
-        upstream,
         _dir: dir,
         _shutdown: shutdown_tx,
+    }
+}
+
+/// Starts a fake upstream and a real gateway pointed at it.
+pub fn start_test_gateway(options: TestGatewayOptions) -> TestGateway {
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap(),
+    );
+    let upstream = start_fake_upstream(&runtime);
+    let authority = Arc::new(StubAuthority::new(options.behaviour, options.resource_kind));
+    let recorder = Arc::new(StubRecorder::default());
+    let gateway = start_gateway_for(
+        &upstream,
+        GatewayShape {
+            resource_kind: options.resource_kind,
+            credential_mode: options.credential_mode,
+            max_request_bytes: options.max_request_bytes,
+        },
+        Arc::clone(&authority) as Arc<dyn SpendAuthority>,
+        Arc::clone(&recorder) as Arc<dyn RequestRecorder>,
+        options
+            .shared
+            .clone()
+            .map(|s| s as Arc<dyn SharedBudgetAuthority>),
+    );
+
+    TestGateway {
+        addr: gateway.addr,
+        token: gateway.token.clone(),
+        authority,
+        shared: options.shared,
+        recorder,
+        stats: Arc::clone(&gateway.stats),
+        upstream,
+        _gateway: gateway,
         _runtime: runtime,
     }
 }

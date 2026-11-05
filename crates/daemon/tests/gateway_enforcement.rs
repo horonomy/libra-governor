@@ -17,6 +17,9 @@
 //! 3. A hard budget refusal actually happens at the ledger, not merely at
 //!    the policy projection.
 
+mod common;
+
+use common::{fixture_repo, generous_policy};
 use std::io::BufReader;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -39,10 +42,6 @@ use libra_governor_ledger::LedgerStore;
 use libra_governor_protocol::{
     wire, Request, RequestEnvelope, Response, ResponseEnvelope, PROTOCOL_VERSION,
 };
-
-fn fixture_repo() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample_repo")
-}
 
 fn send(
     listener: &UnixListener,
@@ -107,31 +106,6 @@ fn config(dir: &Path, policy: Policy, with_gateway: bool) -> DaemonConfig {
         shared_budget: Default::default(),
         progressive_interval_secs: libra_governor_daemon::DEFAULT_PROGRESSIVE_INTERVAL_SECS,
     }
-}
-
-fn generous_policy() -> Policy {
-    Policy::validated(
-        "generous-test",
-        ResourceBound {
-            mode: ConstraintMode::Elastic,
-            target: ResourceAmount::Tokens(100_000),
-            elastic_ceiling: Some(ResourceAmount::Tokens(125_000)),
-            hard_ceiling: ResourceAmount::Tokens(150_000),
-        },
-        TimeBound {
-            mode: ConstraintMode::Elastic,
-            target_secs: 3600,
-            elastic_ceiling_secs: Some(4500),
-            hard_ceiling_secs: Some(5400),
-            deadline: None,
-        },
-        CompletionContract::first(vec![CompletionCriterion::required(
-            "required verification (tests/build/lint) passes",
-        )]),
-        Confidence::Low,
-        AutonomyBoundary::AskOnApproval,
-    )
-    .unwrap()
 }
 
 /// A tiny hard budget, so one modest gateway request exhausts it.
