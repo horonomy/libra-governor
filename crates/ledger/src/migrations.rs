@@ -300,6 +300,47 @@ mod tests {
     }
 
     #[test]
+    fn migration_11_backfilled_task_accounts_stay_unattributed() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        apply_known_through(&mut conn, 10);
+        conn.execute(
+            "INSERT INTO tasks (task_id, external_ref_kind, external_ref_value, created_at, last_event_at)
+             VALUES ('00000000-0000-7000-8000-000000000011', NULL, NULL, '2026-10-11T00:00:00Z', '2026-10-11T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_budgets (
+                task_id, resource_kind, hard_limit, initial_completion_reserve,
+                completion_reserve, completion_reserve_basis, policy_json,
+                policy_schema_version, reservation_schema_version, created_at, updated_at
+             ) VALUES ('00000000-0000-7000-8000-000000000011', 'tokens', 1000.0, 10.0, 10.0,
+                       'policy_target', '{}', 'policy-v1', 'r1', '2026-10-11T00:00:00Z',
+                       '2026-10-11T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        apply_all(&mut conn).unwrap();
+
+        // HORO-2191 AC2: a legacy row is never backfilled with a lineage or
+        // dimension key (it is NotRecorded), which is how it stays
+        // distinguishable from a new row that records 'unknown'.
+        let (provenance, lineage, dimension_key): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT provenance, provider_lineage_status, execution_dimension_key_json
+                 FROM resource_accounts",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(provenance, "legacy_backfill_0011");
+        assert_eq!(lineage, None);
+        assert_eq!(dimension_key, None);
+    }
+
+    #[test]
     fn migration_21_preserves_0020_shared_pool_rows_and_leaves_attribution_null() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", true).unwrap();

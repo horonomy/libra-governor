@@ -84,35 +84,25 @@ fn total_tokens(observation: &GatewayRequestObservation) -> Option<u64> {
     Some(fresh.iter().filter_map(|f| *f).sum())
 }
 
-/// Builds the attribution for one gateway request, per the ticket's
-/// three-level correlation priority. Never produces
-/// [`EconomicScope::Agent`]/[`EconomicScope::TurnTask`] — the gateway
-/// exposes neither `agent_id` nor `turn_id`.
+/// Builds the attribution for one gateway request: task correlation Libra
+/// already proves, else explicit unknown. Never produces
+/// [`EconomicScope::Session`]/[`EconomicScope::Agent`]/
+/// [`EconomicScope::TurnTask`].
+///
+/// Session scope is deliberately not derivable here (HORO-2191 AC4).
+/// `gateway_requests` carries a `session_id` string but no `host_id` or
+/// `tool_provider`, and a session is only identified by the
+/// `(host_id, tool_provider, provider_session_id)` triple
+/// ([`ExecutionIdentity::cache_key`]). Matching on the bare string would
+/// let identical ids under two providers or hosts each claim the same
+/// row, and supplying the missing host/provider from the caller's identity
+/// would synthesise the second identity system ADR-0007 forbids. Session
+/// attribution needs a gateway row that carries the full triple.
 fn attribution_for(
     observation: &GatewayRequestObservation,
-    execution: Option<&ExecutionIdentity>,
     model_request: Option<ModelRequest>,
 ) -> (EconomicAttribution, EconomicScope) {
-    // Priority 1: caller-supplied identity whose provider_session_id
-    // matches this row's session_id. The identity is passed in, never
-    // re-derived — gateway_requests carries no host_id/tool_provider, so
-    // synthesising one would be the second identity system ADR-0007
-    // forbids.
-    if let (Some(identity), Some(session_id)) = (execution, observation.session_id.as_deref()) {
-        if identity.provider_session_id() == Some(session_id) {
-            let mut attribution =
-                EconomicAttribution::from_execution(Attributed::known(identity.clone()));
-            if let Some(task_id) = observation.task_id {
-                attribution.task = Attributed::known(task_id);
-            }
-            if let Some(model_request) = model_request {
-                attribution.model_request = Attributed::known(model_request);
-            }
-            return (attribution, EconomicScope::Session);
-        }
-    }
-
-    // Priority 2: task correlation Libra already proves.
+    // Task correlation Libra already proves.
     if let Some(task_id) = observation.task_id {
         let mut attribution = EconomicAttribution::from_execution(Attributed::unknown(
             UnknownReason::NotExposedByProvider,
@@ -124,7 +114,7 @@ fn attribution_for(
         return (attribution, EconomicScope::Task);
     }
 
-    // Priority 3: explicit unknown/partial attribution.
+    // Explicit unknown/partial attribution.
     let mut attribution = EconomicAttribution::from_execution(Attributed::unknown(
         UnknownReason::NotExposedByProvider,
     ));
@@ -148,17 +138,18 @@ fn attribution_for(
 /// resource kind: a non-USD (e.g. Tokens) row emits no USD fact, and for it only the
 /// `false` row's hold fallback survives, in that kind (HORO-2042).
 ///
-/// `execution`, when supplied, is used only to prove `EconomicScope::Session`
-/// — it is never derived from the gateway row itself.
+/// `_execution` is accepted for API stability but does not influence
+/// attribution: a gateway row has no host/provider, so a session-string
+/// match cannot prove `EconomicScope::Session` (see `attribution_for`).
 pub fn events_from_gateway_request(
     observation: &GatewayRequestObservation,
-    execution: Option<&ExecutionIdentity>,
+    _execution: Option<&ExecutionIdentity>,
 ) -> Vec<EconomicEvent> {
     let model_request = Some(ModelRequest {
         request: observation.gateway_request_id.clone(),
         model: observation.model.clone(),
     });
-    let (attribution, owning_scope) = attribution_for(observation, execution, model_request);
+    let (attribution, owning_scope) = attribution_for(observation, model_request);
 
     let mut events = Vec::with_capacity(2);
 
@@ -540,8 +531,12 @@ mod tests {
         assert_eq!(first[1].id(), second[1].id());
     }
 
+    /// HORO-2191 AC4: a gateway row carries no host_id/tool_provider, so a
+    /// bare provider_session_id string match is not proof of the session.
+    /// An identity whose session string equals the row's is NOT attributed
+    /// Session scope; the row keeps the task correlation Libra proves.
     #[test]
-    fn correlation_prefers_matching_session_identity() {
+    fn a_bare_session_string_match_is_not_session_attributed() {
         let identity = ExecutionIdentityBuilder::new("host-1", "claude_code")
             .provider_session_id("sess-1")
             .root_lineage()
@@ -551,8 +546,41 @@ mod tests {
         obs.session_id = Some("sess-1".to_string());
         obs.task_id = Some(TaskId::new());
         let events = events_from_gateway_request(&obs, Some(&identity));
-        assert_eq!(events[0].owning_scope(), EconomicScope::Session);
-        assert!(events[0].attribution().execution.is_known());
+        assert_eq!(events[0].owning_scope(), EconomicScope::Task);
+        assert!(!events[0].attribution().execution.is_known());
+
+        obs.task_id = None;
+        let events = events_from_gateway_request(&obs, Some(&identity));
+        assert_eq!(events[0].owning_scope(), EconomicScope::Unknown);
+        assert!(!events[0].attribution().execution.is_known());
+    }
+
+    /// The collision the rule exists to prevent: identical session strings
+    /// under two different providers/hosts must not each claim the row.
+    #[test]
+    fn identical_session_strings_under_different_providers_or_hosts_are_not_session_attributed() {
+        let mut obs = observation(EnforcementTier::GatewayMetered, true);
+        obs.session_id = Some("shared-session".to_string());
+        for (host, provider) in [
+            ("host-1", "claude_code"),
+            ("host-1", "codex"),
+            ("host-2", "claude_code"),
+        ] {
+            let identity = ExecutionIdentityBuilder::new(host, provider)
+                .provider_session_id("shared-session")
+                .root_lineage()
+                .build_at(now())
+                .unwrap();
+            let events = events_from_gateway_request(&obs, Some(&identity));
+            for event in &events {
+                assert_ne!(
+                    event.owning_scope(),
+                    EconomicScope::Session,
+                    "{host}/{provider} must not be session-attributed from a bare string"
+                );
+                assert!(!event.attribution().execution.is_known());
+            }
+        }
     }
 
     #[test]

@@ -67,8 +67,14 @@ hook schemas vs. what remains unverified.
     stdout (the Estimate-vs-Actual receipt goes to stderr) and never blocks.
   - There is no `PreToolUse` gate for Codex; a long tool-free turn keeps its
     hold only until it expires.
-  - Unless `shared-budget.json` carries `pricing_overrides` for the Codex
-    model, every turn settles at the flat per-turn hold (`usage_known=false`).
+  - A turn on a pinned OpenAI model (gpt-6.1-sol, gpt-6.1-terra, gpt-6-sol, gpt-6-astra, gpt-6-luna and gpt-5.3-codex;
+    standard tier, short context) is priced from the pinned table, and a
+    `pricing_overrides` entry for the model takes precedence. A model id is
+    matched exactly or with a dated `-YYYYMMDD` suffix only. Any other model
+    (for example `gpt-5.6-*`, or `gpt-6.1-sol-pro`) settles at the flat
+    per-turn hold (`usage_known=false`) unless an override names it. OpenAI
+    bills prompts above 272K input tokens at a higher rate that the table
+    cannot express, so those turns are under-counted.
   - Known limits: a stale daemon (built before this change, same protocol
     version 25) silently leaves an enrolled install ungated until it is
     restarted; a prompt with no `turn_id` is admitted unmapped and its hold
@@ -89,9 +95,10 @@ hook schemas vs. what remains unverified.
     - `codex_enrolled_hooks`: whether the three hooks are wired and the trust
       state (likely not yet trusted / unknown / disabled), always a Warn
       because doctor cannot prove trust;
-    - `codex_pricing`: a Warn when no `pricing_overrides` model id starts with
-      `gpt` (every turn then books the flat hold; a Codex model id that does
-      not start with `gpt` is not recognised by this check);
+    - `codex_pricing`: Ok; names the pinned `gpt-*` ids and the pricing
+      version, any `gpt-*` `pricing_overrides` ids that take precedence, and
+      states that every other Codex model is unpriced (flat hold). It does not
+      know the model of a particular turn;
     - `codex_daemon_admission`: a read-only Codex `Check` with a synthetic
       session probes the running daemon. `not_configured` is an **Error**
       ("enrolled but the running daemon is not honouring Codex admission
@@ -102,7 +109,7 @@ hook schemas vs. what remains unverified.
     `shared-budget status` swaps the "Codex route has no budget gate" line of
     its not-covered list for the remaining Codex gaps (subagents, no
     PreToolUse, no heartbeat, unmapped no-`turn_id` prompts, untrusted hooks
-    ungated, unpriced models at the flat hold). The guarantee label stays
+    ungated, models with neither a pinned price nor an override at the flat hold). The guarantee label stays
     `admission-bounded (cooperative)`, and the `agents` capability row stays
     Unavailable.
 - `libra-governor agents [--json]` — the capability matrix for both
