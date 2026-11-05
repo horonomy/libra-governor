@@ -920,17 +920,19 @@ fn settle_tail_refuses_a_session_with_no_settled_lane() {
         tail(&mut fx, "s1", &s(&tx)),
         SharedBudgetRefusal::NoSettledLane,
     );
-    // Admitted but the hold never settled: still nothing to continue from.
+    // Admitted but never settled: a SessionEnd now settles the pending hold
+    // instead of refusing (HORO-2440), so it is not left reserved. The
+    // never-billed-history guarantee still holds: only the open turn's own
+    // records are counted, and measured spend may exceed the hold.
     fx.admit_hold("s1");
-    expect_refused(
-        tail(&mut fx, "s1", &s(&tx)),
-        SharedBudgetRefusal::NoSettledLane,
+    let out = tail(&mut fx, "s1", &s(&tx));
+    assert!(
+        matches!(out, SharedBudgetOutcome::TailSettled { .. }),
+        "{out:?}"
     );
-    assert_eq!(
-        totals(&fx.status()),
-        (0, 1_000),
-        "the whole history was not billed"
-    );
+    let (used, reserved) = totals(&fx.status());
+    assert_eq!(reserved, 0, "the pending hold was released");
+    assert_eq!(used, 2_700, "the open turn's measured spend");
 }
 
 #[test]
@@ -4090,7 +4092,8 @@ fn session_end_after_expiry_books_measured_only_never_flat() {
             fx.admit_hold("s2");
         }
         let used_before = fx.status().used_usd_cents;
-        tail(&mut fx, "s1", &s(&fx.path().join("gone.jsonl")));
+        let gone = fx.path().join("gone.jsonl");
+        tail(&mut fx, "s1", &s(&gone));
         assert_eq!(fx.status().used_usd_cents, used_before, "swept={swept}");
         assert_eq!(fx.lane("s1")[0].settled_amount, None, "swept={swept}");
     }
