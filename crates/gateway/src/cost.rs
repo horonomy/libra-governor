@@ -112,18 +112,37 @@ pub fn worst_case_reservation(
             input_upper.saturating_add(max_tokens),
         )),
         ResourceKind::Usd => {
-            let Some(model_pricing) = pricing.lookup(model) else {
-                return Err(EnforcementGap::UnpricedModel {
-                    model: model.to_string(),
-                });
-            };
-            let usd = (input_upper as f64) * model_pricing.worst_case_input_usd_per_mtok()
-                / 1_000_000.0
-                + (max_tokens as f64) * model_pricing.output_usd_per_mtok / 1_000_000.0;
-            Ok(ResourceAmount::UsdCents(usd_to_cents_ceil(usd)))
+            worst_case_usd_reservation(input_upper, Some(max_tokens), model, pricing)
         }
         ResourceKind::QuotaPercent => Err(EnforcementGap::UnsupportedResourceKind { kind }),
     }
+}
+
+/// The worst-case USD cost of a request whose input is bounded by
+/// `input_upper` tokens, rounded up to whole cents (S11d). Input is priced at
+/// the model's most expensive tier. [`worst_case_reservation`] derives
+/// `input_upper` from the body size; the shared-budget (governor-held) mode
+/// derives it from [`hard_input_upper_bound`] instead.
+///
+/// `max_tokens` must be positive; `None` or zero is
+/// [`EnforcementGap::UnboundedRequest`], never a zero reservation.
+pub fn worst_case_usd_reservation(
+    input_upper: u64,
+    max_tokens: Option<u64>,
+    model: &str,
+    pricing: &PricingTable,
+) -> Result<ResourceAmount, EnforcementGap> {
+    let Some(max_tokens) = max_tokens.filter(|m| *m > 0) else {
+        return Err(EnforcementGap::UnboundedRequest);
+    };
+    let Some(model_pricing) = pricing.lookup(model) else {
+        return Err(EnforcementGap::UnpricedModel {
+            model: model.to_string(),
+        });
+    };
+    let usd = (input_upper as f64) * model_pricing.worst_case_input_usd_per_mtok() / 1_000_000.0
+        + (max_tokens as f64) * model_pricing.output_usd_per_mtok / 1_000_000.0;
+    Ok(ResourceAmount::UsdCents(usd_to_cents_ceil(usd)))
 }
 
 /// The exact cost of a completed request, in `kind`, from the provider's
@@ -489,6 +508,27 @@ mod tests {
             reserved,
             ResourceAmount::UsdCents((expected_usd * 100.0).ceil() as i64)
         );
+    }
+
+    #[test]
+    fn explicit_input_bound_prices_like_the_body_derived_one_and_refuses_the_same_gaps() {
+        let table = PricingTable::pinned();
+        let model = "claude-sonnet-4-5";
+        let from_body =
+            worst_case_reservation(ResourceKind::Usd, 3_000, Some(1_000), model, &table).unwrap();
+        let from_bound =
+            worst_case_usd_reservation(input_token_upper_bound(3_000), Some(1_000), model, &table)
+                .unwrap();
+        assert_eq!(from_body, from_bound);
+
+        assert_eq!(
+            worst_case_usd_reservation(10, Some(0), model, &table),
+            Err(EnforcementGap::UnboundedRequest)
+        );
+        assert!(matches!(
+            worst_case_usd_reservation(10, Some(1), "no-such-model", &table),
+            Err(EnforcementGap::UnpricedModel { .. })
+        ));
     }
 
     #[test]
