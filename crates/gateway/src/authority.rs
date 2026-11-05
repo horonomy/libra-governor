@@ -25,7 +25,12 @@
 //! future. The proxy calls these through `tokio::task::spawn_blocking`
 //! instead, which is what that facility is for.
 
-use libra_governor_domain::{Headroom, ReservationId, ResourceAmount, ResourceKind, TaskId};
+use libra_governor_domain::{
+    Headroom, ReservationId, ResourceAmount, ResourceKind, SharedPoolReservationId, TaskId,
+};
+
+use crate::cost::{EnforcementGap, SettleFlags};
+use crate::usage::ObservedUsage;
 
 /// What the ledger already knows about the task a request is bound to —
 /// fetched before any cost arithmetic, because the budget's own
@@ -151,4 +156,111 @@ pub trait SpendAuthority: Send + Sync + 'static {
     /// when the upstream call never happened (a connection failure) or
     /// produced no tokens at all.
     fn release(&self, reservation_id: ReservationId) -> Result<(), AuthorityError>;
+}
+
+// ---- The shared monthly budget (S11e) --------------------------------
+
+/// Whether the shared monthly budget applies to the next request. Asked
+/// once per request, before anything is reserved, so a request the shared
+/// path would refuse never touches the task budget either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedMode {
+    /// The shared budget is not in force for the gateway: exactly the
+    /// task-budget behaviour that existed before it.
+    NotConsulted,
+    /// Every metered request also reserves against the shared pool.
+    Enforce,
+    /// The shared budget is in force but cannot be honoured (for example a
+    /// pass-through gateway under `enforcement = gateway`): refuse.
+    Unavailable,
+}
+
+/// One request for a hold on the shared pool. The authority prices the
+/// worst case itself from these facts; the gateway never supplies an
+/// amount, and never holds a pricing table for this path.
+#[derive(Debug, Clone)]
+pub struct SharedReserveRequest<'a> {
+    pub session_id: &'a str,
+    pub model: &'a str,
+    /// The request body's full length. Looser than excluding inline base64
+    /// payloads, which only over-reserves.
+    pub body_bytes: usize,
+    pub max_tokens: Option<u64>,
+    pub image_count: usize,
+    /// The per-request id; the authority joins it with its own boot id.
+    pub request_id: &'a str,
+    pub ttl_secs: u64,
+}
+
+/// A granted hold on the shared pool, and the facts it was priced with.
+/// [`SharedBudgetAuthority::settle`] takes it back unchanged, so the
+/// settlement is computed from the same model, `max_tokens` and input
+/// bound as the reservation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedHold {
+    pub id: SharedPoolReservationId,
+    pub reserved_usd_cents: u64,
+    pub input_bound_tokens: u64,
+    pub model: String,
+    pub max_tokens: u64,
+}
+
+/// Why the shared pool refused a request.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SharedDenial {
+    /// The request's worst case does not fit in the remaining cap.
+    CapExhausted { remaining_usd_cents: i64 },
+    /// The shared budget could not be consulted or is not usable.
+    Unavailable,
+    /// The session id is not one the shared budget can book against.
+    Unattributable,
+    /// No finite, priceable worst case exists for the request.
+    Unenforceable(EnforcementGap),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SharedDecision {
+    /// The shared budget stopped applying between [`SharedBudgetAuthority::mode`]
+    /// and the reserve; proceed on the task budget alone.
+    NotConsulted,
+    Granted(SharedHold),
+    Denied(SharedDenial),
+}
+
+/// What a settlement booked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedSettled {
+    pub booked_usd_cents: u64,
+    /// `true` only when the booked amount is the provider's own figure.
+    pub usage_known: bool,
+    pub flags: SettleFlags,
+}
+
+/// The raw facts of a finished request. The authority applies the S11b
+/// rule with the shared-budget table; the gateway prices nothing here.
+#[derive(Debug, Clone)]
+pub struct SharedSettlement<'a> {
+    pub hold: &'a SharedHold,
+    pub observed: Option<ObservedUsage>,
+    pub completed_cleanly: bool,
+    pub saw_message_start: bool,
+}
+
+/// The gateway's surface against the shared monthly budget. Like
+/// [`SpendAuthority`], blocking, and answered by the daemon.
+pub trait SharedBudgetAuthority: Send + Sync + 'static {
+    fn mode(&self) -> SharedMode;
+
+    fn reserve(&self, req: SharedReserveRequest<'_>) -> Result<SharedDecision, AuthorityError>;
+
+    /// Books the request. An error leaves the hold active; the daemon books
+    /// it at its reservation when it expires.
+    fn settle(&self, settlement: SharedSettlement<'_>) -> Result<SharedSettled, AuthorityError>;
+
+    /// Releases a hold for a request the provider did not bill.
+    fn release(&self, id: SharedPoolReservationId) -> Result<(), AuthorityError>;
+
+    /// Extends a hold for a stream that outlasts its first lease. Failure
+    /// is only logged by the caller: safety does not depend on it.
+    fn renew(&self, id: SharedPoolReservationId, ttl_secs: u64) -> Result<(), AuthorityError>;
 }

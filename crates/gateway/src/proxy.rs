@@ -70,9 +70,16 @@ use hyper::header::{HeaderName, HeaderValue};
 use hyper::{Request, Response, StatusCode};
 use libra_governor_domain::{ReservationId, ResourceAmount, ResourceKind, TaskId};
 
-use crate::authority::{SpendAuthority, SpendDecision, SpendDenial, SpendRequest};
+use crate::authority::{
+    SharedBudgetAuthority, SharedDecision, SharedDenial, SharedHold, SharedMode,
+    SharedReserveRequest, SharedSettlement, SpendAuthority, SpendDecision, SpendDenial,
+    SpendRequest,
+};
 use crate::config::{GatewayCredentialMode, ValidatedGatewayConfig};
-use crate::cost::{bound_violated, settled_cost, worst_case_reservation, EnforcementGap};
+use crate::cost::{
+    bound_violated, image_block_count, screen_unbounded_inputs, settled_cost,
+    worst_case_reservation, EnforcementGap,
+};
 use crate::credential::{CredentialStore, LocalCapabilityToken};
 use crate::pricing::PRICING_VERSION;
 use crate::route::{match_route, Route};
@@ -143,6 +150,9 @@ pub enum Decision {
     PayloadTooLarge,
     Overloaded,
     UpstreamUnavailable,
+    SharedBudgetExceeded,
+    SharedBudgetUnavailable,
+    SharedBudgetUnattributable,
 }
 
 impl Decision {
@@ -161,6 +171,9 @@ impl Decision {
             Decision::PayloadTooLarge => "payload_too_large",
             Decision::Overloaded => "overloaded",
             Decision::UpstreamUnavailable => "upstream_unavailable",
+            Decision::SharedBudgetExceeded => "shared_budget_exceeded",
+            Decision::SharedBudgetUnavailable => "shared_budget_unavailable",
+            Decision::SharedBudgetUnattributable => "shared_budget_unattributable",
         }
     }
 }
@@ -271,6 +284,9 @@ pub trait RequestRecorder: Send + Sync + 'static {
 pub struct GatewayState {
     pub config: Arc<ValidatedGatewayConfig>,
     pub authority: Arc<dyn SpendAuthority>,
+    /// The shared monthly budget. `None` leaves the gateway exactly a
+    /// task-budget gateway.
+    pub shared: Option<Arc<dyn SharedBudgetAuthority>>,
     pub recorder: Arc<dyn RequestRecorder>,
     pub stats: Arc<GatewayStats>,
     pub token: LocalCapabilityToken,
@@ -456,10 +472,14 @@ fn reject(
     record.decision = decision.as_str();
     record.terminal_state = TerminalState::RejectedBeforeUpstream.as_str();
     match decision {
-        Decision::BudgetExceeded | Decision::NoBudget => state.stats.record_denied_budget(),
-        Decision::TaskUnbound | Decision::UnpricedModel | Decision::UnenforceableRequest => {
-            state.stats.record_denied_unenforceable()
+        Decision::BudgetExceeded | Decision::NoBudget | Decision::SharedBudgetExceeded => {
+            state.stats.record_denied_budget()
         }
+        Decision::TaskUnbound
+        | Decision::UnpricedModel
+        | Decision::UnenforceableRequest
+        | Decision::SharedBudgetUnavailable
+        | Decision::SharedBudgetUnattributable => state.stats.record_denied_unenforceable(),
         // A transport failure is not an authorization refusal, and
         // bucketing it as one would make the statusline blame the user
         // for the provider being unreachable.
@@ -872,6 +892,42 @@ async fn metered_request(
         );
     };
 
+    // The shared monthly budget is asked about first, before anything is
+    // reserved: a request it would refuse must not touch the task budget.
+    let shared_enforced = match &state.shared {
+        None => false,
+        Some(shared) => {
+            let shared = Arc::clone(shared);
+            match tokio::task::spawn_blocking(move || shared.mode()).await {
+                Ok(SharedMode::NotConsulted) => false,
+                Ok(SharedMode::Enforce) => true,
+                Ok(SharedMode::Unavailable) | Err(_) => {
+                    return reject(
+                        state,
+                        record,
+                        StatusCode::FORBIDDEN,
+                        Decision::SharedBudgetUnavailable,
+                        request_id,
+                        "the shared monthly budget is in force but cannot be enforced here",
+                    );
+                }
+            }
+        }
+    };
+    if shared_enforced {
+        if let Some(gap) = screen_unbounded_inputs(&body) {
+            record.decision_detail = Some(gap.to_string());
+            return reject(
+                state,
+                record,
+                StatusCode::FORBIDDEN,
+                Decision::UnenforceableRequest,
+                request_id,
+                "the request references input the shared budget cannot bound from its body",
+            );
+        }
+    }
+
     let context = {
         let authority = Arc::clone(&state.authority);
         let session = session_id.clone();
@@ -1019,6 +1075,77 @@ async fn metered_request(
         record.decision_detail = Some("approval_required".to_string());
     }
 
+    // ---- Reserving, shared budget -------------------------------------
+    //
+    // After the task reservation, so a refusal here must give it back.
+    let mut shared_hold: Option<SharedHold> = None;
+    if shared_enforced {
+        let shared = state
+            .shared
+            .as_ref()
+            .map(Arc::clone)
+            .expect("shared_enforced is only set when the gateway has a shared authority");
+        let reserve = {
+            let session = session_id.clone();
+            let model = model.clone();
+            let request_id = request_id.to_string();
+            let body_bytes = body.len();
+            let images = image_block_count(&body);
+            let max_tokens = envelope.max_tokens;
+            let ttl = state.config.reservation_ttl_secs;
+            tokio::task::spawn_blocking(move || {
+                shared.reserve(SharedReserveRequest {
+                    session_id: &session,
+                    model: &model,
+                    body_bytes,
+                    max_tokens,
+                    image_count: images,
+                    request_id: &request_id,
+                    ttl_secs: ttl,
+                })
+            })
+            .await
+        };
+        let (decision, reason) = match reserve {
+            Ok(Ok(SharedDecision::NotConsulted)) => (None, ""),
+            Ok(Ok(SharedDecision::Granted(hold))) => {
+                shared_hold = Some(hold);
+                (None, "")
+            }
+            Ok(Ok(SharedDecision::Denied(SharedDenial::CapExhausted { .. }))) => (
+                Some(Decision::SharedBudgetExceeded),
+                "this request would exceed the shared monthly budget",
+            ),
+            Ok(Ok(SharedDecision::Denied(SharedDenial::Unattributable))) => (
+                Some(Decision::SharedBudgetUnattributable),
+                "this session cannot be attributed in the shared monthly budget",
+            ),
+            Ok(Ok(SharedDecision::Denied(SharedDenial::Unenforceable(gap)))) => {
+                record.decision_detail = Some(gap.to_string());
+                (
+                    Some(Decision::UnenforceableRequest),
+                    "the request has no finite worst-case cost in the shared monthly budget",
+                )
+            }
+            // Fail closed, like the task reservation: no shared hold, no spend.
+            Ok(Ok(SharedDecision::Denied(SharedDenial::Unavailable))) | Ok(Err(_)) | Err(_) => (
+                Some(Decision::SharedBudgetUnavailable),
+                "the shared monthly budget could not authorize this spend",
+            ),
+        };
+        if let Some(decision) = decision {
+            release_all(state, reservation_id, None).await;
+            return reject(
+                state,
+                record,
+                StatusCode::FORBIDDEN,
+                decision,
+                request_id,
+                reason,
+            );
+        }
+    }
+
     // ---- Forwarding --------------------------------------------------
     let upstream =
         send_with_credential_retry(state, route, parts, query.as_deref(), body, presented).await;
@@ -1028,7 +1155,7 @@ async fn metered_request(
         None => {
             // The call never happened: refund in full rather than
             // charging for provider work that was never done.
-            settle_or_release(state, reservation_id, None, true).await;
+            release_all(state, reservation_id, shared_hold.as_ref()).await;
             state.stats.record_upstream_error();
             record.decision = Decision::UpstreamUnavailable.as_str();
             record.terminal_state = TerminalState::UpstreamUnavailable.as_str();
@@ -1050,7 +1177,7 @@ async fn metered_request(
         // reservation is released in full. The body is relayed unmodified
         // — the provider's own error is more useful to the agent than
         // anything this gateway could substitute.
-        settle_or_release(state, reservation_id, None, true).await;
+        release_all(state, reservation_id, shared_hold.as_ref()).await;
         state.stats.record_upstream_error();
         record.terminal_state = TerminalState::UpstreamRejected.as_str();
         return relay_head(status, &head.headers, request_id)
@@ -1084,6 +1211,7 @@ async fn metered_request(
         max_tokens: envelope.max_tokens.unwrap_or(0),
         record: record.clone(),
         is_sse,
+        shared: shared_hold,
     };
     // From here the pump owns the provenance row: it is the only place
     // that will learn how this response actually ended.
@@ -1182,6 +1310,8 @@ struct SettleContext {
     max_tokens: u64,
     record: GatewayRequestRecord,
     is_sse: bool,
+    /// The shared-pool hold, settled alongside the task reservation.
+    shared: Option<SharedHold>,
 }
 
 /// Relays the upstream body frame by frame, taps usage on the way past,
@@ -1198,9 +1328,22 @@ async fn pump_and_settle(
     let mut accumulator = UsageAccumulator::new();
     let mut whole_body: Vec<u8> = Vec::new();
     let mut terminal = TerminalState::CompletedCleanly;
+    // The first renewal is one period out, not immediate: a fresh hold has
+    // a whole lease left.
+    let mut renewal = ctx.shared.as_ref().map(|_| {
+        let period = renewal_period(ctx.state.config.reservation_ttl_secs);
+        tokio::time::interval_at(tokio::time::Instant::now() + period, period)
+    });
 
     loop {
-        match upstream.frame().await {
+        let next = tokio::select! {
+            frame = upstream.frame() => frame,
+            _ = next_renewal(&mut renewal) => {
+                renew_shared_hold(&ctx);
+                continue;
+            }
+        };
+        match next {
             Some(Ok(frame)) => {
                 if let Some(data) = frame.data_ref() {
                     if ctx.is_sse {
@@ -1265,6 +1408,16 @@ async fn pump_and_settle(
         ctx.state.stats.record_settled_without_usage();
     }
 
+    if let Some(hold) = ctx.shared.take() {
+        settle_shared_hold(
+            &ctx.state,
+            hold,
+            observed,
+            &accumulator,
+            terminal == TerminalState::CompletedCleanly && !ctx.is_sse,
+        )
+        .await;
+    }
     settle_or_release(&ctx.state, ctx.reservation_id, actual, false).await;
     ctx.state.recorder.record(ctx.record);
 }
@@ -1299,4 +1452,87 @@ async fn settle_or_release(
         }
     })
     .await;
+}
+
+/// Releases the task reservation and, when there is one, the shared hold:
+/// the paths where the provider did not bill the request.
+async fn release_all(
+    state: &Arc<GatewayState>,
+    reservation_id: ReservationId,
+    shared: Option<&SharedHold>,
+) {
+    settle_or_release(state, reservation_id, None, true).await;
+    if let (Some(authority), Some(hold)) = (state.shared.as_ref(), shared) {
+        let authority = Arc::clone(authority);
+        let id = hold.id;
+        // A failure leaves the hold active; the daemon books it at expiry.
+        let _ = tokio::task::spawn_blocking(move || authority.release(id)).await;
+    }
+}
+
+/// How often a stream renews its shared hold: a third of the lease, never
+/// more often than every 30 seconds.
+pub fn renewal_period(ttl_secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs((ttl_secs / 3).max(30))
+}
+
+/// Resolves on the next renewal tick, or never when there is no shared hold.
+async fn next_renewal(timer: &mut Option<tokio::time::Interval>) {
+    match timer {
+        Some(timer) => {
+            timer.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// Spawns a renewal of the stream's shared hold without waiting for it, so
+/// relaying never waits on the ledger. A failure only means the hold is
+/// booked at its reservation when it lapses.
+fn renew_shared_hold(ctx: &SettleContext) {
+    let (Some(hold), Some(authority)) = (ctx.shared.as_ref(), ctx.state.shared.as_ref()) else {
+        return;
+    };
+    let authority = Arc::clone(authority);
+    let id = hold.id;
+    let ttl = ctx.state.config.reservation_ttl_secs;
+    tokio::task::spawn_blocking(move || {
+        let _ = authority.renew(id, ttl);
+    });
+}
+
+/// Hands the raw facts of a finished request to the shared authority,
+/// which prices them. A buffered (non-streaming) body that arrived whole
+/// counts as complete. An authority error leaves the hold active.
+async fn settle_shared_hold(
+    state: &Arc<GatewayState>,
+    hold: SharedHold,
+    observed: Option<crate::usage::ObservedUsage>,
+    accumulator: &UsageAccumulator,
+    whole_body_arrived: bool,
+) {
+    let Some(authority) = state.shared.as_ref().map(Arc::clone) else {
+        return;
+    };
+    let completed_cleanly =
+        accumulator.completed_cleanly() || (whole_body_arrived && observed.is_some());
+    let saw_message_start =
+        accumulator.saw_message_start() || (whole_body_arrived && observed.is_some());
+    let settled = tokio::task::spawn_blocking(move || {
+        authority.settle(SharedSettlement {
+            hold: &hold,
+            observed,
+            completed_cleanly,
+            saw_message_start,
+        })
+    })
+    .await;
+    if let Ok(Ok(settled)) = settled {
+        if settled.flags.truncated_settle {
+            state.stats.record_truncated_settle();
+        }
+        if settled.flags.input_bound_violated {
+            state.stats.record_input_bound_violation();
+        }
+    }
 }

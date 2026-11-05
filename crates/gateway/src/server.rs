@@ -26,7 +26,7 @@ use hyper::header::HeaderName;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ServerBuilder;
 
-use crate::authority::SpendAuthority;
+use crate::authority::{SharedBudgetAuthority, SpendAuthority};
 use crate::config::{GatewayCredentialMode, ValidatedGatewayConfig};
 use crate::credential::{CredentialError, CredentialStore, LocalCapabilityToken};
 use crate::proxy::{self, GatewayState, RequestRecorder, DEFAULT_SESSION_HEADER};
@@ -55,6 +55,9 @@ pub struct GatewayRuntimeConfig {
     pub authority: Arc<dyn SpendAuthority>,
     pub recorder: Arc<dyn RequestRecorder>,
     pub stats: Arc<GatewayStats>,
+    /// The shared monthly budget, when the daemon offers one. `None` keeps
+    /// the gateway a pure task-budget gateway.
+    pub shared: Option<Arc<dyn SharedBudgetAuthority>>,
     /// Header naming the agent session a request belongs to. Configurable
     /// because the header a harness emits is a property of that harness,
     /// not of this protocol — see the known limitation documented in
@@ -74,8 +77,14 @@ impl GatewayRuntimeConfig {
             authority,
             recorder,
             stats,
+            shared: None,
             session_header: DEFAULT_SESSION_HEADER.to_string(),
         }
+    }
+
+    pub fn with_shared_budget(mut self, shared: Arc<dyn SharedBudgetAuthority>) -> Self {
+        self.shared = Some(shared);
+        self
     }
 }
 
@@ -125,6 +134,7 @@ pub fn build_state(runtime: &GatewayRuntimeConfig) -> Result<GatewayState, Gatew
     Ok(GatewayState {
         config: Arc::new(runtime.config.clone()),
         authority: Arc::clone(&runtime.authority),
+        shared: runtime.shared.clone(),
         recorder: Arc::clone(&runtime.recorder),
         stats: Arc::clone(&runtime.stats),
         token,
