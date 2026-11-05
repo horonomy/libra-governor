@@ -48,6 +48,41 @@ fn reserved(gw: &TestGateway) -> ResourceAmount {
         .expect("a reservation was taken")
 }
 
+/// One streaming `/v1/messages` request to the test gateway: the response
+/// and the pieces that keep its connection alive.
+struct OpenStream {
+    status: hyper::StatusCode,
+    body: hyper::body::Incoming,
+    sender: hyper::client::conn::http1::SendRequest<http_body_util::Full<bytes::Bytes>>,
+    conn_task: tokio::task::JoinHandle<Result<(), hyper::Error>>,
+}
+
+async fn open_stream(addr: std::net::SocketAddr, token: String, scenario: String) -> OpenStream {
+    let body = messages_body("claude-sonnet-4-5", Some(1_000), true);
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (mut sender, conn) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+            .await
+            .unwrap();
+    let conn_task = tokio::spawn(conn);
+    let request = hyper::Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("host", addr.to_string())
+        .header("x-api-key", token)
+        .header(SESSION, "sess-1")
+        .header(SCENARIO_HEADER, scenario)
+        .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+        .unwrap();
+    let response = sender.send_request(request).await.unwrap();
+    OpenStream {
+        status: response.status(),
+        body: response.into_body(),
+        sender,
+        conn_task,
+    }
+}
+
 /// Sends a request, reads response headers plus `frames` body frames, then
 /// drops the connection without reading further. This is a client hang-up
 /// (Claude Code's ESC), as distinct from `send`, which reads to the end.
@@ -57,35 +92,16 @@ fn request_then_hang_up(
     scenario: &str,
     frames: usize,
 ) {
-    let addr = gw.addr;
-    let token = gw.token.clone();
-    let scenario = scenario.to_string();
-    let body = messages_body("claude-sonnet-4-5", Some(1_000), true);
+    let (addr, token, scenario) = (gw.addr, gw.token.clone(), scenario.to_string());
     rt.block_on(async move {
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let (mut sender, conn) =
-            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
-                .await
-                .unwrap();
-        let conn_task = tokio::spawn(conn);
-        let request = hyper::Request::builder()
-            .method("POST")
-            .uri("/v1/messages")
-            .header("host", addr.to_string())
-            .header("x-api-key", token)
-            .header(SESSION, "sess-1")
-            .header(SCENARIO_HEADER, scenario)
-            .body(http_body_util::Full::new(bytes::Bytes::from(body)))
-            .unwrap();
-        let response = sender.send_request(request).await.unwrap();
-        assert_eq!(response.status(), hyper::StatusCode::OK);
-        let mut body = response.into_body();
+        let mut open = open_stream(addr, token, scenario).await;
+        assert_eq!(open.status, hyper::StatusCode::OK);
         for _ in 0..frames {
-            body.frame().await.expect("a frame").expect("frame ok");
+            open.body.frame().await.expect("a frame").expect("frame ok");
         }
-        drop(body);
-        drop(sender);
-        conn_task.abort();
+        drop(open.body);
+        drop(open.sender);
+        open.conn_task.abort();
     });
 }
 
@@ -96,29 +112,10 @@ fn read_until_the_stream_ends_or_fails(
     gw: &TestGateway,
     scenario: &str,
 ) {
-    let addr = gw.addr;
-    let token = gw.token.clone();
-    let scenario = scenario.to_string();
-    let body = messages_body("claude-sonnet-4-5", Some(1_000), true);
+    let (addr, token, scenario) = (gw.addr, gw.token.clone(), scenario.to_string());
     rt.block_on(async move {
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let (mut sender, conn) =
-            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
-                .await
-                .unwrap();
-        tokio::spawn(conn);
-        let request = hyper::Request::builder()
-            .method("POST")
-            .uri("/v1/messages")
-            .header("host", addr.to_string())
-            .header("x-api-key", token)
-            .header(SESSION, "sess-1")
-            .header(SCENARIO_HEADER, scenario)
-            .body(http_body_util::Full::new(bytes::Bytes::from(body)))
-            .unwrap();
-        let response = sender.send_request(request).await.unwrap();
-        let mut body = response.into_body();
-        while let Some(Ok(_)) = body.frame().await {}
+        let mut open = open_stream(addr, token, scenario).await;
+        while let Some(Ok(_)) = open.body.frame().await {}
     });
 }
 
@@ -293,30 +290,11 @@ fn a_stalled_upstream_leaves_the_reservation_open_with_no_settle_release_or_rene
 /// Sends a request, reads headers and the first frame, and returns with the
 /// connection still open (held by a detached task for the test's lifetime).
 fn request_then_stay_connected(rt: &tokio::runtime::Runtime, gw: &TestGateway, scenario: &str) {
-    let addr = gw.addr;
-    let token = gw.token.clone();
-    let scenario = scenario.to_string();
-    let body = messages_body("claude-sonnet-4-5", Some(1_000), true);
+    let (addr, token, scenario) = (gw.addr, gw.token.clone(), scenario.to_string());
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     rt.spawn(async move {
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let (mut sender, conn) =
-            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
-                .await
-                .unwrap();
-        tokio::spawn(conn);
-        let request = hyper::Request::builder()
-            .method("POST")
-            .uri("/v1/messages")
-            .header("host", addr.to_string())
-            .header("x-api-key", token)
-            .header(SESSION, "sess-1")
-            .header(SCENARIO_HEADER, scenario)
-            .body(http_body_util::Full::new(bytes::Bytes::from(body)))
-            .unwrap();
-        let response = sender.send_request(request).await.unwrap();
-        let mut body = response.into_body();
-        body.frame().await.expect("a frame").expect("frame ok");
+        let mut open = open_stream(addr, token, scenario).await;
+        open.body.frame().await.expect("a frame").expect("frame ok");
         ready_tx.send(()).unwrap();
         tokio::time::sleep(Duration::from_secs(60)).await;
     });
