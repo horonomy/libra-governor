@@ -2021,6 +2021,39 @@ impl LedgerStore {
         attribution: ExecutorAttribution<'_>,
         watermark: Option<&SettleWatermark>,
     ) -> Result<SharedPoolSettleOutcome, LedgerError> {
+        self.settle_shared_core(id, actual, actual.is_some(), now, attribution, watermark)
+    }
+
+    /// [`Self::settle_shared`] with the amount and its `usage_known` mark
+    /// both explicit: a gateway request cut off mid-stream books a
+    /// conservative estimate that is neither the provider's figure nor the
+    /// whole reservation. Same idempotency and late-settle rules.
+    pub fn settle_shared_marked(
+        &mut self,
+        id: SharedPoolReservationId,
+        amount: u64,
+        usage_known: bool,
+        now: OffsetDateTime,
+    ) -> Result<SharedPoolSettleOutcome, LedgerError> {
+        self.settle_shared_core(
+            id,
+            Some(amount),
+            usage_known,
+            now,
+            ExecutorAttribution::default(),
+            None,
+        )
+    }
+
+    fn settle_shared_core(
+        &mut self,
+        id: SharedPoolReservationId,
+        actual: Option<u64>,
+        usage_known: bool,
+        now: OffsetDateTime,
+        attribution: ExecutorAttribution<'_>,
+        watermark: Option<&SettleWatermark>,
+    ) -> Result<SharedPoolSettleOutcome, LedgerError> {
         let (watermark_text, ids_text) = watermark_columns(watermark)?;
         let supplied = attribution.resolve()?;
         let tx = begin(&mut self.conn, TransactionBehavior::Immediate)?;
@@ -2040,7 +2073,6 @@ impl LedgerStore {
 
         let settled_value = actual.unwrap_or(reservation.amount);
         let settled_value_i64 = checked_i64(settled_value)?;
-        let usage_known = actual.is_some();
 
         let expected_prior_state = if late_after_expiry {
             "expired"
@@ -2912,6 +2944,49 @@ mod tests {
             SharedPoolReleaseOutcome::AlreadyFinal(_) => {}
             other => panic!("expected AlreadyFinal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn settle_marked_records_the_given_amount_and_mark_and_is_idempotent() {
+        let mut store = LedgerStore::open_in_memory().unwrap();
+        store
+            .ensure_pool(&pool_id(), &QuotaUnit::Tokens, 10, now())
+            .unwrap();
+        let SharedPoolReserveOutcome::Granted(reservation) = reserve(&mut store, "s1", 7, "k1")
+        else {
+            panic!("expected Granted");
+        };
+        let SharedPoolSettleOutcome::Settled {
+            reservation: row, ..
+        } = store
+            .settle_shared_marked(reservation.id, 4, false, now())
+            .unwrap()
+        else {
+            panic!("expected Settled");
+        };
+        assert_eq!(
+            (row.settled_amount, row.usage_known),
+            (Some(4), Some(false))
+        );
+        assert!(matches!(
+            store
+                .settle_shared_marked(reservation.id, 9, true, now())
+                .unwrap(),
+            SharedPoolSettleOutcome::AlreadyFinal(r) if r.settled_amount == Some(4)
+        ));
+        let known = reserve(&mut store, "s2", 1, "k2");
+        let SharedPoolReserveOutcome::Granted(known) = known else {
+            panic!("expected Granted");
+        };
+        let SharedPoolSettleOutcome::Settled {
+            reservation: row, ..
+        } = store
+            .settle_shared_marked(known.id, 1, true, now())
+            .unwrap()
+        else {
+            panic!("expected Settled");
+        };
+        assert_eq!(row.usage_known, Some(true));
     }
 
     #[test]
