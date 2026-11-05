@@ -25,6 +25,7 @@
 //! own — the `BEGIN IMMEDIATE` transaction inside `LedgerStore::reserve`
 //! is.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::shared_budget::{
@@ -380,6 +381,13 @@ pub struct LedgerSharedAuthority {
     /// only hard when it does; a pass-through gateway cannot honour
     /// `enforcement = gateway`.
     governor_held: bool,
+    /// Set once the file has been seen asking for `enforcement = gateway`
+    /// (including at daemon start). From then on an unreadable file refuses
+    /// instead of leaving the gateway uncapped: a bad write must not lift a
+    /// cap that was in force. Absent (the operator removed the budget) and
+    /// `enforcement = hooks` (the operator chose another mode) still stand
+    /// the gateway down.
+    gateway_enforced_seen: AtomicBool,
 }
 
 impl LedgerSharedAuthority {
@@ -389,11 +397,16 @@ impl LedgerSharedAuthority {
         boot_id: String,
         governor_held: bool,
     ) -> Self {
+        let started_enforced = matches!(
+            &runtime.loaded().state,
+            SharedBudgetFileState::Valid(cfg) if cfg.enforcement == Enforcement::Gateway
+        );
         Self {
             ledger,
             runtime,
             boot_id,
             governor_held,
+            gateway_enforced_seen: AtomicBool::new(started_enforced),
         }
     }
 
@@ -401,6 +414,10 @@ impl LedgerSharedAuthority {
         self.ledger
             .lock()
             .map_err(|_| AuthorityError("gateway ledger mutex was poisoned".to_string()))
+    }
+
+    fn gateway_enforced_seen(&self) -> bool {
+        self.gateway_enforced_seen.load(Ordering::Relaxed)
     }
 }
 
@@ -412,18 +429,21 @@ impl SharedBudgetAuthority for LedgerSharedAuthority {
     fn mode(&self) -> SharedMode {
         match self.runtime.effective().state {
             SharedBudgetFileState::Valid(cfg) if cfg.enforcement == Enforcement::Gateway => {
+                self.gateway_enforced_seen.store(true, Ordering::Relaxed);
                 if self.governor_held {
                     SharedMode::Enforce
                 } else {
                     SharedMode::Unavailable
                 }
             }
-            // No file, `enforcement = hooks`, or a file that cannot be read:
-            // the gateway behaves as it did before the shared budget. An
-            // invalid file is deliberately NOT a refusal here (design 3.2
-            // would fail closed); the hook path still denies it, and
-            // changing the gateway's behaviour for existing governor_held
-            // deployments is a separate decision.
+            // Fail closed once a cap was in force: the gateway would
+            // otherwise forward uncapped on a truncated or mistyped write.
+            // A file that was never gateway-enforced keeps the gateway as it
+            // was, so existing governor_held deployments are unchanged (the
+            // hook path still denies such a file).
+            SharedBudgetFileState::Invalid(_) if self.gateway_enforced_seen() => {
+                SharedMode::Unavailable
+            }
             SharedBudgetFileState::Absent
             | SharedBudgetFileState::Invalid(_)
             | SharedBudgetFileState::Valid(_) => SharedMode::NotConsulted,
@@ -458,8 +478,14 @@ impl SharedBudgetAuthority for LedgerSharedAuthority {
                 max_tokens: hold.max_tokens,
             }),
             GatewayReserveOutcome::Refused(refusal) => match refusal {
+                // `mode()` said Enforce a moment ago, so the file changed under
+                // this request. Once a cap was in force, refuse this one.
                 GatewayRefusal::NotConfigured | GatewayRefusal::NotGatewayEnforced => {
-                    SharedDecision::NotConsulted
+                    if self.gateway_enforced_seen() {
+                        SharedDecision::Denied(SharedDenial::Unavailable)
+                    } else {
+                        SharedDecision::NotConsulted
+                    }
                 }
                 GatewayRefusal::CapExhausted {
                     remaining_usd_cents,
