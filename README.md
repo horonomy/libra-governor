@@ -260,8 +260,14 @@ When enrolled:
 - Codex hooks run only after you trust them in Codex's `/hooks`. Untrusted
   hooks are skipped silently and leave an enrolled install ungated; `doctor`
   can report trust as "likely not yet trusted" or "unknown", never "trusted".
-- With no `gpt-*` price in `pricing_overrides`, every Codex turn books the flat
-  hold, unmeasured, and is never trued up.
+- Codex turns are priced from the pinned OpenAI list prices (standard tier,
+  short context; `pricing-2026-11-static-v3`) for gpt-6.1-sol, gpt-6.1-terra, gpt-6-sol, gpt-6-astra, gpt-6-luna and gpt-5.3-codex; a
+  `pricing_overrides` entry takes precedence. Any other Codex model (for
+  example `gpt-5.6-*`, whose list price is promotional until 2026-11-30, or a
+  variant id such as `gpt-6.1-sol-pro`) is unpriced: its turns book the flat
+  hold, unmeasured, and are never trued up. OpenAI bills prompts above 272K
+  input tokens at a higher rate that the table cannot express, so such turns
+  are under-counted.
 - A turn Codex interrupts or aborts writes no usage record, so that spend is
   under-counted. A turn longer than the one-hour hold is settled late on
   partial usage.

@@ -24,7 +24,7 @@ What is new in v0.0.5:
 
 Codex limits (apply only if you opt in):
 - **Codex hooks run only after you trust them** in Codex's `/hooks`. Untrusted hooks are skipped silently and leave an enrolled install ungated; `doctor` can only say trust is "likely not yet trusted" or "unknown", never "trusted".
-- **No `gpt-*` price, no measurement.** Without a `gpt-*` price in `pricing_overrides`, every Codex turn books the flat hold (unmeasured) and is never trued up.
+- **Only listed Codex models are priced.** Codex turns are priced from pinned OpenAI list prices (standard tier, short context, `pricing-2026-11-static-v3`) for gpt-6.1-sol, gpt-6.1-terra, gpt-6-sol, gpt-6-astra, gpt-6-luna and gpt-5.3-codex; a `pricing_overrides` entry takes precedence. Any other model (including `gpt-5.6-*`) books the flat hold (unmeasured) and is never trued up, and prompts above 272K input tokens are under-counted.
 - **Interrupted turns are under-counted.** A Codex turn that is interrupted or aborted writes no usage record, so that spend is not visible. A turn longer than the one-hour hold is settled late on partial usage.
 - **Codex subagents are neither admitted nor settled.** There is no mid-turn hold renewal for Codex.
 - **Mostly source-derived.** Codex behavior was derived from reading Codex source at tags 0.160, 0.163, 0.164 and 0.165 and from synthetic fixtures. It was then run against one real Codex host (codex-cli 0.163.0, a few trivial turns in an isolated QA home): trusted hooks fire, a turn is admitted and settled from measured rollout usage, the block decision is honoured, untrusted hooks are skipped silently, and a resumed session is booked once per turn. Interrupt, compact and fork behavior, other Codex versions and provider billing were not run.
