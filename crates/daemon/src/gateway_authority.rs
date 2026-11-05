@@ -382,11 +382,13 @@ pub struct LedgerSharedAuthority {
     /// `enforcement = gateway`.
     governor_held: bool,
     /// Set once the file has been seen asking for `enforcement = gateway`
-    /// (including at daemon start). From then on an unreadable file refuses
-    /// instead of leaving the gateway uncapped: a bad write must not lift a
-    /// cap that was in force. Absent (the operator removed the budget) and
-    /// `enforcement = hooks` (the operator chose another mode) still stand
-    /// the gateway down.
+    /// (including at daemon start). It matters in two places: a reserve that
+    /// finds the file gone or switched under a request `mode()` just admitted
+    /// refuses that request, and a pass-through gateway (which cannot honour
+    /// the mode) refuses on an unreadable file only after it has seen one.
+    /// A `governor_held` gateway does not need it for an unreadable file: it
+    /// always refuses (see `mode`). The flag is per process, so a restart
+    /// starts it from the file as loaded.
     gateway_enforced_seen: AtomicBool,
 }
 
@@ -417,7 +419,7 @@ impl LedgerSharedAuthority {
     }
 
     fn gateway_enforced_seen(&self) -> bool {
-        self.gateway_enforced_seen.load(Ordering::Relaxed)
+        self.gateway_enforced_seen.load(Ordering::SeqCst)
     }
 }
 
@@ -429,19 +431,23 @@ impl SharedBudgetAuthority for LedgerSharedAuthority {
     fn mode(&self) -> SharedMode {
         match self.runtime.effective().state {
             SharedBudgetFileState::Valid(cfg) if cfg.enforcement == Enforcement::Gateway => {
-                self.gateway_enforced_seen.store(true, Ordering::Relaxed);
+                self.gateway_enforced_seen.store(true, Ordering::SeqCst);
                 if self.governor_held {
                     SharedMode::Enforce
                 } else {
                     SharedMode::Unavailable
                 }
             }
-            // Fail closed once a cap was in force: the gateway would
-            // otherwise forward uncapped on a truncated or mistyped write.
-            // A file that was never gateway-enforced keeps the gateway as it
-            // was, so existing governor_held deployments are unchanged (the
-            // hook path still denies such a file).
-            SharedBudgetFileState::Invalid(_) if self.gateway_enforced_seen() => {
+            // An unreadable file refuses a governor_held gateway, always: the
+            // hook path already denies it (`config_invalid`), and forwarding
+            // uncapped on a truncated write, a bad edit or a restart over a
+            // broken file would lift a cap the operator asked for. A
+            // pass-through gateway refuses only once it has seen the file
+            // ask for gateway enforcement. Absent (the operator removed the
+            // budget) and `enforcement = hooks` stand the gateway down.
+            SharedBudgetFileState::Invalid(_)
+                if self.governor_held || self.gateway_enforced_seen() =>
+            {
                 SharedMode::Unavailable
             }
             SharedBudgetFileState::Absent
