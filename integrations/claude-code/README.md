@@ -735,7 +735,7 @@ Every reason text says "Libra-accounted USD, admission-bounded".
 `shared-budget.json` and a running `governor_held` gateway, the gateway reserves
 every request and is the only writer of spend. The hooks then book nothing:
 `UserPromptSubmit` reserves no hold (it still refuses with `cap_exhausted` when
-less than one turn hold remains), `Stop`, `SubagentStop`, `SessionEnd` and the
+less than one turn hold remains, or `gateway_unavailable` when no `governor_held` gateway runs), `Stop`, `SubagentStop`, `SessionEnd` and the
 subagent sweep write nothing, and a hold admitted before the flip still settles
 by transcript. A session that stops without any gateway request is counted as
 `unrouted` in `shared-budget status` (detection only: that spend is not

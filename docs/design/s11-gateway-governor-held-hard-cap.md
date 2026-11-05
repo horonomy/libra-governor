@@ -529,16 +529,33 @@ independent. S11a gates **enablement**, not building.
   fields `enforcement`, `gateway_in_flight`, `truncated_settles`, `input_bound_violations`,
   `unrouted_sessions`, `orphans_booked` (all `serde(default)`).
 - Admit in gateway mode is a pure read (no pool creation, no sweep). It denies `cap_exhausted`
-  when remaining is below the turn hold unless the lane still has a live pre-flip hold. Scoped to
-  Claude lanes; Codex keeps hooks semantics.
+  when remaining is below the turn hold unless the lane still has a live pre-flip hold, and
+  `gateway_unavailable` (fail closed, after the file, identity and clock checks) when the daemon
+  runs no `governor_held` gateway; that is judged by the same validation `GatewayStatus` and
+  `doctor` use. Scoped to Claude lanes; Codex keeps hooks semantics.
+- PreToolUse `Check` in gateway mode answers `available` (an invalid file still denies): no hold
+  backs the turn, so the turn-hold test could wedge an admitted turn, and the gateway refuses each
+  request on its own.
 - `ChargeAgentTranscript` (SubagentStop), `SettleTail` (SessionEnd, after settling any pre-flip
   hold), the Stop sweep and the subagent readiness probe book/wait for nothing. `Stop` settles a
-  pre-flip `turn_hold` only. `ChargeAgent` (explicit client amount, sent by no hook) is unchanged.
+  pre-flip `turn_hold` only. `ChargeAgent` (explicit client amount, sent by no hook) is refused
+  with `GatewayMetered` for Claude lanes.
+- **Gateway to hooks flip.** Hook windows start at the lane's persisted watermark, which gateway
+  turns would not move, so a flip back would book spend the gateway already booked. In gateway
+  mode, for a session that has a gateway row in the pool, `Stop`/`SessionEnd` therefore write a
+  zero-amount settled `gateway-mark:` row carrying the watermark (now), and `SubagentStop`/the
+  sweep write a zero-amount `g<N>` row under the subagent family key recording the file cost the
+  gateway metered, which the hooks-mode cumulative delta adds to what it treats as already
+  charged. Neither row changes used or reserved cents. Unrouted sessions get neither (their spend
+  was never counted, so hooks count it after a flip). A retention prune of a past month drops that
+  month's offset rows; the flip-back window of such a month is not protected.
 - `unrouted_sessions` counts distinct sessions (opaque ids, bounded) whose Stop found no gateway
   row in the current pool. The ledger gained two read-only queries for it and `gateway_in_flight`.
 - `doctor` Errors when the mode has no running `governor_held` gateway (queried by
   `GatewayStatus`, never spawning) or no `ANTHROPIC_BASE_URL` key in settings `env` (presence only).
-  The warning for a mode flip with live holds (§3.4) is not implemented.
+  The route check requires a loopback `ANTHROPIC_BASE_URL` (booleans only; the value is never
+  read into output) and says only the user `~/.claude/settings.json` is inspected. The warning for
+  a mode flip with live holds (§3.4) is still not implemented.
 - In gateway mode PreToolUse `Check` still reports `exhausted` when remaining < turn hold, so tool
   calls can be denied mid-turn once gateway reservations shrink remaining; this is stricter than
   hooks mode.
