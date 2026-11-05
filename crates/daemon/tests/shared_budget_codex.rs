@@ -383,6 +383,70 @@ fn default_without_gpt_overrides_books_the_flat_hold_unmeasured_and_names_the_mo
     assert_eq!(st.unmeasured_settlements, 1);
 }
 
+/// C9: fresh 1,000,000, cache-write 500,000, cache-read 1,000,000, output
+/// 200,001 (reasoning 50,000 is inside the output). At the pinned
+/// `gpt-6.1-sol` list price (2.00 in / 2.00 cache-write / 0.10 cached / 10.00
+/// out per Mtok) that is 5,100,010 micro-dollars = 510.001 cents -> 511.
+const TURN_PINNED: [i64; 5] = [2_500_000, 1_000_000, 500_000, 200_001, 50_000];
+const PINNED_CENTS: u64 = 511;
+/// The same turn at an override twice the pinned price: 10,200,020
+/// micro-dollars = 1020.002 cents -> 1021.
+const OVERRIDDEN_CENTS: u64 = 1021;
+
+fn gpt_6_1_sol_override() -> String {
+    r#","pricing_overrides":{"gpt-6.1-sol":{"input_usd_per_mtok":4.0,
+    "cache_creation_input_usd_per_mtok":4.0,"cache_read_input_usd_per_mtok":0.2,
+    "output_usd_per_mtok":20.0}}"#
+        .to_string()
+}
+
+#[test]
+fn a_pinned_gpt_model_with_no_override_books_the_pinned_price_measured() {
+    let mut fx = fx_with_hold(HOLD, false, true);
+    fx.admit("turn-a");
+    let path = fx.rollout("r.jsonl", &turn_lines("turn-a", TURN_PINNED));
+    let out = fx.settle("turn-a", Some("gpt-6.1-sol"), Some(&path));
+    assert_eq!(settled(&out), (PINNED_CENTS, true, None));
+    assert_eq!(fx.holds()[0].settled_amount, Some(PINNED_CENTS));
+    let st = status(fx.ledger.as_ref().unwrap(), &fx.rt).unwrap();
+    assert!(st.unpriced_models.is_empty(), "{:?}", st.unpriced_models);
+}
+
+#[test]
+fn a_dated_snapshot_of_a_pinned_gpt_model_books_the_pinned_price() {
+    let mut fx = fx_with_hold(HOLD, false, true);
+    fx.admit("turn-a");
+    let path = fx.rollout("r.jsonl", &turn_lines("turn-a", TURN_PINNED));
+    let out = fx.settle("turn-a", Some("gpt-6.1-sol-20261024"), Some(&path));
+    assert_eq!(settled(&out), (PINNED_CENTS, true, None));
+}
+
+#[test]
+fn a_gpt_override_beats_the_pinned_price_through_the_settle_path() {
+    let base = cfg_json(HOLD, false);
+    let config = format!(
+        "{}{}}}",
+        base.strip_suffix('}').expect("a JSON object"),
+        gpt_6_1_sol_override()
+    );
+    let mut fx = Fx::new(&config, true);
+    fx.admit("turn-a");
+    let path = fx.rollout("r.jsonl", &turn_lines("turn-a", TURN_PINNED));
+    let out = fx.settle("turn-a", Some("gpt-6.1-sol"), Some(&path));
+    assert_eq!(settled(&out), (OVERRIDDEN_CENTS, true, None));
+}
+
+#[test]
+fn a_gpt_variant_that_is_not_pinned_books_the_flat_hold_unmeasured() {
+    let mut fx = fx_with_hold(HOLD, false, true);
+    fx.admit("turn-a");
+    let path = fx.rollout("r.jsonl", &turn_lines("turn-a", TURN_PINNED));
+    let out = fx.settle("turn-a", Some("gpt-6.1-sol-pro"), Some(&path));
+    assert_eq!(settled(&out), (HOLD, false, Some("unpriced_model")));
+    let st = status(fx.ledger.as_ref().unwrap(), &fx.rt).unwrap();
+    assert_eq!(st.unpriced_models, vec!["gpt-6.1-sol-pro".to_string()]);
+}
+
 #[test]
 fn an_absent_model_books_the_flat_hold_unmeasured() {
     let mut fx = fx();
