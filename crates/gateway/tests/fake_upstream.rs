@@ -298,6 +298,8 @@ async fn serve_one(
                 r#"{"type":"error","error":{"type":"api_error","message":"upstream exploded"}}"#,
             ))
             .unwrap(),
+        // Closes the connection without answering: the call "never happened".
+        "drop_connection" => return Err(std::io::Error::other("injected connection drop")),
         "overloaded_529" => Response::builder()
             .status(StatusCode::from_u16(529).unwrap())
             .header("content-type", "application/json")
@@ -770,6 +772,27 @@ pub fn governor_held_fake_credential() -> libra_governor_gateway::config::Gatewa
     }
 }
 
+/// A gateway configuration pointed at the fake upstream on `upstream_port`.
+pub fn harness_gateway_config(
+    addr: SocketAddr,
+    token_path: std::path::PathBuf,
+    upstream_port: u16,
+    credential_mode: libra_governor_gateway::config::GatewayCredentialMode,
+    max_request_bytes: usize,
+) -> libra_governor_gateway::config::GatewayConfig {
+    // The plaintext-loopback opt-in, which exists precisely so this
+    // harness can exist. See ADR 0003's "Deviations": the loopback host
+    // literal check, not this flag, is the safeguard.
+    let mut raw =
+        libra_governor_gateway::config::GatewayConfig::new(addr, token_path, credential_mode);
+    raw.upstream = format!("http://127.0.0.1:{upstream_port}");
+    raw.upstream_host_allowlist = vec!["127.0.0.1".to_string()];
+    raw.allow_plaintext_loopback_upstream = true;
+    raw.allow_nonstandard_port = true;
+    raw.max_request_bytes = max_request_bytes;
+    raw
+}
+
 /// A real gateway running in front of a fake upstream, with whatever
 /// authorities the caller supplied. Dropping it stops the gateway.
 pub struct RunningGateway {
@@ -810,19 +833,13 @@ pub fn start_gateway_for(
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
 
-    // The plaintext-loopback opt-in, which exists precisely so this
-    // harness can exist. See ADR 0003's "Deviations": the loopback host
-    // literal check, not this flag, is the safeguard.
-    let mut raw = libra_governor_gateway::config::GatewayConfig::new(
+    let raw = harness_gateway_config(
         addr,
         token_path.clone(),
+        upstream.addr.port(),
         shape.credential_mode,
+        shape.max_request_bytes,
     );
-    raw.upstream = format!("http://127.0.0.1:{}", upstream.addr.port());
-    raw.upstream_host_allowlist = vec!["127.0.0.1".to_string()];
-    raw.allow_plaintext_loopback_upstream = true;
-    raw.allow_nonstandard_port = true;
-    raw.max_request_bytes = shape.max_request_bytes;
 
     let validated = libra_governor_gateway::config::validate(raw, shape.resource_kind)
         .expect("the harness configuration must validate");

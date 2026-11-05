@@ -65,6 +65,7 @@ fn body() -> Vec<u8> {
 }
 
 struct SharedRow {
+    key: String,
     state: String,
     amount: u64,
     settled: Option<u64>,
@@ -127,6 +128,15 @@ impl Fx {
             rt,
             tokio,
         }
+    }
+
+    /// Replaces the shared-budget file, as an operator (or a bad write) would.
+    fn write_file(&self, contents: &str) {
+        std::fs::write(self.dir.path().join(SHARED_BUDGET_FILE_NAME), contents).unwrap();
+    }
+
+    fn remove_file(&self) {
+        std::fs::remove_file(self.dir.path().join(SHARED_BUDGET_FILE_NAME)).unwrap();
     }
 
     fn ledger_path(&self) -> PathBuf {
@@ -198,7 +208,7 @@ impl Fx {
         .unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT state, amount, settled_amount, usage_known
+                "SELECT state, amount, settled_amount, usage_known, idempotency_key
                  FROM shared_pool_reservations ORDER BY created_at, id",
             )
             .unwrap();
@@ -208,6 +218,7 @@ impl Fx {
                 amount: r.get(1)?,
                 settled: r.get(2)?,
                 usage_known: r.get(3)?,
+                key: r.get(4)?,
             })
         })
         .unwrap()
@@ -547,5 +558,151 @@ fn a_pass_through_gateway_cannot_honour_enforcement_gateway_and_refuses() {
     assert!(
         fx.task_states("s1").is_empty(),
         "no task reservation either"
+    );
+}
+
+// ---- an unreadable file never silently lifts a cap that was in force ----
+
+const CORRUPT: &str = "{ truncated";
+
+fn assert_refused_unavailable(fx: &Fx, gw: &RunningGateway, upstream_calls: usize) {
+    let response = fx.post(gw, Some("s1"), "sse");
+    assert_eq!(response.status, StatusCode::FORBIDDEN);
+    assert_eq!(response.decision(), Some("shared_budget_unavailable"));
+    assert_eq!(
+        fx.upstream.received().len(),
+        upstream_calls,
+        "a refused request reached the provider"
+    );
+}
+
+#[test]
+fn a_file_corrupted_while_gateway_enforcement_is_in_force_refuses_until_restored() {
+    let fx = Fx::new(Some(file("gateway", 5_000)), &["s1"]);
+    let gw = fx.held_gateway("boot1");
+    assert_eq!(fx.post(&gw, Some("s1"), "sse").status, StatusCode::OK);
+    assert_eq!(fx.upstream.received().len(), 1);
+
+    fx.write_file(CORRUPT);
+    assert_refused_unavailable(&fx, &gw, 1);
+    assert_eq!(fx.shared_rows().len(), 1, "the refusal booked nothing");
+
+    fx.write_file(&file("gateway", 5_000));
+    assert_eq!(fx.post(&gw, Some("s1"), "sse").status, StatusCode::OK);
+    assert_eq!(fx.shared_rows().len(), 2, "enforcement resumed");
+}
+
+#[test]
+fn a_file_corrupted_before_any_request_still_refuses_when_it_started_gateway_enforced() {
+    let fx = Fx::new(Some(file("gateway", 5_000)), &["s1"]);
+    let gw = fx.held_gateway("boot1");
+    fx.write_file(CORRUPT);
+    assert_refused_unavailable(&fx, &gw, 0);
+}
+
+#[test]
+fn an_unreadable_file_that_was_never_gateway_enforced_leaves_the_gateway_as_it_was() {
+    let fx = Fx::new(Some(CORRUPT.to_string()), &["s1"]);
+    let gw = fx.held_gateway("boot1");
+    assert_eq!(fx.post(&gw, Some("s1"), "sse").status, StatusCode::OK);
+    assert!(fx.shared_rows().is_empty());
+
+    // Nor does a hooks-mode file that later breaks.
+    fx.write_file(&file("hooks", 5_000));
+    assert_eq!(fx.post(&gw, Some("s1"), "sse").status, StatusCode::OK);
+    fx.write_file(CORRUPT);
+    assert_eq!(fx.post(&gw, Some("s1"), "sse").status, StatusCode::OK);
+    assert!(fx.shared_rows().is_empty());
+}
+
+#[test]
+fn removing_the_file_removes_the_cap() {
+    let fx = Fx::new(Some(file("gateway", 5_000)), &["s1"]);
+    let gw = fx.held_gateway("boot1");
+    assert_eq!(fx.post(&gw, Some("s1"), "sse").status, StatusCode::OK);
+    fx.remove_file();
+    assert_eq!(fx.post(&gw, Some("s1"), "sse").status, StatusCode::OK);
+    assert_eq!(fx.shared_rows().len(), 1, "no new row without a file");
+}
+
+// ---- the daemon's start sequence ----
+
+#[test]
+fn daemon_start_books_the_previous_boots_hold_before_the_gateway_takes_requests() {
+    let cap = 5_000;
+    let fx = Fx::new(Some(file("gateway", cap)), &["s1"]);
+    // A hold left by a process that died.
+    let key = libra_governor_daemon::shared_budget::gateway_key("deadboot", "r1").unwrap();
+    libra_governor_daemon::shared_budget::gateway_reserve(
+        &mut fx.ledger.lock().unwrap(),
+        &fx.rt,
+        &libra_governor_daemon::shared_budget::GatewayReserveRequest {
+            session_id: "s1",
+            model: "test-model",
+            body_bytes: 100,
+            max_tokens: Some(8000),
+            image_count: 0,
+            key: &key,
+            ttl_secs: 600,
+        },
+    )
+    .unwrap();
+    assert_eq!(fx.shared_rows()[0].state, "active");
+
+    let addr = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let token_path = fx.dir.path().join("gateway.token");
+    let mut config = common::daemon_config(fx.dir.path(), common::generous_policy(), fx.rt.clone());
+    config.gateway = Some(harness_gateway_config(
+        addr,
+        token_path.clone(),
+        fx.upstream.addr.port(),
+        governor_held_fake_credential(),
+        libra_governor_gateway::config::DEFAULT_MAX_REQUEST_BYTES,
+    ));
+    let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
+
+    let started = libra_governor_daemon::begin_gateway(&mut ledger, &config);
+
+    // Booked by the time the start returns, i.e. before any request.
+    let rows = fx.shared_rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        (rows[0].state.as_str(), rows[0].settled, rows[0].usage_known),
+        ("settled", Some(rows[0].amount), Some(false))
+    );
+    assert_eq!(started.boot_id.len(), 32);
+    assert!(started.boot_id.chars().all(|c| c.is_ascii_hexdigit()));
+    assert!(started.handle.is_some(), "the gateway started");
+
+    // The running gateway keys its holds with that same boot id.
+    let token =
+        libra_governor_gateway::credential::LocalCapabilityToken::load_or_create(&token_path)
+            .unwrap()
+            .expose_for_agent()
+            .to_string();
+    wait_until(
+        || {
+            let headers = [
+                ("x-api-key", token.as_str()),
+                (SESSION, "s1"),
+                (SCENARIO_HEADER, "sse"),
+            ];
+            let runtime = &fx.tokio;
+            // The listener may not be up yet; retry until the gateway answers.
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                send(runtime, addr, "POST", "/v1/messages", &headers, &body()).status
+                    == StatusCode::OK
+            }))
+            .unwrap_or(false)
+        },
+        "the started gateway to serve a request",
+    );
+    let prefix = format!("gw:{}:", started.boot_id);
+    assert!(
+        fx.shared_rows().iter().any(|r| r.key.starts_with(&prefix)),
+        "the new hold is keyed with the daemon's boot id"
     );
 }
