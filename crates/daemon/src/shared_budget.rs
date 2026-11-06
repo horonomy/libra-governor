@@ -4029,6 +4029,8 @@ pub struct GatewayReserveRequest<'a> {
     pub body_bytes: usize,
     pub max_tokens: Option<u64>,
     pub image_count: usize,
+    /// The body asks for anything but standard speed (fast mode is 2x).
+    pub fast_requested: bool,
     /// `gw:<boot_id>:<request_id>`, built by [`gateway_key`].
     pub key: &'a str,
     pub ttl_secs: u64,
@@ -4139,6 +4141,7 @@ pub fn gateway_reserve(
         input_bound_tokens,
         req.max_tokens,
         req.model,
+        req.fast_requested,
         &cfg.pricing_overrides.table(),
     ) {
         Ok(ResourceAmount::UsdCents(cents)) => u64::try_from(cents)

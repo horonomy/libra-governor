@@ -164,6 +164,7 @@ fn request(key: &str) -> GatewayReserveRequest<'_> {
         body_bytes: 0,
         max_tokens: Some(10),
         image_count: 0,
+        fast_requested: false,
         key,
         ttl_secs: 600,
     }
@@ -189,6 +190,7 @@ fn usage(input: u64, cache_read: u64, output: u64) -> ObservedUsage {
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: cache_read,
         output_tokens: output,
+        ..Default::default()
     }
 }
 

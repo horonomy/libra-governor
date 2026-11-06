@@ -470,6 +470,7 @@ impl SharedBudgetAuthority for LedgerSharedAuthority {
                 body_bytes: req.body_bytes,
                 max_tokens: req.max_tokens,
                 image_count: req.image_count,
+                fast_requested: req.fast_requested,
                 key: &key,
                 ttl_secs: req.ttl_secs,
             },

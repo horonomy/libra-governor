@@ -575,6 +575,7 @@ pub enum SharedCall {
         body_bytes: usize,
         max_tokens: Option<u64>,
         image_count: usize,
+        fast_requested: bool,
         request_id: String,
     },
     Settle {
@@ -657,6 +658,7 @@ impl SharedBudgetAuthority for StubSharedAuthority {
             body_bytes: req.body_bytes,
             max_tokens: req.max_tokens,
             image_count: req.image_count,
+            fast_requested: req.fast_requested,
             request_id: req.request_id.to_string(),
         });
         match self.script.lock().unwrap().clone() {

@@ -271,9 +271,10 @@ fn rec(
         String::new()
     };
     format!(
-        r#"{{"type":"assistant","timestamp":"{}",{session}{side}"message":{{"id":"{id}","model":"{model}","usage":{{"input_tokens":{},"cache_creation_input_tokens":{},"cache_read_input_tokens":{},"output_tokens":{}}}}}}}"#,
+        r#"{{"type":"assistant","timestamp":"{}",{session}{side}"message":{{"id":"{id}","model":"{model}","usage":{{"input_tokens":{},"cache_creation_input_tokens":{},"cache_creation":{{"ephemeral_5m_input_tokens":{},"ephemeral_1h_input_tokens":0}},"cache_read_input_tokens":{},"output_tokens":{}}}}}}}"#,
         at(secs).format(&Rfc3339).unwrap(),
         tiers[0],
+        tiers[1],
         tiers[1],
         tiers[2],
         tiers[3],

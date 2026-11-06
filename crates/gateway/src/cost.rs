@@ -31,7 +31,7 @@
 
 use libra_governor_domain::{ResourceAmount, ResourceKind};
 
-use crate::pricing::{ModelPricing, PricingTable};
+use crate::pricing::{PricingTable, RequestPriceError};
 use crate::usage::ObservedUsage;
 
 /// A deliberately low bytes-per-token figure. Real English prose runs
@@ -66,6 +66,12 @@ pub enum EnforcementGap {
     /// entry for this model, and the budget is denominated in currency.
     #[error("model {model} has no pinned price, so a USD budget cannot be enforced against it")]
     UnpricedModel { model: String },
+    /// The provider's usage report for this model cannot be priced
+    /// (contradictory cache-write split, fast mode or US geo on a model
+    /// without it, an unrecognised value). Settlement falls back to the
+    /// reservation and records `usage_known = false`.
+    #[error("the usage reported for model {model} cannot be priced")]
+    UnmeasurableUsage { model: String },
     /// The request references input the gateway cannot bound from the
     /// body: a server tool, a url- or file-sourced block, an MCP server
     /// or a container. Only the shared-budget (governor-held) mode
@@ -83,6 +89,11 @@ pub fn input_token_upper_bound(body_bytes: usize) -> u64 {
 /// Converts a USD figure into the integer cents
 /// [`ResourceAmount::UsdCents`] stores, rounding **up** so the conversion
 /// itself can never round a reservation below the real cost.
+/// Pico-dollars to whole cents, rounding up (10^10 pico-dollars per cent).
+fn pico_to_cents_ceil(pico: u128) -> i64 {
+    i64::try_from(pico.div_ceil(10_000_000_000)).unwrap_or(i64::MAX)
+}
+
 fn usd_to_cents_ceil(usd: f64) -> i64 {
     if !usd.is_finite() || usd <= 0.0 {
         return 0;
@@ -100,6 +111,7 @@ pub fn worst_case_reservation(
     body_bytes: usize,
     max_tokens: Option<u64>,
     model: &str,
+    fast_requested: bool,
     pricing: &PricingTable,
 ) -> Result<ResourceAmount, EnforcementGap> {
     let Some(max_tokens) = max_tokens.filter(|m| *m > 0) else {
@@ -111,9 +123,13 @@ pub fn worst_case_reservation(
         ResourceKind::Tokens => Ok(ResourceAmount::Tokens(
             input_upper.saturating_add(max_tokens),
         )),
-        ResourceKind::Usd => {
-            worst_case_usd_reservation(input_upper, Some(max_tokens), model, pricing)
-        }
+        ResourceKind::Usd => worst_case_usd_reservation(
+            input_upper,
+            Some(max_tokens),
+            model,
+            fast_requested,
+            pricing,
+        ),
         ResourceKind::QuotaPercent => Err(EnforcementGap::UnsupportedResourceKind { kind }),
     }
 }
@@ -130,6 +146,7 @@ pub fn worst_case_usd_reservation(
     input_upper: u64,
     max_tokens: Option<u64>,
     model: &str,
+    fast_requested: bool,
     pricing: &PricingTable,
 ) -> Result<ResourceAmount, EnforcementGap> {
     let Some(max_tokens) = max_tokens.filter(|m| *m > 0) else {
@@ -142,6 +159,9 @@ pub fn worst_case_usd_reservation(
     };
     let usd = (input_upper as f64) * model_pricing.worst_case_input_usd_per_mtok() / 1_000_000.0
         + (max_tokens as f64) * model_pricing.output_usd_per_mtok / 1_000_000.0;
+    // Settlement can book the 1.1x US-geo and the 2x fast-mode multipliers; the
+    // reservation must cover them or the hard cap stops being a bound.
+    let usd = usd * pricing.worst_case_multiplier(model, fast_requested);
     Ok(ResourceAmount::UsdCents(usd_to_cents_ceil(usd)))
 }
 
@@ -159,31 +179,17 @@ pub fn settled_cost(
 ) -> Result<ResourceAmount, EnforcementGap> {
     match kind {
         ResourceKind::Tokens => Ok(ResourceAmount::Tokens(usage.fresh_tokens())),
-        ResourceKind::Usd => {
-            let Some(model_pricing) = pricing.lookup(model) else {
-                return Err(EnforcementGap::UnpricedModel {
-                    model: model.to_string(),
-                });
-            };
-            Ok(ResourceAmount::UsdCents(usd_to_cents_ceil(exact_usd(
-                usage,
-                &model_pricing,
-            ))))
-        }
+        ResourceKind::Usd => match pricing.request_cost_pico(model, usage) {
+            Ok(pico) => Ok(ResourceAmount::UsdCents(pico_to_cents_ceil(pico))),
+            Err(RequestPriceError::Unpriced) => Err(EnforcementGap::UnpricedModel {
+                model: model.to_string(),
+            }),
+            Err(RequestPriceError::Unmeasurable) => Err(EnforcementGap::UnmeasurableUsage {
+                model: model.to_string(),
+            }),
+        },
         ResourceKind::QuotaPercent => Err(EnforcementGap::UnsupportedResourceKind { kind }),
     }
-}
-
-/// Prices each reported token tier at its own rate. Separated from
-/// [`settled_cost`] so the per-tier arithmetic is directly testable
-/// without constructing a [`ResourceAmount`].
-fn exact_usd(usage: &ObservedUsage, pricing: &ModelPricing) -> f64 {
-    (usage.input_tokens as f64) * pricing.input_usd_per_mtok / 1_000_000.0
-        + (usage.cache_creation_input_tokens as f64) * pricing.cache_creation_input_usd_per_mtok
-            / 1_000_000.0
-        + (usage.cache_read_input_tokens as f64) * pricing.cache_read_input_usd_per_mtok
-            / 1_000_000.0
-        + (usage.output_tokens as f64) * pricing.output_usd_per_mtok / 1_000_000.0
 }
 
 /// `true` when the provider reported more output tokens than the request
@@ -268,6 +274,17 @@ pub fn screen_unbounded_inputs(body: &[u8]) -> Option<EnforcementGap> {
     has_unbounded_source(&value).then_some(EnforcementGap::UnboundedInput {
         what: "a url, file or base64 PDF content source",
     })
+}
+
+/// `true` when the request body asks for anything other than standard speed
+/// (`speed` present and not `"standard"`): the reservation then assumes fast
+/// mode's premium. Structural only; an unparsable body is `false` (envelope
+/// parsing already refuses it).
+pub fn requests_fast_speed(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("speed").cloned())
+        .is_some_and(|speed| !speed.is_null() && speed.as_str() != Some("standard"))
 }
 
 /// A base64 PDF is billed per rendered page, which its byte length does not
@@ -394,6 +411,12 @@ mod tests {
             cache_creation_input_tokens: cache_create,
             cache_read_input_tokens: cache_read,
             output_tokens: output,
+            // Real hosts report the TTL split; these fixtures are 5-minute writes.
+            cache_creation_split: crate::pricing::CacheWriteSplit::Split {
+                five_minute: cache_create,
+                one_hour: 0,
+            },
+            ..Default::default()
         }
     }
 
@@ -404,6 +427,7 @@ mod tests {
             3_000,
             Some(1_000),
             "claude-sonnet-4-5",
+            false,
             &PricingTable::pinned(),
         )
         .unwrap();
@@ -427,6 +451,7 @@ mod tests {
             3_000,
             Some(1_000),
             "claude-sonnet-4-5",
+            false,
             &PricingTable::pinned(),
         )
         .unwrap();
@@ -461,6 +486,7 @@ mod tests {
             300,
             Some(50),
             "an-utterly-unknown-model",
+            false,
             &PricingTable::pinned(),
         )
         .expect("a token-denominated budget must not depend on a price list");
@@ -474,6 +500,7 @@ mod tests {
             300,
             Some(50),
             "an-utterly-unknown-model",
+            false,
             &PricingTable::pinned(),
         )
         .unwrap_err();
@@ -492,6 +519,7 @@ mod tests {
             300,
             Some(50),
             "claude-sonnet-4-5",
+            false,
             &PricingTable::pinned(),
         )
         .unwrap_err();
@@ -511,6 +539,7 @@ mod tests {
                 300,
                 max_tokens,
                 "claude-sonnet-4-5",
+                false,
                 &PricingTable::pinned(),
             )
             .unwrap_err();
@@ -528,11 +557,12 @@ mod tests {
             3_000,
             Some(1_000),
             "claude-sonnet-4-5",
+            false,
             &table,
         )
         .unwrap();
 
-        let expected_usd = 1_000.0 * pricing.cache_creation_input_usd_per_mtok / 1e6
+        let expected_usd = 1_000.0 * pricing.one_hour_cache_creation_usd_per_mtok() / 1e6
             + 1_000.0 * pricing.output_usd_per_mtok / 1e6;
         assert_eq!(
             reserved,
@@ -545,18 +575,24 @@ mod tests {
         let table = PricingTable::pinned();
         let model = "claude-sonnet-4-5";
         let from_body =
-            worst_case_reservation(ResourceKind::Usd, 3_000, Some(1_000), model, &table).unwrap();
-        let from_bound =
-            worst_case_usd_reservation(input_token_upper_bound(3_000), Some(1_000), model, &table)
+            worst_case_reservation(ResourceKind::Usd, 3_000, Some(1_000), model, false, &table)
                 .unwrap();
+        let from_bound = worst_case_usd_reservation(
+            input_token_upper_bound(3_000),
+            Some(1_000),
+            model,
+            false,
+            &table,
+        )
+        .unwrap();
         assert_eq!(from_body, from_bound);
 
         assert_eq!(
-            worst_case_usd_reservation(10, Some(0), model, &table),
+            worst_case_usd_reservation(10, Some(0), model, false, &table),
             Err(EnforcementGap::UnboundedRequest)
         );
         assert!(matches!(
-            worst_case_usd_reservation(10, Some(1), "no-such-model", &table),
+            worst_case_usd_reservation(10, Some(1), "no-such-model", false, &table),
             Err(EnforcementGap::UnpricedModel { .. })
         ));
     }
@@ -571,6 +607,7 @@ mod tests {
             3_000,
             Some(1_000),
             "claude-sonnet-4-5",
+            false,
             &table,
         )
         .unwrap();
@@ -944,5 +981,123 @@ mod tests {
     #[test]
     fn a_body_that_is_not_json_is_left_to_envelope_parsing() {
         assert_eq!(screen_unbounded_inputs(b"not json"), None);
+    }
+}
+
+/// HORO-2443: settlement of what the provider's streamed `usage` reports for
+/// the 1-hour cache tier, fast mode, US inference geo and the Haiku 5.5
+/// prompt-length tier. Field names are the Messages API's (official docs,
+/// retrieved 2026-11-06).
+#[cfg(test)]
+mod pricing_gap_tests {
+    use super::*;
+    use crate::usage::UsageAccumulator;
+
+    /// Settles one SSE `message_start` + `message_stop` carrying `usage_json`.
+    fn settle_sse(model: &str, usage_json: &str) -> (ResourceAmount, bool) {
+        let stream = format!(
+            "data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{{usage_json}}}}}}}\n\n\
+             data: {{\"type\":\"message_stop\"}}\n\n"
+        );
+        let mut acc = UsageAccumulator::new();
+        acc.feed(stream.as_bytes());
+        let (amount, known, _flags) = settle_amount_for(
+            acc.observed(),
+            acc.completed_cleanly(),
+            acc.saw_message_start(),
+            ResourceAmount::UsdCents(99_999),
+            1,
+            u64::MAX,
+            ResourceKind::Usd,
+            model,
+            &PricingTable::pinned(),
+        );
+        (amount, known)
+    }
+
+    fn split(input: u64, w5: u64, w1: u64, cache_read: u64, output: u64, extra: &str) -> String {
+        format!(
+            r#""input_tokens":{input},"output_tokens":{output},"cache_creation_input_tokens":{},"cache_read_input_tokens":{cache_read},"cache_creation":{{"ephemeral_5m_input_tokens":{w5},"ephemeral_1h_input_tokens":{w1}}}{extra}"#,
+            w5 + w1
+        )
+    }
+
+    fn cents(c: i64) -> (ResourceAmount, bool) {
+        (ResourceAmount::UsdCents(c), true)
+    }
+
+    #[test]
+    fn a_one_hour_cache_write_settles_at_twice_base_input() {
+        let u = split(0, 0, 1_000_000, 0, 0, "");
+        assert_eq!(settle_sse("claude-sonnet-4-6", &u), cents(600));
+        let mixed = split(0, 400_000, 600_000, 0, 0, "");
+        assert_eq!(settle_sse("claude-sonnet-4-6", &mixed), cents(510));
+    }
+
+    #[test]
+    fn a_cache_write_with_no_ttl_breakdown_settles_as_one_hour() {
+        let u = r#""cache_creation_input_tokens":1000000"#;
+        assert_eq!(settle_sse("claude-sonnet-4-6", u), cents(600));
+    }
+
+    #[test]
+    fn haiku_5_5_settles_by_prompt_length() {
+        let low = split(50_000, 0, 0, 50_000, 1_000_000, "");
+        assert_eq!(settle_sse("claude-haiku-5-5", &low), cents(51));
+        let high = split(50_000, 0, 0, 50_001, 1_000_000, "");
+        assert_eq!(settle_sse("claude-haiku-5-5", &high), cents(253));
+    }
+
+    #[test]
+    fn fast_mode_and_us_geo_settle_at_their_multipliers() {
+        let fast = split(100_000, 0, 0, 0, 50_000, r#","speed":"fast""#);
+        assert_eq!(settle_sse("claude-opus-5", &fast), cents(350));
+        let geo = split(100_000, 0, 0, 0, 50_000, r#","inference_geo":"us""#);
+        assert_eq!(settle_sse("claude-opus-5", &geo), cents(193));
+        let both = split(
+            100_000,
+            0,
+            0,
+            0,
+            50_000,
+            r#","speed":"fast","inference_geo":"us""#,
+        );
+        assert_eq!(settle_sse("claude-opus-5", &both), cents(385));
+    }
+
+    #[test]
+    fn a_modifier_that_cannot_be_priced_settles_at_the_reservation_unknown() {
+        for (model, extra) in [
+            ("claude-sonnet-4-6", r#","speed":"fast""#),
+            ("claude-opus-5", r#","speed":"turbo""#),
+            ("claude-opus-4-5", r#","inference_geo":"us""#),
+        ] {
+            let u = split(100_000, 0, 0, 0, 50_000, extra);
+            assert_eq!(
+                settle_sse(model, &u),
+                (ResourceAmount::UsdCents(99_999), false),
+                "{model} {extra}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_reservation_covers_a_one_hour_cache_write_of_the_whole_input() {
+        // 1M input tokens at the 1h write rate ($10/Mtok on opus-5) + 1 output.
+        let r = worst_case_usd_reservation(
+            1_000_000,
+            Some(1),
+            "claude-opus-5",
+            false,
+            &PricingTable::pinned(),
+        )
+        .unwrap();
+        let ResourceAmount::UsdCents(c) = r else {
+            panic!()
+        };
+        assert!(
+            c >= 1000,
+            "reservation {c} must cover a 1h write of the whole input"
+        );
     }
 }

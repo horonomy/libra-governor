@@ -33,6 +33,8 @@
 
 use serde::Deserialize;
 
+use crate::pricing::{CacheWriteSplit, GeoReport, SpeedReport};
+
 /// The largest single SSE line the accumulator will buffer before
 //  dropping it and resynchronising. Real `message_start` frames are a few
 /// hundred bytes; 64 KiB is generous by orders of magnitude while still
@@ -51,6 +53,13 @@ pub struct ObservedUsage {
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
     pub output_tokens: u64,
+    /// The 5-minute / 1-hour split of `cache_creation_input_tokens`
+    /// (`usage.cache_creation`), priced by [`crate::pricing::PricingTable::request_cost_pico`].
+    pub cache_creation_split: CacheWriteSplit,
+    /// `usage.speed`: fast mode is its own price row on the models that have it.
+    pub speed: SpeedReport,
+    /// `usage.inference_geo`: `"us"` is a 1.1x multiplier on 4.6+ models.
+    pub inference_geo: GeoReport,
 }
 
 impl ObservedUsage {
@@ -80,6 +89,32 @@ struct UsageFields {
     cache_creation_input_tokens: Option<u64>,
     cache_read_input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    cache_creation: Option<serde_json::Value>,
+    speed: Option<serde_json::Value>,
+    inference_geo: Option<serde_json::Value>,
+}
+
+/// Reads `usage.cache_creation` (`ephemeral_5m_input_tokens` /
+/// `ephemeral_1h_input_tokens`). A count that is not a non-negative integer,
+/// or a value that is not an object, is [`CacheWriteSplit::Malformed`].
+fn parse_cache_split(value: &serde_json::Value) -> CacheWriteSplit {
+    let Some(object) = value.as_object() else {
+        return CacheWriteSplit::Malformed;
+    };
+    let count = |key: &str| match object.get(key) {
+        None | Some(serde_json::Value::Null) => Some(0),
+        Some(v) => v.as_u64(),
+    };
+    match (
+        count("ephemeral_5m_input_tokens"),
+        count("ephemeral_1h_input_tokens"),
+    ) {
+        (Some(five_minute), Some(one_hour)) => CacheWriteSplit::Split {
+            five_minute,
+            one_hour,
+        },
+        _ => CacheWriteSplit::Malformed,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -208,6 +243,15 @@ impl UsageAccumulator {
         if let Some(v) = fields.output_tokens {
             self.usage.output_tokens = v;
             saw_any = true;
+        }
+        if let Some(v) = &fields.cache_creation {
+            self.usage.cache_creation_split = parse_cache_split(v);
+        }
+        if fields.speed.is_some() {
+            self.usage.speed = SpeedReport::from_json(fields.speed.as_ref());
+        }
+        if fields.inference_geo.is_some() {
+            self.usage.inference_geo = GeoReport::from_json(fields.inference_geo.as_ref());
         }
         self.saw_usage |= saw_any;
     }
@@ -396,6 +440,7 @@ mod tests {
             cache_creation_input_tokens: 2,
             cache_read_input_tokens: 4,
             output_tokens: 8,
+            ..Default::default()
         };
         assert_eq!(usage.fresh_tokens(), 11);
     }
