@@ -286,7 +286,8 @@ When enrolled:
   hooks are skipped silently and leave an enrolled install ungated; `doctor`
   can report trust as "likely not yet trusted" or "unknown", never "trusted".
 - With no `gpt-*` price in `pricing_overrides`, every Codex turn books the flat
-  hold, unmeasured, and is never trued up.
+  hold, unmeasured, and is never trued up. (This describes the v0.0.5 candidate;
+  the published v0.0.4 binary does not count Codex turns in the shared budget at all.)
 - A turn Codex interrupts or aborts writes no usage record, so that spend is
   under-counted. A turn longer than the one-hour hold is settled late on
   partial usage.
