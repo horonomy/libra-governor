@@ -1067,24 +1067,45 @@ user-facing text (founder packet item 1).
 
 ### What is built (all behind `enforcement = "gateway"`, default `hooks`)
 
-- **S11b (gateway crate).** Pure settle rule: a truncated stream settles at the
-  exact input tiers from `message_start` plus `max_tokens` times the output
-  rate, or at the full reservation when `message_start` was not seen
-  (`usage_known = false`). Hard input upper bound (`bytes / 1.0` plus per-image
-  and tool constants), `input_bound_violated` detection, an unbounded-input
-  screen (server tools, url/file sources, and similar are refused with
-  `403 unenforceable_request`), and counters `truncated_settles` and
-  `input_bound_violations`. Not applied to the task path, so the pinned
-  task-path behaviour (R6) is unchanged.
-- **S11c (ledger).** Expire-as-charge: an expired active `charge_source =
-  'gateway'` reservation is booked at its reserved amount instead of freeing
-  capacity. A startup orphan sweep books active gateway rows from a previous
-  `boot_id` at the reservation. Gateway rows are excluded from the lane and
-  heartbeat queries, so the heartbeat never renews them.
-- **S11d (daemon).** Optional `enforcement` field (`hooks` default, `gateway`;
-  unknown value is `config_invalid`), and `gateway_reserve`, `gateway_settle`,
-  `gateway_release`, `gateway_renew`, `gateway_orphans_at_start`, priced with the
-  shared-budget table, never the gateway config's `pricing_overrides`.
+- **S11b (gateway crate, #316).** Pure `settle_amount_for`: a request cut off
+  after `message_start` usage settles at the exact input tiers plus
+  `max(observed output, max_tokens)` output, `usage_known = false`; one cut off
+  before any usage, or a model or kind that cannot be priced, settles at the
+  reservation. The amount is never clamped to the reservation, so an overrun
+  stays visible. `hard_input_upper_bound` is the body bytes (inline base64
+  `source.data` excluded) plus 8,000 tokens per image block plus a 1,000-token
+  tool-prompt allowance; both constants are inferences until S11a.
+  `input_bound_violated` is set when reported prompt tokens (input plus cache
+  creation plus cache read) exceed the bound. `screen_unbounded_inputs` refuses
+  a body with a server tool (`web_search_*`, `web_fetch_*`, `code_execution_*`),
+  a url or file content source, non-empty `mcp_servers`, a `container`, a
+  `container_upload` block, or a base64 PDF; the list is closed, so a block type
+  added upstream passes until it is named. Counters `truncated_settles` and
+  `input_bound_violations`. Not applied to the task path.
+- **S11c (ledger, #312).** `expire_stale_shared_pool_reservations` books an
+  expired active `charge_source = 'gateway'` non-charge hold as `settled` at its
+  reserved amount with `usage_known = 0`, instead of `expired`; a late settle is
+  `AlreadyFinal`. `settle_orphaned_gateway_holds` books every active gateway
+  non-charge hold whose idempotency key lacks the current `gw:<boot_id>:`
+  prefix, regardless of expiry; a second run books nothing, and a malformed
+  prefix sweeps nothing. The sweep is global to the ledger: it assumes one
+  gateway process per ledger, and a second live gateway on the same ledger would
+  have its holds booked as orphans. Gateway rows are excluded from the lane,
+  pending-hold and heartbeat queries. No migration.
+- **S11d (daemon).** Optional `enforcement` (`hooks` default, `null` is
+  `hooks`, `gateway`; any other string is an invalid-file error). The shared
+  budget runtime is an `Arc` on `DaemonConfig`. `gateway_reserve` refuses,
+  writing nothing, unless the file is valid and asks for gateway enforcement,
+  identity and key are usable (256-byte cap; key `gw:<boot_id>:<request_id>`),
+  no later-period pool exists and the request is priceable. Only then does it
+  create the period's pool, sweep expired holds and reserve, so the pool
+  creation and the sweep can write before a `CapExhausted` refusal (intended).
+  `gateway_settle` prices with the shared-budget table (the pinned prices plus
+  the file's `pricing_overrides`, never the gateway config's) and the reserved
+  amount read from the row; if the file is no longer valid at settle time the
+  row is booked at its reservation, `usage_known = false`. `gateway_release`,
+  `gateway_renew`, and `gateway_orphans_at_start` (run at daemon start whether
+  or not the gateway is enabled).
 - **S11e (gateway wiring).** Per-request reserve before forwarding and settle
   after, combined with the task reservation by AND with compensating release;
   both are released on upstream failure; pump renewal. New decisions
