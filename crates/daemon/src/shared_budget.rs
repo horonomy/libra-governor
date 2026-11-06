@@ -323,11 +323,25 @@ impl SharedBudgetRuntime {
     /// gateway thread starts and the thread clears it when it exits, so a
     /// failed start, a bind error or a later stop all read as `Stopped`.
     pub fn set_gateway_run(&self, run: GatewayRun) {
-        let _ = self.gateway_run.try_update(
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-            |cur| Some((cur & !RUN_MASK) | run_bits(run)),
-        );
+        let _ = self.update_gateway_run(|cur| Some((cur & !RUN_MASK) | run_bits(run)));
+    }
+
+    /// Compare-and-swap loop over the packed run state. `AtomicU64::fetch_update`
+    /// is deprecated and `try_update` is unstable on the toolchains CI pins, so
+    /// neither can be used. `f` returning `None` leaves the state untouched.
+    fn update_gateway_run(&self, f: impl Fn(u64) -> Option<u64>) -> Result<u64, u64> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut cur = self.gateway_run.load(SeqCst);
+        loop {
+            let Some(next) = f(cur) else { return Err(cur) };
+            match self
+                .gateway_run
+                .compare_exchange_weak(cur, next, SeqCst, SeqCst)
+            {
+                Ok(prev) => return Ok(prev),
+                Err(seen) => cur = seen,
+            }
+        }
     }
 
     /// Starts a new gateway generation in state `run` and returns its token.
@@ -335,12 +349,7 @@ impl SharedBudgetRuntime {
     /// no newer gateway has started since.
     pub fn begin_gateway_run(&self, run: GatewayRun) -> u64 {
         let prev = self
-            .gateway_run
-            .try_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |cur| Some((((cur >> 2) + 1) << 2) | run_bits(run)),
-            )
+            .update_gateway_run(|cur| Some((((cur >> 2) + 1) << 2) | run_bits(run)))
             .unwrap_or_default();
         (prev >> 2) + 1
     }
@@ -348,12 +357,7 @@ impl SharedBudgetRuntime {
     /// Marks the gateway `Stopped` if `generation` is still the current one;
     /// returns whether it did.
     pub fn end_gateway_run(&self, generation: u64) -> bool {
-        self.gateway_run
-            .try_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |cur| (cur >> 2 == generation).then_some(cur & !RUN_MASK),
-            )
+        self.update_gateway_run(|cur| (cur >> 2 == generation).then_some(cur & !RUN_MASK))
             .is_ok()
     }
 
