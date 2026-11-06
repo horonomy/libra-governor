@@ -1051,9 +1051,12 @@ label wording and the counting-scope change are Level 2 founder decisions
 recorded in a separate packet; until the founder decides, the default stays
 `enforcement = "hooks"` and README and release notes make no hard-cap claim.
 Evidence class is `TestOwnedLive` (fake upstream, `ManualClock`). The S11a
-real-host capture of the gateway request shape (session header equality with
-the hook `session_id`) is **not part of this record**; any host-dependent
-statement below is a host assumption until S11a lands.
+host capture of the gateway request shape (claude 2.1.306, producer-run, not
+independent QA; `docs/evidence/s11a-claude-code-gateway-request-shape.md`) is a
+separate record. It confirmed the session header equals the hook `session_id`
+(18/18 requests), but the real gateway was not in the request path, so gateway
+acceptance of the shape is untested; other host-dependent statements below
+remain assumptions.
 
 ### Guarantee label (gateway mode)
 
@@ -1088,7 +1091,7 @@ the mode on sees it before any founder decision.
   reservation. The amount is never clamped to the reservation, so an overrun
   stays visible. `hard_input_upper_bound(bytes, image_count)` is `bytes` (documented to
   exclude inline base64 `source.data`) plus 8,000 tokens per image block plus a
-  1,000-token tool-prompt allowance; both constants are inferences until S11a.
+  1,000-token tool-prompt allowance; both constants are still inferences: S11a observed only a 64x64 image and a one-page PDF, so `IMAGE_MAX_TOKENS` is unassessed.
   The gateway passes `body.len()`, the whole request body including base64
   payloads, so the reservation is looser than the function's contract and
   over-reserves image-heavy requests (the safe direction).
@@ -1158,12 +1161,12 @@ silent fix. "Over-count" is the safe direction for a cap; "under-count" is not.
   and recorded as `input_bound_violated`, not prevented. Tokenizer behaviour is
   an inference.
 - *Inline images and documents* are billed by rendering, not bytes. Per-block
-  constants stand in; their values are inferences until S11a and API docs.
+  constants stand in; S11a did not assess their values (synthetic sizes only); they remain inferences pending API docs and a realistic screenshot.
   Base64 screenshots can over-reserve; a many-page PDF can overrun.
 - *Content not in the body* (url/file sources, Files API, `mcp_servers`,
   `container`, server tools such as web search, fetch, code execution) is
   unbounded input plus per-use fees outside `usage`. Hard mode refuses these.
-  Claude Code WebSearch is likely refused (inference, S11a to confirm).
+  Claude Code WebSearch is refused: S11a observed it send a separate request with `tools: [web_search_20250305]`. A base64 PDF read (`is_base64_pdf`) is also refused as unbounded. `web_fetch_*`, `code_execution_*`, `mcp_servers`, `container` and url/file sources were not observed.
 - *1-hour cache-write tier* (2x base input): reserve and settle share one
   model, so Libra-accounted totals stay at or under the cap, but the bill can
   be higher. Not modelled; optional S11h would model it and bump
@@ -1277,9 +1280,10 @@ silent fix. "Over-count" is the safe direction for a cap; "under-count" is not.
   stated in the label.
 - *Identity:* the gateway session header is a host assumption (R1). If it is
   absent or differs from the hook `session_id`, the mode fails closed and is
-  unusable. Subagent traffic is probably not distinguishable (open question Q1).
+  unusable. Subagent requests do carry `x-claude-code-agent-id`, equal to the hook `agent_id` (S11a, subagent scenario only); the proxy ignores it today, so attribution stays `unattributed` unless a founder/architect design option adopts it (Q1).
 - *Evidence:* everything is `TestOwnedLive`. No real-host gateway journey has
-  run; S11a is pending at the time of writing.
+  run. S11a (shape only, producer-run, real gateway not in the path) is recorded in
+  `docs/evidence/s11a-claude-code-gateway-request-shape.md`.
 
 ## Consequences
 
