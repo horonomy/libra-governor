@@ -742,6 +742,9 @@ by transcript. A session that stops without any gateway request is counted as
 counted). `doctor` reports an Error when this mode has no running
 `governor_held` gateway or `settings.json` `env` has no `ANTHROPIC_BASE_URL`
 key (presence only). The default is `hooks`, whose behaviour is unchanged.
+There is no gateway supervisor: if the gateway stops (a bind error, a runtime failure or
+a panic), `Admit` and `PreToolUse` keep denying `gateway_unavailable` and `doctor` reports
+it not running until the daemon restarts or `enforcement` is set back to `hooks`.
 
 The installer (`libra-governor install`, HORO-2216) adds the `PreToolUse`,
 `SubagentStop` and `SessionEnd` entries beside the original three,

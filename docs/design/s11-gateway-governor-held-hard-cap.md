@@ -537,6 +537,10 @@ independent. S11a gates **enablement**, not building.
   thread exits for any reason (bind error, runtime error, shutdown). `GatewayStatus` reports
   `running` from the same state, so `doctor` says "not running" in those cases. Recovery is a
   daemon restart, or setting `enforcement` back to `hooks`. Scoped to Claude lanes; Codex keeps hooks semantics.
+  There is deliberately no gateway supervisor: a stopped gateway is not restarted, so `Admit` and
+  `Check` keep denying `gateway_unavailable` until the daemon restarts. The state is cleared by a
+  drop guard on the gateway thread (so a panic clears it too), keyed by a start generation so an
+  old thread's exit cannot clear a newer gateway.
 - PreToolUse `Check` in gateway mode answers `available` only while that gateway runs (else it
   denies `gateway_unavailable`; an invalid file still denies): no hold
   backs the turn, so the turn-hold test could wedge an admitted turn, and the gateway refuses each
