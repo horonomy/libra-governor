@@ -285,8 +285,9 @@ When enrolled:
 - Codex hooks run only after you trust them in Codex's `/hooks`. Untrusted
   hooks are skipped silently and leave an enrolled install ungated; `doctor`
   can report trust as "likely not yet trusted" or "unknown", never "trusted".
-- Codex turns are priced from the pinned OpenAI list prices (standard tier,
-  short context; `pricing-2026-11-static-v3`) for gpt-6.1-sol, gpt-6.1-terra, gpt-6-sol, gpt-6-astra, gpt-6-luna and gpt-5.3-codex; a
+- (v0.0.5 candidate, not in the published v0.0.4 binary, where every Codex turn
+  books the flat hold, unmeasured.) Codex turns are priced from the pinned OpenAI
+  list prices (standard tier, short context; `pricing-2026-11-static-v3`) for gpt-6.1-sol, gpt-6.1-terra, gpt-6-sol, gpt-6-astra, gpt-6-luna and gpt-5.3-codex; a
   `pricing_overrides` entry takes precedence. Any other Codex model (for
   example `gpt-5.6-*`, whose list price is promotional until 2026-11-30, or a
   variant id such as `gpt-6.1-sol-pro`) is unpriced: its turns book the flat
