@@ -166,8 +166,9 @@ fn shared_budget_findings() -> Vec<Finding> {
 /// traffic Claude Code sends to it, so each missing piece is an Error: the
 /// budget would read as healthy while counting nothing.
 ///
-/// `ANTHROPIC_BASE_URL` is checked for PRESENCE only (the key in
-/// `settings.json`'s `env`); its value is never read or printed here.
+/// `ANTHROPIC_BASE_URL` is checked as a key in `settings.json`'s `env`. The
+/// inspection reads its value only to classify the host as loopback or not;
+/// the value is never printed or stored here.
 fn gateway_enforcement_findings(
     probe: &shared_budget_view::GatewayProbe,
     settings: Option<&claude_settings::Inspection>,
