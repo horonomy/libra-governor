@@ -213,8 +213,11 @@ original strict hard-cap guarantee.
 - *Not a strict monetary cap.* A prompt is admitted or refused up front;
   nothing stops spend once a turn is running, so in-turn overshoot is possible.
 - *Codex is not counted (v0.0.4) unless you opt in (v0.0.5 candidate only).* There is no gateway hard cap for the monthly
-  budget: the S11 design is not built (the optional local gateway is a separate,
-  per-task mechanism that is not connected to the monthly budget). Codex accounting (v0.0.5 candidate) is
+  budget. In the v0.0.5 candidate, S11b to S11f are merged as dark code behind
+  `enforcement=gateway`, which is off by default and is neither enabled nor
+  supported for use; no hard-cap guarantee is claimed, and enabling it awaits a
+  founder decision. Otherwise the optional local gateway is a separate,
+  per-task mechanism that is not connected to the monthly budget. Codex accounting (v0.0.5 candidate) is
   opt-in and off by default; see "Codex accounting" below.
 - *Not your bill.* Amounts are Libra's list-price-equivalent estimates, or the
   flat turn hold when a turn cannot be measured. Pricing gaps drift both ways
