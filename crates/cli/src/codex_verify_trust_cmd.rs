@@ -758,6 +758,62 @@ mod tests {
         }
     }
 
+    /// HORO-2422 regression. A sibling thread's `fork` can hand its child a
+    /// copy of a still-open write descriptor for the script this test just
+    /// wrote; until that child `exec`s, executing the script fails with
+    /// `ETXTBSY` on Linux. Reproduced deterministically here by holding a
+    /// write descriptor open across the first spawn attempts. `verify()`
+    /// must ride that out instead of reporting "could not reach Codex
+    /// app-server" for a genuinely trusted hook.
+    #[test]
+    fn a_fixture_briefly_held_open_for_write_still_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let hooks_path = dir.path().join("hooks.json");
+        wire_real_hooks(&hooks_path);
+        let [prompt, tool, stop] = expected_commands();
+        let hooks_path_str = hooks_path.display().to_string();
+        let entry = |event: &str, command: &str, hash: &str| {
+            format!(
+                "{{\"eventName\":\"{event}\",\"command\":\"{command}\",\
+                 \"sourcePath\":\"{hooks_path_str}\",\"currentHash\":\"{hash}\",\
+                 \"trustStatus\":\"trusted\",\"enabled\":true}}"
+            )
+        };
+        let hooks = [
+            entry("userPromptSubmit", &prompt, "sha256:aaa"),
+            entry("postToolUse", &tool, "sha256:bbb"),
+            entry("stop", &stop, "sha256:ccc"),
+        ]
+        .join(",");
+        let script = write_fixture(
+            dir.path(),
+            &format!(
+                "read -r _init\nprintf '{{\"id\":1,\"result\":{{\"ok\":true}}}}\\n'\nread -r \
+                 _hooks\nprintf '{{\"id\":2,\"result\":{{\"data\":[{{\"cwd\":\"/x\",\
+                 \"warnings\":[],\"errors\":[],\"hooks\":[{hooks}]}}]}}}}\\n'\n"
+            ),
+        );
+
+        let held = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&script)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+
+        let cfg = config(dir.path(), hooks_path, script.display().to_string());
+        let report = verify(&cfg);
+        release.join().unwrap();
+        assert_eq!(report.hooks.len(), 3, "{:?}", report.hooks);
+        assert!(
+            report.hooks.iter().all(|h| h.trust.is_trusted()),
+            "{:?}",
+            report.hooks
+        );
+    }
+
     #[test]
     fn positive_a_genuinely_trusted_hook_reports_trusted() {
         let dir = tempfile::tempdir().unwrap();
