@@ -19,7 +19,7 @@ Read-only design. Line numbers refer to aea0894. Status: design intent only; not
    `deny_unknown_fields` (`crates/daemon/src/shared_budget_file.rs:51-59`): a new key would make an older
    daemon report `config_invalid` and start denying **Claude** prompts.
 4. **No OpenAI gateway now.** It is a Level-2 founder decision (new egress, new credential path, new trust
-   boundary), and the Claude S11 `governor_held` it would mirror does not exist yet.
+   boundary), and the Claude S11 `governor_held` mode it would mirror is built only as dark, opt-in code (`enforcement=gateway`, S11b to S11f merged, off by default, not enabled, no real-host evidence).
 5. **Codex subagents are explicitly NOT COVERED** in the first slices. They are named in `NOT_COVERED`,
    `status` and `doctor`, never silently dropped.
 6. **Turning it on is a founder decision (Level 2).** Precedent: `crates/cli/src/agent/run.rs:33-40`
