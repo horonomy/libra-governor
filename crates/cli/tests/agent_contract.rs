@@ -329,6 +329,7 @@ fn claude_stop_stderr_summary_golden() {
                      Estimate: cold start — insufficient local history: no ExecutionReceipt \
                      rows recorded yet (confidence: Low, n=0)\n\
                      Actual:   <E>s / unknown (harness does not expose cost/usage data)\n\
+                     Model:    unknown (the host's Stop payload carried no model)\n\
                      Outcome:  Unknown (no automated completion verification in MVP 1)\n\
                      Tool calls: 2\n\
                      Inside P90: n/a (cold start)\n";
