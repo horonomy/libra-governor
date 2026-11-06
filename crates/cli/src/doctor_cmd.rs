@@ -29,9 +29,7 @@ use libra_governor_protocol::{
 };
 
 use crate::agent::{budget_gate, run as agent_run};
-use crate::{
-    claude_settings, client, codex_hooks_file, gateway_cmd, install_cmd, shared_budget_view,
-};
+use crate::{claude_settings, client, codex_hooks_file, install_cmd, shared_budget_view};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Severity {
