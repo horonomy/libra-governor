@@ -447,7 +447,8 @@ pub fn gateway_token_path(state_dir: &Path) -> PathBuf {
 
 /// What `doctor` can say about a `config.json` that parses but that the
 /// daemon may still not honour. Never carries a config value, only key
-/// paths and the gateway's own rejection text.
+/// paths and the gateway's own rejection text (which may name the bind
+/// address or an allowlist host, never a secret).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ConfigReview {
     /// Why the daemon's own gateway validation rejects the gateway block

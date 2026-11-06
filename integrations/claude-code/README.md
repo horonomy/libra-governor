@@ -415,7 +415,7 @@ Same fields as [`GatewayConfig`](../../crates/gateway/src/config.rs), in
 | Field | Required | Meaning |
 |---|---|---|
 | `bind_addr` | yes | Loopback address:port the gateway listens on, e.g. `"127.0.0.1:8787"`. Matches the `ANTHROPIC_BASE_URL` you point Claude Code at in step 2 of "Setup" below. |
-| `token_path` | yes | File holding the gateway's local capability token. `libra-governor gateway token` (and `doctor`) read and create this exact file (v0.0.5 candidate; in v0.0.4 the command ignored this setting and always used `<state_dir>/gateway.token`, so `token_path` had to equal that path). A relative path is used as written, so prefer an absolute one. |
+| `token_path` | yes | File holding the gateway's local capability token. `libra-governor gateway token` reads and creates this exact file, and `doctor` checks that it exists (v0.0.5 candidate; in v0.0.4 the command ignored this setting and always used `<state_dir>/gateway.token`, so `token_path` had to equal that path). A relative path is used as written, so prefer an absolute one. |
 | `credential_mode` | yes | `"governor_held"` or `"pass_through_subscription"` — see "Capability tiers" below for what each one can honestly claim. |
 | `credential_command` | only for `governor_held` | The program to run to fetch the real provider key (step 3 of "Setup" below) — e.g. `"security"`, `"op"`, `"pass"`. Its stdout is read directly into the credential; never written back to this file or any other config. |
 | `credential_args` | no (default `[]`) | Arguments to `credential_command`, e.g. `["read", "op://Private/Anthropic/api-key"]`. |
