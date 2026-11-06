@@ -3097,6 +3097,8 @@ fn start_gateway(config: &DaemonConfig, boot_id: &str) -> Option<GatewayHandle> 
         .name("libra-gateway".to_string())
         .spawn(move || {
             let _run_guard = run_guard;
+            #[cfg(test)]
+            gateway_fault::panic_if_armed(&log_path);
             if let Err(e) = libra_governor_gateway::server::run_gateway(runtime_config, shutdown_rx)
             {
                 log::append_line(&log_path, &format!("gateway stopped: {e}"));
@@ -3113,6 +3115,26 @@ fn start_gateway(config: &DaemonConfig, boot_id: &str) -> Option<GatewayHandle> 
     Some(GatewayHandle {
         _shutdown: shutdown_tx,
     })
+}
+
+/// Test-only fault injection: a panic in the gateway thread, keyed by the
+/// daemon log path so parallel tests cannot trip each other's gateway.
+#[cfg(test)]
+mod gateway_fault {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static ARMED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    pub fn arm(log_path: &Path) {
+        ARMED.lock().unwrap().push(log_path.to_path_buf());
+    }
+
+    pub fn panic_if_armed(log_path: &Path) {
+        if ARMED.lock().unwrap().iter().any(|p| p == log_path) {
+            panic!("injected gateway thread panic");
+        }
+    }
 }
 
 /// A running extension event dispatcher's thread and its shutdown
@@ -3713,6 +3735,116 @@ mod tests {
             shared_budget: Default::default(),
             progressive_interval_secs: DEFAULT_PROGRESSIVE_INTERVAL_SECS,
         }
+    }
+
+    // ---- gateway run state follows the gateway thread (S11f hardening) ----
+
+    fn gateway_fixture(dir: &std::path::Path) -> (DaemonConfig, std::net::SocketAddr) {
+        std::fs::write(
+            dir.join(crate::shared_budget_file::SHARED_BUDGET_FILE_NAME),
+            r#"{"schema_version":1,"monthly_cap_usd_cents":5000,"time_zone":"UTC",
+            "turn_hold_usd_cents":10,"enforcement":"gateway"}"#,
+        )
+        .unwrap();
+        let mut config = test_daemon_config(dir);
+        config.shared_budget =
+            std::sync::Arc::new(crate::shared_budget::SharedBudgetRuntime::load(dir));
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        config.gateway = Some(libra_governor_gateway::config::GatewayConfig::new(
+            addr,
+            dir.join(format!("gateway-{}.token", addr.port())),
+            libra_governor_gateway::config::GatewayCredentialMode::GovernorHeld {
+                credential: libra_governor_gateway::credential::CredentialCommand::new(
+                    "/bin/sh",
+                    vec![
+                        "-c".to_string(),
+                        "printf 'fake-test-credential'".to_string(),
+                    ],
+                ),
+            },
+        ));
+        (config, addr)
+    }
+
+    fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !cond() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn admit_denies_gateway_unavailable(ledger: &mut LedgerStore, config: &DaemonConfig) -> bool {
+        matches!(
+            crate::shared_budget::admit(ledger, &config.shared_budget, "sess-1", None, None, None),
+            Ok(libra_governor_protocol::SharedBudgetOutcome::Denied {
+                reason: libra_governor_protocol::SharedBudgetDenyReason::GatewayUnavailable,
+                ..
+            })
+        )
+    }
+
+    #[test]
+    fn a_panic_in_the_gateway_thread_clears_the_running_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, _addr) = gateway_fixture(dir.path());
+        let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
+        handle_preflight("fix the bug", dir.path(), "sess-1", &mut ledger, &config).unwrap();
+        gateway_fault::arm(&config.log_path);
+
+        let started = begin_gateway(&mut ledger, &config);
+
+        assert!(started.handle.is_some(), "the start itself succeeded");
+        wait_for("the panicked gateway thread to clear the state", || {
+            config.shared_budget.gateway_run() == crate::shared_budget::GatewayRun::Stopped
+        });
+        assert!(admit_denies_gateway_unavailable(&mut ledger, &config));
+        assert!(!gateway_status(&config).running);
+    }
+
+    #[test]
+    fn an_old_gateways_exit_does_not_clear_a_newer_gateways_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first_config, first_addr) = gateway_fixture(dir.path());
+        let (mut second_config, _second_addr) = gateway_fixture(dir.path());
+        second_config.shared_budget = std::sync::Arc::clone(&first_config.shared_budget);
+        let mut ledger = LedgerStore::open(&first_config.ledger_path).unwrap();
+        handle_preflight(
+            "fix the bug",
+            dir.path(),
+            "sess-1",
+            &mut ledger,
+            &first_config,
+        )
+        .unwrap();
+
+        let first = begin_gateway(&mut ledger, &first_config);
+        let second = begin_gateway(&mut ledger, &second_config);
+        assert!(first.handle.is_some() && second.handle.is_some());
+
+        drop(first);
+        // The old gateway has fully stopped once its port can be bound again.
+        wait_for("the old gateway to release its port", || {
+            std::net::TcpListener::bind(first_addr).is_ok()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        assert_eq!(
+            second_config.shared_budget.gateway_run(),
+            crate::shared_budget::GatewayRun::GovernorHeld
+        );
+        assert!(!admit_denies_gateway_unavailable(
+            &mut ledger,
+            &second_config
+        ));
+        assert!(gateway_status(&second_config).running);
+        drop(second);
     }
 
     fn config_for_doctor_tests(dir: &std::path::Path) -> DaemonConfig {
