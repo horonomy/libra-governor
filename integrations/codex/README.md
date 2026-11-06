@@ -67,7 +67,7 @@ hook schemas vs. what remains unverified.
     stdout (the Estimate-vs-Actual receipt goes to stderr) and never blocks.
   - There is no `PreToolUse` gate for Codex; a long tool-free turn keeps its
     hold only until it expires.
-  - A turn on a pinned OpenAI model (gpt-6.1-sol, gpt-6.1-terra, gpt-6-sol, gpt-6-astra, gpt-6-luna and gpt-5.3-codex;
+  - (v0.0.5 candidate, not in the published v0.0.4 binary): a turn on a pinned OpenAI model (gpt-6.1-sol, gpt-6.1-terra, gpt-6-sol, gpt-6-astra, gpt-6-luna and gpt-5.3-codex;
     standard tier, short context) is priced from the pinned table, and a
     `pricing_overrides` entry for the model takes precedence. A model id is
     matched exactly or with a dated `-YYYYMMDD` suffix only. Any other model
