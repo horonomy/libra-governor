@@ -731,6 +731,18 @@ and anything that edits `shared-budget.json` as the same OS user can change
 the cap. A per-request hard cap exists only with the gateway (ADR-0003).
 Every reason text says "Libra-accounted USD, admission-bounded".
 
+**`"enforcement": "gateway"` (dark, opt-in, S11f).** With this field in
+`shared-budget.json` and a running `governor_held` gateway, the gateway reserves
+every request and is the only writer of spend. The hooks then book nothing:
+`UserPromptSubmit` reserves no hold (it still refuses with `cap_exhausted` when
+less than one turn hold remains, or `gateway_unavailable` when no `governor_held` gateway runs), `Stop`, `SubagentStop`, `SessionEnd` and the
+subagent sweep write nothing, and a hold admitted before the flip still settles
+by transcript. A session that stops without any gateway request is counted as
+`unrouted` in `shared-budget status` (detection only: that spend is not
+counted). `doctor` reports an Error when this mode has no running
+`governor_held` gateway or `settings.json` `env` has no `ANTHROPIC_BASE_URL`
+key (presence only). The default is `hooks`, whose behaviour is unchanged.
+
 The installer (`libra-governor install`, HORO-2216) adds the `PreToolUse`,
 `SubagentStop` and `SessionEnd` entries beside the original three,
 idempotently, and `uninstall` removes exactly those. They are installed

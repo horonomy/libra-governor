@@ -367,13 +367,45 @@ pub(crate) fn unquote(binary: &str) -> Option<&str> {
 /// `true` only for a loopback host — see module docs on why
 /// `ANTHROPIC_BASE_URL` removal is scoped this way.
 fn is_loopback_base_url(url: &str) -> bool {
-    let without_scheme = url.split("://").nth(1).unwrap_or(url);
-    let host = without_scheme
-        .trim_start_matches('[')
-        .split(['/', ':', ']'])
-        .next()
-        .unwrap_or("");
-    matches!(host, "127.0.0.1" | "localhost" | "::1")
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Userinfo (`user@host`) would make the real host the part after `@`, and
+    // no gateway URL needs it: refuse rather than guess which part is the host.
+    if authority.is_empty() || authority.contains(['@', '\\', ' ']) {
+        return false;
+    }
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        let Some((inside, after)) = bracketed.split_once(']') else {
+            return false;
+        };
+        if !(after.is_empty() || after.strip_prefix(':').is_some_and(is_port)) {
+            return false;
+        }
+        inside
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) => {
+                if !is_port(port) {
+                    return false;
+                }
+                host
+            }
+            None => authority,
+        }
+    };
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "::1"
+    )
+}
+
+fn is_port(port: &str) -> bool {
+    !port.is_empty() && port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// A sha256 over a config file's exact bytes at one instant, used only
@@ -1674,6 +1706,23 @@ mod tests {
         assert!(is_loopback_base_url("http://localhost:8787"));
         assert!(!is_loopback_base_url("https://api.example.com"));
         assert!(!is_loopback_base_url("http://10.0.0.5:8787"));
+    }
+
+    #[test]
+    fn is_loopback_base_url_rejects_userinfo_tricks_and_accepts_bracketed_ipv6() {
+        assert!(!is_loopback_base_url("http://127.0.0.1@evil.com"));
+        assert!(!is_loopback_base_url("http://127.0.0.1:80@evil.com/x"));
+        assert!(!is_loopback_base_url("http://localhost@evil.com:8787"));
+        assert!(!is_loopback_base_url("http://127.0.0.1.evil.com:8787"));
+        assert!(!is_loopback_base_url("ftp://127.0.0.1:8787"));
+        assert!(!is_loopback_base_url("127.0.0.1:8787"));
+        assert!(!is_loopback_base_url("http://127.0.0.1:port"));
+        assert!(is_loopback_base_url("http://[::1]:8787"));
+        assert!(is_loopback_base_url("http://[::1]"));
+        assert!(is_loopback_base_url("http://[::1]:8787/v1"));
+        assert!(!is_loopback_base_url("http://[::2]:8787"));
+        assert!(!is_loopback_base_url("http://[::1:8787"));
+        assert!(is_loopback_base_url("http://localhost/"));
     }
 
     fn read_json(path: &Path) -> Value {

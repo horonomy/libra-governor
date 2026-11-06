@@ -39,7 +39,8 @@ pub use shared_budget::{
     SharedBudgetCheckState, SharedBudgetConfigDrift, SharedBudgetConfigState,
     SharedBudgetConfigView, SharedBudgetDenyReason, SharedBudgetExecutorRow, SharedBudgetOutcome,
     SharedBudgetPeriod, SharedBudgetRefusal, SharedBudgetRequest, SharedBudgetStatus,
-    SoftLimitScope, SoftLimitWarning, SHARED_BUDGET_BASIS, SHARED_BUDGET_GUARANTEE,
+    SoftLimitScope, SoftLimitWarning, SHARED_BUDGET_BASIS, SHARED_BUDGET_ENFORCEMENT_GATEWAY,
+    SHARED_BUDGET_ENFORCEMENT_HOOKS, SHARED_BUDGET_GUARANTEE, SHARED_BUDGET_GUARANTEE_GATEWAY,
     SHARED_BUDGET_SCOPE,
 };
 mod messages;
@@ -297,4 +298,15 @@ pub use messages::{
 /// path covers that. HORO-2282 adds the same optional, omitted-when-absent
 /// `provider` to `ChargeAgent`, `SettleTail` and `TranscriptReady` without a
 /// further bump: no shipped client sets it yet.
+///
+/// Still v25 (HORO-2274, S11f; v25 is unreleased, so no second bump):
+/// `SharedBudgetOutcome` gained `GatewayMetered` (the answer to an `Admit`
+/// under `enforcement = "gateway"`, with no `reservation_id`),
+/// `SharedBudgetRefusal` gained `GatewayMetered` (a hook charge path that
+/// booked nothing because the gateway meters spend), and
+/// `SharedBudgetStatus` gained `enforcement`, `gateway_in_flight`,
+/// `truncated_settles`, `input_bound_violations`, `unrouted_sessions` and
+/// `orphans_booked`, all defaulted when absent. A v24 decoder cannot parse
+/// the new outcome, and the envelope version check fails a v24 hook against
+/// a v25 daemon (and the reverse) closed at prompt admission.
 pub const PROTOCOL_VERSION: u32 = 25;

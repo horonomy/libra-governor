@@ -481,3 +481,98 @@ fn reserve_racing_expire_never_lets_settled_plus_active_exceed_the_cap() {
     assert!(a.settled <= cap);
     assert!(granted > 0, "vacuous unless something was granted");
 }
+
+// ---- S11f read-only counters ----
+
+#[test]
+fn active_gateway_holds_are_counted_apart_from_turn_holds_and_expired_rows() {
+    let (_dir, mut store) = new_store(1_000);
+    assert_eq!(
+        store
+            .count_active_gateway_holds(&pool_id(), &owner(), now())
+            .unwrap(),
+        0
+    );
+    let g1 = gateway_hold(&mut store, "s1", 10, "gw:b:1");
+    gateway_hold(&mut store, "s2", 10, "gw:b:2");
+    reserve_with(
+        &mut store,
+        "s3",
+        10,
+        "turn-hold",
+        ExecutorAttribution::unattributed(Some(ChargeSource::TurnHold)),
+    );
+    assert_eq!(
+        store
+            .count_active_gateway_holds(&pool_id(), &owner(), now())
+            .unwrap(),
+        2,
+        "a turn hold is not a gateway request"
+    );
+    store.release_shared(g1.id, now()).unwrap();
+    assert_eq!(
+        store
+            .count_active_gateway_holds(&pool_id(), &owner(), now())
+            .unwrap(),
+        1,
+        "a released hold is no longer in flight"
+    );
+    assert_eq!(
+        store
+            .count_active_gateway_holds(&pool_id(), &owner(), after_ttl())
+            .unwrap(),
+        0,
+        "an expired hold is not in flight"
+    );
+}
+
+#[test]
+fn a_session_has_a_gateway_row_in_any_state_but_not_a_turn_hold_row() {
+    let (dir, mut store) = new_store(1_000);
+    gateway_hold(&mut store, "routed", 10, "gw:b:1");
+    reserve_with(
+        &mut store,
+        "hooks-only",
+        10,
+        "turn-hold",
+        ExecutorAttribution::unattributed(Some(ChargeSource::TurnHold)),
+    );
+    let before = dump_reservations(&dir);
+    let has = |s: &str| {
+        store
+            .has_gateway_row_for_session(&pool_id(), &owner(), s)
+            .unwrap()
+    };
+    assert!(has("routed"));
+    assert!(!has("hooks-only"));
+    assert!(!has("never-seen"));
+    assert_eq!(dump_reservations(&dir), before, "the probe is read-only");
+}
+
+#[test]
+fn charge_keys_are_listed_by_prefix_without_writing() {
+    let (dir, mut store) = new_store(1_000);
+    for (i, key) in ["fam|c10", "fam|g4", "other|c1"].iter().enumerate() {
+        store
+            .charge_shared(SharedPoolChargeRequest {
+                pool_id: &pool_id(),
+                principal_id: &owner(),
+                session_id: "s1",
+                amount: i as u64,
+                unit: &QuotaUnit::UsdCents,
+                idempotency_key: key,
+                now: now(),
+                attribution: ExecutorAttribution::unattributed(Some(ChargeSource::TurnHold)),
+                capacity_source: CapacitySource::LocalConfigured { cap: 1_000 },
+                usage_known: true,
+            })
+            .unwrap();
+    }
+    let before = dump_reservations(&dir);
+    let mut keys = store
+        .shared_charge_keys_by_prefix(&owner(), "fam|", "metered:")
+        .unwrap();
+    keys.sort();
+    assert_eq!(keys, vec!["fam|c10".to_string(), "fam|g4".to_string()]);
+    assert_eq!(dump_reservations(&dir), before);
+}

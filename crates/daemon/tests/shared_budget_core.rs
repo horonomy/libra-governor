@@ -297,9 +297,11 @@ const JAN: &str = "2027-01-15T12:00:00Z";
 // ---------------------------------------------------------------------
 
 #[test]
-fn the_enforcement_mode_changes_nothing_for_the_hook_path() {
+fn an_omitted_or_hooks_enforcement_keeps_the_turn_hold_path_unchanged() {
+    // `gateway` deliberately differs since S11f (no hold is reserved); that
+    // is pinned in shared_budget_gateway_hooks.rs.
     let mut grants = Vec::new();
-    for value in [r#""hooks""#, r#""gateway""#] {
+    for value in [r#""hooks""#, "null"] {
         let mut fx = Fx::new(Some(&with_enforcement(value)), JAN);
         let g = grant(fx.admit("s1", None, Some("p1")));
         grants.push((g.hold, g.remaining, g.kind, g.warnings.len()));

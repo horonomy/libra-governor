@@ -1010,8 +1010,18 @@ pub(crate) fn dispatch(
                     }
                     outcome
                 }),
-                SharedBudgetRequest::Status {} => crate::shared_budget::status(ledger, rt)
-                    .map(|status| SharedBudgetOutcome::Status(Box::new(status))),
+                SharedBudgetRequest::Status {} => {
+                    let gateway = config.gateway_stats.snapshot();
+                    crate::shared_budget::status_with_gateway(
+                        ledger,
+                        rt,
+                        crate::shared_budget::GatewayCounters {
+                            truncated_settles: gateway.truncated_settles,
+                            input_bound_violations: gateway.input_bound_violations,
+                        },
+                    )
+                    .map(|status| SharedBudgetOutcome::Status(Box::new(status)))
+                }
             };
             match outcome {
                 Ok(outcome) => Response::SharedBudget(Box::new(outcome)),
@@ -3046,15 +3056,32 @@ fn start_gateway(config: &DaemonConfig, boot_id: &str) -> Option<GatewayHandle> 
 
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
     let log_path = config.log_path.clone();
-    std::thread::Builder::new()
+    // Marked running before the thread starts (a bind error inside
+    // `run_gateway` must clear it after, never race it) and cleared when the
+    // thread ends for any reason, so Admit and Check see what is real.
+    let shared = std::sync::Arc::clone(&config.shared_budget);
+    shared.set_gateway_run(
+        if tier == libra_governor_domain::EnforcementTier::GatewayMetered {
+            crate::shared_budget::GatewayRun::GovernorHeld
+        } else {
+            crate::shared_budget::GatewayRun::PassThrough
+        },
+    );
+    let spawned = std::thread::Builder::new()
         .name("libra-gateway".to_string())
         .spawn(move || {
             if let Err(e) = libra_governor_gateway::server::run_gateway(runtime_config, shutdown_rx)
             {
                 log::append_line(&log_path, &format!("gateway stopped: {e}"));
             }
-        })
-        .ok()?;
+            shared.set_gateway_run(crate::shared_budget::GatewayRun::Stopped);
+        });
+    if spawned.is_err() {
+        config
+            .shared_budget
+            .set_gateway_run(crate::shared_budget::GatewayRun::Stopped);
+        return None;
+    }
 
     log::append_line(
         &config.log_path,
@@ -3129,6 +3156,21 @@ fn gateway_status(config: &DaemonConfig) -> GatewayStatusResult {
             None,
         ),
         Some(raw) => match libra_governor_gateway::config::validate(raw, policy_kind) {
+            Ok(_)
+                if config.shared_budget.gateway_run()
+                    == crate::shared_budget::GatewayRun::Stopped =>
+            {
+                (
+                    false,
+                    Some(
+                        "the gateway is configured but not running (its start failed or it \
+                     stopped); see the daemon log"
+                            .to_string(),
+                    ),
+                    None,
+                    None,
+                )
+            }
             Ok(validated) => (
                 true,
                 None,
