@@ -128,7 +128,10 @@ use serde::Deserialize;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use libra_governor_gateway::pricing::PricingTable;
+use libra_governor_gateway::pricing::{
+    CacheWriteSplit, GeoReport, PricingTable, RequestPriceError, SpeedReport,
+};
+use libra_governor_gateway::usage::ObservedUsage;
 
 use super::{scan_lines_backward, ScanEnd, UsageUnavailable};
 
@@ -169,10 +172,6 @@ pub const FUTURE_SKEW: time::Duration = time::Duration::minutes(5);
 
 /// One cent in pico-dollars (10^-12 USD).
 const PICO_PER_CENT: u128 = 10_000_000_000;
-/// Prices are dollars per million tokens, i.e. micro-dollars per token;
-/// scaled by 10^6 that is pico-dollars per token, exact for any price with
-/// up to six decimals.
-const PRICE_SCALE: f64 = 1_000_000.0;
 
 /// What a read covers.
 #[derive(Debug, Clone, Copy)]
@@ -204,28 +203,6 @@ pub struct Tiers {
     pub cache_creation: u64,
     pub cache_read: u64,
     pub output: u64,
-}
-
-impl Tiers {
-    fn is_zero(&self) -> bool {
-        self.input == 0 && self.cache_creation == 0 && self.cache_read == 0 && self.output == 0
-    }
-
-    fn add(&mut self, other: Tiers) {
-        self.input = self.input.saturating_add(other.input);
-        self.cache_creation = self.cache_creation.saturating_add(other.cache_creation);
-        self.cache_read = self.cache_read.saturating_add(other.cache_read);
-        self.output = self.output.saturating_add(other.output);
-    }
-
-    fn max(self, other: Tiers) -> Tiers {
-        Tiers {
-            input: self.input.max(other.input),
-            cache_creation: self.cache_creation.max(other.cache_creation),
-            cache_read: self.cache_read.max(other.cache_read),
-            output: self.output.max(other.output),
-        }
-    }
 }
 
 /// A fully priced window.
@@ -351,21 +328,104 @@ struct PricedUsage {
     cache_read_input_tokens: Option<Lenient<u64>>,
     #[serde(default)]
     output_tokens: Option<Lenient<u64>>,
+    /// `usage.cache_creation.{ephemeral_5m,ephemeral_1h}_input_tokens`.
+    #[serde(default)]
+    cache_creation: Option<serde_json::Value>,
+    /// `usage.speed` (`"standard"` / `"fast"`).
+    #[serde(default)]
+    speed: Option<serde_json::Value>,
+    /// `usage.inference_geo` (`"global"` / `"us"`).
+    #[serde(default)]
+    inference_geo: Option<serde_json::Value>,
 }
 
 impl PricedUsage {
     /// `None` when any present count is not a non-negative integer.
-    fn tiers(self) -> Option<Tiers> {
+    fn observed(self) -> Option<ObservedUsage> {
         let count = |v: Option<Lenient<u64>>| match v {
             None => Some(0),
             Some(l) => l.into_value(),
         };
-        Some(Tiers {
-            input: count(self.input_tokens)?,
-            cache_creation: count(self.cache_creation_input_tokens)?,
-            cache_read: count(self.cache_read_input_tokens)?,
-            output: count(self.output_tokens)?,
+        let cache_creation_split = match &self.cache_creation {
+            None | Some(serde_json::Value::Null) => CacheWriteSplit::Absent,
+            Some(serde_json::Value::Object(o)) => {
+                let part = |key: &str| match o.get(key) {
+                    None | Some(serde_json::Value::Null) => Some(0),
+                    Some(v) => v.as_u64(),
+                };
+                match (
+                    part("ephemeral_5m_input_tokens"),
+                    part("ephemeral_1h_input_tokens"),
+                ) {
+                    (Some(five_minute), Some(one_hour)) => CacheWriteSplit::Split {
+                        five_minute,
+                        one_hour,
+                    },
+                    _ => CacheWriteSplit::Malformed,
+                }
+            }
+            Some(_) => CacheWriteSplit::Malformed,
+        };
+        Some(ObservedUsage {
+            input_tokens: count(self.input_tokens)?,
+            cache_creation_input_tokens: count(self.cache_creation_input_tokens)?,
+            cache_read_input_tokens: count(self.cache_read_input_tokens)?,
+            output_tokens: count(self.output_tokens)?,
+            cache_creation_split,
+            speed: SpeedReport::from_json(self.speed.as_ref()),
+            inference_geo: GeoReport::from_json(self.inference_geo.as_ref()),
         })
+    }
+}
+
+fn is_zero(u: &ObservedUsage) -> bool {
+    u.input_tokens == 0
+        && u.cache_creation_input_tokens == 0
+        && u.cache_read_input_tokens == 0
+        && u.output_tokens == 0
+}
+
+/// The per-field maximum of two content-block lines of one `message.id`
+/// (the HORO-1882 rule). The modifiers do not differ between blocks of one
+/// message; if they ever do, the later non-absent report wins.
+fn merge_max(a: ObservedUsage, b: ObservedUsage) -> ObservedUsage {
+    let split = match (a.cache_creation_split, b.cache_creation_split) {
+        (CacheWriteSplit::Malformed, _) | (_, CacheWriteSplit::Malformed) => {
+            CacheWriteSplit::Malformed
+        }
+        (CacheWriteSplit::Absent, other) | (other, CacheWriteSplit::Absent) => other,
+        (
+            CacheWriteSplit::Split {
+                five_minute: a5,
+                one_hour: a1,
+            },
+            CacheWriteSplit::Split {
+                five_minute: b5,
+                one_hour: b1,
+            },
+        ) => CacheWriteSplit::Split {
+            five_minute: a5.max(b5),
+            one_hour: a1.max(b1),
+        },
+    };
+    ObservedUsage {
+        input_tokens: a.input_tokens.max(b.input_tokens),
+        cache_creation_input_tokens: a
+            .cache_creation_input_tokens
+            .max(b.cache_creation_input_tokens),
+        cache_read_input_tokens: a.cache_read_input_tokens.max(b.cache_read_input_tokens),
+        output_tokens: a.output_tokens.max(b.output_tokens),
+        cache_creation_split: split,
+        speed: if b.speed == SpeedReport::Absent {
+            a.speed
+        } else {
+            b.speed
+        },
+        inference_geo: if b.inference_geo == GeoReport::Absent {
+            a.inference_geo
+        } else {
+            b.inference_geo
+        },
     }
 }
 
@@ -374,9 +434,9 @@ impl PricedUsage {
 struct Accumulator {
     /// Id-keyed turns: per-field maximum of the repeated lines, and the
     /// model they reported.
-    by_id: HashMap<String, (Tiers, String)>,
-    /// Lines with no `message.id`, summed as they are.
-    per_model: BTreeMap<String, Tiers>,
+    by_id: HashMap<String, (ObservedUsage, String)>,
+    /// Lines with no `message.id`: each its own request, priced as it is.
+    unkeyed: Vec<(String, ObservedUsage)>,
     records: u64,
     id_less_records: u64,
     foreign: u64,
@@ -460,7 +520,7 @@ fn visit_line(
     let Some(usage) = message.usage else {
         return ControlFlow::Continue(());
     };
-    let usage = usage.into_value().and_then(PricedUsage::tiers);
+    let usage = usage.into_value().and_then(PricedUsage::observed);
     let message_id = message.id.and_then(Lenient::into_value);
     if let (ReadMode::ParentWindow { counted_ids, .. }, Some(id)) = (mode, message_id.as_ref()) {
         if counted_ids.contains(id) {
@@ -526,13 +586,13 @@ fn visit_line(
             acc.by_id
                 .entry(id)
                 .and_modify(|(t, m)| {
-                    *t = t.max(tiers);
+                    *t = merge_max(*t, tiers);
                     *m = model.clone();
                 })
                 .or_insert((tiers, model));
         }
         None => {
-            acc.per_model.entry(model).or_default().add(tiers);
+            acc.unkeyed.push((model, tiers));
             acc.id_less_records += 1;
         }
     }
@@ -554,11 +614,11 @@ fn finish(mut acc: Accumulator, table: &PricingTable) -> PricedObservation {
     let mut message_ids: Vec<String> = acc.by_id.keys().cloned().collect();
     message_ids.sort_unstable();
     if acc.future {
-        for (_, (tiers, model)) in acc.by_id.drain() {
-            acc.per_model.entry(model).or_default().add(tiers);
+        for (_, (usage, model)) in acc.by_id.drain() {
+            acc.unkeyed.push((model, usage));
         }
         let priced_cents = (distinct_turns > 0)
-            .then(|| window_cost_cents(&acc.per_model, table).ok())
+            .then(|| records_cost_cents(&acc.unkeyed, table).ok())
             .flatten();
         return PricedObservation::FutureTimestamp {
             priced_cents,
@@ -566,8 +626,8 @@ fn finish(mut acc: Accumulator, table: &PricingTable) -> PricedObservation {
             message_ids,
         };
     }
-    for (_, (tiers, model)) in acc.by_id.drain() {
-        acc.per_model.entry(model).or_default().add(tiers);
+    for (_, (usage, model)) in acc.by_id.drain() {
+        acc.unkeyed.push((model, usage));
     }
     if distinct_turns == 0 {
         return if acc.foreign > 0 {
@@ -576,7 +636,7 @@ fn finish(mut acc: Accumulator, table: &PricingTable) -> PricedObservation {
             PricedObservation::Unavailable(UsageUnavailable::NoUsageInWindow)
         };
     }
-    match window_cost_cents(&acc.per_model, table) {
+    match records_cost_cents(&acc.unkeyed, table) {
         Ok(cents) => PricedObservation::Priced(PricedWindow {
             cents,
             records: distinct_turns,
@@ -585,41 +645,85 @@ fn finish(mut acc: Accumulator, table: &PricingTable) -> PricedObservation {
             foreign_lines: acc.foreign,
             id_less_records: acc.id_less_records,
         }),
-        Err(models) => PricedObservation::UnpricedModels(models),
+        Err(WindowPriceError::Unpriced(models)) => PricedObservation::UnpricedModels(models),
+        Err(WindowPriceError::Unmeasurable) => PricedObservation::MalformedUsage,
     }
 }
 
-/// Prices `per_model` and rounds up to whole cents once.
+/// Why a window's records could not be priced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WindowPriceError {
+    /// Sorted models with non-zero usage and no price.
+    Unpriced(Vec<String>),
+    /// A record's usage report is contradictory or carries a modifier that
+    /// cannot be priced for its model (see
+    /// [`PricingTable::request_cost_pico`]).
+    Unmeasurable,
+}
+
+/// Prices every request in `records` with the gateway's own per-request
+/// arithmetic, sums exactly in integer pico-dollars and rounds up to whole
+/// cents once.
+fn records_cost_cents(
+    records: &[(String, ObservedUsage)],
+    table: &PricingTable,
+) -> Result<u64, WindowPriceError> {
+    let mut unpriced = BTreeSet::new();
+    let mut unmeasurable = false;
+    let mut pico: u128 = 0;
+    for (model, usage) in records {
+        if is_zero(usage) {
+            continue;
+        }
+        match table.request_cost_pico(model, usage) {
+            Ok(p) => pico = pico.saturating_add(p),
+            Err(RequestPriceError::Unpriced) => {
+                unpriced.insert(model.clone());
+            }
+            Err(RequestPriceError::Unmeasurable) => unmeasurable = true,
+        }
+    }
+    if !unpriced.is_empty() {
+        return Err(WindowPriceError::Unpriced(unpriced.into_iter().collect()));
+    }
+    if unmeasurable {
+        return Err(WindowPriceError::Unmeasurable);
+    }
+    Ok(u64::try_from(pico.div_ceil(PICO_PER_CENT)).unwrap_or(u64::MAX))
+}
+
+/// Prices `per_model` (one summed record per model, no cache TTL split, no
+/// modifiers: the OpenAI/Codex path, which has no 1-hour tier) and rounds up
+/// to whole cents once.
 ///
 /// `Err` carries the sorted models that have non-zero usage and no price.
-/// Exposed for tests so the arithmetic can be pinned against the
-/// gateway's `settled_cost` without writing a transcript.
 pub fn window_cost_cents(
     per_model: &BTreeMap<String, Tiers>,
     table: &PricingTable,
 ) -> Result<u64, Vec<String>> {
-    let mut unpriced = BTreeSet::new();
-    let mut pico: u128 = 0;
-    for (model, tiers) in per_model {
-        if tiers.is_zero() {
-            continue;
-        }
-        let Some(p) = table.lookup(model) else {
-            unpriced.insert(model.clone());
-            continue;
-        };
-        let per_token = |usd_per_mtok: f64| (usd_per_mtok * PRICE_SCALE).round() as u128;
-        pico = pico.saturating_add(
-            u128::from(tiers.input) * per_token(p.input_usd_per_mtok)
-                + u128::from(tiers.cache_creation) * per_token(p.cache_creation_input_usd_per_mtok)
-                + u128::from(tiers.cache_read) * per_token(p.cache_read_input_usd_per_mtok)
-                + u128::from(tiers.output) * per_token(p.output_usd_per_mtok),
-        );
-    }
-    if !unpriced.is_empty() {
-        return Err(unpriced.into_iter().collect());
-    }
-    Ok(u64::try_from(pico.div_ceil(PICO_PER_CENT)).unwrap_or(u64::MAX))
+    let records: Vec<(String, ObservedUsage)> = per_model
+        .iter()
+        .map(|(model, t)| {
+            (
+                model.clone(),
+                ObservedUsage {
+                    input_tokens: t.input,
+                    cache_creation_input_tokens: t.cache_creation,
+                    cache_read_input_tokens: t.cache_read,
+                    output_tokens: t.output,
+                    cache_creation_split: CacheWriteSplit::Split {
+                        five_minute: t.cache_creation,
+                        one_hour: 0,
+                    },
+                    ..ObservedUsage::default()
+                },
+            )
+        })
+        .collect();
+    records_cost_cents(&records, table).map_err(|e| match e {
+        WindowPriceError::Unpriced(models) => models,
+        WindowPriceError::Unmeasurable => Vec::new(),
+    })
 }
 
 #[cfg(test)]
@@ -644,9 +748,10 @@ mod tests {
     /// shape. `extra` is spliced in as additional top-level fields.
     fn line(secs: i64, id: &str, model: &str, t: [u64; 4], extra: &str) -> String {
         format!(
-            r#"{{"type":"assistant","timestamp":"{}",{extra}"message":{{"id":"{id}","model":"{model}","usage":{{"input_tokens":{},"cache_creation_input_tokens":{},"cache_read_input_tokens":{},"output_tokens":{}}}}}}}"#,
+            r#"{{"type":"assistant","timestamp":"{}",{extra}"message":{{"id":"{id}","model":"{model}","usage":{{"input_tokens":{},"cache_creation_input_tokens":{},"cache_creation":{{"ephemeral_5m_input_tokens":{},"ephemeral_1h_input_tokens":0}},"cache_read_input_tokens":{},"output_tokens":{}}}}}}}"#,
             rfc(secs),
             t[0],
+            t[1],
             t[1],
             t[2],
             t[3]
@@ -781,6 +886,11 @@ mod tests {
                     cache_creation_input_tokens: t[1],
                     cache_read_input_tokens: t[2],
                     output_tokens: t[3],
+                    cache_creation_split: CacheWriteSplit::Split {
+                        five_minute: t[1],
+                        one_hour: 0,
+                    },
+                    ..Default::default()
                 },
                 model,
                 &table,
@@ -1435,5 +1545,346 @@ mod tests {
         assert_eq!(read(Some("aaa")), PricedObservation::SessionMismatch);
         assert!(matches!(read(Some("zzz")), PricedObservation::Priced(_)));
         assert!(matches!(read(None), PricedObservation::Priced(_)));
+    }
+}
+
+/// HORO-2443 / HORO-2366: the pricing gaps found in v0.0.4 QA. Field names are
+/// the Anthropic Messages API `usage` object's (official docs, retrieved
+/// 2026-11-06) and were present on every assistant line of real Claude Code
+/// transcripts sampled on 2026-11-06 (aggregate counts only).
+#[cfg(test)]
+mod pricing_gap_tests {
+    use super::*;
+    use std::io::Write;
+
+    const SESSION: &str = "s1";
+
+    fn observe_usage(model: &str, usage_json: &str) -> PricedObservation {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","timestamp":"2026-11-06T02:55:19.521Z","sessionId":"{SESSION}","isSidechain":false,"message":{{"id":"m1","model":"{model}","usage":{{{usage_json}}}}}}}"#
+        )
+        .unwrap();
+        f.flush().unwrap();
+        observe_priced(
+            f.path(),
+            ReadMode::ParentWindow {
+                after: OffsetDateTime::UNIX_EPOCH,
+                counted_ids: &HashSet::new(),
+                horizon: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(4_000_000_000),
+            },
+            SESSION,
+            &PricingTable::pinned(),
+            BUDGET_SCAN_CAP_BYTES,
+        )
+    }
+
+    fn cents(o: PricedObservation) -> u64 {
+        match o {
+            PricedObservation::Priced(w) => w.cents,
+            other => panic!("expected Priced, got {other:?}"),
+        }
+    }
+
+    /// `input`/`output`/`cache_read` plus a cache write of `w5` (5m) and
+    /// `w1` (1h) tokens, with the top-level total consistent.
+    fn split(input: u64, w5: u64, w1: u64, cache_read: u64, output: u64, extra: &str) -> String {
+        format!(
+            r#""input_tokens":{input},"output_tokens":{output},"cache_creation_input_tokens":{},"cache_read_input_tokens":{cache_read},"cache_creation":{{"ephemeral_5m_input_tokens":{w5},"ephemeral_1h_input_tokens":{w1}}}{extra}"#,
+            w5 + w1
+        )
+    }
+
+    // ---- (a) 1-hour cache write = 2x base input ----
+
+    #[test]
+    fn a_one_hour_cache_write_is_priced_at_twice_base_input() {
+        // sonnet-4-6: $3 input, $3.75 5m write, $6 1h write.
+        let o = observe_usage("claude-sonnet-4-6", &split(0, 0, 1_000_000, 0, 0, ""));
+        assert_eq!(cents(o), 600);
+    }
+
+    #[test]
+    fn a_mixed_cache_write_prices_each_ttl_at_its_own_rate() {
+        // 400k * 3.75 + 600k * 6 = 1.5 + 3.6 = $5.10
+        let o = observe_usage("claude-sonnet-4-6", &split(0, 400_000, 600_000, 0, 0, ""));
+        assert_eq!(cents(o), 510);
+    }
+
+    #[test]
+    fn an_unattributed_cache_write_remainder_is_priced_as_one_hour() {
+        // Total 1M but the breakdown accounts for only 400k (all 1h): the
+        // other 600k are unknown and must not be priced as the cheaper tier.
+        let o = observe_usage(
+            "claude-sonnet-4-6",
+            r#""cache_creation_input_tokens":1000000,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":400000}"#,
+        );
+        assert_eq!(cents(o), 600);
+    }
+
+    #[test]
+    fn a_cache_write_without_a_ttl_breakdown_is_priced_as_one_hour() {
+        // Real hosts always carry the breakdown; an absent one is unknown.
+        let o = observe_usage(
+            "claude-sonnet-4-6",
+            r#""cache_creation_input_tokens":1000000"#,
+        );
+        assert_eq!(cents(o), 600);
+    }
+
+    #[test]
+    fn a_breakdown_larger_than_the_total_is_malformed() {
+        let o = observe_usage(
+            "claude-sonnet-4-6",
+            r#""cache_creation_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":100,"ephemeral_1h_input_tokens":100}"#,
+        );
+        assert_eq!(o, PricedObservation::MalformedUsage);
+    }
+
+    // ---- (c) Haiku 5.5 prompt-length tier ----
+
+    #[test]
+    fn haiku_5_5_prompts_up_to_100k_use_the_low_row() {
+        // 100,000-token prompt (50k input + 50k cache read), 1M output:
+        // 50k*0.10 + 50k*0.01 + 1M*0.50 = 0.005 + 0.0005 + 0.5 -> 51 cents.
+        let o = observe_usage(
+            "claude-haiku-5-5",
+            &split(50_000, 0, 0, 50_000, 1_000_000, ""),
+        );
+        assert_eq!(cents(o), 51);
+    }
+
+    #[test]
+    fn haiku_5_5_prompts_over_100k_use_the_high_row() {
+        // 100,001 tokens: 50k*0.50 + 50,001*0.05 + 1M*2.50 = 2.5275 -> 253.
+        let o = observe_usage(
+            "claude-haiku-5-5",
+            &split(50_000, 0, 0, 50_001, 1_000_000, ""),
+        );
+        assert_eq!(cents(o), 253);
+    }
+
+    #[test]
+    fn haiku_5_5_cache_writes_count_toward_the_prompt_length() {
+        // 60k input + 50k 5m write = 110k prompt -> high row:
+        // 60k*0.50 + 50k*0.625 = 0.03 + 0.03125 = 0.06125 -> 7 cents.
+        let o = observe_usage("claude-haiku-5-5", &split(60_000, 50_000, 0, 0, 0, ""));
+        assert_eq!(cents(o), 7);
+    }
+
+    // ---- (b) fast mode (2x) and US inference geo (1.1x) ----
+
+    #[test]
+    fn fast_mode_on_a_supported_model_is_priced_at_twice_standard() {
+        // opus-5 100k in + 50k out = $1.75 standard; fast = $10/$50 -> $3.50.
+        let o = observe_usage(
+            "claude-opus-5",
+            &split(100_000, 0, 0, 0, 50_000, r#","speed":"fast""#),
+        );
+        assert_eq!(cents(o), 350);
+    }
+
+    #[test]
+    fn us_inference_geo_is_priced_at_one_point_one_x() {
+        // $1.75 * 1.1 = $1.925 -> 193 cents.
+        let o = observe_usage(
+            "claude-opus-5",
+            &split(100_000, 0, 0, 0, 50_000, r#","inference_geo":"us""#),
+        );
+        assert_eq!(cents(o), 193);
+    }
+
+    #[test]
+    fn fast_and_us_geo_stack() {
+        // $3.50 * 1.1 = $3.85.
+        let o = observe_usage(
+            "claude-opus-5",
+            &split(
+                100_000,
+                0,
+                0,
+                0,
+                50_000,
+                r#","speed":"fast","inference_geo":"us""#,
+            ),
+        );
+        assert_eq!(cents(o), 385);
+    }
+
+    #[test]
+    fn standard_global_and_absent_modifiers_price_at_the_base_rate() {
+        for extra in [
+            "",
+            r#","speed":"standard","inference_geo":"global","service_tier":"standard""#,
+        ] {
+            let o = observe_usage("claude-opus-5", &split(100_000, 0, 0, 0, 50_000, extra));
+            assert_eq!(cents(o), 175, "{extra}");
+        }
+    }
+
+    #[test]
+    fn modifiers_that_cannot_be_priced_are_malformed_not_cheaper() {
+        for (model, extra) in [
+            // fast mode exists only on opus-5-5 / opus-5 / opus-4-8
+            ("claude-sonnet-4-6", r#","speed":"fast""#),
+            ("claude-opus-5", r#","speed":"turbo""#),
+            ("claude-opus-5", r#","speed":7"#),
+            // US geo only exists on 4.6+ models
+            ("claude-opus-4-5", r#","inference_geo":"us""#),
+            ("claude-opus-5", r#","inference_geo":"eu""#),
+        ] {
+            let o = observe_usage(model, &split(100_000, 0, 0, 0, 50_000, extra));
+            assert_eq!(o, PricedObservation::MalformedUsage, "{model} {extra}");
+        }
+    }
+
+    #[test]
+    fn a_pre_4_6_model_reporting_global_or_not_available_geo_is_standard() {
+        for geo in ["global", "not_available"] {
+            let o = observe_usage(
+                "claude-haiku-4-5",
+                &split(
+                    1_000_000,
+                    0,
+                    0,
+                    0,
+                    0,
+                    &format!(r#","inference_geo":"{geo}""#),
+                ),
+            );
+            assert_eq!(cents(o), 100, "{geo}");
+        }
+    }
+
+    // ---- (d) HORO-2366: an unlisted newer id is unpriced ----
+
+    #[test]
+    fn an_unlisted_newer_model_id_is_unpriced_so_the_window_settles_flat() {
+        let o = observe_usage("claude-opus-5-6", &split(100_000, 0, 0, 0, 100_000, ""));
+        assert_eq!(
+            o,
+            PricedObservation::UnpricedModels(vec!["claude-opus-5-6".to_string()])
+        );
+    }
+
+    /// The daemon's transcript pricing and the gateway's settlement must book
+    /// the same cents for the same reported usage (one shared arithmetic).
+    #[test]
+    fn transcript_pricing_equals_gateway_settlement_for_every_modifier() {
+        use libra_governor_domain::{ResourceAmount, ResourceKind};
+        use libra_governor_gateway::cost::settled_cost;
+        use libra_governor_gateway::usage::UsageAccumulator;
+
+        let cases: [(&str, String); 7] = [
+            ("claude-sonnet-4-6", split(10, 0, 999_983, 7, 3, "")),
+            (
+                "claude-sonnet-4-6",
+                split(12_345, 777, 888, 99_999, 4_321, ""),
+            ),
+            (
+                "claude-opus-5",
+                split(100_000, 50_001, 7, 3, 50_000, r#","speed":"fast""#),
+            ),
+            (
+                "claude-opus-5-5",
+                split(33_333, 0, 11, 0, 77, r#","inference_geo":"us""#),
+            ),
+            (
+                "claude-opus-4-8",
+                split(
+                    1_000_000,
+                    0,
+                    0,
+                    0,
+                    0,
+                    r#","speed":"fast","inference_geo":"us""#,
+                ),
+            ),
+            ("claude-haiku-5-5", split(50_000, 0, 0, 50_000, 12_345, "")),
+            (
+                "claude-haiku-5-5",
+                split(50_000, 1, 0, 50_000, 12_345, r#","inference_geo":"us""#),
+            ),
+        ];
+        for (model, usage_json) in cases {
+            let ours = cents(observe_usage(model, &usage_json));
+            let stream = format!(
+                "data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{{usage_json}}}}}}}\n\n"
+            );
+            let mut acc = UsageAccumulator::new();
+            acc.feed(stream.as_bytes());
+            let theirs = settled_cost(
+                ResourceKind::Usd,
+                &acc.observed().unwrap(),
+                model,
+                &PricingTable::pinned(),
+            )
+            .unwrap();
+            assert_eq!(
+                ResourceAmount::UsdCents(ours as i64),
+                theirs,
+                "{model} {usage_json}"
+            );
+        }
+    }
+
+    /// The eight HORO-2443 / HORO-2366 repro transcripts of the v0.0.4
+    /// post-publication QA (`pricing_impact_repro.py`), usage objects copied
+    /// verbatim, against the OFFICIAL cents. The script's own "official"
+    /// column used 1.1x for fast mode; the official fast-mode rows are 2x
+    /// (fast-mode and pricing pages, 2026-11-06), so those three differ from
+    /// the script's expectation.
+    #[test]
+    fn the_v0_0_4_repro_transcripts_book_the_official_cents() {
+        let rows: [(&str, &str, Option<u64>); 8] = [
+            (
+                "claude-sonnet-4-6",
+                r#""input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":1000000,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":1000000}"#,
+                Some(600),
+            ),
+            (
+                "claude-sonnet-4-6",
+                r#""input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":500000,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":500000}"#,
+                Some(300),
+            ),
+            (
+                "claude-opus-5",
+                r#""input_tokens":100000,"output_tokens":50000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"speed":"fast""#,
+                Some(350),
+            ),
+            (
+                "claude-opus-5",
+                r#""input_tokens":100000,"output_tokens":50000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"inference_geo":"us""#,
+                Some(193),
+            ),
+            (
+                "claude-haiku-5-5",
+                r#""input_tokens":90000,"output_tokens":1782000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0"#,
+                Some(90),
+            ),
+            (
+                "claude-opus-5-6",
+                r#""input_tokens":100000,"output_tokens":100000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0"#,
+                None,
+            ),
+            (
+                "claude-opus-5",
+                r#""input_tokens":100000,"output_tokens":140000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"speed":"fast""#,
+                Some(800),
+            ),
+            (
+                "claude-opus-5",
+                r#""input_tokens":1000000,"output_tokens":250000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"speed":"fast""#,
+                Some(2250),
+            ),
+        ];
+        for (model, usage_json, official) in rows {
+            match (observe_usage(model, usage_json), official) {
+                (PricedObservation::Priced(w), Some(c)) => assert_eq!(w.cents, c, "{model}"),
+                (PricedObservation::UnpricedModels(m), None) => assert_eq!(m, [model]),
+                (other, _) => panic!("{model}: unexpected {other:?}"),
+            }
+        }
     }
 }

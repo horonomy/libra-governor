@@ -271,9 +271,10 @@ fn rec(
         String::new()
     };
     format!(
-        r#"{{"type":"assistant","timestamp":"{}",{session}{side}"message":{{"id":"{id}","model":"{model}","usage":{{"input_tokens":{},"cache_creation_input_tokens":{},"cache_read_input_tokens":{},"output_tokens":{}}}}}}}"#,
+        r#"{{"type":"assistant","timestamp":"{}",{session}{side}"message":{{"id":"{id}","model":"{model}","usage":{{"input_tokens":{},"cache_creation_input_tokens":{},"cache_creation":{{"ephemeral_5m_input_tokens":{},"ephemeral_1h_input_tokens":0}},"cache_read_input_tokens":{},"output_tokens":{}}}}}}}"#,
         at(secs).format(&Rfc3339).unwrap(),
         tiers[0],
+        tiers[1],
         tiers[1],
         tiers[2],
         tiers[3],
@@ -4392,4 +4393,82 @@ fn session_end_frees_capacity_for_a_second_session() {
     tail(&mut fx, "s1", &s(&tx));
     grant(fx.admit("s2", None, None));
     assert_eq!(totals(&fx.status()), (300, 1_000));
+}
+
+// ---------------------------------------------------------------------
+// HORO-2443: pricing gaps flip admission (v0.0.4 post-publication QA)
+// ---------------------------------------------------------------------
+
+fn raw_usage_line(secs: i64, id: &str, model: &str, usage_json: &str) -> String {
+    format!(
+        r#"{{"type":"assistant","timestamp":"{}","sessionId":"s1","message":{{"id":"{id}","model":"{model}","usage":{{{usage_json}}}}}}}"#,
+        at(secs).format(&Rfc3339).unwrap(),
+    )
+}
+
+#[test]
+fn a_one_hour_cache_write_is_booked_at_its_dearer_rate_so_the_next_prompt_is_refused() {
+    // Cap $5, turn hold $1. 1M tokens written at the 1-hour tier on
+    // sonnet-4-6 cost $6.00 officially; booked at the 5-minute rate ($3.75)
+    // the budget would still show $1.25 and admit the next prompt.
+    let mut fx = Fx::new(Some(&cfg_json(500, "UTC", 100)), BASE);
+    fx.admit_hold("s1");
+    let tx = fx.path().join("s1.jsonl");
+    write_lines(
+        &tx,
+        &[raw_usage_line(
+            10,
+            "m1",
+            "claude-sonnet-4-6",
+            r#""input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":1000000,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":1000000}"#,
+        )],
+    );
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(totals(&fx.status()), (600, 0));
+    expect_cap_exhausted(fx.admit("s2", None, None), -100);
+}
+
+#[test]
+fn fast_mode_is_booked_at_twice_standard_so_a_boundary_prompt_is_refused() {
+    // Cap $5, hold $1. opus-5 fast: 100k in + 140k out = $8.00 officially
+    // (standard $4.00 would leave exactly the $1.00 hold and admit).
+    let mut fx = Fx::new(Some(&cfg_json(500, "UTC", 100)), BASE);
+    fx.admit_hold("s1");
+    let tx = fx.path().join("s1.jsonl");
+    write_lines(
+        &tx,
+        &[raw_usage_line(
+            10,
+            "m1",
+            "claude-opus-5",
+            r#""input_tokens":100000,"output_tokens":140000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"speed":"fast""#,
+        )],
+    );
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(totals(&fx.status()), (800, 0));
+    expect_cap_exhausted(fx.admit("s2", None, None), -300);
+}
+
+#[test]
+fn a_short_haiku_5_5_prompt_is_booked_at_the_low_row_so_the_next_prompt_is_admitted() {
+    // Cap $5, hold $1. 90k in + 1.782M out on Haiku 5.5 costs $0.90; at the
+    // over-100k row ($4.50) the budget would refuse the next prompt.
+    let mut fx = Fx::new(Some(&cfg_json(500, "UTC", 100)), BASE);
+    fx.admit_hold("s1");
+    let tx = fx.path().join("s1.jsonl");
+    write_lines(
+        &tx,
+        &[raw_usage_line(
+            10,
+            "m1",
+            "claude-haiku-5-5",
+            r#""input_tokens":90000,"output_tokens":1782000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0"#,
+        )],
+    );
+    fx.clock.set(at(60));
+    fx.finalize("s1", Some(&s(&tx)));
+    assert_eq!(totals(&fx.status()), (90, 0));
+    let _ = grant(fx.admit("s2", None, None));
 }

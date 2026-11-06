@@ -250,6 +250,7 @@ impl Fx {
             body_bytes: 0,
             max_tokens: Some(10),
             image_count: 0,
+            fast_requested: false,
             key: &key,
             ttl_secs: 600,
         };

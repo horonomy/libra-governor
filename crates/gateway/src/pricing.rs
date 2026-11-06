@@ -41,7 +41,7 @@ use std::collections::BTreeMap;
 /// list prices; USD in this crate means
 /// Libra-accounted list-price-equivalent USD at this version, never a
 /// provider bill or quota.
-pub const PRICING_VERSION: &str = "pricing-2026-11-static-v3";
+pub const PRICING_VERSION: &str = "pricing-2026-11-static-v4";
 
 /// Per-million-token USD prices for one model.
 ///
@@ -62,18 +62,154 @@ pub struct ModelPricing {
 }
 
 impl ModelPricing {
+    /// The 1-hour cache-write price. Anthropic charges 2x base input for the
+    /// 1-hour tier (and 1.25x for the 5-minute tier this struct stores), so
+    /// it is derived rather than stored: existing four-field overrides keep
+    /// parsing. A provider whose cache write is not dearer than ordinary
+    /// input (OpenAI rows) has no 1-hour tier, so the price stays at input.
+    pub fn one_hour_cache_creation_usd_per_mtok(&self) -> f64 {
+        if self.cache_creation_input_usd_per_mtok > self.input_usd_per_mtok {
+            self.input_usd_per_mtok * 2.0
+        } else {
+            self.input_usd_per_mtok
+        }
+    }
+
     /// The most expensive per-token input price this model can charge.
     ///
     /// Used for the pre-flight reservation: before the request is sent we
     /// cannot know which cache tier its input will land in, so the
-    /// reservation must assume the worst one. Settlement then corrects
-    /// downward using the provider's own per-tier counts.
+    /// reservation must assume the worst one (the 1-hour cache write).
+    /// Settlement then corrects downward using the provider's own per-tier
+    /// counts.
     pub fn worst_case_input_usd_per_mtok(&self) -> f64 {
         self.input_usd_per_mtok
             .max(self.cache_creation_input_usd_per_mtok)
+            .max(self.one_hour_cache_creation_usd_per_mtok())
             .max(self.cache_read_input_usd_per_mtok)
     }
 }
+
+/// How a request's cache-write tokens split by TTL, as reported by the
+/// provider's `usage.cache_creation` object (`ephemeral_5m_input_tokens`,
+/// `ephemeral_1h_input_tokens`). Official docs: the two sum to the top-level
+/// `cache_creation_input_tokens`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheWriteSplit {
+    /// No breakdown reported. Real Claude Code transcripts always carry one,
+    /// so an absent one is unknown and is priced at the dearer 1-hour rate.
+    #[default]
+    Absent,
+    Split {
+        five_minute: u64,
+        one_hour: u64,
+    },
+    /// A breakdown count that is not a non-negative integer.
+    Malformed,
+}
+
+impl CacheWriteSplit {
+    /// `(five_minute, one_hour)` tokens for a request that wrote `total`
+    /// cache tokens, or `None` when the report is contradictory. Tokens the
+    /// breakdown does not account for are priced as 1-hour (never cheaper).
+    pub fn resolve(self, total: u64) -> Option<(u64, u64)> {
+        match self {
+            Self::Absent => Some((0, total)),
+            Self::Split {
+                five_minute,
+                one_hour,
+            } => {
+                let sum = five_minute.checked_add(one_hour)?;
+                let rest = total.checked_sub(sum)?;
+                Some((five_minute, one_hour.saturating_add(rest)))
+            }
+            Self::Malformed => None,
+        }
+    }
+}
+
+/// The `usage.speed` a response reported (`"standard"` or `"fast"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpeedReport {
+    /// Field absent: fast mode is opt-in, so absent means standard. ASSUMED
+    /// (real hosts always carry it; a missing one has not been observed
+    /// meaning anything else).
+    #[default]
+    Absent,
+    Standard,
+    Fast,
+    /// Any other value, or a non-string: cannot be priced.
+    Unrecognised,
+}
+
+impl SpeedReport {
+    pub fn from_json(value: Option<&serde_json::Value>) -> Self {
+        match value {
+            None | Some(serde_json::Value::Null) => Self::Absent,
+            Some(serde_json::Value::String(s)) if s == "standard" => Self::Standard,
+            Some(serde_json::Value::String(s)) if s == "fast" => Self::Fast,
+            Some(_) => Self::Unrecognised,
+        }
+    }
+}
+
+/// The `usage.inference_geo` a response reported (`"global"` or `"us"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GeoReport {
+    /// Field absent: treated as global. ASSUMED (a workspace default can make
+    /// a request US-only with nothing in the request; real hosts report it).
+    #[default]
+    Absent,
+    Global,
+    Us,
+    /// Any other value (e.g. `not_available` on a model without the feature).
+    Other,
+}
+
+impl GeoReport {
+    pub fn from_json(value: Option<&serde_json::Value>) -> Self {
+        match value {
+            None | Some(serde_json::Value::Null) => Self::Absent,
+            Some(serde_json::Value::String(s)) if s == "global" => Self::Global,
+            Some(serde_json::Value::String(s)) if s == "us" => Self::Us,
+            Some(_) => Self::Other,
+        }
+    }
+}
+
+/// Why a request could not be priced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestPriceError {
+    /// No entry for the model (see [`PricingTable::lookup`]).
+    Unpriced,
+    /// The usage report is contradictory or names a modifier this table
+    /// cannot price for the model (fast mode on a model without it, US geo
+    /// on a pre-4.6 model, an unrecognised value). Nothing is guessed.
+    Unmeasurable,
+}
+
+/// Models with a fast-mode price (official: Opus 5.5, Opus 5, Opus 4.8). Fast
+/// mode is 2x the standard row on all four tiers (the caching multipliers
+/// stack on top).
+const FAST_MODE_MODELS: &[&str] = &["claude-opus-5-5", "claude-opus-5", "claude-opus-4-8"];
+/// Models that accept `inference_geo` (official: Claude 4.6 and later).
+/// `"us"` is 1.1x on every tier.
+const US_GEO_MODELS: &[&str] = &[
+    "claude-fable-5-1",
+    "claude-fable-5",
+    "claude-opus-5-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-sonnet-5-5",
+    "claude-sonnet-5",
+    "claude-sonnet-4-6",
+    "claude-haiku-5-5",
+];
+/// Prompt length (input + cache writes + cache reads of one request) above
+/// which Haiku 5.5 bills its higher row.
+pub const LONG_PROMPT_TOKENS: u64 = 100_000;
 
 /// A pinned set of per-model prices, optionally extended or corrected by
 /// operator-supplied overrides.
@@ -103,8 +239,9 @@ const fn openai(input: f64, cached_input: f64, output: f64) -> ModelPricing {
 /// table and a newer sibling id is never priced at an older entry.
 const PINNED: &[(&str, ModelPricing)] = &[
     // Current generation (HORO-2192). `cache_creation_input_usd_per_mtok` is
-    // the 5-minute cache-write price; the 1-hour tier (2x base input) is not
-    // modelled by `ModelPricing`. Exact/dated matching keeps e.g.
+    // the 5-minute cache-write price; the 1-hour tier (2x base input) is
+    // derived (`ModelPricing::one_hour_cache_creation_usd_per_mtok`). Exact/dated
+    // matching keeps e.g.
     // `claude-opus-5-5` from falling to `claude-opus-5`.
     // Fable 5.1 and Opus/Sonnet 5.5 have a discounted cache-read multiplier
     // (0.025x and 0.05x of base input respectively) per the pricing page.
@@ -208,10 +345,10 @@ const PINNED: &[(&str, ModelPricing)] = &[
         },
     ),
     // Haiku 5.5 is priced by prompt length on the official page: $0.10 input /
-    // $0.125 cache write / $0.01 cache read / $0.50 output up to 100k prompt
-    // tokens, and 5x that above 100k. `ModelPricing` has one price per tier, so
-    // the over-100k prices are pinned: reservations stay conservative and
-    // short-prompt settlements over-account rather than under-account.
+    // $0.125 cache write / $0.01 cache read / $0.50 output up to 100,000 prompt
+    // tokens ([`SHORT_PROMPT_TIERS`]), and 5x that above. This entry is the
+    // over-100k row: a reservation cannot know the prompt length, so it takes
+    // the dearer row; settlement picks the row per request.
     (
         "claude-haiku-5-5",
         ModelPricing {
@@ -292,6 +429,20 @@ const PINNED: &[(&str, ModelPricing)] = &[
     ("gpt-5.3-codex", openai(1.75, 0.175, 14.0)),
 ];
 
+/// Rows used instead of the [`PINNED`] entry of the same id when one request's
+/// prompt is at most [`LONG_PROMPT_TOKENS`] (official Haiku 5.5 "prompts up
+/// to 100,000 tokens" row, retrieved 2026-11-06). Applies only while the
+/// entry is the pinned one: an operator override of that id wins outright.
+const SHORT_PROMPT_TIERS: &[(&str, ModelPricing)] = &[(
+    "claude-haiku-5-5",
+    ModelPricing {
+        input_usd_per_mtok: 0.10,
+        cache_creation_input_usd_per_mtok: 0.125,
+        cache_read_input_usd_per_mtok: 0.01,
+        output_usd_per_mtok: 0.50,
+    },
+)];
+
 impl PricingTable {
     /// The model ids the pinned snapshot lists (read-only; `doctor` uses it to
     /// report which Codex models are covered without an override).
@@ -352,8 +503,13 @@ impl PricingTable {
     /// Returns `None` when nothing matches — the caller must then refuse,
     /// never guess. See [`crate::cost::worst_case_reservation`].
     pub fn lookup(&self, model: &str) -> Option<ModelPricing> {
-        if let Some(exact) = self.entries.get(model) {
-            return Some(*exact);
+        self.resolve(model).map(|(_, pricing)| pricing)
+    }
+
+    /// [`Self::lookup`] plus the table key the id resolved to.
+    fn resolve(&self, model: &str) -> Option<(&str, ModelPricing)> {
+        if let Some((key, exact)) = self.entries.get_key_value(model) {
+            return Some((key.as_str(), *exact));
         }
         self.entries
             .iter()
@@ -363,9 +519,103 @@ impl PricingTable {
                     .is_some_and(is_dated_snapshot_suffix)
             })
             .max_by_key(|(key, _)| key.len())
-            .map(|(_, pricing)| *pricing)
+            .map(|(key, pricing)| (key.as_str(), *pricing))
+    }
+
+    /// The exact cost of one request in pico-dollars (10^-12 USD), from the
+    /// provider's reported usage, shared by the gateway's settlement and the
+    /// daemon's transcript pricing so the two cannot drift.
+    ///
+    /// Official list-price rules (retrieved 2026-11-06, see
+    /// [`PRICING_VERSION`]): the 1-hour cache write is 2x base input; Haiku
+    /// 5.5 bills a lower row when the request's prompt (input, cache writes
+    /// and cache reads together) is at most [`LONG_PROMPT_TOKENS`]; fast mode (Opus 5.5,
+    /// 5, 4.8 only) is 2x every tier; `inference_geo: "us"` (Claude 4.6 and
+    /// later only) is 1.1x every tier; both stack. Integer arithmetic only,
+    /// the 1.1x rounded up.
+    pub fn request_cost_pico(
+        &self,
+        model: &str,
+        usage: &crate::usage::ObservedUsage,
+    ) -> Result<u128, RequestPriceError> {
+        let (key, mut price) = self.resolve(model).ok_or(RequestPriceError::Unpriced)?;
+        let (write_5m, write_1h) = usage
+            .cache_creation_split
+            .resolve(usage.cache_creation_input_tokens)
+            .ok_or(RequestPriceError::Unmeasurable)?;
+
+        let fast = match usage.speed {
+            SpeedReport::Absent | SpeedReport::Standard => false,
+            SpeedReport::Fast if FAST_MODE_MODELS.contains(&key) => true,
+            SpeedReport::Fast | SpeedReport::Unrecognised => {
+                return Err(RequestPriceError::Unmeasurable)
+            }
+        };
+        let us_geo = match usage.inference_geo {
+            GeoReport::Absent | GeoReport::Global => false,
+            GeoReport::Us if US_GEO_MODELS.contains(&key) => true,
+            GeoReport::Us => return Err(RequestPriceError::Unmeasurable),
+            // A model without the feature has nothing to report; on one that
+            // has it an unrecognised value cannot be priced.
+            GeoReport::Other if US_GEO_MODELS.contains(&key) => {
+                return Err(RequestPriceError::Unmeasurable)
+            }
+            GeoReport::Other => false,
+        };
+
+        let prompt = usage
+            .input_tokens
+            .saturating_add(usage.cache_creation_input_tokens)
+            .saturating_add(usage.cache_read_input_tokens);
+        if prompt <= LONG_PROMPT_TOKENS {
+            let pinned_entry = PINNED.iter().any(|(m, p)| *m == key && *p == price);
+            if let Some((_, short)) = SHORT_PROMPT_TIERS.iter().find(|(m, _)| *m == key) {
+                if pinned_entry {
+                    price = *short;
+                }
+            }
+        }
+
+        let per_token = |usd_per_mtok: f64| (usd_per_mtok * PRICE_SCALE).round() as u128;
+        let mut pico = u128::from(usage.input_tokens) * per_token(price.input_usd_per_mtok)
+            + u128::from(write_5m) * per_token(price.cache_creation_input_usd_per_mtok)
+            + u128::from(write_1h) * per_token(price.one_hour_cache_creation_usd_per_mtok())
+            + u128::from(usage.cache_read_input_tokens)
+                * per_token(price.cache_read_input_usd_per_mtok)
+            + u128::from(usage.output_tokens) * per_token(price.output_usd_per_mtok);
+        if fast {
+            pico = pico.saturating_mul(2);
+        }
+        if us_geo {
+            pico = pico.saturating_mul(11).div_ceil(10);
+        }
+        Ok(pico)
+    }
+
+    /// The factor a pre-flight reservation multiplies its worst case by so
+    /// that settlement can never exceed it: 1.1 on a model that accepts
+    /// `inference_geo` (a workspace default can make any request US-only),
+    /// and 2 more when the request itself asks for fast mode on a model that
+    /// has it. 1.0 for an unlisted model (the caller refuses it anyway).
+    pub fn worst_case_multiplier(&self, model: &str, fast_requested: bool) -> f64 {
+        let Some((key, _)) = self.resolve(model) else {
+            return 1.0;
+        };
+        let mut factor = 1.0;
+        if fast_requested && FAST_MODE_MODELS.contains(&key) {
+            factor *= 2.0;
+        }
+        if US_GEO_MODELS.contains(&key) {
+            factor *= 1.1;
+        }
+        factor
     }
 }
+
+/// Pico-dollars per whole USD-per-million-tokens unit: prices are dollars
+/// per million tokens, i.e. micro-dollars per token; scaled by 10^6 that is
+/// pico-dollars per token, exact for any price with up to six decimals.
+const PRICE_SCALE: f64 = 1_000_000.0;
 
 /// `-YYYYMMDD`: a dash then exactly eight ASCII digits, nothing else.
 fn is_dated_snapshot_suffix(rest: &str) -> bool {
@@ -452,9 +702,10 @@ mod tests {
         let pricing = PricingTable::pinned().lookup("claude-sonnet-4-5").unwrap();
         assert_eq!(
             pricing.worst_case_input_usd_per_mtok(),
-            pricing.cache_creation_input_usd_per_mtok,
-            "cache creation is the priciest input tier — a reservation must assume it"
+            pricing.one_hour_cache_creation_usd_per_mtok(),
+            "the 1-hour cache write is the priciest input tier — a reservation must assume it"
         );
+        assert_eq!(pricing.one_hour_cache_creation_usd_per_mtok(), 6.0);
     }
 
     #[test]
@@ -541,7 +792,7 @@ mod tests {
 
     #[test]
     fn pricing_version_names_this_snapshot() {
-        assert_eq!(PRICING_VERSION, "pricing-2026-11-static-v3");
+        assert_eq!(PRICING_VERSION, "pricing-2026-11-static-v4");
     }
 
     // ---- HORO-2366: a variant is never priced at the older entry ----
@@ -663,5 +914,71 @@ mod tests {
         let table = PricingTable::pinned();
         assert_eq!(table.lookup("claude-unreleased-9"), None);
         assert_eq!(table.lookup("claude-mythos-5-1"), None);
+    }
+
+    // ---- HORO-2443: tiers and modifiers ----
+
+    #[test]
+    fn one_hour_write_is_twice_input_for_every_anthropic_row_and_input_for_openai() {
+        for (model, pricing) in PINNED {
+            let expected = if model.starts_with("claude-") {
+                pricing.input_usd_per_mtok * 2.0
+            } else {
+                pricing.input_usd_per_mtok
+            };
+            assert_eq!(
+                pricing.one_hour_cache_creation_usd_per_mtok(),
+                expected,
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_override_of_the_haiku_id_replaces_both_prompt_length_rows() {
+        let price = ModelPricing {
+            input_usd_per_mtok: 1.0,
+            cache_creation_input_usd_per_mtok: 1.25,
+            cache_read_input_usd_per_mtok: 0.1,
+            output_usd_per_mtok: 5.0,
+        };
+        let table =
+            PricingTable::with_overrides(BTreeMap::from([("claude-haiku-5-5".to_string(), price)]));
+        let usage = crate::usage::ObservedUsage {
+            input_tokens: 1_000_000,
+            cache_creation_split: CacheWriteSplit::Split {
+                five_minute: 0,
+                one_hour: 0,
+            },
+            ..Default::default()
+        };
+        // Short prompt, but the override has no lower row: $1.00 = 1e12 pico.
+        assert_eq!(
+            table.request_cost_pico("claude-haiku-5-5", &usage),
+            Ok(1_000_000_000_000 / 10 * 10)
+        );
+    }
+
+    #[test]
+    fn the_cache_write_split_never_prices_unknown_tokens_cheaper() {
+        let split = |five_minute, one_hour| CacheWriteSplit::Split {
+            five_minute,
+            one_hour,
+        };
+        assert_eq!(CacheWriteSplit::Absent.resolve(10), Some((0, 10)));
+        assert_eq!(split(4, 6).resolve(10), Some((4, 6)));
+        assert_eq!(split(4, 1).resolve(10), Some((4, 6)));
+        assert_eq!(split(8, 8).resolve(10), None);
+        assert_eq!(CacheWriteSplit::Malformed.resolve(0), None);
+    }
+
+    #[test]
+    fn worst_case_multiplier_covers_geo_and_requested_fast_mode() {
+        let table = PricingTable::pinned();
+        assert_eq!(table.worst_case_multiplier("claude-sonnet-4-5", true), 1.0);
+        assert_eq!(table.worst_case_multiplier("claude-sonnet-4-6", true), 1.1);
+        assert_eq!(table.worst_case_multiplier("claude-opus-5", false), 1.1);
+        assert_eq!(table.worst_case_multiplier("claude-opus-5", true), 2.2);
+        assert_eq!(table.worst_case_multiplier("no-such-model", true), 1.0);
     }
 }

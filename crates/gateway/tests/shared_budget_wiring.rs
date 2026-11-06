@@ -101,6 +101,7 @@ fn an_enforced_request_reserves_both_budgets_and_settles_the_hold_it_was_granted
         body_bytes,
         max_tokens,
         image_count,
+        fast_requested,
         request_id,
     } = shared(&gw).reserves()[0].clone()
     else {
@@ -111,6 +112,7 @@ fn an_enforced_request_reserves_both_budgets_and_settles_the_hold_it_was_granted
     assert_eq!(body_bytes, body.len(), "the full body length, not a subset");
     assert_eq!(max_tokens, Some(1_000));
     assert_eq!(image_count, 0);
+    assert!(!fast_requested);
     assert_eq!(
         Some(request_id.as_str()),
         response.header("x-libra-request-id")

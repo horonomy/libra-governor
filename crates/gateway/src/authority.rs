@@ -187,6 +187,9 @@ pub struct SharedReserveRequest<'a> {
     pub body_bytes: usize,
     pub max_tokens: Option<u64>,
     pub image_count: usize,
+    /// The body asks for anything but standard speed (fast mode is 2x), so the
+    /// worst case must include its premium.
+    pub fast_requested: bool,
     /// The per-request id; the authority joins it with its own boot id.
     pub request_id: &'a str,
     pub ttl_secs: u64,

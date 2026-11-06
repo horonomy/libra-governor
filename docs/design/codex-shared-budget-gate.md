@@ -204,7 +204,7 @@ Daemon `settle_codex_turn` (it deliberately differs from Claude's `settle_turn` 
 **Pricing (C9, delivered).** The pinned table now lists six OpenAI models from the OpenAI pricing page
 <https://developers.openai.com/api/docs/pricing> (retrieved 2026-11-05, no update date on the page; standard tier,
 short context <=272K input tokens): gpt-6.1-sol, gpt-6.1-terra, gpt-6-sol, gpt-6-astra, gpt-6-luna,
-gpt-5.3-codex (`PRICING_VERSION` `pricing-2026-11-static-v3`). Cache creation is priced as input (OpenAI has no
+gpt-5.3-codex (`PRICING_VERSION` `pricing-2026-11-static-v4`). Cache creation is priced as input (OpenAI has no
 cache-write surcharge). `gpt-5.6-*` is not pinned (promotional Sol price until 2026-11-30). Lookup matches a
 pinned or override id exactly or with a `-YYYYMMDD` suffix only (HORO-2366), so `gpt-6.1-sol-pro` is unpriced.
 A model that is neither pinned nor overridden settles at the flat hold with `usage_known=false`, and
