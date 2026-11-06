@@ -65,7 +65,7 @@ All paths are relative to the repo root.
 | Truncated stream settles at partial usage | under-count | proxy.rs:1234-1243 [V] | Shared path: settle = exact input tiers from `message_start` + `max_tokens × output`, or the full reservation if `message_start` was not seen; `usage_known=false` (S11b) |
 | Input tokens > `bytes/3` (dense Unicode or emoji, the API's tool-use system prompt) | actual > reserved, an overrun | cost.rs:37-42 calls 3.0 "deliberately low" but it is a heuristic [V]; tokenizer behaviour [I] | Hard mode uses `bytes / 1.0` (byte-level BPE gives ≥1 byte per token [I]) plus a per-image constant and a tool-prompt constant. Detect and record `input_bound_violated`, mirroring `bound_violated` (cost.rs:172-174) |
 | Inline images and documents (base64) are billed by rendering, not bytes [I] | either direction. Base64 screenshots inflate the reservation, so R2 is understated. A small many-page PDF can exceed the bound, which is an overrun | body is not inspected (proxy.rs:308-323) [V] | Hard mode excludes `source.data` payload bytes from the byte bound and adds per-block constants (an image maximum and a per-page PDF maximum, values [I] until S11a/API docs). Inventory both in S11a. S11a result: base64 image/PDF blocks are nested in `tool_result`; synthetic sizes only, constants unassessed |
-| Content not in the body: `source.type` url/file, Files API, `mcp_servers`, `container`, server tools (`web_search_*`, `web_fetch_*`, `code_execution_*`) | unbounded input, plus per-use fees not in `usage` | body is not inspected beyond 3 fields (proxy.rs:308-323) [V]; field names [I] | Hard mode refuses with `403 unenforceable_request` (a structural check; nothing is retained). **This breaks Claude Code WebSearch [I]**, which is a founder item |
+| *(S11a observed `web_search_20250305`, so Claude Code WebSearch is refused in hard mode; see the evidence note.)* Content not in the body: `source.type` url/file, Files API, `mcp_servers`, `container`, server tools (`web_search_*`, `web_fetch_*`, `code_execution_*`) | unbounded input, plus per-use fees not in `usage` | body is not inspected beyond 3 fields (proxy.rs:308-323) [V]; field names [I] | Hard mode refuses with `403 unenforceable_request` (a structural check; nothing is retained). **This breaks Claude Code WebSearch [I]**, which is a founder item |
 | 1-hour cache-write tier (2× base input, above the 1.25× 5-minute rate) | the reserve under-states the bill; the settle also under-states it (`ephemeral_1h` is not parsed, usage.rs:79-85) | pricing.rs:90-93, ADR-0026:129-131 [V] | Libra-accounted totals stay ≤ cap because reserve and settle use the same model. This is bill drift, not a Libra overrun. Optional S11h models it and bumps `PRICING_VERSION` |
 | Fast mode, `inference_geo` 1.1×, long-context premium | bill drift | ADR-0026:132-133 [V] | Disclosed residual. S11a: no `speed`/`inference_geo`/`service_tier` key and no `ttl` observed |
 | Haiku 5.5 short prompts | over-count by about 5× | pricing.rs:195-199 [V] | Conservative, so no action |
@@ -339,7 +339,7 @@ independent. S11a gates **enablement**, not building.
     speed/geo/beta flags, whether `max_tokens` is always present. Record tags only, no content.
   - Record whether WebSearch uses a server tool.
 - **AC:**
-  - Each [H] in §2 and §1.3 is marked confirmed or refuted, with the CLI version. **Done** (claude 2.1.306; see the evidence note).
+  - Each [H] in §2 and §1.3 is marked confirmed, refuted or not observed, with the CLI version. **Done** (claude 2.1.306; see the evidence note).
   - No secret, prompt or body content is stored.
 - **Proposed title:** "S11a: capture Claude Code gateway request identity and envelope shape
   (TestOwnedLive)".
@@ -522,7 +522,7 @@ independent. S11a gates **enablement**, not building.
   answer cannot change safety, only accuracy.
 - **Q3:** Does the hook path always create `session_tasks`, which the gateway's task gate
   requires (crates/ledger/src/session.rs:49-64)? If not, gateway mode refuses `task_unbound`.
-  Verify in S11a and S11e integration tests.
+  Verify in S11a and S11e integration tests. (S11a did not cover this: it did not examine `session_tasks`.)
 - **Q4:** Founder choice between replace and `message.id` dedupe (§3.4).
 
 ---
