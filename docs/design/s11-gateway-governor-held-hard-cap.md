@@ -530,10 +530,15 @@ independent. S11a gates **enablement**, not building.
   `unrouted_sessions`, `orphans_booked` (all `serde(default)`).
 - Admit in gateway mode is a pure read (no pool creation, no sweep). It denies `cap_exhausted`
   when remaining is below the turn hold unless the lane still has a live pre-flip hold, and
-  `gateway_unavailable` (fail closed, after the file, identity and clock checks) when the daemon
-  runs no `governor_held` gateway; that is judged by the same validation `GatewayStatus` and
-  `doctor` use. Scoped to Claude lanes; Codex keeps hooks semantics.
-- PreToolUse `Check` in gateway mode answers `available` (an invalid file still denies): no hold
+  `gateway_unavailable` (fail closed, after the file, identity and clock checks) unless a
+  `governor_held` gateway is actually running. That is a runtime state (`GatewayRun` on the shared
+  budget runtime): set only when `start_gateway` got as far as spawning the gateway thread (after
+  config validation, its ledger connection and the credential/token build), and cleared when the
+  thread exits for any reason (bind error, runtime error, shutdown). `GatewayStatus` reports
+  `running` from the same state, so `doctor` says "not running" in those cases. Recovery is a
+  daemon restart, or setting `enforcement` back to `hooks`. Scoped to Claude lanes; Codex keeps hooks semantics.
+- PreToolUse `Check` in gateway mode answers `available` only while that gateway runs (else it
+  denies `gateway_unavailable`; an invalid file still denies): no hold
   backs the turn, so the turn-hold test could wedge an admitted turn, and the gateway refuses each
   request on its own.
 - `ChargeAgentTranscript` (SubagentStop), `SettleTail` (SessionEnd, after settling any pre-flip
@@ -559,3 +564,17 @@ independent. S11a gates **enablement**, not building.
 - In gateway mode PreToolUse `Check` still reports `exhausted` when remaining < turn hold, so tool
   calls can be denied mid-turn once gateway reservations shrink remaining; this is stricter than
   hooks mode.
+
+- **Residuals of the flip back to hooks.**
+  - The watermark moves to the time of the last gateway-mode Stop/SessionEnd, so transcript
+    usage that the gateway metered *less* than (partial metering, a truncated settle that booked
+    the reservation instead, a request the gateway refused after the host had already counted it)
+    is forgiven after the flip, not recovered by the hooks. This is an under-count direction and
+    is pinned by a test.
+  - A subagent that finished before the flip to gateway mode but whose `SubagentStop`/sweep has
+    not run yet is charged by neither: after the flip it is a gateway-mode file and its offset row
+    forgives its cost.
+  - A retention prune of a past month deletes that month's `gateway-mark:` and `g<N>` rows, so a
+    flip-back window of that month is no longer protected (over-count direction).
+  - The Stop sweep now lists and prices subagent files in gateway mode (bounded by the same
+    file-count and byte budget as in hooks mode) to write offsets.
