@@ -2959,6 +2959,30 @@ fn sweep_gateway_orphans(ledger: &mut LedgerStore, config: &DaemonConfig, boot_i
     }
 }
 
+/// Marks the gateway running for as long as it lives. Dropping it (normal
+/// exit, early return, shutdown or an unwinding panic of the gateway thread)
+/// marks it stopped, unless a newer gateway has started since.
+struct GatewayRunGuard {
+    shared: std::sync::Arc<crate::shared_budget::SharedBudgetRuntime>,
+    generation: u64,
+}
+
+impl GatewayRunGuard {
+    fn begin(
+        shared: std::sync::Arc<crate::shared_budget::SharedBudgetRuntime>,
+        run: crate::shared_budget::GatewayRun,
+    ) -> Self {
+        let generation = shared.begin_gateway_run(run);
+        Self { shared, generation }
+    }
+}
+
+impl Drop for GatewayRunGuard {
+    fn drop(&mut self) {
+        self.shared.end_gateway_run(self.generation);
+    }
+}
+
 /// A running gateway's thread and its shutdown channel.
 ///
 /// Dropping this closes the channel, which the gateway's own shutdown
@@ -3059,27 +3083,26 @@ fn start_gateway(config: &DaemonConfig, boot_id: &str) -> Option<GatewayHandle> 
     // Marked running before the thread starts (a bind error inside
     // `run_gateway` must clear it after, never race it) and cleared when the
     // thread ends for any reason, so Admit and Check see what is real.
-    let shared = std::sync::Arc::clone(&config.shared_budget);
-    shared.set_gateway_run(
+    let run_guard = GatewayRunGuard::begin(
+        std::sync::Arc::clone(&config.shared_budget),
         if tier == libra_governor_domain::EnforcementTier::GatewayMetered {
             crate::shared_budget::GatewayRun::GovernorHeld
         } else {
             crate::shared_budget::GatewayRun::PassThrough
         },
     );
+    // The guard moves into the closure, so a failed spawn drops it (and
+    // clears the state) too.
     let spawned = std::thread::Builder::new()
         .name("libra-gateway".to_string())
         .spawn(move || {
+            let _run_guard = run_guard;
             if let Err(e) = libra_governor_gateway::server::run_gateway(runtime_config, shutdown_rx)
             {
                 log::append_line(&log_path, &format!("gateway stopped: {e}"));
             }
-            shared.set_gateway_run(crate::shared_budget::GatewayRun::Stopped);
         });
     if spawned.is_err() {
-        config
-            .shared_budget
-            .set_gateway_run(crate::shared_budget::GatewayRun::Stopped);
         return None;
     }
 
