@@ -24,7 +24,7 @@ use time::OffsetDateTime;
 use libra_governor_daemon::recon::ReconBudget;
 use libra_governor_daemon::shared_budget::{
     gateway_key, gateway_orphans_at_start, gateway_reserve, GatewayReserveOutcome,
-    GatewayReserveRequest, ManualClock, SharedBudgetRuntime,
+    GatewayReserveRequest, GatewayRun, ManualClock, SharedBudgetRuntime,
 };
 use libra_governor_daemon::shared_budget_file::SHARED_BUDGET_FILE_NAME;
 use libra_governor_daemon::DaemonConfig;
@@ -87,20 +87,6 @@ fn daemon_config(dir: &Path, shared_budget: SharedBudgetRuntime) -> DaemonConfig
     }
 }
 
-/// A valid `governor_held` gateway configuration. It is only validated by the
-/// daemon (as `GatewayStatus` does), never started.
-fn governor_held_gateway(dir: &Path) -> libra_governor_gateway::config::GatewayConfig {
-    use libra_governor_gateway::config::{GatewayConfig, GatewayCredentialMode};
-    use libra_governor_gateway::credential::CredentialCommand;
-    GatewayConfig::new(
-        "127.0.0.1:0".parse().unwrap(),
-        dir.join("gateway.token"),
-        GatewayCredentialMode::GovernorHeld {
-            credential: CredentialCommand::new("/bin/sh", vec!["-c".into(), "printf x".into()]),
-        },
-    )
-}
-
 struct Fx {
     dir: tempfile::TempDir,
     clock: Arc<ManualClock>,
@@ -124,10 +110,12 @@ impl Fx {
         }
     }
 
-    /// Gateway mode with a `governor_held` gateway configured.
+    /// Gateway mode with a `governor_held` gateway reported running.
     fn gateway() -> Self {
-        let mut fx = Self::new("gateway");
-        fx.config.gateway = Some(governor_held_gateway(fx.dir.path()));
+        let fx = Self::new("gateway");
+        fx.config
+            .shared_budget
+            .set_gateway_run(GatewayRun::GovernorHeld);
         fx
     }
 
@@ -169,7 +157,7 @@ impl Fx {
         out
     }
 
-    /// Zero-amount settled charge rows: the watermark and offset rows.
+    /// Zero-amount settled `gateway-mark:` watermark rows (not offset rows).
     fn mark_rows(&self) -> i64 {
         let conn = rusqlite::Connection::open_with_flags(
             &self.config.ledger_path,
@@ -177,7 +165,7 @@ impl Fx {
         )
         .unwrap();
         conn.query_row(
-            "SELECT COUNT(*) FROM shared_pool_reservations WHERE is_charge = 1 AND settled_amount = 0",
+            "SELECT COUNT(*) FROM shared_pool_reservations WHERE is_charge = 1 AND settled_amount = 0 AND idempotency_key LIKE 'gateway-mark:%'",
             [],
             |r| r.get(0),
         )
@@ -375,11 +363,10 @@ fn admit_in_gateway_mode_fails_closed_without_a_governor_held_gateway() {
 
     // A pass-through (subscription) gateway is not governor_held.
     let mut passthrough = Fx::new("gateway");
-    passthrough.config.gateway = Some(libra_governor_gateway::config::GatewayConfig::new(
-        "127.0.0.1:0".parse().unwrap(),
-        passthrough.dir.path().join("t"),
-        libra_governor_gateway::config::GatewayCredentialMode::PassThroughSubscription,
-    ));
+    passthrough
+        .config
+        .shared_budget
+        .set_gateway_run(GatewayRun::PassThrough);
     assert!(matches!(
         passthrough.admit("s"),
         SharedBudgetOutcome::Denied {
@@ -450,6 +437,19 @@ fn a_tool_check_in_gateway_mode_never_denies_on_the_turn_hold_test() {
         }),
         SharedBudgetOutcome::Denied {
             reason: SharedBudgetDenyReason::ConfigInvalid,
+            ..
+        }
+    ));
+    // With no running governor_held gateway the same Check denies like Admit.
+    let mut down = Fx::new("gateway");
+    assert!(matches!(
+        down.sb(SharedBudgetRequest::Check {
+            session_id: "s".into(),
+            agent_id: None,
+            provider: None,
+        }),
+        SharedBudgetOutcome::Denied {
+            reason: SharedBudgetDenyReason::GatewayUnavailable,
             ..
         }
     ));
@@ -684,15 +684,26 @@ fn an_unrouted_session_is_counted_once_and_a_routed_one_is_not() {
     fx.gateway_hold("routed", "r1");
     let (routed, _) = transcripts(fx.dir.path(), "routed");
     let (bypass, _) = transcripts(fx.dir.path(), "bypass");
-
-    fx.finalize("routed", Some(&routed));
-    assert_eq!(fx.status().unrouted_sessions, 0);
+    assert_eq!(fx.mark_rows(), 0);
 
     fx.finalize("bypass", Some(&bypass));
     fx.finalize("bypass", Some(&bypass));
     let st = fx.status();
     assert_eq!(st.unrouted_sessions, 1, "distinct sessions, not Stops");
     assert_eq!(st.used_usd_cents, 0, "detection never charges");
+    assert_eq!(
+        fx.mark_rows(),
+        0,
+        "an unrouted Stop writes no watermark row"
+    );
+
+    fx.finalize("routed", Some(&routed));
+    assert_eq!(
+        fx.status().unrouted_sessions,
+        1,
+        "a routed session is not counted"
+    );
+    assert_eq!(fx.mark_rows(), 1, "a routed Stop writes one");
 }
 
 #[test]
@@ -834,7 +845,9 @@ fn a_flip_back_to_hooks_books_only_the_usage_after_the_gateway_turns() {
 
     // 2. Gateway turns: the gateway meters them; the hooks book nothing.
     fx.set_mode("gateway");
-    fx.config.gateway = Some(governor_held_gateway(&dir));
+    fx.config
+        .shared_budget
+        .set_gateway_run(GatewayRun::GovernorHeld);
     fx.clock.set(at(20));
     fx.gateway_hold("sess-1", "r1");
     std::fs::write(&main, lines(&[(5, "h1"), (25, "g1"), (30, "g2")])).unwrap();
@@ -911,7 +924,9 @@ fn session_end_settles_a_pre_flip_hold_and_books_nothing_else() {
     fx.admit("sess-1");
     let (main, _) = transcripts(fx.dir.path(), "sess-1");
     fx.set_mode("gateway");
-    fx.config.gateway = Some(governor_held_gateway(fx.dir.path()));
+    fx.config
+        .shared_budget
+        .set_gateway_run(GatewayRun::GovernorHeld);
     fx.clock.set(at(10));
     match fx.sb(SharedBudgetRequest::SettleTail {
         session_id: "sess-1".into(),
@@ -936,4 +951,44 @@ fn session_end_settles_a_pre_flip_hold_and_books_nothing_else() {
         gateway_metered_refusal()
     );
     assert_eq!(fx.status().used_usd_cents, 300);
+}
+
+#[test]
+fn a_flip_back_forgives_spend_the_gateway_did_not_meter() {
+    // Documented residual: the watermark moves to the gateway Stop's time, so
+    // transcript usage the gateway metered LESS than (here, none was settled)
+    // is forgiven after a flip back rather than recovered by the hooks.
+    let mut fx = Fx::gateway();
+    let dir = fx.dir.path().to_path_buf();
+    let main = dir.join("sess-1.jsonl");
+    let path = main.to_str().unwrap().to_string();
+    fx.gateway_hold("sess-1", "r1");
+    std::fs::write(
+        &main,
+        rec(5, "u1", "sess-1", None, 1) + "\n" + &rec(6, "u2", "sess-1", None, 1) + "\n",
+    )
+    .unwrap();
+    fx.clock.set(at(10));
+    fx.finalize("sess-1", Some(&path));
+
+    fx.set_mode("hooks");
+    fx.clock.set(at(20));
+    fx.admit("sess-1");
+    std::fs::write(
+        &main,
+        rec(5, "u1", "sess-1", None, 1)
+            + "\n"
+            + &rec(6, "u2", "sess-1", None, 1)
+            + "\n"
+            + &rec(30, "h1", "sess-1", None, 1)
+            + "\n",
+    )
+    .unwrap();
+    fx.clock.set(at(40));
+    fx.finalize("sess-1", Some(&path));
+    assert_eq!(
+        fx.status().used_usd_cents,
+        300,
+        "the two pre-flip records (600) are forgiven; only the hooks turn is booked"
+    );
 }

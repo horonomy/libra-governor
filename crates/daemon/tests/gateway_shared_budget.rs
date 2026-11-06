@@ -738,3 +738,114 @@ fn daemon_start_books_the_previous_boots_hold_before_the_gateway_takes_requests(
         "the new hold is keyed with the daemon's boot id"
     );
 }
+
+// ---- the hook side follows the gateway that is really running (S11f) ----
+
+fn admit_outcome(
+    ledger: &mut LedgerStore,
+    rt: &libra_governor_daemon::shared_budget::SharedBudgetRuntime,
+) -> libra_governor_protocol::SharedBudgetOutcome {
+    libra_governor_daemon::shared_budget::admit(ledger, rt, "s1", None, None, None).unwrap()
+}
+
+fn is_gateway_unavailable(o: &libra_governor_protocol::SharedBudgetOutcome) -> bool {
+    matches!(
+        o,
+        libra_governor_protocol::SharedBudgetOutcome::Denied {
+            reason: libra_governor_protocol::SharedBudgetDenyReason::GatewayUnavailable,
+            ..
+        }
+    )
+}
+
+fn lifecycle_config(
+    fx: &Fx,
+    addr: std::net::SocketAddr,
+    credential: GatewayCredentialMode,
+) -> libra_governor_daemon::DaemonConfig {
+    let mut config = common::daemon_config(fx.dir.path(), common::generous_policy(), fx.rt.clone());
+    config.gateway = Some(harness_gateway_config(
+        addr,
+        fx.dir.path().join("gateway.token"),
+        fx.upstream.addr.port(),
+        credential,
+        libra_governor_gateway::config::DEFAULT_MAX_REQUEST_BYTES,
+    ));
+    config
+}
+
+fn free_addr() -> std::net::SocketAddr {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+}
+
+#[test]
+fn a_gateway_that_failed_to_start_leaves_admit_denying() {
+    let fx = Fx::new(Some(file("gateway", 5_000)), &["s1"]);
+    let failing = GatewayCredentialMode::GovernorHeld {
+        credential: libra_governor_gateway::credential::CredentialCommand::new(
+            "/bin/sh",
+            vec!["-c".to_string(), "exit 1".to_string()],
+        ),
+    };
+    let config = lifecycle_config(&fx, free_addr(), failing);
+    let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
+    let started = libra_governor_daemon::begin_gateway(&mut ledger, &config);
+    assert!(started.handle.is_none(), "the start failed");
+
+    let before = common::ledger_fingerprint(&config.ledger_path);
+    assert!(is_gateway_unavailable(&admit_outcome(&mut ledger, &fx.rt)));
+    assert_eq!(common::ledger_fingerprint(&config.ledger_path), before);
+}
+
+#[test]
+fn a_running_governor_held_gateway_lets_admit_through() {
+    let fx = Fx::new(Some(file("gateway", 5_000)), &["s1"]);
+    let config = lifecycle_config(&fx, free_addr(), governor_held_fake_credential());
+    let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
+    let started = libra_governor_daemon::begin_gateway(&mut ledger, &config);
+    assert!(started.handle.is_some());
+    assert!(matches!(
+        admit_outcome(&mut ledger, &fx.rt),
+        libra_governor_protocol::SharedBudgetOutcome::GatewayMetered { .. }
+    ));
+}
+
+#[test]
+fn a_gateway_that_cannot_bind_flips_admit_to_denying() {
+    let fx = Fx::new(Some(file("gateway", 5_000)), &["s1"]);
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let config = lifecycle_config(
+        &fx,
+        occupied.local_addr().unwrap(),
+        governor_held_fake_credential(),
+    );
+    let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
+    let _started = libra_governor_daemon::begin_gateway(&mut ledger, &config);
+    let ledger = std::cell::RefCell::new(ledger);
+    wait_until(
+        || is_gateway_unavailable(&admit_outcome(&mut ledger.borrow_mut(), &fx.rt)),
+        "the failed bind to clear the running state",
+    );
+    drop(occupied);
+}
+
+#[test]
+fn a_gateway_that_stops_flips_admit_to_denying() {
+    let fx = Fx::new(Some(file("gateway", 5_000)), &["s1"]);
+    let config = lifecycle_config(&fx, free_addr(), governor_held_fake_credential());
+    let mut ledger = LedgerStore::open(&config.ledger_path).unwrap();
+    let started = libra_governor_daemon::begin_gateway(&mut ledger, &config);
+    assert!(matches!(
+        admit_outcome(&mut ledger, &fx.rt),
+        libra_governor_protocol::SharedBudgetOutcome::GatewayMetered { .. }
+    ));
+    drop(started);
+    let ledger = std::cell::RefCell::new(ledger);
+    wait_until(
+        || is_gateway_unavailable(&admit_outcome(&mut ledger.borrow_mut(), &fx.rt)),
+        "the stopped gateway to clear the running state",
+    );
+}
