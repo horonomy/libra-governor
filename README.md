@@ -236,7 +236,8 @@ original strict hard-cap guarantee.
   time-zone change near a month edge opens the next month's budget early.
   `shared-budget init --force` regenerates the file: flags you pass win, and
   every other setting of the existing file (`pricing_overrides`, the subagent
-  fallback, turn hold, soft limits, unknown keys) is carried over. A value
+  fallback, turn hold, soft limits, enforcement) is carried over. A key this
+  version does not know is reported and left only in the backup. A value
   that no longer validates is reported and replaced by its default. The
   previous file is kept as `shared-budget.json.bak-<UTC timestamp>` (earlier
   backups are never overwritten), and stdout names it. In the published v0.0.4

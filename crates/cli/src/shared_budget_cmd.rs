@@ -63,8 +63,8 @@ const HELP: &str = "Usage:\n  \
     each prompt reserves (default 10; must not exceed the cap). Refuses to replace an existing \
     file unless --force, which regenerates it: every setting you pass as a flag is applied and every \
     other setting of the existing file (pricing_overrides, subagent_unmeasured_charge_usd_cents, \
-    turn hold, soft limits, enforcement, unknown keys) is carried over; a value that no longer \
-    validates is reported and replaced by its default; the previous file is kept as \
+    turn hold, soft limits, enforcement) is carried over; a value that no longer validates, or a key \
+    this version does not know, is reported and left only in the backup (the default applies); the previous file is kept as \
     shared-budget.json.bak-<UTC timestamp>, never overwritten by a later --force; the ledger is \
     untouched. The optional \
     per-session and per-agent soft limits are dollars, warn only, and never grant capacity or deny a prompt. A running \
@@ -288,7 +288,7 @@ struct Merged {
 
 /// Builds the regenerated file for `init --force`: the settings the user
 /// passed as flags (`base`) win, and every other setting of the previous
-/// file (known keys and unknown keys alike) is carried over as long as the
+/// file is carried over as long as the
 /// result still validates with the daemon's own parser. Each carried
 /// setting is tried on its own against what is accepted so far, so one bad
 /// value is reported and falls back to the default without costing the
@@ -1501,9 +1501,17 @@ mod tests {
         assert_eq!(doc["subagent_unmeasured_charge_usd_cents"], 123);
         assert_eq!(doc["turn_hold_usd_cents"], 700);
         assert_eq!(doc["soft_limits"]["per_agent_usd_cents"], 500);
-        assert_eq!(doc["some_future_key"]["x"], 1, "unknown keys are kept");
-        assert!(report.not_carried.is_empty(), "{:?}", report.not_carried);
+        // The daemon's parser rejects unknown keys, so carrying one would
+        // make the whole file invalid: it is reported and stays in the backup.
+        assert!(doc.get("some_future_key").is_none());
+        assert_eq!(report.not_carried.len(), 1, "{:?}", report.not_carried);
+        assert!(
+            report.not_carried[0].starts_with("some_future_key"),
+            "{:?}",
+            report.not_carried
+        );
         let text = render_init(&report);
+        assert!(text.contains("NOT carried over: some_future_key"), "{text}");
         assert!(
             text.contains("subagent_unmeasured_charge_usd_cents"),
             "{text}"
