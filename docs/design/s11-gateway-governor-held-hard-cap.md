@@ -565,14 +565,12 @@ independent. S11a gates **enablement**, not building.
   The route check requires a loopback `ANTHROPIC_BASE_URL` (booleans only; the value is never
   read into output) and says only the user `~/.claude/settings.json` is inspected. The warning for
   a mode flip with live holds (§3.4) is still not implemented.
-- In gateway mode PreToolUse `Check` still reports `exhausted` when remaining < turn hold, so tool
-  calls can be denied mid-turn once gateway reservations shrink remaining; this is stricter than
-  hooks mode.
+- In gateway mode PreToolUse `Check` (Claude lanes) denies `gateway_unavailable` unless a `governor_held` gateway runs, else answers `available` unconditionally; it never reports `exhausted` or `admitted` in this mode (corrected after review; the earlier wording called it stricter than hooks mode, which the code does not do).
 
 - **Residuals of the flip back to hooks.**
   - The watermark moves to the time of the last gateway-mode Stop/SessionEnd, so transcript
-    usage that the gateway metered *less* than (partial metering, a truncated settle that booked
-    the reservation instead, a request the gateway refused after the host had already counted it)
+    usage that the gateway metered *less* than (partial metering, an orphaned or expired request booked
+    at its reservation instead, a request the gateway refused after the host had already counted it)
     is forgiven after the flip, not recovered by the hooks. This is an under-count direction and
     is pinned by a test.
   - A subagent that finished before the flip to gateway mode but whose `SubagentStop`/sweep has
