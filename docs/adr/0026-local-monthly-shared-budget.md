@@ -135,20 +135,39 @@ gateway's USD budget path instead refuses with `403 unpriced_model`
 (`crates/gateway/src/pricing.rs` module docs; `Decision::UnpricedModel` in
 `crates/gateway/src/proxy.rs`).
 
-#### Known pricing limitations (pricing refresh, PR #208)
+#### Pricing rules and known limitations (HORO-2443, `pricing-2026-11-static-v4`)
 
-The pinned table is list-price-equivalent and **not exact**:
+The pinned table is list-price-equivalent and **not exact**. Official rules
+modelled (Anthropic pricing, fast-mode, data-residency and prompt-caching
+pages, retrieved 2026-11-06):
 
-- (a) The 1-hour cache-write tier (2x base input) is not modelled; those
-  tokens are priced at the 5-minute rate, so spend is **under-accounted**.
-- (b) Fast-mode premium and the `inference_geo` multiplier (1.1x, US-only)
-  are not modelled, so spend is **under-accounted** for such requests.
-- (c) Haiku 5.5 prompts under 100k tokens are priced at the over-100k rate,
-  so they are **over-accounted** by about 5x.
+- 1-hour cache write = 2x base input (the stored cache-write price is the
+  5-minute 1.25x row). Split read from `usage.cache_creation.
+  ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens`; tokens the split
+  does not account for, and a cache write with no split at all, are priced as
+  1-hour (never the cheaper tier); a split larger than the total is unpriceable.
+- Fast mode (`usage.speed == "fast"`; Opus 5.5, Opus 5, Opus 4.8 only) is 2x
+  every tier. `inference_geo: "us"` (`usage.inference_geo`; Claude 4.6 and
+  later only) is 1.1x every tier. They stack. Fast mode or US geo on a model
+  without it, or an unrecognised value, is unpriceable.
+- Haiku 5.5 bills its lower row when one request's prompt (input + cache
+  writes + cache reads) is at most 100,000 tokens, else the higher row.
+- An unpriceable usage report settles at the flat hold with
+  `usage_known=false`, like an unpriced model (an unlisted id such as
+  `claude-opus-5-6` is unpriced: only an exact id or a `-YYYYMMDD` dated
+  suffix matches, HORO-2366).
+- A pre-flight reservation covers the 1-hour write rate and the 1.1x geo
+  multiplier on models that accept `inference_geo`, and 2x when the request
+  body asks for a non-standard `speed`, so settlement cannot exceed it.
 
-The cap is therefore a Libra-accounted estimate that may drift from the
-provider bill in either direction and is never a bill guarantee. The table
-is operator-overridable through `PricingTable::with_overrides`.
+Residual limits: absent `speed` / `inference_geo` are read as standard /
+global (an assumption; real Claude Code transcripts always carry both);
+`service_tier` is not a list-price modifier here; OpenAI long-context
+(>272K) is still under-counted. The cap is a Libra-accounted estimate that
+may drift from the provider bill and is never a bill guarantee. The table
+is operator-overridable through `PricingTable::with_overrides`; an override
+of an Anthropic id inherits the derived 1-hour rate (2x its `input`), and an
+override of `claude-haiku-5-5` replaces both prompt-length rows.
 
 ### Evidence class
 

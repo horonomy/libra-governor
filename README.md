@@ -217,8 +217,8 @@ original strict hard-cap guarantee.
   per-task mechanism that is not connected to the monthly budget). Codex accounting (v0.0.5 candidate) is
   opt-in and off by default; see "Codex accounting" below.
 - *Not your bill.* Amounts are Libra's list-price-equivalent estimates, or the
-  flat turn hold when a turn cannot be measured. Pricing gaps drift both ways
-  (for example the 1-hour cache tier is under-counted); see ADR-0026.
+  flat turn hold when a turn cannot be measured. The pinned table can drift
+  from the provider bill in either direction (prices change); see ADR-0026.
 - *Accounting boundary.* Counted: Claude Code sessions and subagents whose
   settlement hooks run and whose transcripts can be read and attributed, plus
   (v0.0.5 candidate only) Codex main-lane turns if you opted in. Not counted or not attributable:
@@ -287,7 +287,7 @@ When enrolled:
   can report trust as "likely not yet trusted" or "unknown", never "trusted".
 - (v0.0.5 candidate, not in the published v0.0.4 binary, where Codex turns are
   not counted at all.) Codex turns are priced from the pinned OpenAI
-  list prices (standard tier, short context; `pricing-2026-11-static-v3`) for gpt-6.1-sol, gpt-6.1-terra, gpt-6-sol, gpt-6-astra, gpt-6-luna and gpt-5.3-codex; a
+  list prices (standard tier, short context; `pricing-2026-11-static-v4`) for gpt-6.1-sol, gpt-6.1-terra, gpt-6-sol, gpt-6-astra, gpt-6-luna and gpt-5.3-codex; a
   `pricing_overrides` entry takes precedence. Any other Codex model (for
   example `gpt-5.6-*`, whose list price is promotional until 2026-11-30, or a
   variant id such as `gpt-6.1-sol-pro`) is unpriced: its turns book the flat

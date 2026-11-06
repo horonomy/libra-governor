@@ -114,7 +114,7 @@ C2 to C5 acceptance criteria are mapped to named tests in the evidence file
 - Codex has no mid-turn hold renewal here: a turn longer than the 1 h hold
   expires and is settled late by orphan recovery on partial measurement.
 - Codex turns are priced from the pinned OpenAI list prices (standard tier,
-  short context; `pricing-2026-11-static-v3`, source
+  short context; `pricing-2026-11-static-v4`, source
   <https://developers.openai.com/api/docs/pricing>, retrieved 2026-11-05) for
   gpt-6.1-sol, gpt-6.1-terra, gpt-6-sol, gpt-6-astra, gpt-6-luna and gpt-5.3-codex; a `pricing_overrides` entry takes precedence. Any other Codex model
   (including `gpt-5.6-*`) is unpriced: its turns book the flat hold,
