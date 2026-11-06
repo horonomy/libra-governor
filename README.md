@@ -231,11 +231,13 @@ original strict hard-cap guarantee.
   written, a subagent file over 32 MiB, and a hook that fails open while the
   daemon is down can be under-counted or missed. A forward clock jump or a
   time-zone change near a month edge opens the next month's budget early.
-  `shared-budget init --force` replaces the whole file, so `pricing_overrides`, the subagent
-  fallback and unrepeated soft limits are not carried over. In the published v0.0.4 no backup is
-  kept; the v0.0.5 candidate keeps the previous file as
-  `shared-budget.json.bak-<UTC timestamp>` (earlier backups are never
-  overwritten) and prints its path and the keys not carried over.
+  `shared-budget init --force` regenerates the file: flags you pass win, and
+  every other setting of the existing file (`pricing_overrides`, the subagent
+  fallback, turn hold, soft limits, unknown keys) is carried over. A value
+  that no longer validates is reported and replaced by its default. The
+  previous file is kept as `shared-budget.json.bak-<UTC timestamp>` (earlier
+  backups are never overwritten), and stdout names it. In the published v0.0.4
+  `--force` replaced the whole file and kept no backup.
 - *Published v0.0.4: every subagent can be booked at the flat turn hold
   (known High defect, HORO-2446).* On real Claude Code 2.1.306 the
   `SubagentStop` hook ran before the host had written the subagent's final
@@ -322,8 +324,8 @@ than one turn hold remains.
 
 **Change or remove it.** Edit `shared-budget.json` in the state directory
 (`status` prints its path) or delete it; the daemon re-reads it on every
-decision, so the change applies from the next prompt. To start over use
-`shared-budget init --force`.
+decision, so the change applies from the next prompt. To regenerate it from flags
+(keeping your other settings) use `shared-budget init --force`.
 
 Details: [ADR-0026](docs/adr/0026-local-monthly-shared-budget.md) and
 [`integrations/claude-code/README.md`](integrations/claude-code/README.md).

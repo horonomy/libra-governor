@@ -61,10 +61,12 @@ const HELP: &str = "Usage:\n  \
     dollars (at most 2 decimals, e.g. 200 or 12.50). --time-zone is required: the budget period is \
     a calendar month in that zone and there is deliberately no UTC default. --turn-hold-usd is what \
     each prompt reserves (default 10; must not exceed the cap). Refuses to replace an existing \
-    file unless --force (which replaces the whole file: pricing_overrides, \
-    subagent_unmeasured_charge_usd_cents and any soft limit not repeated are not carried over, \
-    but the previous file is kept as shared-budget.json.bak-<UTC timestamp> (never overwritten by a \
-    later --force), its path and the keys not carried over are printed; the ledger is untouched). The optional \
+    file unless --force, which regenerates it: every setting you pass as a flag is applied and every \
+    other setting of the existing file (pricing_overrides, subagent_unmeasured_charge_usd_cents, \
+    turn hold, soft limits, enforcement, unknown keys) is carried over; a value that no longer \
+    validates is reported and replaced by its default; the previous file is kept as \
+    shared-budget.json.bak-<UTC timestamp>, never overwritten by a later --force; the ledger is \
+    untouched. The optional \
     per-session and per-agent soft limits are dollars, warn only, and never grant capacity or deny a prompt. A running \
     daemon picks the file up on the next prompt.\n  \
     status   Read-only budget posture from the running daemon (never starts one): config state, \
@@ -227,9 +229,10 @@ struct InitReport {
     replaced: bool,
     /// Where the replaced file was kept; `Some` exactly when `replaced`.
     backup: Option<PathBuf>,
-    /// Keys the previous file had that the new one does not write, so a
-    /// hand-written setting is never lost without being named.
-    dropped_keys: Vec<String>,
+    /// Settings of the previous file carried into the new one.
+    carried_keys: Vec<String>,
+    /// Previous-file settings that were NOT carried, each with the reason.
+    not_carried: Vec<String>,
 }
 
 /// `YYYYMMDDTHHMMSSZ` (UTC) for a backup file name.
@@ -275,29 +278,104 @@ fn back_up_existing(dir: &Path, path: &Path) -> std::io::Result<PathBuf> {
     ))
 }
 
-/// Keys present in the previous file's JSON (top level, plus the members
-/// of `soft_limits`) that the new document does not carry. Best effort: an
-/// unparsable previous file yields none, since the backup still holds it.
-fn dropped_keys(previous: &[u8], new: &[u8]) -> Vec<String> {
-    let (Ok(Value::Object(old)), Ok(Value::Object(new))) = (
-        serde_json::from_slice::<Value>(previous),
-        serde_json::from_slice::<Value>(new),
-    ) else {
-        return Vec::new();
+/// The regenerated file's bytes plus what happened to the previous file's
+/// settings.
+struct Merged {
+    bytes: Vec<u8>,
+    carried: Vec<String>,
+    not_carried: Vec<String>,
+}
+
+/// Builds the regenerated file for `init --force`: the settings the user
+/// passed as flags (`base`) win, and every other setting of the previous
+/// file (known keys and unknown keys alike) is carried over as long as the
+/// result still validates with the daemon's own parser. Each carried
+/// setting is tried on its own against what is accepted so far, so one bad
+/// value is reported and falls back to the default without costing the
+/// others.
+fn merge_previous(previous: &[u8], base: &[u8]) -> Merged {
+    use libra_governor_daemon::shared_budget_file::{parse, SharedBudgetFileState};
+
+    let mut merged = Merged {
+        bytes: base.to_vec(),
+        carried: Vec::new(),
+        not_carried: Vec::new(),
     };
-    let mut dropped = Vec::new();
+    let Ok(Value::Object(old)) = serde_json::from_slice::<Value>(previous) else {
+        merged.not_carried.push(
+            "the previous file was not a valid JSON object, so none of it could be carried"
+                .to_string(),
+        );
+        return merged;
+    };
+    let Ok(Value::Object(mut doc)) = serde_json::from_slice::<Value>(base) else {
+        return merged;
+    };
+
+    // (display name, top-level key, soft_limits member, value) in file order.
+    let mut candidates: Vec<(String, String, Option<String>, Value)> = Vec::new();
     for (key, value) in &old {
-        match (key.as_str(), value, new.get(key)) {
-            (_, _, None) => dropped.push(key.clone()),
-            ("soft_limits", Value::Object(old_soft), Some(Value::Object(new_soft))) => {
-                for member in old_soft.keys().filter(|m| !new_soft.contains_key(*m)) {
-                    dropped.push(format!("soft_limits.{member}"));
+        match (key.as_str(), value) {
+            ("schema_version", _) => {}
+            ("soft_limits", Value::Object(members)) => {
+                for (member, v) in members {
+                    candidates.push((
+                        format!("soft_limits.{member}"),
+                        key.clone(),
+                        Some(member.clone()),
+                        v.clone(),
+                    ));
                 }
             }
-            _ => {}
+            _ => candidates.push((key.clone(), key.clone(), None, value.clone())),
         }
     }
-    dropped
+
+    for (name, key, member, value) in candidates {
+        // A setting the user passed as a flag wins over the previous value.
+        let already_set = match &member {
+            None => doc.contains_key(&key),
+            Some(m) => doc
+                .get(&key)
+                .and_then(Value::as_object)
+                .is_some_and(|o| o.contains_key(m)),
+        };
+        if already_set {
+            continue;
+        }
+        let mut trial = doc.clone();
+        match &member {
+            None => {
+                trial.insert(key.clone(), value.clone());
+            }
+            Some(m) => {
+                let entry = trial
+                    .entry(key.clone())
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                if let Value::Object(o) = entry {
+                    o.insert(m.clone(), value.clone());
+                }
+            }
+        }
+        let trial_bytes =
+            serde_json::to_vec_pretty(&Value::Object(trial.clone())).unwrap_or_default();
+        match parse(&trial_bytes) {
+            SharedBudgetFileState::Valid(_) => {
+                doc = trial;
+                merged.carried.push(name);
+            }
+            SharedBudgetFileState::Invalid(reason) => {
+                merged
+                    .not_carried
+                    .push(format!("{name}: {reason}; the default applies"));
+            }
+            SharedBudgetFileState::Absent => {}
+        }
+    }
+    let mut bytes = serde_json::to_vec_pretty(&Value::Object(doc)).unwrap_or_default();
+    bytes.push(b'\n');
+    merged.bytes = bytes;
+    merged
 }
 
 /// Serialises the request into the file's bytes. Only the fields the user
@@ -353,19 +431,18 @@ fn unique_temp_name() -> String {
 /// written. They go to an owner-only temp file in `dir` first; without
 /// `force` they are then linked into place (fails if anything exists, with
 /// no check-then-write race), with `force` they replace a regular file via
-/// rename, after the old file is kept as `shared-budget.json.bak-<UTC stamp>`. A reader
+/// rename, after the old file is kept as `shared-budget.json.bak-<UTC stamp>`.
+/// Settings of the old file that the request does not set are carried over. A reader
 /// therefore sees the old file or the new one, never a partial one.
 fn init_in(dir: &Path, request: &InitRequest) -> Result<InitReport, String> {
     use libra_governor_daemon::shared_budget_file::{
         parse, SharedBudgetFileState, SHARED_BUDGET_FILE_NAME,
     };
 
-    let bytes = init_bytes(request);
-    let config = match parse(&bytes) {
-        SharedBudgetFileState::Valid(config) => config,
-        SharedBudgetFileState::Invalid(reason) => return Err(init_invalid_message(&reason)),
-        SharedBudgetFileState::Absent => return Err("internal error: empty configuration".into()),
-    };
+    let mut bytes = init_bytes(request);
+    if let SharedBudgetFileState::Invalid(reason) = parse(&bytes) {
+        return Err(init_invalid_message(&reason));
+    }
 
     let path = dir.join(SHARED_BUDGET_FILE_NAME);
     let replaced = match std::fs::symlink_metadata(&path) {
@@ -388,17 +465,27 @@ fn init_in(dir: &Path, request: &InitRequest) -> Result<InitReport, String> {
     };
 
     let mut backup = None;
-    let mut dropped = Vec::new();
+    let mut carried = Vec::new();
+    let mut not_carried = Vec::new();
     if replaced {
         // A hard link keeps the old inode (and its owner-only mode) alive
         // under the backup name. Done before anything is replaced so a
         // failure here leaves the original untouched.
-        dropped = dropped_keys(&std::fs::read(&path).unwrap_or_default(), &bytes);
+        let merged = merge_previous(&std::fs::read(&path).unwrap_or_default(), &bytes);
+        bytes = merged.bytes;
+        carried = merged.carried;
+        not_carried = merged.not_carried;
         match back_up_existing(dir, &path) {
             Ok(kept) => backup = Some(kept),
             Err(e) => return Err(format!("could not back up {}: {e}", path.display())),
         }
     }
+
+    let config = match parse(&bytes) {
+        SharedBudgetFileState::Valid(config) => config,
+        SharedBudgetFileState::Invalid(reason) => return Err(init_invalid_message(&reason)),
+        SharedBudgetFileState::Absent => return Err("internal error: empty configuration".into()),
+    };
 
     let tmp = dir.join(unique_temp_name());
     let staged = std::fs::OpenOptions::new()
@@ -440,7 +527,8 @@ fn init_in(dir: &Path, request: &InitRequest) -> Result<InitReport, String> {
         config,
         replaced,
         backup,
-        dropped_keys: dropped,
+        carried_keys: carried,
+        not_carried,
     })
 }
 
@@ -557,14 +645,17 @@ fn render_init(report: &InitReport) -> String {
     let mut kept = String::new();
     if let Some(backup) = &report.backup {
         kept.push_str(&format!(
-            "  Previous file kept as {} (nothing was lost; earlier backups are never overwritten)\n",
+            "  Previous file kept as {} (earlier backups are never overwritten)\n",
             backup.display()
         ));
-        if !report.dropped_keys.is_empty() {
+        if !report.carried_keys.is_empty() {
             kept.push_str(&format!(
-                "  Not carried over (copy from the backup if still wanted): {}\n",
-                report.dropped_keys.join(", ")
+                "  Carried over from the previous file: {}\n",
+                report.carried_keys.join(", ")
             ));
+        }
+        for reason in &report.not_carried {
+            kept.push_str(&format!("  NOT carried over: {reason}\n"));
         }
     }
     format!(
@@ -1380,30 +1471,102 @@ mod tests {
         assert_eq!(contents, expected, "both earlier files must survive");
     }
 
-    #[test]
-    fn init_force_report_names_the_backup_and_the_hand_written_keys_it_dropped() {
-        let dir = tempfile::tempdir().unwrap();
-        init_in(dir.path(), &req(20_000, "UTC", None, false)).unwrap();
-        let hand_edited = br#"{
+    const HAND_EDITED: &[u8] = br#"{
   "schema_version": 1,
   "monthly_cap_usd_cents": 20000,
   "time_zone": "UTC",
+  "turn_hold_usd_cents": 700,
   "subagent_unmeasured_charge_usd_cents": 123,
-  "soft_limits": { "per_agent_usd_cents": 500 }
+  "soft_limits": { "per_agent_usd_cents": 500 },
+  "some_future_key": { "x": 1 }
 }
 "#;
-        std::fs::write(dir.path().join("shared-budget.json"), hand_edited).unwrap();
+
+    fn current_json(dir: &Path) -> Value {
+        serde_json::from_slice(&std::fs::read(dir.join("shared-budget.json")).unwrap()).unwrap()
+    }
+
+    fn seed(dir: &Path, bytes: &[u8]) {
+        init_in(dir, &req(20_000, "UTC", None, false)).unwrap();
+        std::fs::write(dir.join("shared-budget.json"), bytes).unwrap();
+    }
+
+    #[test]
+    fn init_force_preserves_hand_written_settings_and_a_second_force_still_does() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), HAND_EDITED);
         let report = init_in(dir.path(), &req(30_000, "UTC", None, true)).unwrap();
+        let doc = current_json(dir.path());
+        assert_eq!(doc["monthly_cap_usd_cents"], 30_000, "flag value applies");
+        assert_eq!(doc["subagent_unmeasured_charge_usd_cents"], 123);
+        assert_eq!(doc["turn_hold_usd_cents"], 700);
+        assert_eq!(doc["soft_limits"]["per_agent_usd_cents"], 500);
+        assert_eq!(doc["some_future_key"]["x"], 1, "unknown keys are kept");
+        assert!(report.not_carried.is_empty(), "{:?}", report.not_carried);
         let text = render_init(&report);
-        let found = backups(dir.path());
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(std::fs::read(&found[0]).unwrap(), hand_edited.to_vec());
-        assert!(text.contains(found[0].to_str().unwrap()), "{text}");
         assert!(
             text.contains("subagent_unmeasured_charge_usd_cents"),
             "{text}"
         );
-        assert!(text.contains("soft_limits.per_agent_usd_cents"), "{text}");
+        assert_eq!(
+            report.config.subagent_unmeasured_charge_usd_cents,
+            Some(123)
+        );
+
+        init_in(dir.path(), &req(40_000, "UTC", None, true)).unwrap();
+        let doc = current_json(dir.path());
+        assert_eq!(doc["monthly_cap_usd_cents"], 40_000);
+        assert_eq!(doc["subagent_unmeasured_charge_usd_cents"], 123);
+        assert_eq!(backups(dir.path()).len(), 2);
+    }
+
+    #[test]
+    fn init_force_flags_override_preserved_values() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), HAND_EDITED);
+        init_in(dir.path(), &req(30_000, "Asia/Taipei", Some(250), true)).unwrap();
+        let doc = current_json(dir.path());
+        assert_eq!(doc["turn_hold_usd_cents"], 250);
+        assert_eq!(doc["time_zone"], "Asia/Taipei");
+        assert_eq!(doc["subagent_unmeasured_charge_usd_cents"], 123);
+    }
+
+    #[test]
+    fn init_force_reports_an_invalid_previous_value_and_uses_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            br#"{"schema_version":1,"monthly_cap_usd_cents":20000,"time_zone":"UTC",
+                 "subagent_unmeasured_charge_usd_cents":-5,"turn_hold_usd_cents":999999}"#,
+        );
+        let report = init_in(dir.path(), &req(30_000, "UTC", None, true)).unwrap();
+        let doc = current_json(dir.path());
+        assert!(doc.get("subagent_unmeasured_charge_usd_cents").is_none());
+        assert!(doc.get("turn_hold_usd_cents").is_none());
+        let text = render_init(&report);
+        assert!(
+            text.contains("NOT carried over: subagent_unmeasured_charge_usd_cents"),
+            "{text}"
+        );
+        assert!(
+            text.contains("NOT carried over: turn_hold_usd_cents"),
+            "{text}"
+        );
+        assert_eq!(report.config.turn_hold_usd_cents, 1_000, "default applies");
+    }
+
+    #[test]
+    fn init_force_over_an_unparseable_file_backs_it_up_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), b"{ this is not json");
+        let report = init_in(dir.path(), &req(30_000, "UTC", None, true)).unwrap();
+        let found = backups(dir.path());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(std::fs::read(&found[0]).unwrap(), b"{ this is not json");
+        let text = render_init(&report);
+        assert!(text.contains("NOT carried over"), "{text}");
+        assert!(text.contains(found[0].to_str().unwrap()), "{text}");
+        assert_eq!(current_json(dir.path())["monthly_cap_usd_cents"], 30_000);
     }
 
     #[test]
