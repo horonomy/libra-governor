@@ -39,7 +39,7 @@ hook schemas vs. what remains unverified.
   below), and a best-effort read of `~/.codex/config.toml`'s
   `[hooks.state]` trust gate.
 - **Local shared-budget gate: OFF by default, experimental (ADR-0026,
-  HORO-2283).** Unless both `shared-budget.json` and the marker file
+  HORO-2283; v0.0.5 candidate, not in the published v0.0.4 binary).** Unless both `shared-budget.json` and the marker file
   `<state_dir>/shared-budget.codex` exist (a regular file, contents never
   read, removing it switches the gate off again), the Codex hook route never
   sends a shared-budget `Admit`, never sends `SettleTurn`, never blocks a
