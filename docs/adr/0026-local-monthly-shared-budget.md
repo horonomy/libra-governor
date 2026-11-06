@@ -46,9 +46,12 @@ and the shared-budget checks in `doctor` (see *Status, statusline and doctor
 delivered in S8*). **S11f (HORO-2274) delivers the hook side of the dark
 `enforcement = "gateway"` mode** (Admit reserves nothing, the charge paths book
 zero, Status and doctor report the mode); the mode is off by default and its
-label claim is not made until the S11g founder packet. **Not built or not
-enabled**: the S11 gateway hard cap (`governor_held`) as a shipped claim,
-a Codex budget gate, remote upload, and any real-host evidence (everything is
+label claim is not made until a founder decision on the S11 packet. **S11b to
+S11f are merged on `main` as dark, opt-in code** (see *Gateway enforcement
+delivered in S11*); **S11g (this amendment) is documentation only.** **Not built
+or not enabled**: any shipped or released claim of gateway enforcement, the
+S11 mode enabled by default or in any release, a Codex gateway or budget gate
+beyond the hooks path, remote upload, and any real-host evidence (everything is
 `TestOwnedLive`; nothing is `ProductionObserved`). Everything else below that
 is not delivered by a slice named above is **design intent**; it must not be
 read as shipped behaviour. No real Claude Code host has
@@ -115,11 +118,15 @@ half-open interval `[day-1 00:00 local, next month's day-1 00:00 local)`.
 
 ### Guarantee label
 
+(Amended by S11g, see *Gateway enforcement delivered in S11* for the gateway
+mode's separate label. The hooks-mode label below is unchanged and must not be
+strengthened.)
+
 Hooks-only mode is **admission-bounded (cooperative)**. Admission is
 refuse-before-spend at prompt admission (cooperative), but in-turn spend is visible only at Stop, so spend can overshoot
 the hold. A per-request hard cap exists only with the gateway in
 `governor_held` mode, which is follow-up slice S11 and **not part of this
-MVP**. ADR-0003's wording that the gateway is the only enforcement point is
+MVP**. (Superseded by the S11b-f dark code: see *Gateway enforcement delivered in S11*.) ADR-0003's wording that the gateway is the only enforcement point is
 superseded **for the local budget only**, by cooperative admission.
 
 ### Meaning of USD
@@ -627,7 +634,7 @@ id, path or content).
   the pool.
 
 **Not done in S5** (S7 delivered the installer and `SessionEnd` wiring, S8
-the `status` command and `doctor` checks): no gateway path (S11). `Finalize` itself returns
+the `status` command and `doctor` checks): no gateway path (S11; superseded by the S11b-f dark code, see *Gateway enforcement delivered in S11*). `Finalize` itself returns
 nothing about the settlement; it is observable through `Status`, the ledger
 and the log.
 
@@ -859,7 +866,7 @@ and CLI processes, synthetic transcripts); **nothing here is
 - The S7 review finding L-A is fixed: `inspect()` counted our command under a
   user's foreign matcher group (for example `Bash`) as wired; it now requires
   a no-matcher, `""` or `"*"` group, the same rule `install` applies.
-- **Not built, and not claimed:** the S11 gateway hard cap (`governor_held`);
+- **Not built, and not claimed:** the S11 gateway hard cap (`governor_held`; superseded by the S11b-f dark code, see *Gateway enforcement delivered in S11*: built, not enabled, not claimed);
   a Codex budget gate (the Codex route neither admits nor charges); remote
   upload (S10 delivers a local export only); a `clock_anomaly` repair command;
   in-turn overshoot protection in hooks-only mode; real-host evidence.
@@ -1035,6 +1042,245 @@ Residuals, disclosed:
 - `status`: the not-covered list is the unchanged const unless a budget exists and the regular marker file sits in the state directory; then the "Codex route has no budget gate" line is replaced by the remaining Codex gaps. The `agents` capability row stays Unavailable; its detail names the experimental marker.
 - Follow-up, not done here: the C4 `codex_recovery_errors` telemetry (and `unadmitted_turns`) is not a `SharedBudgetStatus` field; surfacing it needs an additive optional protocol field on the C4 branch.
 
+## Gateway enforcement delivered in S11
+
+Status: **built, dark, opt-in, not enabled, not claimed.** Source of truth for
+the design is `docs/design/s11-gateway-governor-held-hard-cap.md` (HORO-2261,
+HORO-2274). Nothing in this section is a release claim. Enabling the mode, its
+label wording and the counting-scope change are Level 2 founder decisions
+recorded in a separate packet; until the founder decides, the default stays
+`enforcement = "hooks"` and README and release notes make no hard-cap claim.
+Evidence class is `TestOwnedLive` (fake upstream, `ManualClock`). The S11a
+real-host capture of the gateway request shape (session header equality with
+the hook `session_id`) is **not part of this record**; any host-dependent
+statement below is a host assumption until S11a lands.
+
+### Guarantee label (gateway mode)
+
+`SHARED_BUDGET_GUARANTEE_GATEWAY = "gateway-reserved-modelled-worst-case"`,
+separate from `SHARED_BUDGET_GUARANTEE = "admission-bounded-cooperative"`, which
+is not strengthened. The label's meaning, exactly as approved in the design:
+
+> **Gateway mode (governor_held).** Every `POST /v1/messages` routed through the
+> Libra gateway is forwarded only after its modelled worst-case cost is
+> atomically reserved against the month's pool. At every admission, settled plus
+> reserved is at most the cap. Spend is Libra-accounted, list-price-equivalent
+> USD at the pinned `PRICING_VERSION`. Total spend can exceed the cap only when
+> a request's actual exceeds its modelled worst case, which is detected and
+> reported (`bound_violated`, `input_bound_violated`). Spend not routed through
+> the gateway is **not counted** in this mode. This is not a provider-bill
+> guarantee. Any process running as the same OS user can edit
+> `shared-budget.json` or the ledger, so the cap is not tamper-proof.
+
+Do not say "hard cap" without both qualifiers "modelled worst case" and
+"gateway-routed". The wording is proposed, not approved for use in README,
+release notes or other documentation (founder packet item 1). It is not hidden
+in the product: `shared-budget status` (text and `--json`) already prints this
+label whenever `enforcement = "gateway"` is configured, so an operator who turns
+the mode on sees it before any founder decision.
+
+### What is built (all behind `enforcement = "gateway"`, default `hooks`)
+
+- **S11b (gateway crate, #316).** Pure `settle_amount_for`: a request cut off
+  after `message_start` usage settles at the exact input tiers plus
+  `max(observed output, max_tokens)` output, `usage_known = false`; one cut off
+  before any usage, or a model or kind that cannot be priced, settles at the
+  reservation. The amount is never clamped to the reservation, so an overrun
+  stays visible. `hard_input_upper_bound(bytes, image_count)` is `bytes` (documented to
+  exclude inline base64 `source.data`) plus 8,000 tokens per image block plus a
+  1,000-token tool-prompt allowance; both constants are inferences until S11a.
+  The gateway passes `body.len()`, the whole request body including base64
+  payloads, so the reservation is looser than the function's contract and
+  over-reserves image-heavy requests (the safe direction).
+  `input_bound_violated` is set when reported prompt tokens (input plus cache
+  creation plus cache read) exceed the bound. `screen_unbounded_inputs` refuses
+  a body with a server tool (`web_search_*`, `web_fetch_*`, `code_execution_*`),
+  a url or file content source, non-empty `mcp_servers`, a `container`, a
+  `container_upload` block, or a base64 PDF; the list is closed, so a block type
+  added upstream passes until it is named. Counters `truncated_settles` and
+  `input_bound_violations`. Not applied to the task path.
+- **S11c (ledger, #312).** `expire_stale_shared_pool_reservations` books an
+  expired active `charge_source = 'gateway'` non-charge hold as `settled` at its
+  reserved amount with `usage_known = 0`, instead of `expired`; a late settle is
+  `AlreadyFinal`. `settle_orphaned_gateway_holds` books every active gateway
+  non-charge hold whose idempotency key lacks the current `gw:<boot_id>:`
+  prefix, regardless of expiry; a second run books nothing, and a malformed
+  prefix sweeps nothing. The sweep is global to the ledger: it assumes one
+  gateway process per ledger, and a second live gateway on the same ledger would
+  have its holds booked as orphans. Gateway rows are excluded from the lane,
+  pending-hold and heartbeat queries. No migration.
+- **S11d (daemon).** Optional `enforcement` (`hooks` default, `null` is
+  `hooks`, `gateway`; any other string is an invalid-file error). The shared
+  budget runtime is an `Arc` on `DaemonConfig`. `gateway_reserve` refuses,
+  writing nothing, unless the file is valid and asks for gateway enforcement,
+  identity and key are usable (256-byte cap; key `gw:<boot_id>:<request_id>`),
+  no later-period pool exists and the request is priceable. Only then does it
+  create the period's pool, sweep expired holds and reserve, so the pool
+  creation and the sweep can write before a `CapExhausted` refusal (intended).
+  `gateway_settle` prices with the shared-budget table (the pinned prices plus
+  the file's `pricing_overrides`, never the gateway config's) and the reserved
+  amount read from the row; if the file is no longer valid at settle time the
+  row is booked at its reservation, `usage_known = false`. `gateway_release`,
+  `gateway_renew`, and `gateway_orphans_at_start` (run at daemon start whether
+  or not the gateway is enabled).
+- **S11e (gateway wiring).** Per-request reserve before forwarding and settle
+  after, combined with the task reservation by AND with compensating release;
+  both are released on upstream failure; pump renewal. New decisions
+  `shared_budget_exceeded`, `shared_budget_unavailable`,
+  `shared_budget_unattributable`. An `Invalid` file stops a `governor_held`
+  gateway's metered requests with `403 shared_budget_unavailable`; a
+  pass-through gateway is stopped only after it has seen the file ask for gateway
+  enforcement. `enforcement = "gateway"` without `governor_held` is refused.
+- **S11f (hooks, Status, doctor).** Replace mode. `PROTOCOL_VERSION` 25 (the
+  unreleased value, no second bump). In gateway mode `Admit` is a pure read: it
+  reserves nothing (`GatewayMetered`), denies `cap_exhausted` when remaining is
+  below the turn hold, and denies `gateway_unavailable` (fail closed) unless a
+  `governor_held` gateway is actually running. `Stop`, `SubagentStop`,
+  `SessionEnd`, the sweep and the subagent readiness probe book nothing;
+  `Stop` settles only a pre-flip `turn_hold`. Status gains `enforcement`,
+  `gateway_in_flight`, `truncated_settles`, `input_bound_violations`,
+  `unrouted_sessions`, `orphans_booked`. `doctor` errors when `enforcement = gateway`
+  and a `governor_held` gateway cannot be confirmed running (gateway not
+  running, running but not `governor_held`, or the daemon unreachable), and when
+  the `ANTHROPIC_BASE_URL` in settings `env` is absent or not a loopback host.
+  The URL value is read only to classify loopback and is never printed. Only the
+  user `~/.claude/settings.json` is inspected, so a project or local settings
+  override is not seen.
+
+### Residuals and known limitations
+
+Each is a property of the built code or the design, not a defect awaiting a
+silent fix. "Over-count" is the safe direction for a cap; "under-count" is not.
+
+**Where the modelled worst case is not a real upper bound (design 1.3)**
+
+- *Input tokens above `bytes / 1.0`:* an overrun is possible; it is detected
+  and recorded as `input_bound_violated`, not prevented. Tokenizer behaviour is
+  an inference.
+- *Inline images and documents* are billed by rendering, not bytes. Per-block
+  constants stand in; their values are inferences until S11a and API docs.
+  Base64 screenshots can over-reserve; a many-page PDF can overrun.
+- *Content not in the body* (url/file sources, Files API, `mcp_servers`,
+  `container`, server tools such as web search, fetch, code execution) is
+  unbounded input plus per-use fees outside `usage`. Hard mode refuses these.
+  Claude Code WebSearch is likely refused (inference, S11a to confirm).
+- *1-hour cache-write tier* (2x base input): reserve and settle share one
+  model, so Libra-accounted totals stay at or under the cap, but the bill can
+  be higher. Not modelled; optional S11h would model it and bump
+  `PRICING_VERSION`.
+- *Fast mode, `inference_geo` 1.1x, long-context premium, stale pinned price
+  table:* bill drift against the provider bill, disclosed, not corrected.
+- *`output_tokens > max_tokens`:* detected, never clamped; reported in Status.
+- *Haiku-class short prompts* over-count by about 5x (safe direction).
+- *Reserve granularity:* with `bytes / 1.0` the worst-case input for a large
+  context can be dollars per request on Opus-class prices, and concurrent
+  subagents multiply it. The last dollars of a month can be unusable.
+
+**Interaction with the turn hold and counting scope (design 3.4)**
+
+- *Replace, not stack:* in gateway mode the budget counts only
+  gateway-routed spend; transcript-measured spend from sessions not routed
+  through the gateway is **not counted**. Detection only: a `Stop` for a session
+  with no gateway row in the current pool counts toward `unrouted_sessions`
+  (distinct, bounded, in-memory; it resets on daemon restart).
+- *Alternative not built:* `message.id` dedupe (hooks keep settling, skipping
+  records the gateway booked) keeps bypass coverage but double-counts on a race
+  and needs a new column. It is presented to the founder, not recommended for
+  the first slice.
+- *`ChargeAgent`* (explicit client amount, sent by no hook) is refused with
+  `GatewayMetered` for Claude lanes.
+- *Codex stays on hooks semantics.* No Codex gateway or budget gate exists.
+- *PreToolUse `Check`* in gateway mode (Claude lanes) denies
+  `gateway_unavailable` unless a `governor_held` gateway is running, and
+  otherwise answers `available` unconditionally; it never reports `exhausted`
+  or `admitted` in this mode, so the turn-hold test cannot wedge an admitted
+  turn. (An absent file, invalid file and clock anomaly are decided before this
+  branch.) Each request is refused by the gateway itself when the pool cannot
+  cover it.
+- *`Admit`* denies `cap_exhausted` below the turn hold unless the lane still has
+  a live pre-flip hold; it creates no pool and runs no sweep.
+- *Run state:* the gateway "running" state means the gateway thread was
+  spawned and has not exited ("thread alive"), set after config validation, the
+  ledger connection and credential/token build. It does not prove the host is
+  bound to it (the request path, session header and `ANTHROPIC_BASE_URL` route
+  are separate and host-dependent).
+- *No gateway supervisor:* a stopped gateway is not restarted. `Admit` and
+  `Check` keep denying `gateway_unavailable` until the daemon restarts or
+  `enforcement` is set back to `hooks`.
+
+**Crash and interruption (design 4)**
+
+- *Cancel before the pump exists, a pump panic, a pre-header hold, or a lease
+  lapsing unrenewed* (renewal starts only after response headers): the gateway
+  never settles that hold. It is booked at the full reservation by
+  expire-as-charge, or by the next start's orphan sweep. Over-count only;
+  cancellation is not redesigned. Visible over-count on ESC interrupts is
+  expected (inference).
+- *Truncated requests* that saw `message_start` usage book the exact input
+  tiers plus `max(observed output, max_tokens)` (`usage_known = false`), not
+  the observed partial usage. *Orphaned, expired and no-usage requests* book the
+  full reservation. (The doc comment on the Status `truncated_settles` field in
+  `crates/protocol/src/shared_budget.rs` says "booked at the full reservation";
+  that is imprecise for the truncated case. A known code-comment imprecision,
+  not edited here.)
+- *Death after the shared reserve but before forwarding* books the worst case
+  even though nothing was sent. Accepted over-count.
+- *Restart overlap* with a draining old daemon: old rows are booked at the
+  reservation and late settles are `AlreadyFinal`. Over-count.
+- *Sleep longer than the TTL* mid-stream: the reservation is booked and the late
+  settle is `AlreadyFinal`. Over-count.
+- *Ledger write failure at settle:* the row stays active, then
+  expire-as-charge books the reservation.
+- *Process death mid-request in hooks-era task path* is unchanged: capacity is
+  freed with unknown spend (ADR-0003 accepted under-count). The pre-existing
+  task-path under-count on truncated streams (R6) is out of S11 and unchanged.
+- *No shared cap when the file asks for none:* with an `Absent` file or
+  `enforcement = "hooks"`, a running `governor_held` gateway forwards without
+  consulting the shared budget (`NotConsulted`, by design). Only the task-budget
+  reservation applies.
+- *Upstream non-2xx* releases both holds in full, which assumes the provider did
+  not bill the failed request.
+- *Renewal can stall:* the pump renews the lease in the same `select!` loop that
+  forwards frames, so a slow client (send backpressure) can delay renewals; a
+  lapsed lease is booked at the full reservation (over-count).
+- *Gateway TTL (600 s) is shorter than the heartbeat TTL (3600 s):* long
+  thinking streams rely on pump renewal for accuracy, not for safety.
+
+**Mode flips**
+
+- *Gateway back to hooks:* hook windows start at the lane's persisted
+  watermark. Gateway-mode `Stop`/`SessionEnd` write, only for sessions that have a gateway row (routed; Codex lanes are skipped), a zero-amount
+  `gateway-mark:` row and the subagent paths write a zero-amount `g<N>` offset
+  row so the hooks-mode window does not re-count spend the gateway booked. After
+  the flip, transcript usage the gateway metered *less* than (partial metering,
+  an orphaned or expired request booked at its reservation, a request refused after the
+  host had counted it) is **forgiven** (under-count, pinned by a test). A
+  subagent that finished before the flip to gateway but was not yet charged is
+  charged by neither. A retention prune of a past month deletes that month's
+  offset rows, so that month's flip-back window is no longer protected
+  (over-count).
+- *Hooks to gateway:* a hooks-mode `turn_hold` still settles by transcript after
+  the flip. The Stop sweep prices subagent files in gateway mode to write
+  offsets, bounded by the hooks-mode file-count and byte budget.
+- *`doctor` does not warn about a flip while holds are live* (designed in 3.4,
+  not implemented).
+
+**Other**
+
+- *Soft-limit warnings are absent* in gateway mode; the gateway mode adds only
+  the refusal and Status fields above.
+- *Export:* the shared-budget export keeps the existing label and does not
+  carry the gateway label; export wording is not updated.
+- *Retention:* `prune` never touches a pool with an active row; gateway rows
+  finalise within minutes, so no change was needed.
+- *Tamper:* the same OS user can raise the cap or edit the ledger; unchanged and
+  stated in the label.
+- *Identity:* the gateway session header is a host assumption (R1). If it is
+  absent or differs from the hook `session_id`, the mode fails closed and is
+  unusable. Subagent traffic is probably not distinguishable (open question Q1).
+- *Evidence:* everything is `TestOwnedLive`. No real-host gateway journey has
+  run; S11a is pending at the time of writing.
+
 ## Consequences
 
 - Once slices S4-S8 land (design intent), refusal before spend at prompt
@@ -1058,5 +1304,5 @@ Residuals, disclosed:
 
 ## Not decided here
 
-Release GO/NO-GO, remote upload, enabling gateway `governor_held` (S11, designed, not built; not enabled in v0.0.4 per the founder scope decision above), enabling a Codex budget gate (designed, not built; same), any provider-bill
+Release GO/NO-GO, remote upload, enabling gateway `governor_held` (S11, built dark in S11b to S11f, opt-in via `enforcement = "gateway"`, not enabled in v0.0.4 or by default; enabling and the label wording are an open Level 2 founder packet), enabling a Codex budget gate (designed, not built; same), any provider-bill
 reconciliation, and any change to the ADR-0023 production-feed ban.
