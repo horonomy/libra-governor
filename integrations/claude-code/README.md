@@ -694,9 +694,9 @@ budget gate (its hook route is unchanged).
 | `PreToolUse` | present, budget exhausted / `config_invalid` / `clock_anomaly` | `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"..."}}`, exit 0 |
 | `PreToolUse` | present, anything else (available, admitted, `not_configured`, daemon down, error, no answer in 500 ms) | empty output = allow (fail open); never spawns a daemon |
 | `SubagentStop` (`hook subagent-stop`) | absent | nothing is parsed or sent, the daemon is not contacted |
-| `SubagentStop` | present | one `ChargeAgentTranscript` with `session_id`, `agent_id` and `agent_transcript_path` as the host sent them, after the same bounded wait for the subagent's own transcript (HORO-2446); the daemon reads, binds, prices and de-duplicates. Always silent, exit 0 |
+| `SubagentStop` | present | one `ChargeAgentTranscript` with `session_id`, `agent_id` and `agent_transcript_path` as the host sent them, after the same bounded wait for the subagent's own transcript (HORO-2446; v0.0.5 candidate, not in the published v0.0.4 binary); the daemon reads, binds, prices and de-duplicates. Always silent, exit 0 |
 | `SessionEnd` (`hook session-end`) | absent | nothing is parsed or sent, the daemon is not contacted |
-| `SessionEnd` | present | one `SettleTail` with `session_id` and `transcript_path`; the hook first waits (bounded) for the host's transcript flush, as `Stop` does. The daemon settles the lane's pending turn hold if a `Stop` never did (measured, else the hold amount flagged unmeasured; HORO-2440), and otherwise charges the records no `Stop` counted. With an invalid budget file nothing is settled. A host that kills the hook during the flush wait leaves the hold to expire, as before. Always silent, exit 0 |
+| `SessionEnd` | present | one `SettleTail` with `session_id` and `transcript_path`; the hook first waits (bounded) for the host's transcript flush, as `Stop` does (v0.0.5 candidate, not in the published v0.0.4 binary). The daemon settles the lane's pending turn hold if a `Stop` never did (measured, else the hold amount flagged unmeasured; HORO-2440; v0.0.5 candidate, not in the published v0.0.4 binary), and otherwise charges the records no `Stop` counted. With an invalid budget file nothing is settled. A host that kills the hook during the flush wait leaves the hold to expire, as before. Always silent, exit 0 |
 
 `Stop` also waits, bounded, before it settles (HORO-2246): when a budget file
 exists it polls the daemon's read-only `TranscriptReady` probe, for at most 1.5 s
@@ -706,7 +706,7 @@ ceiling), because the host writes its transcript about 70 ms after the hook is
 dispatched. It never denies and never opens the transcript; a daemon that is
 down, older or slow ends the wait and `Finalize` is sent as before. With no
 budget file nothing is probed. `SessionEnd` and `SubagentStop` wait the same
-way. See ADR-0026 *Flush lag at Stop*.
+way (v0.0.5 candidate, not in the published v0.0.4 binary). See ADR-0026 *Flush lag at Stop*.
 
 The settlement hooks (`SubagentStop`, `SessionEnd`) never block and never
 spawn a daemon: no daemon, no answer within 5 s, a malformed payload, an
@@ -731,7 +731,7 @@ and anything that edits `shared-budget.json` as the same OS user can change
 the cap. A per-request hard cap exists only with the gateway (ADR-0003).
 Every reason text says "Libra-accounted USD, admission-bounded".
 
-**`"enforcement": "gateway"` (dark, opt-in, S11f).** With this field in
+**`"enforcement": "gateway"` (dark, opt-in, S11f; v0.0.5 candidate, not in the published v0.0.4 binary).** With this field in
 `shared-budget.json` and a running `governor_held` gateway, the gateway reserves
 every request and is the only writer of spend. The hooks then book nothing:
 `UserPromptSubmit` reserves no hold (it still refuses with `cap_exhausted` when
