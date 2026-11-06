@@ -4,7 +4,7 @@
 - **Date:** 2026-09-18
 - **Ticket:** HORO-1144
 - **Amended for the local monthly budget only by [ADR-0026](0026-local-monthly-shared-budget.md):** cooperative prompt-time admission; the gateway remains the hard per-request enforcement point.
-- **S11 amendment (dark, not enabled):** ADR-0026 *Gateway enforcement delivered in S11* records the opt-in `enforcement = "gateway"` mode, which reserves each request against the local monthly pool and replaces the hook charge paths. It is built but off by default, its guarantee label is not approved for user-facing use, and it does not change this ADR's task-budget behaviour.
+- **S11 amendment (dark, not enabled):** ADR-0026 *Gateway enforcement delivered in S11* records the opt-in `enforcement = "gateway"` mode, which reserves each request against the local monthly pool and replaces the hook charge paths. It is built but off by default, its guarantee label is not approved for README or release-notes use (though `shared-budget status` already prints it when `enforcement = "gateway"` is configured), and it does not change this ADR's task-budget behaviour.
 
 ## Context
 
