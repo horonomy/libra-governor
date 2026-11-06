@@ -64,10 +64,10 @@ All paths are relative to the repo root.
 |---|---|---|---|
 | Truncated stream settles at partial usage | under-count | proxy.rs:1234-1243 [V] | Shared path: settle = exact input tiers from `message_start` + `max_tokens × output`, or the full reservation if `message_start` was not seen; `usage_known=false` (S11b) |
 | Input tokens > `bytes/3` (dense Unicode or emoji, the API's tool-use system prompt) | actual > reserved, an overrun | cost.rs:37-42 calls 3.0 "deliberately low" but it is a heuristic [V]; tokenizer behaviour [I] | Hard mode uses `bytes / 1.0` (byte-level BPE gives ≥1 byte per token [I]) plus a per-image constant and a tool-prompt constant. Detect and record `input_bound_violated`, mirroring `bound_violated` (cost.rs:172-174) |
-| Inline images and documents (base64) are billed by rendering, not bytes [I] | either direction. Base64 screenshots inflate the reservation, so R2 is understated. A small many-page PDF can exceed the bound, which is an overrun | body is not inspected (proxy.rs:308-323) [V] | Hard mode excludes `source.data` payload bytes from the byte bound and adds per-block constants (an image maximum and a per-page PDF maximum, values [I] until S11a/API docs). Inventory both in S11a |
+| Inline images and documents (base64) are billed by rendering, not bytes [I] | either direction. Base64 screenshots inflate the reservation, so R2 is understated. A small many-page PDF can exceed the bound, which is an overrun | body is not inspected (proxy.rs:308-323) [V] | Hard mode excludes `source.data` payload bytes from the byte bound and adds per-block constants (an image maximum and a per-page PDF maximum, values [I] until S11a/API docs). Inventory both in S11a. S11a result: base64 image/PDF blocks are nested in `tool_result`; synthetic sizes only, constants unassessed |
 | Content not in the body: `source.type` url/file, Files API, `mcp_servers`, `container`, server tools (`web_search_*`, `web_fetch_*`, `code_execution_*`) | unbounded input, plus per-use fees not in `usage` | body is not inspected beyond 3 fields (proxy.rs:308-323) [V]; field names [I] | Hard mode refuses with `403 unenforceable_request` (a structural check; nothing is retained). **This breaks Claude Code WebSearch [I]**, which is a founder item |
 | 1-hour cache-write tier (2× base input, above the 1.25× 5-minute rate) | the reserve under-states the bill; the settle also under-states it (`ephemeral_1h` is not parsed, usage.rs:79-85) | pricing.rs:90-93, ADR-0026:129-131 [V] | Libra-accounted totals stay ≤ cap because reserve and settle use the same model. This is bill drift, not a Libra overrun. Optional S11h models it and bumps `PRICING_VERSION` |
-| Fast mode, `inference_geo` 1.1×, long-context premium | bill drift | ADR-0026:132-133 [V] | Disclosed residual. S11a inventories the field names |
+| Fast mode, `inference_geo` 1.1×, long-context premium | bill drift | ADR-0026:132-133 [V] | Disclosed residual. S11a: no `speed`/`inference_geo`/`service_tier` key and no `ttl` observed |
 | Haiku 5.5 short prompts | over-count by about 5× | pricing.rs:195-199 [V] | Conservative, so no action |
 | `output_tokens > max_tokens` | overrun | detected, never clamped (proxy.rs:1250-1253) [V] | Unchanged; reported in Status |
 | Stale pinned table | bill drift | pricing.rs:31-41 [V] | Unchanged; `PRICING_VERSION` is recorded on every row |
@@ -97,11 +97,16 @@ Do not say "hard cap" without the qualifiers "modelled worst case" and "gateway-
 ### 2.1 Mapping [V/H]
 - The session comes from the configurable header `gateway_session_header`, default
   `x-claude-code-session-id` (proxy.rs:89; crates/daemon/src/server.rs:134-136, 2894) [V].
-  - **Nothing in the repo shows that Claude Code sends this header or that it equals the hook
-    `session_id` [H].** Treat it the way ADR-0026 treats the unproven `prompt_id` equality
+  - **[H] CONFIRMED by S11a (claude 2.1.306): the header is sent and equals the hook
+    `session_id` on 18/18 requests**, including subagent and `/compact` requests (evidence:
+    `docs/evidence/s11a-claude-code-gateway-request-shape.md`). Original text: nothing in the
+    repo showed this [H]. Treat it the way ADR-0026 treats the unproven `prompt_id` equality
     (docs/adr/0026-local-monthly-shared-budget.md:523-526).
-- No agent id exists on the wire [V: the proxy reads only the session header]. Whether subagent
-  requests carry a distinguishing header is [H].
+- No agent id exists on the wire [V: the proxy reads only the session header]. This stays true
+  of the proxy code. Whether subagent requests carry a distinguishing header was [H]:
+  **CONFIRMED by S11a**: Claude Code sends `x-claude-code-agent-id` on subagent requests, equal
+  to the hook `agent_id` (subagent scenario only; a `/compact` run's hook-visible agent had no
+  such header). The proxy ignores it today; adopting it is a design option, not a decision.
   - Gateway rows are therefore **`unattributed` under the session**, using
     `ExecutorAttribution::unattributed(Some(ChargeSource::Gateway))`
     (crates/ledger/src/shared_pool.rs:284-290) [V]. ADR-0026's identity rules apply: a missing
@@ -125,7 +130,7 @@ Do not say "hard cap" without the qualifiers "modelled worst case" and "gateway-
 - **Alternative (rejected):** charge the pool under an explicit unknown session. The cap stays
   hard either way, so this only buys usability, at the cost of an invented identity.
 - **Consequence:** if [H] fails and Claude Code does not send the header, gateway mode refuses
-  everything. S11a must prove the header before the mode is enabled anywhere.
+  everything. S11a proved the header on 2.1.306 (producer-run; real gateway not in the path).
 
 ---
 
@@ -334,7 +339,7 @@ independent. S11a gates **enablement**, not building.
     speed/geo/beta flags, whether `max_tokens` is always present. Record tags only, no content.
   - Record whether WebSearch uses a server tool.
 - **AC:**
-  - Each [H] in §2 and §1.3 is marked confirmed or refuted, with the CLI version.
+  - Each [H] in §2 and §1.3 is marked confirmed or refuted, with the CLI version. **Done** (claude 2.1.306; see the evidence note).
   - No secret, prompt or body content is stored.
 - **Proposed title:** "S11a: capture Claude Code gateway request identity and envelope shape
   (TestOwnedLive)".
@@ -490,7 +495,7 @@ independent. S11a gates **enablement**, not building.
 
 ## 7. Risks and open questions
 
-- **R1 [H]:** the session header is not sent, or does not equal the hook `session_id`. Gateway
+- **R1 [H] (S11a: header sent and equal, so R1 did not trigger on 2.1.306):** the session header is not sent, or does not equal the hook `session_id`. Gateway
   mode is then unusable (fail closed). S11a must resolve this first.
 - **R2:** over-reservation near the cap. With `bytes/1` and a 200k-token context, the
   worst-case input alone is about $1–4 per request for Opus-class prices [I, arithmetic on
