@@ -32,9 +32,6 @@ use libra_governor_protocol::{
 
 use crate::client;
 
-/// The gateway token's filename inside the daemon's state directory.
-pub const TOKEN_FILE_NAME: &str = "gateway.token";
-
 /// Prints the local capability token, creating it if the gateway has
 /// never run.
 ///
@@ -50,7 +47,9 @@ pub fn run_token() {
             std::process::exit(1);
         }
     };
-    let path = state_dir.join(TOKEN_FILE_NAME);
+    // The gateway checks clients against `gateway.token_path` from
+    // `config.json`, so that is the file this command must create/read.
+    let path = libra_governor_daemon::config_file::gateway_token_path(&state_dir);
     match LocalCapabilityToken::load_or_create(&path) {
         Ok(token) => println!("{}", token.expose_for_agent()),
         Err(e) => {
