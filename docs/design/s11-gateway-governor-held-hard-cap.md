@@ -1,4 +1,4 @@
-> **Status: design proposal, not shipped.** HORO-2261 (S11 gateway governor_held). Line numbers refer to main aea0894. Nothing here is approved for enablement: switching on any enforcement mode, its guarantee label and every item listed as Level 2 need an explicit founder decision. READY_FOR_RELEASE stays false.
+> **Status: design record. S11b to S11f are built and merged on `main` as dark, opt-in code (S11b #316, S11c #312, S11d #318, S11e #320, S11f #321, hardening #323); the mode is off by default (`enforcement=hooks`), not enabled and not claimed. S11g (docs) and S11a (host evidence) are not code.** HORO-2261 (S11 gateway governor_held). The original text below is the design as proposed (line numbers refer to main aea0894); "As built" notes state what the code does, and where they differ the notes win. Nothing here is approved for enablement: switching on any enforcement mode, its guarantee label and every item listed as Level 2 need an explicit founder decision. READY_FOR_RELEASE stays false.
 
 # S11 design: gateway per-request hard cap against the local monthly shared budget
 
@@ -238,7 +238,7 @@ bump precedent). A v24 hook against a v25 daemon fails closed at prompt admissio
 - After a flip from gateway back to hooks, the first `Stop`'s window starts at the lane's old
   watermark and re-counts records the gateway already booked. That is an over-count, the safe
   direction.
-- `doctor` should warn about a flip while holds are live.
+- `doctor` should warn about a flip while holds are live. **As built: NOT implemented** (no such warning exists).
 
 ---
 
@@ -293,8 +293,9 @@ are final within minutes, so no change is needed.
 3. **Refusing server tools and url/file sources in hard mode.** This likely disables Claude Code
    WebSearch [I]. The alternative is an operator-configured per-use surcharge, which is a new
    financial policy.
-4. **Conservative settlement policy.** Truncated, orphaned and expired gateway requests are
-   booked at the worst case. Expect visible over-count on ESC interrupts [I].
+4. **Conservative settlement policy.** Orphaned and expired gateway requests are booked at
+   the full reservation; a truncated one after `message_start` books its actual input tiers plus
+   `max(observed output, max_tokens)`. Expect visible over-count on ESC interrupts [I].
 5. The input-bound choice for hard mode: `bytes/1` (recommended) vs `bytes/3` vs a
    `count_tokens` preflight (an extra upstream round trip and dependency). This is a
    cap-usability trade-off.
@@ -565,14 +566,12 @@ independent. S11a gates **enablement**, not building.
   The route check requires a loopback `ANTHROPIC_BASE_URL` (booleans only; the value is never
   read into output) and says only the user `~/.claude/settings.json` is inspected. The warning for
   a mode flip with live holds (§3.4) is still not implemented.
-- In gateway mode PreToolUse `Check` still reports `exhausted` when remaining < turn hold, so tool
-  calls can be denied mid-turn once gateway reservations shrink remaining; this is stricter than
-  hooks mode.
+- In gateway mode PreToolUse `Check` (Claude lanes) denies `gateway_unavailable` unless a `governor_held` gateway runs, else answers `available` unconditionally; it never reports `exhausted` or `admitted` in this mode (corrected after review; the earlier wording called it stricter than hooks mode, which the code does not do).
 
 - **Residuals of the flip back to hooks.**
   - The watermark moves to the time of the last gateway-mode Stop/SessionEnd, so transcript
-    usage that the gateway metered *less* than (partial metering, a truncated settle that booked
-    the reservation instead, a request the gateway refused after the host had already counted it)
+    usage that the gateway metered *less* than (partial metering, an orphaned or expired request booked
+    at its reservation instead, a request the gateway refused after the host had already counted it)
     is forgiven after the flip, not recovered by the hooks. This is an under-count direction and
     is pinned by a test.
   - A subagent that finished before the flip to gateway mode but whose `SubagentStop`/sweep has
@@ -582,3 +581,9 @@ independent. S11a gates **enablement**, not building.
     flip-back window of that month is no longer protected (over-count direction).
   - The Stop sweep now lists and prices subagent files in gateway mode (bounded by the same
     file-count and byte budget as in hooks mode) to write offsets.
+
+## As built: S11b (#316), S11c (#312), S11d (#318)
+
+- **S11b.** `settle_amount_for(observed, completed_cleanly, saw_message_start, reserved, max_tokens, input_bound, kind, model, pricing)` is pure (it takes `input_bound` too). Clean completion settles the exact tiers, `usage_known = true`. A cut-off after `message_start` usage settles at the exact input tiers plus `max(observed output, max_tokens)`, `usage_known = false`, `truncated_settle`. No usage, no `message_start`, or an unpriceable model settles at `reserved`. `input_bound_violated` when input plus cache creation plus cache read exceeds the bound; never clamped. `hard_input_upper_bound(bytes, image_count)` = bytes (inline base64 excluded by the function; the gateway currently passes the whole body length, so the reservation is looser) + 8,000 per image + 1,000 tool-prompt allowance ([I] constants). `screen_unbounded_inputs` refuses server tools (`web_search_`, `web_fetch_`, `code_execution_` prefixes), url/file sources, non-empty `mcp_servers`, `container`, `container_upload` and base64 PDFs; the list is closed. Counters `truncated_settles`, `input_bound_violations`.
+- **S11c.** Expire-as-charge books an expired active gateway non-charge hold at its reservation (`usage_known = 0`). `settle_orphaned_gateway_holds(boot_prefix_keep, now)` books every active gateway hold whose key lacks `gw:<boot_id>:`, ignoring expiry; idempotent; a malformed prefix sweeps nothing. It is global per ledger and assumes one gateway process per ledger. Gateway rows are excluded from the lane, pending-hold and heartbeat queries.
+- **S11d.** `enforcement` parses `hooks` (default, also `null`) or `gateway`; other values make the file invalid. `gateway_reserve` refuses without writing unless the file is valid and asks for gateway enforcement, identity and key are usable (256-byte cap, key `gw:<boot_id>:<request_id>`), no later-period pool exists and the request is priceable; it then creates the pool, sweeps expired holds and reserves, so pool creation and the sweep may write before a `CapExhausted` refusal. `gateway_settle` prices with the file's pricing table (never the gateway config's overrides) and books the reservation, `usage_known = false`, if the file is no longer valid. `gateway_release`, `gateway_renew`, `gateway_orphans_at_start` (daemon start, whether or not the gateway is enabled).
