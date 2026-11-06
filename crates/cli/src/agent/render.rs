@@ -150,13 +150,25 @@ pub fn format_receipt_summary(result: &FinalizeResult) -> String {
         "[libra-governor] Execution Receipt (task {})\n\
          {estimate_line}\n\
          Actual:   {}\n\
+         Model:    {}\n\
          Outcome:  Unknown (no automated completion verification in MVP 1)\n\
          Tool calls: {}\n\
          Inside P90: {inside_p90}",
         receipt.task_id,
         format_actual_line(receipt.actual_duration_secs, &receipt.actual_usage),
+        format_model_line(receipt.model.as_deref()),
         receipt.tool_call_count,
     )
+}
+
+/// The receipt's model, or an explicit "unknown": Claude Code's `Stop`
+/// payload carries no `model` (HORO-2442), and an absent or blank value must
+/// never render as an empty string or an invented default.
+fn format_model_line(model: Option<&str>) -> String {
+    match model.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(model) => model.to_string(),
+        None => "unknown (the host's Stop payload carried no model)".to_string(),
+    }
 }
 
 fn format_estimate_line(estimate: &Estimate) -> String {
@@ -271,6 +283,34 @@ mod tests {
             OffsetDateTime::UNIX_EPOCH,
         )
         .with_tool_call_count(3)
+    }
+
+    #[test]
+    fn a_receipt_without_a_model_says_unknown_never_blank_or_invented() {
+        for model in [None, Some(""), Some("   ")] {
+            let mut receipt = sample_receipt();
+            receipt.model = model.map(str::to_owned);
+            let summary = format_receipt_summary(&FinalizeResult {
+                receipt,
+                estimate: Some(Estimate::cold_start()),
+            });
+            let line = summary
+                .lines()
+                .find(|l| l.starts_with("Model:"))
+                .unwrap_or_else(|| panic!("no Model line in {summary}"));
+            assert!(line.contains("unknown"), "{model:?}: {line}");
+        }
+    }
+
+    #[test]
+    fn a_receipt_with_a_model_shows_it() {
+        let mut receipt = sample_receipt();
+        receipt.model = Some("claude-sonnet-5".to_string());
+        let summary = format_receipt_summary(&FinalizeResult {
+            receipt,
+            estimate: None,
+        });
+        assert!(summary.contains("Model:    claude-sonnet-5"), "{summary}");
     }
 
     #[test]

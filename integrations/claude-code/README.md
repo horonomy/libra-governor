@@ -236,7 +236,9 @@ stays local — see the Privacy Boundary section of `ARCHITECTURE.md`.
   `permission_mode`, `prompt_id`, `session_id`, `tool_input`, `tool_name`,
   `tool_response`, `tool_use_id`, `transcript_path`). `hook stop` parses a
   `model` when a payload carries one (Codex's `Stop` does), so on Claude Code
-  `ExecutionReceipt.model` is `None`. This does not affect the settled cost:
+  `ExecutionReceipt.model` is `None` and the Estimate-vs-Actual summary prints
+  `Model:    unknown (the host's Stop payload carried no model)`; a blank
+  `model` is treated the same, never recorded as an empty string. This does not affect the settled cost:
   usage is priced from the per-message `model` in the transcript, not from
   the hook payload.
 - Neither payload exposes a provider identifier, token counts, or
