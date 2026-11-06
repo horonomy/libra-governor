@@ -636,6 +636,85 @@ fn doctor_never_prints_a_gateway_credential_reference() {
     }
 }
 
+/// HORO-2363: `gateway token` must create/serve the token at the
+/// configured `gateway.token_path` (the file the gateway checks clients
+/// against), not at `<state_dir>/gateway.token`. The token value is only
+/// ever compared between the two files, never printed by this test.
+#[test]
+fn gateway_token_uses_the_configured_token_path() {
+    let sandbox = Sandbox::new();
+    std::fs::create_dir_all(&sandbox.state_dir).unwrap();
+    let configured = sandbox.state_dir.parent().unwrap().join("elsewhere.token");
+    let config = serde_json::json!({
+        "gateway": {
+            "bind_addr": "127.0.0.1:0",
+            "token_path": configured,
+            "credential_mode": "pass_through_subscription"
+        }
+    });
+    std::fs::write(
+        sandbox.state_dir.join("config.json"),
+        serde_json::to_string(&config).unwrap(),
+    )
+    .unwrap();
+
+    let (output, _) = sandbox.run(&["gateway", "token"]);
+
+    assert!(output.status.success());
+    assert!(
+        configured.exists(),
+        "the configured token file must be created"
+    );
+    assert!(
+        !sandbox.state_dir.join("gateway.token").exists(),
+        "no token may be created at the default path when another is configured"
+    );
+    let on_disk = std::fs::read_to_string(&configured).unwrap();
+    let printed = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(printed.trim(), on_disk.trim());
+    let (doctor, _) = sandbox.run(&["doctor"]);
+    let doctor_out = String::from_utf8_lossy(&doctor.stdout);
+    assert!(
+        doctor_out.contains("gateway capability token present")
+            && doctor_out.contains(configured.to_str().unwrap()),
+        "doctor must check the configured path: {doctor_out}"
+    );
+}
+
+/// HORO-2364: a `config.json` the daemon will fail closed on must not be
+/// reported as "parses cleanly".
+#[test]
+fn doctor_warns_for_a_non_loopback_bind_and_for_unknown_keys() {
+    let sandbox = Sandbox::new();
+    std::fs::create_dir_all(&sandbox.state_dir).unwrap();
+    let config = serde_json::json!({
+        "gateway": {
+            "bind_addr": "0.0.0.0:8787",
+            "token_path": sandbox.state_dir.join("gateway.token"),
+            "credential_mode": "pass_through_subscription",
+            "bogus_key": 1
+        }
+    });
+    std::fs::write(
+        sandbox.state_dir.join("config.json"),
+        serde_json::to_string(&config).unwrap(),
+    )
+    .unwrap();
+
+    let (output, _) = sandbox.run(&["doctor"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("config_file_present"))
+        .unwrap_or_else(|| panic!("no config_file_present line: {stdout}"));
+    assert!(line.starts_with("[warn]"), "{line}");
+    assert!(!line.contains("parses cleanly"), "{line}");
+    assert!(line.contains("0.0.0.0:8787"), "{line}");
+    assert!(line.contains("gateway.bogus_key"), "{line}");
+    assert!(output.status.success(), "a warning must not fail doctor");
+}
+
 /// Regression coverage for HORO-1500: several threads creating sandboxes
 /// and exec'ing their own private binary copy at the same time must never
 /// fail to exec, and must never fork while a copy is in flight.
