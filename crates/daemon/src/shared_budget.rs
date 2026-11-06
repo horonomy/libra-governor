@@ -185,8 +185,20 @@ pub struct SharedBudgetRuntime {
     sweep_seen: Mutex<std::collections::HashMap<(String, String), (u64, i128)>>,
     /// What the daemon knows about its gateway right now (S11f): see
     /// [`GatewayRun`]. Set by the daemon's gateway start, cleared when the
-    /// gateway thread exits or errors. Process memory only.
-    gateway_run: std::sync::atomic::AtomicU8,
+    /// gateway thread exits or errors. Process memory only. Packed as
+    /// `generation << 2 | run`: the generation counts gateway starts so a
+    /// stale thread's exit cannot clear a newer gateway's state.
+    gateway_run: std::sync::atomic::AtomicU64,
+}
+
+const RUN_MASK: u64 = 0b11;
+
+fn run_bits(run: GatewayRun) -> u64 {
+    match run {
+        GatewayRun::Stopped => 0,
+        GatewayRun::PassThrough => 1,
+        GatewayRun::GovernorHeld => 2,
+    }
 }
 
 /// Whether, and as what, the daemon's gateway is running.
@@ -275,7 +287,7 @@ impl SharedBudgetRuntime {
             clock: Arc::new(SystemClock),
             telemetry: Mutex::new(Telemetry::default()),
             sweep_seen: Mutex::new(std::collections::HashMap::new()),
-            gateway_run: std::sync::atomic::AtomicU8::new(0),
+            gateway_run: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -311,17 +323,48 @@ impl SharedBudgetRuntime {
     /// gateway thread starts and the thread clears it when it exits, so a
     /// failed start, a bind error or a later stop all read as `Stopped`.
     pub fn set_gateway_run(&self, run: GatewayRun) {
-        let v = match run {
-            GatewayRun::Stopped => 0,
-            GatewayRun::PassThrough => 1,
-            GatewayRun::GovernorHeld => 2,
-        };
-        self.gateway_run
-            .store(v, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.update_gateway_run(|cur| Some((cur & !RUN_MASK) | run_bits(run)));
+    }
+
+    /// Compare-and-swap loop over the packed run state. `AtomicU64::try_update`
+    /// is unstable on the harness's pinned Rust 1.90 and `fetch_update` is
+    /// deprecated on newer stable (which CI floats on), so an explicit loop is
+    /// the one form that builds warning-free on both. `f` returning `None`
+    /// leaves the state untouched.
+    fn update_gateway_run(&self, f: impl Fn(u64) -> Option<u64>) -> Result<u64, u64> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut cur = self.gateway_run.load(SeqCst);
+        loop {
+            let Some(next) = f(cur) else { return Err(cur) };
+            match self
+                .gateway_run
+                .compare_exchange_weak(cur, next, SeqCst, SeqCst)
+            {
+                Ok(prev) => return Ok(prev),
+                Err(seen) => cur = seen,
+            }
+        }
+    }
+
+    /// Starts a new gateway generation in state `run` and returns its token.
+    /// [`Self::end_gateway_run`] with that token clears the state only while
+    /// no newer gateway has started since.
+    pub fn begin_gateway_run(&self, run: GatewayRun) -> u64 {
+        let prev = self
+            .update_gateway_run(|cur| Some((((cur >> 2) + 1) << 2) | run_bits(run)))
+            .unwrap_or_default();
+        (prev >> 2) + 1
+    }
+
+    /// Marks the gateway `Stopped` if `generation` is still the current one;
+    /// returns whether it did.
+    pub fn end_gateway_run(&self, generation: u64) -> bool {
+        self.update_gateway_run(|cur| (cur >> 2 == generation).then_some(cur & !RUN_MASK))
+            .is_ok()
     }
 
     pub fn gateway_run(&self) -> GatewayRun {
-        match self.gateway_run.load(std::sync::atomic::Ordering::SeqCst) {
+        match self.gateway_run.load(std::sync::atomic::Ordering::SeqCst) & RUN_MASK {
             1 => GatewayRun::PassThrough,
             2 => GatewayRun::GovernorHeld,
             _ => GatewayRun::Stopped,
