@@ -183,6 +183,22 @@ pub struct SharedBudgetRuntime {
     /// `(session, agent)`. Process memory only: a restart re-checks every
     /// file once, which the delta logic makes harmless.
     sweep_seen: Mutex<std::collections::HashMap<(String, String), (u64, i128)>>,
+    /// What the daemon knows about its gateway right now (S11f): see
+    /// [`GatewayRun`]. Set by the daemon's gateway start, cleared when the
+    /// gateway thread exits or errors. Process memory only.
+    gateway_run: std::sync::atomic::AtomicU8,
+}
+
+/// Whether, and as what, the daemon's gateway is running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayRun {
+    /// No gateway runs: none configured, its start failed, or it stopped.
+    Stopped,
+    /// A gateway runs that passes the caller's credential through; it cannot
+    /// meter the shared budget.
+    PassThrough,
+    /// A `governor_held` gateway runs.
+    GovernorHeld,
 }
 
 /// At most this many unpriced model ids are remembered for `Status`.
@@ -259,6 +275,7 @@ impl SharedBudgetRuntime {
             clock: Arc::new(SystemClock),
             telemetry: Mutex::new(Telemetry::default()),
             sweep_seen: Mutex::new(std::collections::HashMap::new()),
+            gateway_run: std::sync::atomic::AtomicU8::new(0),
         }
     }
 
@@ -290,6 +307,27 @@ impl SharedBudgetRuntime {
     /// present right now. Stat on every call, so removing the file switches
     /// Codex settlement off from the next request. A runtime with no state
     /// directory is never enrolled; a symlink does not count.
+    /// Records the gateway's run state (S11f). The daemon sets it before the
+    /// gateway thread starts and the thread clears it when it exits, so a
+    /// failed start, a bind error or a later stop all read as `Stopped`.
+    pub fn set_gateway_run(&self, run: GatewayRun) {
+        let v = match run {
+            GatewayRun::Stopped => 0,
+            GatewayRun::PassThrough => 1,
+            GatewayRun::GovernorHeld => 2,
+        };
+        self.gateway_run
+            .store(v, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn gateway_run(&self) -> GatewayRun {
+        match self.gateway_run.load(std::sync::atomic::Ordering::SeqCst) {
+            1 => GatewayRun::PassThrough,
+            2 => GatewayRun::GovernorHeld,
+            _ => GatewayRun::Stopped,
+        }
+    }
+
     pub fn codex_enrolled(&self) -> bool {
         self.loaded
             .path
@@ -827,9 +865,10 @@ fn allowed(
     })
 }
 
-/// Handles `SharedBudgetRequest::Admit`, assuming a `governor_held` gateway
-/// is running (see [`admit_with_gateway`], which the daemon dispatch uses
-/// with the real answer). Hooks mode never consults that assumption.
+/// Handles `SharedBudgetRequest::Admit`. Under `enforcement = "gateway"` a
+/// prompt with no running `governor_held` gateway ([`GatewayRun`]) is denied
+/// `gateway_unavailable` (after the file, identity and clock checks), because
+/// the hooks book nothing and nothing else would meter the spend.
 pub fn admit(
     ledger: &mut LedgerStore,
     rt: &SharedBudgetRuntime,
@@ -837,22 +876,6 @@ pub fn admit(
     agent_id: Option<&str>,
     prompt_id: Option<&str>,
     provider: Option<&str>,
-) -> Result<SharedBudgetOutcome, SharedBudgetError> {
-    admit_with_gateway(ledger, rt, session_id, agent_id, prompt_id, provider, true)
-}
-
-/// [`admit`] told whether the daemon runs a `governor_held` gateway. Under
-/// `enforcement = "gateway"` a prompt with no such gateway is denied
-/// `gateway_unavailable` (after the file, identity and clock checks), because
-/// the hooks book nothing and nothing else would meter the spend.
-pub fn admit_with_gateway(
-    ledger: &mut LedgerStore,
-    rt: &SharedBudgetRuntime,
-    session_id: &str,
-    agent_id: Option<&str>,
-    prompt_id: Option<&str>,
-    provider: Option<&str>,
-    governor_held_gateway: bool,
 ) -> Result<SharedBudgetOutcome, SharedBudgetError> {
     let prompt_id = usable_prompt(prompt_id);
     let GateContext {
@@ -874,7 +897,7 @@ pub fn admit_with_gateway(
     // sees Codex traffic.
     if cfg.enforcement == Enforcement::Gateway && is_claude_provider(provider) {
         let remaining = remaining_of(ledger, &period.pool_id, cfg, now)?;
-        if !governor_held_gateway {
+        if rt.gateway_run() != GatewayRun::GovernorHeld {
             return Ok(denied(
                 SharedBudgetDenyReason::GatewayUnavailable,
                 Some(remaining),
@@ -1097,6 +1120,16 @@ pub fn check(
     // meters and refuses each request itself. An invalid file, a clock
     // anomaly and an absent file were handled above.
     if cfg.enforcement == Enforcement::Gateway && is_claude_provider(provider) {
+        // Available only while a governor_held gateway actually runs;
+        // otherwise nothing meters the call, so deny as Admit does.
+        if rt.gateway_run() != GatewayRun::GovernorHeld {
+            return Ok(denied(
+                SharedBudgetDenyReason::GatewayUnavailable,
+                Some(remaining),
+                Some(period.end),
+                Some("enforcement=gateway needs a running governor_held gateway".to_string()),
+            ));
+        }
         return Ok(SharedBudgetOutcome::Checked {
             state: SharedBudgetCheckState::Available,
             remaining_usd_cents: remaining,
@@ -1143,7 +1176,8 @@ pub fn charge(
     event_time: Option<&str>,
     provider: Option<&str>,
 ) -> Result<SharedBudgetOutcome, SharedBudgetError> {
-    if matches!(rt.effective().state, SharedBudgetFileState::Absent) {
+    let state = rt.effective().state;
+    if matches!(state, SharedBudgetFileState::Absent) {
         return Ok(SharedBudgetOutcome::NotConfigured);
     }
     let lane = match admission_lane(session_id, agent_id, provider, false) {
@@ -1152,7 +1186,7 @@ pub fn charge(
     };
     // `enforcement = gateway` (S11f): the gateway is the only writer of
     // spend for Claude lanes, and no hook sends this request.
-    if is_claude_provider(provider) && gateway_enforced(&rt.effective().state) {
+    if is_claude_provider(provider) && gateway_enforced(&state) {
         return Ok(refused(SharedBudgetRefusal::GatewayMetered));
     }
     charge_on_lane(

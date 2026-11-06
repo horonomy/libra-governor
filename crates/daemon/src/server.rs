@@ -901,14 +901,13 @@ pub(crate) fn dispatch(
                     agent_id,
                     prompt_id,
                     provider,
-                } => crate::shared_budget::admit_with_gateway(
+                } => crate::shared_budget::admit(
                     ledger,
                     rt,
                     &session_id,
                     agent_id.as_deref(),
                     prompt_id.as_deref(),
                     provider.as_deref(),
-                    gateway_is_governor_held(config),
                 ),
                 SharedBudgetRequest::Check {
                     session_id,
@@ -3057,15 +3056,32 @@ fn start_gateway(config: &DaemonConfig, boot_id: &str) -> Option<GatewayHandle> 
 
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
     let log_path = config.log_path.clone();
-    std::thread::Builder::new()
+    // Marked running before the thread starts (a bind error inside
+    // `run_gateway` must clear it after, never race it) and cleared when the
+    // thread ends for any reason, so Admit and Check see what is real.
+    let shared = std::sync::Arc::clone(&config.shared_budget);
+    shared.set_gateway_run(
+        if tier == libra_governor_domain::EnforcementTier::GatewayMetered {
+            crate::shared_budget::GatewayRun::GovernorHeld
+        } else {
+            crate::shared_budget::GatewayRun::PassThrough
+        },
+    );
+    let spawned = std::thread::Builder::new()
         .name("libra-gateway".to_string())
         .spawn(move || {
             if let Err(e) = libra_governor_gateway::server::run_gateway(runtime_config, shutdown_rx)
             {
                 log::append_line(&log_path, &format!("gateway stopped: {e}"));
             }
-        })
-        .ok()?;
+            shared.set_gateway_run(crate::shared_budget::GatewayRun::Stopped);
+        });
+    if spawned.is_err() {
+        config
+            .shared_budget
+            .set_gateway_run(crate::shared_budget::GatewayRun::Stopped);
+        return None;
+    }
 
     log::append_line(
         &config.log_path,
@@ -3120,17 +3136,6 @@ fn start_extensions(config: &DaemonConfig) -> Option<ExtensionDispatcherHandle> 
     })
 }
 
-/// Whether the daemon's gateway configuration is `governor_held`
-/// ([`libra_governor_domain::EnforcementTier::GatewayMetered`]) and valid,
-/// judged the way `GatewayStatus` judges `running`, which `doctor` reads.
-fn gateway_is_governor_held(config: &DaemonConfig) -> bool {
-    let Some(raw) = config.gateway.clone() else {
-        return false;
-    };
-    libra_governor_gateway::config::validate(raw, config.policy.resource.target.kind())
-        .is_ok_and(|v| v.tier == libra_governor_domain::EnforcementTier::GatewayMetered)
-}
-
 /// Answers a `GatewayStatus` request from state the daemon already holds.
 ///
 /// Read-only by construction — there is no request variant that starts,
@@ -3151,6 +3156,21 @@ fn gateway_status(config: &DaemonConfig) -> GatewayStatusResult {
             None,
         ),
         Some(raw) => match libra_governor_gateway::config::validate(raw, policy_kind) {
+            Ok(_)
+                if config.shared_budget.gateway_run()
+                    == crate::shared_budget::GatewayRun::Stopped =>
+            {
+                (
+                    false,
+                    Some(
+                        "the gateway is configured but not running (its start failed or it \
+                     stopped); see the daemon log"
+                            .to_string(),
+                    ),
+                    None,
+                    None,
+                )
+            }
             Ok(validated) => (
                 true,
                 None,
