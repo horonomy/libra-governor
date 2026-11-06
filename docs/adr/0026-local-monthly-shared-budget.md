@@ -357,7 +357,8 @@ the subagent path is trusted; S8 re-verifies):
    **confirmed**, including subagent requests and across `/compact`. Subagent
    requests carry `x-claude-code-agent-id`, equal to the hook `agent_id` -
    **confirmed**. WebSearch issues a `web_search_20250305` server-tool request -
-   **confirmed**. `web_fetch_*`, `code_execution_*`, `mcp_servers`, `container`,
+   **confirmed**; hard mode would also 403 a base64 PDF read, which `is_base64_pdf`
+   treats as unbounded. `web_fetch_*`, `code_execution_*`, `mcp_servers`, `container`,
    url/file sources, a 1h cache `ttl`, fast mode and `inference_geo` -
    **not observed**. The real gateway was not in the request path (the daemon
    config cannot target a loopback upstream); gateway acceptance is untested.
