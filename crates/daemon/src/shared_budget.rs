@@ -326,9 +326,11 @@ impl SharedBudgetRuntime {
         let _ = self.update_gateway_run(|cur| Some((cur & !RUN_MASK) | run_bits(run)));
     }
 
-    /// Compare-and-swap loop over the packed run state. `AtomicU64::fetch_update`
-    /// is deprecated and `try_update` is unstable on the toolchains CI pins, so
-    /// neither can be used. `f` returning `None` leaves the state untouched.
+    /// Compare-and-swap loop over the packed run state. `AtomicU64::try_update`
+    /// is unstable on the harness's pinned Rust 1.90 and `fetch_update` is
+    /// deprecated on newer stable (which CI floats on), so an explicit loop is
+    /// the one form that builds warning-free on both. `f` returning `None`
+    /// leaves the state untouched.
     fn update_gateway_run(&self, f: impl Fn(u64) -> Option<u64>) -> Result<u64, u64> {
         use std::sync::atomic::Ordering::SeqCst;
         let mut cur = self.gateway_run.load(SeqCst);
