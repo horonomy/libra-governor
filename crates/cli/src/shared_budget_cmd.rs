@@ -61,9 +61,12 @@ const HELP: &str = "Usage:\n  \
     dollars (at most 2 decimals, e.g. 200 or 12.50). --time-zone is required: the budget period is \
     a calendar month in that zone and there is deliberately no UTC default. --turn-hold-usd is what \
     each prompt reserves (default 10; must not exceed the cap). Refuses to replace an existing \
-    file unless --force (which replaces the whole file: pricing_overrides, \
-    subagent_unmeasured_charge_usd_cents and any soft limit not repeated are dropped, but the \
-    previous file is kept as shared-budget.json.bak; the ledger is untouched). The optional \
+    file unless --force, which regenerates it: every setting you pass as a flag is applied and every \
+    other setting of the existing file (pricing_overrides, subagent_unmeasured_charge_usd_cents, \
+    turn hold, soft limits, enforcement) is carried over; a value that no longer validates, or a key \
+    this version does not know, is reported and left only in the backup (the default applies); the previous file is kept as \
+    shared-budget.json.bak-<UTC timestamp>, never overwritten by a later --force; the ledger is \
+    untouched. The optional \
     per-session and per-agent soft limits are dollars, warn only, and never grant capacity or deny a prompt. A running \
     daemon picks the file up on the next prompt.\n  \
     status   Read-only budget posture from the running daemon (never starts one): config state, \
@@ -224,6 +227,155 @@ struct InitReport {
     path: PathBuf,
     config: libra_governor_daemon::shared_budget_file::SharedBudgetConfig,
     replaced: bool,
+    /// Where the replaced file was kept; `Some` exactly when `replaced`.
+    backup: Option<PathBuf>,
+    /// Settings of the previous file carried into the new one.
+    carried_keys: Vec<String>,
+    /// Previous-file settings that were NOT carried, each with the reason.
+    not_carried: Vec<String>,
+}
+
+/// `YYYYMMDDTHHMMSSZ` (UTC) for a backup file name.
+fn backup_stamp() -> String {
+    let now = OffsetDateTime::now_utc();
+    format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second()
+    )
+}
+
+/// Keeps the file at `path` under a fresh `shared-budget.json.bak-<stamp>`
+/// name and returns it. The name is claimed with a hard link, which fails
+/// if it exists, so an earlier backup is never overwritten: a second
+/// forced `init` in the same second gets a `-1`, `-2`, ... suffix.
+fn back_up_existing(dir: &Path, path: &Path) -> std::io::Result<PathBuf> {
+    let stamp = backup_stamp();
+    let base = format!(
+        "{}.bak-{stamp}",
+        libra_governor_daemon::shared_budget_file::SHARED_BUDGET_FILE_NAME
+    );
+    for attempt in 0..1000u32 {
+        let name = if attempt == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{attempt}")
+        };
+        let target = dir.join(name);
+        match std::fs::hard_link(path, &target) {
+            Ok(()) => return Ok(target),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no unused backup name",
+    ))
+}
+
+/// The regenerated file's bytes plus what happened to the previous file's
+/// settings.
+struct Merged {
+    bytes: Vec<u8>,
+    carried: Vec<String>,
+    not_carried: Vec<String>,
+}
+
+/// Builds the regenerated file for `init --force`: the settings the user
+/// passed as flags (`base`) win, and every other setting of the previous
+/// file is carried over as long as the
+/// result still validates with the daemon's own parser. Each carried
+/// setting is tried on its own against what is accepted so far, so one bad
+/// value is reported and falls back to the default without costing the
+/// others.
+fn merge_previous(previous: &[u8], base: &[u8]) -> Merged {
+    use libra_governor_daemon::shared_budget_file::{parse, SharedBudgetFileState};
+
+    let mut merged = Merged {
+        bytes: base.to_vec(),
+        carried: Vec::new(),
+        not_carried: Vec::new(),
+    };
+    let Ok(Value::Object(old)) = serde_json::from_slice::<Value>(previous) else {
+        merged.not_carried.push(
+            "the previous file was not a valid JSON object, so none of it could be carried"
+                .to_string(),
+        );
+        return merged;
+    };
+    let Ok(Value::Object(mut doc)) = serde_json::from_slice::<Value>(base) else {
+        return merged;
+    };
+
+    // (display name, top-level key, soft_limits member, value) in file order.
+    let mut candidates: Vec<(String, String, Option<String>, Value)> = Vec::new();
+    for (key, value) in &old {
+        match (key.as_str(), value) {
+            ("schema_version", _) => {}
+            ("soft_limits", Value::Object(members)) => {
+                for (member, v) in members {
+                    candidates.push((
+                        format!("soft_limits.{member}"),
+                        key.clone(),
+                        Some(member.clone()),
+                        v.clone(),
+                    ));
+                }
+            }
+            _ => candidates.push((key.clone(), key.clone(), None, value.clone())),
+        }
+    }
+
+    for (name, key, member, value) in candidates {
+        // A setting the user passed as a flag wins over the previous value.
+        let already_set = match &member {
+            None => doc.contains_key(&key),
+            Some(m) => doc
+                .get(&key)
+                .and_then(Value::as_object)
+                .is_some_and(|o| o.contains_key(m)),
+        };
+        if already_set {
+            continue;
+        }
+        let mut trial = doc.clone();
+        match &member {
+            None => {
+                trial.insert(key.clone(), value.clone());
+            }
+            Some(m) => {
+                let entry = trial
+                    .entry(key.clone())
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                if let Value::Object(o) = entry {
+                    o.insert(m.clone(), value.clone());
+                }
+            }
+        }
+        let trial_bytes =
+            serde_json::to_vec_pretty(&Value::Object(trial.clone())).unwrap_or_default();
+        match parse(&trial_bytes) {
+            SharedBudgetFileState::Valid(_) => {
+                doc = trial;
+                merged.carried.push(name);
+            }
+            SharedBudgetFileState::Invalid(reason) => {
+                merged
+                    .not_carried
+                    .push(format!("{name}: {reason}; the default applies"));
+            }
+            SharedBudgetFileState::Absent => {}
+        }
+    }
+    let mut bytes = serde_json::to_vec_pretty(&Value::Object(doc)).unwrap_or_default();
+    bytes.push(b'\n');
+    merged.bytes = bytes;
+    merged
 }
 
 /// Serialises the request into the file's bytes. Only the fields the user
@@ -279,19 +431,18 @@ fn unique_temp_name() -> String {
 /// written. They go to an owner-only temp file in `dir` first; without
 /// `force` they are then linked into place (fails if anything exists, with
 /// no check-then-write race), with `force` they replace a regular file via
-/// rename, after the old file is kept as `shared-budget.json.bak`. A reader
+/// rename, after the old file is kept as `shared-budget.json.bak-<UTC stamp>`.
+/// Settings of the old file that the request does not set are carried over. A reader
 /// therefore sees the old file or the new one, never a partial one.
 fn init_in(dir: &Path, request: &InitRequest) -> Result<InitReport, String> {
     use libra_governor_daemon::shared_budget_file::{
         parse, SharedBudgetFileState, SHARED_BUDGET_FILE_NAME,
     };
 
-    let bytes = init_bytes(request);
-    let config = match parse(&bytes) {
-        SharedBudgetFileState::Valid(config) => config,
-        SharedBudgetFileState::Invalid(reason) => return Err(init_invalid_message(&reason)),
-        SharedBudgetFileState::Absent => return Err("internal error: empty configuration".into()),
-    };
+    let mut bytes = init_bytes(request);
+    if let SharedBudgetFileState::Invalid(reason) = parse(&bytes) {
+        return Err(init_invalid_message(&reason));
+    }
 
     let path = dir.join(SHARED_BUDGET_FILE_NAME);
     let replaced = match std::fs::symlink_metadata(&path) {
@@ -313,20 +464,28 @@ fn init_in(dir: &Path, request: &InitRequest) -> Result<InitReport, String> {
         Err(e) => return Err(format!("could not inspect {}: {e}", path.display())),
     };
 
+    let mut backup = None;
+    let mut carried = Vec::new();
+    let mut not_carried = Vec::new();
     if replaced {
         // A hard link keeps the old inode (and its owner-only mode) alive
-        // under the .bak name, and the rename over an existing .bak is
-        // atomic. Done before anything is replaced so a failure here leaves
-        // the original untouched.
-        let link = dir.join(unique_temp_name());
-        let backed_up = std::fs::hard_link(&path, &link).and_then(|()| {
-            std::fs::rename(&link, dir.join(format!("{SHARED_BUDGET_FILE_NAME}.bak")))
-        });
-        if let Err(e) = backed_up {
-            let _ = std::fs::remove_file(&link);
-            return Err(format!("could not back up {}: {e}", path.display()));
+        // under the backup name. Done before anything is replaced so a
+        // failure here leaves the original untouched.
+        let merged = merge_previous(&std::fs::read(&path).unwrap_or_default(), &bytes);
+        bytes = merged.bytes;
+        carried = merged.carried;
+        not_carried = merged.not_carried;
+        match back_up_existing(dir, &path) {
+            Ok(kept) => backup = Some(kept),
+            Err(e) => return Err(format!("could not back up {}: {e}", path.display())),
         }
     }
+
+    let config = match parse(&bytes) {
+        SharedBudgetFileState::Valid(config) => config,
+        SharedBudgetFileState::Invalid(reason) => return Err(init_invalid_message(&reason)),
+        SharedBudgetFileState::Absent => return Err("internal error: empty configuration".into()),
+    };
 
     let tmp = dir.join(unique_temp_name());
     let staged = std::fs::OpenOptions::new()
@@ -367,6 +526,9 @@ fn init_in(dir: &Path, request: &InitRequest) -> Result<InitReport, String> {
         path,
         config,
         replaced,
+        backup,
+        carried_keys: carried,
+        not_carried,
     })
 }
 
@@ -480,9 +642,25 @@ fn render_init(report: &InitReport) -> String {
             ));
         }
     }
+    let mut kept = String::new();
+    if let Some(backup) = &report.backup {
+        kept.push_str(&format!(
+            "  Previous file kept as {} (earlier backups are never overwritten)\n",
+            backup.display()
+        ));
+        if !report.carried_keys.is_empty() {
+            kept.push_str(&format!(
+                "  Carried over from the previous file: {}\n",
+                report.carried_keys.join(", ")
+            ));
+        }
+        for reason in &report.not_carried {
+            kept.push_str(&format!("  NOT carried over: {reason}\n"));
+        }
+    }
     format!(
         "{} {}\n\
-         \x20 Monthly cap:  {} (calendar month in {})\n\
+         {kept}\x20 Monthly cap:  {} (calendar month in {})\n\
          \x20 Turn hold:    {} reserved per prompt\n\
          {soft}\x20 Guarantee:    admission-bounded (cooperative); Libra-accounted list-price-equivalent \
          USD, not a provider bill or quota\n\
@@ -1248,29 +1426,165 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 
+    fn backups(dir: &Path) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("shared-budget.json.bak"))
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
     #[test]
     fn init_force_keeps_the_previous_file_as_an_owner_only_backup() {
         let dir = tempfile::tempdir().unwrap();
         init_in(dir.path(), &req(20_000, "UTC", None, false)).unwrap();
         let original = std::fs::read(dir.path().join("shared-budget.json")).unwrap();
         init_in(dir.path(), &req(30_000, "UTC", None, true)).unwrap();
-        let backup = dir.path().join("shared-budget.json.bak");
-        assert_eq!(std::fs::read(&backup).unwrap(), original);
-        let mode = std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
+        let found = backups(dir.path());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(std::fs::read(&found[0]).unwrap(), original);
+        let mode = std::fs::metadata(&found[0]).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }
 
     #[test]
-    fn init_force_backup_holds_only_the_most_recent_previous_file() {
+    fn init_force_never_overwrites_an_earlier_backup() {
         let dir = tempfile::tempdir().unwrap();
         init_in(dir.path(), &req(20_000, "UTC", None, false)).unwrap();
+        let first = std::fs::read(dir.path().join("shared-budget.json")).unwrap();
         init_in(dir.path(), &req(30_000, "UTC", None, true)).unwrap();
         let second = std::fs::read(dir.path().join("shared-budget.json")).unwrap();
         init_in(dir.path(), &req(40_000, "UTC", None, true)).unwrap();
-        assert_eq!(
-            std::fs::read(dir.path().join("shared-budget.json.bak")).unwrap(),
-            second
+        let mut contents: Vec<Vec<u8>> = backups(dir.path())
+            .iter()
+            .map(|p| std::fs::read(p).unwrap())
+            .collect();
+        contents.sort();
+        let mut expected = vec![first, second];
+        expected.sort();
+        assert_eq!(contents, expected, "both earlier files must survive");
+    }
+
+    const HAND_EDITED: &[u8] = br#"{
+  "schema_version": 1,
+  "monthly_cap_usd_cents": 20000,
+  "time_zone": "UTC",
+  "turn_hold_usd_cents": 700,
+  "subagent_unmeasured_charge_usd_cents": 123,
+  "soft_limits": { "per_agent_usd_cents": 500 },
+  "some_future_key": { "x": 1 }
+}
+"#;
+
+    fn current_json(dir: &Path) -> Value {
+        serde_json::from_slice(&std::fs::read(dir.join("shared-budget.json")).unwrap()).unwrap()
+    }
+
+    fn seed(dir: &Path, bytes: &[u8]) {
+        init_in(dir, &req(20_000, "UTC", None, false)).unwrap();
+        std::fs::write(dir.join("shared-budget.json"), bytes).unwrap();
+    }
+
+    #[test]
+    fn init_force_preserves_hand_written_settings_and_a_second_force_still_does() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), HAND_EDITED);
+        let report = init_in(dir.path(), &req(30_000, "UTC", None, true)).unwrap();
+        let doc = current_json(dir.path());
+        assert_eq!(doc["monthly_cap_usd_cents"], 30_000, "flag value applies");
+        assert_eq!(doc["subagent_unmeasured_charge_usd_cents"], 123);
+        assert_eq!(doc["turn_hold_usd_cents"], 700);
+        assert_eq!(doc["soft_limits"]["per_agent_usd_cents"], 500);
+        // The daemon's parser rejects unknown keys, so carrying one would
+        // make the whole file invalid: it is reported and stays in the backup.
+        assert!(doc.get("some_future_key").is_none());
+        assert_eq!(report.not_carried.len(), 1, "{:?}", report.not_carried);
+        assert!(
+            report.not_carried[0].starts_with("some_future_key"),
+            "{:?}",
+            report.not_carried
         );
+        let text = render_init(&report);
+        assert!(text.contains("NOT carried over: some_future_key"), "{text}");
+        assert!(
+            text.contains("subagent_unmeasured_charge_usd_cents"),
+            "{text}"
+        );
+        assert_eq!(
+            report.config.subagent_unmeasured_charge_usd_cents,
+            Some(123)
+        );
+
+        init_in(dir.path(), &req(40_000, "UTC", None, true)).unwrap();
+        let doc = current_json(dir.path());
+        assert_eq!(doc["monthly_cap_usd_cents"], 40_000);
+        assert_eq!(doc["subagent_unmeasured_charge_usd_cents"], 123);
+        assert_eq!(backups(dir.path()).len(), 2);
+    }
+
+    #[test]
+    fn init_force_flags_override_preserved_values() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), HAND_EDITED);
+        init_in(dir.path(), &req(30_000, "Asia/Taipei", Some(250), true)).unwrap();
+        let doc = current_json(dir.path());
+        assert_eq!(doc["turn_hold_usd_cents"], 250);
+        assert_eq!(doc["time_zone"], "Asia/Taipei");
+        assert_eq!(doc["subagent_unmeasured_charge_usd_cents"], 123);
+    }
+
+    #[test]
+    fn init_force_reports_an_invalid_previous_value_and_uses_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            br#"{"schema_version":1,"monthly_cap_usd_cents":20000,"time_zone":"UTC",
+                 "subagent_unmeasured_charge_usd_cents":-5,"turn_hold_usd_cents":999999}"#,
+        );
+        let report = init_in(dir.path(), &req(30_000, "UTC", None, true)).unwrap();
+        let doc = current_json(dir.path());
+        assert!(doc.get("subagent_unmeasured_charge_usd_cents").is_none());
+        assert!(doc.get("turn_hold_usd_cents").is_none());
+        let text = render_init(&report);
+        assert!(
+            text.contains("NOT carried over: subagent_unmeasured_charge_usd_cents"),
+            "{text}"
+        );
+        assert!(
+            text.contains("NOT carried over: turn_hold_usd_cents"),
+            "{text}"
+        );
+        assert_eq!(report.config.turn_hold_usd_cents, 1_000, "default applies");
+    }
+
+    #[test]
+    fn init_force_over_an_unparseable_file_backs_it_up_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), b"{ this is not json");
+        let report = init_in(dir.path(), &req(30_000, "UTC", None, true)).unwrap();
+        let found = backups(dir.path());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(std::fs::read(&found[0]).unwrap(), b"{ this is not json");
+        let text = render_init(&report);
+        assert!(text.contains("NOT carried over"), "{text}");
+        assert!(text.contains(found[0].to_str().unwrap()), "{text}");
+        assert_eq!(current_json(dir.path())["monthly_cap_usd_cents"], 30_000);
+    }
+
+    #[test]
+    fn a_fresh_init_reports_no_backup_and_leaves_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = init_in(dir.path(), &req(20_000, "UTC", None, false)).unwrap();
+        let text = render_init(&report);
+        assert!(backups(dir.path()).is_empty());
+        assert!(!text.contains("kept as"), "{text}");
+        assert!(text.starts_with("Wrote"), "{text}");
     }
 
     #[test]

@@ -127,9 +127,11 @@ impl AppServerClient {
         for (key, value) in extra_env {
             command.env(key, value);
         }
-        let mut child = command
-            .spawn()
-            .map_err(|e| AppServerError::Spawn(program.to_owned(), e.to_string()))?;
+        let mut child = retry_while_text_file_busy(|| {
+            command
+                .spawn()
+                .map_err(|e| AppServerError::Spawn(program.to_owned(), e.to_string()))
+        })?;
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
         let spawn_elapsed = start.elapsed();
@@ -281,6 +283,45 @@ impl Drop for AppServerClient {
     }
 }
 
+/// Runs `op`, retrying while it fails with `ETXTBSY` (HORO-2422).
+///
+/// On Linux, `exec` of a file that any process still holds open for
+/// writing fails with "Text file busy" (os error 26). That happens
+/// whenever another thread of this process `fork`s while a script has just
+/// been written (a test fixture, or a binary being installed over): the
+/// forked child inherits the writable descriptor and keeps it until its
+/// own `exec` closes it. The window is short and self-healing, so a
+/// bounded retry removes the race without hiding any other spawn error.
+/// Living in `spawn` itself means every caller is covered, not only the
+/// call paths that remembered to retry.
+fn retry_while_text_file_busy<T>(
+    op: impl FnMut() -> Result<T, AppServerError>,
+) -> Result<T, AppServerError> {
+    retry_while_text_file_busy_with(TEXT_FILE_BUSY_MAX_RETRIES, TEXT_FILE_BUSY_DELAY, op)
+}
+
+const TEXT_FILE_BUSY_MAX_RETRIES: u32 = 200;
+const TEXT_FILE_BUSY_DELAY: Duration = Duration::from_millis(20);
+
+fn retry_while_text_file_busy_with<T>(
+    max_retries: u32,
+    delay: Duration,
+    mut op: impl FnMut() -> Result<T, AppServerError>,
+) -> Result<T, AppServerError> {
+    let mut retries = 0;
+    loop {
+        match op() {
+            Err(AppServerError::Spawn(_, msg))
+                if msg.contains("os error 26") && retries < max_retries =>
+            {
+                retries += 1;
+                thread::sleep(delay);
+            }
+            other => return other,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,40 +345,8 @@ mod tests {
         path
     }
 
-    /// Runs `op`, retrying while it fails with `ETXTBSY`. Another test
-    /// thread's `fork` can inherit the still-open write descriptor of a
-    /// script this test just created and hold it until that child `exec`s,
-    /// so executing the script in that window fails with "Text file busy"
-    /// (os error 26) on Linux. The window is microseconds long, so a short
-    /// bounded retry removes the race without hiding any other spawn error.
-    fn retry_while_text_file_busy<T>(
-        op: impl FnMut() -> Result<T, AppServerError>,
-    ) -> Result<T, AppServerError> {
-        retry_while_text_file_busy_with(100, Duration::from_millis(20), op)
-    }
-
-    fn retry_while_text_file_busy_with<T>(
-        max_retries: u32,
-        delay: Duration,
-        mut op: impl FnMut() -> Result<T, AppServerError>,
-    ) -> Result<T, AppServerError> {
-        let mut retries = 0;
-        loop {
-            match op() {
-                Err(AppServerError::Spawn(_, msg))
-                    if msg.contains("os error 26") && retries < max_retries =>
-                {
-                    retries += 1;
-                    std::thread::sleep(delay);
-                }
-                other => return other,
-            }
-        }
-    }
-
     fn spawn_fixture(script: &std::path::Path) -> (AppServerClient, Duration) {
-        retry_while_text_file_busy(|| AppServerClient::spawn(script.to_str().unwrap(), &[], &[]))
-            .unwrap()
+        AppServerClient::spawn(script.to_str().unwrap(), &[], &[]).unwrap()
     }
 
     #[test]

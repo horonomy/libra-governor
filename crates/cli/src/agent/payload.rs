@@ -95,7 +95,7 @@ pub struct ToolCompletedPayload {
 pub struct TurnCompletedPayload {
     #[serde(default, deserialize_with = "optional_native_call_id")]
     pub session_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_model")]
     pub model: Option<String>,
     #[serde(default)]
     pub turn_id: Option<String>,
@@ -121,9 +121,37 @@ where
     Ok(value.as_str().map(str::to_owned))
 }
 
+/// A host-reported model id: absent, non-string or blank all read as
+/// unknown, so an empty string is never recorded as a model.
+fn optional_model<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_str()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_owned))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_blank_or_missing_model_in_a_stop_payload_reads_as_unknown() {
+        for json in [
+            r#"{"session_id":"s"}"#,
+            r#"{"session_id":"s","model":""}"#,
+            r#"{"session_id":"s","model":"  "}"#,
+            r#"{"session_id":"s","model":null}"#,
+            r#"{"session_id":"s","model":7}"#,
+        ] {
+            let payload: TurnCompletedPayload = serde_json::from_str(json).unwrap();
+            assert_eq!(payload.model, None, "{json}");
+        }
+    }
 
     #[test]
     fn prompt_submit_payload_fails_to_deserialize_malformed_json() {
