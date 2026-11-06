@@ -299,6 +299,11 @@ fn init_never_overwrites_without_force() {
     assert_eq!(doc["monthly_cap_usd_cents"], 30_000);
     assert_eq!(doc["turn_hold_usd_cents"], 250);
     assert!(text(&out.stdout).contains("Replaced"));
+    assert!(
+        text(&out.stdout).contains("shared-budget.json.bak-"),
+        "stdout must name the backup it made: {}",
+        text(&out.stdout)
+    );
 }
 
 #[test]

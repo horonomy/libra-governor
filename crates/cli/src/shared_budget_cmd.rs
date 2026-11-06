@@ -62,8 +62,9 @@ const HELP: &str = "Usage:\n  \
     a calendar month in that zone and there is deliberately no UTC default. --turn-hold-usd is what \
     each prompt reserves (default 10; must not exceed the cap). Refuses to replace an existing \
     file unless --force (which replaces the whole file: pricing_overrides, \
-    subagent_unmeasured_charge_usd_cents and any soft limit not repeated are dropped, but the \
-    previous file is kept as shared-budget.json.bak; the ledger is untouched). The optional \
+    subagent_unmeasured_charge_usd_cents and any soft limit not repeated are not carried over, \
+    but the previous file is kept as shared-budget.json.bak-<UTC timestamp> (never overwritten by a \
+    later --force), its path and the keys not carried over are printed; the ledger is untouched). The optional \
     per-session and per-agent soft limits are dollars, warn only, and never grant capacity or deny a prompt. A running \
     daemon picks the file up on the next prompt.\n  \
     status   Read-only budget posture from the running daemon (never starts one): config state, \
@@ -224,6 +225,79 @@ struct InitReport {
     path: PathBuf,
     config: libra_governor_daemon::shared_budget_file::SharedBudgetConfig,
     replaced: bool,
+    /// Where the replaced file was kept; `Some` exactly when `replaced`.
+    backup: Option<PathBuf>,
+    /// Keys the previous file had that the new one does not write, so a
+    /// hand-written setting is never lost without being named.
+    dropped_keys: Vec<String>,
+}
+
+/// `YYYYMMDDTHHMMSSZ` (UTC) for a backup file name.
+fn backup_stamp() -> String {
+    let now = OffsetDateTime::now_utc();
+    format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second()
+    )
+}
+
+/// Keeps the file at `path` under a fresh `shared-budget.json.bak-<stamp>`
+/// name and returns it. The name is claimed with a hard link, which fails
+/// if it exists, so an earlier backup is never overwritten: a second
+/// forced `init` in the same second gets a `-1`, `-2`, ... suffix.
+fn back_up_existing(dir: &Path, path: &Path) -> std::io::Result<PathBuf> {
+    let stamp = backup_stamp();
+    let base = format!(
+        "{}.bak-{stamp}",
+        libra_governor_daemon::shared_budget_file::SHARED_BUDGET_FILE_NAME
+    );
+    for attempt in 0..1000u32 {
+        let name = if attempt == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{attempt}")
+        };
+        let target = dir.join(name);
+        match std::fs::hard_link(path, &target) {
+            Ok(()) => return Ok(target),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no unused backup name",
+    ))
+}
+
+/// Keys present in the previous file's JSON (top level, plus the members
+/// of `soft_limits`) that the new document does not carry. Best effort: an
+/// unparsable previous file yields none, since the backup still holds it.
+fn dropped_keys(previous: &[u8], new: &[u8]) -> Vec<String> {
+    let (Ok(Value::Object(old)), Ok(Value::Object(new))) = (
+        serde_json::from_slice::<Value>(previous),
+        serde_json::from_slice::<Value>(new),
+    ) else {
+        return Vec::new();
+    };
+    let mut dropped = Vec::new();
+    for (key, value) in &old {
+        match (key.as_str(), value, new.get(key)) {
+            (_, _, None) => dropped.push(key.clone()),
+            ("soft_limits", Value::Object(old_soft), Some(Value::Object(new_soft))) => {
+                for member in old_soft.keys().filter(|m| !new_soft.contains_key(*m)) {
+                    dropped.push(format!("soft_limits.{member}"));
+                }
+            }
+            _ => {}
+        }
+    }
+    dropped
 }
 
 /// Serialises the request into the file's bytes. Only the fields the user
@@ -279,7 +353,7 @@ fn unique_temp_name() -> String {
 /// written. They go to an owner-only temp file in `dir` first; without
 /// `force` they are then linked into place (fails if anything exists, with
 /// no check-then-write race), with `force` they replace a regular file via
-/// rename, after the old file is kept as `shared-budget.json.bak`. A reader
+/// rename, after the old file is kept as `shared-budget.json.bak-<UTC stamp>`. A reader
 /// therefore sees the old file or the new one, never a partial one.
 fn init_in(dir: &Path, request: &InitRequest) -> Result<InitReport, String> {
     use libra_governor_daemon::shared_budget_file::{
@@ -313,18 +387,16 @@ fn init_in(dir: &Path, request: &InitRequest) -> Result<InitReport, String> {
         Err(e) => return Err(format!("could not inspect {}: {e}", path.display())),
     };
 
+    let mut backup = None;
+    let mut dropped = Vec::new();
     if replaced {
         // A hard link keeps the old inode (and its owner-only mode) alive
-        // under the .bak name, and the rename over an existing .bak is
-        // atomic. Done before anything is replaced so a failure here leaves
-        // the original untouched.
-        let link = dir.join(unique_temp_name());
-        let backed_up = std::fs::hard_link(&path, &link).and_then(|()| {
-            std::fs::rename(&link, dir.join(format!("{SHARED_BUDGET_FILE_NAME}.bak")))
-        });
-        if let Err(e) = backed_up {
-            let _ = std::fs::remove_file(&link);
-            return Err(format!("could not back up {}: {e}", path.display()));
+        // under the backup name. Done before anything is replaced so a
+        // failure here leaves the original untouched.
+        dropped = dropped_keys(&std::fs::read(&path).unwrap_or_default(), &bytes);
+        match back_up_existing(dir, &path) {
+            Ok(kept) => backup = Some(kept),
+            Err(e) => return Err(format!("could not back up {}: {e}", path.display())),
         }
     }
 
@@ -367,6 +439,8 @@ fn init_in(dir: &Path, request: &InitRequest) -> Result<InitReport, String> {
         path,
         config,
         replaced,
+        backup,
+        dropped_keys: dropped,
     })
 }
 
@@ -480,9 +554,22 @@ fn render_init(report: &InitReport) -> String {
             ));
         }
     }
+    let mut kept = String::new();
+    if let Some(backup) = &report.backup {
+        kept.push_str(&format!(
+            "  Previous file kept as {} (nothing was lost; earlier backups are never overwritten)\n",
+            backup.display()
+        ));
+        if !report.dropped_keys.is_empty() {
+            kept.push_str(&format!(
+                "  Not carried over (copy from the backup if still wanted): {}\n",
+                report.dropped_keys.join(", ")
+            ));
+        }
+    }
     format!(
         "{} {}\n\
-         \x20 Monthly cap:  {} (calendar month in {})\n\
+         {kept}\x20 Monthly cap:  {} (calendar month in {})\n\
          \x20 Turn hold:    {} reserved per prompt\n\
          {soft}\x20 Guarantee:    admission-bounded (cooperative); Libra-accounted list-price-equivalent \
          USD, not a provider bill or quota\n\
@@ -1248,29 +1335,85 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 
+    fn backups(dir: &Path) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("shared-budget.json.bak"))
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
     #[test]
     fn init_force_keeps_the_previous_file_as_an_owner_only_backup() {
         let dir = tempfile::tempdir().unwrap();
         init_in(dir.path(), &req(20_000, "UTC", None, false)).unwrap();
         let original = std::fs::read(dir.path().join("shared-budget.json")).unwrap();
         init_in(dir.path(), &req(30_000, "UTC", None, true)).unwrap();
-        let backup = dir.path().join("shared-budget.json.bak");
-        assert_eq!(std::fs::read(&backup).unwrap(), original);
-        let mode = std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
+        let found = backups(dir.path());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(std::fs::read(&found[0]).unwrap(), original);
+        let mode = std::fs::metadata(&found[0]).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }
 
     #[test]
-    fn init_force_backup_holds_only_the_most_recent_previous_file() {
+    fn init_force_never_overwrites_an_earlier_backup() {
         let dir = tempfile::tempdir().unwrap();
         init_in(dir.path(), &req(20_000, "UTC", None, false)).unwrap();
+        let first = std::fs::read(dir.path().join("shared-budget.json")).unwrap();
         init_in(dir.path(), &req(30_000, "UTC", None, true)).unwrap();
         let second = std::fs::read(dir.path().join("shared-budget.json")).unwrap();
         init_in(dir.path(), &req(40_000, "UTC", None, true)).unwrap();
-        assert_eq!(
-            std::fs::read(dir.path().join("shared-budget.json.bak")).unwrap(),
-            second
+        let mut contents: Vec<Vec<u8>> = backups(dir.path())
+            .iter()
+            .map(|p| std::fs::read(p).unwrap())
+            .collect();
+        contents.sort();
+        let mut expected = vec![first, second];
+        expected.sort();
+        assert_eq!(contents, expected, "both earlier files must survive");
+    }
+
+    #[test]
+    fn init_force_report_names_the_backup_and_the_hand_written_keys_it_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        init_in(dir.path(), &req(20_000, "UTC", None, false)).unwrap();
+        let hand_edited = br#"{
+  "schema_version": 1,
+  "monthly_cap_usd_cents": 20000,
+  "time_zone": "UTC",
+  "subagent_unmeasured_charge_usd_cents": 123,
+  "soft_limits": { "per_agent_usd_cents": 500 }
+}
+"#;
+        std::fs::write(dir.path().join("shared-budget.json"), hand_edited).unwrap();
+        let report = init_in(dir.path(), &req(30_000, "UTC", None, true)).unwrap();
+        let text = render_init(&report);
+        let found = backups(dir.path());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(std::fs::read(&found[0]).unwrap(), hand_edited.to_vec());
+        assert!(text.contains(found[0].to_str().unwrap()), "{text}");
+        assert!(
+            text.contains("subagent_unmeasured_charge_usd_cents"),
+            "{text}"
         );
+        assert!(text.contains("soft_limits.per_agent_usd_cents"), "{text}");
+    }
+
+    #[test]
+    fn a_fresh_init_reports_no_backup_and_leaves_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = init_in(dir.path(), &req(20_000, "UTC", None, false)).unwrap();
+        let text = render_init(&report);
+        assert!(backups(dir.path()).is_empty());
+        assert!(!text.contains("kept as"), "{text}");
+        assert!(text.starts_with("Wrote"), "{text}");
     }
 
     #[test]

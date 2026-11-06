@@ -231,10 +231,11 @@ original strict hard-cap guarantee.
   written, a subagent file over 32 MiB, and a hook that fails open while the
   daemon is down can be under-counted or missed. A forward clock jump or a
   time-zone change near a month edge opens the next month's budget early.
-  `shared-budget init --force` replaces the whole file, dropping `pricing_overrides`, the subagent
-  fallback and unrepeated soft limits. In the published v0.0.4 no backup is
+  `shared-budget init --force` replaces the whole file, so `pricing_overrides`, the subagent
+  fallback and unrepeated soft limits are not carried over. In the published v0.0.4 no backup is
   kept; the v0.0.5 candidate keeps the previous file as
-  `shared-budget.json.bak`.
+  `shared-budget.json.bak-<UTC timestamp>` (earlier backups are never
+  overwritten) and prints its path and the keys not carried over.
 - *Published v0.0.4: every subagent can be booked at the flat turn hold
   (known High defect, HORO-2446).* On real Claude Code 2.1.306 the
   `SubagentStop` hook ran before the host had written the subagent's final
