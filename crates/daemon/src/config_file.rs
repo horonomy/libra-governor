@@ -427,6 +427,136 @@ fn resolve_gateway(raw: RawGatewayConfig) -> Result<GatewayConfig, ConfigFileErr
     Ok(config)
 }
 
+/// The gateway capability token's filename inside the state directory,
+/// used when `config.json` does not name a `gateway.token_path`.
+pub const DEFAULT_GATEWAY_TOKEN_FILE_NAME: &str = "gateway.token";
+
+/// The path of the gateway capability token the daemon serves: the
+/// `gateway.token_path` `config.json` names, else
+/// `<state_dir>/gateway.token`. A missing or unparseable `config.json`
+/// yields the default, because then the daemon runs no gateway at all.
+pub fn gateway_token_path(state_dir: &Path) -> PathBuf {
+    match load_overrides(state_dir) {
+        Ok(ConfigOverrides {
+            gateway: Some(gateway),
+            ..
+        }) => gateway.token_path,
+        _ => state_dir.join(DEFAULT_GATEWAY_TOKEN_FILE_NAME),
+    }
+}
+
+/// What `doctor` can say about a `config.json` that parses but that the
+/// daemon may still not honour. Never carries a config value, only key
+/// paths and the gateway's own rejection text (which may name the bind
+/// address or an allowlist host, never a secret).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ConfigReview {
+    /// Why the daemon's own gateway validation rejects the gateway block
+    /// (it would log "gateway disabled" and start no listener).
+    pub gateway_rejection: Option<String>,
+    /// Keys the daemon silently ignores, as dotted paths.
+    pub unknown_keys: Vec<String>,
+}
+
+// The keys each `Raw*` struct above reads. Unknown keys are tolerated, not
+// rejected (`deny_unknown_fields` would make one extra key drop a whole
+// config back to defaults), so `doctor` lists them instead. Keep these in
+// step with the `Raw*` structs; the `review_*` tests exercise each level.
+const TOP_KEYS: &[&str] = &["policy", "gateway", "extensions", "launcher"];
+const POLICY_KEYS: &[&str] = &["preset", "resource_target_tokens", "time_target_secs"];
+const GATEWAY_KEYS: &[&str] = &[
+    "bind_addr",
+    "token_path",
+    "credential_mode",
+    "credential_command",
+    "credential_args",
+    "upstream_host_allowlist",
+];
+const EXTENSIONS_KEYS: &[&str] = &["business_context_provider", "policy_webhook", "events"];
+const SURFACE_KEYS: &[&str] = &["url", "timeout_ms", "secret_command", "secret_args"];
+const EVENTS_KEYS: &[&str] = &[
+    "url",
+    "timeout_ms",
+    "max_attempts",
+    "kinds",
+    "secret_command",
+    "secret_args",
+];
+const LAUNCHER_KEYS: &[&str] = &["pools", "hold_ttl_secs"];
+const POOL_KEYS: &[&str] = &["alias", "capacity", "enabled"];
+
+/// Reviews a `config.json` that parses, using the daemon's own gateway
+/// validation (`libra_governor_gateway::config::validate`, the call
+/// `start_gateway` makes) rather than a copy of its rules. It does not
+/// resolve credentials or run any command.
+pub fn review_config(state_dir: &Path) -> Result<ConfigReview, ConfigFileError> {
+    let overrides = load_overrides(state_dir)?;
+    let mut review = ConfigReview::default();
+
+    if let Some(gateway) = overrides.gateway {
+        let policy_kind = overrides
+            .policy
+            .unwrap_or_else(crate::server::default_admission_policy)
+            .resource
+            .target
+            .kind();
+        if let Err(e) = libra_governor_gateway::config::validate(gateway, policy_kind) {
+            review.gateway_rejection = Some(e.to_string());
+        }
+    }
+
+    // `load_overrides` just read this file, so a failure here is a race
+    // with an editor; the parse result above stands.
+    if let Ok(text) = std::fs::read_to_string(state_dir.join(CONFIG_FILE_NAME)) {
+        if let Ok(root) = serde_json::from_str::<serde_json::Value>(&text) {
+            let mut unknown = Vec::new();
+            let obj = |v: &serde_json::Value, known: &[&str], path: &str, out: &mut Vec<String>| {
+                if let Some(map) = v.as_object() {
+                    for key in map.keys() {
+                        if !known.contains(&key.as_str()) {
+                            out.push(if path.is_empty() {
+                                key.clone()
+                            } else {
+                                format!("{path}.{key}")
+                            });
+                        }
+                    }
+                }
+            };
+            obj(&root, TOP_KEYS, "", &mut unknown);
+            if let Some(v) = root.get("policy") {
+                obj(v, POLICY_KEYS, "policy", &mut unknown);
+            }
+            if let Some(v) = root.get("gateway") {
+                obj(v, GATEWAY_KEYS, "gateway", &mut unknown);
+            }
+            if let Some(ext) = root.get("extensions") {
+                obj(ext, EXTENSIONS_KEYS, "extensions", &mut unknown);
+                for name in ["business_context_provider", "policy_webhook"] {
+                    if let Some(v) = ext.get(name) {
+                        obj(v, SURFACE_KEYS, &format!("extensions.{name}"), &mut unknown);
+                    }
+                }
+                if let Some(v) = ext.get("events") {
+                    obj(v, EVENTS_KEYS, "extensions.events", &mut unknown);
+                }
+            }
+            if let Some(launcher) = root.get("launcher") {
+                obj(launcher, LAUNCHER_KEYS, "launcher", &mut unknown);
+                if let Some(pools) = launcher.get("pools").and_then(|p| p.as_array()) {
+                    for pool in pools {
+                        obj(pool, POOL_KEYS, "launcher.pools[]", &mut unknown);
+                    }
+                }
+            }
+            unknown.sort();
+            unknown.dedup();
+            review.unknown_keys = unknown;
+        }
+    }
+    Ok(review)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,5 +821,87 @@ mod tests {
             err,
             ConfigFileError::LaunchAliasDuplicate { alias } if alias == "agents"
         ));
+    }
+
+    fn write_config(dir: &Path, json: &str) {
+        std::fs::write(dir.join(CONFIG_FILE_NAME), json).unwrap();
+    }
+
+    #[test]
+    fn gateway_token_path_is_the_configured_path_when_one_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"{"gateway":{"bind_addr":"127.0.0.1:8787","token_path":"/elsewhere/g.token","credential_mode":"pass_through_subscription"}}"#,
+        );
+        assert_eq!(
+            gateway_token_path(dir.path()),
+            PathBuf::from("/elsewhere/g.token")
+        );
+    }
+
+    #[test]
+    fn gateway_token_path_defaults_inside_the_state_dir_without_a_gateway_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let default = dir.path().join("gateway.token");
+        assert_eq!(gateway_token_path(dir.path()), default);
+        write_config(dir.path(), r#"{"policy":{"preset":"balanced"}}"#);
+        assert_eq!(gateway_token_path(dir.path()), default);
+        write_config(dir.path(), "{ not json");
+        assert_eq!(gateway_token_path(dir.path()), default);
+    }
+
+    #[test]
+    fn review_flags_a_non_loopback_bind_with_the_gateways_own_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"{"gateway":{"bind_addr":"0.0.0.0:8787","token_path":"/t/g.token","credential_mode":"pass_through_subscription"}}"#,
+        );
+        let review = review_config(dir.path()).unwrap();
+        let reason = review
+            .gateway_rejection
+            .expect("non-loopback must be rejected");
+        assert!(reason.contains("0.0.0.0:8787"), "{reason}");
+        assert!(review.unknown_keys.is_empty());
+    }
+
+    #[test]
+    fn review_accepts_a_loopback_gateway_and_reports_no_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"{"gateway":{"bind_addr":"127.0.0.1:8787","token_path":"/t/g.token","credential_mode":"pass_through_subscription"}}"#,
+        );
+        assert_eq!(review_config(dir.path()).unwrap(), ConfigReview::default());
+    }
+
+    #[test]
+    fn review_lists_unknown_keys_by_path_and_never_their_values() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"{"bogus_top":"SECRET-VALUE","policy":{"preset":"balanced","nonsense":1},"gateway":{"bind_addr":"127.0.0.1:8787","token_path":"/t/g.token","credential_mode":"pass_through_subscription","session_header":"x","bogus_key":2},"extensions":{"events":{"url":"https://e.example","kinds":[],"secret_command":"c","extra":true}},"launcher":{"pools":[{"alias":"a","capacity":1,"oops":1}]}}"#,
+        );
+        let review = review_config(dir.path()).unwrap();
+        assert_eq!(
+            review.unknown_keys,
+            vec![
+                "bogus_top",
+                "extensions.events.extra",
+                "gateway.bogus_key",
+                "gateway.session_header",
+                "launcher.pools[].oops",
+                "policy.nonsense",
+            ]
+        );
+        assert!(!format!("{review:?}").contains("SECRET-VALUE"));
+    }
+
+    #[test]
+    fn review_propagates_a_parse_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "{ not json");
+        assert!(review_config(dir.path()).is_err());
     }
 }

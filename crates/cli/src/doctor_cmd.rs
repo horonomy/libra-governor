@@ -29,9 +29,7 @@ use libra_governor_protocol::{
 };
 
 use crate::agent::{budget_gate, run as agent_run};
-use crate::{
-    claude_settings, client, codex_hooks_file, gateway_cmd, install_cmd, shared_budget_view,
-};
+use crate::{claude_settings, client, codex_hooks_file, install_cmd, shared_budget_view};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Severity {
@@ -1144,12 +1142,34 @@ fn config_file_presence_finding(dir: &Path) -> Finding {
                 .to_string(),
         };
     }
-    match libra_governor_daemon::config_file::load_overrides(dir) {
-        Ok(_) => Finding {
-            id: "config_file_present",
-            severity: Severity::Ok,
-            message: format!("{} is present and parses cleanly", path.display()),
-        },
+    match libra_governor_daemon::config_file::review_config(dir) {
+        Ok(review) if review.gateway_rejection.is_none() && review.unknown_keys.is_empty() => {
+            Finding {
+                id: "config_file_present",
+                severity: Severity::Ok,
+                message: format!("{} is present and parses cleanly", path.display()),
+            }
+        }
+        Ok(review) => {
+            let mut problems = Vec::new();
+            if let Some(reason) = &review.gateway_rejection {
+                problems.push(format!(
+                    "the gateway block would be rejected at daemon start ({reason}) so no \
+                     gateway would run"
+                ));
+            }
+            if !review.unknown_keys.is_empty() {
+                problems.push(format!(
+                    "unrecognised keys are ignored, not applied: {}",
+                    review.unknown_keys.join(", ")
+                ));
+            }
+            Finding {
+                id: "config_file_present",
+                severity: Severity::Warn,
+                message: format!("{} parses, but {}", path.display(), problems.join("; ")),
+            }
+        }
         Err(e) => Finding {
             id: "config_file_present",
             severity: Severity::Error,
@@ -1163,7 +1183,7 @@ fn config_file_presence_finding(dir: &Path) -> Finding {
 }
 
 fn gateway_token_finding(dir: &Path) -> Finding {
-    let path = dir.join(gateway_cmd::TOKEN_FILE_NAME);
+    let path = libra_governor_daemon::config_file::gateway_token_path(dir);
     Finding {
         id: "gateway_token_present",
         severity: Severity::Ok,

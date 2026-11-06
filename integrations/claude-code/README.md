@@ -415,7 +415,7 @@ Same fields as [`GatewayConfig`](../../crates/gateway/src/config.rs), in
 | Field | Required | Meaning |
 |---|---|---|
 | `bind_addr` | yes | Loopback address:port the gateway listens on, e.g. `"127.0.0.1:8787"`. Matches the `ANTHROPIC_BASE_URL` you point Claude Code at in step 2 of "Setup" below. |
-| `token_path` | yes | Must equal `<state_dir>/gateway.token`: `libra-governor gateway token` always reads and creates that file whatever this setting says, so any other value makes `apiKeyHelper` print a token the gateway rejects. |
+| `token_path` | yes | File holding the gateway's local capability token. `libra-governor gateway token` reads and creates this exact file, and `doctor` checks that it exists (v0.0.5 candidate; in v0.0.4 the command ignored this setting and always used `<state_dir>/gateway.token`, so `token_path` had to equal that path). A relative path is used as written, so prefer an absolute one. |
 | `credential_mode` | yes | `"governor_held"` or `"pass_through_subscription"` — see "Capability tiers" below for what each one can honestly claim. |
 | `credential_command` | only for `governor_held` | The program to run to fetch the real provider key (step 3 of "Setup" below) — e.g. `"security"`, `"op"`, `"pass"`. Its stdout is read directly into the credential; never written back to this file or any other config. |
 | `credential_args` | no (default `[]`) | Arguments to `credential_command`, e.g. `["read", "op://Private/Anthropic/api-key"]`. |
@@ -431,7 +431,11 @@ falls back to no gateway, logged.
 `Request::GatewayStatus`) reports the gateway tier that is actually
 running, which reflects `config.json` if one was loaded — this is the
 authoritative way to confirm a `config.json` change took effect, not just
-that the file parses.
+that the file parses. `State: running` means the daemon started the gateway
+thread and it has not exited (v0.0.5 candidate; v0.0.4 could print it after a
+startup failure). `doctor` additionally warns when `config.json` parses but the
+daemon would reject the gateway block (for example a non-loopback `bind_addr`)
+or ignore unrecognised keys; unknown keys are never an error.
 
 ## Daemon lifecycle
 
