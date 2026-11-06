@@ -481,7 +481,7 @@ independent. S11a gates **enablement**, not building.
   - The founder packet holds the Level 2 items from §5 as ONE packet.
 - **Codex QA:** no (docs). The founder decision gates any README or release-notes claim.
 
-### S11h (optional): model the 1-hour cache tier
+### S11h (done in HORO-2443): model the 1-hour cache tier
 - **Files:** crates/gateway/src/{usage.rs,pricing.rs,cost.rs}; the daemon transcript pricing
   (`usage/priced.rs`).
 - **Work:**
