@@ -323,7 +323,7 @@ impl SharedBudgetRuntime {
     /// gateway thread starts and the thread clears it when it exits, so a
     /// failed start, a bind error or a later stop all read as `Stopped`.
     pub fn set_gateway_run(&self, run: GatewayRun) {
-        let _ = self.gateway_run.fetch_update(
+        let _ = self.gateway_run.try_update(
             std::sync::atomic::Ordering::SeqCst,
             std::sync::atomic::Ordering::SeqCst,
             |cur| Some((cur & !RUN_MASK) | run_bits(run)),
@@ -336,7 +336,7 @@ impl SharedBudgetRuntime {
     pub fn begin_gateway_run(&self, run: GatewayRun) -> u64 {
         let prev = self
             .gateway_run
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
                 |cur| Some((((cur >> 2) + 1) << 2) | run_bits(run)),
@@ -349,7 +349,7 @@ impl SharedBudgetRuntime {
     /// returns whether it did.
     pub fn end_gateway_run(&self, generation: u64) -> bool {
         self.gateway_run
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
                 |cur| (cur >> 2 == generation).then_some(cur & !RUN_MASK),
