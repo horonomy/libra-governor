@@ -66,9 +66,9 @@ All paths are relative to the repo root.
 | Input tokens > `bytes/3` (dense Unicode or emoji, the API's tool-use system prompt) | actual > reserved, an overrun | cost.rs:37-42 calls 3.0 "deliberately low" but it is a heuristic [V]; tokenizer behaviour [I] | Hard mode uses `bytes / 1.0` (byte-level BPE gives ≥1 byte per token [I]) plus a per-image constant and a tool-prompt constant. Detect and record `input_bound_violated`, mirroring `bound_violated` (cost.rs:172-174) |
 | Inline images and documents (base64) are billed by rendering, not bytes [I] | either direction. Base64 screenshots inflate the reservation, so R2 is understated. A small many-page PDF can exceed the bound, which is an overrun | body is not inspected (proxy.rs:308-323) [V] | Hard mode excludes `source.data` payload bytes from the byte bound and adds per-block constants (an image maximum and a per-page PDF maximum, values [I] until S11a/API docs). Inventory both in S11a. S11a result: base64 image/PDF blocks are nested in `tool_result`; synthetic sizes only, constants unassessed |
 | *(S11a observed `web_search_20250305`, so Claude Code WebSearch is refused in hard mode; see the evidence note.)* Content not in the body: `source.type` url/file, Files API, `mcp_servers`, `container`, server tools (`web_search_*`, `web_fetch_*`, `code_execution_*`) | unbounded input, plus per-use fees not in `usage` | body is not inspected beyond 3 fields (proxy.rs:308-323) [V]; field names [I] | Hard mode refuses with `403 unenforceable_request` (a structural check; nothing is retained). **This breaks Claude Code WebSearch [I]**, which is a founder item |
-| 1-hour cache-write tier (2× base input, above the 1.25× 5-minute rate) | the reserve under-states the bill; the settle also under-states it (`ephemeral_1h` is not parsed, usage.rs:79-85) | pricing.rs:90-93, ADR-0026:129-131 [V] | Libra-accounted totals stay ≤ cap because reserve and settle use the same model. This is bill drift, not a Libra overrun. Optional S11h models it and bumps `PRICING_VERSION` |
-| Fast mode, `inference_geo` 1.1×, long-context premium | bill drift | ADR-0026:132-133 [V] | Disclosed residual. S11a: no `speed`/`inference_geo`/`service_tier` key and no `ttl` observed |
-| Haiku 5.5 short prompts | over-count by about 5× | pricing.rs:195-199 [V] | Conservative, so no action |
+| 1-hour cache-write tier (2× base input, above the 1.25× 5-minute rate) | modelled since `pricing-2026-11-static-v4` (HORO-2443) | usage.rs `parse_cache_split`, pricing.rs `request_cost_pico` | The reservation prices input at the 1-hour write rate, so reserve ≥ settle. |
+| Fast mode (2×, Opus 5.5/5/4.8), `inference_geo` 1.1× | modelled since `pricing-2026-11-static-v4` (HORO-2443) | usage.rs, pricing.rs | The reservation covers 1.1× on geo-capable models and 2× when the body asks for a non-standard `speed`. |
+| Haiku 5.5 short prompts | priced at the lower row per request since `pricing-2026-11-static-v4` | pricing.rs `SHORT_PROMPT_TIERS` | The reservation keeps the higher row. |
 | `output_tokens > max_tokens` | overrun | detected, never clamped (proxy.rs:1250-1253) [V] | Unchanged; reported in Status |
 | Stale pinned table | bill drift | pricing.rs:31-41 [V] | Unchanged; `PRICING_VERSION` is recorded on every row |
 
@@ -481,7 +481,7 @@ independent. S11a gates **enablement**, not building.
   - The founder packet holds the Level 2 items from §5 as ONE packet.
 - **Codex QA:** no (docs). The founder decision gates any README or release-notes claim.
 
-### S11h (optional): model the 1-hour cache tier
+### S11h (done in HORO-2443): model the 1-hour cache tier
 - **Files:** crates/gateway/src/{usage.rs,pricing.rs,cost.rs}; the daemon transcript pricing
   (`usage/priced.rs`).
 - **Work:**

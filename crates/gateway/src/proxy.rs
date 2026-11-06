@@ -77,7 +77,7 @@ use crate::authority::{
 };
 use crate::config::{GatewayCredentialMode, ValidatedGatewayConfig};
 use crate::cost::{
-    bound_violated, image_block_count, screen_unbounded_inputs, settled_cost,
+    bound_violated, image_block_count, requests_fast_speed, screen_unbounded_inputs, settled_cost,
     worst_case_reservation, EnforcementGap,
 };
 use crate::credential::{CredentialStore, LocalCapabilityToken};
@@ -967,6 +967,7 @@ async fn metered_request(
         body.len(),
         envelope.max_tokens,
         &model,
+        requests_fast_speed(&body),
         &state.config.pricing,
     ) {
         Ok(amount) => amount,
@@ -989,6 +990,11 @@ async fn metered_request(
                     Decision::UnenforceableRequest,
                     "this task's budget is denominated in a unit that cannot be derived from \
                      token counts",
+                ),
+                // Produced by settlement only; mapped defensively.
+                EnforcementGap::UnmeasurableUsage { .. } => (
+                    Decision::UnenforceableRequest,
+                    "the request's usage cannot be priced",
                 ),
             };
             record.decision_detail = Some(gap.to_string());
@@ -1091,6 +1097,7 @@ async fn metered_request(
             let request_id = request_id.to_string();
             let body_bytes = body.len();
             let images = image_block_count(&body);
+            let fast_requested = requests_fast_speed(&body);
             let max_tokens = envelope.max_tokens;
             let ttl = state.config.reservation_ttl_secs;
             tokio::task::spawn_blocking(move || {
@@ -1100,6 +1107,7 @@ async fn metered_request(
                     body_bytes,
                     max_tokens,
                     image_count: images,
+                    fast_requested,
                     request_id: &request_id,
                     ttl_secs: ttl,
                 })

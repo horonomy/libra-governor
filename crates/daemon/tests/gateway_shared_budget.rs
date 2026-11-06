@@ -674,6 +674,7 @@ fn daemon_start_books_the_previous_boots_hold_before_the_gateway_takes_requests(
             body_bytes: 100,
             max_tokens: Some(8000),
             image_count: 0,
+            fast_requested: false,
             key: &key,
             ttl_secs: 600,
         },
