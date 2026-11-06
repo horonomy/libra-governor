@@ -351,6 +351,16 @@ the subagent path is trusted; S8 re-verifies):
    inversions are not measured.
 5. Repeated `message.id` across content blocks - **confirmed**: split lines
    with identical usage.
+6. Gateway request identity (S11a, 2.1.306, producer-run, not independent QA;
+   `docs/evidence/s11a-claude-code-gateway-request-shape.md`): the
+   `x-claude-code-session-id` header is sent and equals the hook `session_id` -
+   **confirmed**, including subagent requests and across `/compact`. Subagent
+   requests carry `x-claude-code-agent-id`, equal to the hook `agent_id` -
+   **confirmed**. WebSearch issues a `web_search_20250305` server-tool request -
+   **confirmed**. `web_fetch_*`, `code_execution_*`, `mcp_servers`, `container`,
+   url/file sources, a 1h cache `ttl`, fast mode and `inference_geo` -
+   **not observed**. The real gateway was not in the request path (the daemon
+   config cannot target a loopback upstream); gateway acceptance is untested.
 
 **Window watermark (migration 0022, nullable columns, no backfill).** A
 window is every record **strictly after** the lane's watermark: the newest
