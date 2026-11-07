@@ -1190,8 +1190,10 @@ silent fix. "Over-count" is the safe direction for a cap; "under-count" is not.
   model, so Libra-accounted totals stay at or under the cap, but the bill can
   be higher. Not modelled; optional S11h would model it and bump
   `PRICING_VERSION`.
-- *Fast mode, `inference_geo` 1.1x, long-context premium, stale pinned price
-  table:* bill drift against the provider bill, disclosed, not corrected.
+- *Long-context premium, stale pinned price table:* bill drift against the
+  provider bill, disclosed, not corrected. Fast mode (2x) and `inference_geo`
+  "us" (1.1x) are modelled since `pricing-2026-11-static-v4` (HORO-2443); the
+  earlier "fast mode 1.1x" wording was wrong.
 - *`output_tokens > max_tokens`:* detected, never clamped; reported in Status.
 - *Haiku-class short prompts* over-count by about 5x (safe direction).
 - *Reserve granularity:* with `bytes / 1.0` the worst-case input for a large
